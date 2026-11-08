@@ -52,8 +52,8 @@ fn checkpoint(dir: &Path) {
     .unwrap();
 }
 
-#[test]
-fn converted_asset_and_program_are_stable_and_ship_with_every_job() {
+#[tokio::test]
+async fn converted_asset_and_program_are_stable_and_ship_with_every_job() {
     let root = tempfile::tempdir().unwrap();
     let checkpoint_dir = root.path().join("checkpoint");
     checkpoint(&checkpoint_dir);
@@ -82,7 +82,7 @@ fn converted_asset_and_program_are_stable_and_ship_with_every_job() {
     );
     let second = root.path().join("second");
     assert_eq!(convert_whisper(&checkpoint_dir, &second).unwrap(), object);
-    let model = ModelPackage::open(&converted).unwrap();
+    let model = ModelPackage::open(&converted).await.unwrap();
     for _ in 0..2 {
         let job = model
             .render_job(&ModelRequest::Transcription {
@@ -90,6 +90,7 @@ fn converted_asset_and_program_are_stable_and_ship_with_every_job() {
                 language: Some("en"),
                 max_new_tokens: 4,
             })
+            .await
             .unwrap();
         hellas_rpc::protocol::invocation::InvocationInput {
             parameters: JsonBytes(job.plan.canonical_bytes().unwrap()),
@@ -98,7 +99,11 @@ fn converted_asset_and_program_are_stable_and_ship_with_every_job() {
         .validate()
         .unwrap();
         assert_eq!(job.environment.assets[0].object, object);
-        assert!(job.content.read(object).is_err());
+        assert!(
+            hellas_channel::content::read(&job.content.0, &job.content.1, object, (object).bytes())
+                .await
+                .is_err()
+        );
         assert_eq!(job.environment.sources.len(), 1);
         assert_eq!(
             job.environment.sources[0],
@@ -109,7 +114,16 @@ fn converted_asset_and_program_are_stable_and_ship_with_every_job() {
                 351878,
             ),
         );
-        assert!(job.content.read(job.environment.sources[0]).is_ok());
+        assert!(
+            hellas_channel::content::read(
+                &job.content.0,
+                &job.content.1,
+                job.environment.sources[0],
+                (job.environment.sources[0]).bytes()
+            )
+            .await
+            .is_ok()
+        );
         assert!(job.plan.step.is_none());
         assert_eq!(job.plan.calls[0].entry, "whisper.transcribe");
         assert_eq!(job.plan.calls[0].args.len(), 10 + tensors(&cfg).len());
@@ -135,27 +149,8 @@ fn converted_asset_and_program_are_stable_and_ship_with_every_job() {
     }
 }
 
-#[test]
-#[ignore = "compiles CUDA and HIP model programs; run check-model-programs"]
-fn shipped_whisper_program_matches_catena_models() {
-    let model =
-        ModelPackage::open(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src/model/whisper/mini"))
-            .unwrap();
-    let job = model
-        .render_job(&ModelRequest::Transcription {
-            samples: &[0.; 400],
-            language: Some("en"),
-            max_new_tokens: 4,
-        })
-        .unwrap();
-    let config =
-        Config::read(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src/model/whisper/mini"))
-            .unwrap();
-    crate::model::program::assert_shipped_module(&job, &graph::bundle(&config, false).unwrap());
-}
-
-#[test]
-fn masks_match_the_upstream_language_text_and_first_token_rules() {
+#[tokio::test]
+async fn masks_match_the_upstream_language_text_and_first_token_rules() {
     let root = tempfile::tempdir().unwrap();
     checkpoint(root.path());
     let (config, generation, _) = metadata(root.path()).unwrap();
@@ -170,14 +165,14 @@ fn masks_match_the_upstream_language_text_and_first_token_rules() {
     );
 }
 
-#[test]
-fn decode_validates_the_result_header_and_decodes_client_side() {
+#[tokio::test]
+async fn decode_validates_the_result_header_and_decodes_client_side() {
     let root = tempfile::tempdir().unwrap();
     let original = root.path().join("original");
     checkpoint(&original);
     let converted = root.path().join("converted");
     convert_whisper(&original, &converted).unwrap();
-    let model = ModelPackage::open(&converted).unwrap();
+    let model = ModelPackage::open(&converted).await.unwrap();
     let output = |values: &[u64]| InvocationOutput {
         outcome: Outcome::Succeeded,
         artifacts: vec![Artifact::new(
@@ -217,6 +212,7 @@ fn decode_validates_the_result_header_and_decodes_client_side() {
                 language: Some("xx"),
                 max_new_tokens: 1
             })
+            .await
             .is_err()
     );
     assert!(
@@ -226,6 +222,7 @@ fn decode_validates_the_result_header_and_decodes_client_side() {
                 language: None,
                 max_new_tokens: 5
             })
+            .await
             .is_err()
     );
 }

@@ -382,7 +382,7 @@ let
     home = "${builtins.storeDir}/hellas";
   };
   storePathContentProvider = evalProvider {
-    content = [ "${builtins.storeDir}/model.hex" ];
+    content.lower = [ "${builtins.storeDir}/model.hex" ];
   };
   defaultIdentityProvider = evalProvider { };
   customHomeProvider = evalProvider { home = "/srv/hellas-home"; };
@@ -400,7 +400,7 @@ let
     home = "/";
   };
   unsafeServeExtraArgs = evalProvider {
-    extraArgs = [ "--content=${builtins.storeDir}/model.hex" ];
+    extraArgs = [ "--content-config=${builtins.storeDir}/content.toml" ];
   };
   unsafeServeAssuranceArgs = evalProvider {
     extraArgs = [ "--assurance=producer-signed" ];
@@ -445,6 +445,38 @@ let
     workProfile = "/run/hellas/work-profile.json";
     passkey = "/run/hellas/principal.passkey";
   };
+  managedGatewayContent = evalGateway {
+    localGrant = "00000000000000000000000000000000";
+    authorityJournal = "/var/lib/hellas-gateway/http-authority";
+    content.lower = [ "/var/lib/hellas-gateway/models" ];
+    trustStore = "/var/lib/hellas-gateway/trust";
+    trustPolicy = "provider";
+    workProfile = "/run/hellas/work-profile.json";
+    passkey = "/run/hellas/principal.passkey";
+  };
+  gatewayLowerOverGrantData = evalGateway {
+    localGrant = "00000000000000000000000000000000";
+    content.lower = [ "/var/lib/hellas-gateway/.hellas/grants" ];
+  };
+  gatewayLowerOverAuthority = evalGateway {
+    localGrant = "00000000000000000000000000000000";
+    authorityJournal = "/var/lib/hellas-gateway/authority";
+    content.lower = [ "/var/lib/hellas-gateway/authority/models" ];
+  };
+  gatewayLowerOverUpper = evalGateway {
+    localGrant = "00000000000000000000000000000000";
+    content.upper = "/var/lib/hellas-gateway/store";
+    content.lower = [ "/var/lib/hellas-gateway/store/models" ];
+  };
+  paidContentGateway = evalGateway {
+    paidWorkConfig = "/run/hellas/pool.json";
+    passkey = "/run/hellas/principal.passkey";
+  };
+  gatewayContentDisjointAssertion =
+    evaluation:
+    lib.findFirst (
+      assertion: lib.hasInfix "content.lower must be disjoint" assertion.message
+    ) (throw "missing gateway content disjointness assertion") evaluation.config.assertions;
   awaitOwnerHipProvider = evalProvider {
     awaitOwner = true;
     gpuBackend = "hip";
@@ -458,7 +490,7 @@ let
     gpuBackend = "hip";
   };
   grantOnlyHipProvider = evalProvider {
-    contentRoots = [ "/srv/hellas/grant-content" ];
+    content.lower = [ "/srv/hellas/grant-content" ];
     grantConfigFile = "/run/hellas/grant.json";
     gpuBackend = "hip";
   };
@@ -475,7 +507,7 @@ let
     memoryMaxBytes = 137438953472;
   };
   managedContentProvider = evalProvider {
-    contentRoots = [ "/var/lib/hellas/content" ];
+    content.lower = [ "/var/lib/hellas/content" ];
   };
   oversizedGpuSessionAssetBytes =
     builtins.tryEval
@@ -544,7 +576,7 @@ let
     home = "${builtins.storeDir}/hellas";
   };
   homeManagerDarwinStoreContent = evalDarwinServe {
-    content = [ "${builtins.storeDir}/model.hex" ];
+    content.lower = [ "${builtins.storeDir}/model.hex" ];
   };
   homeManagerDarwinStoreWorkConfig = evalDarwinServe {
     workConfigFile = "${builtins.storeDir}/work.toml";
@@ -591,8 +623,11 @@ let
   homeManagerDarwinUnsafeAssuranceArgs = evalDarwinServe {
     extraArgs = [ "--assurance=producer-signed" ];
   };
+  homeManagerDarwinContent = evalDarwinServe {
+    content.lower = [ "/Users/hellas/models" ];
+  };
   homeManagerDarwinLocalCatena = evalDarwinServe {
-    contentRoots = [ "/srv/hellas/content" ];
+    gpuBackend = "hip";
   };
   homeManagerRelativeEnvironmentFile = builtins.tryEval (
     builtins.deepSeq
@@ -617,7 +652,14 @@ let
           # An operator explicitly enables arbitrary locally satisfiable
           # Evaluate work, including restart from an already-populated index.
           home = "/var/lib/hellas/.hellas-v3";
-          contentRoots = [ "/srv/hellas/content" ];
+          durability = "power";
+          content = {
+            lower = [ "/srv/hellas/content" ];
+            upper = "/srv/hellas-upper";
+            index = "require";
+            capacity = "1GiB";
+            policy.on_miss = "refuse";
+          };
           gpuSessionAssetBytes = 1073741824;
           memoryMaxBytes = 2147483648;
           workConfigFile = "/run/hellas/work.toml";
@@ -658,9 +700,20 @@ let
   defaultProviderService = defaultIdentityProvider.config.systemd.services.hellas;
   managedContentProviderService = managedContentProvider.config.systemd.services.hellas;
   gatewayService = evaluated.config.systemd.services.hellas-gateway;
+  providerContentFile =
+    lib.findFirst (arg: lib.hasSuffix "-hellas-content.toml" (toString arg))
+      (throw "provider lacks content declaration")
+      (
+        hellasModule.mkServeArgs {
+          inherit lib pkgs;
+          serve = evaluated.config.services.hellas;
+          inherit (evaluated.config.services.hellas) otel;
+        }
+      );
+
 in
 {
-  provider-content-index-eval =
+  provider-content-eval =
     assert lib.hasInfix "--chain devnet"
       (evalProvider { chain = "devnet"; }).config.systemd.services.hellas.serviceConfig.ExecStart;
     assert lib.hasInfix "--chain-config /run/hellas/chain.json"
@@ -739,15 +792,24 @@ in
     assert lib.elem "/srv/hellas-gateway-home"
       customHomeGateway.config.systemd.services.hellas-gateway.unitConfig.RequiresMountsFor;
     assert lib.hasInfix "--queue-size 0" service.serviceConfig.ExecStart;
+    assert lib.hasInfix "--durability power" service.serviceConfig.ExecStart;
+    assert lib.hasInfix "--durability crash" defaultProviderService.serviceConfig.ExecStart;
+    assert lib.hasInfix
+      "--content-config ${builtins.unsafeDiscardStringContext (toString providerContentFile)}"
+      service.serviceConfig.ExecStart;
     assert lib.hasInfix "--assurance producer-signed" service.serviceConfig.ExecStart;
     assert lib.all (path: lib.elem path service.unitConfig.RequiresMountsFor) [
       "/var/lib/hellas/.hellas-v3"
       "/srv/hellas/content"
+      "/srv/hellas-upper"
       "/run/hellas/work.toml"
       "/run/hellas/fetch.json"
       "/run/hellas/provider.env"
     ];
-    assert !(service.serviceConfig ? ReadWritePaths);
+    assert
+      service.serviceConfig.ReadWritePaths == [
+        "/srv/hellas-upper"
+      ];
     assert service.serviceConfig.ReadOnlyPaths == [ "/srv/hellas/content" ];
     assert
       managedContentProviderService.serviceConfig.ReadOnlyPaths == [
@@ -896,6 +958,19 @@ in
     assert
       localGrantHipGateway.config.systemd.services.hellas-gateway.serviceConfig.LimitMEMLOCK
       == "infinity";
+    assert lib.elem "/run/hellas/pool.content"
+      paidContentGateway.config.systemd.services.hellas-gateway.serviceConfig.ReadWritePaths;
+    assert lib.elem "/run/hellas/pool.content"
+      paidContentGateway.config.systemd.services.hellas-gateway.unitConfig.RequiresMountsFor;
+    assert (gatewayContentDisjointAssertion managedGatewayContent).assertion;
+    assert
+      managedGatewayContent.config.systemd.services.hellas-gateway.serviceConfig.ReadOnlyPaths
+      == [ "/var/lib/hellas-gateway/models" ];
+    assert
+      !(managedGatewayContent.config.systemd.services.hellas-gateway.serviceConfig ? ReadWritePaths);
+    assert !(gatewayContentDisjointAssertion gatewayLowerOverGrantData).assertion;
+    assert !(gatewayContentDisjointAssertion gatewayLowerOverAuthority).assertion;
+    assert !(gatewayContentDisjointAssertion gatewayLowerOverUpper).assertion;
     assert !(grantPoolGateway.config.systemd.services.hellas-gateway.environment ? ROCM_PATH);
     assert !(grantPoolGateway.config.systemd.services.hellas-gateway.serviceConfig ? LimitMEMLOCK);
     assert !(memoryHeadroomAssertion insufficientMemoryHeadroom).assertion;
@@ -1029,12 +1104,22 @@ in
     assert !(homeManagerEnvironmentStoreAssertion homeManagerDarwinControlFileUriEnvironment).assertion;
     assert !(homeManagerExtraArgsAssertion homeManagerDarwinUnsafeAssuranceArgs).assertion;
     assert !(homeManagerCatenaAssertion homeManagerDarwinLocalCatena).assertion;
+    assert (homeManagerCatenaAssertion homeManagerDarwinContent).assertion;
     assert !homeManagerRelativeEnvironmentFile.success;
     assert !homeManagerNixPathEnvironmentFile.success;
     assert !(providerAssertion discoveryGateway).assertion;
     assert
       !(lib.hasInfix "--text-model" nativeGatewayWithoutModel.config.systemd.services.hellas-gateway.serviceConfig.ExecStart);
-    pkgs.runCommand "hellas-provider-content-index-module-eval" { } ''
+    pkgs.runCommand "hellas-provider-content-module-eval" { nativeBuildInputs = [ pkgs.python3 ]; } ''
+      python3 - ${providerContentFile} <<'PYCONTENT'
+      import sys, tomllib
+      with open(sys.argv[1], "rb") as source:
+          declaration = tomllib.load(source)
+      assert declaration == {"content": {
+          "upper": "/srv/hellas-upper", "lower": ["/srv/hellas/content"],
+          "index": "require", "capacity": "1GiB", "policy": {"on_miss": "refuse"}
+      }}, declaration
+      PYCONTENT
       umask 077
       environment_file="$PWD/provider.env"
       printf '%s\n' \

@@ -34,11 +34,14 @@ fn one_record(marker: u8) -> Records {
 }
 
 #[cfg(unix)]
-#[test]
-fn forged_persisted_identity_cannot_supply_content_or_chunks() {
+#[tokio::test]
+async fn forged_persisted_identity_cannot_supply_content_or_chunks() {
     let directory = tempfile::tempdir().expect("fixture directory");
-    let path = directory.path().join("content");
-    let index = directory.path().join("index");
+    let lower = directory.path().join("lower");
+    std::fs::create_dir(&lower).unwrap();
+    let path = lower.join("content");
+    let upper = directory.path().join("upper");
+    let index = upper.join("fastresume.bin");
     let bytes = b"actual file bytes";
     std::fs::write(&path, bytes).expect("write content");
     let metadata = std::fs::metadata(&path).expect("stat content");
@@ -54,30 +57,77 @@ fn forged_persisted_identity_cannot_supply_content_or_chunks() {
     std::fs::set_permissions(&index, std::fs::Permissions::from_mode(0o660))
         .expect("make forged index group-writable");
 
-    let store = crate::ContentStore::new();
-    let loaded = store.records().load(&index);
-    let indexed = store.index(&path).expect("index content");
+    let records = Records::default();
+    let ram = crate::content::Reservations::ram(crate::STREAM_BUFFER as u64);
+    let loaded = records.load(&index);
+    let indexed = records
+        .index_file(&path, &ram, false)
+        .expect("index content");
     assert_eq!(indexed.id, XetHash::hash(bytes));
     assert_eq!(loaded, 0);
     assert_ne!(indexed.chunks, forged.chunks);
-    assert!(!store.have(forged.id));
+    // A later import must not replace the verified in-process result.
+    assert_eq!(records.load(&index), 0);
+    assert_eq!(
+        records.get(&metadata).expect("verified record").id,
+        indexed.id
+    );
+    assert_eq!(
+        records
+            .index_file(&path, &ram, false)
+            .expect("reuse verified record")
+            .id,
+        indexed.id
+    );
+    // Import refusal must also hold at the scoped store's actual visibility gate.
+    use crate::content::{
+        ContentStore as _, DiskStore, IndexMode, PinName, PinPolicy, PinValue, Reservations, Scope,
+        Target,
+    };
+    let store = DiskStore::open(
+        hellas_private::StoreLocation::for_test(std::path::Path::new(&upper)),
+        vec![lower],
+        IndexMode::Resume,
+        None,
+        Reservations::ram(32 << 20),
+        false,
+    )
+    .await
+    .unwrap();
+    store.finish_recovery().await.unwrap();
+    let name = PinName::new("verified".into()).unwrap();
     assert!(
         store
-            .open_verified(forged.id, forged.len)
-            .expect("lookup")
-            .is_none()
+            .set_pin(
+                &Scope::Owner,
+                &name,
+                None,
+                Some(PinValue {
+                    target: Target::Object(hellas_rpc::ContentRef::new(
+                        hellas_rpc::ContentId::from_bytes(forged.id.into_bytes()),
+                        forged.len
+                    )),
+                    policy: PinPolicy::Owner,
+                    expires: None,
+                })
+            )
+            .await
+            .is_err()
     );
-
-    // A later import must not replace the verified in-process result.
-    assert_eq!(store.records().load(&index), 0);
-    assert_eq!(
-        store.records().get(&metadata).expect("verified record").id,
-        indexed.id
-    );
-    assert_eq!(
-        store.index(&path).expect("reuse verified record").id,
-        indexed.id
-    );
+    store
+        .set_pin(
+            &Scope::Owner,
+            &name,
+            None,
+            Some(PinValue {
+                target: Target::Object(hellas_rpc::ContentRef::for_bytes(bytes)),
+                policy: PinPolicy::Owner,
+                expires: None,
+            }),
+        )
+        .await
+        .unwrap();
+    store.close().await;
 }
 
 #[cfg(unix)]
@@ -87,15 +137,20 @@ fn private_persisted_index_skips_rehashing_after_restart() {
     let path = directory.path().join("weights");
     let index = directory.path().join("index");
     std::fs::write(&path, b"unchanged model weights").expect("write content");
-    let store = crate::ContentStore::new();
-    let indexed = store.index(&path).expect("initial hash");
-    store.records().save(&index).expect("save private index");
-    drop(store);
+    let records = Records::default();
+    let ram = crate::content::Reservations::ram(crate::STREAM_BUFFER as u64);
+    let indexed = records
+        .index_file(&path, &ram, false)
+        .expect("initial hash");
+    records.save(&index).expect("save private index");
+    drop(records);
 
-    let restarted = crate::ContentStore::new();
-    assert_eq!(restarted.records().load(&index), 1);
+    let restarted = Records::default();
+    assert_eq!(restarted.load(&index), 1);
     let before = crate::HASH_CALLS.with(std::cell::Cell::get);
-    let remembered = restarted.index(&path).expect("index after restart");
+    let remembered = restarted
+        .index_file(&path, &ram, false)
+        .expect("index after restart");
     assert_eq!(remembered.id, indexed.id);
     assert_eq!(remembered.chunks, indexed.chunks);
     assert_eq!(remembered.len, indexed.len);
@@ -367,4 +422,30 @@ fn save_rejects_parent_components_before_creating_directories() {
     assert!(!unrelated.exists());
     assert!(!existing_parent.join("content-index.bin").exists());
     std::fs::remove_dir(existing_parent).expect("remove existing parent");
+}
+
+#[test]
+fn explicit_lower_index_reuses_verified_identity_and_refuses_debris() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("weights");
+    std::fs::write(&path, b"weights one").unwrap();
+    let records = Records::default();
+    let ram = crate::content::Reservations::ram(32 << 20);
+    crate::HASH_CALLS.with(|calls| calls.set(0));
+    let original = records.index_file(&path, &ram, false).unwrap();
+    assert_eq!(original.id, hellas_xet::XetHash::hash(b"weights one"));
+    assert_eq!(records.index_file(&path, &ram, false).unwrap(), original);
+    crate::HASH_CALLS
+        .with(|calls| assert_eq!(calls.get(), if FileIdentity::REMEMBERS { 1 } else { 2 }));
+    let replacement = root.path().join("replacement");
+    std::fs::write(&replacement, b"weights two").unwrap();
+    std::fs::rename(replacement, &path).unwrap();
+    let changed = records.index_file(&path, &ram, false).unwrap();
+    assert_eq!(changed.id, hellas_xet::XetHash::hash(b"weights two"));
+    assert_ne!(changed.id, original.id);
+    let debris = root.path().join("weights.lock");
+    std::fs::write(&debris, b"lock bytes").unwrap();
+    assert!(records.index_file(&debris, &ram, false).is_err());
+    assert!(records.get(&std::fs::metadata(&debris).unwrap()).is_none());
+    assert_eq!(ram.held(), 0);
 }

@@ -26,7 +26,7 @@ pub async fn pay_for_result<T>(
     work_id: Digest,
 ) -> Result<u64, PaymentError>
 where
-    T: StreamTransport + Sync,
+    T: StreamTransport + Clone + Send + Sync,
     T::Error: std::error::Error + Send + Sync + 'static,
     T::Stream: 'static,
 {

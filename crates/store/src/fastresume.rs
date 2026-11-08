@@ -64,7 +64,7 @@ use std::collections::HashMap;
 use std::fs::Metadata;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::Indexed;
@@ -128,18 +128,106 @@ impl FileIdentity {
     }
 }
 
-/// What one store remembers about files it has hashed.
-///
-/// Owned rather than global. A process-wide table would mean one
-/// store's `force_recheck` silently emptied another's, and two stores in
-/// one process could never be reasoned about independently — which also
-/// made tests interfere with each other, which is how this was noticed.
+/// Verified identities belong to one store. Explicit rechecks forget only
+/// the descriptor identity being indexed, preserving unrelated records.
 #[derive(Debug, Default)]
 pub struct Records {
     entries: Mutex<HashMap<FileIdentity, Indexed>>,
 }
 
+/// Walk regular lower files without following nested symlinks; an explicitly
+/// supplied symlinked root is followed, as it is for daemon lower scans.
+pub fn walk_lower(
+    paths: &[PathBuf],
+    mut visit: impl FnMut(&Path) -> crate::content::Result<()>,
+) -> crate::content::Result<()> {
+    let mut pending = paths.to_vec();
+    while let Some(path) = pending.pop() {
+        if is_cache_debris(&path) {
+            continue;
+        }
+        let metadata = std::fs::metadata(&path)?;
+        if metadata.is_file() {
+            visit(&path)?;
+        } else if metadata.is_dir() {
+            for entry in std::fs::read_dir(path)? {
+                let entry = entry?;
+                let kind = entry.file_type()?;
+                let path = entry.path();
+                if is_cache_debris(&path) {
+                    continue;
+                }
+                if kind.is_dir() {
+                    pending.push(path);
+                } else if kind.is_file() {
+                    visit(&path)?;
+                }
+            }
+        } else {
+            return Err(crate::content::Error::Invalid(
+                "lower root is not an ordinary file or directory",
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl Records {
+    /// Explicit owner indexing for lower files. Uses the same verified identity
+    /// and bounded hashing path as the DiskStore scanner.
+    pub fn index_file(
+        &self,
+        path: &Path,
+        ram: &crate::content::Reservations,
+        recheck: bool,
+    ) -> crate::content::Result<Indexed> {
+        self.index_entry(path, crate::content::IndexMode::Resume, ram, recheck)
+            .map(|(indexed, _)| indexed)
+    }
+    pub(crate) fn index_entry(
+        &self,
+        path: &Path,
+        mode: crate::content::IndexMode,
+        ram: &crate::content::Reservations,
+        recheck: bool,
+    ) -> crate::content::Result<(Indexed, crate::Entry)> {
+        use crate::{
+            Entry,
+            content::{Error, IndexMode},
+        };
+        if is_cache_debris(path) {
+            return Err(Error::Invalid("cache debris is not lower content"));
+        }
+        let mut file = crate::open_regular_file(path)?;
+        let metadata = file.metadata()?;
+        let identity = FileIdentity::of(&metadata);
+        if recheck {
+            self.forget(identity);
+        }
+        let indexed = match self.get(&metadata) {
+            Some(indexed) => indexed,
+            None if matches!(mode, IndexMode::Require) => {
+                return Err(Error::Invalid("lower file requires an index record"));
+            }
+            None => {
+                let _scratch = ram.reserve(crate::STREAM_BUFFER as u64)?;
+                crate::hash_exact_length(&mut file, metadata.len())?
+                    .ok_or(Error::Invalid("file changed during indexing"))?
+            }
+        };
+        crate::still_the_file_that_was_read(path, identity, &file)
+            .map_err(|_| Error::Invalid("file replaced during indexing"))?;
+        self.put(&metadata, &indexed);
+        Ok((
+            indexed.clone(),
+            Entry {
+                path: path.to_owned(),
+                identity,
+                chunks: indexed.chunks,
+            },
+        ))
+    }
+
     /// What indexing this file produced last time, if it still looks
     /// exactly the same.
     ///
@@ -172,24 +260,10 @@ impl Records {
         }
     }
 
-    /// Discards every record, forcing a re-hash of everything.
-    ///
-    /// The "force recheck" every fastresume implementation needs,
-    /// because the identity check is a heuristic and heuristics are
-    /// wrong eventually.
-    pub fn force_recheck(&self) {
+    pub(crate) fn forget(&self, identity: FileIdentity) {
         if let Ok(mut entries) = self.entries.lock() {
-            entries.clear();
+            entries.remove(&identity);
         }
-    }
-
-    /// Number of files remembered.
-    #[must_use]
-    pub fn remembered(&self) -> usize {
-        self.entries
-            .lock()
-            .map(|entries| entries.len())
-            .unwrap_or(0)
     }
 }
 

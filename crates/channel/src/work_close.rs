@@ -459,7 +459,7 @@ pub fn close_response(
     // `response_build_ms`: the digest and the signature over it, which
     // is the whole of what building an answer costs. The journal record
     // that fixes it is not in here — §4 counts that separately, as one
-    // of `Wresp`'s three fsyncs.
+    // of `Wresp`'s three commits.
     let parties = channel.payment_terms().parties();
     let authority = parties
         .taker()
@@ -981,6 +981,7 @@ pub(crate) fn expiry_at(
                     } else if height > authorization.acceptance_deadline
                         && job.phase() == JobPhase::HalfSigned
                         && job.prepared_input().is_empty()
+                        && !state.retained_roots().contains_key(&job.work_id())
                     {
                         authorization.acceptance_deadline
                     } else if height > authorization.payment_deadline
@@ -1319,7 +1320,7 @@ where
 ///
 /// The journal's own
 /// [`ChannelRecord::CloseResponded`](crate::work_store::ChannelRecord::CloseResponded)
-/// is not, because it is fsynced *before* the submission it authorises:
+/// is not, because it is committed *before* the submission it authorises:
 /// a crash between the two leaves a record saying "answered" over a
 /// consensus that received nothing, and a scan floor built on it would
 /// read the whole successor backlog past the deadline with the answer

@@ -152,24 +152,71 @@ impl GrantService {
         &self,
         delivery: Arc<Delivery>,
     ) -> hellas_wire::WriteAuthority {
-        hellas_wire::WriteAuthority::new(DeliveryWriter {
-            service: self.clone(),
-            cancelled: {
-                let delivery = delivery.clone();
-                Box::pin(async move { delivery.cancellation.cancelled().await })
-            },
-            delivery,
-            pending: None,
-            changed: Box::pin(self.node.changed.clone().notified_owned()),
-            timer: None,
-            denied: false,
-        })
+        writer(DeliverySource::Work(Box::new(self.clone()), delivery))
     }
+}
+pub(crate) fn content_authority(
+    binding: Arc<crate::content::ContentBinding>,
+) -> hellas_wire::WriteAuthority {
+    writer(DeliverySource::Content(binding))
+}
+enum DeliverySource {
+    Work(Box<GrantService>, Arc<Delivery>),
+    Content(Arc<crate::content::ContentBinding>),
+}
+impl DeliverySource {
+    fn node(&self) -> &crate::node::NodeCoordinator {
+        match self {
+            Self::Work(service, _) => &service.node,
+            Self::Content(binding) => &binding.node,
+        }
+    }
+    fn cancelled(&self) -> BoxFuture<'static, ()> {
+        match self {
+            Self::Work(_, delivery) => {
+                let cancellation = delivery.cancellation().clone();
+                Box::pin(async move { cancellation.cancelled().await })
+            }
+            Self::Content(binding) => {
+                let binding = binding.clone();
+                Box::pin(async move {
+                    let parent = async {
+                        match &binding.parent {
+                            Some(parent) => parent.cancelled().await,
+                            None => std::future::pending().await,
+                        }
+                    };
+                    tokio::select! { _ = binding.cancellation.cancelled() => {}, _ = parent => binding.cancellation.cancel() }
+                })
+            }
+        }
+    }
+    fn current(&self, store: &NodeStore, now: UnixMillis) -> Option<UnixMillis> {
+        match self {
+            Self::Work(service, delivery) => service
+                .inner
+                .lock()
+                .ok()
+                .and_then(|held| held.status.check().ok())
+                .and_then(|()| delivery.refresh(store, now).ok()),
+            Self::Content(binding) => binding.refresh(store, now).ok(),
+        }
+    }
+}
+fn writer(source: DeliverySource) -> hellas_wire::WriteAuthority {
+    let cancelled = source.cancelled();
+    hellas_wire::WriteAuthority::new(DeliveryWriter {
+        cancelled,
+        pending: None,
+        changed: Box::pin(source.node().changed.clone().notified_owned()),
+        source,
+        timer: None,
+        denied: false,
+    })
 }
 
 struct DeliveryWriter {
-    service: GrantService,
-    delivery: Arc<Delivery>,
+    source: DeliverySource,
     pending: Option<BoxFuture<'static, Result<OwnedEndpointGuard<NodeStore>, ()>>>,
     changed: BoxFuture<'static, ()>,
     cancelled: BoxFuture<'static, ()>,
@@ -191,10 +238,10 @@ impl hellas_wire::WriteAuthorization for DeliveryWriter {
             return Poll::Ready(Err(denied()));
         }
         while self.changed.as_mut().poll(cx).is_ready() {
-            self.changed = Box::pin(self.service.node.changed.clone().notified_owned());
+            self.changed = Box::pin(self.source.node().changed.clone().notified_owned());
         }
         let pending = self.pending.get_or_insert_with(|| {
-            let store = self.service.node.store.clone();
+            let store = self.source.node().store.clone();
             Box::pin(async move { store.lock_owned().await })
         });
         let store = std::task::ready!(pending.as_mut().poll(cx));
@@ -203,14 +250,8 @@ impl hellas_wire::WriteAuthorization for DeliveryWriter {
             self.denied = true;
             return Poll::Ready(Err(denied()));
         };
-        let now = self.service.node.observed_time(&store);
-        let current = self
-            .service
-            .inner
-            .lock()
-            .ok()
-            .and_then(|held| held.status.check().ok())
-            .and_then(|()| self.delivery.refresh(&store, now).ok());
+        let now = self.source.node().observed_time(&store);
+        let current = self.source.current(&store, now);
         let Some(expires) = current else {
             self.denied = true;
             return Poll::Ready(Err(denied()));

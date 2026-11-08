@@ -95,6 +95,7 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
             super::recovery::Backend::default(),
             vec![],
             Arc::new(|| hellas_auth::authority::UnixMillis::now().unwrap_or_default()),
+            hellas_authority::test_support::content_store(&fixture.root.path().join("grants")).await,
         )
         .unwrap();
         let mut admin =
@@ -180,14 +181,36 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
                             Err(_) if index >= 2 => return,
                             Err(error) => panic!("Work authentication failed: {error}"),
                         };
+                        let mut unmounted_acceptance = false;
                         while let Ok(Some(inbound)) = transport.accept().await {
                             assert!(index < 2, "failed Open must not disclose a Work request");
                             // The client can observe finalized setup before the
                             // provider's clock has mounted its Work channel.
                             if inbound.method_id
-                                == hellas_rpc::services::work::UploadContent::METHOD_ID
+                                == hellas_rpc::services::content::Upload::METHOD_ID
                                 && first_upload.swap(false, std::sync::atomic::Ordering::SeqCst)
-                                || inbound.method_id
+                            {
+                                unmounted_acceptance = true;
+                                let context = inbound.context.clone();
+                                let _ = hellas_rpc::call::dispatch_bidi_streaming::<
+                                    IrohTransport, hellas_rpc::services::content::Upload, _, _, _,
+                                >(inbound, |requests| async move {
+                                    crate::paid_provider::MountedWork::default()
+                                        .upload_stream(
+                                            Box::pin(requests), context,
+                                            hellas_channel::work::admission::Cancellation::new(),
+                                        )
+                                        .await
+                                }).await;
+                            } else if inbound.method_id
+                                    == hellas_rpc::services::work::AcceptWork::METHOD_ID
+                                    && unmounted_acceptance
+                            {
+                                unmounted_acceptance = false;
+                                let _ = Dispatcher::<IrohTransport>::dispatch(
+                                    &WorkServer(crate::work_router::UnmountedWork), inbound,
+                                ).await;
+                            } else if inbound.method_id
                                     == hellas_rpc::services::work::AdmitCertificate::METHOD_ID
                                     && first_certificate
                                         .swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -218,7 +241,9 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
                 }
             }
         });
-        let client = ClientService::new(fixture.client().await);
+        let client_store = fixture.store(hellas_channel::work_store::Role::Client).await;
+        let content = client_store.content_store();
+        let client = ClientService::new(hellas_channel::work::ClientEndpoint::new(fixture.ready.clone(), client_store, crate::test_support::signer(1)).unwrap());
         client
             .observer()
             .observe_ready(
@@ -230,6 +255,7 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
             .unwrap();
         let mut session = PaidWorkSession {
             args: PaidWorkOptions {
+                content,
                 config: fixture.config.clone(),
                 journal_kind: crate::paid_client::PaidJournalKind::Client,
                 provider: crate::test_support::address(server.id()),
@@ -254,7 +280,7 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
             observer: None,
             needs_recovery: false,
         };
-        let error = session.run(Some(fixture.proposal().prepared_input), &hellas_channel::content::InvocationContent::Ephemeral(Default::default()), false, None).await.err().expect("interrupted before acknowledgement");
+        let error = session.run(Some(fixture.proposal().prepared_input), &hellas_channel::test_support::channel::program_content().await, false, None).await.err().expect("interrupted before acknowledgement");
         assert!(matches!(error, PaidClientError::Payment(hellas_channel::work::PaymentError::Transport(status)) if status.code() == hellas_wire::WireCode::Cancelled));
         assert!(!first_upload.load(std::sync::atomic::Ordering::SeqCst));
         assert!(!first_certificate.load(std::sync::atomic::Ordering::SeqCst));
@@ -265,12 +291,15 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
         }).await.unwrap();
         assert_eq!(service.with_state(|state| state.ledger().credited_cumulative()).await.unwrap(), 0);
         session.shutdown().await;
-        let args = session.args.clone();
+        session.args.content.close().await;
+        let mut args = session.args.clone();
         let descriptor = session.descriptor.clone();
         let policy = session.policy.clone();
         let dialer = std::mem::replace(&mut session.dialer, ProviderDialer::new(server.id(), server.bound_sockets(), client_endpoint.clone(), trust.clone()));
         drop(session);
-        let client = ClientService::new(ClientEndpoint::recover(fixture.store(Role::Client).await, signer(1)).unwrap());
+        let store = fixture.store(Role::Client).await;
+        args.content = store.content_store();
+        let client = ClientService::new(ClientEndpoint::recover(store, signer(1)).unwrap());
         client.observer().observe_ready(fixture.ready.clone(), ObservationTime::now(), Duration::from_secs(60)).await.unwrap();
         let mut session = PaidWorkSession { args, descriptor, policy, dialer, client, observer: None, needs_recovery: true };
         let job = crate::job::Job::fetch(crate::test_support::PRICE, hellas_channel::test_support::test_responses_contract(), "openai".into(), "responses".into(), crate::test_support::BODY.to_vec(), Assurance::ProducerSigned).unwrap();
@@ -348,7 +377,7 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
             .run(
                 "responses",
                 grant_input,
-                &hellas_channel::content::InvocationContent::Ephemeral(Default::default()),
+                &hellas_channel::test_support::channel::program_content().await,
                 None,
                 None,
                 None,

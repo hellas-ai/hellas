@@ -34,9 +34,6 @@ impl WorkExecutionBackend for Fake {
         self.started.notify_one();
         assert_eq!(job.plan.calls[0].entry, "whisper.transcribe");
         assert!(job.plan.step.is_none());
-        for source in &job.environment.sources {
-            assert!(!job.content.read(*source).unwrap().is_empty());
-        }
         assert_eq!(
             job.inputs
                 .iter()
@@ -88,6 +85,11 @@ impl WorkExecutionBackend for Fake {
         let delay = self.delay;
         let provenance = self.provenance.clone();
         Ok(Box::pin(async_stream::stream! {
+            for source in &job.environment.sources {
+                let reader = job.content.0.open_verified(&job.content.1, *source, None).await.unwrap().unwrap();
+                let bytes = reader.read_all(*source, &job.content.0.ram_pool()).await.unwrap();
+                assert!(!bytes.is_empty());
+            }
             if let Some((accepted, _)) = &provenance {
                 yield Ok(WorkEvent::Accepted(accepted.clone()));
             }

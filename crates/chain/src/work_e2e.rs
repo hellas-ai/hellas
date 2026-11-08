@@ -5,6 +5,7 @@
 
 use hellas_channel::test_support::channel::serve_work as serve;
 use hellas_channel::test_support::channel::{AnsweringBackend, work_policy};
+use hellas_channel::work::ClientChannel as _;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -30,6 +31,7 @@ use hellas_kernel::{
     Secp256k1Signer, Secp256k1Verifier, Terms as KernelTerms, Tx as KernelTx, WorkPaymentTerms,
     WorkStakeBondTerms,
 };
+use hellas_store::content::DiskStore;
 use hellas_wire::TransportContext;
 use hellas_wire::mux::MuxTransport;
 
@@ -384,8 +386,24 @@ impl WorkDevnet {
 
 // ── The handshake, and the setup drive ────────────────────────────────
 
-async fn open_setup(root: &std::path::Path, bond: EdgeId, role: Role) -> SetupStore {
-    hellas_channel::test_support::channel::open_setup_store(root, TEST_NETWORK, bond, role).await
+/// A fresh party's content store; its channel journal owns the paid content.
+async fn content(root: &std::path::Path) -> DiskStore {
+    let content = hellas_channel::test_support::channel::content_store(root).await;
+    content.finish_recovery().await.unwrap();
+    content
+}
+
+async fn open_setup(
+    root: &std::path::Path,
+    content: &DiskStore,
+    bond: EdgeId,
+    role: Role,
+) -> SetupStore {
+    let mut store =
+        hellas_channel::test_support::channel::open_setup_store(root, TEST_NETWORK, bond, role)
+            .await;
+    store.set_content_store(content.clone());
+    store
 }
 
 fn scan_at(block: &HellasBlock) -> SetupScan {
@@ -411,12 +429,19 @@ struct Handshake {
 async fn shake_hands(
     provider_root: &std::path::Path,
     client_root: &std::path::Path,
+    client_content: &DiskStore,
     allocations: &Allocations,
     scan: SetupScan,
 ) -> Handshake {
     let bond = bond_edge(allocations);
     let mut proposer = SetupEndpoint::new(
-        open_setup(provider_root, bond, Role::Provider).await,
+        open_setup(
+            provider_root,
+            &content(provider_root).await,
+            bond,
+            Role::Provider,
+        )
+        .await,
         provider(),
         PaymentAdmission::Admits(Box::new(provider_policy())),
     );
@@ -437,7 +462,7 @@ async fn shake_hands(
     let service = SetupService::new(proposer);
 
     let mut caller = SetupEndpoint::new(
-        open_setup(client_root, bond, Role::Client).await,
+        open_setup(client_root, client_content, bond, Role::Client).await,
         client(),
         PaymentAdmission::Proposes(Box::new(provider_policy())),
     );
@@ -519,10 +544,7 @@ fn session() -> TransportContext {
 }
 
 fn transport_pair() -> (MuxTransport, MuxTransport) {
-    hellas_channel::test_support::transport::transport_pair_without_write_authority(
-        session(),
-        session(),
-    )
+    hellas_channel::test_support::transport::transport_pair_with_context(session(), session())
 }
 
 // ── The whole opened channel, both halves ─────────────────────────────
@@ -532,7 +554,7 @@ fn transport_pair() -> (MuxTransport, MuxTransport) {
 /// readiness decision, and where the channel began.
 struct Opened {
     service: WorkService,
-    client: ClientEndpoint,
+    client: hellas_channel::work::ClientService,
     ready: ReadyChannel,
     origin: SetupOrigin,
 }
@@ -580,7 +602,15 @@ async fn open_channel(
         );
     }
     let floor = devnet.seal().await;
-    let handshake = shake_hands(provider_root, client_root, &allocations, scan_at(&floor)).await;
+    let client_content = content(client_root).await;
+    let handshake = shake_hands(
+        provider_root,
+        client_root,
+        &client_content,
+        &allocations,
+        scan_at(&floor),
+    )
+    .await;
 
     // The bond, submitted by the driver and finalized by consensus.
     assert_eq!(
@@ -628,7 +658,13 @@ async fn open_channel(
     // The client reaches the same origin from its own journal, reading a
     // different validator. The journal is reopened from the disk, so
     // nothing this process held in memory carries the client's half.
-    let mut client_setup = open_setup(client_root, bond_edge(&allocations), Role::Client).await;
+    let mut client_setup = open_setup(
+        client_root,
+        &client_content,
+        bond_edge(&allocations),
+        Role::Client,
+    )
+    .await;
     let client_advance = client_step(&mut client_setup, &client_blocks).await;
     assert_eq!(client_advance.progress, SetupProgress::Complete(origin));
     let Some(client_store) = client_advance.mounted else {
@@ -681,14 +717,18 @@ async fn open_channel(
     if let Err(error) = service.admit_new_work(ready.clone()).await {
         panic!("the ready channel admits work: {error}");
     }
-    let client_endpoint = match ClientEndpoint::new(client_ready, client_store, client()) {
+    let client_endpoint = match ClientEndpoint::new(client_ready.clone(), client_store, client()) {
         Ok(endpoint) => endpoint,
         Err(error) => panic!("the client endpoint binds: {error}"),
     };
 
     Opened {
         service,
-        client: client_endpoint,
+        client: hellas_channel::test_support::channel::client_service(
+            client_endpoint,
+            client_ready,
+        )
+        .await,
         ready,
         origin,
     }
@@ -711,7 +751,7 @@ async fn run_one_paid_job(devnet: &WorkDevnet, opened: &mut Opened) -> u64 {
         transport,
         &mut opened.client,
         &proposal,
-        &hellas_channel::test_support::channel::program_content(),
+        &hellas_channel::test_support::channel::program_content().await,
     )
     .await
     .expect("the provider accepts the proposed job");
@@ -736,7 +776,7 @@ async fn run_one_paid_job(devnet: &WorkDevnet, opened: &mut Opened) -> u64 {
 
     // Nothing is payable yet: the client has not collected the
     // authenticated answer.
-    let too_early = opened.client.pay(work_id).await;
+    let too_early = opened.client.client().await.unwrap().pay(work_id).await;
     assert!(
         matches!(too_early, Err(PaymentError::NotPayable { .. })),
         "a job the client has not collected is not payable: {too_early:?}",
@@ -763,7 +803,10 @@ async fn run_one_paid_job(devnet: &WorkDevnet, opened: &mut Opened) -> u64 {
     // The payment is signed only after the client records its own result check.
     opened
         .client
-        .verified(work_id)
+        .client()
+        .await
+        .unwrap()
+        .verified(work_id, &proposal.prepared_input)
         .await
         .expect("the client records its result check");
     let (transport, server) = transport_pair();

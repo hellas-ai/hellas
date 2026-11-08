@@ -53,7 +53,6 @@ use hellas_chain::test_support::devnet::{
     Devnet, DevnetConfig, GenesisOwner, OwnerKind, delegate_allocation, run,
 };
 use hellas_chain::{FinalizedWorkView as _, LightClient as _};
-use hellas_channel::content::InvocationContent;
 use hellas_channel::model::work::{JobPaymentPolicyV2, PaidChannelPolicyV1};
 use hellas_channel::test_support::{HANG_GUARD, enrollment, test_responses_contract};
 use hellas_executor::{
@@ -74,7 +73,36 @@ use hellas_sdk::{
     FetchProviderOptions, FetchRoute, FetchRouteEntry, FetchRoutePolicy, FetchRouteRegistry,
     NodeIdentity, PaidProviderOptions, RootProver, start_fetch_provider,
 };
+use hellas_store::content::{LocalStore, MemoryStore, Reservations, Scope};
 use invocation::fetch::{FetchAdmission, FetchLimits, FetchRoutePolicy as PaidRoute};
+
+async fn fresh_client_content(root: &std::path::Path) -> hellas_store::content::DiskStore {
+    assert!(
+        !root.join("content").exists(),
+        "this fixture has no prior client obligations"
+    );
+    let content = hellas_channel::test_support::channel::content_store(root).await;
+    content.finish_recovery().await.unwrap();
+    content
+}
+
+fn empty_content() -> (LocalStore, Scope) {
+    (
+        LocalStore::Memory(MemoryStore::new(Reservations::ram(
+            hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
+        ))),
+        Scope::Owner,
+    )
+}
+async fn source_content(objects: impl IntoIterator<Item = Vec<u8>>) -> (LocalStore, Scope) {
+    let (store, scope) = empty_content();
+    for bytes in objects {
+        hellas_channel::content::upload_object(&store, &bytes)
+            .await
+            .unwrap();
+    }
+    (store, scope)
+}
 
 /// The job's flat price.
 const PRICE: u64 = 10;
@@ -187,6 +215,7 @@ async fn check_other_enrollment_refused(
     let error = hellas_sdk::paid_gateway::PaidGateway::open(
         hellas_sdk::paid_gateway::PaidGatewayOptions {
             config: gateway.config.clone(),
+            content: gateway.content.clone(),
             providers: vec![gateway_provider(&gateway)],
             max_pending_requests: 1,
         },
@@ -337,8 +366,14 @@ async fn start_provider(
     config: WorkConfig,
     node: hellas_sdk::FullNode,
     identity: &NodeIdentity,
-) -> (hellas_sdk::ProviderHandle, PausedFetch) {
+) -> (
+    hellas_sdk::ProviderHandle,
+    PausedFetch,
+    hellas_store::content::DiskStore,
+) {
     let (routes, upstream) = routes();
+    let content =
+        hellas_channel::test_support::channel::content_store(&root.join("provider-state")).await;
     let location = StoreLocation::for_test(&root.join("provider-state"));
     let provider = start_fetch_provider(
         FetchProviderOptions {
@@ -347,6 +382,7 @@ async fn start_provider(
             enrollment: provider_enrollment(identity),
             root: Arc::new(SoftwareRoot),
             home: location,
+            content: content.clone(),
             grants: Some(hellas_sdk::GrantProviderOptions {
                 configuration: Default::default(),
                 max_job_millis: std::num::NonZeroU64::new(5000).unwrap(),
@@ -362,7 +398,7 @@ async fn start_provider(
     )
     .await
     .unwrap();
-    (provider, upstream)
+    (provider, upstream, content)
 }
 
 fn addresses(provider: &hellas_sdk::ProviderHandle) -> Vec<std::net::SocketAddr> {
@@ -674,6 +710,7 @@ async fn check_gateway_quote(
     let gateway = hellas_sdk::paid_gateway::PaidGateway::open(
         hellas_sdk::paid_gateway::PaidGatewayOptions {
             config: args.config.clone(),
+            content: args.content.clone(),
             providers: vec![gateway_provider(&args)],
             max_pending_requests: 1,
         },
@@ -737,6 +774,7 @@ struct PaidScenario<S = PaidWorkSession> {
     devnet: Devnet,
     provider_node: hellas_sdk::FullNode,
     provider: hellas_sdk::ProviderHandle,
+    provider_content: hellas_store::content::DiskStore,
     relays: remote::Relays,
     approvals: Arc<Approvals>,
     owner: Arc<hellas_sdk::client_owner::ClientOwner>,
@@ -821,7 +859,7 @@ async fn paid_fixture(runtime: commonware_runtime::tokio::Context) -> PaidScenar
     drop(store);
     let config = work_config(&devnet, root.path().join("provider-journal"));
     let relays = remote::Relays::start(&devnet).await;
-    let (provider, _) = start_provider(
+    let (provider, _, provider_content) = start_provider(
         root.path(),
         config.clone(),
         provider_node.clone(),
@@ -918,6 +956,7 @@ async fn paid_fixture(runtime: commonware_runtime::tokio::Context) -> PaidScenar
     let provider_address =
         hellas_sdk::client::ProviderAddress::of(&provider_enrollment(&identity)).unwrap();
     let options = PaidWorkOptions {
+        content: fresh_client_content(&root.path().join("client-store")).await,
         config: client_config,
         journal_kind: hellas_sdk::paid_client::PaidJournalKind::Client,
         provider: provider_address,
@@ -992,6 +1031,7 @@ async fn paid_fixture(runtime: commonware_runtime::tokio::Context) -> PaidScenar
         devnet,
         provider_node,
         provider,
+        provider_content,
         relays,
         approvals,
         owner,
@@ -1016,6 +1056,7 @@ async fn paid_setup(
         mut devnet,
         provider_node,
         provider,
+        provider_content,
         mut relays,
         approvals,
         owner,
@@ -1063,6 +1104,7 @@ async fn paid_setup(
         );
         endpoint.close().await;
         provider.shutdown().await.unwrap();
+        provider_content.close().await;
         relays.shutdown().await;
         devnet.shutdown().await;
         return None;
@@ -1096,6 +1138,7 @@ async fn paid_setup(
         devnet,
         provider_node,
         provider,
+        provider_content,
         relays,
         approvals,
         owner,
@@ -1118,6 +1161,7 @@ async fn paid_finish(case: PaidScenario) {
         mut devnet,
         provider_node,
         provider,
+        provider_content,
         mut relays,
         approvals,
         owner,
@@ -1178,7 +1222,8 @@ async fn paid_finish(case: PaidScenario) {
     endpoint.close().await;
 
     provider.shutdown().await.unwrap();
-    let (provider, upstream) =
+    provider_content.close().await;
+    let (provider, upstream, provider_content) =
         start_provider(root.path(), provider_config, provider_node, &identity).await;
     assert_eq!(
         provider
@@ -1309,7 +1354,7 @@ async fn paid_finish(case: PaidScenario) {
     )
     .unwrap();
     let job_folder = root.path().join("job");
-    job.save(&job_folder).unwrap();
+    job.save(&job_folder).await.unwrap();
     let endpoint = bind_paid_endpoint(client_transport).await.unwrap();
     let mut session = PaidWorkSession::open(
         options.clone(),
@@ -1322,12 +1367,7 @@ async fn paid_finish(case: PaidScenario) {
     .await
     .unwrap();
     session
-        .run(
-            None,
-            &InvocationContent::Ephemeral(Default::default()),
-            true,
-            None,
-        )
+        .run(None, &empty_content(), true, None)
         .await
         .unwrap();
     assert!(
@@ -1378,12 +1418,7 @@ async fn paid_finish(case: PaidScenario) {
     .await
     .unwrap();
     session
-        .run(
-            None,
-            &InvocationContent::Ephemeral(Default::default()),
-            true,
-            None,
-        )
+        .run(None, &empty_content(), true, None)
         .await
         .unwrap();
     upstream
@@ -1443,7 +1478,7 @@ async fn paid_finish(case: PaidScenario) {
         .pause
         .store(false, std::sync::atomic::Ordering::SeqCst);
     upstream.release.notify_one();
-    let loaded = hellas_sdk::job::Job::load(&job_folder).unwrap();
+    let loaded = hellas_sdk::job::Job::load(&job_folder).await.unwrap();
     let result = hellas_sdk::transact::transact(
         &mut session,
         &loaded,
@@ -1594,6 +1629,7 @@ async fn paid_finish(case: PaidScenario) {
     endpoint.close().await;
     assert!(!client_home.join("chain").exists());
     provider.shutdown().await.unwrap();
+    provider_content.close().await;
     relays.shutdown().await;
     devnet.shutdown().await;
 }
@@ -1605,12 +1641,7 @@ async fn provider_close_offline(
 ) {
     use hellas_chain::{WorkBlocks, work_view::WorkChannelQuery};
     let result = session
-        .run(
-            Some(input),
-            &InvocationContent::Ephemeral(Default::default()),
-            false,
-            None,
-        )
+        .run(Some(input), &empty_content(), false, None)
         .await
         .unwrap()
         .unwrap();
@@ -1801,4 +1832,11 @@ fn a_responsive_source_below_the_journal_height_is_not_selected() {
 #[test]
 fn paid_startup_selects_a_source_at_the_retained_journal_floor() {
     run(remote::paid_startup_uses_the_retained_floor);
+}
+
+#[test]
+fn cancelled_initial_observation_releases_its_journal_before_a_retry() {
+    run(|runtime| {
+        Box::pin(remote::opening_cancellation_releases_the_mounted_client_journal(runtime))
+    });
 }

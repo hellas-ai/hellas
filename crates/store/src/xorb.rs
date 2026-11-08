@@ -26,19 +26,14 @@
 //! and concatenated, so recovering the original means interleaving them
 //! back. Remainder bytes go one each to the first groups.
 //!
-//! # What verification this can and cannot do
-//!
-//! Each decoded chunk is hashed and checked against the chunk hash the
-//! caller expects, so a xorb that decodes into the wrong bytes is
-//! caught here. That check is only possible because *we* hold the chunk
-//! list — a reconstruction response carries no chunk hashes, so a client
-//! without an index cannot verify anything until it has reassembled a
-//! whole file.
-
-use hellas_xet::{Chunk, XetHash, chunk_hash};
+//! Decoding validates framing and expansion bounds. The acquired file is
+//! canonically hashed against its advertised identity before publication.
 
 /// Bytes of header before each chunk's payload.
-const HEADER: usize = 8;
+pub(crate) const HEADER: usize = 8;
+// LZ4 standard-frame maximum block is 4 MiB. FrameDecoder retains one input
+// block, up to two output blocks and its 64-KiB linked history window.
+pub(crate) const LZ4_SCRATCH_BYTES: usize = 3 * (4 * 1024 * 1024) + 64 * 1024;
 /// Groups the byte-grouping scheme splits a payload into.
 const BG4_GROUPS: usize = 4;
 
@@ -77,10 +72,8 @@ pub enum XorbError {
     Decompress,
     #[error("chunk decompressed to {actual} bytes, header declared {declared}")]
     LengthMismatch { declared: usize, actual: usize },
-    #[error("chunk hashed to {actual}, expected {expected}")]
-    HashMismatch { expected: XetHash, actual: XetHash },
-    #[error("{trailing} bytes follow the {count} chunks that were asked for")]
-    Trailing { count: usize, trailing: usize },
+    #[error("chunk header length exceeds canonical maximum")]
+    TooLarge,
 }
 
 /// One decoded chunk and how many bytes of the xorb it occupied.
@@ -102,7 +95,15 @@ pub fn decode_chunk(bytes: &[u8]) -> Result<Decoded, XorbError> {
     let compressed_size = u24(&header[1..4]);
     let scheme = Scheme::from_tag(header[4])?;
     let uncompressed_size = u24(&header[5..8]);
-
+    if uncompressed_size > hellas_xet::MAX_CHUNK_SIZE {
+        return Err(XorbError::TooLarge);
+    }
+    if matches!(scheme, Scheme::None) && compressed_size != uncompressed_size {
+        return Err(XorbError::LengthMismatch {
+            declared: uncompressed_size,
+            actual: compressed_size,
+        });
+    }
     let payload = bytes
         .get(HEADER..HEADER + compressed_size)
         .ok_or(XorbError::Truncated)?;
@@ -129,55 +130,6 @@ pub fn decode_chunk(bytes: &[u8]) -> Result<Decoded, XorbError> {
     })
 }
 
-/// Decodes a xorb range into chunks, checking each against `expected`.
-///
-/// `expected` is the slice of our own chunk list covering this range.
-/// Checking here is what makes a partial fetch safe: without it the only
-/// verification available is the file hash, which needs every byte.
-pub fn decode_range(bytes: &[u8], expected: &[Chunk]) -> Result<Vec<Vec<u8>>, XorbError> {
-    decode_chunks(bytes, expected.len(), Some(expected))
-}
-
-/// Decodes `count` consecutive chunks, verifying each against
-/// `expected` when the caller has a chunk list to check against.
-///
-/// `None` is not laxity for its own sake: a client fetching content it
-/// has never indexed genuinely has nothing to check against, because a
-/// reconstruction response carries no chunk hashes. Such a fetch is
-/// verified once, whole, against the file hash.
-pub fn decode_chunks(
-    bytes: &[u8],
-    count: usize,
-    expected: Option<&[Chunk]>,
-) -> Result<Vec<Vec<u8>>, XorbError> {
-    let mut decoded = Vec::with_capacity(count);
-    let mut offset = 0;
-    for index in 0..count {
-        let next = decode_chunk(bytes.get(offset..).ok_or(XorbError::Truncated)?)?;
-        if let Some(chunk) = expected.and_then(|chunks| chunks.get(index)) {
-            let actual = chunk_hash(&next.data);
-            if actual != chunk.hash {
-                return Err(XorbError::HashMismatch {
-                    expected: chunk.hash,
-                    actual,
-                });
-            }
-        }
-        offset += next.consumed;
-        decoded.push(next.data);
-    }
-    // The range was requested by byte offsets covering exactly these
-    // chunks, so anything after them is something we did not ask for and
-    // cannot account for.
-    if offset != bytes.len() {
-        return Err(XorbError::Trailing {
-            count,
-            trailing: bytes.len() - offset,
-        });
-    }
-    Ok(decoded)
-}
-
 fn u24(bytes: &[u8]) -> usize {
     usize::from(bytes[0]) | usize::from(bytes[1]) << 8 | usize::from(bytes[2]) << 16
 }
@@ -189,12 +141,28 @@ fn u24(bytes: &[u8]) -> usize {
 /// agreement with the header, and the caller's length check — the thing
 /// that catches a lying header — would pass.
 fn lz4_frame(payload: &[u8], declared: usize) -> Result<Vec<u8>, XorbError> {
-    use std::io::Read as _;
-    let mut out = Vec::new();
-    lz4_flex::frame::FrameDecoder::new(payload)
-        .take(declared.saturating_add(1) as u64)
-        .read_to_end(&mut out)
-        .map_err(|_| XorbError::Decompress)?;
+    use std::io::Read;
+    // Reject legacy/nonstandard frames: the standard frame format limits blocks
+    // to 4 MiB, which bounds FrameDecoder's internal scratch allocation.
+    if payload.get(..4) != Some(&[0x04, 0x22, 0x4d, 0x18]) {
+        return Err(XorbError::Decompress);
+    }
+    let mut decoder = lz4_flex::frame::FrameDecoder::new(payload).take((declared + 1) as u64);
+    let mut out = vec![0; declared + 1];
+    let mut filled = 0;
+    while filled < out.len() {
+        let read = decoder
+            .read(&mut out[filled..])
+            .map_err(|_| XorbError::Decompress)?;
+        if read == 0 {
+            break;
+        }
+        filled += read;
+    }
+    if filled <= declared && !decoder.get_ref().get_ref().is_empty() {
+        return Err(XorbError::Decompress);
+    }
+    out.truncate(filled);
     Ok(out)
 }
 

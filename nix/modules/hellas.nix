@@ -190,8 +190,7 @@ rec {
     "--assurance"
     "--port"
     "--queue-size"
-    "--content"
-    "--content-root"
+    "--content-config"
     "--gpu-backend"
     "--gpu-session-programs"
     "--gpu-session-asset-bytes"
@@ -210,6 +209,7 @@ rec {
   ];
 
   protectedGatewayExtraArgs = [
+    "--content-config"
     "--metrics-port"
     "--metrics-addr"
     "--paid-work-config"
@@ -241,11 +241,7 @@ rec {
 
   catenaConfigured =
     serve:
-    serve.content != [ ]
-    || serve.contentRoots != [ ]
-    || serve.gpuBackend != null
-    || serve.gpuSessionPrograms != null
-    || serve.gpuSessionAssetBytes != null;
+    serve.gpuBackend != null || serve.gpuSessionPrograms != null || serve.gpuSessionAssetBytes != null;
 
   commonOptions =
     {
@@ -384,27 +380,19 @@ rec {
         description = "Maximum number of queued executions waiting behind the active worker.";
       };
       content = mkOption {
-        type = types.listOf runtimePath;
-        default = [ ];
-        example = [ "/srv/hellas/content/model.hex" ];
+        inherit (pkgs.formats.toml { }) type;
+        default = { };
+        example = {
+          upper = "/var/lib/hellas/content-store";
+          lower = [ "/srv/models" ];
+          index = "resume";
+        };
         description = ''
-          Local files available to execution environments. Each path is
-          indexed by content identity at startup and passed as --content.
-
-          Values are strings, not Nix paths: model programs and assets remain
-          operator-managed runtime data and must not be copied into the Nix
-          store.
-        '';
-      };
-      contentRoots = mkOption {
-        type = types.listOf runtimePath;
-        default = [ ];
-        example = [ "/srv/hellas/content" ];
-        description = ''
-          Directory trees adopted into the local content store at startup,
-          passed as repeatable --content-root arguments. No remote fetch is
-          performed. Values are strings so their contents do not enter the
-          Nix store.
+          The [content] declaration: upper, lower, index, capacity, pins and
+          policy. Rendered as one TOML file passed through --content-config.
+          An absent upper uses the store below home. Model bytes stay in
+          runtime lower directories; use absolute string paths outside the
+          Nix store. Pins default to Jobs.
         '';
       };
       gpuBackend = mkOption {
@@ -529,7 +517,7 @@ rec {
     };
 
   gatewayOptions =
-    { lib }:
+    { lib, pkgs }:
     let
       inherit (lib) mkEnableOption mkOption types;
       runtimePath = types.strMatching "/.*";
@@ -537,10 +525,15 @@ rec {
     in
     {
       enable = mkEnableOption "Hellas HTTP gateway";
+      content = mkOption {
+        inherit (pkgs.formats.toml { }) type;
+        default = { };
+        description = "The local-grant [content] declaration, rendered as one --content-config file. An absent upper keeps the dedicated authority-local upper. Use runtime lower paths outside the Nix store.";
+      };
       paidWorkConfig = mkOption {
         type = types.nullOr runtimePath;
         default = null;
-        description = "Runtime JSON provider pool for funded paid-work channels. Requests must match a configured provider's fixed generation policy; authenticated output is returned after payment acknowledgement.";
+        description = "Runtime JSON provider pool for funded paid-work channels. Requests must match a configured provider's fixed generation policy; authenticated output is returned after payment acknowledgement. Content lives in a sibling upper obtained by replacing the config extension with .content. Provision that directory for the service user and preserve it with the client journals.";
       };
       chain = mkOption {
         type = types.nullOr (types.enum [ "devnet" ]);
@@ -728,6 +721,7 @@ rec {
   mkServeArgs =
     {
       lib,
+      pkgs,
       serve,
       otel,
     }:
@@ -750,14 +744,10 @@ rec {
     ]
     ++ optArg "--port" serve.port
     ++ optArg "--queue-size" serve.queueSize
-    ++ lib.concatMap (path: [
-      "--content"
-      path
-    ]) serve.content
-    ++ lib.concatMap (path: [
-      "--content-root"
-      path
-    ]) serve.contentRoots
+    ++ lib.optionals (serve.content != { }) [
+      "--content-config"
+      ((pkgs.formats.toml { }).generate "hellas-content.toml" { inherit (serve) content; })
+    ]
     ++ optArg "--gpu-backend" serve.gpuBackend
     ++ optArg "--gpu-session-programs" serve.gpuSessionPrograms
     ++ optArg "--gpu-session-asset-bytes" serve.gpuSessionAssetBytes
@@ -786,6 +776,7 @@ rec {
   mkGatewayArgs =
     {
       lib,
+      pkgs,
       gateway,
       otel,
     }:
@@ -803,6 +794,10 @@ rec {
       "gateway"
       "--assurance"
       gateway.assurance
+    ]
+    ++ lib.optionals (gateway.content != { }) [
+      "--content-config"
+      ((pkgs.formats.toml { }).generate "hellas-gateway-content.toml" { inherit (gateway) content; })
     ]
     ++ optArg "--trust-store" gateway.trustStore
     ++ optArg "--trust-policy" gateway.trustPolicy

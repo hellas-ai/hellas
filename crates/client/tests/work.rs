@@ -14,7 +14,9 @@ use hellas_channel::test_support::channel::{
 };
 
 use hellas_channel::work::{ClientEndpoint, ProviderEndpoint, WorkService};
-use hellas_channel::work_close::{BlockSourceError, FinalizedBlocks, FinalizedWork};
+use hellas_channel::work_close::{
+    BlockSourceError, CloseChannel as _, FinalizedBlocks, FinalizedWork,
+};
 use hellas_channel::work_store::{JobPhase, JobState, Role};
 use hellas_client::work::payment::pay_for_result;
 use hellas_client::work::{CollectResultError, CollectResultOutcome, collect_result};
@@ -39,10 +41,7 @@ fn session() -> hellas_wire::TransportContext {
 }
 
 fn transport_pair() -> (MuxTransport, MuxTransport) {
-    hellas_channel::test_support::transport::transport_pair_without_write_authority(
-        session(),
-        session(),
-    )
+    hellas_channel::test_support::transport::transport_pair_with_context(session(), session())
 }
 
 /// A finalized-block source over the same synthetic empty chain the
@@ -112,7 +111,7 @@ async fn an_authenticated_answer_is_paid_without_reexecution() {
         "ordinary collection does not claim an independent match",
     );
     endpoint
-        .verified(id)
+        .verified(id, &hellas_channel::test_support::channel::bundle(1))
         .await
         .expect("the client records its result check");
 
@@ -190,7 +189,7 @@ async fn a_payment_signed_before_a_crash_is_re_sent_after_it() {
         "the answer is collected: {collected:?}",
     );
     endpoint
-        .verified(id)
+        .verified(id, &hellas_channel::test_support::channel::bundle(1))
         .await
         .expect("the client records its result check");
 
@@ -198,6 +197,13 @@ async fn a_payment_signed_before_a_crash_is_re_sent_after_it() {
     // certificate leaves it.
     let signed = endpoint.pay(id).await;
     assert!(signed.is_ok(), "the client signs its payment: {signed:?}");
+    endpoint
+        .store()
+        .await
+        .unwrap()
+        .content_store()
+        .close()
+        .await;
     drop(endpoint);
     {
         assert_eq!(
@@ -244,15 +250,26 @@ async fn a_retained_model_job_resumes_with_provider_held_weights() {
 
 #[cfg(feature = "models")]
 #[tokio::test]
-async fn a_retained_model_job_reuploads_an_asset_the_provider_lost() {
+async fn a_retained_model_proposal_reuploads_its_share_after_upload_connection_loss() {
     model_job_restart(false).await;
 }
 
 #[cfg(feature = "models")]
 async fn model_job_restart(provider_held: bool) {
-    use hellas_channel::content::{ContentError, InvocationContent};
+    tokio::time::timeout(
+        hellas_channel::test_support::HANG_GUARD,
+        model_job_restart_inner(provider_held),
+    )
+    .await
+    .expect("the model proposal recovery completes");
+}
+
+#[cfg(feature = "models")]
+async fn model_job_restart_inner(provider_held: bool) {
+    use futures::StreamExt as _;
+    use hellas_channel::model::work::{PaidJobAuthorizationV2, PrivateRecord as _, work_id};
     use hellas_channel::test_support::channel::{advance, deadlines, origin, settlement};
-    use hellas_channel::work::{JobProposal, propose_work, resume_work_proposal};
+    use hellas_channel::work::{ClientChannel, JobProposal, propose_work, resume_work_proposal};
     use hellas_channel::work_store::ChannelStore;
     use hellas_client::model::{ModelPackage, ModelRequest};
     use hellas_kernel::Secp256k1Verifier;
@@ -260,6 +277,10 @@ async fn model_job_restart(provider_held: bool) {
         InvocationInput, InvocationRequest, PreparedInvocation,
     };
     use hellas_rpc::{Assurance, ContentRef, JsonBytes};
+    use hellas_store::content::{
+        DiskStore, IndexMode, PinName, PinPolicy, PinTarget, Reservations, Scope,
+    };
+    use hellas_wire::MethodMarker as _;
     use hellas_wire::StreamTransport as _;
     use std::sync::Arc;
 
@@ -268,37 +289,45 @@ async fn model_job_restart(provider_held: bool) {
     let ready = ready();
     let fixture =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/model/package/mini-qwen3.gguf");
-    let package = ModelPackage::open(&fixture).expect("the miniature Qwen model opens");
+
+    let package = ModelPackage::open(&fixture)
+        .await
+        .expect("the miniature Qwen model opens");
     let job = package
         .render_job(&ModelRequest::Text {
             prompt_ids: &[2, 1],
             max_new: 2,
             stops: &[0, 0],
         })
+        .await
         .expect("the model renders a Compute job");
+
     let weights = std::fs::read(&fixture).expect("the model weights are readable");
     let [weights_asset] = &job.environment.assets[..] else {
         panic!("the model job names exactly one weight asset");
     };
     assert_eq!(weights_asset.object, ContentRef::for_bytes(&weights));
     assert!(
-        matches!(
-            job.content.read(weights_asset.object),
-            Err(ContentError::Missing)
-        ),
-        "the client deliberately does not hold the provider's weights",
+        job.content
+            .0
+            .open_verified(&job.content.1, weights_asset.object, None)
+            .await
+            .unwrap()
+            .is_none(),
+        "the client deliberately does not hold the provider's weights"
     );
 
-    // The provider indexes the weights it serves; the client never sees them.
-    let weights_store = hellas_store::ContentStore::new();
-    let weights_path = provider_root.path().join("mini-qwen3.gguf");
-    if provider_held {
-        std::fs::write(&weights_path, &weights).expect("the weights are written for indexing");
-        weights_store
-            .index(&weights_path)
-            .expect("the provider indexes its weights");
-    }
     let location = hellas_private::StoreLocation::for_test(provider_root.path());
+    let weights_store = DiskStore::open(
+        location.child("content"),
+        vec![],
+        IndexMode::Resume,
+        None,
+        Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+        false,
+    )
+    .await
+    .unwrap();
     let mut provider_store = ChannelStore::open(
         &location,
         ready.channel().clone(),
@@ -310,6 +339,20 @@ async fn model_job_restart(provider_held: bool) {
     )
     .await
     .expect("the provider journal opens");
+    weights_store.finish_recovery().await.unwrap();
+    if provider_held {
+        hellas_channel::content::upload_bytes(
+            &weights_store,
+            &Scope::Owner,
+            &weights,
+            Some(PinTarget {
+                name: PinName::new("provider/weights".into()).unwrap(),
+                policy: PinPolicy::Jobs,
+            }),
+        )
+        .await
+        .unwrap();
+    }
     advance(&mut provider_store, CURSOR).await;
 
     let policy = ready.invocation_policy();
@@ -339,13 +382,12 @@ async fn model_job_restart(provider_held: bool) {
         .expect("the model job is a prepared invocation"),
         deadlines: deadlines(),
     };
-    let content = if provider_held {
-        InvocationContent::Ephemeral(job.content.clone())
-    } else {
-        let client_assets = hellas_store::ContentStore::new();
-        client_assets.index(&fixture).unwrap();
-        InvocationContent::Ephemeral(job.content.clone().with_held(client_assets))
-    };
+    let content = job.content.clone();
+    if !provider_held {
+        hellas_channel::content::upload_object(&content.0, &weights)
+            .await
+            .unwrap();
+    }
 
     // The provider accepts the upload and journals its co-signature, but
     // the reply never reaches the client: the client keeps a half-signed
@@ -354,7 +396,7 @@ async fn model_job_restart(provider_held: bool) {
     struct LostAccept {
         service: WorkService,
         accept: bool,
-        probes: Arc<std::sync::Mutex<std::collections::BTreeMap<Vec<u8>, usize>>>,
+        completed: Arc<std::sync::atomic::AtomicBool>,
     }
     impl hellas_rpc::services::work::WorkHandler for LostAccept {
         async fn accept_work(
@@ -365,31 +407,32 @@ async fn model_job_restart(provider_held: bool) {
             impl Into<hellas_rpc::call::WithTrailer<hellas_rpc::pb::work::AcceptWorkResponse>> + Send,
             hellas_wire::WireStatus,
         > {
+            // Retained proposals first probe for a prior durable acceptance.
+            // Inject loss only after the real Content upload has completed.
+
+            let authorization = PaidJobAuthorizationV2::decode(&request.authorization).unwrap();
+            let id = self
+                .service
+                .with_state(|state| work_id(state.channel(), &authorization))
+                .await
+                .unwrap();
+            if !self.service.completed_content_upload(id).await.unwrap() {
+                return self
+                    .service
+                    .accept_work(request, context)
+                    .await
+                    .map(Into::into);
+            }
+            self.completed
+                .store(true, std::sync::atomic::Ordering::Release);
             if self.accept {
                 let _ = self.service.accept_work(request, context).await?;
             }
-            Err::<hellas_rpc::pb::work::AcceptWorkResponse, _>(hellas_wire::WireStatus::internal(
-                "the acceptance reply was lost",
-            ))
+            Err::<hellas_rpc::call::WithTrailer<hellas_rpc::pb::work::AcceptWorkResponse>, _>(
+                hellas_wire::WireStatus::internal("the acceptance reply was lost"),
+            )
         }
-        async fn upload_content(
-            &self,
-            request: hellas_rpc::pb::work::UploadContentRequest,
-            context: hellas_wire::TransportContext,
-        ) -> Result<
-            impl Into<hellas_rpc::call::WithTrailer<hellas_rpc::pb::work::UploadContentResponse>> + Send,
-            hellas_wire::WireStatus,
-        > {
-            if request.chunk.is_empty() {
-                *self
-                    .probes
-                    .lock()
-                    .unwrap()
-                    .entry(request.content_id.clone())
-                    .or_default() += 1;
-            }
-            self.service.upload_content(request, context).await
-        }
+
         async fn get_standing(
             &self,
             request: hellas_rpc::pb::work::GetStandingRequest,
@@ -427,30 +470,64 @@ async fn model_job_restart(provider_held: bool) {
         ProviderEndpoint::new(ready.clone(), provider_store, provider())
             .expect("the provider endpoint binds"),
     );
-    let mut endpoint = ClientEndpoint::new(
+    let mut endpoint = hellas_channel::test_support::channel::client_service(
+        ClientEndpoint::new(
+            ready.clone(),
+            store_at(client_root.path(), &ready, Role::Client, CURSOR).await,
+            client(),
+        )
+        .expect("the client endpoint binds"),
         ready.clone(),
-        store_at(client_root.path(), &ready, Role::Client, CURSOR).await,
-        client(),
     )
-    .expect("the client endpoint binds");
+    .await;
     let (transport, server_transport) = transport_pair();
     let probes = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let serving = tokio::spawn({
         let service = service.clone();
         let probes = probes.clone();
+        let completed = completed.clone();
         async move {
-            let dispatcher = hellas_rpc::services::work::WorkServer(LostAccept {
-                service,
+            let dispatcher = Arc::new(hellas_rpc::services::work::WorkServer(LostAccept {
+                service: service.clone(),
                 accept: provider_held,
-                probes,
-            });
+                completed,
+            }));
+            let mut tasks = tokio::task::JoinSet::new();
+            let cancellation = hellas_channel::work::admission::Cancellation::new();
+            let _stop =
+                hellas_channel::work::admission::CancelOnFailure(vec![cancellation.clone()]);
             while let Ok(Some(inbound)) = server_transport.accept().await {
-                let _ =
-                    hellas_wire::Dispatcher::<MuxTransport>::dispatch(&dispatcher, inbound).await;
+                let dispatcher = dispatcher.clone();
+                let service = service.clone();
+                let probes = probes.clone();
+                let cancellation = cancellation.clone();
+                tasks.spawn(async move {
+                    if inbound.method_id == hellas_rpc::services::content::Upload::METHOD_ID {
+                        let context = inbound.context.clone();
+                        let _ = hellas_rpc::call::dispatch_bidi_streaming::<
+                            MuxTransport, hellas_rpc::services::content::Upload, _, _, _,
+                        >(inbound, |requests| async move {
+                            let requests = requests.map(move |request| {
+                                if let Ok(hellas_rpc::pb::content::UploadRequest {
+                                    part: Some(hellas_rpc::pb::content::upload_request::Part::Open(open)),
+                                }) = &request {
+                                    *probes.lock().unwrap().entry(open.object.as_ref().unwrap().id.clone()).or_default() += 1;
+                                }
+                                request
+                            });
+                            service.upload_stream(Box::pin(requests), context, cancellation).await
+                        }).await;
+                    } else {
+                        let _ = hellas_wire::Dispatcher::<MuxTransport>::dispatch(dispatcher.as_ref(), inbound).await;
+                    }
+                });
             }
         }
     });
+
     let failed = propose_work(transport, &mut endpoint, &proposal, &content).await;
+
     serving.abort();
     let _ = serving.await;
     assert!(
@@ -462,17 +539,35 @@ async fn model_job_restart(provider_held: bool) {
         "the upload completes and only the acceptance reply is lost: {failed:?}",
     );
     assert!(
+        completed.load(std::sync::atomic::Ordering::Acquire),
+        "inject reply loss only after validated upload EOF"
+    );
+    assert_eq!(
+        probes
+            .lock()
+            .unwrap()
+            .get(weights_asset.object.id().as_bytes().as_slice()),
+        Some(&1)
+    );
+    assert!(
         probes.lock().unwrap().values().all(|count| *count == 1),
         "retaining client content must not probe assets a second time"
     );
-    let id = endpoint
+    let id = ClientChannel::client(&mut endpoint)
+        .await
+        .unwrap()
         .state()
         .jobs()
         .next()
         .expect("the proposal is journaled")
         .work_id();
     assert_eq!(
-        endpoint.state().job_by_id(id).map(JobState::phase),
+        ClientChannel::client(&mut endpoint)
+            .await
+            .unwrap()
+            .state()
+            .job_by_id(id)
+            .map(JobState::phase),
         Some(JobPhase::HalfSigned),
     );
     assert_eq!(
@@ -483,65 +578,82 @@ async fn model_job_restart(provider_held: bool) {
         provider_held.then_some(JobPhase::Accepted),
         "the failure is after acceptance only for the provider-held case",
     );
+    let client_node = ClientChannel::client(&mut endpoint)
+        .await
+        .unwrap()
+        .store()
+        .await
+        .unwrap()
+        .content_store();
+    client_node.close().await;
     drop(endpoint);
+    weights_store.close().await;
     drop(service);
     drop(content);
-    if !provider_held {
-        let suffix = format!(
-            "-{}.part",
-            hex::encode(weights_asset.object.id().as_bytes())
-        );
-        let mut removed = 0;
-        let mut directories = vec![provider_root.path().to_path_buf()];
-        while let Some(directory) = directories.pop() {
-            for entry in std::fs::read_dir(directory).unwrap() {
-                let entry = entry.unwrap();
-                if entry.file_type().unwrap().is_dir() {
-                    directories.push(entry.path());
-                } else if entry.file_name().to_string_lossy().ends_with(&suffix) {
-                    std::fs::remove_file(entry.path()).unwrap();
-                    removed += 1;
-                }
-            }
-        }
-        assert_eq!(
-            removed, 1,
-            "simulate loss of exactly the provider's uploaded weight asset"
-        );
-    }
+    drop(weights_store);
 
+    // The unaccepted provider's carrier has ended, so its private staging is
+    // abandoned. The signed client's exact retained share must survive this.
     // The reopened journal rebuilds the client's share from its own store.
     let store = store_at(client_root.path(), &ready, Role::Client, CURSOR).await;
     let recovered = store
         .recoverable_content(id)
         .expect("the retained closure reads")
         .expect("the client-supplied objects survived");
+    let recovered_weights = recovered
+        .0
+        .open_verified(&recovered.1, weights_asset.object, None)
+        .await;
     if provider_held {
         assert!(
             matches!(
-                recovered.read(weights_asset.object),
-                Err(ContentError::Missing)
+                recovered_weights,
+                Ok(None) | Err(hellas_store::content::Error::Denied)
             ),
             "a provider-held weight is not claimed as locally retained"
         );
     } else {
+        let actual = recovered_weights
+            .unwrap()
+            .unwrap()
+            .read_all(weights_asset.object, &recovered.0.ram_pool())
+            .await
+            .unwrap();
         assert_eq!(
-            recovered.read(weights_asset.object).unwrap().as_slice(),
-            weights,
-            "the client can reupload from its own retained copy after restart"
+            actual.as_ref(),
+            weights.as_slice(),
+            "the client reuploads from its own retained copy after restart"
         );
     }
+    let weights_store = DiskStore::open(
+        location.child("content"),
+        vec![],
+        IndexMode::Resume,
+        None,
+        Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+        false,
+    )
+    .await
+    .unwrap();
     let mut provider_store = ChannelStore::open(
         &location,
         ready.channel().clone(),
         settlement(),
         Role::Provider,
         origin(),
-        weights_store,
+        weights_store.clone(),
         &Secp256k1Verifier::new(),
     )
     .await
     .expect("the provider journal reopens");
+    weights_store.finish_recovery().await.unwrap();
+    if !provider_held {
+        assert_eq!(
+            weights_store.stats().unwrap().used,
+            0,
+            "the disconnected, unaccepted upload has no durable authority"
+        );
+    }
     advance(&mut provider_store, CURSOR).await;
     let service = WorkService::new(
         ProviderEndpoint::new(ready.clone(), provider_store, provider())
@@ -551,13 +663,28 @@ async fn model_job_restart(provider_held: bool) {
         ClientEndpoint::new(ready.clone(), store, client()).expect("the client endpoint rebinds");
     let (transport, server) = transport_pair();
     let serving = serve(server, service);
+
     let resumed = resume_work_proposal(transport, &mut endpoint, id, &recovered).await;
+
     serving.abort();
     let _ = serving.await;
     assert_eq!(resumed.expect("the retained proposal is accepted"), id);
     assert_eq!(
-        endpoint.state().job_by_id(id).map(JobState::phase),
+        ClientChannel::client(&mut endpoint)
+            .await
+            .unwrap()
+            .state()
+            .job_by_id(id)
+            .map(JobState::phase),
         Some(JobPhase::Accepted),
     );
-    assert_eq!(endpoint.state().job_book().pending_proposal(), None);
+    assert_eq!(
+        ClientChannel::client(&mut endpoint)
+            .await
+            .unwrap()
+            .state()
+            .job_book()
+            .pending_proposal(),
+        None
+    );
 }

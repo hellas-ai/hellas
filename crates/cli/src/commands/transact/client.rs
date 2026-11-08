@@ -13,6 +13,57 @@ pub(super) async fn config(args: &ClientArgs, context: &Context) -> CliResult<Wo
     Ok(WorkConfig::from_chain_dir(chain)?)
 }
 
+/// One client upper for all provider journals under this state root. Restore
+/// every root before opening the shared recovery barrier, including providers
+/// other than the one selected for the next operation.
+pub(super) async fn content(
+    context: &Context,
+    network: hellas_kernel::NetworkId,
+) -> CliResult<hellas_store::content::DiskStore> {
+    use hellas_store::content::{DiskStore, IndexMode, Reservations};
+    let root = context.chain.client();
+    let store = DiskStore::open(
+        root.child("content"),
+        vec![],
+        IndexMode::Resume,
+        None,
+        Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+        false,
+    )
+    .await?;
+    let restored: CliResult<()> = async {
+        let channels = root.child("channels");
+        match std::fs::read_dir(&channels) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry?;
+                    anyhow::ensure!(
+                        entry.file_type()?.is_dir(),
+                        "client channel root must be a directory: {}",
+                        entry.path().display()
+                    );
+                    hellas_sdk::paid_client::recover_content(
+                        &channels.child(entry.file_name()),
+                        network,
+                        &store,
+                    )
+                    .await?;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        store.finish_recovery().await?;
+        Ok(())
+    }
+    .await;
+    if let Err(error) = restored {
+        store.close().await;
+        return Err(error);
+    }
+    Ok(store)
+}
+
 pub(super) async fn settle(args: &ClientArgs, context: &Context) -> CliResult<()> {
     let provider = args.paid_provider()?;
     let config = config(args, context).await?;
@@ -32,10 +83,16 @@ pub(super) async fn settle(args: &ClientArgs, context: &Context) -> CliResult<()
         context.settlement.party_key(),
     )
     .await?;
+    let content = content(context, config.network()).await?;
     let mut closed = 0;
     for channel in channels {
-        let options =
-            args.options_with_config(context, channel.price, channel.assurance, config.clone())?;
+        let options = args.options_with_config(
+            context,
+            channel.price,
+            channel.assurance,
+            config.clone(),
+            content.clone(),
+        )?;
         if finalized_channel_settlement(
             &options,
             channel.bond,
@@ -54,6 +111,7 @@ pub(super) async fn settle(args: &ClientArgs, context: &Context) -> CliResult<()
         );
         closed += 1;
     }
+    content.close().await;
     println!("settled {closed} channels with {}", provider.address);
     Ok(())
 }

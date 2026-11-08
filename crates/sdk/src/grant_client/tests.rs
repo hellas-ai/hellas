@@ -88,6 +88,7 @@ fn backend(slots: Arc<Semaphore>, calls: Arc<AtomicUsize>) -> Backend {
 }
 struct Fixture {
     root: tempfile::TempDir,
+    content: hellas_store::content::DiskStore,
     service: GrantService,
     application: Arc<ClientProfile>,
     administrator: hellas_auth::authority::CredentialSecret,
@@ -106,12 +107,15 @@ impl Fixture {
         let calls = Arc::new(AtomicUsize::new(0));
         let backend = backend(Arc::new(Semaphore::new(2)), calls.clone());
         let clock = TestClock::default();
+        let content =
+            hellas_authority::test_support::content_store(&root.path().join("provider")).await;
         let service = GrantService::new(
             store,
             Arc::new(principal(2).1),
             backend,
             vec![],
             clock.source(),
+            content.clone(),
         )
         .unwrap();
         let application =
@@ -119,6 +123,7 @@ impl Fixture {
                 .await;
         Self {
             root,
+            content,
             service,
             application,
             administrator: secret,
@@ -186,7 +191,7 @@ async fn local_sessions_keep_authenticated_payloads_out_of_journals() {
         .run(
             "responses",
             f.input(),
-            &InvocationContent::Ephemeral(Default::default()),
+            &hellas_channel::test_support::channel::program_content().await,
             Some(Arc::new(move |_| {
                 seen.fetch_add(1, Ordering::SeqCst);
                 Ok(())
@@ -325,7 +330,7 @@ async fn lost_acceptance_recovers_from_metadata_without_replaying_input() {
                 .run(
                     "responses",
                     f.input(),
-                    &InvocationContent::Ephemeral(Default::default()),
+                    &hellas_channel::test_support::channel::program_content().await,
                     None,
                     None,
                     None,
@@ -452,7 +457,7 @@ async fn remote_grant_session_authenticates_an_independent_client_transport() {
         .run(
             "responses",
             f.input(),
-            &InvocationContent::Ephemeral(Default::default()),
+            &hellas_channel::test_support::channel::program_content().await,
             None,
             None,
             None,
@@ -485,7 +490,7 @@ async fn completed_jobs_reconcile_ram_before_the_delivery_window_expires() {
                 .run(
                     "responses",
                     f.input(),
-                    &InvocationContent::Ephemeral(Default::default()),
+                    &hellas_channel::test_support::channel::program_content().await,
                     None,
                     None,
                     None,
@@ -514,7 +519,7 @@ async fn recovered_metadata_is_bound_to_the_requested_job_channel_and_provider()
         .run(
             "responses",
             f.input(),
-            &InvocationContent::Ephemeral(Default::default()),
+            &hellas_channel::test_support::channel::program_content().await,
             None,
             None,
             None,
@@ -771,7 +776,7 @@ async fn prepared_resource_gets_fresh_admission_standing() {
         .run_current(
             f.grant.policies[0].resource,
             input,
-            &InvocationContent::Ephemeral(Default::default()),
+            &hellas_channel::test_support::channel::program_content().await,
             None,
             None,
             None,

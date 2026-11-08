@@ -92,10 +92,14 @@ impl Reply {
 }
 
 pub type ContentInspection = Arc<
-    dyn Fn(
-            &hellas_rpc::protocol::invocation::PreparedInvocation,
-            &crate::content::InvocationContent,
-        ) + Send
+    dyn for<'a> Fn(
+            &'a hellas_rpc::protocol::invocation::PreparedInvocation,
+            &'a (
+                hellas_store::content::LocalStore,
+                hellas_store::content::Scope,
+            ),
+        ) -> futures::future::BoxFuture<'a, ()>
+        + Send
         + Sync,
 >;
 
@@ -164,7 +168,7 @@ impl WorkBackend for Backend {
             .await?;
         self.calls.fetch_add(1, Ordering::SeqCst);
         if let Some(inspect) = &self.inspect_content {
-            inspect(&prepared, &content);
+            inspect(&prepared, &content).await;
         }
         if let Some(first) = &self.first {
             self.started.notify_one();

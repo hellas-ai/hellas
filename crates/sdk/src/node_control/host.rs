@@ -63,6 +63,9 @@ struct GatewayConfiguration {
 
 /// The provider identity is the authority's binding, read from the store.
 pub struct HostOptions {
+    /// Shared node content, recovered before listeners start; retained journals
+    /// must all be restored before the caller finishes the recovery barrier.
+    pub content: hellas_store::content::DiskStore,
     /// The normal node transport belongs to the host, across provider restarts.
     pub transport: Option<iroh::Endpoint>,
     pub start_provider: bool,
@@ -143,6 +146,14 @@ impl HostHandle {
             }
             access.validate().await?;
         }
+        if let Some(endpoint) = &options.transport {
+            options
+                .content
+                .clone()
+                .with_peers(hellas_wire::iroh::Pool::for_service::<
+                    hellas_rpc::services::content::Content,
+                >(endpoint.clone(), Default::default()));
+        }
         let transport = options.transport;
         let state = Arc::new(Mutex::new(State {
             configuration: None,
@@ -167,7 +178,9 @@ impl HostHandle {
         };
         let node = options.control.as_ref().map(|(node, _)| node.clone());
         let (control, listener) = if let Some((node, config)) = options.control {
-            let mut control = NodeControl::new(node).with_remote_admission(config.remote);
+            let mut control = NodeControl::new(node)
+                .with_content_store(options.content.clone())
+                .with_remote_admission(config.remote);
             control.host = Some(runtime.clone());
             let parent = config.socket.parent().ok_or_else(|| {
                 std::io::Error::new(
@@ -190,6 +203,7 @@ impl HostHandle {
                 endpoint.clone(),
                 control.clone(),
                 runtime.clone(),
+                options.content.clone(),
                 stopped.clone(),
             ));
             (endpoint, task)
@@ -764,6 +778,7 @@ async fn accept(
     endpoint: iroh::Endpoint,
     control: Option<NodeControl>,
     runtime: Runtime,
+    content: hellas_store::content::DiskStore,
     mut stopped: watch::Receiver<bool>,
 ) {
     let mut tasks = tokio::task::JoinSet::new();
@@ -785,6 +800,8 @@ async fn accept(
         };
         let control = control.clone();
         let runtime = runtime.clone();
+        let content = content.clone();
+        let stopped = stopped.clone();
         tasks.spawn(async move {
             let Some(admitted) = pending.finish().await else {
                 return;
@@ -794,6 +811,10 @@ async fn accept(
                 if let Some(control) = control {
                     let _ = admitted.run(control.serve_iroh(connection)).await;
                 }
+            } else if connection.alpn() == hellas_rpc::services::content::Content::ALPN.as_bytes() {
+                let _ = admitted
+                    .run(crate::provider::serve_content(connection, content, stopped))
+                    .await;
             } else {
                 let sender = runtime.with(|state| state.ingress.clone()).ok().flatten();
                 if sender
@@ -878,6 +899,9 @@ pub async fn bind_transport(
 fn transport_alpns() -> Vec<Vec<u8>> {
     vec![
         hellas_rpc::services::node::Node::ALPN.as_bytes().to_vec(),
+        hellas_rpc::services::content::Content::ALPN
+            .as_bytes()
+            .to_vec(),
         hellas_rpc::services::work::Work::ALPN.as_bytes().to_vec(),
         hellas_rpc::services::work_setup::WorkSetup::ALPN
             .as_bytes()

@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use catena_lang::runtime::{GeneratedFunction, RuntimeModule, ValueKind as NativeKind};
-use hellas_channel::content::{ContentError, InvocationContent};
 use hellas_rpc::{
     ContentRef,
     protocol::invocation::{Limits, compute::*},
@@ -42,13 +41,12 @@ pub fn kind(kind: NativeKind) -> ValueKind {
     }
 }
 
-/// Check plan bounds and local have state without acquiring any missing content.
+/// Check plan bounds before opening local content or compiling sources.
 pub fn preflight(
     env: &Environment,
     inputs: &BTreeMap<String, ContentRef>,
     plan: &Plan,
     limits: &Limits,
-    content: &InvocationContent,
 ) -> Result<(), InvalidPlan> {
     plan.validate_bounds(limits).map_err(|error| {
         invalid(
@@ -95,33 +93,7 @@ pub fn preflight(
             ));
         }
     }
-    let mut upload = Some(0u64);
-    for (id, bytes) in objects {
-        let held = if let Some(store) = content.retained_store() {
-            store
-                .open_verified(id.digest(), bytes)
-                .map_err(|e| invalid(0, None, "verified local content", e))?
-                .is_some()
-        } else {
-            // A zero-length chunk checks presence without loading held weights.
-            match content.read_chunk(ContentRef::new(id, bytes), 0, 0) {
-                Ok(_) => true,
-                Err(ContentError::Missing) => false,
-                Err(error) => return Err(invalid(0, None, "verified RAM content", error)),
-            }
-        };
-        if !held {
-            upload = upload.and_then(|total| total.checked_add(bytes));
-        }
-    }
-    if upload.is_none_or(|n| n > limits.max_upload_bytes) {
-        return Err(invalid(
-            0,
-            None,
-            format!("upload <= {}", limits.max_upload_bytes),
-            "upload exceeds limit",
-        ));
-    }
+
     Ok(())
 }
 
@@ -131,9 +103,8 @@ pub fn validate(
     inputs: &BTreeMap<String, ContentRef>,
     plan: &Plan,
     limits: &Limits,
-    content: &InvocationContent,
 ) -> Result<(), InvalidPlan> {
-    preflight(env, inputs, plan, limits, content)?;
+    preflight(env, inputs, plan, limits)?;
     let mut slots = BTreeMap::new();
     for (i, call) in plan.calls.iter().enumerate() {
         check_call(

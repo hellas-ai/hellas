@@ -203,3 +203,71 @@ async fn a_rotation_leaves_no_deleted_record_on_disk() {
         );
     }
 }
+
+#[tokio::test]
+async fn pre_cutover_journals_are_refused_without_migration_or_legacy_replay() {
+    let directory = tempfile::tempdir().unwrap();
+    let location = StoreLocation::for_test(directory.path());
+    let path = Journal::path(&location, "old");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let options = SqliteConnectOptions::new()
+        .filename(&path)
+        .create_if_missing(true);
+    let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+    sqlx::raw_sql(include_str!("schema.sql"))
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO record(payload) VALUES (?)")
+        .bind(b"old private metadata".as_slice())
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    connection.close().await.unwrap();
+    assert!(matches!(
+        Journal::open_latest(&location, "old", id()).await,
+        Err(JournalError::Version { found: 0 })
+    ));
+    assert!(matches!(
+        Journal::open_existing(&location, "old", id()).await,
+        Err(JournalError::Version { found: 0 })
+    ));
+    assert!(matches!(
+        Journal::inspect(&location, "old").await,
+        Err(JournalError::Version { found: 0 })
+    ));
+    let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+    let bytes: Vec<u8> = sqlx::query_scalar("SELECT payload FROM record")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(bytes, b"old private metadata");
+    let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(version, 0);
+    connection.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_header_validation_releases_the_writer_before_returning() {
+    let root = tempfile::tempdir().unwrap();
+    let location = StoreLocation::for_test(root.path());
+    let (mut original, _) = Journal::open_latest(&location, "duty", id()).await.unwrap();
+    original.append(b"authoritative").await.unwrap();
+    original.close().await;
+    let wrong = JournalId {
+        role: Role::Provider,
+        ..id()
+    };
+    assert!(matches!(
+        Journal::open_existing(&location, "duty", wrong).await,
+        Err(JournalError::HeaderMismatch { .. })
+    ));
+    let (mut reopened, replay) = Journal::open_existing(&location, "duty", id())
+        .await
+        .unwrap();
+    assert_eq!(replay.records, vec![b"authoritative".to_vec()]);
+    reopened.close().await;
+}

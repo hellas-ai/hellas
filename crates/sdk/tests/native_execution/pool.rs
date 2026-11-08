@@ -94,6 +94,7 @@ pub(super) async fn provider_with_limit(
         },
         vec![],
         TestClock::default().source(),
+        hellas_authority::test_support::content_store(root).await,
     )
     .unwrap();
     let credential =

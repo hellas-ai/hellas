@@ -78,8 +78,7 @@ let
         "wasm-rpc"
         "wasm-chain"
         "wasm-xet"
-      ]
-      ++ lib.optional (!darwin) "model-programs";
+      ];
       artifacts =
         lib.optionalAttrs darwin {
           portable-aarch64 = archive "${system}-portable" portableDarwin;
@@ -99,14 +98,13 @@ let
       vms = lib.optionals x86 [
         "basic"
         "discovery-monitor"
-        "provider-content-index-eval"
+        "provider-content-eval"
       ];
     };
     gpu = {
       checks = [
         "executor"
         "client-work"
-        "model-programs"
         "http-fetch"
       ];
       artifacts = {

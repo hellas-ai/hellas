@@ -26,6 +26,14 @@ impl WorkConfig {
     pub fn max_observation_age(&self) -> Duration {
         self.max_observation_age
     }
+
+    /// Shorten readiness freshness so integration tests can expire observation.
+    #[cfg(feature = "integration-tests")]
+    #[doc(hidden)]
+    pub fn with_max_observation_age(mut self, max_observation_age: Duration) -> Self {
+        self.max_observation_age = max_observation_age;
+        self
+    }
     pub fn for_chain(chain: ChainProfile, root: &StoreLocation) -> Result<Self> {
         Self::from_chain_dir(ChainDir::open(root, &chain)?)
     }

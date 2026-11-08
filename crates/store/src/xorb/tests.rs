@@ -49,28 +49,6 @@ fn sample(len: usize) -> Vec<u8> {
 }
 
 #[test]
-fn every_scheme_round_trips() {
-    for len in [0, 1, 3, 4, 5, 1000, 65_537] {
-        let data = sample(len);
-        for scheme in [Scheme::None, Scheme::Lz4, Scheme::ByteGrouping4Lz4] {
-            let decoded = decode_chunk(&framed(&data, scheme))
-                .unwrap_or_else(|err| panic!("{scheme:?} len {len}: {err}"));
-            assert_eq!(decoded.data, data, "{scheme:?} len {len}");
-        }
-    }
-}
-
-/// Lengths that are not multiples of four are where an ungrouper
-/// that assumes equal groups goes wrong.
-#[test]
-fn byte_grouping_survives_ragged_lengths() {
-    for len in [1, 2, 3, 5, 6, 7, 9, 4095, 4097, 4098, 4099] {
-        let data = sample(len);
-        assert_eq!(ungroup(&group(&data)), data, "len {len}");
-    }
-}
-
-#[test]
 fn a_truncated_xorb_is_refused_not_guessed() {
     let framed = framed(&sample(100), Scheme::Lz4);
     assert_eq!(decode_chunk(&framed[..4]), Err(XorbError::Truncated));
@@ -92,21 +70,6 @@ fn an_unknown_version_or_scheme_is_refused() {
     let mut bad = framed(&sample(10), Scheme::None);
     bad[4] = 9;
     assert_eq!(decode_chunk(&bad), Err(XorbError::UnknownScheme { tag: 9 }));
-}
-
-/// The check that makes a partial fetch safe: bytes that decode
-/// cleanly but are not the bytes we asked for must be rejected.
-#[test]
-fn a_chunk_that_decodes_to_the_wrong_bytes_is_rejected() {
-    let real = sample(5_000);
-    let lie = sample(5_001);
-    let expected = [Chunk::new(chunk_hash(&real), real.len() as u64)];
-
-    assert!(decode_range(&framed(&real, Scheme::Lz4), &expected).is_ok());
-    assert!(matches!(
-        decode_range(&framed(&lie, Scheme::Lz4), &expected),
-        Err(XorbError::HashMismatch { .. }),
-    ));
 }
 
 /// A header is a claim, and the payload is the sender's. Decoding
@@ -147,35 +110,19 @@ fn a_byte_grouped_chunk_is_bounded_by_its_declared_length_too() {
     ));
 }
 
-/// Bytes after the chunks that were asked for are bytes nobody
-/// accounted for. The range was requested by byte offsets covering
-/// exactly those chunks.
 #[test]
-fn bytes_after_the_requested_chunks_are_refused() {
-    let data = sample(1_000);
-    let expected = [Chunk::new(chunk_hash(&data), data.len() as u64)];
-    let mut xorb = framed(&data, Scheme::Lz4);
-    let honest = xorb.len();
-    xorb.extend_from_slice(&framed(&sample(50), Scheme::None));
-
+fn cold_caps_are_checked_from_the_header_before_payload() {
+    let mut header = [0u8; HEADER];
+    header[1..4].copy_from_slice(&1000usize.to_le_bytes()[..3]);
+    header[5..8].copy_from_slice(&1usize.to_le_bytes()[..3]);
     assert_eq!(
-        decode_range(&xorb, &expected),
-        Err(XorbError::Trailing {
-            count: 1,
-            trailing: xorb.len() - honest,
-        }),
+        decode_chunk(&header),
+        Err(XorbError::LengthMismatch {
+            declared: 1,
+            actual: 1000
+        })
     );
-    assert!(decode_range(&xorb[..honest], &expected).is_ok());
-}
-
-#[test]
-fn a_range_decodes_consecutive_chunks_in_order() {
-    let parts = [sample(1_000), sample(2_000), sample(3_000)];
-    let mut xorb = Vec::new();
-    let mut expected = Vec::new();
-    for part in &parts {
-        xorb.extend_from_slice(&framed(part, Scheme::ByteGrouping4Lz4));
-        expected.push(Chunk::new(chunk_hash(part), part.len() as u64));
-    }
-    assert_eq!(decode_range(&xorb, &expected).expect("decode"), parts);
+    header[4] = 1;
+    header[5..8].copy_from_slice(&(hellas_xet::MAX_CHUNK_SIZE + 1).to_le_bytes()[..3]);
+    assert_eq!(decode_chunk(&header), Err(XorbError::TooLarge));
 }

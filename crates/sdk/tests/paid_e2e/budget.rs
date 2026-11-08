@@ -159,7 +159,7 @@ fn consecutive_jobs_reuse_bounded_funding_and_closing_channels_never_refund_it()
                 descriptor.expected_settlement().unwrap(),
                 hellas_channel::work_store::Role::Client,
                 origin,
-                hellas_store::ContentStore::new(),
+                case.options.content.clone(),
                 &verifier,
             )
             .await

@@ -31,6 +31,7 @@ fn durability_is_global_and_defaults_to_crash() {
             .durability,
         Durability::Crash,
     );
+    assert!(Cli::try_parse_from(["hellas", "serve", "--durability", "off"]).is_err());
 }
 
 #[test]
@@ -159,17 +160,15 @@ fn identity_enrollment_id_has_an_explicit_dispatch_command() {
 #[test]
 fn remote_trust_flags_are_rejected_by_irrelevant_commands() {
     let commands: &[&[&str]] = &[
-        &["hellas", "store", "status"],
-        &[
-            "hellas",
-            "environment",
-            "inspect",
-            "--environment",
-            "model.environment",
-        ],
+        &["hellas", "store", "collect"],
         &["hellas", "identity", "init"],
     ];
     for command in commands {
+        assert!(
+            Cli::try_parse_from(command.iter().copied()).is_ok(),
+            "{} must be a valid command",
+            command.join(" ")
+        );
         for flag in TEST_REMOTE_TRUST_ARGS.as_chunks::<2>().0 {
             assert!(
                 Cli::try_parse_from(command.iter().copied().chain(flag.iter().copied())).is_err(),

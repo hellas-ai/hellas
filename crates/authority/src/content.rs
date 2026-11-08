@@ -1,0 +1,437 @@
+//! Concrete content evidence, sharing Work's current authority and response writer.
+use crate::{
+    grant_service::{Access, GrantWork},
+    node::NodeCoordinator,
+    operations::Operation,
+    work_store::grant::{NodeStore, NodeStoreError},
+};
+use hellas_auth::authority::{AuthorityError, AuthorityId, Permission, ResourceId, UnixMillis};
+use hellas_channel::work::admission::Cancellation;
+use hellas_rpc::{
+    call::{ResponseStream, WithTrailer},
+    pb::content as pb,
+    services::content::ContentHandler,
+};
+use hellas_store::content::{GrantHandle, PinName, Scope, ScopeKind};
+use hellas_wire::{TransportContext, WireCode, WireStatus};
+
+pub const READ: &str = "content.read";
+pub const UPLOAD: &str = "content.upload";
+pub const ACQUIRE: &str = "content.acquire";
+pub const SET_PIN: &str = "content.pin.set";
+pub const COLLECT: &str = "content.collect";
+pub const RESOLVE: &str = "content.resolve";
+
+/// A grant follows this exact name across CAS/removal/recreation, while its
+/// policy is Granted. Owner policy and removal always close visibility.
+pub fn pin_resource(authority: AuthorityId, pin: &PinName) -> ResourceId {
+    ResourceId(hellas_auth::hash_tuple(
+        "hellas.content.pin.resource.v1",
+        &[authority.0.as_bytes(), pin.as_str().as_bytes()],
+    ))
+}
+pub(crate) struct ContentBinding {
+    pub(crate) node: NodeCoordinator,
+    access: Access,
+    kind: ScopeKind,
+    operation: &'static str,
+    work: Option<crate::model::grant::GrantJobAuthorizationV1>,
+    pub(crate) cancellation: Cancellation,
+    pub(crate) parent: Option<Cancellation>,
+    service: Option<crate::grant_service::GrantService>,
+}
+impl ContentBinding {
+    pub(crate) fn refresh(
+        &self,
+        store: &NodeStore,
+        now: UnixMillis,
+    ) -> Result<UnixMillis, NodeStoreError> {
+        let result = (|| {
+            if self.cancellation.is_cancelled()
+                || self.parent.as_ref().is_some_and(Cancellation::is_cancelled)
+            {
+                return Err(AuthorityError::Revoked.into());
+            }
+            let authority = store.state().authority();
+            match &self.kind {
+                ScopeKind::Work { job, .. } => {
+                    let work = self.work.as_ref().ok_or(AuthorityError::Denied)?;
+                    let book = store
+                        .state()
+                        .channel(work.channel_id)
+                        .map(|channel| channel.job_book());
+                    if book.is_some_and(|book| book.terminal_by_id(job.id).is_some()) {
+                        return Err(AuthorityError::Denied.into());
+                    }
+                    if let Some(service) = &self.service {
+                        service.content_serving(book.is_some_and(|book| {
+                            book.job_by_id(job.id)
+                                .is_some_and(|job| job.provider_signature().is_some())
+                        }))?;
+                    }
+                    let client =
+                        crate::model::grant::ChannelClient::of(self.access.caller(store, now)?)?;
+                    let deadline = if let Some(accepted) = book
+                        .and_then(|book| book.job_by_id(job.id))
+                        .filter(|job| job.provider_signature().is_some())
+                    {
+                        if accepted.authorization() != work {
+                            return Err(AuthorityError::Denied.into());
+                        }
+                        store.state().check_resource(work)?;
+                        work.terminal_deadline_ms
+                    } else {
+                        store.state().check_terms(work, client, now)?;
+                        work.acceptance_deadline_ms
+                    };
+                    if now >= deadline {
+                        return Err(AuthorityError::Expired.into());
+                    }
+                    let expires = if store.state().channel_binding(work.channel_id).is_some() {
+                        self.access.authorize_channel(store, work.channel_id, now)?
+                    } else {
+                        if store.state().channel_id(work.grant_id, client) != Some(work.channel_id)
+                        {
+                            return Err(AuthorityError::Denied.into());
+                        }
+                        self.access.authorize(store, work.grant_id, now)?
+                    };
+                    if work.channel_id.0 != job.channel
+                        || crate::model::grant::grant_work_id(store.state().network(), work)
+                            != job.id
+                    {
+                        return Err(AuthorityError::Denied.into());
+                    }
+                    Ok(expires.min(deadline))
+                }
+                ScopeKind::Grant(handle) => {
+                    if let Some(service) = &self.service {
+                        service.content_serving(false)?;
+                    }
+                    self.access.authorize_permission(
+                        store,
+                        READ,
+                        Permission {
+                            operation: hellas_auth::authority::OperationId::new(READ)?,
+                            resource: pin_resource(authority.authority(), &handle.pin),
+                        },
+                        now,
+                    )
+                }
+                ScopeKind::Owner => {
+                    let owner = authority
+                        .grant(authority.root_grant())
+                        .ok_or(AuthorityError::Denied)?
+                        .spec()
+                        .subject;
+                    if self.access.caller(store, now)?.subject() != owner {
+                        return Err(AuthorityError::Denied.into());
+                    }
+                    self.access.authorize_permission(
+                        store,
+                        self.operation,
+                        Operation::named(self.operation)?
+                            .permission(authority.authority(), None)?,
+                        now,
+                    )
+                }
+                ScopeKind::Public => Err(AuthorityError::Denied.into()),
+            }
+        })();
+        if result.is_err() {
+            self.cancellation.cancel();
+        }
+        result
+    }
+}
+impl GrantWork {
+    async fn content_reader(
+        &self,
+        pin: &str,
+    ) -> Result<hellas_store::content::ContentService<hellas_store::content::DiskStore>, WireStatus>
+    {
+        let pin = PinName::new(pin.to_owned()).map_err(|_| content_denied())?;
+        let (scope, writer) = self.content_read(pin).await.map_err(|_| content_denied())?;
+        Ok(hellas_store::content::ContentService::new(
+            std::sync::Arc::new(self.service.content.clone()),
+            scope,
+        )
+        .with_write_authority(writer))
+    }
+    pub async fn content_read(
+        &self,
+        pin: PinName,
+    ) -> Result<(Scope, hellas_wire::WriteAuthority), NodeStoreError> {
+        self.bind_content(
+            Scope::grant(GrantHandle {
+                grant: self.access.authorization(),
+                pin,
+            }),
+            READ,
+            Cancellation::new(),
+            None,
+        )
+        .await
+    }
+    async fn bind_content(
+        &self,
+        scope: Scope,
+        operation: &'static str,
+        cancellation: Cancellation,
+        work: Option<crate::model::grant::GrantJobAuthorizationV1>,
+    ) -> Result<(Scope, hellas_wire::WriteAuthority), NodeStoreError> {
+        let node = self.service.node();
+        let mut store = node.writer().await?;
+        self.bind_content_locked(&mut store, scope, operation, cancellation, work)
+    }
+    pub(crate) fn content_work_locked(
+        &self,
+        store: &mut NodeStore,
+        scope: Scope,
+        work: crate::model::grant::GrantJobAuthorizationV1,
+        cancellation: Cancellation,
+    ) -> Result<(Scope, hellas_wire::WriteAuthority), NodeStoreError> {
+        if !matches!(scope.kind, ScopeKind::Work { .. }) {
+            return Err(AuthorityError::Denied.into());
+        }
+        self.bind_content_locked(
+            store,
+            scope,
+            crate::grant_service::WORK_EXECUTE,
+            cancellation,
+            Some(work),
+        )
+    }
+    fn bind_content_locked(
+        &self,
+        store: &mut NodeStore,
+        scope: Scope,
+        operation: &'static str,
+        parent: Cancellation,
+        work: Option<crate::model::grant::GrantJobAuthorizationV1>,
+    ) -> Result<(Scope, hellas_wire::WriteAuthority), NodeStoreError> {
+        let binding = ContentBinding {
+            node: self.service.node(),
+            access: self.access.clone(),
+            kind: scope.kind.clone(),
+            operation,
+            cancellation: Cancellation::new(),
+            parent: Some(parent),
+            service: matches!(&scope.kind, ScopeKind::Grant(_) | ScopeKind::Work { .. })
+                .then(|| self.service.clone()),
+            work,
+        };
+        binding.bind_locked(store, scope)
+    }
+}
+
+fn content_denied() -> WireStatus {
+    WireStatus::new(WireCode::PermissionDenied, "content authority unavailable")
+}
+
+// The authenticated carrier fixes the grant. Each request names its resource;
+// the same ContentService performs every read with the resulting exact-pin scope.
+impl ContentHandler for GrantWork {
+    async fn stat(
+        &self,
+        request: pb::StatRequest,
+        context: TransportContext,
+    ) -> Result<impl Into<WithTrailer<pb::StatResponse>> + Send, WireStatus> {
+        let pin = request.at.as_ref().ok_or_else(content_denied)?.pin.clone();
+        let service = self.content_reader(&pin).await?;
+        Ok::<WithTrailer<pb::StatResponse>, _>(service.stat(request, context).await?.into())
+    }
+    async fn chunks(
+        &self,
+        request: pb::ChunksRequest,
+        context: TransportContext,
+    ) -> Result<impl Into<WithTrailer<pb::ChunksResponse>> + Send, WireStatus> {
+        let pin = request.at.as_ref().ok_or_else(content_denied)?.pin.clone();
+        let service = self.content_reader(&pin).await?;
+        Ok::<WithTrailer<pb::ChunksResponse>, _>(service.chunks(request, context).await?.into())
+    }
+    async fn read(
+        &self,
+        request: pb::ReadRequest,
+        context: TransportContext,
+    ) -> Result<ResponseStream<pb::ReadResponse>, WireStatus> {
+        let pin = request.at.as_ref().ok_or_else(content_denied)?.pin.clone();
+        self.content_reader(&pin)
+            .await?
+            .read(request, context)
+            .await
+    }
+    async fn list_pins(
+        &self,
+        request: pb::ListPinsRequest,
+        context: TransportContext,
+    ) -> Result<impl Into<WithTrailer<pb::ListPinsResponse>> + Send, WireStatus> {
+        let service = self.content_reader(&request.prefix).await?;
+        Ok::<WithTrailer<pb::ListPinsResponse>, _>(
+            service.list_pins(request, context).await?.into(),
+        )
+    }
+    async fn watch_pins(
+        &self,
+        request: pb::WatchPinsRequest,
+        context: TransportContext,
+    ) -> Result<ResponseStream<pb::WatchPinsResponse>, WireStatus> {
+        self.content_reader(&request.prefix)
+            .await?
+            .watch_pins(request, context)
+            .await
+    }
+    async fn upload(
+        &self,
+        _: std::pin::Pin<
+            Box<dyn futures::Stream<Item = Result<pb::UploadRequest, WireStatus>> + Send>,
+        >,
+        _: TransportContext,
+    ) -> Result<ResponseStream<pb::UploadResponse>, WireStatus> {
+        Err(content_denied())
+    }
+    async fn acquire(
+        &self,
+        _: pb::AcquireRequest,
+        _: TransportContext,
+    ) -> Result<impl Into<WithTrailer<pb::ContentRef>> + Send, WireStatus> {
+        Err::<WithTrailer<pb::ContentRef>, _>(content_denied())
+    }
+    async fn set_pin(
+        &self,
+        _: pb::SetPinRequest,
+        _: TransportContext,
+    ) -> Result<impl Into<WithTrailer<pb::SetPinResponse>> + Send, WireStatus> {
+        Err::<WithTrailer<pb::SetPinResponse>, _>(content_denied())
+    }
+    async fn collect(
+        &self,
+        _: pb::CollectRequest,
+        _: TransportContext,
+    ) -> Result<impl Into<WithTrailer<pb::CollectResponse>> + Send, WireStatus> {
+        Err::<WithTrailer<pb::CollectResponse>, _>(content_denied())
+    }
+}
+impl ContentBinding {
+    fn bind_locked(
+        self,
+        store: &mut NodeStore,
+        scope: Scope,
+    ) -> Result<(Scope, hellas_wire::WriteAuthority), NodeStoreError> {
+        let binding = self;
+        let now = binding.node.observed_time(store);
+        binding.refresh(store, now)?;
+        let binding = store.register_content(binding, now)?;
+        let writer = crate::grant_service::delivery::content_authority(binding.clone());
+        let monitoring = binding.clone();
+        let ended = move || {
+            let monitor = crate::grant_service::delivery::content_authority(monitoring.clone());
+            async move {
+                let _ = futures::future::poll_fn(|cx| {
+                    monitor.poll_write(cx, &mut |_| std::task::Poll::Pending)
+                })
+                .await;
+            }
+        };
+        Ok((
+            scope.bind(
+                move || {
+                    let binding = binding.clone();
+                    async move {
+                        let writer = binding
+                            .node
+                            .store
+                            .lock_owned()
+                            .await
+                            .map_err(|_| hellas_store::content::Error::Denied)?;
+                        Ok(move || {
+                            binding
+                                .refresh(&writer, binding.node.observed_time(&writer))
+                                .map(|_| ())
+                                .map_err(|_| hellas_store::content::Error::Denied)
+                        })
+                    }
+                },
+                ended,
+            ),
+            writer,
+        ))
+    }
+}
+
+impl NodeCoordinator {
+    /// Bind owner evidence without requiring a provider enrollment or Work service.
+    /// `operation` is selected by the host's RPC dispatch, never by request data.
+    pub async fn content_owner_for_caller(
+        &self,
+        caller: hellas_auth::authority::AuthenticatedCaller,
+        authorization: hellas_auth::authority::GrantId,
+        operation: &'static str,
+    ) -> Result<(Scope, hellas_wire::WriteAuthority), NodeStoreError> {
+        self.bind_content(
+            Access::for_caller(caller, authorization),
+            Scope::Owner,
+            operation,
+        )
+        .await
+    }
+    pub async fn content_owner_for_session(
+        &self,
+        session: std::sync::Arc<hellas_auth::authority::AuthenticatedSession>,
+        binding: hellas_auth::Digest,
+        operation: &'static str,
+    ) -> Result<(Scope, hellas_wire::WriteAuthority), NodeStoreError> {
+        let authorization = self.writer().await?.state().authority().root_grant();
+        self.bind_content(
+            Access::for_session(session, binding, authorization),
+            Scope::Owner,
+            operation,
+        )
+        .await
+    }
+    pub async fn content_read_for_session(
+        &self,
+        session: std::sync::Arc<hellas_auth::authority::AuthenticatedSession>,
+        binding: hellas_auth::Digest,
+        authorization: hellas_auth::authority::GrantId,
+        pin: PinName,
+    ) -> Result<(Scope, hellas_wire::WriteAuthority), NodeStoreError> {
+        self.bind_content(
+            Access::for_session(session, binding, authorization),
+            Scope::grant(GrantHandle {
+                grant: authorization,
+                pin,
+            }),
+            READ,
+        )
+        .await
+    }
+    async fn bind_content(
+        &self,
+        access: Access,
+        scope: Scope,
+        operation: &'static str,
+    ) -> Result<(Scope, hellas_wire::WriteAuthority), NodeStoreError> {
+        if !matches!(
+            operation,
+            READ | UPLOAD | ACQUIRE | SET_PIN | COLLECT | RESOLVE
+        ) {
+            return Err(AuthorityError::Denied.into());
+        }
+        let mut store = self.writer().await?;
+        ContentBinding {
+            node: self.clone(),
+            access,
+            kind: scope.kind.clone(),
+            operation,
+            work: None,
+            cancellation: Cancellation::new(),
+            parent: None,
+            service: None,
+        }
+        .bind_locked(&mut store, scope)
+    }
+}
+
+#[cfg(test)]
+mod tests;

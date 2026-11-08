@@ -153,8 +153,10 @@ async fn finalized_channel_settlement_inner(
         settlement_receipt(&recovery).await
     }
     .await;
-    recovery.journal.close().await;
-    result
+    let closed = recovery.journal.close().await;
+    let value = result?;
+    closed?;
+    Ok(value)
 }
 
 /// Close exactly this retained funded channel using its signed journal and
@@ -199,8 +201,10 @@ pub async fn settle_channel(
         .await
     }
     .await;
-    endpoint.close().await;
-    result
+    let closed = endpoint.close().await;
+    let value = result?;
+    closed?;
+    Ok(value)
 }
 
 struct SettlementRecovery {
@@ -287,7 +291,7 @@ async fn open_settlement(
         descriptor.expected_settlement()?,
         Role::Client,
         origin,
-        hellas_store::ContentStore::new(),
+        args.content.clone(),
         &verifier,
     )
     .await?;
@@ -309,7 +313,8 @@ async fn open_settlement(
     let chain = match chain {
         Ok(chain) => chain,
         Err(error) => {
-            journal.close().await;
+            // The read failure is the cause; a close failure is secondary.
+            let _ = journal.close().await;
             return Err(error);
         }
     };

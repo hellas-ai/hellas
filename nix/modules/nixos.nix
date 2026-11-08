@@ -30,24 +30,49 @@ let
     gateway.home
     "/var/cache/hellas-gateway"
   ];
-  providerContentPaths = lib.unique (map normalizeRuntimePath (cfg.content ++ cfg.contentRoots));
+  providerContentPaths = lib.unique (map normalizeRuntimePath (cfg.content.lower or [ ]));
+  providerUpper = normalizeRuntimePath (cfg.content.upper or "${cfg.home}/store");
+  providerWriteRoots = lib.unique [
+    (normalizeRuntimePath cfg.home)
+    providerUpper
+  ];
   providerWritablePaths = lib.unique (
     lib.optional (outsideManagedRoots [ hellasLib.defaultStateDir ] cfg.home) (
       normalizeRuntimePath cfg.home
+    )
+    ++ lib.optional (outsideManagedRoots [
+      hellasLib.defaultStateDir
+      cfg.home
+    ] providerUpper) providerUpper
+  );
+  gatewayContentPaths = lib.unique (map normalizeRuntimePath (gateway.content.lower or [ ]));
+  gatewayPaidUpper =
+    if gateway.paidWorkConfig == null then
+      null
+    else
+      let
+        name = builtins.baseNameOf gateway.paidWorkConfig;
+        extension = builtins.match "(.+)\\.[^.]*" name;
+        stem = if extension == null then name else builtins.head extension;
+      in
+      "${builtins.dirOf gateway.paidWorkConfig}/${stem}.content";
+  gatewayWriteRoots = lib.unique (
+    map normalizeRuntimePath (
+      [ gateway.home ]
+      ++ lib.optional (gateway.content ? upper) gateway.content.upper
+      ++ lib.optional (gatewayPaidUpper != null) gatewayPaidUpper
+      ++ lib.optional (gateway.authorityJournal != null) gateway.authorityJournal
     )
   );
   gatewayWritablePaths = lib.unique (
     lib.optional (outsideManagedRoots [ "/var/lib/hellas-gateway" ] gateway.home) (
       normalizeRuntimePath gateway.home
     )
-    ++ lib.optional (
-      gateway.authorityJournal != null
-      && outsideManagedRoots gatewayManagedWritableRoots gateway.authorityJournal
-    ) (normalizeRuntimePath gateway.authorityJournal)
+    ++ lib.filter (outsideManagedRoots gatewayManagedWritableRoots) gatewayWriteRoots
   );
   providerWritablePathsAreDisjoint = lib.all (
     writable: lib.all (content: !pathsOverlap writable content) providerContentPaths
-  ) providerWritablePaths;
+  ) providerWriteRoots;
   providerCatenaConfigured = hellas.catenaConfigured cfg;
   providerLocalExecutionEnabled =
     hellas.catenaConfigured cfg
@@ -99,8 +124,8 @@ let
   providerRuntimePaths = [
     cfg.home
   ]
-  ++ cfg.content
-  ++ cfg.contentRoots
+  ++ (cfg.content.lower or [ ])
+  ++ lib.optional (cfg.content ? upper) cfg.content.upper
   ++ lib.optional (cfg.workConfigFile != null) cfg.workConfigFile
   ++ lib.optional (cfg.chainConfig != null) cfg.chainConfig
   ++ lib.optional (cfg.grantConfigFile != null) cfg.grantConfigFile
@@ -110,6 +135,9 @@ let
   gatewayRuntimePaths = lib.optionals gateway.enable (
     lib.optional (gateway.textModel != null) gateway.textModel
     ++ [ gateway.home ]
+    ++ (gateway.content.lower or [ ])
+    ++ lib.optional (gateway.content ? upper) gateway.content.upper
+    ++ lib.optional (gatewayPaidUpper != null) gatewayPaidUpper
     ++ lib.optional (gateway.environmentFile != null) gateway.environmentFile
     ++ lib.optional (gateway.paidWorkConfig != null) gateway.paidWorkConfig
     ++ lib.optional (gateway.chainConfig != null) gateway.chainConfig
@@ -155,7 +183,7 @@ in
     }
     // hellas.serveOptions { inherit lib pkgs; }
     // {
-      gateway = hellas.gatewayOptions { inherit lib; } // {
+      gateway = hellas.gatewayOptions { inherit lib pkgs; } // {
         package = mkOption {
           type = types.package;
           default = cfg.package;
@@ -235,15 +263,27 @@ in
       }
       {
         assertion = !cfg.enable || lib.all (path: path != "/") providerWritablePaths;
-        message = "services.hellas.home must not expose the filesystem root as writable.";
+        message = "services.hellas.home and content.upper must not expose the filesystem root as writable.";
       }
       {
         assertion = !gateway.enable || lib.all (path: path != "/") gatewayWritablePaths;
         message = "services.hellas.gateway writable journal paths must not expose the filesystem root as writable.";
       }
       {
+        assertion =
+          !gateway.enable
+          || lib.all (
+            writable: lib.all (lower: !pathsOverlap writable lower) (gateway.content.lower or [ ])
+          ) gatewayWriteRoots;
+        message = "services.hellas.gateway content.lower must be disjoint from writable journal and upper paths.";
+      }
+      {
+        assertion = gateway.content == { } || gateway.localGrant != null;
+        message = "services.hellas.gateway.content requires localGrant.";
+      }
+      {
         assertion = !cfg.enable || providerWritablePathsAreDisjoint;
-        message = "services.hellas.home must not overlap content or contentRoots.";
+        message = "services.hellas.home and content.upper must be disjoint from content.lower.";
       }
       {
         assertion = cfg.memoryMaxBytes == null || cfg.memoryMaxBytes > effectiveGpuSessionAssetBytes;
@@ -267,7 +307,7 @@ in
       }
       {
         assertion = hellas.catenaPlatform pkgs || !providerCatenaConfigured;
-        message = "Local Catena execution is supported only on x86_64-linux; omit content, contentRoots, GPU resource bounds on this platform.";
+        message = "Local Catena execution is supported only on x86_64-linux; omit GPU backend and resource bounds on this platform.";
       }
       {
         assertion =
@@ -366,7 +406,7 @@ in
         ExecStart = lib.escapeShellArgs (
           [ "${cfg.package}/bin/hellas" ]
           ++ hellas.mkServeArgs {
-            inherit lib;
+            inherit lib pkgs;
             serve = cfg;
             inherit (cfg) otel;
           }
@@ -445,7 +485,7 @@ in
         ExecStart = lib.escapeShellArgs (
           [ "${gateway.package}/bin/hellas" ]
           ++ hellas.mkGatewayArgs {
-            inherit lib gateway;
+            inherit lib pkgs gateway;
             inherit (cfg) otel;
           }
         );
@@ -458,6 +498,9 @@ in
       }
       // lib.optionalAttrs (gatewayWritablePaths != [ ]) {
         ReadWritePaths = gatewayWritablePaths;
+      }
+      // lib.optionalAttrs (gatewayContentPaths != [ ]) {
+        ReadOnlyPaths = gatewayContentPaths;
       }
       // lib.optionalAttrs (gateway.environmentFile != null) {
         EnvironmentFile = gateway.environmentFile;

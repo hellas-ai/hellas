@@ -122,6 +122,7 @@ async fn sponsored_terms_bind_each_channel_to_its_authenticated_actor_across_rev
         Backend::default(),
         vec![],
         Arc::new(|| UnixMillis(1001)),
+        crate::test_support::content_store(dir.path()).await,
     )
     .unwrap();
     // This grant now names actor 3; it still cannot expose actor 1's channel.

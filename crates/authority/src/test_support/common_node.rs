@@ -55,7 +55,6 @@ pub async fn bootstrap_node_with_credential(
     provider: Option<ProviderEnrollmentBundle>,
     now: auth::UnixMillis,
 ) -> Result<(NodeStore, auth::CredentialSecret), NodeStoreError> {
-    let provider = provider.expect("provider fixture");
     let authority = auth::AuthorityId(Digest::hash(b"test node authority"));
     let extra: Vec<_> = crate::operations::OPERATIONS
         .iter()
@@ -68,7 +67,7 @@ pub async fn bootstrap_node_with_credential(
         &extra,
         (now, auth::UnixMillis(u64::MAX)),
         (u64::MAX, auth::MAX_DELEGATION_DEPTH),
-        &[crate::grant_service::WORK_EXECUTE],
+        &[crate::grant_service::WORK_EXECUTE, crate::content::READ],
     );
     let root = auth::GrantId([0; 16]);
     let location = StoreLocation::for_test(path);
@@ -80,7 +79,7 @@ pub async fn bootstrap_node_with_credential(
             auth::Ownership::Bootstrap { root, target: None },
             administrator,
         ),
-        Some(provider),
+        provider,
         now,
     )
     .await
@@ -378,12 +377,14 @@ pub async fn provision(
     let now = store.state().now();
     let network = store.state().network();
     let provider = store.state().provider().unwrap().clone();
+    let content = super::content_store(path).await;
     let service = crate::grant_service::GrantService::new(
         store,
         std::sync::Arc::new(signer),
         NoBackend,
         vec![],
         std::sync::Arc::new(move || now),
+        content.clone(),
     )
     .unwrap();
     let mut admin = WorkAdmin::new(service.clone(), secret, definition.policies.clone()).await;
@@ -394,6 +395,7 @@ pub async fn provision(
     admin.budgets(pool, subject, budget.0, budget.1).await;
     admin.create(definition).await;
     service.drain().await.unwrap();
+    content.close().await;
     drop(admin);
     drop(service);
     let location = StoreLocation::for_test(path);

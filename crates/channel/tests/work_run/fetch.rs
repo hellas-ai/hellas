@@ -2,7 +2,9 @@ use super::*;
 use hellas_channel::model::work::PrivateRecord as _;
 use hellas_channel::test_support::HANG_GUARD;
 use hellas_channel::test_support::channel::accept_uploaded_client;
-use hellas_channel::work::{Admitted, ClientEndpoint, JobProposal, fetch_result_stream};
+use hellas_channel::work::{
+    Admitted, ClientChannel as _, ClientEndpoint, ClientService, JobProposal, fetch_result_stream,
+};
 use hellas_private::StoreLocation;
 use hellas_rpc::fetch::{
     build_input_events_with_retention, encode_fetch_event_payload, encode_fetch_terminal_payload,
@@ -58,11 +60,18 @@ async fn fetch_streams_before_terminal_then_pays_once_with_metadata_only_journal
             prepared_input: input_with_assurance(Retention::Ephemeral, assurance),
             deadlines: deadlines(),
         };
-        let request = client.propose(&proposal).await.unwrap();
-        let id = client
-            .accepted(&accept_uploaded_client(&service, &client, &request).await)
+        let request = client
+            .propose(
+                &proposal,
+                &hellas_channel::test_support::channel::program_content().await,
+            )
             .await
             .unwrap();
+        let id = {
+            let response = accept_uploaded_client(&service, &client, &request).await;
+            client.client().await.unwrap().accepted(&response).await
+        }
+        .unwrap();
         let release = Arc::new(tokio::sync::Notify::new());
         let worker = {
             let service = service.clone();
@@ -117,7 +126,13 @@ async fn fetch_streams_before_terminal_then_pays_once_with_metadata_only_journal
             worker.await.unwrap().unwrap(),
             RunOutcome::Completed { .. }
         ));
-        client.verified(id).await.unwrap();
+        client
+            .client()
+            .await
+            .unwrap()
+            .verified(id, &proposal.prepared_input)
+            .await
+            .unwrap();
         let rpc = WorkClientImpl::new(transport);
         assert_eq!(admit_payment(&rpc, &mut client, id).await.unwrap(), PRICE);
         assert_eq!(admit_payment(&rpc, &mut client, id).await.unwrap(), PRICE);
@@ -163,7 +178,13 @@ async fn invalid_paid_authorizations_never_invoke_fetch() {
         let client_dir = temp();
         let service = service(provider_dir.path()).await;
         let mut client = client_endpoint(client_dir.path()).await;
-        let mut request = client.propose(&proposal()).await.unwrap();
+        let mut request = client
+            .propose(
+                &proposal(),
+                &hellas_channel::test_support::channel::program_content().await,
+            )
+            .await
+            .unwrap();
         let mut authorization = PaidJobAuthorizationV2::decode(&request.authorization).unwrap();
         match invalid {
             "price" => authorization.price += 1,
@@ -279,9 +300,10 @@ fn signed_output(input: &PreparedInvocation, payloads: &[Vec<u8>]) -> Vec<Output
 }
 async fn receive(
     service: &WorkService,
-    client: &mut ClientEndpoint,
+    client: &mut ClientService,
     ready: &ReadyChannel,
     id: Digest,
+    input: &PreparedInvocation,
 ) -> hellas_channel::work::Delivery {
     let (transport, server) = transport::transport_pair();
     let serving = hellas_channel::test_support::channel::serve_work(server, service.clone());
@@ -290,7 +312,13 @@ async fn receive(
         .unwrap();
     serving.abort();
     let _ = serving.await;
-    client.verified(id).await.unwrap();
+    client
+        .client()
+        .await
+        .unwrap()
+        .verified(id, input)
+        .await
+        .unwrap();
     result
 }
 
@@ -306,6 +334,7 @@ async fn metadata_store(root: &std::path::Path) -> ChannelStore {
 }
 
 async fn store_for(root: &std::path::Path, ready: &ReadyChannel, role: Role) -> ChannelStore {
+    let content = hellas_channel::test_support::channel::content_store(root).await;
     let location = StoreLocation::for_test(root);
     let mut store = ChannelStore::open(
         &location,
@@ -313,11 +342,12 @@ async fn store_for(root: &std::path::Path, ready: &ReadyChannel, role: Role) -> 
         settlement(),
         role,
         origin(),
-        hellas_store::ContentStore::new(),
+        content.clone(),
         &Secp256k1Verifier::new(),
     )
     .await
     .unwrap();
+    content.finish_recovery().await.unwrap();
     advance(&mut store, CURSOR).await;
     store
 }
@@ -328,9 +358,13 @@ async fn service(root: &std::path::Path) -> WorkService {
     )
 }
 
-async fn client_endpoint(root: &std::path::Path) -> ClientEndpoint {
+async fn client_endpoint(root: &std::path::Path) -> ClientService {
     let store = store_for(root, &fetch_ready(), Role::Client).await;
-    ClientEndpoint::new(fetch_ready(), store, client()).unwrap()
+    hellas_channel::test_support::channel::client_service(
+        ClientEndpoint::new(fetch_ready(), store, client()).unwrap(),
+        fetch_ready(),
+    )
+    .await
 }
 
 #[tokio::test]
@@ -378,12 +412,16 @@ async fn paid_fetch_larger_than_a_wire_frame_streams_and_pays_without_disk_paylo
     let ready = ready_of(descriptor_with(profile.clone()), CURSOR);
     let client_dir = temp();
     let provider_dir = temp();
-    let mut client = ClientEndpoint::new(
+    let mut client = hellas_channel::test_support::channel::client_service(
+        ClientEndpoint::new(
+            ready.clone(),
+            store_for(client_dir.path(), &ready, Role::Client).await,
+            super::client(),
+        )
+        .unwrap(),
         ready.clone(),
-        store_for(client_dir.path(), &ready, Role::Client).await,
-        super::client(),
     )
-    .unwrap();
+    .await;
     let service = WorkService::new(
         ProviderEndpoint::new(
             ready.clone(),
@@ -392,17 +430,22 @@ async fn paid_fetch_larger_than_a_wire_frame_streams_and_pays_without_disk_paylo
         )
         .unwrap(),
     );
+    let prepared = input_under(&profile, Retention::Ephemeral, Assurance::ProducerSigned);
     let request = client
-        .propose(&JobProposal {
-            prepared_input: input_under(&profile, Retention::Ephemeral, Assurance::ProducerSigned),
-            deadlines: deadlines(),
-        })
+        .propose(
+            &JobProposal {
+                prepared_input: prepared.clone(),
+                deadlines: deadlines(),
+            },
+            &hellas_channel::test_support::channel::program_content().await,
+        )
         .await
         .unwrap();
-    let id = client
-        .accepted(&accept_uploaded_client(&service, &client, &request).await)
-        .await
-        .unwrap();
+    let id = {
+        let response = accept_uploaded_client(&service, &client, &request).await;
+        client.client().await.unwrap().accepted(&response).await
+    }
+    .unwrap();
     run_accepted_work(&service, &ready, &LargeFetch, id)
         .await
         .unwrap();
@@ -430,7 +473,13 @@ async fn paid_fetch_larger_than_a_wire_frame_streams_and_pays_without_disk_paylo
     })
     .unwrap();
     assert_eq!(received, 256);
-    client.verified(id).await.unwrap();
+    client
+        .client()
+        .await
+        .unwrap()
+        .verified(id, &prepared)
+        .await
+        .unwrap();
     assert!(delivered.transcript.len() > hellas_wire::frame::MAX_FRAME_BYTES);
     assert_eq!(
         admit_payment(&WorkClientImpl::new(transport), &mut client, id)
@@ -456,11 +505,19 @@ async fn streamed_fetch_cannot_pay_without_a_complete_authenticated_terminal() {
         let client_dir = temp();
         let mut client = client_endpoint(client_dir.path()).await;
         let service = service(provider_dir.path()).await;
-        let request = client.propose(&proposal()).await.unwrap();
-        let id = client
-            .accepted(&accept_uploaded_client(&service, &client, &request).await)
+        let proposal = proposal();
+        let request = client
+            .propose(
+                &proposal,
+                &hellas_channel::test_support::channel::program_content().await,
+            )
             .await
             .unwrap();
+        let id = {
+            let response = accept_uploaded_client(&service, &client, &request).await;
+            client.client().await.unwrap().accepted(&response).await
+        }
+        .unwrap();
         run_accepted_work(&service, &fetch_ready(), &FetchBackend::default(), id)
             .await
             .unwrap();
@@ -469,7 +526,12 @@ async fn streamed_fetch_cannot_pay_without_a_complete_authenticated_terminal() {
         use hellas_rpc::services::work::WorkHandler as _;
         let mut source = service
             .stream_result(
-                client.request_delivery(id, &exporter).unwrap(),
+                client
+                    .client()
+                    .await
+                    .unwrap()
+                    .request_delivery(id, &exporter)
+                    .unwrap(),
                 hellas_wire::TransportContext {
                     open_exporter: Some(exporter),
                     ..Default::default()
@@ -499,7 +561,7 @@ async fn streamed_fetch_cannot_pay_without_a_complete_authenticated_terminal() {
             signature: hellas_kernel::Sig::from_bytes(
                 source_terminal.provider_signature.try_into().unwrap(),
             ),
-            transcript: encode_transcript(&source_prefix).unwrap(),
+            transcript: encode_transcript(&source_prefix).unwrap().into(),
         };
         let events = decode_transcript(&delivered.transcript, 65536).unwrap();
         let mut terminal = WorkStreamTerminal {
@@ -545,16 +607,29 @@ async fn streamed_fetch_cannot_pay_without_a_complete_authenticated_terminal() {
         serving.await.unwrap();
         if fault == "none" {
             result.unwrap();
-            client.verified(id).await.unwrap();
-            assert!(client.pay(id).await.is_ok());
+            client
+                .client()
+                .await
+                .unwrap()
+                .verified(id, &proposal.prepared_input)
+                .await
+                .unwrap();
+            assert!(client.client().await.unwrap().pay(id).await.is_ok());
         } else {
             assert!(result.is_err(), "{fault}");
             assert!(
-                client.pay(id).await.is_err(),
+                client.client().await.unwrap().pay(id).await.is_err(),
                 "{fault} must not create payable evidence"
             );
             assert_eq!(
-                client.state().job_by_id(id).unwrap().phase(),
+                client
+                    .client()
+                    .await
+                    .unwrap()
+                    .state()
+                    .job_by_id(id)
+                    .unwrap()
+                    .phase(),
                 JobPhase::Accepted
             );
         }
@@ -619,11 +694,19 @@ async fn fetch_is_run_delivered_and_paid_without_provider_disk_bodies() {
     let mut client = client_endpoint(client_dir.path()).await;
     let service = service(provider_dir.path()).await;
     let backend = FetchBackend::default();
-    let request = client.propose(&proposal()).await.unwrap();
-    let id = client
-        .accepted(&accept_uploaded_client(&service, &client, &request).await)
+    let proposal = proposal();
+    let request = client
+        .propose(
+            &proposal,
+            &hellas_channel::test_support::channel::program_content().await,
+        )
         .await
         .unwrap();
+    let id = {
+        let response = accept_uploaded_client(&service, &client, &request).await;
+        client.client().await.unwrap().accepted(&response).await
+    }
+    .unwrap();
     assert_no_bodies(provider_dir.path());
     assert!(matches!(
         run_accepted_work(&service, &fetch_ready(), &backend, id)
@@ -632,17 +715,46 @@ async fn fetch_is_run_delivered_and_paid_without_provider_disk_bodies() {
         RunOutcome::Completed { .. }
     ));
     assert_no_bodies(provider_dir.path());
-    let request = client.request_delivery(id, &[8; 32]).unwrap();
-    receive(&service, &mut client, &fetch_ready(), id).await;
+    let request = client
+        .client()
+        .await
+        .unwrap()
+        .request_delivery(id, &[8; 32])
+        .unwrap();
+    receive(
+        &service,
+        &mut client,
+        &fetch_ready(),
+        id,
+        &proposal.prepared_input,
+    )
+    .await;
     assert_no_bodies(provider_dir.path());
     assert_no_bodies(client_dir.path());
-    let payment = client.pay(id).await.unwrap();
+    let payment = client.client().await.unwrap().pay(id).await.unwrap();
+    {
+        use hellas_channel::work_close::CloseChannel as _;
+        client
+            .client()
+            .await
+            .unwrap()
+            .store()
+            .await
+            .unwrap()
+            .content_store()
+            .close()
+            .await;
+    }
     drop(client);
     let mut client = client_endpoint(client_dir.path()).await;
-    assert_eq!(client.pay(id).await.unwrap(), payment);
+    assert_eq!(
+        client.client().await.unwrap().pay(id).await.unwrap(),
+        payment
+    );
     assert_no_bodies(client_dir.path());
 
     // A delivery already happened: restart loses bodies but can still bank the signed payment.
+    close_content(&service).await;
     drop(service);
     let store = metadata_store(provider_dir.path()).await;
     assert!(
@@ -678,6 +790,7 @@ async fn fetch_is_run_delivered_and_paid_without_provider_disk_bodies() {
         Some(hellas_rpc::pb::work::work_stream_event::Outcome::Refused(_))
     ));
     drop(frames);
+    close_content(&recovered).await;
     drop(recovered);
     let mut recovered = ProviderEndpoint::new(
         fetch_ready(),
@@ -697,21 +810,25 @@ async fn restarting_an_accepted_fetch_never_reinvokes_from_a_missing_payload() {
     let client_dir = temp();
     let mut client = client_endpoint(client_dir.path()).await;
     let service_before = service(provider_dir.path()).await;
-    let request = client.propose(&proposal()).await.unwrap();
-    let id = client
-        .accepted(&accept_uploaded_client(&service_before, &client, &request).await)
+    let request = client
+        .propose(
+            &proposal(),
+            &hellas_channel::test_support::channel::program_content().await,
+        )
         .await
         .unwrap();
+    let id = {
+        let response = accept_uploaded_client(&service_before, &client, &request).await;
+        client.client().await.unwrap().accepted(&response).await
+    }
+    .unwrap();
+    close_content(&service_before).await;
     drop(service_before);
     let backend = FetchBackend::default();
-    let outcome = run_accepted_work(
-        &service(provider_dir.path()).await,
-        &fetch_ready(),
-        &backend,
-        id,
-    )
-    .await
-    .unwrap();
+    let recovered = service(provider_dir.path()).await;
+    let outcome = run_accepted_work(&recovered, &fetch_ready(), &backend, id)
+        .await
+        .unwrap();
     assert_eq!(outcome, RunOutcome::Indeterminate);
     assert_eq!(backend.0.load(Ordering::SeqCst), 0);
     assert_no_bodies(provider_dir.path());
@@ -726,7 +843,15 @@ async fn fetch_refuses_payload_journals_and_retention_requests() {
         prepared_input: input(Retention::Retain),
         deadlines: deadlines(),
     };
-    assert!(client.propose(&retained).await.is_err());
+    assert!(
+        client
+            .propose(
+                &retained,
+                &hellas_channel::test_support::channel::program_content().await
+            )
+            .await
+            .is_err()
+    );
 
     // A peer bypassing the client API cannot obtain a provider acceptance either.
     let provider_dir = temp();
@@ -749,12 +874,9 @@ async fn fetch_refuses_payload_journals_and_retention_requests() {
         client_signature: super::client().sign(signing_hash(id)).as_bytes().to_vec(),
         prepared_input: retained.prepared_input.canonical_bytes().unwrap(),
     };
+    let service = service(provider_dir.path()).await;
     assert!(matches!(
-        service(provider_dir.path())
-            .await
-            .accept(&request)
-            .await
-            .outcome,
+        service.accept(&request).await.outcome,
         Some(hellas_rpc::pb::work::accept_work_response::Outcome::Refused(_))
     ));
     assert_no_bodies(provider_dir.path());
@@ -780,11 +902,18 @@ async fn fetch_output_limits_include_terminal_and_bad_results_are_never_payable(
     let client_dir = temp();
     let mut client = client_endpoint(client_dir.path()).await;
     let service = service(provider_dir.path()).await;
-    let request = client.propose(&proposal()).await.unwrap();
-    let id = client
-        .accepted(&accept_uploaded_client(&service, &client, &request).await)
+    let request = client
+        .propose(
+            &proposal(),
+            &hellas_channel::test_support::channel::program_content().await,
+        )
         .await
         .unwrap();
+    let id = {
+        let response = accept_uploaded_client(&service, &client, &request).await;
+        client.client().await.unwrap().accepted(&response).await
+    }
+    .unwrap();
     let RunAdmission::Invoke(input) = service.begin_run(id, &fetch_ready()).await.unwrap() else {
         panic!("first Fetch dispatch");
     };
@@ -837,7 +966,7 @@ async fn fetch_output_limits_include_terminal_and_bad_results_are_never_payable(
             .await
             .is_err()
     );
-    assert!(client.pay(id).await.is_err());
+    assert!(client.client().await.unwrap().pay(id).await.is_err());
     assert_no_bodies(provider_dir.path());
 }
 
@@ -851,11 +980,18 @@ async fn app_attest_paid_fetch_uses_the_signed_scheme_without_disk_payloads() {
         prepared_input: input_with_assurance(Retention::Ephemeral, Assurance::AppleAppAttest),
         deadlines: deadlines(),
     };
-    let request = client.propose(&proposal).await.unwrap();
-    let id = client
-        .accepted(&accept_uploaded_client(&service, &client, &request).await)
+    let request = client
+        .propose(
+            &proposal,
+            &hellas_channel::test_support::channel::program_content().await,
+        )
         .await
         .unwrap();
+    let id = {
+        let response = accept_uploaded_client(&service, &client, &request).await;
+        client.client().await.unwrap().accepted(&response).await
+    }
+    .unwrap();
     let backend = FetchBackend::default();
     assert!(matches!(
         run_accepted_work(&service, &fetch_ready(), &backend, id)
@@ -863,8 +999,15 @@ async fn app_attest_paid_fetch_uses_the_signed_scheme_without_disk_payloads() {
             .unwrap(),
         RunOutcome::Completed { .. }
     ));
-    receive(&service, &mut client, &fetch_ready(), id).await;
-    let payment = client.pay(id).await.unwrap();
+    receive(
+        &service,
+        &mut client,
+        &fetch_ready(),
+        id,
+        &proposal.prepared_input,
+    )
+    .await;
+    let payment = client.client().await.unwrap().pay(id).await.unwrap();
     use hellas_rpc::services::work::WorkHandler;
     let response: hellas_rpc::call::WithTrailer<hellas_rpc::pb::work::AdmitCertificateResponse> =
         service
@@ -883,28 +1026,40 @@ use hellas_channel::test_support::test_responses_contract;
 
 #[tokio::test]
 async fn the_generic_proposal_helper_ignores_unneeded_cached_root_openings_for_fetch() {
-    use hellas_channel::{
-        content::{EphemeralContent, InvocationContent},
-        work::propose_work,
-    };
+    use hellas_channel::work::propose_work;
+    use hellas_store::content::{LocalStore, MemoryStore, Reservations, Scope};
     for cached in [false, true] {
         let provider_dir = temp();
         let client_dir = temp();
         let service = service(provider_dir.path()).await;
         let mut client = client_endpoint(client_dir.path()).await;
-        let mut memory = EphemeralContent::default();
+        let memory = MemoryStore::new(Reservations::ram(
+            hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
+        ));
         if cached {
-            let reference = memory.insert(test_responses_contract().canonical_bytes());
+            let reference = hellas_channel::content::upload_object(
+                &memory,
+                &test_responses_contract().canonical_bytes(),
+            )
+            .await
+            .unwrap();
             assert_eq!(reference.id(), test_responses_contract().manifest().root());
         }
-        let content = InvocationContent::Ephemeral(memory);
+        let content = (LocalStore::Memory(memory), Scope::Owner);
         let (transport, server) = transport::transport_pair();
         let serving = hellas_channel::test_support::channel::serve_work(server, service.clone());
         let id = propose_work(transport, &mut client, &proposal(), &content)
             .await
             .unwrap();
         assert_eq!(
-            client.state().job_by_id(id).unwrap().phase(),
+            client
+                .client()
+                .await
+                .unwrap()
+                .state()
+                .job_by_id(id)
+                .unwrap()
+                .phase(),
             JobPhase::Accepted
         );
         assert_eq!(

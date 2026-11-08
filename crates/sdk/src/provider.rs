@@ -54,6 +54,8 @@ pub enum ProviderError {
     Address(#[from] iroh::endpoint::InvalidSocketAddr),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Content(#[from] hellas_store::content::Error),
     #[error("discovery could not start: {0}")]
     Discovery(String),
     #[error(transparent)]
@@ -85,6 +87,7 @@ pub struct FetchProviderOptions<R> {
     pub root: Arc<R>,
     /// Process home for chain-agnostic grant authority state.
     pub home: StoreLocation,
+    pub content: hellas_store::content::DiskStore,
     pub grants: Option<crate::GrantProviderOptions>,
     pub routes: FetchRouteRegistry,
     pub fetch_max_in_flight: usize,
@@ -140,6 +143,7 @@ impl<R> FetchProviderOptions<R> {
                 Some(options.root),
             )?),
             executor: executor_config,
+            content: options.content,
             grants: options.grants.map(|config| ProviderGrants {
                 config,
                 authority: ProviderAuthority::Journal {
@@ -217,6 +221,7 @@ impl ProviderGrants {
 /// The caller owns discovery advertising and the executing chain node's lifetime.
 pub struct ProviderOptions<R> {
     pub executor: ExecutorSpawnConfig,
+    pub content: hellas_store::content::DiskStore,
     pub grants: Option<ProviderGrants>,
     pub port: Option<u16>,
     pub build: String,
@@ -231,6 +236,7 @@ impl<R> Clone for ProviderOptions<R> {
     fn clone(&self) -> Self {
         Self {
             executor: self.executor.clone(),
+            content: self.content.clone(),
             grants: self.grants.clone(),
             port: self.port,
             build: self.build.clone(),
@@ -300,7 +306,10 @@ pub struct ProviderHandle {
     drained: Option<oneshot::Sender<()>>,
     alpns: Vec<Vec<u8>>,
     endpoint: Endpoint,
-    owns_endpoint: bool,
+    /// Set when this handle bound its own endpoint and lent it to the
+    /// caller's content store for peer reads. The store outlives the
+    /// provider, so drop takes the endpoint back to release its sockets.
+    peer_store: Option<hellas_store::content::DiskStore>,
     accept_task: tokio::task::JoinHandle<()>,
     work: Option<WorkWatcher>,
     owned_authority: Option<hellas_authority::node::NodeCoordinator>,
@@ -373,7 +382,7 @@ impl ProviderHandle {
         // restart starts its successor with this identity and port as soon as
         // this returns. Until the close completes, the old socket stays bound
         // and refuses every new handshake addressed to this identity.
-        if self.owns_endpoint {
+        if self.peer_store.is_some() {
             self.endpoint.close().await;
         }
         if let Some(node) = self.owned_authority.take() {
@@ -386,6 +395,9 @@ impl ProviderHandle {
 impl Drop for ProviderHandle {
     fn drop(&mut self) {
         self.accept_task.abort();
+        if let Some(content) = &self.peer_store {
+            content.clear_peers();
+        }
     }
 }
 
@@ -394,7 +406,12 @@ fn served_alpns(
     grants_configured: bool,
     remote_control: bool,
 ) -> Vec<Vec<u8>> {
-    let mut alpns = vec![Node::ALPN.as_bytes().to_vec()];
+    let mut alpns = vec![
+        Node::ALPN.as_bytes().to_vec(),
+        hellas_rpc::services::content::Content::ALPN
+            .as_bytes()
+            .to_vec(),
+    ];
     if work_configured {
         alpns.extend([
             hellas_rpc::services::chain_sync::ChainSync::ALPN
@@ -457,7 +474,7 @@ where
         matches!(grants.authority, ProviderAuthority::Journal { .. }).then(|| node.clone())
     });
     let signer = config.executor.producer_key.clone();
-    let content = config.executor.content_store.clone();
+    let content = config.content.clone();
     let handle = Executor::spawn_configured(config.executor).await?;
     let remote_control = prepared_grants
         .as_ref()
@@ -488,6 +505,7 @@ where
         ),
         None => None,
     };
+    content.finish_recovery().await?;
     let alpns = advertised_alpns.clone();
     let ingress = match prepared_grants
         .as_ref()
@@ -514,6 +532,14 @@ where
             (builder.bind().await?, None, true)
         }
     };
+    // A host endpoint is already the host's content peer pool.
+    let peer_store = owns_endpoint.then(|| {
+        content
+            .clone()
+            .with_peers(hellas_wire::iroh::Pool::for_service::<
+                hellas_rpc::services::content::Content,
+            >(endpoint.clone(), Default::default()))
+    });
     let discovery = config
         .discovery
         .then(|| discovery::start_server_advertising(&endpoint, &advertised_alpns))
@@ -546,10 +572,9 @@ where
                 .ip_addrs()
                 .map(ToString::to_string)
                 .collect(),
+            content.clone(),
         )
-        .await?
-        .with_upload_quota(work_mount.upload_quota())
-        .with_content_store(content.clone());
+        .await?;
         let administration = hellas_authority::grant_service::WorkAdministration::new(
             service.clone(),
             grants.config.configuration,
@@ -623,6 +648,7 @@ where
             let work_for_conn = serves_work.clone();
             let setup_for_conn = serves_setup.clone();
             let admin_for_conn = admin.clone();
+            let content_for_conn = content.clone();
             let mut stopping = quiesced.clone();
             connections.spawn(async move {
                 let admitted = match incoming {
@@ -651,6 +677,7 @@ where
                         setup_for_conn,
                         work_for_conn,
                         admin_for_conn,
+                        content_for_conn,
                         stopping,
                     ))
                     .await
@@ -678,7 +705,7 @@ where
         drained: Some(drained),
         accept_task,
         endpoint,
-        owns_endpoint,
+        peer_store,
         owned_authority,
         work,
     })
@@ -696,8 +723,12 @@ async fn serve_connection<R: RootProver + Send + Sync + 'static>(
     setup: Option<MountedSetup>,
     work: Option<WorkRouter>,
     admin: Option<crate::node_control::NodeControl>,
+    content: hellas_store::content::DiskStore,
     mut quiesce: watch::Receiver<bool>,
 ) -> Result<(), ProviderError> {
+    if alpn == hellas_rpc::services::content::Content::ALPN.as_bytes() {
+        return serve_content(conn, content, quiesce).await;
+    }
     if alpn == hellas_rpc::services::host_control::HostControl::ALPN.as_bytes() {
         let admin = admin
             .ok_or_else(|| WireStatus::new(WireCode::Unavailable, "node control is unavailable"))?;
@@ -711,7 +742,14 @@ async fn serve_connection<R: RootProver + Send + Sync + 'static>(
     // Account for inbound requests and refresh last_seen_ms in the shared registry.
     if alpn == <Node as ServiceMarker>::ALPN.as_bytes() {
         let server = AccountingDispatcher::new(NodeServer(node_handler), manager);
-        serve_loop(transport, server, quiesce).await;
+        let _ = serve_loop(
+            transport,
+            server,
+            quiesce,
+            RPC_CONNECTION_IDLE_TIMEOUT,
+            tokio::time::Instant::now() + MAX_LIFETIME,
+        )
+        .await;
         Ok(())
     } else if alpn == hellas_rpc::services::chain_sync::ChainSync::ALPN.as_bytes()
         && let Some(chain) = node_handler.chain
@@ -720,7 +758,14 @@ async fn serve_connection<R: RootProver + Send + Sync + 'static>(
             hellas_rpc::services::chain_sync::ChainSyncServer(chain),
             manager,
         );
-        serve_loop(transport, server, quiesce).await;
+        let _ = serve_loop(
+            transport,
+            server,
+            quiesce,
+            RPC_CONNECTION_IDLE_TIMEOUT,
+            tokio::time::Instant::now() + MAX_LIFETIME,
+        )
+        .await;
         Ok(())
     } else if let Some(setup) =
         setup.filter(|_| alpn == <WorkSetup as ServiceMarker>::ALPN.as_bytes())
@@ -732,7 +777,14 @@ async fn serve_connection<R: RootProver + Send + Sync + 'static>(
             ),
             manager,
         );
-        serve_loop(transport, server, quiesce).await;
+        let _ = serve_loop(
+            transport,
+            server,
+            quiesce,
+            RPC_CONNECTION_IDLE_TIMEOUT,
+            tokio::time::Instant::now() + MAX_LIFETIME,
+        )
+        .await;
         Ok(())
     } else if let Some(work) = work.filter(|_| alpn == <Work as ServiceMarker>::ALPN.as_bytes()) {
         let connection = tokio::select! {
@@ -743,12 +795,43 @@ async fn serve_connection<R: RootProver + Send + Sync + 'static>(
             },
         };
         let server = AccountingDispatcher::new(connection, manager);
-        serve_loop(transport, server, quiesce).await;
+        let _ = serve_loop(
+            transport,
+            server,
+            quiesce,
+            RPC_CONNECTION_IDLE_TIMEOUT,
+            tokio::time::Instant::now() + MAX_LIFETIME,
+        )
+        .await;
         Ok(())
     } else {
         warn!("Unknown ALPN: {:?}", String::from_utf8_lossy(&alpn));
         Ok(())
     }
+}
+
+pub(crate) async fn serve_content(
+    connection: Connection,
+    content: hellas_store::content::DiskStore,
+    mut quiesce: watch::Receiver<bool>,
+) -> Result<(), ProviderError> {
+    let service = hellas_store::content::ContentService::new(
+        Arc::new(content),
+        hellas_store::content::Scope::Public,
+    );
+    let serving = serve_loop(
+        Arc::new(IrohTransport::new(connection)),
+        hellas_rpc::services::content::ContentServer(service),
+        quiesce.clone(),
+        RPC_CONNECTION_IDLE_TIMEOUT,
+        tokio::time::Instant::now() + MAX_LIFETIME,
+    );
+    // Public reads and watches carry no reply obligation during shutdown.
+    tokio::select! {
+        _ = quiescing(&mut quiesce) => {},
+        _ = serving => {},
+    }
+    Ok(())
 }
 
 async fn quiescing(receiver: &mut watch::Receiver<bool>) {
@@ -757,7 +840,13 @@ async fn quiescing(receiver: &mut watch::Receiver<bool>) {
     }
 }
 
-async fn serve_loop<T, S>(transport: Arc<T>, server: S, mut quiesce: watch::Receiver<bool>)
+pub(crate) async fn serve_loop<T, S>(
+    transport: Arc<T>,
+    server: S,
+    mut quiesce: watch::Receiver<bool>,
+    idle_timeout: Duration,
+    deadline: tokio::time::Instant,
+) -> Result<(), WireStatus>
 where
     T: StreamTransport + Send + Sync + 'static,
     S: Dispatcher<T> + Send + Sync + 'static,
@@ -787,17 +876,14 @@ where
     });
 
     let mut dispatches = JoinSet::new();
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "inventory class C: connection lifetime"
-    )]
-    let lifetime = tokio::time::sleep(MAX_LIFETIME);
+    let lifetime = tokio::time::sleep_until(deadline);
     tokio::pin!(lifetime);
     let mut draining = false;
+    let mut result = Ok(());
     loop {
         if dispatches.len() >= MAX_RPC_IN_FLIGHT_PER_CONNECTION {
             tokio::select! {
-                _ = &mut lifetime => break,
+                _ = &mut lifetime => { result = Err(WireStatus::new(WireCode::PermissionDenied, "connection expired")); break; },
                 _ = quiescing(&mut quiesce) => { draining = true; break; }
                 completed = dispatches.join_next() => log_dispatch_result(completed),
             }
@@ -807,11 +893,14 @@ where
         let idle = dispatches.is_empty();
         let next = tokio::select! {
             biased;
-            _ = &mut lifetime => break,
+            _ = &mut lifetime => { result = Err(WireStatus::new(WireCode::PermissionDenied, "connection expired")); break; },
             _ = quiescing(&mut quiesce) => { draining = true; break; }
             next = async {
                 if idle {
-                    tokio::time::timeout(RPC_CONNECTION_IDLE_TIMEOUT, inbound_rx.recv()).await.unwrap_or(None)
+                    match tokio::time::timeout(idle_timeout, inbound_rx.recv()).await {
+                        Ok(next) => next,
+                        Err(_) => { result = Err(WireStatus::new(WireCode::PermissionDenied, "connection idle")); None }
+                    }
                 } else {
                     inbound_rx.recv().await
                 }
@@ -829,6 +918,7 @@ where
             }
             Some(Err(_)) => {
                 debug!("provider transport ended");
+                result = Err(WireStatus::new(WireCode::Unavailable, "connection ended"));
                 break;
             }
             None => break,
@@ -843,6 +933,7 @@ where
     } else {
         dispatches.shutdown().await;
     }
+    result
 }
 
 fn log_dispatch_result<E>(result: Option<Result<Result<(), E>, tokio::task::JoinError>>)

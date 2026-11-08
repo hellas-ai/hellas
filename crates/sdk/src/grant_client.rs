@@ -10,7 +10,6 @@ use hellas_auth::{
 use hellas_authority::model::grant::records::{
     check_grant_provider, grant_producer, grant_transport,
 };
-use hellas_channel::content::InvocationContent;
 use hellas_client::ProviderTrustAnchor;
 pub use hellas_client::{PinnedOffer, UnpinnedOffer};
 use hellas_kernel::NetworkId;
@@ -18,10 +17,7 @@ use hellas_private::StoreLocation;
 use hellas_rpc::protocol::invocation::{
     InvocationPolicy, PreparedInvocation, output::StreamVerifier,
 };
-use hellas_rpc::{
-    ContentRef,
-    protocol::content_upload::{CONTENT_CHUNK_BYTES, chunk_digest, encode_reference},
-};
+use hellas_rpc::{ContentRef, protocol::content::encode_reference};
 use hellas_rpc::{
     OutputEventEnvelope, ProviderEnrollmentBundle,
     pb::work::{
@@ -31,6 +27,7 @@ use hellas_rpc::{
         get_standing_response, work_stream_event,
     },
 };
+use hellas_store::content::{LocalStore, Scope};
 use hellas_wire::StreamTransport as _;
 use hellas_wire::iroh::IrohTransport;
 use iroh::{Endpoint, EndpointId};
@@ -98,7 +95,7 @@ pub enum GrantClientError {
     #[error(transparent)]
     Stream(#[from] hellas_rpc::StreamVerifyError),
     #[error(transparent)]
-    Content(#[from] hellas_channel::content::ContentError),
+    Content(#[from] hellas_store::content::Error),
     #[error("grant operation timed out; proposal recovery may be required")]
     Timeout,
     /// No proposal was sent, or a fresh proposal was conclusively refused and
@@ -196,7 +193,7 @@ impl GrantTarget {
         check_grant_provider(&self.provider)?;
         match transport {
             GrantTransport::Local(service) => Ok(SessionTransport::Local {
-                service: service.clone(),
+                service: Box::new(service.clone()),
                 application: application.clone(),
                 signer: signer.clone(),
             }),
@@ -275,7 +272,7 @@ pub async fn bind_endpoint(
 enum SessionTransport {
     Remote(Box<WorkLink>),
     Local {
-        service: GrantService,
+        service: Box<GrantService>,
         application: Arc<ClientProfile>,
         signer: Arc<ProducerSigningKey>,
     },
@@ -306,10 +303,70 @@ impl SessionTransport {
                     if caller.authority() != application.authority {
                         return Err(GrantError::Audience.into());
                     }
-                    Ok(Link::Local(
-                        service.for_caller(caller, application.authorization),
-                        rand::random(),
-                    ))
+                    let work = service.for_caller(caller, application.authorization);
+                    let exporter = rand::random();
+                    let cancellation = hellas_channel::work::admission::Cancellation::new();
+                    let context = hellas_wire::TransportContext {
+                        open_exporter: Some(exporter),
+                        ..Default::default()
+                    };
+                    let (left, right) =
+                        tokio::io::duplex(hellas_wire::transport::DEFAULT_STREAM_WINDOW as usize);
+                    let client = hellas_wire::local::transport(
+                        left,
+                        hellas_wire::mux::Role::Client,
+                        context.clone(),
+                    )
+                    .map_err(|error| {
+                        GrantClientError::Client(hellas_client::ClientError::source(
+                            "native content transport",
+                            error,
+                        ))
+                    })?;
+                    let server = hellas_wire::local::transport(
+                        right,
+                        hellas_wire::mux::Role::Server,
+                        context,
+                    )
+                    .map_err(|error| {
+                        GrantClientError::Client(hellas_client::ClientError::source(
+                            "native content transport",
+                            error,
+                        ))
+                    })?;
+                    let endpoint = work.clone();
+                    let stopped = cancellation.clone();
+                    tokio::spawn(async move {
+                        while let Ok(Some(mut inbound)) = server.accept().await {
+                            use hellas_wire::{MethodMarker, Stream};
+                            if inbound.method_id != hellas_rpc::services::content::Upload::METHOD_ID
+                            {
+                                inbound.stream.reset(hellas_wire::WireCode::Unimplemented);
+                                continue;
+                            }
+                            let context = inbound.context.clone();
+                            let endpoint = endpoint.clone();
+                            let stopped = stopped.clone();
+                            tokio::spawn(async move {
+                                let _ = hellas_rpc::call::dispatch_bidi_streaming::<
+                                    hellas_wire::mux::MuxTransport,
+                                    hellas_rpc::services::content::Upload,
+                                    _,
+                                    _,
+                                    _,
+                                >(
+                                    inbound, |requests| async move {
+                                    endpoint
+                                        .upload_stream(Box::pin(requests), context, stopped)
+                                        .await
+                                }
+                                )
+                                .await;
+                            });
+                        }
+                        stopped.cancel();
+                    });
+                    Ok(Link::Local(Box::new(work), exporter, client, cancellation))
                 }
                 Self::Closed => Err(GrantClientError::Closed),
             }
@@ -323,27 +380,30 @@ struct PreparedUpload {
     bytes: Vec<u8>,
     reference: ContentRef,
     manifest: Vec<u8>,
-    root: Vec<u8>,
+    root: Option<Vec<u8>>,
     objects: Vec<ContentRef>,
 }
 impl PreparedUpload {
-    fn new(input: &PreparedInvocation, content: &InvocationContent) -> Result<Self> {
+    async fn new(input: &PreparedInvocation, content: &(LocalStore, Scope)) -> Result<Self> {
         let bytes = input.canonical_bytes()?;
         let reference = ContentRef::for_bytes(&bytes);
         let manifest = input.manifest()?;
         let policy = InvocationPolicy::from_canonical_bytes(input.application_policy.as_bytes())?;
         let root = if policy.content_closure(&manifest, &[]).is_ok() {
-            Vec::new()
+            None
         } else {
-            content
-                .read_bounded(
-                    manifest.root(),
-                    hellas_channel::content::MAX_PROGRAM_ROOT_BYTES as u64,
-                )?
-                .as_ref()
-                .clone()
+            Some(
+                hellas_channel::content::root(&content.0, &content.1, manifest.root())
+                    .await?
+                    .to_vec(),
+            )
         };
-        let objects = hellas_channel::job::content_closure(&policy, &manifest, &root, reference)?;
+        let objects = hellas_channel::job::content_closure(
+            &policy,
+            &manifest,
+            root.as_deref().unwrap_or_default(),
+            reference,
+        )?;
         Ok(Self {
             bytes,
             reference,
@@ -357,13 +417,25 @@ enum Link {
     /// The host closes the connection, and cancels its work, when the
     /// authenticated session expires.
     Remote(IrohTransport, Option<tokio::time::Instant>),
-    Local(GrantWork, [u8; 32]),
+    Local(
+        Box<GrantWork>,
+        [u8; 32],
+        hellas_wire::mux::MuxTransport,
+        hellas_channel::work::admission::Cancellation,
+    ),
+}
+impl Drop for Link {
+    fn drop(&mut self) {
+        if let Self::Local(_, _, _, cancellation) = self {
+            cancellation.cancel();
+        }
+    }
 }
 impl Link {
     fn expires(&self) -> Option<tokio::time::Instant> {
         match self {
             Self::Remote(_, expires) => *expires,
-            Self::Local(_, _) => None,
+            Self::Local(_, _, _, _) => None,
         }
     }
     async fn standing(&self, request: GetStandingRequest) -> Result<GetStandingResponse> {
@@ -374,97 +446,117 @@ impl Link {
             .get_standing(request)
             .await
             .map_err(GrantClientError::from),
-            Self::Local(s, _) => Ok(s.standing(&request).await),
+            Self::Local(s, _, _, _) => Ok(s.standing(&request).await),
         }
     }
     async fn accept(
         &self,
         request: AcceptWorkRequest,
         work: Digest,
-        input: Option<(&PreparedUpload, &InvocationContent)>,
+        input: Option<(&PreparedUpload, &(LocalStore, Scope))>,
         signer: &ProducerSigningKey,
     ) -> Result<AcceptWorkResponse> {
         if let Some((input, content)) = input {
-            let exporter = match self {
-                Self::Remote(transport, _) => transport
-                    .context()
-                    .open_exporter
-                    .ok_or(GrantError::Signature)?,
-                Self::Local(_, exporter) => *exporter,
+            let (exporter, transport) = match self {
+                Self::Remote(transport, _) => (
+                    transport
+                        .context()
+                        .open_exporter
+                        .ok_or(GrantError::Signature)?,
+                    None,
+                ),
+                Self::Local(_, exporter, transport, _) => (*exporter, Some(transport.clone())),
             };
+            let mut opening = hellas_rpc::pb::content::WorkOpening {
+                signed_opening: prost::Message::encode_to_vec(&request),
+                manifest: input.manifest.clone(),
+                root: input.root.as_ref().map(|bytes| {
+                    let object = ContentRef::for_bytes(bytes);
+                    hellas_rpc::pb::content::ContentRef {
+                        id: object.id().as_bytes().to_vec(),
+                        bytes: object.bytes(),
+                    }
+                }),
+                binding_signature: vec![],
+            };
+            opening.binding_signature = signer
+                .sign_digest(hellas_channel::job::opening_digest(&opening, &exporter))?
+                .bytes()
+                .to_vec();
             let authorization = GrantJobAuthorizationV1::decode(&request.authorization)?;
-            for &object in &input.objects {
-                let mut offset = 0_u64;
-                let mut probing = true;
-                loop {
-                    let chunk = if probing {
-                        Vec::new()
-                    } else if object == input.reference {
-                        input.bytes[offset as usize
-                            ..(offset as usize + CONTENT_CHUNK_BYTES).min(input.bytes.len())]
-                            .to_vec()
-                    } else {
-                        content.read_chunk(object, offset, CONTENT_CHUNK_BYTES)?
-                    };
-                    let end = offset + chunk.len() as u64;
-                    let signature = signer.sign_digest(chunk_digest(
-                        authorization.channel_id.0,
-                        work,
-                        object,
-                        offset,
-                        &chunk,
-                        &exporter,
-                    ))?;
-                    let upload = hellas_rpc::pb::work::UploadContentRequest {
-                        route: request.route.clone(),
-                        authorization: request.authorization.clone(),
-                        client_signature: request.client_signature.clone(),
-                        program_manifest: input.manifest.clone(),
-                        program_root: input.root.clone(),
-                        content_id: object.id().as_bytes().to_vec(),
-                        total_bytes: object.bytes(),
-                        offset,
-                        chunk,
-                        chunk_signature: signature.bytes().to_vec(),
-                    };
-                    let response = match self {
-                        Self::Remote(transport, _) => {
-                            hellas_rpc::services::work::WorkClientImpl::new(IrohTransport::new(
-                                transport.connection().clone(),
-                            ))
-                            .upload_content(upload)
-                            .await?
+            let scope = Scope::work(
+                hellas_store::content::JobId {
+                    channel: authorization.channel_id.0,
+                    id: work,
+                },
+                input.objects.clone(),
+                0,
+            );
+            let first = input
+                .root
+                .as_ref()
+                .map(|bytes| ContentRef::for_bytes(bytes))
+                .unwrap_or(input.reference);
+            // Both native and remote use the same RemoteStore transfer helper.
+            macro_rules! transfer {
+                ($transport:expr) => {{
+                    let remote =
+                        hellas_store::content::RemoteStore::new($transport, content.0.ram_pool())
+                            .with_opening(opening);
+                    let transferred: std::result::Result<(), hellas_store::content::Error> =
+                        async {
+                            for object in std::iter::once(first).chain(
+                                input
+                                    .objects
+                                    .iter()
+                                    .copied()
+                                    .filter(|object| *object != first),
+                            ) {
+                                let reader = if object == input.reference {
+                                    Some(hellas_store::content::VerifiedReader::Memory(
+                                        std::io::Cursor::new(input.bytes.clone().into()),
+                                    ))
+                                } else {
+                                    content.0.open_verified(&content.1, object, None).await?
+                                };
+                                remote.upload_reader(&scope, object, None, reader).await?;
+                            }
+                            remote.finish_uploads().await
                         }
-                        Self::Local(service, _) => {
-                            service
-                                .upload(
-                                    &upload,
-                                    &hellas_wire::TransportContext {
-                                        open_exporter: Some(exporter),
-                                        ..Default::default()
-                                    },
-                                )
-                                .await?
-                        }
-                    };
-                    if let Some(refusal) = response.refused {
-                        return Ok(AcceptWorkResponse {
-                            outcome: Some(accept_work_response::Outcome::Refused(refusal)),
-                        });
-                    }
-                    if response.next_offset > object.bytes()
-                        || (!probing && response.next_offset < end)
-                    {
-                        return Err(GrantError::Malformed.into());
-                    }
-                    if response.next_offset == object.bytes() {
-                        break;
-                    }
-                    offset = response.next_offset;
-                    probing = false;
+                        .await;
+                    transferred
+                }};
+            }
+            let transferred = match self {
+                Self::Remote(remote, _) => {
+                    transfer!(IrohTransport::new(remote.connection().clone()))
                 }
+                Self::Local(_, _, _, _) => transfer!(transport.ok_or(GrantError::Malformed)?),
+            };
+            if let Err(error) = transferred {
+                // A lost acceptance ACK can outlive its ephemeral upload scope.
+                // Recover the durable co-signature or a current policy refusal.
+                // Missing upload content is Malformed; preserve the transfer error
+                // in that case so an interrupted upload stays resumable.
+                let response = self.accept_existing(request.clone()).await?;
+                if matches!(
+                    &response.outcome,
+                    Some(accept_work_response::Outcome::Accepted(_))
+                ) || matches!(
+                    &response.outcome,
+                    Some(accept_work_response::Outcome::Refused(refusal))
+                        if refusal.grant.as_ref()
+                            .and_then(|grant| GrantRefusalCode::try_from(grant.code).ok())
+                            .is_some_and(|code| code != GrantRefusalCode::Malformed)
+                ) {
+                    return Ok(response);
+                }
+                return Err(error.into());
             }
         }
+        self.accept_existing(request).await
+    }
+    async fn accept_existing(&self, request: AcceptWorkRequest) -> Result<AcceptWorkResponse> {
         match self {
             Self::Remote(t, _) => hellas_rpc::services::work::WorkClientImpl::new(
                 IrohTransport::new(t.connection().clone()),
@@ -472,7 +564,7 @@ impl Link {
             .accept_work(request)
             .await
             .map_err(GrantClientError::from),
-            Self::Local(s, _) => Ok(s.accept(&request).await),
+            Self::Local(s, _, _, _) => Ok(s.accept(&request).await),
         }
     }
     async fn stream(
@@ -492,7 +584,7 @@ impl Link {
                     if let Err(error) = stream.finish() { yield Err(GrantClientError::from(error)); }
                 }))
             }
-            Self::Local(s, _) => Ok(Box::pin(
+            Self::Local(s, _, _, _) => Ok(Box::pin(
                 s.stream(request)
                     .map(|event| event.map_err(GrantClientError::from)),
             )),
@@ -534,7 +626,7 @@ pub struct GrantSession {
     observed: UnixMillis,
     standing_now: UnixMillis,
     observed_at: Instant,
-    pending_body: Option<(Digest, PreparedInvocation, InvocationContent)>,
+    pending_body: Option<(Digest, PreparedInvocation, (LocalStore, Scope))>,
 }
 impl GrantSession {
     pub(crate) fn execution_target(&self) -> Result<crate::execution::ExecutionTarget> {
@@ -705,10 +797,13 @@ impl GrantSession {
             .pending_body
             .as_ref()
             .filter(|(work, _, _)| *work == id)
-            .map(|(_, body, content)| {
-                PreparedUpload::new(body, content).map(|input| (input, content.clone()))
-            })
-            .transpose()?;
+            .cloned();
+        let prepared = match prepared {
+            Some((_, body, content)) => {
+                Some((PreparedUpload::new(&body, &content).await?, content))
+            }
+            None => None,
+        };
         let probe = prepared.is_none();
         if probe {
             self.refresh().await?;
@@ -826,7 +921,7 @@ impl GrantSession {
         &mut self,
         policy_name: &str,
         input: PreparedInvocation,
-        content: &InvocationContent,
+        content: &(LocalStore, Scope),
         progress: Option<PaidProgress>,
         accepted: Option<crate::transact::Accepted>,
         proposed: Option<&std::sync::atomic::AtomicBool>,
@@ -848,7 +943,7 @@ impl GrantSession {
         &mut self,
         resource: hellas_auth::authority::ResourceId,
         input: PreparedInvocation,
-        content: &InvocationContent,
+        content: &(LocalStore, Scope),
         progress: Option<PaidProgress>,
         accepted: Option<crate::transact::Accepted>,
         proposed: Option<&std::sync::atomic::AtomicBool>,
@@ -869,7 +964,7 @@ impl GrantSession {
         &mut self,
         resource: hellas_auth::authority::ResourceId,
         input: PreparedInvocation,
-        content: &InvocationContent,
+        content: &(LocalStore, Scope),
         observers: crate::execution::ExecutionObservers,
         tracker: Option<&mut crate::execution::GrantAttempt>,
     ) -> Result<GrantWorkResult> {
@@ -894,7 +989,7 @@ impl GrantSession {
         &mut self,
         selection: GrantSelection<'_>,
         input: PreparedInvocation,
-        content: &InvocationContent,
+        content: &(LocalStore, Scope),
         progress: Option<PaidProgress>,
         accepted: Option<crate::transact::Accepted>,
         proposed: Option<&std::sync::atomic::AtomicBool>,
@@ -1054,7 +1149,7 @@ impl GrantSession {
         &mut self,
         selection: GrantSelection<'_>,
         input: &PreparedInvocation,
-        content: &InvocationContent,
+        content: &(LocalStore, Scope),
         proposed: Option<&std::sync::atomic::AtomicBool>,
         mut tracker: Option<&mut crate::execution::GrantAttempt>,
     ) -> Result<(
@@ -1070,7 +1165,7 @@ impl GrantSession {
             return Err(GrantProtocolError::Assurance.into());
         }
         let channel = self.store.channel().id;
-        let prepared = PreparedUpload::new(input, content)?;
+        let prepared = PreparedUpload::new(input, content).await?;
         let prepared_input_digest = hellas_channel::job::bound_prepared_input_digest(
             self.target.network,
             channel.0,
@@ -1103,6 +1198,16 @@ impl GrantSession {
         policy
             .invocation_policy
             .admit(input, &self.options.signer.public_key())?;
+        let manifest = input.manifest()?;
+        if policy
+            .invocation_policy
+            .content_closure(&manifest, &[])
+            .is_err()
+        {
+            let root =
+                hellas_channel::content::root(&content.0, &content.1, manifest.root()).await?;
+            policy.invocation_policy.content_closure(&manifest, &root)?;
+        }
         let now = self.now();
         // The provider clock has advanced at least as far as this standing, so
         // measuring the signed limit from it never exceeds the allowance.

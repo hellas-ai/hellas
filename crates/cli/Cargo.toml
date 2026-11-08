@@ -91,6 +91,7 @@ iroh = { workspace = true, features = ["tls-ring"] }
 iroh-metrics = { version = "1", default-features = false, features = [
     "metrics",
 ], optional = true }
+notify = "8.2"
 opentelemetry = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 opentelemetry-prometheus = { workspace = true, optional = true }

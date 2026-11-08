@@ -1,6 +1,5 @@
 //! Caller-owned job folders. Purchase nonces derive from durable channel state.
 use hellas_auth::{Digest, ProducerSigningKey, PublicKey, hash_tuple};
-use hellas_channel::content::{EphemeralContent, InvocationContent};
 use hellas_rpc::{
     Assurance, ContentRef, FetchContract, JsonBytes, ProgramManifest,
     protocol::invocation::{
@@ -8,8 +7,9 @@ use hellas_rpc::{
         compute, fetch,
     },
 };
+use hellas_store::content::{LocalStore, MemoryStore, Reservations, Scope};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, path::Path};
+use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 pub const FORMAT: &str = "hellas.job.v1";
 // Model plans name hundreds of weight views; their TOML exceeds 64 KiB.
@@ -31,20 +31,20 @@ pub enum JobError {
     #[error(transparent)]
     Fetch(#[from] hellas_rpc::fetch::FetchProtocolError),
     #[error(transparent)]
-    Content(#[from] hellas_channel::content::ContentError),
+    Content(#[from] hellas_store::content::Error),
 }
 type Result<T> = std::result::Result<T, JobError>;
 fn invalid(message: impl Into<String>) -> JobError {
     JobError::Invalid(message.into())
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Job {
     price: u64,
-    input: JobInput,
+    input: Arc<JobInput>,
     manifest: ProgramManifest,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum JobInput {
     Fetch {
         contract: FetchContract,
@@ -57,7 +57,7 @@ pub enum JobInput {
         environment: compute::Environment,
         plan: compute::Plan,
         inputs: Vec<Artifact>,
-        content: InvocationContent,
+        content: Arc<(LocalStore, Scope)>,
     },
 }
 #[derive(Serialize, Deserialize)]
@@ -175,19 +175,9 @@ impl JobInput {
                 environment,
                 plan,
                 inputs,
-                content,
+                ..
             } => {
-                let root = environment.canonical_bytes()?;
                 let manifest = environment.manifest()?;
-                if content
-                    .read_bounded(manifest.root(), compute::MAX_ENVIRONMENT_BYTES as u64)?
-                    .as_slice()
-                    != root
-                {
-                    return Err(invalid(
-                        "compute content does not open the environment root",
-                    ));
-                }
                 InvocationInput {
                     parameters: JsonBytes(plan.canonical_bytes()?),
                     artifacts: inputs.clone(),
@@ -250,10 +240,15 @@ impl JobInput {
     }
 
     /// The content the provider reads; a Fetch carries none.
-    pub fn content(&self) -> InvocationContent {
+    pub fn content(&self) -> (LocalStore, Scope) {
         match self {
-            JobInput::Compute { content, .. } => content.clone(),
-            JobInput::Fetch { .. } => InvocationContent::Ephemeral(EphemeralContent::default()),
+            JobInput::Compute { content, .. } => content.as_ref().clone(),
+            JobInput::Fetch { .. } => (
+                LocalStore::Memory(MemoryStore::new(Reservations::ram(
+                    hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
+                ))),
+                Scope::Owner,
+            ),
         }
     }
 
@@ -283,7 +278,7 @@ impl Job {
         let manifest = input.manifest()?;
         Ok(Self {
             price,
-            input,
+            input: Arc::new(input),
             manifest,
         })
     }
@@ -306,22 +301,43 @@ impl Job {
             },
         )
     }
-    pub fn compute(
+    pub async fn compute(
         price: u64,
         environment: compute::Environment,
         plan: compute::Plan,
         inputs: Vec<Artifact>,
-        content: InvocationContent,
+        content: (LocalStore, Scope),
     ) -> Result<Self> {
-        Self::from_input(
+        let job = Self::from_input(
             price,
             JobInput::Compute {
                 environment,
                 plan,
                 inputs,
-                content,
+                content: Arc::new(content),
             },
-        )
+        )?;
+        job.validate_content().await?;
+        Ok(job)
+    }
+    /// Validate the exact local environment before any funding or proposal.
+    pub async fn validate_content(&self) -> Result<()> {
+        if let JobInput::Compute {
+            environment,
+            content,
+            ..
+        } = self.input.as_ref()
+        {
+            let expected = environment.canonical_bytes()?;
+            let bytes =
+                hellas_channel::content::root(&content.0, &content.1, self.manifest.root()).await?;
+            if bytes.as_ref() != expected {
+                return Err(invalid(
+                    "compute content does not open the environment root",
+                ));
+            }
+        }
+        Ok(())
     }
     pub fn price(&self) -> u64 {
         self.price
@@ -330,7 +346,7 @@ impl Job {
         &self.input
     }
     pub fn assurance(&self) -> Assurance {
-        match &self.input {
+        match self.input.as_ref() {
             JobInput::Fetch { assurance, .. } => *assurance,
             JobInput::Compute { .. } => Assurance::ProducerSigned,
         }
@@ -338,7 +354,7 @@ impl Job {
     pub fn manifest(&self) -> ProgramManifest {
         self.manifest.clone()
     }
-    pub fn content(&self) -> InvocationContent {
+    pub fn content(&self) -> (LocalStore, Scope) {
         self.input.content()
     }
     /// Check the quoted application before asking the owner to fund anything.
@@ -355,7 +371,7 @@ impl Job {
         self.input.admits(&policy.invocation_policy, true)
     }
     pub fn canonical_bytes(&self) -> Vec<u8> {
-        let bytes = match &self.input {
+        let bytes = match self.input.as_ref() {
             JobInput::Fetch {
                 contract,
                 service,
@@ -404,10 +420,22 @@ impl Job {
         self.input
             .prepare(&self.manifest, key, nonce, runner, policy, true)
     }
-    pub fn load(root: &Path) -> Result<Self> {
-        let directory = hellas_private::ReadDirectory::open(root)?;
-        let read = |name: &str, limit| directory.read(Path::new(name), limit);
-        let bytes = read("job.toml", MAX_DOCUMENT_BYTES)?;
+    pub async fn load(root: &Path) -> Result<Self> {
+        let root = root.to_owned();
+        let directory = Arc::new(
+            tokio::task::spawn_blocking(move || hellas_private::ReadDirectory::open(&root))
+                .await
+                .map_err(|error| invalid(error.to_string()))??,
+        );
+        let read = async |name: &str, maximum| {
+            let directory = directory.clone();
+            let name = name.to_owned();
+            tokio::task::spawn_blocking(move || directory.read(Path::new(&name), maximum))
+                .await
+                .map_err(|error| invalid(error.to_string()))?
+                .map_err(JobError::from)
+        };
+        let bytes = read("job.toml", MAX_DOCUMENT_BYTES).await?;
         let doc: Document = toml::from_str(
             std::str::from_utf8(&bytes).map_err(|_| invalid("job.toml must be UTF-8"))?,
         )?;
@@ -416,10 +444,13 @@ impl Job {
         }
         let job = match (doc.fetch, doc.compute) {
             (Some(fetch), None) => {
-                let contract = serde_json::from_slice(&read(
-                    &fetch.contract,
-                    hellas_rpc::protocol::fetch_contract::MAX_FETCH_CONTRACT_BYTES,
-                )?)?;
+                let contract = serde_json::from_slice(
+                    &read(
+                        &fetch.contract,
+                        hellas_rpc::protocol::fetch_contract::MAX_FETCH_CONTRACT_BYTES,
+                    )
+                    .await?,
+                )?;
                 let assurance = match fetch.assurance.as_str() {
                     "producer-signed" => Assurance::ProducerSigned,
                     "apple-app-attest" => Assurance::AppleAppAttest,
@@ -433,46 +464,59 @@ impl Job {
                     read(
                         &fetch.request,
                         hellas_rpc::fetch::MAX_FETCH_REQUEST_BODY_BYTES,
-                    )?,
+                    )
+                    .await?,
                     assurance,
                 )?
             }
             (None, Some(compute)) => {
-                let bytes = read(&compute.environment, compute::MAX_ENVIRONMENT_BYTES)?;
+                let bytes = read(&compute.environment, compute::MAX_ENVIRONMENT_BYTES).await?;
                 let environment = compute::Environment::from_canonical_bytes(&bytes)?;
-                let mut content = EphemeralContent::default();
-                content.insert(bytes);
+                let content = (
+                    LocalStore::Memory(MemoryStore::new(Reservations::ram(
+                        hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
+                    ))),
+                    Scope::Owner,
+                );
+                hellas_channel::content::upload_object(&content.0, &bytes).await?;
                 for file in compute.objects {
-                    let bytes = read(
-                        &file.path,
-                        usize::try_from(file.object.bytes())
-                            .map_err(|_| invalid("content length overflow"))?,
-                    )?;
-                    if content.insert(bytes) != file.object {
-                        return Err(invalid("job content identity or length mismatch"));
+                    use hellas_store::content::ContentStore;
+                    // Admission precedes even opening an attacker-declared large object.
+                    let mut upload = content
+                        .0
+                        .upload(
+                            &content.1,
+                            file.object,
+                            Some(hellas_channel::content::object_pin(file.object)?),
+                        )
+                        .await?;
+                    if !upload.complete() {
+                        let directory = directory.clone();
+                        let reader = tokio::task::spawn_blocking(move || {
+                            directory.open_file(Path::new(&file.path))
+                        })
+                        .await
+                        .map_err(|error| invalid(error.to_string()))??;
+                        upload.copy_from(reader, &content.0.ram_pool()).await?;
                     }
                 }
-                let inputs = compute
-                    .inputs
-                    .into_iter()
-                    .map(|file| {
-                        Ok(Artifact::new(
-                            file.name,
-                            file.format,
-                            read(
-                                &file.path,
-                                hellas_rpc::protocol::invocation::MAX_INVOCATION_BYTES,
-                            )?,
-                        ))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                let mut inputs = Vec::new();
+                let mut remaining = hellas_rpc::protocol::invocation::MAX_INVOCATION_BYTES;
+                for file in compute.inputs {
+                    let bytes = read(&file.path, remaining).await?;
+                    remaining = remaining
+                        .checked_sub(bytes.len())
+                        .ok_or_else(|| invalid("input byte limit"))?;
+                    inputs.push(Artifact::new(file.name, file.format, bytes));
+                }
                 Self::compute(
                     doc.payment.price,
                     environment,
                     compute.plan,
                     inputs,
-                    InvocationContent::Ephemeral(content),
-                )?
+                    content,
+                )
+                .await?
             }
             _ => return Err(invalid("job must contain exactly one application input")),
         };
@@ -486,13 +530,55 @@ impl Job {
         Ok(job)
     }
     /// Publish job.toml after its caller-owned inputs. Reuse only an exact job.
-    pub fn save(&self, root: &Path) -> Result<()> {
-        if root.exists() && std::fs::read_dir(root)?.next().is_some() {
-            if Self::load(root)?.canonical_bytes() == self.canonical_bytes() {
+    pub async fn save(&self, root: &Path) -> Result<()> {
+        self.validate_content().await?;
+        let root = root.to_owned();
+        let check = root.clone();
+        let occupied = tokio::task::spawn_blocking(move || -> std::io::Result<bool> {
+            Ok(check.exists() && std::fs::read_dir(check)?.next().is_some())
+        })
+        .await
+        .map_err(|error| invalid(error.to_string()))??;
+        if occupied {
+            if Self::load(&root).await?.canonical_bytes() == self.canonical_bytes() {
                 return Ok(());
             }
             return Err(invalid("destination contains a different job"));
         }
+        let mut readers = Vec::new();
+        if let JobInput::Compute {
+            environment,
+            content,
+            ..
+        } = self.input.as_ref()
+        {
+            let mut objects = BTreeMap::new();
+            for object in environment
+                .sources
+                .iter()
+                .copied()
+                .chain(environment.assets.iter().map(|asset| asset.object))
+            {
+                objects.insert(object.id(), object);
+            }
+            for object in objects.into_values() {
+                match content.0.open_verified(&content.1, object, None).await? {
+                    Some(reader) => readers.push((object, reader)),
+                    None if !environment.sources.contains(&object) => {}
+                    None => return Err(hellas_store::content::Error::Missing.into()),
+                }
+            }
+        }
+        let job = self.clone();
+        tokio::task::spawn_blocking(move || job.save_sync(&root, readers))
+            .await
+            .map_err(|error| invalid(error.to_string()))?
+    }
+    fn save_sync(
+        &self,
+        root: &Path,
+        readers: Vec<(ContentRef, hellas_store::content::VerifiedReader)>,
+    ) -> Result<()> {
         hellas_private::create_dir_all_durable(root)?;
         let write = |name: &str, bytes: &[u8]| {
             hellas_private::write_atomically(&root.join(name), ".writing", bytes)
@@ -508,7 +594,7 @@ impl Job {
             fetch: None,
             compute: None,
         };
-        match &self.input {
+        match self.input.as_ref() {
             JobInput::Fetch {
                 contract,
                 service,
@@ -534,7 +620,7 @@ impl Job {
                 environment,
                 plan,
                 inputs,
-                content,
+                ..
             } => {
                 write("environment.cbor", &environment.canonical_bytes()?)?;
                 let mut files = Vec::new();
@@ -547,30 +633,31 @@ impl Job {
                         path,
                     });
                 }
-                let mut objects = BTreeMap::new();
-                for object in environment
-                    .sources
-                    .iter()
-                    .copied()
-                    .chain(environment.assets.iter().map(|a| a.object))
-                {
-                    objects.insert(object.id(), object);
-                }
                 let mut object_files = Vec::new();
-                for (i, object) in objects.into_values().enumerate() {
-                    let bytes = match content.read(object) {
-                        Err(hellas_channel::content::ContentError::Missing)
-                            if !environment
-                                .sources
-                                .iter()
-                                .any(|source| source.id() == object.id()) =>
-                        {
-                            continue;
-                        }
-                        result => result?,
-                    };
+                for (i, (object, mut reader)) in readers.into_iter().enumerate() {
+                    use std::io::{Read, Write};
                     let path = format!("object-{i}.bin");
-                    write(&path, &bytes)?;
+                    let mut output = tempfile::NamedTempFile::new_in(root)?;
+                    let mut hash = hellas_xet::XetFileHasher::new();
+                    let mut remaining = object.bytes();
+                    let mut scratch = vec![0; hellas_xet::MAX_CHUNK_SIZE];
+                    while remaining != 0 {
+                        let count = remaining.min(scratch.len() as u64) as usize;
+                        reader.read_exact(&mut scratch[..count])?;
+                        hash.update(&scratch[..count]);
+                        output.write_all(&scratch[..count])?;
+                        remaining -= count as u64;
+                    }
+                    if reader.read(&mut [0])? != 0
+                        || hellas_xet::file_hash(&hash.finalize_chunks()) != object.id().digest()
+                    {
+                        return Err(invalid("job content changed while saving"));
+                    }
+                    output.as_file().sync_all()?;
+                    output
+                        .persist(root.join(&path))
+                        .map_err(|error| error.error)?;
+                    hellas_private::sync_directory(root)?;
                     object_files.push(ContentFile { object, path });
                 }
                 doc.compute = Some(ComputeFiles {

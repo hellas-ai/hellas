@@ -41,9 +41,11 @@ struct ConnectionLease {
     slot: Option<OwnedSemaphorePermit>,
     public: Option<OwnedSemaphorePermit>,
     expiry: Option<tokio::task::JoinHandle<()>>,
+    cancellation: hellas_channel::work::admission::Cancellation,
 }
 impl Drop for ConnectionLease {
     fn drop(&mut self) {
+        self.cancellation.cancel();
         if let Some(expiry) = &self.expiry {
             expiry.abort();
         }
@@ -67,6 +69,7 @@ impl WorkRouter {
             slot: None,
             public: None,
             expiry: None,
+            cancellation: hellas_channel::work::admission::Cancellation::new(),
         };
         if lease.connection.alpn() != Work::ALPN.as_bytes() {
             return Err(denied());
@@ -157,13 +160,18 @@ impl WorkRouter {
         .await
         .map_err(|_| denied())??;
         drop(pending);
-        if let Some(deadline) = deadline {
-            let connection = lease.connection.clone();
-            lease.expiry = Some(tokio::spawn(async move {
-                tokio::time::sleep_until(deadline).await;
-                connection.close(0u32.into(), b"Work session expired");
-            }));
-        }
+        let connection = lease.connection.clone();
+        let cancellation = lease.cancellation.clone();
+        lease.expiry = Some(tokio::spawn(async move {
+            let expiry = async {
+                match deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! { _ = expiry => { connection.close(0u32.into(), b"Work session expired"); }, _ = connection.closed() => {} }
+            cancellation.cancel();
+        }));
         Ok(WorkConnection {
             server: WorkServer(ConnectionWork {
                 funding,
@@ -194,6 +202,50 @@ impl Dispatcher<IrohTransport> for WorkConnection {
             return Err(TransportError::Protocol(
                 "Work session is no longer authenticated".into(),
             ));
+        }
+        if inbound.method_id == hellas_rpc::services::content::Upload::METHOD_ID {
+            let context = inbound.context.clone();
+            let cancellation = self._lease.cancellation.clone();
+            return hellas_rpc::call::dispatch_bidi_streaming::<
+                IrohTransport,
+                hellas_rpc::services::content::Upload,
+                _,
+                _,
+                _,
+            >(inbound, |requests| async move {
+                match &self.server.0.funding {
+                    Funding::Grants(grants) => {
+                        grants
+                            .upload_stream(Box::pin(requests), context, cancellation)
+                            .await
+                    }
+                    Funding::Payment(payment) => {
+                        payment
+                            .upload_stream(Box::pin(requests), context, cancellation)
+                            .await
+                    }
+                }
+            })
+            .await;
+        }
+        use hellas_rpc::services::content;
+        if matches!(
+            inbound.method_id,
+            content::Stat::METHOD_ID
+                | content::Chunks::METHOD_ID
+                | content::Read::METHOD_ID
+                | content::Acquire::METHOD_ID
+                | content::SetPin::METHOD_ID
+                | content::ListPins::METHOD_ID
+                | content::WatchPins::METHOD_ID
+                | content::Collect::METHOD_ID
+        ) && let Funding::Grants(grants) = &self.server.0.funding
+        {
+            return Dispatcher::<IrohTransport>::dispatch(
+                &content::ContentServer(grants.clone()),
+                inbound,
+            )
+            .await;
         }
         Dispatcher::<IrohTransport>::dispatch(&self.server, inbound).await
     }

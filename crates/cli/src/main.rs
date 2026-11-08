@@ -9,6 +9,7 @@ use iroh::EndpointId;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 mod compute;
+mod content_configuration;
 
 mod commands;
 mod identity;
@@ -48,6 +49,7 @@ fn load_command_identity(
     let grant_identity = matches!(
         command,
         Commands::Admin(_)
+            | Commands::Store(_)
             | Commands::Gateway { offer: Some(_), .. }
             | Commands::Gateway {
                 local_grant: Some(_),
@@ -397,11 +399,8 @@ enum Commands {
     },
     /// Generate one PNG with a client-rendered Flux job on a paid provider.
     Image(commands::transact::ImageArgs),
-    /// Inspect and fill the content store
-    Store {
-        #[command(subcommand)]
-        command: commands::store::StoreCommand,
-    },
+    /// Inspect and manage node content with Owner authority.
+    Store(commands::store::StoreArgs),
     /// Query or run Hellas chain components
     Chain {
         #[command(subcommand)]
@@ -602,18 +601,27 @@ async fn async_main() {
         fetch_config_file,
         grant_config_file,
         audio_model,
+        native,
         ..
     } = &cli.command
     {
-        let result = if let Some(model) = audio_model {
-            commands::serve::audio_model::configure(model, &home).map(|_| ())
-        } else {
+        let result = async {
+            anyhow::ensure!(fetch_config_file.is_some() || grant_config_file.is_some() || audio_model.is_some() || native.content_config.is_some(), "--check-config requires --content-config, --fetch-config, --grant-config or --audio-model");
+            if let Some(model) = audio_model {
+                commands::serve::audio_model::precheck(
+                    native.content_config.as_deref(),
+                    model,
+                    &home,
+                )?;
+                commands::serve::audio_model::configure(model, &home).await?;
+            }
             commands::serve::validate_provider_config(
                 fetch_config_file.as_deref(),
                 grant_config_file.as_deref(),
+                native.content_config.as_deref(),
                 &home,
             )
-        };
+        }.await;
         tracer_provider.shutdown();
         if let Err(error) = result {
             eprintln!("error: {error:#}");
@@ -763,8 +771,8 @@ async fn async_main() {
             }
             return;
         }
-        Commands::Store { command } => {
-            let result = commands::store::run(command, &home).await;
+        Commands::Store(args) if args.profile.is_none() => {
+            let result = commands::store::run(args, &home, None, passkey).await;
             tracer_provider.shutdown();
             if let Err(err) = result {
                 eprintln!("error: {err:#}");
@@ -818,6 +826,9 @@ async fn async_main() {
             unreachable!("contact commands handled before identity load")
         }
         Commands::Admin(args) => commands::admin::run(args, &local_identity, passkey, &home).await,
+        Commands::Store(args) => {
+            commands::store::run(args, &home, Some(&local_identity), passkey).await
+        }
 
         Commands::Serve {
             mut native,
@@ -876,10 +887,15 @@ async fn async_main() {
                                 assurance == hellas_rpc::Assurance::ProducerSigned,
                                 "grants require producer-signed assurance"
                             );
-                            native
-                                .content_paths
-                                .push(model.join(hellas_client::model::whisper::WEIGHTS_FILE));
-                            Some(commands::serve::audio_model::configure(model, &home)?)
+                            commands::serve::audio_model::precheck(
+                                native.content_config.as_deref(),
+                                model,
+                                &home,
+                            )?;
+                            let (grants, weights) =
+                                commands::serve::audio_model::configure(model, &home).await?;
+                            native.audio_content = Some((std::path::absolute(model)?, weights));
+                            Some(grants)
                         } else {
                             None
                         };
@@ -1012,6 +1028,7 @@ async fn async_main() {
                     .clone()
                     .ok_or_else(|| anyhow::anyhow!("--work-profile is required for grant Work"))
             };
+            let mut local_content = None;
             let mut local_service = None;
             let grant_source = if let Some(name) = offer.as_deref() {
                 let client = commands::contributions::require_principal(passkey)?;
@@ -1042,7 +1059,7 @@ async fn async_main() {
                     assurance == hellas_rpc::Assurance::ProducerSigned,
                     "local Work requires producer-signed assurance"
                 );
-                let (session, service) = commands::grant_gateway::local::prepare(
+                let ((session, service), reload) = commands::grant_gateway::local::prepare(
                     &home,
                     grant,
                     native,
@@ -1052,6 +1069,7 @@ async fn async_main() {
                     remote_trust.load(&home)?,
                 )
                 .await?;
+                local_content = Some(reload);
                 local_service = Some(service.clone());
                 Some((
                     session,
@@ -1151,6 +1169,7 @@ async fn async_main() {
             if let Some((address, bundle)) = metrics {
                 metrics::spawn_metrics_server(address, bundle).await?;
             }
+            let mut paid_content = None;
             let gateway = if let Some(pool) = pool_options {
                 let endpoint = hellas_sdk::grant_client::bind_endpoint(secret_key.clone()).await?;
                 let transports = (0..pool.channels.len())
@@ -1175,7 +1194,24 @@ async fn async_main() {
                 let config =
                     hellas_sdk::work_config::WorkConfig::for_chain(selected_chain.clone(), &home)?;
                 let client_chain = config.chain.clone();
-                let options = hellas_sdk::paid_gateway::load_pool_options(path, assurance, config)?;
+                let content = hellas_store::content::DiskStore::open(
+                    StoreLocation::from_home(&path.with_extension("content"), home.durability()),
+                    vec![],
+                    hellas_store::content::IndexMode::Resume,
+                    None,
+                    hellas_store::content::Reservations::ram(
+                        hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
+                    ),
+                    false,
+                )
+                .await?;
+                let options = hellas_sdk::paid_gateway::load_pool_options(
+                    path,
+                    assurance,
+                    config,
+                    content.clone(),
+                )?;
+                paid_content = Some(content);
                 let passkey = owner.clone().ok_or_else(|| {
                     anyhow::anyhow!("paid work requires --passkey, --faucet or --faucet-account")
                 })?;
@@ -1202,6 +1238,9 @@ async fn async_main() {
             let served = hellas_gateway::wait_for_shutdown(gateway)
                 .await
                 .map_err(anyhow::Error::from);
+            if let Some(content) = paid_content {
+                content.close().await;
+            }
             let stopped = match control {
                 Some(control) => served.and(control.shutdown().await.map_err(anyhow::Error::from)),
                 None => served,
@@ -1210,6 +1249,12 @@ async fn async_main() {
             let stopped = match local_service {
                 Some(service) => stopped.and(service.shutdown().await.map_err(anyhow::Error::from)),
                 None => stopped,
+            };
+            // The local content store outlives the service that reads it.
+            let stopped = if let Some(content) = local_content {
+                stopped.and(content.shutdown().await)
+            } else {
+                stopped
             };
             node.close().await;
             stopped
@@ -1299,7 +1344,6 @@ async fn async_main() {
         }
         Commands::Trust(args) => commands::trust::run(args),
         Commands::Chain { .. } => unreachable!("chain commands handled before identity load"),
-        Commands::Store { .. } => unreachable!("store commands handled before identity load"),
         #[cfg(unix)]
         Commands::Machines(_) => {
             unreachable!("management commands handled before identity load")

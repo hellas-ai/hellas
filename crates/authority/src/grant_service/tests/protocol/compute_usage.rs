@@ -86,7 +86,8 @@ async fn small_compute_grant_runs_and_settles_one_request_without_tokens_or_devi
         );
         assert!(!bytes.windows(output.len()).any(|w| w == output));
     }
-    assert!(!directory.path().join("content").exists());
+    assert_eq!(world.service.content.stats().unwrap().used, 0);
+    assert_eq!(world.service.content.ram_pool().held(), 0);
 }
 
 #[tokio::test]
@@ -131,14 +132,15 @@ fn no_closure_payloads_on_disk(root: &std::path::Path, objects: &[Vec<u8>]) {
             }
         }
     }
-    assert!(!root.join("content").exists());
 }
 
 #[tokio::test]
 async fn unseen_grant_program_closure_reaches_only_the_ram_backend_and_never_files_or_database_rows()
  {
-    use hellas_rpc::protocol::content_upload::{chunk_digest, encode_reference};
+    use hellas_rpc::pb::content as pb;
+    use hellas_rpc::protocol::content::encode_reference;
     use hellas_rpc::protocol::invocation::compute::{Environment, NamedAsset};
+    use hellas_store::content::{ContentStore as _, Cursor, Scope};
     let directory = tempfile::tempdir().unwrap();
     let (node, mut proposal) = compute_node(directory.path(), false).await;
     let source = b"grant-private-program-source-7321".to_vec();
@@ -181,23 +183,42 @@ async fn unseen_grant_program_closure_reaches_only_the_ram_backend_and_never_fil
     let backend = Backend {
         signer: Arc::new(PROVIDER.node_key()),
         inspect_content: Some(Arc::new(move |input, content| {
-            assert!(!input.request.retain);
-            assert_eq!(content.retention(), Retention::Ephemeral);
-            assert!(content.retained_store().is_none());
-            for bytes in &expected {
-                let reference = ContentRef::for_bytes(bytes);
-                assert_eq!(
-                    content.read(reference).unwrap().as_slice(),
-                    bytes.as_slice()
+            let expected = expected.clone();
+            let observed = observed.clone();
+            Box::pin(async move {
+                assert!(!input.request.retain);
+                assert_eq!(content.0.retention(), Retention::Ephemeral);
+                assert!(matches!(
+                    content.0,
+                    hellas_store::content::LocalStore::Job(_)
+                ));
+                for bytes in &expected {
+                    let reference = ContentRef::for_bytes(bytes);
+                    let reader = content
+                        .0
+                        .open_verified(&content.1, reference, None)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let actual = reader
+                        .read_all(reference, &content.0.ram_pool())
+                        .await
+                        .unwrap();
+                    assert_eq!(actual.as_ref(), bytes.as_slice());
+                }
+                assert!(
+                    content
+                        .0
+                        .open_verified(
+                            &content.1,
+                            ContentRef::for_bytes(b"not in the signed closure"),
+                            None,
+                        )
+                        .await
+                        .is_err()
                 );
-                assert_eq!(content.read_chunk(reference, 2, 5).unwrap(), bytes[2..7]);
-            }
-            assert!(
-                content
-                    .read(ContentRef::for_bytes(b"not in the signed closure"))
-                    .is_err()
-            );
-            observed.fetch_add(1, Ordering::SeqCst);
+                observed.fetch_add(1, Ordering::SeqCst);
+            })
         })),
         ..Backend::default()
     };
@@ -209,49 +230,77 @@ async fn unseen_grant_program_closure_reaches_only_the_ram_backend_and_never_fil
     let id = proposal.work();
     let mut request = proposal.request();
     request.prepared_input = encode_reference(a.input_content);
-    for bytes in &objects {
-        let reference = ContentRef::for_bytes(bytes);
-        let signature = FRIEND
-            .node_key()
-            .sign_digest(chunk_digest(
-                a.channel_id.0,
-                id,
-                reference,
-                0,
-                bytes,
-                &[7; 32],
-            ))
-            .unwrap();
-        let uploaded = work
-            .upload(
-                &UploadContentRequest {
-                    route: request.route.clone(),
-                    authorization: request.authorization.clone(),
-                    client_signature: request.client_signature.clone(),
-                    program_manifest: manifest.canonical_bytes(),
-                    program_root: root.clone(),
-                    content_id: reference.id().as_bytes().to_vec(),
-                    total_bytes: reference.bytes(),
-                    offset: 0,
-                    chunk: bytes.clone(),
-                    chunk_signature: signature.bytes().to_vec(),
-                },
-                &context(),
-            )
-            .await
-            .unwrap();
-        assert!(
-            uploaded.refused.is_none(),
-            "closure object refused: {uploaded:?}"
+    let mut frames = hellas_channel::test_support::upload_frames(
+        &request,
+        manifest.canonical_bytes(),
+        root,
+        &objects[3],
+        |opening| {
+            FRIEND
+                .node_key()
+                .sign_digest(hellas_channel::job::opening_digest(opening, &[7; 32]))
+                .unwrap()
+                .bytes()
+                .to_vec()
+        },
+    );
+    for bytes in &objects[..2] {
+        let mut object_frames = hellas_channel::test_support::upload_frames(
+            &request,
+            vec![],
+            vec![],
+            bytes,
+            |_| vec![],
         );
-        assert_eq!(uploaded.next_offset, reference.bytes());
-        assert_eq!(world.snapshot().await, before);
-        assert_eq!(
-            world.service.node().writer().await.unwrap().journal_len(),
-            rows,
-            "uploading a grant closure writes no authority row"
-        );
-        no_closure_payloads_on_disk(directory.path(), &objects);
+        let Some(pb::upload_request::Part::Open(open)) = &mut object_frames[0].part else {
+            unreachable!()
+        };
+        open.work = None;
+        frames.extend(object_frames);
+    }
+    let (send, receive) = futures::channel::mpsc::unbounded();
+    send.unbounded_send(Ok(frames.remove(0))).unwrap();
+    let connection = hellas_channel::work::admission::Cancellation::new();
+    let _stop = hellas_channel::work::admission::CancelOnFailure(vec![connection.clone()]);
+    let mut replies = work
+        .upload_stream(Box::pin(receive), context(), connection)
+        .await
+        .unwrap();
+    let mut frames = frames.into_iter();
+    loop {
+        let reply = replies.next().await.unwrap().unwrap();
+        if reply.complete {
+            assert_eq!(world.snapshot().await, before);
+            assert_eq!(
+                world.service.node().writer().await.unwrap().journal_len(),
+                rows,
+                "uploading a grant closure writes no authority row"
+            );
+            assert_eq!(world.service.content.stats().unwrap().used, 0);
+            assert!(
+                world
+                    .service
+                    .content
+                    .pins(&Scope::Owner, "", Cursor::default())
+                    .await
+                    .unwrap()
+                    .pins
+                    .is_empty()
+            );
+            no_closure_payloads_on_disk(directory.path(), &objects);
+        }
+        match frames.find(|frame| {
+            !reply.complete || matches!(frame.part, Some(pb::upload_request::Part::Open(_)))
+        }) {
+            Some(frame) => send.unbounded_send(Ok(frame)).unwrap(),
+            None => {
+                drop(send);
+                hellas_channel::test_support::drive_upload(Ok(replies))
+                    .await
+                    .unwrap();
+                break;
+            }
+        }
     }
     assert_eq!(accepted_id(work.accept(&request).await), id);
     within(backend.started.notified()).await;

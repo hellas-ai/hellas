@@ -62,6 +62,7 @@ fn scope(actor: Actor) -> GrantSpec {
 }
 struct Fixture {
     directory: tempfile::TempDir,
+    content: hellas_store::content::DiskStore,
     node: NodeCoordinator,
     service: NodeControl,
     secret: CredentialSecret,
@@ -74,12 +75,17 @@ async fn fixture() -> Fixture {
         .await;
     let secret = world.secret(ROOT);
     let secret = CredentialSecret::from_parts(secret.id(), *secret.expose_secret());
+    let content = world.content;
     let node = NodeCoordinator::new(world.store, world.clock.source());
     Fixture {
-        service: NodeControl::new(node.clone()).with_remote_admission(
-            RemoteControlAdmission::new(vec![SecretKey::from_bytes(&[62; 32]).public()]).unwrap(),
-        ),
+        service: NodeControl::new(node.clone())
+            .with_content_store(content.clone())
+            .with_remote_admission(
+                RemoteControlAdmission::new(vec![SecretKey::from_bytes(&[62; 32]).public()])
+                    .unwrap(),
+            ),
         directory,
+        content,
         node,
         secret,
     }

@@ -5,14 +5,14 @@
 //!
 //! Canonical private records and content references. `AcceptWorkRequest`
 //! carries canonical [`PaidJobAuthorizationV2`] bytes and a content reference
-//! to the prepared input transferred by UploadContent. Signatures cover the
+//! to the prepared input transferred by scoped Content.Upload. Signatures cover the
 //! canonical authorization and its exact input commitment.
 //!
 //! # The order
 //!
 //! Both endpoints obey the same rule, which is [`crate::work_store`]'s:
-//! **the state that authorises a signature is fsynced before the
-//! signature leaves the process.**
+//! **the state that authorises a signature is committed before the
+//! signature leaves the process.** Power mode also flushes the commit.
 //!
 //! The client reserves its nonce, builds and signs the authorization,
 //! and journals the signature — all before the request is handed to a
@@ -40,7 +40,7 @@
 //! # Running what was accepted
 //!
 //! [`run_accepted_work`] is the second half, and it obeys the same rule
-//! in the one place it matters most: the running marker is fsynced
+//! in the one place it matters most: the running marker is committed
 //! before the backend is called. It is not a wire exchange — there is no
 //! Run RPC here — but it is the same journal, the same channel, and the
 //! same `work_id`, so it lives beside the acceptance that authorised it.
@@ -84,11 +84,11 @@
 //!
 //! The client derives the amount itself — its own credited total plus
 //! the price its own authorization fixed — signs the certificate and the
-//! binding that says what that certificate bought, and fsyncs both
+//! binding that says what that certificate bought, and commits both
 //! before either leaves the process, through the ledger that says this
 //! job has not been paid for before.
 //!
-//! Then the provider fsyncs the same pair before it acknowledges
+//! Then the provider commits the same pair before it acknowledges
 //! anything, deriving the same amount from its own ledger, and that same
 //! record is what retires the job's compute and delivery credit. There
 //! is no moment at which this client is owed service for a payment the
@@ -123,13 +123,13 @@ mod stream;
 use admission::{AdmissionError, CapacityDomain, WorkAdmission, WorkPermit};
 pub use stream::{PaidProgress, PaidResultStream, ProgressError, fetch_result_stream};
 
-mod upload;
-use hellas_rpc::protocol::content_upload::{decode_reference, encode_reference};
+mod content;
+use content::content_refusal;
+use hellas_rpc::protocol::content::{decode_reference, encode_reference};
 use hellas_rpc::{ContentId, ContentRef};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use upload::content_refusal;
 
 use crate::endpoint_lock::{EndpointGuard, EndpointLock};
 
@@ -640,6 +640,11 @@ impl ProviderEndpoint {
     /// [`EndpointError::NotAdmitting`] when readiness is unavailable,
     /// and [`EndpointError::ObservationStale`]
     /// while awaiting fresh finalized progress.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn fixture_store(&mut self) -> &mut ChannelStore {
+        &mut self.close.store
+    }
+
     fn admitting(&self) -> Result<&ReadyChannel, EndpointError> {
         let ready = self.ready.as_ref().ok_or(EndpointError::NotAdmitting)?;
         if let Some(observation) = &self.observation {
@@ -762,18 +767,8 @@ impl ProviderEndpoint {
 
     async fn decide(&mut self, request: &AcceptWorkRequest) -> Result<(Digest, Sig), Refusal> {
         let (authorization, client_signature, work_id) = self.authenticate_proposal(request)?;
-        self.close.store.gc_uploads()?;
         if let Some(retained) = self.prior_acceptance(&authorization, work_id)? {
-            if let Some(job) = self.state().job_by_id(work_id) {
-                let bytes = job.prepared_input().to_vec();
-                if !bytes.is_empty() {
-                    self.close
-                        .store
-                        .uploads
-                        .publish_accepted(work_id, &bytes, authorization.retention)
-                        .map_err(content_refusal)?;
-                }
-            }
+            self.close.store.reconcile_content(false).await?;
             return Ok((work_id, retained));
         }
         let ready = self
@@ -807,12 +802,7 @@ impl ProviderEndpoint {
                 "input reference differs from the signed proposal",
             ));
         }
-        let prepared_input = self
-            .close
-            .store
-            .uploads
-            .read(work_id, reference, authorization.retention)
-            .map_err(content_refusal)?;
+        let prepared_input = self.close.store.read_content(work_id, reference).await?;
         let bundle = PreparedInvocation::from_canonical_bytes(
             &prepared_input,
             crate::content::MAX_CONTENT_BYTES,
@@ -823,21 +813,46 @@ impl ProviderEndpoint {
         let manifest = bundle
             .manifest()
             .map_err(|error| Refusal::invalid(error.to_string()))?;
-        let root = self
-            .close
-            .store
-            .uploads
-            .root(work_id, manifest.root(), authorization.retention)
-            .map_err(content_refusal)?;
+        let (store, scope) = self.close.store.invocation_content(work_id)?;
+        let root = if policy.content_closure(&manifest, &[]).is_ok() {
+            bytes::Bytes::new()
+        } else {
+            let hellas_store::content::ScopeKind::Work { closure, .. } = &scope.kind else {
+                return Err(content_refusal(hellas_store::content::Error::Denied));
+            };
+            let root = *closure
+                .iter()
+                .find(|object| object.id() == manifest.root())
+                .ok_or_else(|| content_refusal(hellas_store::content::Error::Missing))?;
+            self.close.store.read_content(work_id, root).await?
+        };
         let objects =
             crate::job::content_closure(policy, &manifest, &root, authorization.input_content)?;
-        let content = self
-            .close
-            .store
-            .uploads
-            .invocation_content(work_id, &objects, authorization.retention)
-            .map_err(content_refusal)?;
-
+        if !store
+            .missing_refs(&scope, objects.clone())
+            .await
+            .map_err(content_refusal)?
+            .is_empty()
+        {
+            return Err(content_refusal(hellas_store::content::Error::Missing));
+        }
+        if authorization.retention == hellas_rpc::Retention::Retain {
+            let facts =
+                crate::job::check_paid_input(ready.channel(), &authorization, policy, &bundle)?;
+            self.close
+                .store
+                .reserve_retained(work_id, facts.max_spool_bytes)
+                .await?;
+        }
+        if self
+            .state()
+            .job_by_id(work_id)
+            .is_some_and(|job| job.prepared_input().is_empty())
+        {
+            self.close
+                .store
+                .reattach_input(work_id, prepared_input.clone())?;
+        }
         // The client's signature, its bundle, and the credit this job
         // costs, on the disk before a co-signature exists to leak.
         self.close
@@ -847,12 +862,13 @@ impl ProviderEndpoint {
                     authorization,
                     client_signature,
                     prepared_input: prepared_input.clone(),
+
+                    retained_tree: None,
                 },
                 &Secp256k1Verifier::new(),
             )
             .await?;
 
-        self.close.store.remember_content(work_id, content);
         let signature = self.close.signer.sign(signing_hash(work_id));
         self.close
             .store
@@ -860,15 +876,18 @@ impl ProviderEndpoint {
                 ChannelRecord::JobAccepted {
                     work_id,
                     provider_signature: signature,
+
+                    retained_tree: None,
                 },
                 &Secp256k1Verifier::new(),
             )
             .await?;
-        self.close
-            .store
-            .uploads
-            .publish_accepted(work_id, &prepared_input, authorization.retention)
-            .map_err(content_refusal)?;
+        if let hellas_store::content::LocalStore::Job(job) = &store {
+            job.store()
+                .accept_work(&scope)
+                .await
+                .map_err(content_refusal)?;
+        }
         Ok((work_id, signature))
     }
 
@@ -968,6 +987,8 @@ impl ProviderEndpoint {
             authorization.payment_deadline,
         )?;
 
+        self.close.store.load_retained_content(work_id).await?;
+        let job = self.state().job_by_id(work_id).ok_or(RunError::NoSuchJob)?;
         if job.prepared_input().is_empty() {
             return Ok(RunAdmission::Indeterminate);
         }
@@ -986,9 +1007,7 @@ impl ProviderEndpoint {
             bundle,
             facts.limits,
             facts.capacity_domain,
-            self.close
-                .store
-                .invocation_content(work_id, ready.invocation_policy())?,
+            self.close.store.invocation_content(work_id)?,
             WorkAdmission::payment(),
         )));
 
@@ -1026,6 +1045,7 @@ impl ProviderEndpoint {
         work_id: Digest,
         transcript: &[OutputEventEnvelope],
     ) -> Result<(PaidJobResultV1, Sig), RunError> {
+        self.close.store.load_retained_content(work_id).await?;
         let job = self.state().job_by_id(work_id).ok_or(RunError::NoSuchJob)?;
         let authorization = *job.authorization();
         let input = PreparedInvocation::from_canonical_bytes(
@@ -1088,7 +1108,9 @@ impl ProviderEndpoint {
                     work_id,
                     result,
                     provider_signature: signature,
-                    transcript: spool,
+                    transcript: spool.into(),
+
+                    retained_tree: None,
                 },
                 &Secp256k1Verifier::new(),
             )
@@ -1138,7 +1160,7 @@ impl ProviderEndpoint {
             return Err(EndpointError::NotAdmitting.into());
         }
         let ready = self.admitting()?.clone();
-        if job.result().is_none() || job.transcript().is_empty() {
+        if job.result().is_none() {
             return Err(DeliverError::NoResult { phase: job.phase() });
         }
         crate::model::work::check_payment_policy_binding(
@@ -1326,7 +1348,7 @@ async fn retain_close_start(
     store: &mut ChannelStore,
     start: &PaymentCloseStart,
 ) -> Result<(), WorkStoreError> {
-    let fsynced = Timing::start();
+    let committed = Timing::start();
     store
         .commit(
             ChannelRecord::ClosePrepared {
@@ -1335,7 +1357,7 @@ async fn retain_close_start(
             &Secp256k1Verifier::new(),
         )
         .await?;
-    if let Some(ms) = fsynced.ms() {
+    if let Some(ms) = committed.ms() {
         tracing::event!(
             name: "close_prepared_fsync_ms",
             target: TARGET,
@@ -1763,8 +1785,8 @@ impl CloseChannel for ClientEndpoint {
 
 impl ClientEndpoint {
     /// Release a locally owned channel after its observer and requests stop.
-    pub async fn close(&mut self) {
-        self.store.close().await;
+    pub async fn close(&mut self) -> Result<(), WorkStoreError> {
+        self.store.close().await
     }
 
     /// Applies one finalized block: every transition it carries, then
@@ -2024,7 +2046,7 @@ pub struct Delivery {
     /// The provider's signature over its digest.
     pub signature: Sig,
     /// The encoded transcript, as [`decode_transcript`](crate::model::work::decode_transcript) reads it.
-    pub transcript: Vec<u8>,
+    pub transcript: bytes::Bytes,
 }
 
 /// Why one delivery did not happen.
@@ -2600,18 +2622,19 @@ impl WorkService {
         Ok(())
     }
 
-    /// Ends admission and delivery after accepted work and the observer have stopped.
-    /// Release the journal after request execution and observation have drained.
-    pub async fn close(&self) {
+    /// Finish provider unaccepted content cleanup and release the journal
+    /// after request execution and observation have drained.
+    pub async fn close(&self) -> Result<(), WorkStoreError> {
         self.endpoint
             .lock_for_shutdown()
             .await
             .close
             .store
             .close()
-            .await;
+            .await
     }
 
+    /// Ends admission and delivery while retaining the journal and close duties.
     pub async fn stop(&self) -> Result<(), EndpointError> {
         let mut endpoint = self.endpoint().await?;
         let height = endpoint.state().cursor().0;
@@ -2685,6 +2708,21 @@ impl WorkService {
         Ok(read(self.endpoint().await?.state()))
     }
 
+    /// Accepted jobs, excluding retained work whose input could not be restored.
+    pub async fn accepted_work_ids(&self) -> Result<Vec<Digest>, EndpointError> {
+        let endpoint = self.endpoint().await?;
+        Ok(endpoint
+            .state()
+            .jobs()
+            .filter(|job| {
+                job.phase() == JobPhase::Accepted
+                    && (job.authorization().retention != hellas_rpc::Retention::Retain
+                        || endpoint.close.store.contents.contains_key(&job.work_id()))
+            })
+            .map(|job| job.work_id())
+            .collect())
+    }
+
     /// Takes this channel's one cursor-driving authority, or says it is
     /// already taken.
     ///
@@ -2734,7 +2772,9 @@ impl WorkService {
     /// [`CloseError::Endpoint`] when the endpoint is unreachable, and
     /// whatever [`ProviderEndpoint::prepare_close`] raises otherwise.
     pub async fn prepare_close(&self) -> Result<PaymentCloseStart, CloseError> {
-        self.endpoint().await?.prepare_close().await
+        let result = self.endpoint().await?.prepare_close().await;
+        self.changed.notify_waiters();
+        result
     }
 
     /// Builds the close that ends this endpoint's contest, from one
@@ -2810,22 +2850,9 @@ impl WorkService {
             .endpoint()
             .await
             .map_err(|error| Refusal::new(endpoint_refusal(error), error.to_string()))
-            .and_then(|mut endpoint| {
+            .and_then(|endpoint| {
                 let (authorization, _, work_id) = endpoint.authenticate_proposal(request)?;
                 let retained = endpoint.prior_acceptance(&authorization, work_id)?;
-                if retained.is_some()
-                    && let Some(job) = endpoint.state().job_by_id(work_id)
-                {
-                    let bytes = job.prepared_input().to_vec();
-                    if !bytes.is_empty() {
-                        endpoint
-                            .close
-                            .store
-                            .uploads
-                            .publish_accepted(work_id, &bytes, authorization.retention)
-                            .map_err(content_refusal)?;
-                    }
-                }
                 Ok(retained.map(|signature| (work_id, signature)))
             });
         result.transpose().map(acceptance_response)
@@ -2833,8 +2860,23 @@ impl WorkService {
 
     /// Answers one proposal, or says the endpoint is unreachable.
     pub async fn accept(&self, request: &AcceptWorkRequest) -> AcceptWorkResponse {
-        match self.endpoint().await {
-            Ok(mut endpoint) => endpoint.accept(request).await,
+        let result = match self.endpoint.lock_owned().await {
+            Ok(mut endpoint) => {
+                let (request, changed) = (request.clone(), self.changed.clone());
+                // Acceptance, publication and RAM transfer retain the writer even
+                // when the RPC drops its response after a journal append started.
+                tokio::spawn(async move {
+                    let response = endpoint.accept(&request).await;
+                    changed.notify_waiters();
+                    response
+                })
+                .await
+                .map_err(|_| EndpointError::Poisoned)
+            }
+            Err(_) => Err(EndpointError::Poisoned),
+        };
+        match result {
+            Ok(response) => response,
             Err(error) => AcceptWorkResponse::refused(WorkRefused {
                 grant: None,
                 code: endpoint_refusal(error).code() as i32,
@@ -2855,7 +2897,16 @@ impl WorkService {
         work_id: Digest,
         ready: &ReadyChannel,
     ) -> Result<RunAdmission, RunError> {
-        let result = self.endpoint().await?.begin_run(work_id, ready).await;
+        let mut endpoint = self.endpoint().await?;
+        let mut result = endpoint.begin_run(work_id, ready).await;
+        if let Ok(RunAdmission::Invoke(input)) = &mut result {
+            let authorization = *endpoint
+                .state()
+                .job_by_id(work_id)
+                .ok_or(RunError::NoSuchJob)?
+                .authorization();
+            input.bind_scope(self.content_scope(input.content().1.clone(), authorization));
+        }
         self.changed.notify_waiters();
         result
     }
@@ -2935,6 +2986,19 @@ impl WorkService {
             .reserve_ready_release(request, &exporter)
             .await
             .map_err(Refusal::from)?;
+        endpoint
+            .close
+            .store
+            .load_retained_input(work_id)
+            .await
+            .map_err(|e| Refusal::from(DeliverError::from(e)))?;
+        let facts = endpoint.job_facts(work_id).map_err(Refusal::from)?;
+        endpoint
+            .close
+            .store
+            .load_retained_transcript(work_id, facts.max_spool_bytes, false)
+            .await
+            .map_err(|e| Refusal::from(DeliverError::from(e)))?;
         // The endpoint remains locked from authorization through this snapshot.
         let job = endpoint
             .state()
@@ -2946,14 +3010,14 @@ impl WorkService {
         Ok(Delivery {
             result: *result,
             signature: *signature,
-            transcript: job.transcript().to_vec(),
+            transcript: job.transcript.clone(),
         })
     }
 
     /// Admits one payment, or says why not.
     ///
     /// The answer is produced after [`ProviderEndpoint::admit`] returns,
-    /// which is after its record is fsynced. Nothing on this path can
+    /// which is after its record is committed. Nothing on this path can
     /// acknowledge a payment the disk does not hold.
     async fn credit(&self, request: &AdmitCertificateRequest) -> AdmitCertificateResponse {
         let outcome = match self.endpoint().await {
@@ -3014,17 +3078,6 @@ impl WorkHandler for WorkService {
         Ok(self.accept(&request).await)
     }
 
-    async fn upload_content(
-        &self,
-        request: hellas_rpc::pb::work::UploadContentRequest,
-        context: TransportContext,
-    ) -> Result<
-        impl Into<hellas_rpc::call::WithTrailer<hellas_rpc::pb::work::UploadContentResponse>> + Send,
-        WireStatus,
-    > {
-        self.upload(&request, &context).await
-    }
-
     async fn stream_result(
         &self,
         request: StreamResultRequest,
@@ -3069,7 +3122,7 @@ pub struct JobProposal {
 #[derive(Debug, thiserror::Error)]
 pub enum ProposeError {
     #[error(transparent)]
-    Content(#[from] crate::content::ContentError),
+    Content(#[from] hellas_store::content::Error),
     /// The shared client endpoint is unavailable.
     #[error(transparent)]
     Endpoint(#[from] EndpointError),
@@ -3174,7 +3227,13 @@ impl ClientEndpoint {
     pub fn retained_content(
         &self,
         work_id: Digest,
-    ) -> Result<Option<crate::content::InvocationContent>, WorkStoreError> {
+    ) -> Result<
+        Option<(
+            hellas_store::content::LocalStore,
+            hellas_store::content::Scope,
+        )>,
+        WorkStoreError,
+    > {
         self.store.recoverable_content(work_id)
     }
 
@@ -3198,10 +3257,16 @@ impl ClientEndpoint {
     /// proposal, [`ProposeError::Conflict`] when a different proposal is
     /// outstanding, and the record, readiness, and journal errors the
     /// proposal itself raises.
-    pub async fn propose(
+    async fn propose_owned(
         &mut self,
         proposal: &JobProposal,
+        content: &(
+            hellas_store::content::LocalStore,
+            hellas_store::content::Scope,
+        ),
+        cancellation: &admission::Cancellation,
     ) -> Result<AcceptWorkRequest, ProposeError> {
+        self.store.check_authority()?;
         if let Some(observation) = &self.observation {
             observation.check()?;
         }
@@ -3227,19 +3292,12 @@ impl ClientEndpoint {
             if rebuilt != retained {
                 continue;
             }
-            let request = wire_request(
-                &retained,
-                job.client_signature(),
-                job.prepared_input().to_vec(),
-            );
-            let id = job.work_id();
-            retry = Some((id, request));
+            retry = Some(job.work_id());
             break;
         }
 
-        if let Some((id, request)) = retry {
-            self.mark_proposal_pending(id).await?;
-            return Ok(request);
+        if let Some(id) = retry {
+            return self.resume_proposal(id).await;
         }
 
         if self.state().job_book().pending_proposal().is_some() {
@@ -3282,18 +3340,87 @@ impl ClientEndpoint {
             .map_err(PaidWorkError::from)?;
         let work_id = work_id(self.state().channel(), &authorization);
 
-        let signature = self.signer.sign(signing_hash(work_id));
+        let result = async {
+            // Keep this preparation polled until its Core effects have handed
+            // ownership back, then cancel before creating a signed proposal.
+            self.retain_proposal(work_id, &authorization, &proposal.prepared_input, content)
+                .await?;
+            if cancellation.is_cancelled() {
+                return Err(ProposeError::Content(hellas_store::content::Error::Denied));
+            }
+            let signature = self.signer.sign(signing_hash(work_id));
+            self.store
+                .commit(
+                    ChannelRecord::JobProposed {
+                        authorization,
+                        client_signature: signature,
+                        prepared_input: prepared_input.clone().into(),
+                        retained_tree: None,
+                    },
+                    &Secp256k1Verifier::new(),
+                )
+                .await?;
+            Ok(wire_request(&authorization, signature, prepared_input))
+        }
+        .await;
+        if result.is_err()
+            && self.store.check_authority().is_ok()
+            && self.state().job_by_id(work_id).is_none()
+            && let Ok((_, scope)) = self.store.invocation_content(work_id)
+            && let hellas_store::content::ScopeKind::Work { reservation, .. } = scope.kind
+        {
+            // The owned endpoint writer excludes any successor until cleanup
+            // finishes. An ambiguous journal write instead stays for replay.
+            self.store
+                .discard_unaccepted_content(work_id, reservation)
+                .await?;
+        }
+        result
+    }
+
+    #[cfg(test)]
+    async fn propose(
+        &mut self,
+        proposal: &JobProposal,
+        content: &(
+            hellas_store::content::LocalStore,
+            hellas_store::content::Scope,
+        ),
+    ) -> Result<AcceptWorkRequest, ProposeError> {
+        self.propose_owned(proposal, content, &admission::Cancellation::new())
+            .await
+    }
+
+    /// Load a retained input without retaining its encoded transcript as well.
+    pub async fn load_retained_input(&mut self, work: Digest) -> Result<(), WorkStoreError> {
+        self.store.load_retained_input(work).await
+    }
+
+    /// Load a retained transcript after rechecking the caller's original input.
+    pub async fn load_retained_transcript(
+        &mut self,
+        work: Digest,
+        input: &PreparedInvocation,
+    ) -> Result<(), WorkStoreError> {
+        let job = self
+            .state()
+            .job_by_id(work)
+            .ok_or(ChannelStateError::Malformed)?;
+        let policy = hellas_rpc::protocol::invocation::InvocationPolicy::from_canonical_bytes(
+            input.application_policy.as_bytes(),
+        )
+        .map_err(PaidWorkError::from)
+        .map_err(ChannelStateError::from)?;
+        let facts = crate::job::check_paid_input(
+            self.state().channel(),
+            job.authorization(),
+            &policy,
+            input,
+        )
+        .map_err(ChannelStateError::from)?;
         self.store
-            .commit(
-                ChannelRecord::JobProposed {
-                    authorization,
-                    client_signature: signature,
-                    prepared_input: prepared_input.clone(),
-                },
-                &Secp256k1Verifier::new(),
-            )
-            .await?;
-        Ok(wire_request(&authorization, signature, prepared_input))
+            .load_retained_transcript(work, facts.max_spool_bytes, false)
+            .await
     }
 
     /// Resend a half-signed proposal exactly as journaled, including the
@@ -3306,6 +3433,7 @@ impl ClientEndpoint {
         &mut self,
         work_id: Digest,
     ) -> Result<AcceptWorkRequest, ProposeError> {
+        self.store.load_retained_content(work_id).await?;
         let job = self
             .state()
             .job_by_id(work_id)
@@ -3408,6 +3536,8 @@ impl ClientEndpoint {
                 ChannelRecord::JobAccepted {
                     work_id,
                     provider_signature: signature,
+
+                    retained_tree: None,
                 },
                 &Secp256k1Verifier::new(),
             )
@@ -3484,6 +3614,7 @@ impl ClientEndpoint {
         work_id: Digest,
         ready: &ReadyChannel,
         delivered: &ResultTranscript,
+        input: &PreparedInvocation,
     ) -> Result<Delivery, DeliverError> {
         bind(ready, &self.store, &self.signer, Role::Client)?;
         let job = self
@@ -3509,20 +3640,23 @@ impl ClientEndpoint {
         let signature = signature(&delivered.provider_signature)
             .ok_or(DeliverError::Malformed("provider signature"))?;
         self.store
-            .commit(
+            .commit_with_input(
                 ChannelRecord::JobResult {
                     work_id,
                     result,
                     provider_signature: signature,
-                    transcript: delivered.transcript.clone(),
+                    transcript: delivered.transcript.clone().into(),
+
+                    retained_tree: None,
                 },
+                Some(input),
                 &Secp256k1Verifier::new(),
             )
             .await?;
         Ok(Delivery {
             result,
             signature,
-            transcript: delivered.transcript.clone(),
+            transcript: delivered.transcript.clone().into(),
         })
     }
 
@@ -3563,13 +3697,18 @@ impl ClientEndpoint {
 
     /// Durably records authenticated invocation verification before payment.
     /// The store rechecks the exact input, signed output and stop rule.
-    pub async fn verified(&mut self, work_id: Digest) -> Result<(), DeliverError> {
+    pub async fn verified(
+        &mut self,
+        work_id: Digest,
+        input: &PreparedInvocation,
+    ) -> Result<(), DeliverError> {
         self.state()
             .job_by_id(work_id)
             .ok_or(DeliverError::NoSuchJob)?;
         self.store
-            .commit(
+            .commit_with_input(
                 ChannelRecord::ResultVerified { work_id },
+                Some(input),
                 &Secp256k1Verifier::new(),
             )
             .await?;
@@ -3741,8 +3880,8 @@ impl ClientEndpoint {
 /// transport.
 ///
 /// The order is the durability rule at its last step: the certificate
-/// is fsynced by [`ClientEndpoint::pay`] before the request is built,
-/// and the provider fsyncs its own copy before the answer this reads is
+/// is committed by [`ClientEndpoint::pay`] before the request is built,
+/// and the provider commits its own copy before the answer this reads is
 /// produced. A transport fault leaves a durable, unsent payment;
 /// calling this again re-sends exactly those bytes.
 ///
@@ -3757,7 +3896,7 @@ pub async fn admit_payment<T>(
     work_id: Digest,
 ) -> Result<u64, PaymentError>
 where
-    T: StreamTransport + Sync,
+    T: StreamTransport + Clone + Send + Sync,
     T::Error: std::error::Error + Send + Sync + 'static,
     T::Stream: 'static,
 {
@@ -3776,21 +3915,24 @@ where
 /// # Errors
 ///
 /// [`ProposeError::Transport`] when the call does not complete, and
-/// whatever [`ClientEndpoint::propose`] or [`ClientEndpoint::accepted`]
+/// whatever [`ClientService::propose`] or [`ClientEndpoint::accepted`]
 /// raises.
 pub async fn propose_work<T>(
     transport: T,
-    endpoint: &mut impl ClientChannel,
+    endpoint: &mut ClientService,
     proposal: &JobProposal,
-    content: &crate::content::InvocationContent,
+    content: &(
+        hellas_store::content::LocalStore,
+        hellas_store::content::Scope,
+    ),
 ) -> Result<Digest, ProposeError>
 where
-    T: StreamTransport + Sync,
+    T: StreamTransport + Clone + Send + Sync,
     T::Error: std::error::Error + Send + Sync + 'static,
     T::Stream: 'static,
 {
-    let request = endpoint.client().await?.propose(proposal).await?;
-    upload::send_proposal(transport, endpoint, request, content).await
+    let request = endpoint.propose(proposal, content).await?;
+    content::transfer_proposal(transport, endpoint, request, content).await
 }
 
 /// Resend a retained proposal over a live transport and journal its answer.
@@ -3802,15 +3944,18 @@ pub async fn resume_work_proposal<T>(
     transport: T,
     endpoint: &mut impl ClientChannel,
     work_id: Digest,
-    content: &crate::content::InvocationContent,
+    content: &(
+        hellas_store::content::LocalStore,
+        hellas_store::content::Scope,
+    ),
 ) -> Result<Digest, ProposeError>
 where
-    T: StreamTransport + Sync,
+    T: StreamTransport + Clone + Send + Sync,
     T::Error: std::error::Error + Send + Sync + 'static,
     T::Stream: 'static,
 {
     let request = endpoint.client().await?.resume_proposal(work_id).await?;
-    upload::send_proposal(transport, endpoint, request, content).await
+    content::transfer_proposal(transport, endpoint, request, content).await
 }
 
 // ── Wire shapes ───────────────────────────────────────────────────────

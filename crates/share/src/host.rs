@@ -29,6 +29,7 @@ pub struct OpenAiProviderOptions<R> {
     pub root: Arc<R>,
     /// Process home; the SDK derives chain-agnostic grant state beneath it.
     pub home: StoreLocation,
+    pub content: hellas_store::content::DiskStore,
     pub service: String,
     pub method: String,
     pub bearer_token: String,
@@ -80,6 +81,7 @@ where
         enrollment: options.enrollment.clone(),
         root: options.root.clone(),
         home: options.home.clone(),
+        content: options.content.clone(),
         routes,
         grants: Some(GrantProviderOptions {
             configuration: hellas_authority::model::grant::configuration::NodeConfiguration::new(

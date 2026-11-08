@@ -1,10 +1,10 @@
 use super::{compile, validate};
 use catena_lang::{codegen::GpuDialect, runtime::RuntimeModule};
-use hellas_channel::content::InvocationContent;
 use hellas_rpc::{
     ContentId, ContentRef,
     protocol::invocation::{Limits, PreparedInvocation, compute::*},
 };
+use hellas_store::content::{LocalStore, Scope, ScopeKind, VerifiedReader};
 use std::{collections::BTreeMap, path::Path};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -15,32 +15,19 @@ pub struct BoundProgram {
     manifest: ContentId,
 }
 impl BoundProgram {
-    pub fn compile(
-        content: &InvocationContent,
+    /// Open every asset through current pin policy before entering synchronous GPU code.
+    /// These owned readers also authorize GPU cache hits.
+    pub async fn open(
+        content: &(LocalStore, Scope),
         prepared: &PreparedInvocation,
         limits: &Limits,
-        executable: &Path,
-        dialect: GpuDialect,
-    ) -> Result<Self> {
-        Self::compile_cancellable(
-            content,
-            prepared,
-            limits,
-            executable,
-            &super::Cancellation::default(),
-            dialect,
-        )
-    }
-    pub fn compile_cancellable(
-        content: &InvocationContent,
-        prepared: &PreparedInvocation,
-        limits: &Limits,
-        executable: &Path,
-        cancel: &super::Cancellation,
-        dialect: GpuDialect,
-    ) -> Result<Self> {
+    ) -> Result<(
+        Environment,
+        Vec<String>,
+        BTreeMap<ContentId, VerifiedReader>,
+    )> {
         prepared.validate()?;
-        if prepared.request.retain != (content.retention() == hellas_rpc::Retention::Retain) {
+        if prepared.request.retain != (content.0.retention() == hellas_rpc::Retention::Retain) {
             return Err("compute content retention differs from the signed request".into());
         }
         let manifest = prepared.manifest()?;
@@ -49,7 +36,25 @@ impl BoundProgram {
         {
             return Err("unsupported compute evaluator".into());
         }
-        let root = content.read_bounded(manifest.root(), MAX_ENVIRONMENT_BYTES as u64)?;
+        let root = if let ScopeKind::Work { closure, .. } = &content.1.kind {
+            let object = closure
+                .iter()
+                .find(|object| object.id() == manifest.root())
+                .copied()
+                .ok_or("missing compute root reference")?;
+            if object.bytes() > MAX_ENVIRONMENT_BYTES as u64 {
+                return Err("compute root exceeds byte limit".into());
+            }
+            content
+                .0
+                .preflight(&content.1, object)
+                .await?
+                .ok_or("missing compute root")?
+                .read_all(object, &content.0.ram_pool())
+                .await?
+        } else {
+            hellas_channel::content::root(&content.0, &content.1, manifest.root()).await?
+        };
         let environment = Environment::from_canonical_bytes(&root)?;
         if environment.manifest()?.content_id() != manifest.content_id() {
             return Err("compute environment identity mismatch".into());
@@ -61,17 +66,48 @@ impl BoundProgram {
             .iter()
             .map(|a| (a.name.clone(), ContentRef::for_bytes(a.bytes.as_bytes())))
             .collect();
-        validate::preflight(&environment, &inputs, &plan, limits, content)?;
-        let sources = environment
-            .sources
+        validate::preflight(&environment, &inputs, &plan, limits)?;
+        let mut sources = Vec::new();
+        for object in &environment.sources {
+            let bytes = content
+                .0
+                .preflight(&content.1, *object)
+                .await?
+                .ok_or("missing compute source")?
+                .read_all(*object, &content.0.ram_pool())
+                .await?;
+            sources.push(std::str::from_utf8(&bytes)?.to_owned());
+        }
+        let mut readers = BTreeMap::new();
+        for asset in &environment.assets {
+            let reader = content
+                .0
+                .preflight(&content.1, asset.object)
+                .await?
+                .ok_or("missing compute asset")?;
+            readers.insert(asset.object.id(), reader);
+        }
+        Ok((environment, sources, readers))
+    }
+    pub fn compile_cancellable(
+        environment: Environment,
+        sources: Vec<String>,
+        prepared: &PreparedInvocation,
+        limits: &Limits,
+        executable: &Path,
+        cancel: &super::Cancellation,
+        dialect: GpuDialect,
+    ) -> Result<Self> {
+        let manifest = prepared.manifest()?;
+        let plan = Plan::from_canonical_bytes(prepared.input.parameters.as_bytes())?;
+        let inputs = prepared
+            .input
+            .artifacts
             .iter()
-            .map(|object| {
-                let bytes = content.read(*object)?;
-                Ok(std::str::from_utf8(&bytes)?.to_owned())
-            })
-            .collect::<Result<Vec<_>>>()?;
+            .map(|a| (a.name.clone(), ContentRef::for_bytes(a.bytes.as_bytes())))
+            .collect();
         let module = compile::compile_cancellable(&sources, executable, cancel, dialect)?;
-        validate::validate(&module, &environment, &inputs, &plan, limits, content)?;
+        validate::validate(&module, &environment, &inputs, &plan, limits)?;
         Ok(Self {
             environment,
             module,

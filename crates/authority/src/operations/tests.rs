@@ -12,6 +12,7 @@ fn documented_operations_match_the_mounted_permission_table() {
         OperationId::new(op.name).unwrap();
         let resource = match op.scope {
             Scope::Host => "Host",
+            Scope::Pin => "Exact content pin; Host for owner",
             Scope::Machine => "Work machine",
             Scope::Allowance => "Selected allowance",
         };

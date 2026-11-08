@@ -210,6 +210,22 @@ pub trait RecvHalf:
 // streaming flags, request/response types) so call sites never spell wire
 // names as strings.
 
+/// Default maximum unconsumed body bytes per direction per stream.
+///
+/// A body is atomic at the RPC layer, so the window is also the maximum
+/// body-frame size. Keeping those as one value makes it impossible to
+/// configure a body that can never acquire enough credit to be sent.
+pub const DEFAULT_STREAM_WINDOW: u32 = 1024 * 1024; // 1 MiB
+
+/// Usable body size shared by paged protocols and their raw codecs.
+pub const fn body_limit() -> usize {
+    if (DEFAULT_STREAM_WINDOW as usize) < crate::frame::MAX_FRAME_BYTES {
+        DEFAULT_STREAM_WINDOW as usize
+    } else {
+        crate::frame::MAX_FRAME_BYTES
+    }
+}
+
 /// Compile-time identity of a proto service. The build script emits one
 /// implementor per `service` block.
 pub trait ServiceMarker {
@@ -219,6 +235,8 @@ pub trait ServiceMarker {
     const ALPN: &'static str;
     /// Truncated 32-bit service id (Xet hash of schema, low 4 bytes LE).
     const SERVICE_ID: u32;
+    /// Raw protobuf body bound, checked before decoding.
+    const MAX_BODY_BYTES: usize = crate::frame::MAX_FRAME_BYTES;
 }
 
 /// Compile-time identity of a proto rpc method. The build script emits one

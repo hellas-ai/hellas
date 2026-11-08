@@ -25,8 +25,8 @@ let
   serveRuntimePaths = [
     cfg.serve.home
   ]
-  ++ cfg.serve.content
-  ++ cfg.serve.contentRoots
+  ++ (cfg.serve.content.lower or [ ])
+  ++ lib.optional (cfg.serve.content ? upper) cfg.serve.content.upper
   ++ lib.optional (cfg.serve.workConfigFile != null) cfg.serve.workConfigFile
   ++ lib.optional (cfg.serve.chainConfig != null) cfg.serve.chainConfig
   ++ lib.optional (cfg.serve.grantConfigFile != null) cfg.serve.grantConfigFile
@@ -44,7 +44,7 @@ let
     "${cfg.package}/bin/hellas"
   ]
   ++ hellas.mkServeArgs {
-    inherit lib;
+    inherit lib pkgs;
     inherit (cfg) serve otel;
   };
   serveProgramArguments =

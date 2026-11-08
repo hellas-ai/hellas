@@ -53,6 +53,12 @@ impl ReadDirectory {
     }
 
     pub fn read(&self, relative: &Path, maximum: usize) -> io::Result<Vec<u8>> {
+        read_bounded(self.open_file(relative)?, maximum)
+    }
+
+    /// Open an owned regular-file descriptor through this held directory,
+    /// refusing symlinks/reparse points in every relative path component.
+    pub fn open_file(&self, relative: &Path) -> io::Result<std::fs::File> {
         use std::path::Component;
         let spelling = relative.to_str().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 relative path")
@@ -133,12 +139,12 @@ impl ReadDirectory {
                 }
                 parents.push(handle);
             };
-            // Retain every parent until the selected file has been opened and read.
-            return read_bounded(file, maximum);
+            // The selected descriptor pins the file after this checked walk.
+            return Ok(file);
         };
         #[cfg(unix)]
         {
-            read_bounded(file, maximum)
+            Ok(file)
         }
     }
 }

@@ -242,6 +242,7 @@ hellas-kernel = { workspace = true, features = ["test-support"] }
 # consensus is asked to accept. As a runtime dependency `hellas-rpc`
 # arrives without the work protocol; the settlement suite needs it.
 hellas-rpc = { workspace = true, features = ["work"] }
+hellas-store.workspace = true
 serde = { workspace = true, features = ["derive"] }
 sha2.workspace = true
 tempfile = "3"

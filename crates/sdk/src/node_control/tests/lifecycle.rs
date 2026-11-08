@@ -30,6 +30,7 @@ impl Harness {
         let socket = f.directory.path().join("host.sock");
         let forbidden_journal = f.directory.path().join("unused-provider-directory");
         let enrollment = crate::test_support::provider_enrollment();
+        let content = f.content.clone();
         let starting = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(Semaphore::new(0));
         let starts = Arc::new(AtomicUsize::new(0));
@@ -42,6 +43,7 @@ impl Harness {
                 enrollment.clone(),
                 forbidden_journal.clone(),
             );
+            let content = content.clone();
             let prepares = invocations.clone();
             let calls = invocations.clone();
             host::ProviderFactory {
@@ -53,6 +55,7 @@ impl Harness {
                 }),
                 start: Arc::new(move |control: Option<NodeControl>| {
                     calls.fetch_add(1, Ordering::SeqCst);
+                    let content = content.clone();
                     let (starting, release, starts, enrollment, forbidden_journal) = (
                         starting.clone(),
                         release.clone(),
@@ -79,6 +82,7 @@ impl Harness {
                                 root: Arc::new(
                                     hellas_channel::test_support::actors::PROVIDER.node_key(),
                                 ),
+                                content,
                                 home: location,
                                 grants: Some(crate::GrantProviderOptions {
                                     configuration: Default::default(),
@@ -103,6 +107,7 @@ impl Harness {
             }
         };
         let host = HostHandle::start(HostOptions {
+            content,
             transport: Some(
                 host::bind_transport(
                     SecretKey::from_bytes(&[5; 32]),
@@ -226,9 +231,11 @@ async fn unbound_fixture() -> Fixture {
     .await
     .unwrap();
     let node = NodeCoordinator::new(store, Arc::new(|| UnixMillis(1000)));
+    let content = hellas_authority::test_support::content_store(directory.path()).await;
     Fixture {
-        service: NodeControl::new(node.clone()),
+        service: NodeControl::new(node.clone()).with_content_store(content.clone()),
         directory,
+        content,
         node,
         secret,
     }
@@ -519,7 +526,7 @@ async fn provider_restart_retains_the_host_control_writer() {
                 &location,
                 hellas_channel::test_support::network(),
                 Some(crate::test_support::provider_enrollment()),
-                UnixMillis(1000)
+                UnixMillis(1000),
             )
             .await,
             hellas_authority::work_store::grant::NodeStoreError::Journal(
@@ -576,6 +583,8 @@ async fn controlled_host(
     let (tls, client_tls) = tls_configs();
     let socket = directory.join("control.sock");
     let host = HostHandle::start(HostOptions {
+        content: hellas_authority::test_support::content_store(&directory.join("host-content"))
+            .await,
         transport: None,
         start_provider: false,
         control: Some((
@@ -678,6 +687,10 @@ async fn deferred_gateway_loads_only_on_first_enable_and_reuses_validated_access
     let socket = world.root.path().join("deferred-control.sock");
     let host = HostHandle::start_with_deferred_gateway(
         HostOptions {
+            content: hellas_authority::test_support::content_store(
+                &world.root.path().join("host-content"),
+            )
+            .await,
             transport: None,
             start_provider: false,
             control: Some((

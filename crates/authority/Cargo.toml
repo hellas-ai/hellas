@@ -10,7 +10,6 @@ documentation.workspace = true
 [features]
 test-support = [
     "hellas-channel/test-support",
-    "dep:bytes",
     "hellas-auth/test-support",
     "hellas-wire/mux",
 ]
@@ -20,7 +19,7 @@ async-stream.workspace = true
 async-trait = "0.1"
 base64.workspace = true
 brotli = "9"
-bytes = { workspace = true, optional = true }
+bytes.workspace = true
 flate2 = "1"
 futures.workspace = true
 getrandom = "0.4"
@@ -53,4 +52,5 @@ zstd = "0.14"
 bytes.workspace = true
 hellas-authority = { workspace = true, features = ["test-support"] }
 hellas-wire = { workspace = true, features = ["mux"] }
+iroh = { workspace = true, features = ["tls-ring"] }
 proptest = "1.11"

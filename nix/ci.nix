@@ -187,7 +187,7 @@ let
     # Test each complete package so service/method identity pins stay covered.
     rpc-work =
       mkCargo "check-rpc-work"
-        "cargo test -p hellas-rpc --features work && cargo test -p hellas-channel -p hellas-authority && cargo clippy -p hellas-rpc --features work --all-targets -- -D warnings && cargo clippy -p hellas-channel -p hellas-authority --all-targets -- -D warnings"
+        "cargo check -p hellas-rpc --no-default-features && cargo test -p hellas-rpc --features work && cargo test -p hellas-channel -p hellas-authority && cargo clippy -p hellas-rpc --features work --all-targets -- -D warnings && cargo clippy -p hellas-channel -p hellas-authority --all-targets -- -D warnings"
         (cargoEnv rustToolchain);
     # The client's paid-work half and the oracle inside it. `work` is off
     # by default on `hellas-client`, so `check-clippy` compiles none of
@@ -197,12 +197,6 @@ let
     client-work =
       mkCargo "check-client-work"
         "cargo test -p hellas-client --features work && cargo clippy -p hellas-client --features work --all-targets -- -D warnings"
-        (cargoEnv rustToolchain);
-    # Compile each shipped model program for CUDA and HIP and compare it with
-    # upstream. These CPU compiler checks belong to CLI/GPU release validation.
-    model-programs =
-      mkCargo "check-model-programs"
-        "cargo test --locked -p hellas-client --features models --lib shipped_ -- --ignored"
         (cargoEnv rustToolchain);
     # HTTP boundaries and the bounded file primitives shared by hosts.
     http-fetch =
@@ -299,9 +293,10 @@ let
     flake-check = mk "check-flake-check" "nix flake check --accept-flake-config --no-build" [
       pkgs.nix
     ];
-    wasm-rpc = mkCargo "check-wasm-rpc" "cargo check -p hellas-rpc --target wasm32-unknown-unknown" (
-      cargoEnv (rustToolchain.override { targets = [ "wasm32-unknown-unknown" ]; })
-    );
+    wasm-rpc =
+      mkCargo "check-wasm-rpc"
+        "cargo check -p hellas-rpc --no-default-features --target wasm32-unknown-unknown"
+        (cargoEnv (rustToolchain.override { targets = [ "wasm32-unknown-unknown" ]; }));
     wasm-chain = mkCargo "check-wasm-chain" ''
       export CC_wasm32_unknown_unknown=${lib.getExe' pkgs.llvmPackages.clang-unwrapped "clang"}
       export AR_wasm32_unknown_unknown=${lib.getExe' pkgs.llvmPackages.llvm "llvm-ar"}

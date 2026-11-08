@@ -31,6 +31,7 @@ async fn verified_usage_survives_error_status_and_late_settlement_without_faulti
             backend.clone(),
             vec![],
             clock.source(),
+            crate::test_support::content_store(dir.path()).await,
         )
         .unwrap();
         let (work_service, _) =

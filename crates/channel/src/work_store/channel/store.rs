@@ -1,20 +1,56 @@
 use super::*;
 use hellas_private::StoreLocation;
 
+type ContentEntry = (
+    hellas_store::content::LocalStore,
+    hellas_store::content::Scope,
+    Option<([u8; 32], bool)>,
+);
+
 /// The durable channel journal: the state above and the file it is
 /// replayed from.
-#[derive(Debug)]
 pub struct ChannelStore {
     journal: Journal,
-    state: Channel,
-    contents: BTreeMap<Digest, crate::content::InvocationContent>,
-    pub(crate) uploads: crate::content::UploadStore,
+    pub(super) state: Channel,
+    pub(crate) contents: BTreeMap<Digest, ContentEntry>,
+    pub(super) content: hellas_store::content::DiskStore,
+}
+
+impl std::fmt::Debug for ChannelStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChannelStore")
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ChannelStore {
-    /// Release the journal before another owner opens it.
-    pub async fn close(&mut self) {
+    /// Finish provider unaccepted content cleanup and release the journal writer.
+    /// The host must first stop observers and execution; retained roots stay pinned.
+    pub async fn close(&mut self) -> Result<(), WorkStoreError> {
+        let pending = self
+            .contents
+            .iter()
+            .filter(|_| self.state.role == Role::Provider)
+            .filter_map(|(work, (_, scope, _))| {
+                if let hellas_store::content::ScopeKind::Work { reservation, .. } = scope.kind {
+                    Some((*work, reservation))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut result = Ok(());
+        for (work, reservation) in pending {
+            result = result.and(self.discard_unaccepted_content(work, reservation).await);
+        }
         self.journal.close().await;
+        result
+    }
+
+    pub(crate) fn check_authority(&self) -> Result<(), WorkStoreError> {
+        self.journal.check_authority()?;
+        Ok(())
     }
 
     /// Opens one channel's journal, replaying and re-checking every
@@ -51,13 +87,21 @@ impl ChannelStore {
         settlement: WorkPaymentSettlement,
         role: Role,
         origin: SetupOrigin,
-        content: hellas_store::ContentStore,
+        content: hellas_store::content::DiskStore,
         verifier: &V,
     ) -> Result<Self, WorkStoreError> {
         Self::open_inner(
-            root, channel, settlement, role, origin, content, verifier, false,
+            root,
+            channel,
+            Some(settlement),
+            role,
+            Some(origin),
+            content,
+            verifier,
+            false,
         )
-        .await
+        .await?
+        .ok_or_else(|| ChannelStateError::Malformed.into())
     }
 
     /// Replays an initialized channel without creating an empty replacement.
@@ -68,27 +112,55 @@ impl ChannelStore {
         settlement: WorkPaymentSettlement,
         role: Role,
         origin: SetupOrigin,
-        content: hellas_store::ContentStore,
+        content: hellas_store::content::DiskStore,
         verifier: &V,
     ) -> Result<Self, WorkStoreError> {
         Self::open_inner(
-            root, channel, settlement, role, origin, content, verifier, true,
+            root,
+            channel,
+            Some(settlement),
+            role,
+            Some(origin),
+            content,
+            verifier,
+            true,
         )
-        .await
+        .await?
+        .ok_or_else(|| ChannelStateError::Malformed.into())
+    }
+
+    /// Recover the journal's initialized funding binding without a chain read.
+    /// Missing journals and empty pre-initialization headers carry no channel effects.
+    pub async fn recover<V: SigVerifier>(
+        root: &StoreLocation,
+        channel: PaidChannel,
+        role: Role,
+        content: hellas_store::content::DiskStore,
+        verifier: &V,
+    ) -> Result<Option<Self>, WorkStoreError> {
+        match Self::open_inner(root, channel, None, role, None, content, verifier, true).await {
+            Err(WorkStoreError::Journal(JournalError::Missing { .. })) => Ok(None),
+            result => result,
+        }
+    }
+
+    pub fn journal_key(channel: &PaidChannel) -> [u8; 32] {
+        channel_key(channel).into_bytes()
     }
 
     #[allow(clippy::too_many_arguments)]
     async fn open_inner<V: SigVerifier>(
         root: &StoreLocation,
         channel: PaidChannel,
-        settlement: WorkPaymentSettlement,
+        settlement: Option<WorkPaymentSettlement>,
         role: Role,
-        origin: SetupOrigin,
-        content: hellas_store::ContentStore,
+        origin: Option<SetupOrigin>,
+        content: hellas_store::content::DiskStore,
         verifier: &V,
         existing: bool,
-    ) -> Result<Self, WorkStoreError> {
-        if origin.payment_edge != channel.payment_edge() {
+    ) -> Result<Option<Self>, WorkStoreError> {
+        content.claim_work().await?;
+        if origin.is_some_and(|origin| origin.payment_edge != channel.payment_edge()) {
             return Err(ChannelStateError::WrongChannel {
                 field: "setup origin payment_edge",
             }
@@ -102,42 +174,34 @@ impl ChannelStore {
             role,
             key,
         };
-        let (journal, replay) = if existing {
+        let (mut journal, replay) = if existing {
             Journal::open_existing(root, &stem, id).await?
         } else {
             Journal::open_latest(root, &stem, id).await?
         };
-        let mut uploads = crate::content::UploadStore::durable(root, &stem, channel.id(), content)?;
         let mut state = match &replay.checkpoint {
-            Some(bytes) => Channel::from_checkpoint(bytes, channel, settlement, role, verifier)?,
-            None => Channel::new(channel, settlement, role, origin),
+            Some(bytes) => {
+                let settlement = match settlement {
+                    Some(settlement) => settlement,
+                    None => Channel::checkpoint_settlement(bytes, &channel)?,
+                };
+                Channel::from_checkpoint(bytes, channel, settlement, role, verifier)?
+            }
+            None if !replay.records.is_empty() => return Err(ChannelStateError::Malformed.into()),
+            None => {
+                let Some(settlement) = settlement else {
+                    return Ok(None);
+                };
+                let origin = origin.ok_or(ChannelStateError::Malformed)?;
+                let state = Channel::new(channel, settlement, role, origin);
+                // Persist the actual funding binding before any channel effect.
+                journal.rotate(&state.checkpoint_for_storage()).await?;
+                state
+            }
         };
         for bytes in &replay.records {
             let record = ChannelRecord::decode(bytes)?;
             state.apply(&record, verifier, true)?;
-        }
-        // Acceptance is durable before promotion. Recover that gap before deadline GC.
-        for job in state.book.jobs.values_mut() {
-            if job.authorization.retention == hellas_rpc::Retention::Retain {
-                let reference = job.authorization.input_content;
-                let input =
-                    match uploads.read(job.work_id, reference, hellas_rpc::Retention::Retain) {
-                        Ok(input) => input,
-                        Err(crate::content::ContentError::Missing)
-                            if job.phase == JobPhase::HalfSigned =>
-                        {
-                            continue;
-                        }
-                        Err(error) => return Err(error.into()),
-                    };
-                if job.provider_signature.is_some() {
-                    uploads.publish_accepted(job.work_id, &input, hellas_rpc::Retention::Retain)?;
-                }
-                job.prepared_input = input;
-                if let Some((result, _)) = &job.result {
-                    job.transcript = uploads.retained(result.transcript_content)?;
-                }
-            }
         }
         state.book.indeterminate = state
             .book
@@ -150,7 +214,7 @@ impl ChannelStore {
         let mut store = Self {
             journal,
             state,
-            uploads,
+            content,
             contents: BTreeMap::new(),
         };
         // A journal reopened past a deadline must not keep an active job the
@@ -165,177 +229,9 @@ impl ChannelStore {
                 .commit(ChannelRecord::JobTerminated { work_id, outcome }, verifier)
                 .await?;
         }
+        store.restore_content().await?;
         store.release_unresumable_proposal(verifier).await?;
-        store.gc_uploads()?;
-        Ok(store)
-    }
-
-    pub(crate) fn remember_content(
-        &mut self,
-        work: Digest,
-        content: crate::content::InvocationContent,
-    ) {
-        self.contents.insert(work, content);
-    }
-    pub(crate) fn invocation_content(
-        &self,
-        work: Digest,
-        policy: &InvocationPolicy,
-    ) -> Result<crate::content::InvocationContent, WorkStoreError> {
-        if let Some(content) = self.contents.get(&work) {
-            return Ok(content.clone());
-        }
-        let job = self
-            .state
-            .job_by_id(work)
-            .ok_or(ChannelStateError::Malformed)?;
-        let input = PreparedInvocation::from_canonical_bytes(
-            job.prepared_input(),
-            crate::content::MAX_CONTENT_BYTES,
-        )
-        .map_err(PaidWorkError::from)
-        .map_err(ChannelStateError::from)?;
-        let manifest = input
-            .manifest()
-            .map_err(PaidWorkError::from)
-            .map_err(ChannelStateError::from)?;
-        let root = self
-            .uploads
-            .root(work, manifest.root(), job.authorization().retention)?;
-        let objects = crate::job::content_closure(
-            policy,
-            &manifest,
-            &root,
-            job.authorization().input_content,
-        )
-        .map_err(ChannelStateError::from)?;
-        Ok(self
-            .uploads
-            .invocation_content(work, &objects, job.authorization().retention)?)
-    }
-
-    /// Reconstructs the upload content a retained job still needs from what
-    /// this journal durably holds.
-    ///
-    /// `None` means the job is not a retained job, or its upload never
-    /// completed: the retention pass never recorded which objects this
-    /// client supplies, or one of those objects is not in the upload store.
-    /// Missing content is unresolved work, not an empty program, and a
-    /// caller must not treat it as one.
-    ///
-    /// The returned source holds exactly the objects the client retained.
-    /// Objects the provider already had when the proposal was sent are
-    /// absent from it and read as [`crate::content::ContentError::Missing`];
-    /// the upload probes the provider before every read, so a provider-held
-    /// object is never asked for locally.
-    ///
-    /// # Errors
-    ///
-    /// [`WorkStoreError`] when the prepared bundle does not parse or the
-    /// upload store reports something other than absence.
-    pub fn recoverable_content(
-        &self,
-        work: Digest,
-    ) -> Result<Option<crate::content::InvocationContent>, WorkStoreError> {
-        let Some(job) = self.state.job_by_id(work) else {
-            return Ok(None);
-        };
-        if job.authorization().retention != hellas_rpc::Retention::Retain
-            || job.prepared_input().is_empty()
-        {
-            return Ok(None);
-        }
-        let input = PreparedInvocation::from_canonical_bytes(
-            job.prepared_input(),
-            crate::content::MAX_CONTENT_BYTES,
-        )
-        .map_err(PaidWorkError::from)
-        .map_err(ChannelStateError::from)?;
-        let manifest = input
-            .manifest()
-            .map_err(PaidWorkError::from)
-            .map_err(ChannelStateError::from)?;
-        let policy = InvocationPolicy::from_canonical_bytes(input.application_policy.as_bytes())
-            .map_err(PaidWorkError::from)
-            .map_err(ChannelStateError::from)?;
-        // The ticket is written only after every client-supplied object is
-        // durable. Without it nothing establishes which objects the provider
-        // held, so the upload is unresolved rather than partially recovered.
-        let Some(retained) = self.uploads.retained_closure(work) else {
-            return Ok(None);
-        };
-        // The policy says whether an opening is required at all; a
-        // self-contained program (Fetch) has no root to recover. Anything
-        // else whose root is not retained is unfinished, never empty.
-        let program_root = if policy.content_closure(&manifest, &[]).is_ok() {
-            Vec::new()
-        } else {
-            match self
-                .uploads
-                .root(work, manifest.root(), hellas_rpc::Retention::Retain)
-            {
-                Ok(root) if !root.is_empty() => root,
-                Ok(_) | Err(crate::content::ContentError::Missing) => return Ok(None),
-                Err(error) => return Err(error.into()),
-            }
-        };
-        let objects = match crate::job::content_closure(
-            &policy,
-            &manifest,
-            &program_root,
-            job.authorization().input_content,
-        ) {
-            Ok(objects) => objects,
-            Err(_) => return Ok(None),
-        };
-        // A retained object outside this signed closure is a ticket for
-        // other bytes, not an upload this job can resume.
-        if retained.iter().any(|object| !objects.contains(object)) {
-            return Ok(None);
-        }
-        match self
-            .uploads
-            .invocation_content(work, &retained, hellas_rpc::Retention::Retain)
-        {
-            Ok(content) => Ok(Some(content)),
-            Err(crate::content::ContentError::Missing) => Ok(None),
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    /// Retains one content object beside a client's proposal.
-    ///
-    /// A retained proposal is resumed from the journal alone, so the bytes
-    /// its upload needs must outlive this process. The upload store is the
-    /// one durable content home the journal already has.
-    ///
-    /// # Errors
-    ///
-    /// [`crate::content::ContentError`] when the store cannot index the
-    /// bytes.
-    pub(crate) fn retain_upload(&self, bytes: &[u8]) -> Result<(), crate::content::ContentError> {
-        self.uploads.retain(bytes).map(|_| ())
-    }
-
-    /// Records the exact closure a retained proposal can re-send.
-    ///
-    /// The list is the client's share only: an object the provider already
-    /// held when the proposal was sent is not retained and is not listed.
-    /// Writing the ticket is what makes a half-signed job resumable after a
-    /// restart; before it exists, recovery has no evidence of the provider's
-    /// share and reports the upload unresolved.
-    ///
-    /// # Errors
-    ///
-    /// [`crate::content::ContentError`] when the upload store cannot record
-    /// the closure.
-    pub(crate) fn retain_closure(
-        &mut self,
-        work: Digest,
-        objects: &[hellas_rpc::ContentRef],
-        deadline: u64,
-    ) -> Result<(), crate::content::ContentError> {
-        self.uploads.retain_closure(work, objects, deadline)
+        Ok(Some(store))
     }
 
     /// Releases a pending proposal this journal can no longer send.
@@ -362,9 +258,7 @@ impl ChannelStore {
         let Some(job) = self.state.job_by_id(work_id) else {
             return Ok(());
         };
-        if job.phase() != JobPhase::HalfSigned
-            || (!job.prepared_input().is_empty() && self.recoverable_content(work_id)?.is_some())
-        {
+        if job.phase() != JobPhase::HalfSigned || self.recoverable_content(work_id)?.is_some() {
             return Ok(());
         }
         self.commit(
@@ -391,7 +285,10 @@ impl ChannelStore {
         work_id: Digest,
         bytes: Vec<u8>,
     ) -> Result<(), WorkStoreError> {
-        self.state.restore_client_input(work_id, bytes)?;
+        if self.state.role() != Role::Client {
+            return Err(ChannelStateError::Malformed.into());
+        }
+        self.state.restore_input(work_id, bytes.into())?;
         Ok(())
     }
 
@@ -424,140 +321,88 @@ impl ChannelStore {
     /// [`WorkStoreError::Channel`] when the step is not one this state
     /// may take — checked before anything is written — and
     /// [`WorkStoreError::Journal`] when an append or its sync fails.
-    pub async fn commit<V: SigVerifier>(
-        &mut self,
+    pub fn commit<'a, V: SigVerifier>(
+        &'a mut self,
         record: ChannelRecord,
         verifier: &V,
-    ) -> Result<&Channel, WorkStoreError> {
-        self.promote_accepted_content()?;
-        // Applied to a copy first: a record the rules refuse must leave
-        // neither the file nor the state touched. A cheap exact check
-        // first: the stream replay path offers a redundant release per
-        // emitted frame, and the copy would clone the whole transcript.
-        if self.state.is_redundant(&record) {
-            return Ok(&self.state);
-        }
-        let previous_jobs = self.state.jobs().count();
-        let mut next = self.state.clone();
-        // The `false` keeps commit-time validation at full strength even
-        // for a metadata-only journal: bodies are verified — digest and
-        // transcript-to-result authentication — before they are stripped
-        // from the bytes written. Only replay and checkpoint validation
-        // downgrade for body-less records.
-        if next.apply(&record, verifier, false)? == Applied::Changed {
-            // The signature this record carries leaves after this
-            // returns, so the state that authorises it has to be one a
-            // rotation can still carry. The proposed job is charged the
-            // fixed tail it can still add — the result it will be
-            // answered with and the terminal that pays for it — because
-            // by then there is no refusal left that costs nothing.
-            if let Some(tail) = record.checkpoint_tail() {
-                let len = next.checkpoint_for_storage().len().saturating_add(tail);
-                if len > MAX_CHECKPOINT_BYTES {
-                    return Err(JournalError::CheckpointTooLarge { len }.into());
-                }
-            }
-            self.rotate_if_full(record.is_new_work()).await?;
-            if let ChannelRecord::JobProposed {
-                authorization,
-                prepared_input,
-                ..
-            } = &record
-                && authorization.retention == hellas_rpc::Retention::Retain
+    ) -> impl std::future::Future<Output = Result<&'a Channel, WorkStoreError>> {
+        self.commit_with_input(record, None, verifier)
+    }
+
+    pub(crate) fn commit_with_input<'a, V: SigVerifier>(
+        &'a mut self,
+        mut record: ChannelRecord,
+        supplied: Option<&'a PreparedInvocation>,
+        verifier: &V,
+    ) -> impl std::future::Future<Output = Result<&'a Channel, WorkStoreError>> {
+        // Like SetupStore::commit, own the validated candidate and content I/O
+        // in this journal boundary rather than every setup/settlement poll frame.
+        Box::pin(async move {
+            self.check_authority()?;
+            if let ChannelRecord::JobResult { work_id, .. }
+            | ChannelRecord::ResultVerified { work_id } = &record
             {
-                if next.role() == Role::Client {
-                    self.uploads.retain(prepared_input)?;
-                } else {
-                    let input = PreparedInvocation::from_canonical_bytes(
-                        prepared_input,
-                        crate::content::MAX_CONTENT_BYTES,
-                    )
-                    .map_err(PaidWorkError::from)
-                    .map_err(ChannelStateError::from)?;
-                    let policy =
-                        InvocationPolicy::from_canonical_bytes(input.application_policy.as_bytes())
-                            .map_err(PaidWorkError::from)
+                if let Some(input) = supplied {
+                    let job = self
+                        .state()
+                        .job_by_id(*work_id)
+                        .ok_or(ChannelStateError::Malformed)?;
+                    let (_, facts) =
+                        crate::job::job_facts(self.state().channel(), job.authorization(), input)
                             .map_err(ChannelStateError::from)?;
-                    self.uploads.stage_complete(
-                        work_id(next.channel(), authorization),
-                        authorization.input_content,
-                        authorization.acceptance_deadline,
-                        authorization.retention,
-                        policy.limits.max_upload_bytes,
-                        prepared_input,
-                    )?;
+                    if self.state().retained_roots().contains_key(work_id)
+                        && let Some(job) = self.state.book.jobs.get_mut(work_id)
+                    {
+                        job.prepared_input = bytes::Bytes::new();
+                    }
+                    if matches!(record, ChannelRecord::ResultVerified { .. }) {
+                        self.load_retained_transcript(*work_id, facts.max_spool_bytes, false)
+                            .await?;
+                    }
+                } else {
+                    self.load_retained_content(*work_id).await?;
                 }
             }
-            // Retain the exact signed transcript before its reference becomes durable.
-            if let ChannelRecord::JobResult {
-                work_id,
-                result,
-                transcript,
-                ..
-            } = &record
-            {
-                let job = next
-                    .job_by_id(*work_id)
-                    .ok_or(ChannelStateError::Malformed)?;
-                if job.authorization().retention == hellas_rpc::Retention::Retain
-                    && self.uploads.retain(transcript)? != result.transcript_content
-                {
-                    return Err(crate::content::ContentError::Hash.into());
+            self.reconcile_content(false).await?;
+            let staged = self.prepare_record(&mut record)?;
+            // Applied to a copy first: a record the rules refuse must leave
+            // neither the file nor the state touched. A cheap exact check
+            // first: the stream replay path offers a redundant release per
+            // emitted frame, and the copy would clone the whole transcript.
+            if self.state.is_redundant(&record) {
+                return Ok(&self.state);
+            }
+            let previous_jobs = self.state.jobs().count();
+            let mut next = self.state.clone();
+            // The `false` keeps commit-time validation at full strength even
+            // for a metadata-only journal: bodies are verified — digest and
+            // transcript-to-result authentication — before they are stripped
+            // from the bytes written. Only replay and checkpoint validation
+            // downgrade for body-less records.
+            if next.apply_with_input(&record, verifier, false, supplied)? == Applied::Changed {
+                // The signature this record carries leaves after this
+                // returns, so the state that authorises it has to be one a
+                // rotation can still carry. The proposed job is charged the
+                // fixed tail it can still add — the result it will be
+                // answered with and the terminal that pays for it — because
+                // by then there is no refusal left that costs nothing.
+                if let Some(tail) = record.checkpoint_tail() {
+                    let len = next.checkpoint_for_storage().len().saturating_add(tail);
+                    if len > MAX_CHECKPOINT_BYTES {
+                        return Err(JournalError::CheckpointTooLarge { len }.into());
+                    }
+                }
+                self.rotate_if_full(record.is_new_work()).await?;
+                self.stage_record(&record, staged).await?;
+                self.journal.append(&record.encode_for_storage()).await?;
+                self.state = next;
+                self.reconcile_content(false).await?;
+                if self.state.jobs().count() < previous_jobs {
+                    self.rotate().await?;
                 }
             }
-            self.journal.append(&record.encode_for_storage()).await?;
-            self.state = next;
-            self.contents
-                .retain(|id, _| self.state.job_by_id(*id).is_some());
-            if let ChannelRecord::JobAccepted { work_id, .. } = &record {
-                let job = self
-                    .state
-                    .job_by_id(*work_id)
-                    .ok_or(ChannelStateError::Malformed)?;
-                self.uploads.publish_accepted(
-                    *work_id,
-                    job.prepared_input(),
-                    job.authorization().retention,
-                )?;
-            }
-            if self.state.jobs().count() < previous_jobs {
-                self.rotate().await?;
-            }
-        }
-        self.gc_uploads()?;
-        Ok(&self.state)
-    }
-
-    fn promote_accepted_content(&mut self) -> Result<(), WorkStoreError> {
-        for job in self.state.jobs() {
-            if job.authorization().retention == hellas_rpc::Retention::Retain
-                && job.provider_signature().is_some()
-                && self.uploads.has_stage(job.work_id())
-            {
-                let bytes = self.uploads.read(
-                    job.work_id(),
-                    job.authorization().input_content,
-                    hellas_rpc::Retention::Retain,
-                )?;
-                self.uploads.publish_accepted(
-                    job.work_id(),
-                    &bytes,
-                    hellas_rpc::Retention::Retain,
-                )?;
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn gc_uploads(&mut self) -> Result<(), WorkStoreError> {
-        self.promote_accepted_content()?;
-        self.uploads.gc(
-            self.state.cursor().0,
-            self.state.close_prepared().is_some()
-                || self.state.close_opened().is_some()
-                || self.state.close_settled().is_some(),
-        )?;
-        Ok(())
+            Ok(&self.state)
+        })
     }
 
     /// Moves the journal on to its next generation, carrying this state

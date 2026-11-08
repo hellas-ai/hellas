@@ -9,7 +9,6 @@ documentation.workspace = true
 
 [features]
 test-support = [
-    "dep:bytes",
     "hellas-auth/test-support",
     "hellas-private/test-support",
     "hellas-wire/mux",
@@ -19,7 +18,7 @@ test-support = [
 async-stream.workspace = true
 async-trait = "0.1"
 base64.workspace = true
-bytes = { workspace = true, optional = true }
+bytes.workspace = true
 futures.workspace = true
 getrandom = "0.4"
 hellas-auth.workspace = true

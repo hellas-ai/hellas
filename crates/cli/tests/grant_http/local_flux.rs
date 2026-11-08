@@ -86,7 +86,9 @@ async fn local_grant_flux_matches_reference_image_without_a_chain() {
             .unwrap(),
         ),
     };
-    let package = hellas_client::model::ModelPackage::open(&model).unwrap();
+    let package = hellas_client::model::ModelPackage::open(&model)
+        .await
+        .unwrap();
     let hellas_client::model::ModelResponse::Image(image) = package.decode(&output).unwrap() else {
         panic!()
     };

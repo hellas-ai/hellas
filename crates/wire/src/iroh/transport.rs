@@ -62,6 +62,7 @@ struct AcceptState {
     connection_error: Option<IrohTransportError>,
 }
 
+#[derive(Clone)]
 pub struct IrohTransport {
     connection: Arc<Connection>,
     accept_state: Arc<Mutex<AcceptState>>,

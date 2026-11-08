@@ -25,10 +25,15 @@ pub struct GatewayProviderOptions {
 }
 
 impl GatewayProviderOptions {
-    pub fn with_config(self, config: WorkConfig) -> PaidWorkOptions {
+    pub fn with_config(
+        self,
+        config: WorkConfig,
+        content: hellas_store::content::DiskStore,
+    ) -> PaidWorkOptions {
         PaidWorkOptions {
             config,
             journal_kind: crate::paid_client::PaidJournalKind::Gateway,
+            content,
             provider: self.provider,
             provider_addrs: self.provider_addrs,
             apple_trust: self.apple_trust,
@@ -45,6 +50,8 @@ impl GatewayProviderOptions {
 /// Typed funding and admission options for an application-owned paid pool.
 pub struct PaidGatewayOptions {
     pub config: WorkConfig,
+    /// One content store shared by every provider journal in this pool.
+    pub content: hellas_store::content::DiskStore,
     pub providers: Vec<GatewayProviderOptions>,
     pub max_pending_requests: usize,
 }
@@ -69,7 +76,7 @@ impl PaidGatewayOptions {
         for provider in &self.providers {
             provider
                 .clone()
-                .with_config(self.config.clone())
+                .with_config(self.config.clone(), self.content.clone())
                 .validate()?;
             if provider.timeout.is_none_or(|timeout| timeout.is_zero())
                 || provider.acceptance_blocks == 0
@@ -90,10 +97,12 @@ impl PaidGatewayOptions {
 
 /// Load the operator JSON format used by both CLI and native hosts. File paths
 /// must be absolute; assertion counters live in the shared process home.
+/// Every provider's journals share the pool's content store.
 pub fn load_pool_options(
     path: &Path,
     assurance: Assurance,
     config: WorkConfig,
+    content: hellas_store::content::DiskStore,
 ) -> Result<PaidGatewayOptions> {
     let bytes = hellas_private::read_bounded_regular_file(
         path,
@@ -144,6 +153,7 @@ pub fn load_pool_options(
         .collect::<Result<_>>()?;
     let options = PaidGatewayOptions {
         config,
+        content,
         providers,
         max_pending_requests: file.max_pending_requests,
     };

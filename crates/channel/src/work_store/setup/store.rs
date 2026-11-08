@@ -8,7 +8,7 @@ pub struct SetupStore {
     root: StoreLocation,
     journal: Journal,
     state: SetupState,
-    content: hellas_store::ContentStore,
+    content: Option<hellas_store::content::DiskStore>,
 }
 
 impl SetupStore {
@@ -90,16 +90,18 @@ impl SetupStore {
             root: root.clone(),
             journal,
             state,
-            content: hellas_store::ContentStore::new(),
+            content: None,
         })
     }
 
-    pub fn set_content_store(&mut self, content: hellas_store::ContentStore) {
-        self.content = content;
+    pub fn set_content_store(&mut self, content: hellas_store::content::DiskStore) {
+        self.content = Some(content);
     }
 
-    pub(crate) fn content_store(&self) -> hellas_store::ContentStore {
-        self.content.clone()
+    pub(crate) fn content_store(&self) -> Result<hellas_store::content::DiskStore, WorkStoreError> {
+        self.content
+            .clone()
+            .ok_or_else(|| hellas_store::content::Error::Missing.into())
     }
 
     /// Returns what the handshake has durably reached.

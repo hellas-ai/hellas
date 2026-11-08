@@ -217,6 +217,16 @@ pub fn check_paid_input(
     Ok(facts)
 }
 
+pub(crate) fn job_facts(
+    channel: &PaidChannel,
+    authorization: &PaidJobAuthorizationV2,
+    input: &PreparedInvocation,
+) -> Result<(InvocationPolicy, AdmissionFacts), PaidWorkError> {
+    let policy = InvocationPolicy::from_canonical_bytes(input.application_policy.as_bytes())?;
+    let facts = check_paid_input(channel, authorization, &policy, input)?;
+    Ok((policy, facts))
+}
+
 /// The only invocation-to-receipt conversion, used for both funding models.
 pub fn terminal_result(
     context: &WorkContext,
@@ -313,4 +323,25 @@ pub fn content_closure(
         .into_iter()
         .map(|(id, bytes)| ContentRef::new(id, bytes))
         .collect())
+}
+
+/// The one upload signature binds the complete routed opening and root length to
+/// this live connection. Individual Content pages carry no application signature.
+pub fn opening_digest(
+    opening: &hellas_rpc::pb::content::WorkOpening,
+    exporter: &[u8; 32],
+) -> Digest {
+    let root = opening
+        .root
+        .as_ref()
+        .map(|root| {
+            let mut bytes = root.id.clone();
+            bytes.extend_from_slice(&root.bytes.to_be_bytes());
+            bytes
+        })
+        .unwrap_or_default();
+    hellas_auth::hash_tuple(
+        "hellas.work.content-opening.v1",
+        &[&opening.signed_opening, &opening.manifest, &root, exporter],
+    )
 }

@@ -348,7 +348,7 @@ impl PrivateRecord for PaidJobAuthorizationV2 {
         out.extend_from_slice(self.channel_id.as_bytes());
         out.extend_from_slice(self.work_policy_digest.as_bytes());
         out.extend_from_slice(self.payment_policy_digest.as_bytes());
-        out.extend_from_slice(&hellas_rpc::protocol::content_upload::encode_reference(
+        out.extend_from_slice(&hellas_rpc::protocol::content::encode_reference(
             self.input_content,
         ));
         out.extend_from_slice(self.prepared_input_digest.as_bytes());
@@ -430,7 +430,7 @@ impl PrivateRecord for PaidJobResultV1 {
             ResultOutcome::Finished => 0,
             ResultOutcome::Failed => 1,
         });
-        out.extend_from_slice(&hellas_rpc::protocol::content_upload::encode_reference(
+        out.extend_from_slice(&hellas_rpc::protocol::content::encode_reference(
             self.transcript_content,
         ));
     }

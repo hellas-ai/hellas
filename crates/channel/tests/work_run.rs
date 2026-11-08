@@ -69,6 +69,19 @@ fn ready() -> ReadyChannel {
     ready_at(CURSOR)
 }
 
+async fn close_content(service: &WorkService) {
+    use hellas_channel::work_close::CloseChannel as _;
+    service
+        .drive()
+        .unwrap()
+        .store()
+        .await
+        .unwrap()
+        .content_store()
+        .close()
+        .await;
+}
+
 async fn store_at(root: &std::path::Path, height: u64) -> ChannelStore {
     hellas_channel::test_support::channel::store_at(root, &ready(), Role::Provider, height).await
 }
@@ -113,7 +126,9 @@ async fn accept(store: &mut ChannelStore, nonce: u8) -> Digest {
         ChannelRecord::JobProposed {
             authorization,
             client_signature: client().sign(signing_hash(id)),
-            prepared_input: bundle_bytes(nonce),
+            prepared_input: bundle_bytes(nonce).into(),
+
+            retained_tree: None,
         },
     )
     .await;
@@ -122,6 +137,8 @@ async fn accept(store: &mut ChannelStore, nonce: u8) -> Digest {
         ChannelRecord::JobAccepted {
             work_id: id,
             provider_signature: provider().sign(signing_hash(id)),
+
+            retained_tree: None,
         },
     )
     .await;
@@ -306,10 +323,11 @@ async fn one_accepted_job_reaches_the_backend_once() {
             "a retry is answered from the disk",
         );
         assert_eq!(backend.calls(), 1, "the retry invoked nothing");
+        close_content(&service).await;
         id
     };
 
-    // The restart: a new process, a new endpoint, the same files.
+    // Replay in a new endpoint over the same files.
     let service = serving(store_at(dir.path(), CURSOR).await);
     let recovered = expect_outcome(run_accepted_work(&service, &ready(), &backend, id).await);
     assert!(
@@ -338,6 +356,7 @@ async fn a_result_is_on_the_disk_before_its_signature_is_returned() {
     else {
         panic!("the run completes");
     };
+    close_content(&service).await;
     drop(service);
 
     let recovered = store_at(dir.path(), CURSOR).await;
@@ -373,6 +392,7 @@ async fn a_marker_a_process_did_not_come_back_from_is_indeterminate() {
         let id = accept(&mut store, 1).await;
         // Exactly the state `begin_run` leaves before it returns.
         commit(&mut store, ChannelRecord::JobRunning { work_id: id }).await;
+        store.content_store().close().await;
         id
     };
 
@@ -453,7 +473,9 @@ async fn a_restart_runs_the_job_that_was_accepted() {
     let dir = temp();
     let id = {
         let mut store = store_at(dir.path(), CURSOR).await;
-        accept(&mut store, 1).await
+        let id = accept(&mut store, 1).await;
+        store.content_store().close().await;
+        id
     };
 
     let service = serving(store_at(dir.path(), CURSOR).await);
@@ -523,7 +545,9 @@ async fn a_job_that_was_never_co_signed_does_not_run() {
         ChannelRecord::JobProposed {
             authorization,
             client_signature: client().sign(signing_hash(id)),
-            prepared_input: bundle_bytes(1),
+            prepared_input: bundle_bytes(1).into(),
+
+            retained_tree: None,
         },
     )
     .await;
@@ -542,14 +566,24 @@ async fn a_job_that_was_never_co_signed_does_not_run() {
     );
     assert_eq!(backend.calls(), 0);
 
-    // The control: the co-signature is the only thing missing.
+    // An unaccepted provider scope is discarded on restart. A retry stages
+    // the same declared closure before its co-signature authorizes execution.
+    close_content(&service).await;
     drop(service);
     let mut store = store_at(dir.path(), CURSOR).await;
+    hellas_channel::test_support::channel::seed_content(
+        &mut store,
+        authorization,
+        bundle_bytes(1).into(),
+    )
+    .await;
     commit(
         &mut store,
         ChannelRecord::JobAccepted {
             work_id: id,
             provider_signature: provider().sign(signing_hash(id)),
+
+            retained_tree: None,
         },
     )
     .await;
@@ -673,6 +707,7 @@ async fn a_backend_that_answers_the_wrong_question_signs_nothing() {
         );
 
         // Nothing was signed: reopening finds no result on the disk.
+        close_content(&service).await;
         drop(service);
         let recovered = store_at(dir.path(), CURSOR).await;
         assert!(recovered.state().jobs().next().is_none());

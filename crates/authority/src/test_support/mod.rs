@@ -22,6 +22,26 @@ tokio::task_local! {
     );
 }
 
+tokio::task_local! {
+    pub static GRANT_CONTENT_TRANSFER_PAUSE: (
+        std::sync::Arc<tokio::sync::Notify>,
+        std::sync::Arc<tokio::sync::Notify>,
+    );
+}
+pub(crate) async fn pause_grant_content_transfer() {
+    if let Ok((entered, release)) = GRANT_CONTENT_TRANSFER_PAUSE.try_with(Clone::clone) {
+        entered.notify_one();
+        release.notified().await;
+    }
+}
+pub fn pending_content(
+    service: &crate::grant_service::GrantService,
+    channel: ChannelId,
+    work: Digest,
+) -> hellas_store::content::JobContent {
+    service.pending_content(channel, work).unwrap()
+}
+
 pub(crate) async fn pause_bootstrap_commit() {
     if let Ok((entered, release)) = BOOTSTRAP_COMMIT_PAUSE.try_with(Clone::clone) {
         entered.notify_one();
@@ -362,6 +382,24 @@ pub mod common_node;
 
 pub mod credentials;
 
+/// An explicitly shared node store for test hosts, recovered before admission.
+pub async fn content_store(root: &std::path::Path) -> hellas_store::content::DiskStore {
+    let store = hellas_store::content::DiskStore::open(
+        hellas_private::StoreLocation::for_test(&root.join("content")),
+        vec![],
+        hellas_store::content::IndexMode::Resume,
+        None,
+        hellas_store::content::Reservations::ram(
+            hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
+        ),
+        false,
+    )
+    .await
+    .unwrap();
+    store.finish_recovery().await.unwrap();
+    store
+}
+
 pub async fn accept_grant(
     work: &crate::grant_service::GrantWork,
     request: &hellas_rpc::pb::work::AcceptWorkRequest,
@@ -369,21 +407,49 @@ pub async fn accept_grant(
 ) -> hellas_rpc::pb::work::AcceptWorkResponse {
     let exporter = [7; 32];
     let (wire, chunks) = grant_upload_requests(request, signer, network(), exporter);
-    for chunk in chunks {
-        if let Some(refusal) = upload_failure(
-            work.upload(
-                &chunk,
-                &hellas_wire::TransportContext {
-                    open_exporter: Some(exporter),
-                    ..Default::default()
-                },
-            )
-            .await,
-        ) {
-            return refusal;
-        }
+    if !chunks.is_empty() {
+        // These policy fixtures intentionally probe canonical acceptance even
+        // when upload is refused before content can be admitted.
+        let _ = upload_grant_frames(
+            work,
+            chunks,
+            hellas_wire::TransportContext {
+                open_exporter: Some(exporter),
+                ..Default::default()
+            },
+            hellas_channel::work::admission::Cancellation::new(),
+        )
+        .await;
     }
     work.accept(&wire).await
+}
+
+/// Drive the real generic upload stream one acknowledged frame at a time.
+/// Cached objects complete on Open and require no list or payload frames.
+pub async fn upload_grant_frames(
+    work: &crate::grant_service::GrantWork,
+    frames: Vec<hellas_rpc::pb::content::UploadRequest>,
+    context: hellas_wire::TransportContext,
+    cancellation: hellas_channel::work::admission::Cancellation,
+) -> Result<(), hellas_wire::WireStatus> {
+    use futures::StreamExt as _;
+    use hellas_rpc::pb::content::upload_request::Part;
+    let mut frames = frames.into_iter();
+    let (send, receive) = futures::channel::mpsc::unbounded();
+    send.unbounded_send(Ok(frames.next().unwrap())).unwrap();
+    let mut replies = work
+        .upload_stream(Box::pin(receive), context, cancellation)
+        .await?;
+    loop {
+        let reply = replies.next().await.expect("one answer per sent frame")?;
+        match frames.find(|frame| !reply.complete || matches!(frame.part, Some(Part::Open(_)))) {
+            Some(frame) => send.unbounded_send(Ok(frame)).unwrap(),
+            None => {
+                drop(send);
+                return hellas_channel::test_support::drive_upload(Ok(replies)).await;
+            }
+        }
+    }
 }
 
 /// Raw store operations used by accounting tests; preserve the caller and simulated time.

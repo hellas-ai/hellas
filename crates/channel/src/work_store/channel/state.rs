@@ -2,12 +2,11 @@ use super::*;
 use hellas_kernel::PartyAuth;
 
 impl Channel<PaymentFunding> {
-    pub(super) fn restore_client_input(
+    pub(super) fn restore_input(
         &mut self,
         work_id: Digest,
-        input: Vec<u8>,
+        input: bytes::Bytes,
     ) -> Result<(), ChannelStateError> {
-        self.require_role("restoring caller input", Role::Client)?;
         let job = self.book.open_job(work_id, "restoring caller input")?;
         self.check_authorization(&job.authorization, &input, false)?;
         self.book
@@ -24,6 +23,7 @@ impl Channel<PaymentFunding> {
         result: &PaidJobResultV1,
         transcript: &[u8],
         replaying: bool,
+        supplied: Option<&PreparedInvocation>,
     ) -> Result<(), ChannelStateError> {
         if result.work_id != job.work_id {
             return Err(ChannelStateError::WrongChannel {
@@ -37,19 +37,20 @@ impl Channel<PaymentFunding> {
                 Err(ChannelStateError::Malformed)
             };
         }
-        let input = PreparedInvocation::from_canonical_bytes(
-            &job.prepared_input,
-            crate::content::MAX_CONTENT_BYTES,
-        )
-        .map_err(PaidWorkError::from)?;
-        let policy = InvocationPolicy::from_canonical_bytes(input.application_policy.as_bytes())
-            .map_err(PaidWorkError::from)?;
-        let facts = crate::job::check_paid_input(
-            &self.funding.channel,
-            &job.authorization,
-            &policy,
-            &input,
-        )?;
+        let decoded;
+        let input = match supplied {
+            Some(input) => input,
+            None => {
+                decoded = PreparedInvocation::from_canonical_bytes(
+                    &job.prepared_input,
+                    crate::content::MAX_CONTENT_BYTES,
+                )
+                .map_err(PaidWorkError::from)?;
+                &decoded
+            }
+        };
+        let (policy, facts) =
+            crate::job::job_facts(&self.funding.channel, &job.authorization, input)?;
         let events = decode_transcript(
             transcript,
             usize::try_from(facts.max_spool_bytes).unwrap_or(usize::MAX),
@@ -58,7 +59,7 @@ impl Channel<PaymentFunding> {
             &self.funding.channel,
             &job.authorization,
             &policy,
-            &input,
+            input,
             &events,
         )? != *result
         {
@@ -86,6 +87,7 @@ impl Channel<PaymentFunding> {
                 close_history: None,
                 close_responded: None,
                 close_settled: None,
+                retained_roots: BTreeMap::new(),
             },
             role,
             ledger: CreditLedger::new(),
@@ -192,7 +194,7 @@ impl Channel<PaymentFunding> {
                         field: "verified failed result",
                     });
                 }
-                self.check_result_payload(job, result, &job.transcript, metadata_only)?;
+                self.check_result_payload(job, result, &job.transcript, metadata_only, None)?;
                 if !verifier.verify_sig(
                     *provider_signature,
                     self.provider_key(),
@@ -204,6 +206,13 @@ impl Channel<PaymentFunding> {
                     });
                 }
             }
+        }
+        if (self.funding.close_settled.is_some() && !self.funding.retained_roots.is_empty())
+            || self.funding.retained_roots.values().any(|root| {
+                root.bytes() == 0 || root.bytes() > hellas_store::content::MAX_TREE_BYTES as u64
+            })
+        {
+            return Err(ChannelStateError::Malformed);
         }
         for terminal in self.book.terminals.values() {
             if self.book.jobs.contains_key(&terminal.work_id) {
@@ -300,6 +309,47 @@ impl Channel<PaymentFunding> {
     #[must_use]
     pub const fn ledger(&self) -> &CreditLedger {
         &self.ledger
+    }
+
+    /// Retained evidence outlives active jobs and bounded terminal metadata.
+    pub fn retained_roots(&self) -> &BTreeMap<Digest, ContentRef> {
+        &self.funding.retained_roots
+    }
+    fn validate_root(
+        &self,
+        work: Digest,
+        retention: hellas_rpc::Retention,
+        tree: Option<ContentRef>,
+        replace: bool,
+    ) -> Result<(), ChannelStateError> {
+        if let Some(tree) = tree {
+            if retention != hellas_rpc::Retention::Retain
+                || tree.bytes() == 0
+                || tree.bytes() > hellas_store::content::MAX_TREE_BYTES as u64
+            {
+                return Err(ChannelStateError::Malformed);
+            }
+            if !replace
+                && self
+                    .funding
+                    .retained_roots
+                    .get(&work)
+                    .is_some_and(|old| *old != tree)
+            {
+                return Err(ChannelStateError::Conflict {
+                    what: "retained content tree",
+                });
+            }
+        }
+        Ok(())
+    }
+    fn record_root(&mut self, work: Digest, tree: Option<ContentRef>, applied: Applied) -> Applied {
+        if let Some(tree) = tree
+            && self.funding.retained_roots.insert(work, tree) != Some(tree)
+        {
+            return Applied::Changed;
+        }
+        applied
     }
 
     /// Returns which half of the channel this journal is.
@@ -666,6 +716,16 @@ impl Channel<PaymentFunding> {
         verifier: &V,
         metadata_only: bool,
     ) -> Result<Applied, ChannelStateError> {
+        self.apply_with_input(record, verifier, metadata_only, None)
+    }
+
+    pub(super) fn apply_with_input<V: SigVerifier>(
+        &mut self,
+        record: &ChannelRecord,
+        verifier: &V,
+        metadata_only: bool,
+        supplied: Option<&PreparedInvocation>,
+    ) -> Result<Applied, ChannelStateError> {
         match record {
             ChannelRecord::OriginObserved => {
                 if self.funding.origin_observed {
@@ -687,37 +747,97 @@ impl Channel<PaymentFunding> {
                 authorization,
                 client_signature,
                 prepared_input,
-            } => self.apply_proposed(
-                authorization,
-                *client_signature,
-                prepared_input,
-                verifier,
-                metadata_only,
-            ),
+                retained_tree,
+            } => {
+                let work = work_id(&self.funding.channel, authorization);
+                let later = self
+                    .book
+                    .jobs
+                    .get(&work)
+                    .is_some_and(|job| job.result.is_some());
+                self.validate_root(work, authorization.retention, *retained_tree, later)?;
+                if retained_tree.is_some() && self.role != Role::Client {
+                    return Err(ChannelStateError::Malformed);
+                }
+                let applied = self.apply_proposed(
+                    authorization,
+                    *client_signature,
+                    prepared_input,
+                    verifier,
+                    metadata_only,
+                )?;
+                Ok(if later {
+                    applied
+                } else {
+                    self.record_root(work, *retained_tree, applied)
+                })
+            }
             ChannelRecord::JobAccepted {
                 work_id,
                 provider_signature,
-            } => self.apply_accepted(*work_id, *provider_signature, verifier),
+                retained_tree,
+            } => {
+                let Some(job) = self.book.jobs.get(work_id) else {
+                    return self.apply_accepted(*work_id, *provider_signature, verifier);
+                };
+                let later = job.result.is_some();
+                self.validate_root(*work_id, job.authorization.retention, *retained_tree, later)?;
+                let applied = self.apply_accepted(*work_id, *provider_signature, verifier)?;
+                Ok(if later {
+                    applied
+                } else {
+                    self.record_root(*work_id, *retained_tree, applied)
+                })
+            }
             ChannelRecord::JobRunning { work_id } => self.apply_running(*work_id),
             ChannelRecord::JobResult {
                 work_id,
                 result,
                 provider_signature,
                 transcript,
-            } => self.apply_result(
-                *work_id,
-                result,
-                *provider_signature,
-                transcript,
-                verifier,
-                metadata_only,
-            ),
+                retained_tree,
+            } => {
+                let Some(job) = self.book.jobs.get(work_id) else {
+                    return self.apply_result(
+                        *work_id,
+                        (result, *provider_signature),
+                        transcript,
+                        verifier,
+                        metadata_only,
+                        supplied,
+                    );
+                };
+                self.validate_root(
+                    *work_id,
+                    job.authorization.retention,
+                    *retained_tree,
+                    job.result.is_none(),
+                )?;
+                let applied = self.apply_result(
+                    *work_id,
+                    (result, *provider_signature),
+                    transcript,
+                    verifier,
+                    metadata_only,
+                    supplied,
+                )?;
+                Ok(self.record_root(*work_id, *retained_tree, applied))
+            }
             ChannelRecord::PlaintextReleased { work_id } => self.apply_plaintext(*work_id),
             ChannelRecord::ResultVerified { work_id } => {
-                self.apply_verified(*work_id, metadata_only)
+                self.apply_verified(*work_id, metadata_only, supplied)
             }
             ChannelRecord::JobTerminated { work_id, outcome } => {
-                self.apply_terminated(*work_id, outcome, verifier)
+                let unaccepted = self
+                    .book
+                    .jobs
+                    .get(work_id)
+                    .is_some_and(|job| job.provider_signature.is_none());
+                let applied = self.apply_terminated(*work_id, outcome, verifier)?;
+                if unaccepted {
+                    self.funding.retained_roots.remove(work_id);
+                }
+                Ok(applied)
             }
             ChannelRecord::CloseHistoryAdvanced { parent, history } => {
                 self.apply_close_history(*parent, *history)
@@ -1057,6 +1177,7 @@ impl Channel<PaymentFunding> {
         }
         self.refuse_open_job("closing the payment edge")?;
         self.funding.close_settled = Some(settlement);
+        self.funding.retained_roots.clear();
         Ok(Applied::Changed)
     }
 
@@ -1102,9 +1223,7 @@ impl Channel<PaymentFunding> {
             crate::content::MAX_CONTENT_BYTES,
         )
         .map_err(PaidWorkError::from)?;
-        let policy = InvocationPolicy::from_canonical_bytes(input.application_policy.as_bytes())
-            .map_err(PaidWorkError::from)?;
-        crate::job::check_paid_input(&self.funding.channel, authorization, &policy, &input)?;
+        crate::job::job_facts(&self.funding.channel, authorization, &input)?;
         Ok(())
     }
 
@@ -1165,7 +1284,7 @@ impl Channel<PaymentFunding> {
         &mut self,
         authorization: &PaidJobAuthorizationV2,
         client_signature: Sig,
-        prepared_input: &[u8],
+        prepared_input: &bytes::Bytes,
         verifier: &V,
         metadata_only: bool,
     ) -> Result<Applied, ChannelStateError> {
@@ -1173,8 +1292,11 @@ impl Channel<PaymentFunding> {
         if let Some(job) = self.book.jobs.get(&work_id) {
             if job.authorization == *authorization
                 && job.client_signature == client_signature
-                && job.prepared_input == prepared_input
+                && (job.prepared_input == prepared_input || job.prepared_input.is_empty())
             {
+                if job.prepared_input.is_empty() && !metadata_only {
+                    self.check_authorization(authorization, prepared_input, false)?;
+                }
                 return Ok(Applied::Redundant);
             }
             return Err(ChannelStateError::WrongPhase {
@@ -1212,12 +1334,12 @@ impl Channel<PaymentFunding> {
             JobState {
                 authorization: *authorization,
                 work_id,
-                prepared_input: prepared_input.to_vec(),
+                prepared_input: prepared_input.clone(),
                 client_signature,
                 provider_signature: None,
                 phase: JobPhase::HalfSigned,
                 result: None,
-                transcript: Vec::new(),
+                transcript: bytes::Bytes::new(),
             },
             self.role,
         )
@@ -1291,12 +1413,13 @@ impl Channel<PaymentFunding> {
     fn apply_result<V: SigVerifier>(
         &mut self,
         work_id: Digest,
-        result: &PaidJobResultV1,
-        provider_signature: Sig,
-        transcript: &[u8],
+        signed: (&PaidJobResultV1, Sig),
+        transcript: &bytes::Bytes,
         verifier: &V,
         metadata_only: bool,
+        supplied: Option<&PreparedInvocation>,
     ) -> Result<Applied, ChannelStateError> {
+        let (result, provider_signature) = signed;
         let job = self.book.open_job(work_id, "recording a result")?;
         if let Some((held, signature)) = &job.result {
             if held == result && *signature == provider_signature && job.transcript == transcript {
@@ -1308,12 +1431,12 @@ impl Channel<PaymentFunding> {
                 && *signature == provider_signature
                 && job.transcript.is_empty()
             {
-                self.check_result_payload(&job, result, transcript, false)?;
+                self.check_result_payload(&job, result, transcript, false, supplied)?;
                 self.book
                     .jobs
                     .get_mut(&work_id)
                     .ok_or(ChannelStateError::Malformed)?
-                    .transcript = transcript.to_vec();
+                    .transcript = transcript.clone();
                 return Ok(Applied::Changed);
             }
             return Err(ChannelStateError::Conflict {
@@ -1363,7 +1486,7 @@ impl Channel<PaymentFunding> {
             });
         }
 
-        self.check_result_payload(&job, result, transcript, metadata_only)?;
+        self.check_result_payload(&job, result, transcript, metadata_only, supplied)?;
         if !verifier.verify_sig(
             provider_signature,
             self.provider_key(),
@@ -1375,7 +1498,7 @@ impl Channel<PaymentFunding> {
             });
         }
         self.book
-            .record_result(work_id, *result, provider_signature, transcript.to_vec())
+            .record_result(work_id, *result, provider_signature, transcript.clone())
     }
     /// Full verification precedes a new durable verification decision. Replay
     /// keeps the prior decision without requiring ephemeral bodies to survive.
@@ -1383,6 +1506,7 @@ impl Channel<PaymentFunding> {
         &mut self,
         work_id: Digest,
         replaying: bool,
+        supplied: Option<&PreparedInvocation>,
     ) -> Result<Applied, ChannelStateError> {
         self.require_role("recording a verified result", Role::Client)?;
         let job = self.book.open_job(work_id, "recording a verified result")?;
@@ -1401,7 +1525,7 @@ impl Channel<PaymentFunding> {
             return Ok(Applied::Redundant);
         }
         if !replaying {
-            self.check_result_payload(&job, result, &job.transcript, false)?;
+            self.check_result_payload(&job, result, &job.transcript, false, supplied)?;
         }
         self.book.mark_verified(work_id)
     }
@@ -1707,13 +1831,17 @@ mod tests {
                     result,
                     provider_signature: fixture::provider()
                         .sign(signing_hash(result_digest(ready.channel(), &result))),
-                    transcript: crate::model::work::encode_transcript(&events).unwrap(),
+                    transcript: crate::model::work::encode_transcript(&events)
+                        .unwrap()
+                        .into(),
+                    retained_tree: None,
                 },
                 &hellas_kernel::Secp256k1Verifier::new(),
             )
             .await
             .unwrap();
         store.rotate().await.unwrap();
+        store.content_store().close().await;
         drop(store);
         let mut store = fixture::store_at(root.path(), &ready, Role::Client, fixture::CURSOR).await;
         assert_eq!(
@@ -1808,5 +1936,177 @@ mod tests {
             )
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod retained_tests {
+    use super::*;
+    use crate::test_support::channel as fixture;
+    use hellas_rpc::protocol::invocation::output::{FailureReason, InvocationOutput, Outcome};
+
+    fn setup(role: Role) -> (Channel, PaidJobAuthorizationV2, Vec<u8>, ContentRef) {
+        let ready = fixture::ready();
+        let state = Channel::new(
+            ready.channel().clone(),
+            fixture::settlement(),
+            role,
+            fixture::origin(),
+        );
+        let authorization = fixture::authorization();
+        let bytes = fixture::bundle(fixture::NONCE).canonical_bytes().unwrap();
+        let closure = crate::job::content_closure(
+            &fixture::work_policy(),
+            &fixture::manifest(),
+            &fixture::environment().canonical_bytes().unwrap(),
+            authorization.input_content,
+        )
+        .unwrap();
+        let tree = crate::content::job_tree(&closure, None).unwrap().root;
+        (state, authorization, bytes, tree)
+    }
+    #[test]
+    fn retained_root_survives_result_terminal_and_bodyless_checkpoint_then_finalized_close_releases_it()
+     {
+        for role in [Role::Provider, Role::Client] {
+            let (mut state, authorization, input, root) = setup(role);
+            let verifier = hellas_kernel::Secp256k1Verifier::new();
+            let id = work_id(state.channel(), &authorization);
+            let proposed = ChannelRecord::JobProposed {
+                authorization,
+                client_signature: fixture::client().sign(signing_hash(id)),
+                prepared_input: input.into(),
+                retained_tree: (role == Role::Client).then_some(root),
+            };
+            let accepted = ChannelRecord::JobAccepted {
+                work_id: id,
+                provider_signature: fixture::provider().sign(signing_hash(id)),
+                retained_tree: Some(root),
+            };
+            state.apply(&proposed, &verifier, false).unwrap();
+            state.apply(&accepted, &verifier, false).unwrap();
+            if role == Role::Provider {
+                state
+                    .apply(&ChannelRecord::JobRunning { work_id: id }, &verifier, false)
+                    .unwrap();
+            }
+            let input = fixture::bundle(fixture::NONCE);
+            let events = InvocationOutput {
+                outcome: Outcome::Failed(FailureReason::Execution),
+                artifacts: vec![],
+                metadata: hellas_rpc::JsonBytes(vec![]),
+            }
+            .sign(&input.request, &fixture::provider_producer(), 1024)
+            .unwrap();
+            let result = crate::job::paid_terminal_result(
+                state.channel(),
+                &authorization,
+                &fixture::work_policy(),
+                &input,
+                &events,
+            )
+            .unwrap();
+            let transcript = crate::model::work::encode_transcript(&events).unwrap();
+            let closure = crate::job::content_closure(
+                &fixture::work_policy(),
+                &fixture::manifest(),
+                &fixture::environment().canonical_bytes().unwrap(),
+                authorization.input_content,
+            )
+            .unwrap();
+            let finished =
+                crate::content::job_tree(&closure, Some(ContentRef::for_bytes(&transcript)))
+                    .unwrap()
+                    .root;
+            let record = ChannelRecord::JobResult {
+                work_id: id,
+                result,
+                provider_signature: fixture::provider()
+                    .sign(signing_hash(result_digest(state.channel(), &result))),
+                transcript: transcript.into(),
+                retained_tree: Some(finished),
+            };
+            let durable = ChannelRecord::decode(&record.encode_for_storage()).unwrap();
+            assert!(
+                matches!(durable, ChannelRecord::JobResult { retained_tree: Some(tree), ref transcript, .. } if tree == finished && transcript.is_empty())
+            );
+            state.apply(&record, &verifier, false).unwrap();
+            assert_eq!(
+                state.apply(&accepted, &verifier, false).unwrap(),
+                Applied::Redundant
+            );
+            if role == Role::Client {
+                assert_eq!(
+                    state.apply(&proposed, &verifier, false).unwrap(),
+                    Applied::Redundant
+                );
+            }
+            assert_eq!(state.retained_roots().get(&id), Some(&finished));
+            let mut conflicting_result = record.clone();
+            if let ChannelRecord::JobResult { retained_tree, .. } = &mut conflicting_result {
+                *retained_tree = Some(root);
+            }
+            assert!(state.apply(&conflicting_result, &verifier, false).is_err());
+            assert_eq!(state.retained_roots().get(&id), Some(&finished));
+            state
+                .apply(
+                    &ChannelRecord::JobTerminated {
+                        work_id: id,
+                        outcome: TerminalOutcome::Failed { code: 0 },
+                    },
+                    &verifier,
+                    false,
+                )
+                .unwrap();
+            assert!(state.job_by_id(id).is_none());
+            let ready = fixture::ready();
+            let mut reopened = Channel::from_checkpoint(
+                &state.checkpoint_for_storage(),
+                ready.channel().clone(),
+                fixture::settlement(),
+                role,
+                &verifier,
+            )
+            .unwrap();
+            assert_eq!(reopened.retained_roots().get(&id), Some(&finished));
+            reopened
+                .apply_close_settled(CloseSettlement {
+                    height: fixture::CURSOR,
+                    payload: fixture::payload_at(fixture::CURSOR),
+                    provider_payout: 0,
+                })
+                .unwrap();
+            assert!(reopened.retained_roots().is_empty());
+        }
+    }
+    #[test]
+    fn unaccepted_client_proposal_root_is_removed_on_refusal() {
+        let (mut state, authorization, input, root) = setup(Role::Client);
+        let verifier = hellas_kernel::Secp256k1Verifier::new();
+        let id = work_id(state.channel(), &authorization);
+        state
+            .apply(
+                &ChannelRecord::JobProposed {
+                    authorization,
+                    client_signature: fixture::client().sign(signing_hash(id)),
+                    prepared_input: input.into(),
+                    retained_tree: Some(root),
+                },
+                &verifier,
+                false,
+            )
+            .unwrap();
+        assert_eq!(state.retained_roots().get(&id), Some(&root));
+        state
+            .apply(
+                &ChannelRecord::JobTerminated {
+                    work_id: id,
+                    outcome: TerminalOutcome::Failed { code: 0 },
+                },
+                &verifier,
+                false,
+            )
+            .unwrap();
+        assert!(state.retained_roots().is_empty());
     }
 }

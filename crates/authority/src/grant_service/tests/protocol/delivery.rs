@@ -74,7 +74,7 @@ async fn committed_loss_cannot_revive_a_native_stream_or_an_unpolled_carrier_bin
             reply: Reply::text("private-grant-result", 2),
             ..Backend::default()
         };
-        let (service, work, _) = service(store, backend.clone(), &secret).await;
+        let (service, work, _) = service(dir.path(), store, backend.clone(), &secret).await;
         let id = accepted_id(
             crate::test_support::accept_grant(
                 &work,
@@ -147,6 +147,7 @@ async fn response_registry_is_bounded_and_does_not_retain_abandoned_responses() 
         backend.clone(),
         vec![],
         clock.source(),
+        crate::test_support::content_store(dir.path()).await,
     )
     .unwrap();
     let (work, _) = common_node::execution(&service, &secret, &principal(1).1, a.grant_id).await;
@@ -235,6 +236,7 @@ async fn extending_expired_authority_does_not_revive_an_unpolled_response() {
             backend.clone(),
             vec![],
             clock.source(),
+            crate::test_support::content_store(dir.path()).await,
         )
         .unwrap();
         let (work, _) =
@@ -294,7 +296,8 @@ async fn delivery_write_rechecks_under_writer_and_releases_it_on_backpressure() 
         let request = request(&store, 1);
         let a = GrantJobAuthorizationV1::decode(&request.authorization).unwrap();
         let backend = Backend::default();
-        let (service, work, credential) = service(store, backend.clone(), &secret).await;
+        let (service, work, credential) =
+            service(dir.path(), store, backend.clone(), &secret).await;
         let id = accepted_id(
             crate::test_support::accept_grant(
                 &work,
@@ -371,7 +374,8 @@ async fn rpc_revocation_blocks_stream_body_and_end_at_the_carrier() {
                 let request = request(&store, 1);
                 let a = GrantJobAuthorizationV1::decode(&request.authorization).unwrap();
                 let backend = Backend::default();
-                let (service, work, credential) = service(store, backend.clone(), &secret).await;
+                let (service, work, credential) =
+                    service(dir.path(), store, backend.clone(), &secret).await;
                 let id = accepted_id(
                     crate::test_support::accept_grant(
                         &work,
@@ -384,6 +388,7 @@ async fn rpc_revocation_blocks_stream_body_and_end_at_the_carrier() {
                 backend.finish.release();
                 within(service.drain()).await.unwrap();
                 let (service, work) = if recovered {
+                    service.content.close().await;
                     drop(work);
                     drop(service);
                     let location = StoreLocation::for_test(dir.path());
@@ -403,6 +408,7 @@ async fn rpc_revocation_blocks_stream_body_and_end_at_the_carrier() {
                         backend.clone(),
                         vec![],
                         Arc::new(|| UnixMillis(1000)),
+                        crate::test_support::content_store(dir.path()).await,
                     )
                     .unwrap();
                     let caller = service

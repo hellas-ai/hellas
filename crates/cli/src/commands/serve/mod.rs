@@ -70,12 +70,12 @@ fn provider_resources(
 pub fn validate_provider_config(
     fetch: Option<&std::path::Path>,
     grant: Option<&std::path::Path>,
+    content: Option<&std::path::Path>,
     home: &StoreLocation,
 ) -> CliResult<()> {
-    anyhow::ensure!(
-        fetch.is_some() || grant.is_some(),
-        "--check-config requires --fetch-config or --grant-config"
-    );
+    if let Some(path) = content {
+        crate::content_configuration::ContentConfiguration::load(Some(path.into()), None)?;
+    }
     let routes = fetch
         .map(|path| load_fetch_config(path, home))
         .transpose()?
@@ -103,7 +103,14 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
     executor.queue_capacity = options.queue_size;
     executor.fetch_max_in_flight = options.fetch_max_in_flight;
     executor.fetch_queue_capacity = options.fetch_queue_size;
-    options.native.configure(&mut executor, &options.home)?;
+    let content_configuration = options.native.configure(&mut executor)?;
+    let ram = hellas_store::content::Reservations::ram(
+        hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
+    );
+    let content = content_configuration
+        .config()
+        .open(&options.home, ram, options.paid.is_none())
+        .await?;
 
     // What the operator configured, said back once. A node with a
     // paid-work configuration serves its journals, answers every
@@ -155,6 +162,7 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
     let provider = hellas_sdk::ProviderOptions {
         port: options.port,
         executor,
+        content: content.clone(),
         build,
         graffiti,
         work: work_runner,
@@ -184,6 +192,20 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
         .context("failed to start node server")?,
     };
 
+    // Provider startup restores every journal before completing the shared
+    // recovery barrier. Declarations may be reconciled only after that.
+    let content_reload = match content_configuration.start(content.clone()).await {
+        Ok(reload) => reload,
+        Err(error) => {
+            let _ = node.shutdown().await;
+            if let Some(chain) = chain {
+                let _ = chain.shutdown().await;
+            }
+            content.close().await;
+            return Err(error.context("failed to reconcile declared content"));
+        }
+    };
+
     #[cfg(feature = "otel")]
     if let Some((address, bundle)) = options.metrics {
         #[cfg(feature = "otel")]
@@ -202,13 +224,23 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
 
     println!("Shutting down...");
     // Return failures through the CLI so its telemetry guard still flushes.
-    let mut result = node.shutdown().await.map_err(anyhow::Error::from);
+    let mut result = shutdown_content(node, content_reload, content).await;
     if let Some(chain) = chain {
         result = result.and(chain.shutdown().await.map_err(anyhow::Error::from));
     }
     result.context("failed to drain and shut down RPC server")?;
 
     Ok(())
+}
+
+pub(crate) async fn shutdown_content(
+    node: hellas_sdk::node_control::host::HostHandle,
+    reload: crate::content_configuration::ContentReload,
+    content: hellas_store::content::DiskStore,
+) -> CliResult<()> {
+    let (reload_result, node_result) = tokio::join!(reload.shutdown(), node.shutdown());
+    content.close().await;
+    node_result.map_err(anyhow::Error::from).and(reload_result)
 }
 
 fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = std::io::Result<()>>> {

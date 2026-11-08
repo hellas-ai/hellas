@@ -5,11 +5,12 @@ use catena_models::{
     weights::{Weights, f32_to_bf16},
     whisper::{Config, audio, graph},
 };
-use hellas_channel::content::EphemeralContent;
+use hellas_channel::content::{DEFAULT_MAX_STAGING_BYTES, upload_object};
 use hellas_rpc::{
-    ContentId, ContentRef,
+    ContentRef,
     protocol::invocation::{Artifact, compute::*, output::InvocationOutput},
 };
+use hellas_store::content::{LocalStore, MemoryStore, Reservations, Scope};
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
@@ -168,12 +169,9 @@ pub fn convert_whisper(checkpoint: &Path, destination: &Path) -> Result<ContentR
     for name in METADATA {
         std::fs::copy(checkpoint.join(name), staging.path().join(name))?;
     }
-    let indexed = hellas_store::ContentStore::new().index(&path)?;
+    let object = super::file_content(&path)?;
     std::fs::rename(staging.path(), destination)?;
-    Ok(ContentRef::new(
-        ContentId::from_bytes(*indexed.id.as_bytes()),
-        indexed.len,
-    ))
+    Ok(object)
 }
 
 pub(super) struct Whisper {
@@ -181,7 +179,7 @@ pub(super) struct Whisper {
     generation: Generation,
     tokenizer: tokenizers::Tokenizer,
     environment: Environment,
-    content: EphemeralContent,
+    content: (LocalStore, Scope),
     views: Vec<(u64, u64)>,
 }
 #[derive(Debug, serde::Serialize)]
@@ -192,26 +190,37 @@ pub struct Transcription {
     pub truncated: bool,
 }
 impl Whisper {
-    pub fn open(dir: &Path) -> Result<Self> {
-        let (config, generation, tokenizer) = metadata(dir)?;
-        let views = views(&config)?;
-        let indexed = hellas_store::ContentStore::new().index(&dir.join(WEIGHTS_FILE))?;
-        let (offset, bytes) = views.last().context("model has no weights")?;
-        ensure!(
-            indexed.len == offset + bytes,
-            "derived weight file has wrong length"
+    pub async fn open(dir: &Path) -> Result<Self> {
+        let dir = dir.to_owned();
+        let (config, generation, tokenizer, views, object, source) =
+            tokio::task::spawn_blocking(move || -> Result<_> {
+                let (config, generation, tokenizer) = metadata(&dir)?;
+                let views = views(&config)?;
+                let object = super::file_content(&dir.join(WEIGHTS_FILE))?;
+                let (offset, bytes) = views.last().context("model has no weights")?;
+                ensure!(
+                    object.bytes() == offset + bytes,
+                    "derived weight file has wrong length"
+                );
+                let source = super::program::render(&graph::bundle(&config, false)?)?;
+                Ok((config, generation, tokenizer, views, object, source))
+            })
+            .await??;
+        let content = (
+            LocalStore::Memory(MemoryStore::new(Reservations::ram(
+                DEFAULT_MAX_STAGING_BYTES,
+            ))),
+            Scope::Owner,
         );
-        let mut content = EphemeralContent::default();
-        let source =
-            content.insert(super::program::render(&graph::bundle(&config, false)?)?.into_bytes());
+        let source = upload_object(&content.0, source.as_bytes()).await?;
         let environment = Environment {
             sources: vec![source],
             assets: vec![NamedAsset {
                 name: "weights".into(),
-                object: ContentRef::new(ContentId::from_bytes(*indexed.id.as_bytes()), indexed.len),
+                object,
             }],
         };
-        content.insert(environment.canonical_bytes()?);
+        upload_object(&content.0, &environment.canonical_bytes()?).await?;
         Ok(Self {
             config,
             generation,

@@ -14,8 +14,9 @@ use hellas_channel::{
     },
     test_support::channel::{self as fixture, *},
     work::{
-        Admitted, BackendFault, ClientEndpoint, CloseEndpoint, DeliverError, ProviderEndpoint,
-        RunError, RunOutcome, WorkBackend, WorkService, fetch_result_stream, run_accepted_work,
+        Admitted, BackendFault, ClientChannel as _, ClientEndpoint, CloseEndpoint, DeliverError,
+        ProviderEndpoint, RunError, RunOutcome, WorkBackend, WorkService, fetch_result_stream,
+        run_accepted_work,
     },
     work_store::{ChannelRecord, ChannelStore, JobPhase, JobState, Role, TerminalOutcome},
 };
@@ -30,6 +31,23 @@ use prost::Message as _;
 use std::{sync::Arc, time::Duration};
 mod support;
 use support::temp;
+// In-process replay closes both SQLite writers before opening the same paths.
+async fn close_service(service: &WorkService) {
+    use hellas_channel::work_close::CloseChannel as _;
+    let mut driver = service.drive().unwrap();
+    let mut store = driver.store().await.unwrap();
+    let content = store.content_store();
+    store.close().await.unwrap();
+    content.close().await;
+}
+async fn close_client(mut endpoint: impl hellas_channel::work::ClientChannel) {
+    use hellas_channel::work_close::CloseChannel as _;
+    let mut client = endpoint.client().await.unwrap();
+    let mut store = client.store().await.unwrap();
+    let content = store.content_store();
+    store.close().await.unwrap();
+    content.close().await;
+}
 const EXPORTER: [u8; 32] = [0x5e; 32];
 const LAST_RELEASE: u64 = deadlines().terminal - 2;
 fn ready_at(height: u64) -> ReadyChannel {
@@ -77,7 +95,9 @@ async fn accept_input(
             ChannelRecord::JobProposed {
                 authorization: a,
                 client_signature: client().sign(signing_hash(id)),
-                prepared_input: input.canonical_bytes().unwrap(),
+                prepared_input: input.canonical_bytes().unwrap().into(),
+
+                retained_tree: None,
             },
         )
         .await;
@@ -86,6 +106,8 @@ async fn accept_input(
             ChannelRecord::JobAccepted {
                 work_id: id,
                 provider_signature: provider().sign(signing_hash(id)),
+
+                retained_tree: None,
             },
         )
         .await;
@@ -216,16 +238,26 @@ async fn one_answer_crosses_the_wire_and_is_debited_once() {
     );
     serving.abort();
     let _ = serving.await;
-    drop(endpoint);
+    close_client(endpoint).await;
+    close_service(&service).await;
     drop(service);
-    let recovered = store_at(client_root.path(), &ready, Role::Client, CURSOR).await;
+    let mut recovered = store_at(client_root.path(), &ready, Role::Client, CURSOR).await;
+    assert!(
+        recovered
+            .state()
+            .job_by_id(id)
+            .unwrap()
+            .transcript()
+            .is_empty()
+    );
+    recovered.load_retained_content(id).await.unwrap();
     let job = recovered.state().job_by_id(id).unwrap();
     assert_eq!(job.phase(), JobPhase::Ready);
     assert_eq!(job.result().map(|(r, _)| *r), Some(delivered.result));
     assert_eq!(job.transcript(), delivered.transcript);
     let mut endpoint = ClientEndpoint::new(ready.clone(), recovered, client()).unwrap();
-    endpoint.verified(id).await.unwrap();
-    drop(endpoint);
+    endpoint.verified(id, &bundle(1)).await.unwrap();
+    close_client(endpoint).await;
     let recovered = store_at(client_root.path(), &ready, Role::Client, CURSOR).await;
     assert_eq!(
         recovered.state().job_by_id(id).unwrap().phase(),
@@ -245,6 +277,7 @@ async fn the_last_height_the_delivery_margin_fits_is_the_last_that_may_release()
         let service =
             WorkService::new(ProviderEndpoint::new(early.clone(), ps, provider()).unwrap());
         run_to_result(&service, &early, id).await;
+        close_service(&service).await;
         drop(service);
         let ready = ready_at(height);
         let mut ps = store_at(root.path(), &ready, Role::Provider, height).await;
@@ -349,6 +382,7 @@ async fn a_failed_job_returns_its_terminal_after_authentication() {
         run_accepted_work(&service, &ready, &FailingBackend, id).await,
         Err(RunError::Backend(_))
     ));
+    close_service(&service).await;
     drop(service);
     let recovered = store_at(root.path(), &ready, Role::Provider, CURSOR).await;
     assert!(recovered.state().job_by_id(id).is_none());
@@ -648,23 +682,36 @@ async fn a_provider_signs_no_result_the_frame_would_not_carry() {
         )
         .unwrap(),
     );
-    let mut endpoint = ClientEndpoint::new(
+    let mut endpoint = fixture::client_service(
+        ClientEndpoint::new(
+            ready.clone(),
+            store_at(cr.path(), &ready, Role::Client, CURSOR).await,
+            client(),
+        )
+        .unwrap(),
         ready.clone(),
-        store_at(cr.path(), &ready, Role::Client, CURSOR).await,
-        client(),
     )
-    .unwrap();
+    .await;
     let mut input = fetch_bundle(1);
     input.application_policy = hellas_rpc::JsonBytes(policy.canonical_bytes().unwrap());
     let request = endpoint
-        .propose(&hellas_channel::work::JobProposal {
-            prepared_input: input,
-            deadlines: deadlines(),
-        })
+        .propose(
+            &hellas_channel::work::JobProposal {
+                prepared_input: input,
+                deadlines: deadlines(),
+            },
+            &program_content().await,
+        )
         .await
         .unwrap();
     let response = accept_uploaded_client(&service, &endpoint, &request).await;
-    let id = endpoint.accepted(&response).await.unwrap();
+    let id = endpoint
+        .client()
+        .await
+        .unwrap()
+        .accepted(&response)
+        .await
+        .unwrap();
     let result = run_accepted_work(&service, &ready, &FetchBackend, id).await;
     // RPC's shared result check enforces the signed frame ceiling before a receipt is made.
     assert!(
@@ -843,9 +890,19 @@ async fn live_prefix_precedes_terminal_and_reserves_delivery_credit() {
     );
     serving.abort();
     let _ = serving.await;
+    close_service(&service).await;
     drop(service);
-    drop(endpoint);
-    let recovered = store_at(provider_root.path(), &ready, Role::Provider, CURSOR).await;
+    close_client(endpoint).await;
+    let mut recovered = store_at(provider_root.path(), &ready, Role::Provider, CURSOR).await;
+    assert!(
+        recovered
+            .state()
+            .job_by_id(id)
+            .unwrap()
+            .transcript()
+            .is_empty()
+    );
+    recovered.load_retained_content(id).await.unwrap();
     let job = recovered.state().job_by_id(id).unwrap();
     assert_eq!(job.phase(), JobPhase::Delivered);
     assert_eq!(job.transcript(), delivered.transcript);
@@ -864,10 +921,16 @@ async fn one_channel_runs_fetch_then_compute_with_per_job_retention_and_durable_
         }
         async fn execute(&self, input: Admitted) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
             if input.capacity_domain() == hellas_channel::work::admission::CapacityDomain::Fetch {
-                assert!(input.content().retained_store().is_none());
+                assert!(matches!(
+                    input.content().0,
+                    hellas_store::content::LocalStore::Job(_)
+                ));
                 Ok(fetch_transcript(input.invocation()))
             } else {
-                assert!(input.content().retained_store().is_some());
+                assert!(matches!(
+                    input.content().0,
+                    hellas_store::content::LocalStore::Disk(_)
+                ));
                 Ok(transcript_for(&input.invocation().request, &ANSWER))
             }
         }
@@ -894,12 +957,16 @@ async fn one_channel_runs_fetch_then_compute_with_per_job_retention_and_durable_
     let mut policy = work_policy();
     policy.admissions.extend(fetch_policy().admissions);
     let ready = ready_of(&descriptor_with(policy.clone()), CURSOR);
-    let mut client_endpoint = ClientEndpoint::new(
+    let mut client_endpoint = fixture::client_service(
+        ClientEndpoint::new(
+            ready.clone(),
+            store_at(cr.path(), &ready, Role::Client, CURSOR).await,
+            client(),
+        )
+        .unwrap(),
         ready.clone(),
-        store_at(cr.path(), &ready, Role::Client, CURSOR).await,
-        client(),
     )
-    .unwrap();
+    .await;
     let service = WorkService::new(
         ProviderEndpoint::new(
             ready.clone(),
@@ -919,14 +986,23 @@ async fn one_channel_runs_fetch_then_compute_with_per_job_retention_and_durable_
             private_needles.push(input.canonical_bytes().unwrap());
         }
         let proposal = client_endpoint
-            .propose(&hellas_channel::work::JobProposal {
-                prepared_input: input.clone(),
-                deadlines: deadlines(),
-            })
+            .propose(
+                &hellas_channel::work::JobProposal {
+                    prepared_input: input.clone(),
+                    deadlines: deadlines(),
+                },
+                &program_content().await,
+            )
             .await
             .unwrap();
         let reply = accept_uploaded_client(&service, &client_endpoint, &proposal).await;
-        let id = client_endpoint.accepted(&reply).await.unwrap();
+        let id = client_endpoint
+            .client()
+            .await
+            .unwrap()
+            .accepted(&reply)
+            .await
+            .unwrap();
         run_accepted_work(&service, &ready, &Backend, id)
             .await
             .unwrap();
@@ -936,8 +1012,22 @@ async fn one_channel_runs_fetch_then_compute_with_per_job_retention_and_durable_
             })
             .await
             .unwrap();
-        assert!(client_endpoint.pay(id).await.is_err());
-        client_endpoint.verified(id).await.unwrap();
+        assert!(
+            client_endpoint
+                .client()
+                .await
+                .unwrap()
+                .pay(id)
+                .await
+                .is_err()
+        );
+        client_endpoint
+            .client()
+            .await
+            .unwrap()
+            .verified(id, &input)
+            .await
+            .unwrap();
         assert_eq!(
             admit_payment(
                 &WorkClientImpl::new(transport.clone()),
@@ -949,9 +1039,15 @@ async fn one_channel_runs_fetch_then_compute_with_per_job_retention_and_durable_
             (index as u64 + 1) * PRICE
         );
         if is_fetch {
-            private_needles.push(delivered.transcript);
-            assert!(!pr.path().join("content").exists());
-            assert!(!cr.path().join("content").exists());
+            private_needles.push(delivered.transcript.to_vec());
+            for root in [pr.path(), cr.path()] {
+                assert_eq!(
+                    std::fs::read_dir(root.join("content/objects"))
+                        .unwrap()
+                        .count(),
+                    0
+                );
+            }
         } else {
             retained_result = Some((delivered.result, delivered.transcript));
         }
@@ -960,23 +1056,24 @@ async fn one_channel_runs_fetch_then_compute_with_per_job_retention_and_durable_
     }
     serving.abort();
     let _ = serving.await;
+    close_service(&service).await;
     drop(service);
-    drop(client_endpoint);
+    close_client(client_endpoint).await;
     for (root, role) in [(pr.path(), Role::Provider), (cr.path(), Role::Client)] {
         let recovered = store_at(root, &ready, role, CURSOR).await;
         assert!(recovered.state().jobs().next().is_none());
         assert_eq!(recovered.state().ledger().credited_cumulative(), 2 * PRICE);
         let (result, transcript) = retained_result.as_ref().unwrap();
-        let content = hellas_store::ContentStore::new();
-        let path = root
-            .join("content/objects")
-            .join(result.transcript_content.id().to_string());
-        content.index(&path).unwrap();
-        let view = hellas_channel::content::InvocationContent::Retained(content);
-        assert_eq!(
-            view.read(result.transcript_content).unwrap().as_ref(),
-            transcript
-        );
+        let view = hellas_store::content::LocalStore::Disk(recovered.content_store());
+        let body = hellas_channel::content::read(
+            &view,
+            &hellas_store::content::Scope::Owner,
+            result.transcript_content,
+            result.transcript_content.bytes(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(body.as_ref(), transcript);
         assert_absent(root, &private_needles);
     }
 }

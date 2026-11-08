@@ -151,6 +151,30 @@ pub struct WorkPaymentSettlement {
 }
 
 impl WorkPaymentSettlement {
+    /// Restore the funding binding recorded by an initialized channel journal.
+    /// Its capacity must obey the same arithmetic as a funded payment edge.
+    #[must_use]
+    pub fn from_checkpoint(
+        freeze_total: u64,
+        adjudicated_total: u64,
+        capacity: u64,
+        omission_bond: u64,
+    ) -> Option<Self> {
+        if freeze_total
+            .min(adjudicated_total)
+            .checked_sub(omission_bond)?
+            != capacity
+        {
+            return None;
+        }
+        Some(Self {
+            freeze_total,
+            adjudicated_total,
+            capacity,
+            omission_bond,
+        })
+    }
+
     /// Returns the value a cooperative `Freeze` distributes.
     #[must_use]
     pub const fn freeze_total(&self) -> u64 {

@@ -26,6 +26,7 @@ async fn gateway_refuses_funding_owner_from_another_genesis() {
     let provider = crate::test_support::address(iroh::SecretKey::generate().public());
     let options = crate::paid_gateway::PaidGatewayOptions {
         config,
+        content: hellas_authority::test_support::content_store(fixture.root.path()).await,
         max_pending_requests: 1,
         providers: vec![crate::paid_gateway::GatewayProviderOptions {
             provider,

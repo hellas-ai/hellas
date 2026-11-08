@@ -1,130 +1,107 @@
 # `hellas-store`
 
-A content store addressed by **Xet file hash** — the same hash
-HuggingFace uses.
+Scoped, Xet-addressed objects and immutable trees, with pins controlling
+visibility and retention. Memory and Disk share one core; Remote uses the same
+Content protocol. An object's identity includes its content ID and exact byte
+length. Network acquisition verifies both before atomically publishing its pin.
 
-That single choice is what the design turns on: **an existing
-HuggingFace cache is already a populated store.** Adopting one is
-indexing, not downloading.
+## Configuration
 
-## The shape
+Pass a declaration to `serve --content-config content.toml`:
 
-A Nix store, or a BitTorrent client's view of its own disk. An entry is
-named by a hash of its content, so where it came from is not part of its
-identity — which is what makes substitution sound rather than merely
-convenient. Any source producing the right bytes is as good as any
-other.
+```toml
+[content]
+upper = "/var/lib/hellas/content-store"
+lower = ["/srv/models", "/srv/huggingface/hub"]
+index = "require"
 
-| BitTorrent | here |
-| --- | --- |
-| infohash | Xet file hash |
-| metainfo / `.torrent` | the chunk list |
-| piece + piece hash | chunk + `DATA_KEY`-keyed chunk hash |
-| HTTP seed | HuggingFace, ModelScope |
-| peers | other nodes *(not built)* |
-| fastresume | `fastresume::Records` |
-
-## Using it
-
-```
-hellas store adopt                 # index the HuggingFace cache in place
-hellas store adopt --cache PATH    # or a specific one
-hellas store status                # what is remembered
-hellas store fetch --id <64 hex> --repo org/name --out PATH
+# Replace these identity/length values with the output of store index.
+[content.pins."config/whisper-weights"]
+expect = "ee7d1129ce06b7939d6fb172c12501a71378c51301ff8700012e76d48dd0e1fc"
+bytes = 75521280
 ```
 
-`adopt` is a read, not a copy: the store points at the files where they
-already lie. Cost is one read per blob. Later scans and restarts reuse
-hashes while the file identity remains unchanged and the persisted index
-stays inside the user-private state boundary.
+Prepare the private derived index as the daemon's user before startup:
 
-## Persisting hashing work
+```sh
+hellas store --content-config content.toml index
+```
 
-`adopt` writes `fastresume.bin` under `<home>/store` (`--home` or `HELLAS_HOME` selects home), and never inside the HuggingFace cache, which is not
-ours. The record contains the file identity, content id, and chunk list
-from earlier hashing work, so a later run can skip unchanged files.
+Local lower files stay in place. Walks exclude cache debris and symlinks; indexing refuses FIFOs and devices. Require mode refuses missing or stale records without hashing.
+Resume mode hashes changed identities; `index --recheck` forces verification.
+The owner-only index lives at `upper/fastresume.bin`. It caches verified work;
+trusted file identity and the opened descriptor still determine validity.
+Keep the upper and its ancestors private and stable. Lower files are assumed
+immutable: an independent writer holding the same inode can change its bytes.
 
-The record is a cache of work, not a registry of cache roots and not a
-source of truth. It is trusted private state: loading requires an ordinary
-file owned by the effective user with no group/other permissions, opened
-without following a final symlink. Its parent must be owned by that user,
-not a symlink, and not group/other writable. The parent and its ancestors
-must remain stable and trusted. Non-private indexes are ignored, so their
-files are re-hashed. Accepted records are still checked against the live
-content file's identity before reuse.
+The upper defaults to `<home>/store` (`--home` or `HELLAS_HOME` selects home) and takes the node durability; capacity defaults to available
+physical free space. Admission collects unpinned cache on demand; network-on-miss is refused by default.
+Declared pins must live under `config/` and default to `Jobs`. They can explicitly
+select `owner`, `jobs`, `granted` or `public`; Channel policy uses
+`policy = { channel = "ID" }`. A job reads only its
+declared closure through Jobs or its own Channel pins. Public visibility alone
+does not grant job access. Config owns the targets and policies of `config/*` pins; every apply restores their declared values.
 
-## Indexing produces two things, and the second is the valuable one
+HF files using legacy (pre-2026) Xet chunking are refused; content identity stays canonical CDC.
 
-`index` returns the content id **and the chunk list**. Keeping only the
-id would discard the expensive half of a pass we have to make anyway.
+Immutable HF declarations use `hf://org/repo@COMMIT_SHA`. Object declarations
+can use `url`, optional HF `path`, `expect`, `bytes`, HTTPS `sha256`, and
+`policy`. HTTPS declarations require both `expect` and the exact `bytes`
+length; CLI HTTPS acquisition also permits a length without `expect`. With
+no URL, `expect` and `bytes` together name a local object. HF credentials come from `HF_TOKEN` or the node user's HF token
+file and are sent only to HF HTTPS origins. Downloads stream on blocking
+workers with bounded reservations and the existing read/idle timeouts.
 
-The chunk list is the metainfo. A Xet file hash is a Merkle root over
-exactly those descriptors, so holding them makes a later *partial* fetch
-verifiable. This matters because **HuggingFace's reconstruction protocol
-returns no chunk hashes at all** — content arriving from an untrusted
-source is otherwise unverifiable until the whole file is reassembled,
-which is a poor way to discover a peer is lying.
+## Owner commands
 
-## Two rules that are not obvious
+The normal mode is authenticated daemon RPC using an existing Owner profile:
 
-**Never trust an id you did not compute.** HuggingFace advertises an
-`x-xet-hash` per file. For Xet-native uploads it is exactly the Xet hash
-of the content; for legacy-LFS content bridged into Xet it is
-measurably *not*, with sha256 confirming the bytes were the ones HF
-meant. Ids in this store are ones we computed.
+```sh
+hellas store --profile owner-profile.json stat config/whisper-weights
+hellas store --profile owner-profile.json read config/whisper-weights --start 0 --end 64 --out prefix.bin
+hellas store --profile owner-profile.json pin ls
+hellas store --profile owner-profile.json collect
+```
 
-**`have` and `materialize` are different questions.** `have` is local,
-cheap, and touches no network. `materialize` may spend bandwidth and
-disk. The split is enforced by two traits: a `Substituter` answers where
-content already is; only a `Fetcher` can make it appear.
+Without a profile, commands use a checked local upper and may take
+`--content-config`. They refuse a store ever opened by paid Work/Channel
+scopes, even after its pins are removed: use the daemon. Connection or
+authentication failures never fall back locally. Local-grant defaults to its
+own authority-local upper. `index` remains local and only writes derived
+index metadata, so it can prepare lowers while the daemon owns the store.
+
+Resolve is explicit: it resolves a mutable revision once, prints the immutable
+SHA, and pins the resulting tree under `hf/REPO@SHA`. Acquire accepts immutable
+HF sources and publishes only the requested destination pin:
+
+```sh
+hellas store --profile owner-profile.json resolve hf://org/repo
+hellas store --profile owner-profile.json acquire hf://org/repo@COMMIT_SHA --pin model
+hellas store --profile owner-profile.json acquire https://example.org/model --bytes EXACT_BYTES --pin model
+hellas store --profile owner-profile.json acquire peer://NODE_ID --source-pin published --pin model
+hellas store --profile owner-profile.json pin set alias CONTENT_ID --bytes EXACT_BYTES --policy jobs
+hellas store --profile owner-profile.json pin rm alias
+```
+
+Command-created pins default to Owner. Pin mutations use fresh compare-and-swap
+metadata. `stat` and `read` accept `--path` within a tree; reads support byte
+ranges, and pin listing uses protocol pagination. Peer acquisition uses Public
+Content; Owner operations require the authenticated control carrier.
 
 ## Verification
 
-Three layers, deliberately:
+The shared core conformance suite runs against Memory, Disk and RPC. Tests
+exercise bounded chunk pages, tree traversal, scope expiry/revocation, exact
+reservations, private staging/publication, lower file replacement, recovery
+barriers and retained pins. HF tests cover independent Xet vectors, compressed
+chunk framing, multi-term reconstruction, overfetch and offsets, hostile token
+and range responses, and real immutable acquisition. The network test is
+explicitly ignored by default:
 
-1. Per chunk, when we hold a chunk list, as bytes arrive.
-2. Whole file, against the id that was requested, before anything is
-   written.
-3. Re-indexed after writing — so a *fetcher* that lies cannot leave
-   bytes in the store under a name they do not own.
+```sh
+cargo test -p hellas-store --test fetch fetches_the_reference_file_and_verifies_it -- --ignored --exact
+```
 
-## Conformance
-
-The hashing is checked against the published Xet spec vectors, and the
-xorb decoder against 50,469 bytes fetched from HuggingFace's own CAS.
-
-Byte-grouping (scheme 2) is covered too, against a fixture from
-`HuggingFaceTB/SmolLM2-135M` whose chunks are both scheme 2 and both a
-ragged length — the case where an ungrouper that assumes equal groups
-goes wrong. The oracle is not our own decoder: HuggingFace serves the
-reconstructed plaintext for the same byte range, and our decoded chunks
-must equal it.
-
-Still not covered: multi-term and multi-xorb reconstructions, a non-zero
-`offset_into_first_range`, and the HTTP layer itself.
-
-## Why this crate uses `ureq` and not `reqwest`
-
-The rule is:
-
-> **Streaming or async-context HTTP uses `reqwest`. Synchronous,
-> fully-buffered content fetch inside `hellas-store` uses `ureq`.**
-
-The store API is synchronous and its HTTP responses are fully buffered.
-`ureq` fits that interface without introducing `reqwest::blocking` and
-its async-runtime constraints.
-
-Both clients are configured with **bundled Mozilla roots**
-(`rustls-webpki-roots` / `webpki-roots`) rather than the OS trust store.
-Two clients in one binary trusting two different sets of certificate
-authorities is a silent policy split, and "which roots did we trust when
-we fetched this content" should have one answer — a reproducible one,
-independent of what an admin or MDM installed on the host.
-
-## Not built
-
-Peer-to-peer. `Fetcher` is the seam it implements, and the chunk lists
-the store already keeps are what will make a peer's partial response
-verifiable — the property HuggingFace's protocol cannot provide. What it
-needs is a wire protocol: announce what you hold, ask who has an id,
-request chunk ranges.
+HF HTTP uses `ureq` on blocking workers; streaming payloads are not materialized
+as whole files in RAM. Both store and async application HTTP trust bundled
+Mozilla roots, so trust does not depend on the host's certificate store.

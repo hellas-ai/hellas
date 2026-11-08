@@ -185,8 +185,8 @@ fn paid_image_transcript_uses_the_admitted_spool_bound() {
     );
 }
 
-#[test]
-fn insufficient_quoted_collateral_is_rejected_before_a_bond_request_or_journal() {
+#[tokio::test]
+async fn insufficient_quoted_collateral_is_rejected_before_a_bond_request_or_journal() {
     let (mut policy, _, _) = fetch_request(Assurance::ProducerSigned);
     policy.expected_payment_values =
         hellas_kernel::EdgeValues::new(1000, 0, hellas_kernel::Fees::ZERO);
@@ -195,6 +195,7 @@ fn insufficient_quoted_collateral_is_rejected_before_a_bond_request_or_journal()
     let provider = crate::test_support::address(SecretKey::generate().public());
     let journal_root = config.chain.client_journals(&provider.to_string());
     let args = PaidWorkOptions {
+        content: hellas_authority::test_support::content_store(fixture.root.path()).await,
         config,
         journal_kind: PaidJournalKind::Client,
         provider,

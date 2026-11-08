@@ -12,11 +12,9 @@ use catena_models::{
     checkpoint::read_gguf_model_config,
     spec::{ModelConfig, WeightDtype, weight_specs},
 };
-use hellas_channel::content::EphemeralContent;
-use hellas_rpc::{
-    ContentId, ContentRef,
-    protocol::invocation::{Artifact, compute::*},
-};
+use hellas_channel::content::{DEFAULT_MAX_STAGING_BYTES, upload_object};
+use hellas_rpc::protocol::invocation::{Artifact, compute::*};
+use hellas_store::content::{LocalStore, MemoryStore, Reservations, Scope};
 use std::{collections::BTreeMap, fs::File, path::Path};
 
 const PROMPT: &str = "prompt";
@@ -25,60 +23,72 @@ const WEIGHTS: &str = "weights";
 pub(super) struct Qwen3 {
     config: ModelConfig,
     environment: Environment,
-    content: EphemeralContent,
+    content: (LocalStore, Scope),
     views: Vec<(u64, u64)>,
     states: Vec<String>,
 }
 
 impl Qwen3 {
-    pub fn open(path: &Path) -> Result<Self> {
-        let header = gguf::read_header(&mut File::open(path)?)?;
-        let config = read_gguf_model_config(path)?;
-        let tensors: BTreeMap<_, _> = header
-            .tensors
-            .iter()
-            .map(|t| (t.name.as_str(), t))
-            .collect();
-        let mut views = Vec::new();
-        for spec in weight_specs(&config)? {
-            let tensor = tensors
-                .get(spec.gguf_name.as_str())
-                .with_context(|| format!("missing weight {}", spec.gguf_name))?;
-            let dtype = match spec.dtype {
-                WeightDtype::F32 => Dtype::F32,
-                WeightDtype::Bf16 => Dtype::Bf16,
-            };
-            ensure!(
-                tensor.dtype == dtype
-                    && tensor.shape == spec.shape.iter().map(|n| *n as u64).collect::<Vec<_>>(),
-                "weight shape or dtype mismatch: {}",
-                spec.gguf_name
-            );
-            views.push((tensor.offset, tensor.bytes));
-        }
-        let indexed = hellas_store::ContentStore::new().index(path)?;
-        let mut content = EphemeralContent::default();
-        let model = catena::generated_model_source_for(&config)?;
-        let source = super::program::render(&model)?;
-        let raw = metacat::theory::RawTheorySet::from_text(&source)?;
-        let init = raw
-            .theories
-            .get(&"program".parse()?)
-            .and_then(|program| program.arrows.get(&"qwen3.init".parse().unwrap()))
-            .context("model has no qwen3.init entry")?;
-        let hexpr::Hexpr::Tensor(outputs) = &init.type_maps.1 else {
-            anyhow::bail!("model init must declare a tuple of state outputs");
-        };
-        let states = (0..outputs.len()).map(|i| format!("s{i}")).collect();
-        let source = content.insert(source.into_bytes());
+    pub async fn open(path: &Path) -> Result<Self> {
+        let path = path.to_owned();
+        let (config, views, object, source, states) =
+            tokio::task::spawn_blocking(move || -> Result<_> {
+                let header = gguf::read_header(&mut File::open(&path)?)?;
+                let config = read_gguf_model_config(&path)?;
+                let tensors: BTreeMap<_, _> = header
+                    .tensors
+                    .iter()
+                    .map(|t| (t.name.as_str(), t))
+                    .collect();
+                let mut views = Vec::new();
+                for spec in weight_specs(&config)? {
+                    let tensor = tensors
+                        .get(spec.gguf_name.as_str())
+                        .with_context(|| format!("missing weight {}", spec.gguf_name))?;
+                    let dtype = match spec.dtype {
+                        WeightDtype::F32 => Dtype::F32,
+                        WeightDtype::Bf16 => Dtype::Bf16,
+                    };
+                    ensure!(
+                        tensor.dtype == dtype
+                            && tensor.shape
+                                == spec.shape.iter().map(|n| *n as u64).collect::<Vec<_>>(),
+                        "weight shape or dtype mismatch: {}",
+                        spec.gguf_name
+                    );
+                    views.push((tensor.offset, tensor.bytes));
+                }
+                let object = super::file_content(&path)?;
+                let model = catena::generated_model_source_for(&config)?;
+                let source = super::program::render(&model)?;
+                let raw = metacat::theory::RawTheorySet::from_text(&source)?;
+                let init = raw
+                    .theories
+                    .get(&"program".parse()?)
+                    .and_then(|program| program.arrows.get(&"qwen3.init".parse().unwrap()))
+                    .context("model has no qwen3.init entry")?;
+                let hexpr::Hexpr::Tensor(outputs) = &init.type_maps.1 else {
+                    anyhow::bail!("model init must declare a tuple of state outputs");
+                };
+                let states = (0..outputs.len()).map(|i| format!("s{i}")).collect();
+                Ok((config, views, object, source, states))
+            })
+            .await??;
+        let content = (
+            LocalStore::Memory(MemoryStore::new(Reservations::ram(
+                DEFAULT_MAX_STAGING_BYTES,
+            ))),
+            Scope::Owner,
+        );
+        let source = upload_object(&content.0, source.as_bytes()).await?;
         let environment = Environment {
             sources: vec![source],
             assets: vec![NamedAsset {
                 name: WEIGHTS.into(),
-                object: ContentRef::new(ContentId::from_bytes(*indexed.id.as_bytes()), indexed.len),
+                object,
             }],
         };
-        content.insert(environment.canonical_bytes()?);
+        upload_object(&content.0, &environment.canonical_bytes()?).await?;
         Ok(Self {
             config,
             environment,

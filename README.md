@@ -87,19 +87,28 @@ not a sandbox: it does not confine what the program can reach, and there is no
 memory metering. A job over A's upload limit is refused before it runs; a job
 that exceeds the execution limit is killed with its worker and is not paid.
 Compilation has no time limit. Sources and weights a job names by content ID
-must be available to A: index local files with `serve --content FILE` or
-`--content-root DIR`, or adopt a HuggingFace cache with `hellas store adopt`.
-Both commands default to the same store (`<home>/store`, with `--home` or `HELLAS_HOME` selecting home).
+must be available to A through declared Jobs pins in its content configuration.
+Local model directories and existing HuggingFace caches are read-only lower
+layers; acquired objects live in the upper, which defaults to `<home>/store`
+(`--home` or `HELLAS_HOME` selects home). Pass the same file to
+`hellas serve --content-config content.toml` and local index preparation:
 
-To prepare specific files outside daemon startup, run
-`hellas --home /var/lib/hellas/.hellas store index --records /var/lib/hellas/.hellas/store/fastresume.bin /assets/weights.bin`
-as the provider's service user, then start it with `--content /assets/weights.bin`,
-`--require-content-index` with the index under `<home>/store/fastresume.bin`.
-This refuses missing or stale index records instead of hashing at startup.
-Without the required-index flag, changed file identities trigger verification
-again. Use `store index --recheck` to force verification. Keep weights on persistent local
-storage when mount identities can change, and avoid a broad `--content-root`
-if only a few files are needed.
+```toml
+[content]
+upper = "/var/lib/hellas/content-store"
+lower = ["/srv/hellas/content"]
+index = "require"
+```
+
+Run `hellas store --content-config content.toml index` as the service user
+before startup. It prints each content ID and exact byte length; use those in
+`[content.pins."config/NAME"]` declarations with `expect` and `bytes`. Declared
+pins default to `Jobs`. Require mode refuses missing or stale index records
+without hashing. `index = "resume"` permits changed identities to be verified
+again; `store index --recheck` forces verification. The private derived index
+lives in the upper, and model files stay in place. See the
+[content store guide](crates/store/README.md) for declarations, acquisition and
+Owner commands.
 
 Indexed provider content is an immutable local-cache assumption. Hellas pins
 the verified read-only descriptor and detects path/inode replacement; it does
@@ -129,8 +138,8 @@ curl -fL https://raw.githubusercontent.com/ggml-org/whisper.cpp/b0a11594aec50892
 printf '%s  speech.wav\n' 59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e | sha256sum -c -
 ```
 
-Start a worker with the converted model. `--audio-model` pins its program and
-weights, creates its machine/account budgets, and serves one job at a time; no
+Start a worker with the converted model. `--audio-model` declares its weights pin, admits its program as signed Work
+input, creates its machine/account budgets, and serves one job at a time; no
 resource JSON is required. The resource is named after the directory,
 `whisper-tiny`. Here is the CUDA container command for an NVIDIA CDI host:
 
@@ -392,7 +401,11 @@ services.hellas = {
   workConfigFile = "/srv/hellas/paid-work.toml"; # passed as --paid-work-config
   passkey = "/srv/hellas/owner.passkey";
   gpuBackend = "cuda"; # or "hip" / "auto"
-  contentRoots = [ "/srv/hellas/content" ];
+  content = {
+    lower = [ "/srv/hellas/content" ];
+    index = "resume";
+    # Add config/* pin declarations using the IDs and lengths from store index.
+  };
 };
 ```
 
@@ -479,15 +492,18 @@ $(nix build .#docker-hip --print-out-paths) | docker load
 # NVIDIA with a configured CDI device specification:
 docker run --rm --device nvidia.com/gpu=all \
   -v hellas-state:/var/lib/hellas -v /srv/hellas/content:/content:ro \
-  ghcr.io/hellas-ai/hellas:cuda --software-root --content-root /content
+  -v /srv/hellas/content.toml:/etc/hellas-content.toml:ro \
+  ghcr.io/hellas-ai/hellas:cuda --software-root --content-config /etc/hellas-content.toml
 
 # AMD:
 docker run --rm --device /dev/kfd --device /dev/dri \
   -v hellas-state:/var/lib/hellas -v /srv/hellas/content:/content:ro \
-  ghcr.io/hellas-ai/hellas:hip --software-root --content-root /content
+  -v /srv/hellas/content.toml:/etc/hellas-content.toml:ro \
+  ghcr.io/hellas-ai/hellas:hip --software-root --content-config /etc/hellas-content.toml
 ```
 
-Both GPU images default to `serve` with their matching backend. The host supplies
+The mounted content file should name `/content` as its lower and declare the
+Jobs pins needed by the workload. Both GPU images default to `serve` with their matching backend. The host supplies
 the GPU driver and model content stays on runtime volumes. Published images are
 the Hydra-built artifacts of a commit whose CLI and GPU releases both passed.
 

@@ -308,6 +308,8 @@ async fn one_slow_rpc_does_not_serialize_its_connection() {
             Arc::new(IrohTransport::new(connection)),
             WorkSetupServer(witness),
             tokio::sync::watch::channel(false).1,
+            crate::provider::RPC_CONNECTION_IDLE_TIMEOUT,
+            tokio::time::Instant::now() + crate::provider::MAX_LIFETIME,
         )
         .await
     });
@@ -352,10 +354,12 @@ async fn one_slow_rpc_does_not_serialize_its_connection() {
         .expect("the second RPC succeeds");
 
     connection.close(0_u32.into(), b"concurrency test complete");
-    tokio::time::timeout(HANG_GUARD, serving)
+    let closed = tokio::time::timeout(HANG_GUARD, serving)
         .await
         .expect("the server observes connection close")
-        .expect("the server task does not panic");
+        .expect("the server task does not panic")
+        .expect_err("the server reports its closed client transport");
+    assert_eq!(closed.code(), hellas_wire::WireCode::Unavailable);
     client.close().await;
     server.close().await;
 }
@@ -364,6 +368,7 @@ async fn exchange_routed_setup(
     server: &Endpoint,
     target: &EndpointAddr,
     setup: &MountedSetup,
+    content: hellas_store::content::DiskStore,
     client_secret: u8,
     selected_bond: EdgeId,
 ) -> ExchangeSetupResponse {
@@ -399,6 +404,7 @@ async fn exchange_routed_setup(
             Some(setup),
             None,
             None,
+            content,
             tokio::sync::watch::channel(false).1,
         )
         .await
@@ -473,7 +479,8 @@ async fn two_vouched_peers_receive_their_distinct_configured_offers() {
     second
         .seed_provider_offer(dir.path(), admits(), second_peer)
         .await;
-    let setup_mount = MountedSetup::default();
+    let content = hellas_channel::test_support::channel::content_store(dir.path()).await;
+    let setup_mount = MountedSetup::with_content_store(content.clone());
     let runner = WorkRunner::discover(
         WorkRunnerConfig {
             chain: crate::test_support::chain_dir(dir.path(), network()),
@@ -487,6 +494,7 @@ async fn two_vouched_peers_receive_their_distinct_configured_offers() {
     )
     .await
     .expect("both owned provider journals are discovered");
+    content.finish_recovery().await.unwrap();
     assert_eq!(runner.journal_count(), 2, "both journals keep a clock");
 
     let alpn = <WorkSetup as ServiceMarker>::ALPN.as_bytes();
@@ -512,6 +520,7 @@ async fn two_vouched_peers_receive_their_distinct_configured_offers() {
             &server,
             &target,
             &setup_mount,
+            content.clone(),
             first_secret,
             first.bond_edge(),
         )
@@ -522,6 +531,7 @@ async fn two_vouched_peers_receive_their_distinct_configured_offers() {
             &server,
             &target,
             &setup_mount,
+            content.clone(),
             second_secret,
             second.bond_edge(),
         )
@@ -600,8 +610,9 @@ async fn discover_two_route_runner(
     root: &Path,
     work_mount: &MountedWork,
     setup_mount: &MountedSetup,
+    content: &hellas_store::content::DiskStore,
 ) -> WorkRunner {
-    match WorkRunner::discover(
+    let runner = match WorkRunner::discover(
         WorkRunnerConfig {
             chain: crate::test_support::chain_dir(root, network()),
 
@@ -616,7 +627,9 @@ async fn discover_two_route_runner(
     {
         Ok(runner) => runner,
         Err(error) => panic!("both configured routes are discovered: {error}"),
-    }
+    };
+    content.finish_recovery().await.unwrap();
+    runner
 }
 
 fn upload_messages(
@@ -624,59 +637,36 @@ fn upload_messages(
     exporter: [u8; 32],
 ) -> (
     AcceptWorkRequest,
-    Vec<hellas_rpc::pb::work::UploadContentRequest>,
+    Vec<hellas_rpc::pb::content::UploadRequest>,
 ) {
-    use hellas_rpc::{
-        ContentRef,
-        protocol::content_upload::{CONTENT_CHUNK_BYTES, chunk_digest, encode_reference},
-    };
-    let a = PaidJobAuthorizationV2::decode(&request.authorization).unwrap();
+    let authorization = PaidJobAuthorizationV2::decode(&request.authorization).unwrap();
     let key = [OfferFixture::first(), OfferFixture::second()]
         .into_iter()
-        .find(|offer| offer.descriptor().channel().id() == a.channel_id)
+        .find(|offer| offer.descriptor().channel().id() == authorization.channel_id)
         .map(|offer| offer.client())
         .unwrap_or_else(client);
-    let id = hellas_channel::model::work::paid_work_v2_id(network(), a.channel_id, &a);
-    let object = ContentRef::for_bytes(&request.prepared_input);
+    let bytes = request.prepared_input.clone();
     let input = PreparedInvocation::from_canonical_bytes(
-        &request.prepared_input,
+        &bytes,
         hellas_channel::content::MAX_CONTENT_BYTES,
     )
     .unwrap();
-    let program_manifest = input.manifest().unwrap().canonical_bytes();
-    let program_root = hellas_channel::test_support::channel::program_root(&input);
-    let chunks = request
-        .prepared_input
-        .chunks(CONTENT_CHUNK_BYTES)
-        .enumerate()
-        .map(|(index, bytes)| {
-            let offset = (index * CONTENT_CHUNK_BYTES) as u64;
-            hellas_rpc::pb::work::UploadContentRequest {
-                program_root: program_root.clone(),
-                program_manifest: program_manifest.clone(),
-                route: request.route.clone(),
-                authorization: request.authorization.clone(),
-                client_signature: request.client_signature.clone(),
-                content_id: object.id().as_bytes().to_vec(),
-                total_bytes: object.bytes(),
-                offset,
-                chunk: bytes.to_vec(),
-                chunk_signature: key
-                    .sign(signing_hash(chunk_digest(
-                        a.channel_id,
-                        id,
-                        object,
-                        offset,
-                        bytes,
-                        &exporter,
-                    )))
-                    .as_bytes()
-                    .to_vec(),
-            }
-        })
-        .collect();
-    request.prepared_input = encode_reference(object);
-    (request, chunks)
+    request.prepared_input =
+        hellas_rpc::protocol::content::encode_reference(hellas_rpc::ContentRef::for_bytes(&bytes));
+    let frames = hellas_channel::test_support::upload_frames(
+        &request,
+        input.manifest().unwrap().canonical_bytes(),
+        hellas_channel::test_support::channel::program_root(&input),
+        &bytes,
+        |opening| {
+            key.sign(signing_hash(hellas_channel::job::opening_digest(
+                opening, &exporter,
+            )))
+            .as_bytes()
+            .to_vec()
+        },
+    );
+    (request, frames)
 }
 async fn accept_mounted_route(
     mount: &MountedWork,
@@ -686,28 +676,14 @@ async fn accept_mounted_route(
     let mut context = vouched_context(peer);
     context.open_exporter = Some([7; 32]);
     let (request, uploads) = upload_messages(request, [7; 32]);
-    for upload in uploads {
-        let response: WithTrailer<hellas_rpc::pb::work::UploadContentResponse> =
-            match mount.upload_content(upload, context.clone()).await {
-                Ok(response) => response.into(),
-                Err(status) => {
-                    return AcceptWorkResponse {
-                        outcome: Some(accept_work_response::Outcome::Refused(
-                            hellas_rpc::pb::work::WorkRefused {
-                                code: WorkRefusalCode::Unavailable as i32,
-                                reason: status.message.to_string(),
-                                grant: None,
-                            },
-                        )),
-                    };
-                }
-            };
-        if let Some(refusal) = response.response.refused {
-            return AcceptWorkResponse {
-                outcome: Some(accept_work_response::Outcome::Refused(refusal)),
-            };
-        }
-    }
+    let connection = hellas_channel::work::admission::Cancellation::new();
+    let _stop = hellas_channel::work::admission::CancelOnFailure(vec![connection.clone()]);
+    let _ = crate::test_support::upload_frames(uploads, async |requests| {
+        mount
+            .upload_stream(requests, context.clone(), connection.clone())
+            .await
+    })
+    .await;
     let response: WithTrailer<AcceptWorkResponse> = mount
         .accept_work(request, context)
         .await
@@ -730,8 +706,10 @@ async fn completion_clears_and_mounts_only_the_completing_route() {
         .await;
     let source = Chain::routed([first.bond_edge()], [first.ready_snapshot(ORIGIN, None)]);
     let work_mount = MountedWork::default();
-    let setup_mount = MountedSetup::default();
-    let mut runner = discover_two_route_runner(dir.path(), &work_mount, &setup_mount).await;
+    let content = hellas_channel::test_support::channel::content_store(dir.path()).await;
+    let setup_mount = MountedSetup::with_content_store(content.clone());
+    let mut runner =
+        discover_two_route_runner(dir.path(), &work_mount, &setup_mount, &content).await;
 
     assert!(
         runner.tick(&source).await,
@@ -833,8 +811,10 @@ async fn requests_use_local_observation_and_one_contested_route_does_not_disable
         ],
     );
     let work_mount = MountedWork::default();
-    let setup_mount = MountedSetup::default();
-    let mut runner = discover_two_route_runner(dir.path(), &work_mount, &setup_mount).await;
+    let content = hellas_channel::test_support::channel::content_store(dir.path()).await;
+    let setup_mount = MountedSetup::with_content_store(content.clone());
+    let mut runner =
+        discover_two_route_runner(dir.path(), &work_mount, &setup_mount, &content).await;
 
     assert!(runner.tick(&source).await, "both completed routes mount");
     let first_request = first.signed_accept_request();
@@ -978,8 +958,10 @@ async fn one_tick_drives_every_owned_journal_without_connected_clients() {
         ],
     );
     let work_mount = MountedWork::default();
-    let setup_mount = MountedSetup::default();
-    let mut runner = discover_two_route_runner(dir.path(), &work_mount, &setup_mount).await;
+    let content = hellas_channel::test_support::channel::content_store(dir.path()).await;
+    let setup_mount = MountedSetup::with_content_store(content.clone());
+    let mut runner =
+        discover_two_route_runner(dir.path(), &work_mount, &setup_mount, &content).await;
 
     assert!(
         runner.tick(&source).await,
@@ -1120,7 +1102,11 @@ fn network() -> NetworkId {
 }
 
 fn temp() -> tempfile::TempDir {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/hellas-cli-tests");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .unwrap()
+        .join("target/hellas-cli-tests");
     if let Err(error) = std::fs::create_dir_all(&root) {
         panic!("the persistent test-artifact directory exists: {error}");
     }
@@ -1354,22 +1340,22 @@ async fn write_setup_journal(root: &Path) {
 /// Reopens the channel journal the mount opens, under exactly the
 /// channel, settlement, role and origin the descriptor fixes.
 async fn open_channel(root: &Path) -> ChannelStore {
+    let content = hellas_channel::test_support::channel::content_store(root).await;
     let journals = provider_journals(root);
     let location = StoreLocation::for_test(&journals);
-    match ChannelStore::open(
+    let store = ChannelStore::open(
         &location,
         descriptor().channel().clone(),
         settlement(),
         Role::Provider,
         origin(),
-        hellas_store::ContentStore::new(),
+        content.clone(),
         &Secp256k1Verifier::new(),
     )
     .await
-    {
-        Ok(store) => store,
-        Err(error) => panic!("the fixture channel journal opens: {error}"),
-    }
+    .unwrap();
+    content.finish_recovery().await.unwrap();
+    store
 }
 
 // ── One job, paid for, and then contested ─────────────────────────
@@ -1516,9 +1502,11 @@ async fn propose_and_accept(store: &mut ChannelStore) -> Digest {
             authorization: job,
             client_signature: client().sign(signing_hash(id)),
             prepared_input: match bundle().canonical_bytes() {
-                Ok(bytes) => bytes,
+                Ok(bytes) => bytes.into(),
                 Err(error) => panic!("the fixture bundle encodes: {error}"),
             },
+
+            retained_tree: None,
         },
     )
     .await;
@@ -1527,6 +1515,8 @@ async fn propose_and_accept(store: &mut ChannelStore) -> Digest {
         ChannelRecord::JobAccepted {
             work_id: id,
             provider_signature: provider().sign(signing_hash(id)),
+
+            retained_tree: None,
         },
     )
     .await;
@@ -1537,7 +1527,9 @@ async fn propose_and_accept(store: &mut ChannelStore) -> Digest {
 /// durable acceptance and the detached backend task's first poll.
 async fn write_accepted_channel(root: &Path) -> Digest {
     let mut store = open_channel(root).await;
-    propose_and_accept(&mut store).await
+    let work = propose_and_accept(&mut store).await;
+    store.content_store().close().await;
+    work
 }
 
 /// The channel journal a restarted provider finds: one job it
@@ -1570,9 +1562,11 @@ async fn write_contested_channel(root: &Path) -> StartId {
             result,
             provider_signature: provider().sign(signing_hash(result_digest(&channel, &result))),
             transcript: match encode_transcript(&transcript) {
-                Ok(bytes) => bytes,
+                Ok(bytes) => bytes.into(),
                 Err(error) => panic!("the fixture transcript encodes: {error}"),
             },
+
+            retained_tree: None,
         },
     )
     .await;
@@ -1634,6 +1628,7 @@ async fn write_contested_channel(root: &Path) -> StartId {
         },
     )
     .await;
+    store.content_store().close().await;
     start_id
 }
 
@@ -2308,7 +2303,8 @@ impl TxSink for NodeChain {
 /// The runner a node starts with: the configured root, the stored
 /// identity, and the policy it was configured with.
 async fn runner(root: &Path, _policy: ProviderChannelPolicy, mount: &MountedWork) -> WorkRunner {
-    match WorkRunner::discover(
+    let content = hellas_channel::test_support::channel::content_store(root).await;
+    let runner = match WorkRunner::discover(
         WorkRunnerConfig {
             chain: crate::test_support::chain_dir(root, network()),
 
@@ -2317,13 +2313,15 @@ async fn runner(root: &Path, _policy: ProviderChannelPolicy, mount: &MountedWork
             settlement_key: provider(),
         },
         mount.clone(),
-        MountedSetup::default(),
+        MountedSetup::with_content_store(content.clone()),
     )
     .await
     {
         Ok(runner) => runner,
         Err(error) => panic!("the configured root enumerates: {error}"),
-    }
+    };
+    content.finish_recovery().await.unwrap();
+    runner
 }
 
 /// The one contest this fixture's sink was handed an answer to.
@@ -2564,6 +2562,53 @@ impl OfferFixture {
         }
     }
 
+    async fn write_completed_client_setup(self, root: &Path) {
+        let verifier = Secp256k1Verifier::new();
+        let mut store = SetupStore::open(
+            &StoreLocation::for_test(root),
+            network(),
+            self.bond_edge(),
+            Role::Client,
+            &verifier,
+        )
+        .await
+        .unwrap();
+        let one = self.proposed();
+        let two = self.countersigned(one.clone());
+        let three = self.completed(two.clone());
+        let mut offer = recorded_offer(
+            one,
+            first_route_peer(),
+            self.payment_funding(),
+            provider_policy(),
+        );
+        if let SetupRecord::Offer { floor, .. } = &mut offer {
+            *floor = None;
+        }
+        for record in [
+            offer,
+            SetupRecord::ScanArmed {
+                height: FLOOR,
+                payload: payload_at(FLOOR),
+            },
+            SetupRecord::ArmedBundle {
+                bundle: two.encode(),
+                close_descriptor: Box::new(self.descriptor()),
+            },
+            SetupRecord::Bundle {
+                bundle: three.encode(),
+            },
+            SetupRecord::Complete {
+                payment_edge: self.payment_edge(),
+                origin_height: ORIGIN,
+                origin_payload: payload_at(ORIGIN),
+                origin_parent: payload_at(ORIGIN - 1),
+            },
+        ] {
+            store.commit(record, &verifier).await.unwrap();
+        }
+    }
+
     fn prepared_bundle(self) -> PreparedInvocation {
         hellas_channel::test_support::channel::bundle(self.client_seed)
     }
@@ -2620,12 +2665,16 @@ impl OfferFixture {
     }
 
     fn live_payment(self) -> Edge {
+        self.live_payment_value(PAYMENT_VALUE)
+    }
+
+    fn live_payment_value(self, value: u64) -> Edge {
         let terms = Terms::work_payment(self.payment_terms());
         let mut encoded = vec![0_u8; Edge::MAX_ENCODED_SIZE];
         let written = {
             let mut writer = BufferWriter::new(&mut encoded);
             writer.write(&[1, 5]);
-            PAYMENT_VALUE.encode_to(&mut writer);
+            value.encode_to(&mut writer);
             PAYMENT_RESERVE.encode_to(&mut writer);
             Fees::ZERO.encode_to(&mut writer);
             terms.timeout().encode_to(&mut writer);
@@ -2693,6 +2742,15 @@ impl OfferFixture {
     }
 
     fn ready_snapshot(self, height: u64, pending: Option<RegistryChunk>) -> WorkChannelSnapshot {
+        self.ready_snapshot_payment(height, pending, self.live_payment())
+    }
+
+    fn ready_snapshot_payment(
+        self,
+        height: u64,
+        pending: Option<RegistryChunk>,
+        payment: Edge,
+    ) -> WorkChannelSnapshot {
         WorkChannelSnapshot::new(
             WorkChannelQuery {
                 bond_edge: self.bond_edge(),
@@ -2706,7 +2764,7 @@ impl OfferFixture {
                 finalization: Vec::new(),
             },
             Some(self.live_bond()),
-            Some(self.live_payment()),
+            Some(payment),
             self.live_lease_slots(),
             pending,
             BTreeSet::new(),
@@ -2793,7 +2851,8 @@ struct RunningPaidNode {
 
 impl RunningPaidNode {
     async fn start(root: &Path, source: NodeChain) -> Self {
-        let setup_mount = MountedSetup::default();
+        let content = hellas_channel::test_support::channel::content_store(root).await;
+        let setup_mount = MountedSetup::with_content_store(content.clone());
         let execution_calls = Arc::new(AtomicUsize::new(0));
         let peer = PeerId::from_bytes(*SecretKey::from_bytes(&[0x62; 32]).public().as_bytes());
         let work_mount = MountedWork::with_backend(AnsweringPaidBackend {
@@ -2816,6 +2875,7 @@ impl RunningPaidNode {
             Err(error) => panic!("the node discovers its provider offer: {error}"),
         };
 
+        content.finish_recovery().await.unwrap();
         let alpns = served_alpns(true, false, false);
         assert!(
             alpns.contains(&<WorkSetup as ServiceMarker>::ALPN.as_bytes().to_vec())
@@ -2887,6 +2947,7 @@ impl RunningPaidNode {
                 let setup = setup_for_accept.clone();
                 let work = work_for_accept.clone();
                 let execution = execution_for_accept.clone();
+                let content = content.clone();
                 tokio::spawn(async move {
                     let connection = match accepting.await {
                         Ok(connection) => connection,
@@ -2902,6 +2963,7 @@ impl RunningPaidNode {
                         Some(setup),
                         Some(WorkRouter::payment(work)),
                         None,
+                        content,
                         tokio::sync::watch::channel(false).1,
                     )
                     .await
@@ -2985,16 +3047,37 @@ impl RunningPaidNode {
     async fn accept_work(&self, request: AcceptWorkRequest) -> AcceptWorkResponse {
         let (transport, connection) = self.connect(<Work as ServiceMarker>::ALPN.as_bytes()).await;
         let exporter = transport.open_exporter().unwrap();
+        let content = hellas_rpc::services::content::ContentClientImpl::new(transport.clone());
         let client = WorkClientImpl::new(transport);
         let (request, uploads) = upload_messages(request, exporter);
-        for upload in uploads {
-            let response = client.upload_content(upload).await.unwrap();
-            if let Some(refusal) = response.refused {
-                return AcceptWorkResponse {
-                    outcome: Some(accept_work_response::Outcome::Refused(refusal)),
-                };
+        // An unready route may refuse with only a trailer. Acceptance below
+        // supplies the canonical typed refusal and independently checks content.
+        let _ = async {
+            let mut upload = content.upload().await?;
+            let mut complete = false;
+            for frame in uploads {
+                if complete
+                    && !matches!(
+                        frame.part,
+                        Some(hellas_rpc::pb::content::upload_request::Part::Open(_))
+                    )
+                {
+                    continue;
+                }
+                upload.send(frame).await?;
+                let reply = upload.next().await.ok_or_else(|| {
+                    WireStatus::new(
+                        hellas_wire::WireCode::Unavailable,
+                        "missing upload progress",
+                    )
+                })??;
+                complete = reply.complete;
             }
+            upload.close().await?;
+            assert!(upload.next().await.is_none());
+            upload.finish()
         }
+        .await;
         let response = match client.accept_work(request).await {
             Ok(response) => response,
             Err(error) => panic!("Work acceptance reaches the node: {error}"),
@@ -3336,16 +3419,14 @@ async fn a_restart_with_an_open_contest_is_answered_on_the_clock() {
     let mut runner = runner(dir.path(), provider_policy(), &mount).await;
     let chain = Chain::single();
 
-    assert!(
-        mount
-            .service(
-                &vouched_context(default_route_peer()),
-                descriptor().channel().id()
-            )
-            .unwrap()
-            .is_none(),
-        "nothing is mounted before the first tick",
-    );
+    let recovered = mount
+        .service(
+            &vouched_context(default_route_peer()),
+            descriptor().channel().id(),
+        )
+        .unwrap()
+        .expect("startup restores the close driver before the first tick");
+    assert!(recovered.readiness().await.is_err());
     assert!(chain.submitted().is_empty(), "and nothing is submitted");
 
     assert!(runner.tick(&chain).await, "the fixture chain answers");
@@ -3410,7 +3491,7 @@ async fn the_paid_work_clock_submits_adjudication_when_consensus_makes_it_due_an
             .await
             .unwrap_or_else(|error| panic!("the mounted channel is readable: {error}")),
         Some(start_id),
-        "the response is chosen and fsynced locally",
+        "the response is chosen and committed locally",
     );
 
     assert!(
@@ -3625,6 +3706,18 @@ fn the_clock_resumes_an_accepted_job_after_restart() {
             )
             .unwrap()
             .unwrap();
+        {
+            use hellas_channel::work_close::CloseChannel as _;
+            retained
+                .drive()
+                .unwrap()
+                .store()
+                .await
+                .unwrap()
+                .content_store()
+                .close()
+                .await;
+        }
         tokio::spawn(async move {
             std::future::pending::<()>().await;
             drop(retained);
@@ -3842,22 +3935,17 @@ async fn the_clock_does_not_starve_the_request_path() {
         panic!("the channel is mounted before the chain is read")
     };
     let answered = tokio::time::timeout(HANG_GUARD, async move {
-        let context = TransportContext {
-            open_exporter: Some([7; 32]),
-            ..Default::default()
-        };
+        let mut context = vouched_context(default_route_peer());
+        context.open_exporter = Some([7; 32]);
         let (request, uploads) = upload_messages(signed_accept_request(), [7; 32]);
-        for upload in uploads {
-            let response: WithTrailer<hellas_rpc::pb::work::UploadContentResponse> = dispatch
-                .upload_content(upload, context.clone())
-                .await?
-                .into();
-            assert!(
-                response.response.refused.is_none(),
-                "{:?}",
-                response.response
-            );
-        }
+        let connection = hellas_channel::work::admission::Cancellation::new();
+        let _stop = hellas_channel::work::admission::CancelOnFailure(vec![connection.clone()]);
+        crate::test_support::upload_frames(uploads, async |requests| {
+            mount
+                .upload_stream(requests, context.clone(), connection.clone())
+                .await
+        })
+        .await?;
         let response = dispatch.accept_work(request, context).await?;
         Ok::<WithTrailer<AcceptWorkResponse>, WireStatus>(response.into())
     })
@@ -3897,6 +3985,22 @@ async fn a_clean_shutdown_leaves_a_replayable_journal() {
     let start_id = write_contested_channel(dir.path()).await;
     let mount = MountedWork::default();
     let runner = runner(dir.path(), provider_policy(), &mount).await;
+    let content = {
+        use hellas_channel::work_close::CloseChannel as _;
+        mount
+            .service(
+                &vouched_context(default_route_peer()),
+                descriptor().channel().id(),
+            )
+            .unwrap()
+            .unwrap()
+            .drive()
+            .unwrap()
+            .store()
+            .await
+            .unwrap()
+            .content_store()
+    };
     let chain = Chain::single();
     let (stop, stopped) = oneshot::channel();
     let task = {
@@ -3942,8 +4046,10 @@ async fn a_clean_shutdown_leaves_a_replayable_journal() {
         "a stopped clock serves no channel",
     );
 
-    // Both files are released, and both replay to what the clock
-    // left in them.
+    // The fixture owns the content pool; the production clock reuses its
+    // caller's pool across restarts. Finish this fixture's physical handoff.
+    content.close().await;
+    // Both files are released, and both replay to what the clock left in them.
     let location = StoreLocation::for_test(&provider_journals(dir.path()));
     let setup = match SetupStore::open(
         &location,
@@ -3989,8 +4095,9 @@ async fn a_blocked_channel_observer_does_not_stop_other_channels_or_shutdown() {
         release,
     });
     let mount = MountedWork::default();
-    let setups = MountedSetup::default();
-    let runner = discover_two_route_runner(dir.path(), &mount, &setups).await;
+    let content = hellas_channel::test_support::channel::content_store(dir.path()).await;
+    let setups = MountedSetup::with_content_store(content.clone());
+    let runner = discover_two_route_runner(dir.path(), &mount, &setups, &content).await;
     let (stop, stopped) = oneshot::channel();
     let observing = tokio::spawn(async move {
         runner
@@ -4074,8 +4181,9 @@ async fn one_peer_routes_distinct_channels_without_crossing_journals() {
     first.write_completed_setup(root.path()).await;
     second.write_completed_setup(root.path()).await;
     let original = MountedWork::default();
-    let setup = MountedSetup::default();
-    let mut runner = discover_two_route_runner(root.path(), &original, &setup).await;
+    let content = hellas_channel::test_support::channel::content_store(root.path()).await;
+    let setup = MountedSetup::with_content_store(content.clone());
+    let mut runner = discover_two_route_runner(root.path(), &original, &setup, &content).await;
     let source = Chain::routed(
         [first.bond_edge(), second.bond_edge()],
         [
@@ -4162,7 +4270,7 @@ async fn one_peer_routes_distinct_channels_without_crossing_journals() {
     ));
     let mut unmounted_grant = first.signed_accept_request();
     unmounted_grant.route.as_mut().unwrap().funding_kind = FundingKind::Grant as i32;
-    unmounted_grant.prepared_input = hellas_rpc::protocol::content_upload::encode_reference(
+    unmounted_grant.prepared_input = hellas_rpc::protocol::content::encode_reference(
         hellas_rpc::ContentRef::for_bytes(&unmounted_grant.prepared_input),
     );
     let response: WithTrailer<AcceptWorkResponse> = mounted
@@ -4272,6 +4380,8 @@ async fn provider_startup_preserves_explicit_allowances_and_machine_limits() {
             },
             responses: None,
         }]);
+    let content =
+        hellas_authority::test_support::content_store(&root.path().join("grant-content")).await;
     for options in [config(), changed, config()] {
         let node = options
             .open(ProviderResources::ComputeAndFetch(&routes), &provider)
@@ -4288,6 +4398,7 @@ async fn provider_startup_preserves_explicit_allowances_and_machine_limits() {
             Arc::new(producer_key.clone()),
             common_node::NoBackend,
             vec![],
+            content.clone(),
         )
         .await
         .unwrap();
@@ -4489,6 +4600,7 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
         backend,
         vec![],
         Arc::new(move || now),
+        hellas_authority::test_support::content_store(&root.path().join("grants")).await,
     )
     .unwrap();
     let admin = common_node::WorkAdmin::new(service.clone(), &secret, policies).await;
@@ -4518,18 +4630,15 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
         network,
         [7; 32],
     );
-    for upload in uploads {
-        let response: WithTrailer<hellas_rpc::pb::work::UploadContentResponse> = execution
-            .upload_content(upload, context.clone())
+    let connection = hellas_channel::work::admission::Cancellation::new();
+    let _stop = hellas_channel::work::admission::CancelOnFailure(vec![connection.clone()]);
+    crate::test_support::upload_frames(uploads, async |requests| {
+        execution
+            .upload_stream(requests, context.clone(), connection.clone())
             .await
-            .unwrap()
-            .into();
-        assert!(
-            response.response.refused.is_none(),
-            "{:?}",
-            response.response
-        );
-    }
+    })
+    .await
+    .unwrap();
     let response: WithTrailer<AcceptWorkResponse> = execution
         .accept_work(request.clone(), context.clone())
         .await
@@ -4605,4 +4714,623 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
         "stopping the payment observer preserves authenticated grant execution"
     );
     service.drain().await.unwrap();
+}
+
+#[tokio::test]
+async fn offline_startup_restores_retained_pins_and_output_before_the_global_barrier() {
+    use hellas_channel::work_store::journal::{Journal, JournalId, JournalKind};
+    use hellas_store::content::{
+        ContentStore as _, Cursor, DiskStore, IndexMode, Reservations, Scope, Target, Tree,
+    };
+    let root = temp();
+    let journals = StoreLocation::for_test(&provider_journals(root.path()));
+    let offer = OfferFixture::first();
+    offer.write_completed_setup(root.path()).await;
+    let setup = SetupStore::open(
+        &journals,
+        network(),
+        offer.bond_edge(),
+        Role::Provider,
+        &Secp256k1Verifier::new(),
+    )
+    .await
+    .unwrap();
+    let origin = setup.state().origin().unwrap();
+    drop(setup);
+    let descriptor = offer.descriptor();
+    let channel = descriptor.channel().clone();
+    let payment = offer.live_payment_value(PAYMENT_VALUE + 1);
+    let actual = descriptor.funded_settlement(&payment).unwrap();
+    assert_ne!(actual, descriptor.expected_settlement().unwrap());
+    let node = hellas_channel::test_support::channel::content_store(root.path()).await;
+    let mut journal = ChannelStore::open(
+        &journals,
+        channel.clone(),
+        actual,
+        Role::Provider,
+        origin,
+        node.clone(),
+        &Secp256k1Verifier::new(),
+    )
+    .await
+    .unwrap();
+    node.finish_recovery().await.unwrap();
+    let authorization = offer.authorization();
+    let work = work_id(&channel, &authorization);
+    let prepared = offer.prepared_bundle();
+    let input = prepared.canonical_bytes().unwrap();
+    hellas_channel::test_support::channel::seed_content(
+        &mut journal,
+        authorization,
+        input.clone().into(),
+    )
+    .await;
+    journal
+        .commit(
+            ChannelRecord::JobProposed {
+                authorization,
+                client_signature: offer.client().sign(signing_hash(work)),
+                prepared_input: input.clone().into(),
+                retained_tree: None,
+            },
+            &Secp256k1Verifier::new(),
+        )
+        .await
+        .unwrap();
+    let environment = hellas_channel::test_support::channel::program_root(&prepared);
+    let closure = hellas_channel::job::content_closure(
+        &work_policy(),
+        &prepared.manifest().unwrap(),
+        &environment,
+        authorization.input_content,
+    )
+    .unwrap();
+    let tree = Tree::new(
+        closure
+            .iter()
+            .map(|object| (object.id().to_string(), Target::Object(*object)))
+            .collect(),
+    )
+    .unwrap()
+    .bytes();
+    let tree_ref = hellas_rpc::ContentRef::for_bytes(&tree);
+    let (_, scope) = journal
+        .open_content(
+            work,
+            authorization.retention,
+            closure,
+            work_policy().limits.max_upload_bytes,
+        )
+        .await
+        .unwrap();
+    let mut upload = node.stage_output(&scope, tree_ref).await.unwrap();
+    upload
+        .copy_from(std::io::Cursor::new(tree), &node.ram_pool())
+        .await
+        .unwrap();
+    drop(upload);
+    assert!(
+        node.pins(&Scope::Owner, "channel/", Cursor::default())
+            .await
+            .unwrap()
+            .pins
+            .is_empty()
+    );
+    let outstanding = node.stats().unwrap().outstanding;
+    assert!(outstanding > 0);
+    drop(journal);
+    node.close().await;
+    drop(node);
+    // Persist acceptance at the real journal boundary while its tree and input
+    // are still private staging: recovery must publish them before cleanup.
+    let key = ChannelStore::journal_key(&channel);
+    let stem = format!("channel-{}", hex::encode(key));
+    let (mut journal, _) = Journal::open_existing(
+        &journals,
+        &stem,
+        JournalId {
+            kind: JournalKind::Channel,
+            role: Role::Provider,
+            key,
+        },
+    )
+    .await
+    .unwrap();
+    journal
+        .append(
+            &ChannelRecord::JobAccepted {
+                work_id: work,
+                provider_signature: provider().sign(signing_hash(work)),
+                retained_tree: Some(tree_ref),
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    journal.close().await;
+    drop(journal);
+    let node = DiskStore::open(
+        StoreLocation::for_test(root.path()).child("content"),
+        vec![],
+        IndexMode::Resume,
+        None,
+        Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(node.collect(&Scope::Owner).await.is_err());
+    let mounted = MountedWork::default();
+    let setups = MountedSetup::with_content_store(node.clone());
+    // No chain source is supplied to discovery. All storage obligations must
+    // already be restored while every service still lacks fresh readiness.
+    let mut runner = WorkRunner::discover(
+        WorkRunnerConfig {
+            chain: crate::test_support::chain_dir(root.path(), network()),
+            poll: Duration::from_millis(1),
+            max_observation_age: HANG_GUARD,
+            settlement_key: provider(),
+        },
+        mounted.clone(),
+        setups,
+    )
+    .await
+    .unwrap();
+    assert_eq!(runner.channel_count(), 1);
+    assert!(node.collect(&Scope::Owner).await.is_err());
+    let pins = node
+        .pins(&Scope::Owner, "channel/", Cursor::default())
+        .await
+        .unwrap();
+    assert_eq!(pins.pins.len(), 1);
+    assert_eq!(pins.pins[0].1.target, Target::Tree(tree_ref));
+    assert!(node.stats().unwrap().outstanding > 0);
+    let service = mounted
+        .service(&vouched_context(first_route_peer()), channel.id())
+        .unwrap()
+        .unwrap();
+    assert!(service.readiness().await.is_err());
+    node.finish_recovery().await.unwrap();
+    assert_eq!(node.collect(&Scope::Owner).await.unwrap().objects, 0);
+    let after = node.stats().unwrap().outstanding;
+    assert_eq!(
+        after, outstanding,
+        "restore the exact remaining reservation before collection"
+    );
+    let snapshot = offer.ready_snapshot_payment(ORIGIN, None, payment);
+    assert!(
+        !service
+            .with_state(|state| state.origin_observed())
+            .await
+            .unwrap()
+    );
+    let invalid = Chain::routed([], [snapshot.clone()]);
+    assert!(
+        !runner.tick(&invalid).await,
+        "a coherent tip without the actual opening transaction cannot authorize the handoff"
+    );
+    assert!(
+        !service
+            .with_state(|state| state.origin_observed())
+            .await
+            .unwrap()
+    );
+    assert!(service.readiness().await.is_err());
+    let source = Chain::routed([offer.bond_edge()], [snapshot]);
+    assert!(runner.tick(&source).await);
+    assert!(service.readiness().await.is_ok());
+    assert!(
+        service
+            .with_state(|state| state.origin_observed())
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        service
+            .with_state(|state| state.settlement())
+            .await
+            .unwrap(),
+        actual
+    );
+    let ready = service.readiness().await.unwrap();
+    let hellas_channel::work::RunAdmission::Invoke(admitted) =
+        service.begin_run(work, &ready).await.unwrap()
+    else {
+        panic!("the same recovered job runs only after a fresh observer decision")
+    };
+    let (local, scope) = admitted.content();
+    assert_eq!(
+        hellas_channel::content::read(
+            local,
+            scope,
+            authorization.input_content,
+            input.len() as u64
+        )
+        .await
+        .unwrap(),
+        input
+    );
+    drop(admitted);
+    service.end_run(work).await.unwrap();
+    drop(service);
+    drop(mounted);
+    drop(runner);
+    node.close().await;
+    drop(node);
+    let canonical = Journal::path(&journals, &stem);
+    let duplicate = Journal::path(&journals, "channel-duplicate");
+    std::fs::copy(&canonical, &duplicate).unwrap();
+    let node = hellas_channel::test_support::channel::content_store(root.path()).await;
+    let duplicate_result = WorkRunner::discover(
+        WorkRunnerConfig {
+            chain: crate::test_support::chain_dir(root.path(), network()),
+            poll: Duration::from_millis(1),
+            max_observation_age: HANG_GUARD,
+            settlement_key: provider(),
+        },
+        MountedWork::default(),
+        MountedSetup::with_content_store(node.clone()),
+    )
+    .await;
+    assert!(
+        matches!(duplicate_result, Err(crate::paid_provider::PaidProviderError::UnmatchedChannel { path }) if path == duplicate)
+    );
+    assert!(node.collect(&Scope::Owner).await.is_err());
+    node.close().await;
+    drop(node);
+    std::fs::remove_file(duplicate).unwrap();
+    // A surviving channel checkpoint must never be skipped merely because its
+    // signed setup descriptor is no longer discoverable under the node root.
+    let setup_stem = Journal::stems(&journals)
+        .unwrap()
+        .into_iter()
+        .find(|stem| stem.starts_with("setup-"))
+        .unwrap();
+    let setup_path = Journal::path(&journals, &setup_stem);
+    std::fs::rename(&setup_path, setup_path.with_extension("held-aside")).unwrap();
+    let node = hellas_channel::test_support::channel::content_store(root.path()).await;
+    let recovered = WorkRunner::discover(
+        WorkRunnerConfig {
+            chain: crate::test_support::chain_dir(root.path(), network()),
+            poll: Duration::from_millis(1),
+            max_observation_age: HANG_GUARD,
+            settlement_key: provider(),
+        },
+        MountedWork::default(),
+        MountedSetup::with_content_store(node.clone()),
+    )
+    .await;
+    assert!(matches!(
+        recovered,
+        Err(crate::paid_provider::PaidProviderError::UnmatchedChannel { .. })
+    ));
+    assert!(node.collect(&Scope::Owner).await.is_err());
+    node.close().await;
+}
+
+#[tokio::test]
+async fn offline_client_roots_restore_all_half_signed_obligations_before_collection() {
+    use hellas_store::content::{
+        ContentStore as _, Cursor, DiskStore, IndexMode, Reservations, Scope,
+    };
+    let root = temp();
+    let paths = [
+        StoreLocation::for_test(&root.path().join("client-one")),
+        StoreLocation::for_test(&root.path().join("client-two")),
+    ];
+    let offers = [OfferFixture::first(), OfferFixture::second()];
+    let node = DiskStore::open(
+        StoreLocation::for_test(&root.path().join("shared-content")),
+        vec![],
+        IndexMode::Resume,
+        None,
+        Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+        false,
+    )
+    .await
+    .unwrap();
+    node.finish_recovery().await.unwrap();
+    let verifier = Secp256k1Verifier::new();
+    for (offer, path) in offers.into_iter().zip(&paths) {
+        offer.write_completed_client_setup(path).await;
+        let setup =
+            SetupStore::open_existing(path, network(), offer.bond_edge(), Role::Client, &verifier)
+                .await
+                .unwrap();
+        let origin = setup.state().origin().unwrap();
+        drop(setup);
+        let mut journal = ChannelStore::open(
+            path,
+            offer.descriptor().channel().clone(),
+            offer
+                .descriptor()
+                .funded_settlement(&offer.live_payment_value(PAYMENT_VALUE + 1))
+                .unwrap(),
+            Role::Client,
+            origin,
+            node.clone(),
+            &verifier,
+        )
+        .await
+        .unwrap();
+        let authorization = offer.authorization();
+        assert_eq!(authorization.retention, hellas_rpc::Retention::Retain);
+        let input = offer.prepared_bundle().canonical_bytes().unwrap();
+        hellas_channel::test_support::channel::seed_content(
+            &mut journal,
+            authorization,
+            input.clone().into(),
+        )
+        .await;
+        let work = work_id(journal.state().channel(), &authorization);
+        journal
+            .commit(
+                ChannelRecord::JobProposed {
+                    authorization,
+                    client_signature: offer.client().sign(signing_hash(work)),
+                    prepared_input: input.into(),
+                    retained_tree: None,
+                },
+                &verifier,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            journal.state().job_by_id(work).unwrap().phase(),
+            hellas_channel::work_store::JobPhase::HalfSigned
+        );
+    }
+    let before = node.stats().unwrap().outstanding;
+    assert!(before > 0);
+    node.close().await;
+    drop(node);
+    let node = DiskStore::open(
+        StoreLocation::for_test(&root.path().join("shared-content")),
+        vec![],
+        IndexMode::Resume,
+        None,
+        Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(node.stats().unwrap().outstanding, 0);
+    for (index, path) in paths.iter().enumerate() {
+        crate::paid_client::recover_content(path, network(), &node)
+            .await
+            .unwrap();
+        assert!(node.collect(&Scope::Owner).await.is_err());
+        assert_eq!(
+            node.stats().unwrap().outstanding,
+            before / 2 * (index as u64 + 1)
+        );
+    }
+    assert_eq!(
+        node.pins(&Scope::Owner, "channel/", Cursor::default())
+            .await
+            .unwrap()
+            .pins
+            .len(),
+        2
+    );
+    node.finish_recovery().await.unwrap();
+    assert_eq!(node.collect(&Scope::Owner).await.unwrap().bytes, 0);
+    // Offline handles are gone. Canonical online reopening reuses reservations
+    // rather than doubling them; no chain source was contacted to reach this gate.
+    for (offer, path) in offers.into_iter().zip(&paths) {
+        let setup =
+            SetupStore::open_existing(path, network(), offer.bond_edge(), Role::Client, &verifier)
+                .await
+                .unwrap();
+        let journal = ChannelStore::open_existing(
+            path,
+            offer.descriptor().channel().clone(),
+            offer
+                .descriptor()
+                .funded_settlement(&offer.live_payment_value(PAYMENT_VALUE + 1))
+                .unwrap(),
+            Role::Client,
+            setup.state().origin().unwrap(),
+            node.clone(),
+            &verifier,
+        )
+        .await
+        .unwrap();
+        assert_eq!(node.stats().unwrap().outstanding, before);
+        drop(journal);
+        drop(setup);
+    }
+    node.close().await;
+    drop(node);
+    let orphan = OfferFixture {
+        client_seed: 0x25,
+        bond_coin: 0xa3,
+        payment_coin: 0xb3,
+    };
+    let node = DiskStore::open(
+        StoreLocation::for_test(&root.path().join("shared-content")),
+        vec![],
+        IndexMode::Resume,
+        None,
+        Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+        false,
+    )
+    .await
+    .unwrap();
+    let journal = ChannelStore::open(
+        &paths[1],
+        orphan.descriptor().channel().clone(),
+        orphan.descriptor().expected_settlement().unwrap(),
+        Role::Client,
+        hellas_channel::work_store::SetupOrigin {
+            payment_edge: orphan.payment_edge(),
+            height: ORIGIN,
+            payload: payload_at(ORIGIN),
+            parent: payload_at(ORIGIN - 1),
+        },
+        node.clone(),
+        &verifier,
+    )
+    .await
+    .unwrap();
+    drop(journal);
+    crate::paid_client::recover_content(&paths[0], network(), &node)
+        .await
+        .unwrap();
+    assert!(matches!(
+        crate::paid_client::recover_content(&paths[1], network(), &node).await,
+        Err(crate::paid_client::PaidClientError::UnmatchedChannel { .. })
+    ));
+    assert!(node.collect(&Scope::Owner).await.is_err());
+    node.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_stop_waits_for_unaccepted_content_and_reopens_with_old_handlers_alive() {
+    use hellas_store::content::{ContentStore as _, Error, PinName, Scope};
+    let dir = temp();
+    write_setup_journal(dir.path()).await;
+    let content = hellas_channel::test_support::channel::content_store(dir.path()).await;
+    let mount = MountedWork::default();
+    let setup = MountedSetup::with_content_store(content.clone());
+    let runner = discover_two_route_runner(dir.path(), &mount, &setup, &content).await;
+    let source = Chain::single();
+    source.set_snapshot(ready_channel_snapshot(ORIGIN, None));
+    let (stop, stopped) = oneshot::channel();
+    let running = {
+        let source = source.clone();
+        tokio::spawn(async move {
+            runner
+                .run_over(stopped, move || {
+                    let source = source.clone();
+                    async move { Some(source) }
+                })
+                .await
+        })
+    };
+    let held = tokio::time::timeout(HANG_GUARD, async {
+        loop {
+            if let Some(service) = mount
+                .service(
+                    &vouched_context(default_route_peer()),
+                    descriptor().channel().id(),
+                )
+                .unwrap()
+                && service.readiness().await.is_ok()
+            {
+                break service;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let (request, frames) = upload_messages(signed_accept_request(), [7; 32]);
+    let authorization = PaidJobAuthorizationV2::decode(&request.authorization).unwrap();
+    let id = work_id(descriptor().channel(), &authorization);
+    let connection = hellas_channel::work::admission::Cancellation::new();
+    let mut context = vouched_context(default_route_peer());
+    context.open_exporter = Some([7; 32]);
+    crate::test_support::upload_frames(frames, async |requests| {
+        mount
+            .upload_stream(requests, context.clone(), connection.clone())
+            .await
+    })
+    .await
+    .unwrap();
+    assert!(held.completed_content_upload(id).await.unwrap());
+    assert!(
+        held.with_state(|state| state.job_by_id(id).is_none())
+            .await
+            .unwrap()
+    );
+    assert!(content.stats().unwrap().outstanding > 0 || content.ram_pool().held() > 0);
+
+    // Hold the real Core effect gate, using the existing live-scope binding.
+    let (entered, started) = oneshot::channel();
+    let entered = Arc::new(Mutex::new(Some(entered)));
+    let (release, blocked) = std::sync::mpsc::channel();
+    let blocked = Arc::new(Mutex::new(blocked));
+    let gate_scope = Scope::Owner.bind(
+        move || {
+            let (entered, blocked) = (entered.clone(), blocked.clone());
+            async move {
+                Ok(move || {
+                    if let Some(entered) = entered.lock().unwrap().take() {
+                        let _ = entered.send(());
+                    }
+                    blocked.lock().unwrap().recv().map_err(|_| Error::Denied)?;
+                    Ok(())
+                })
+            }
+        },
+        std::future::pending,
+    );
+    let blocker = {
+        let content = content.clone();
+        tokio::spawn(async move {
+            content
+                .set_pin(
+                    &gate_scope,
+                    &PinName::new("stop-gate".into()).unwrap(),
+                    None,
+                    None,
+                )
+                .await
+        })
+    };
+    started.await.unwrap();
+    stop.send(()).unwrap();
+    let mut stopping = running;
+    let result = tokio::time::timeout(Duration::from_millis(250), &mut stopping).await;
+    let waited = result.is_err();
+    release.send(()).unwrap();
+    blocker.await.unwrap().unwrap();
+    match result {
+        Ok(result) => result.unwrap().unwrap(),
+        Err(_) => tokio::time::timeout(HANG_GUARD, stopping)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+    }
+    assert!(
+        waited,
+        "provider shutdown must finish local content cleanup before returning"
+    );
+    assert_eq!(content.stats().unwrap().outstanding, 0);
+    assert_eq!(content.ram_pool().held(), 0);
+
+    let next = MountedWork::default();
+    let setup = MountedSetup::with_content_store(content.clone());
+    let mut restarted = discover_two_route_runner(dir.path(), &next, &setup, &content).await;
+    assert!(restarted.tick(&source).await);
+    let reopened = next
+        .service(
+            &vouched_context(default_route_peer()),
+            descriptor().channel().id(),
+        )
+        .unwrap()
+        .unwrap();
+    assert!(
+        reopened
+            .with_state(|state| state.job_by_id(id).is_none())
+            .await
+            .unwrap()
+    );
+    assert!(matches!(
+        held.accept(&request).await.outcome,
+        Some(accept_work_response::Outcome::Refused(_))
+    ));
+    connection.cancel();
+    let (stop, stopped) = oneshot::channel();
+    stop.send(()).unwrap();
+    restarted
+        .run_over(stopped, move || {
+            let source = source.clone();
+            async move { Some(source) }
+        })
+        .await
+        .unwrap();
+    content.close().await;
 }

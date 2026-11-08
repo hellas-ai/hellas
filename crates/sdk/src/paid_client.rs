@@ -7,10 +7,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tracing::Instrument as _;
 
+mod content;
 mod error;
 mod funding;
 pub(crate) mod offer;
 mod settlement;
+pub use content::recover_content;
 pub use error::PaidClientError;
 pub use funding::{RecoveredFundingChannel, recover_funding_channels, recover_funding_intent};
 pub use offer::{PaidQuote, request_paid_quote};
@@ -24,7 +26,6 @@ use crate::work_link::WorkLink as ProviderDialer;
 use futures::StreamExt as _;
 use hellas_chain::client::RemoteLightClient;
 use hellas_chain::{FinalizedWorkView as _, WorkBlocks, WorkChannelQuery};
-use hellas_channel::content::InvocationContent;
 use hellas_channel::model::setup::{ProviderChannelPolicy, WorkChannelDescriptor};
 use hellas_channel::model::work::{JobDeadlines, private_policy_commitment};
 use hellas_channel::work::{
@@ -44,6 +45,7 @@ use hellas_kernel::{
     WorkPaymentTerms,
 };
 use hellas_rpc::protocol::invocation::PreparedInvocation;
+use hellas_store::content::{LocalStore, Scope};
 use hellas_wire::ServiceMarker;
 #[cfg(test)]
 use hellas_wire::iroh::IrohTransport;
@@ -65,6 +67,7 @@ pub enum PaidJournalKind {
 pub struct PaidWorkOptions {
     pub config: WorkConfig,
     pub journal_kind: PaidJournalKind,
+    pub content: hellas_store::content::DiskStore,
     /// Every connection must present exactly this enrollment and node.
     pub provider: hellas_client::ProviderAddress,
     /// Direct UDP addresses of `provider.node`.
@@ -257,6 +260,41 @@ impl Drop for PaidWorkSession {
     }
 }
 
+async fn observe_client(
+    client: &ClientObserver,
+    descriptor: &WorkChannelDescriptor,
+    config: &WorkConfig,
+    remote: &RemoteLightClient,
+    floor: u64,
+) -> Result<()> {
+    let chain = WorkBlocks::new(remote.clone()).with_min_height(floor);
+    let started = hellas_channel::work::ObservationTime::now();
+    let span = hellas_rpc::request_span!(target: "hellas_request", parent: None, "paid.channel.observe", hellas.channel.role = "client");
+    tokio::time::timeout(
+        config.max_observation_age,
+        async {
+            let mut driver = client.drive()?;
+            driver.advance_close(&chain, &chain).await?;
+            let ready = ready_channel(descriptor, &chain).await?;
+            if ready
+                .check_caught_up(client.with_state(|state| state.cursor().0).await?)
+                .is_err()
+            {
+                driver.catch_up_to(&chain, ready.finalized_height()).await?;
+            }
+            client
+                .observe_ready(ready, started, config.max_observation_age)
+                .await?;
+            Ok::<_, PaidClientError>(())
+        }
+        .instrument(span),
+    )
+    .await
+    .unwrap_or(Err(PaidClientError::Timeout {
+        stage: "channel observer",
+    }))
+}
+
 fn spawn_observer(
     client: ClientObserver,
     descriptor: WorkChannelDescriptor,
@@ -281,32 +319,7 @@ fn spawn_observer(
                 let _ = client.suspend().await;
                 break;
             };
-            let chain = WorkBlocks::new(remote.clone()).with_min_height(floor);
-            let started = hellas_channel::work::ObservationTime::now();
-            let span = hellas_rpc::request_span!(target: "hellas_request", parent: None, "paid.channel.observe", hellas.channel.role = "client");
-            let result = tokio::time::timeout(
-                config.max_observation_age,
-                async {
-                    let mut driver = client.drive()?;
-                    driver.advance_close(&chain, &chain).await?;
-                    let ready = ready_channel(&descriptor, &chain).await?;
-                    if ready
-                        .check_caught_up(client.with_state(|state| state.cursor().0).await?)
-                        .is_err()
-                    {
-                        driver.catch_up_to(&chain, ready.finalized_height()).await?;
-                    }
-                    client
-                        .observe_ready(ready, started, config.max_observation_age)
-                        .await?;
-                    Ok::<_, PaidClientError>(())
-                }
-                .instrument(span),
-            )
-            .await
-            .unwrap_or(Err(PaidClientError::Timeout {
-                stage: "channel observer",
-            }));
+            let result = observe_client(&client, &descriptor, &config, &remote, floor).await;
             if let Err(error) = result {
                 let _ = client.suspend().await;
                 tracing::debug!(%error, "paid client observation unavailable");
@@ -486,6 +499,10 @@ impl PaidWorkSession {
         connection_timeout: Option<Duration>,
         funding: SessionFundingOptions,
     ) -> Result<Self> {
+        if let Some(job) = intent.job.as_deref() {
+            job.validate_content().await?;
+        }
+
         args.validate()?;
         let config = &args.config;
         if owner.chain().as_path() != config.chain.as_path() {
@@ -519,7 +536,7 @@ impl PaidWorkSession {
             .with_min_height(floor);
         let retained = setups.select(&chain).await?;
         let reconnect = retained.is_some();
-        let (store, signed) = match retained {
+        let (mut store, signed) = match retained {
             Some(retained) => retained,
             None if !intent.allow_funding => {
                 return Err(PaidClientError::NoRetainedChannel);
@@ -562,6 +579,7 @@ impl PaidWorkSession {
                 (store, signed)
             }
         };
+        store.set_content_store(args.content.clone());
         signed.check()?;
         let payment_funding = signed.offer().payment_funding.clone();
         let policy = signed.offer().policy.clone();
@@ -658,7 +676,7 @@ impl PaidWorkSession {
         // merely behind, rather than retried until the open deadline.
         let channel_floor = mounted.state().cursor().0;
         let tip = WorkBlocks::new(remote.clone()).latest_height().await;
-        let (remote, chain) = if !matches!(tip, Ok(Some(height)) if height >= channel_floor) {
+        let (mut remote, chain) = if !matches!(tip, Ok(Some(height)) if height >= channel_floor) {
             let remote =
                 crate::client_chain::connect_at(config, read_timeout, channel_floor).await?;
             let chain = WorkBlocks::new(remote.clone())
@@ -684,14 +702,47 @@ impl PaidWorkSession {
                 .observe_ready(ready, started, config.max_observation_age)
                 .await?;
         }
+        if initially_ready {
+            // Keep initial observation in the opening future. Cancellation must
+            // release this journal before a caller can immediately reopen it.
+            let mut source_config = config.clone();
+            within(args.timeout, "initial channel observation", async {
+                while client.readiness().await.is_err()
+                    && !client.with_state(|state| state.is_closing()).await?
+                {
+                    let floor = client.with_state(|state| state.cursor().0).await?;
+                    if let Err(error) = observe_client(
+                        &client.observer(), &descriptor, config, &remote, floor,
+                    ).await {
+                        client.observer().suspend().await?;
+                        tracing::debug!(%error, "paid client observation unavailable");
+                        source_config.chain.rotate_validators();
+                        match crate::client_chain::connect_at(
+                            &source_config, config.max_observation_age, floor,
+                        ).await {
+                            Ok(next) => remote = next,
+                            Err(error) => tracing::debug!(%error, "waiting for a verified remote chain source"),
+                        }
+                    }
+                    if client.readiness().await.is_err() {
+                        #[expect(
+                            clippy::disallowed_methods,
+                            reason = "inventory class A: channel readiness; rollout 2"
+                        )]
+                        tokio::time::sleep(config.poll).await;
+                    }
+                }
+                Ok(())
+            }).await?;
+        }
         let observer = spawn_observer(
             client.observer(),
             descriptor.clone(),
             config.clone(),
             remote,
         );
-
-        let session = Self {
+        // No suspension between giving the observer ownership and returning it.
+        Ok(Self {
             args,
             descriptor,
             policy,
@@ -699,29 +750,7 @@ impl PaidWorkSession {
             client,
             observer: Some(observer),
             needs_recovery: true,
-        };
-        if initially_ready {
-            // A long restart catch-up may outlive the first observation. Wait
-            // during channel opening; requests never perform this catch-up.
-            // The session already owns the task, so cancellation aborts it.
-            within(session.args.timeout, "initial channel observation", async {
-                while session.client.readiness().await.is_err()
-                    && !session
-                        .client
-                        .with_state(|state| state.is_closing())
-                        .await?
-                {
-                    #[expect(
-                        clippy::disallowed_methods,
-                        reason = "inventory class A: channel readiness; rollout 2"
-                    )]
-                    tokio::time::sleep(session.args.config.poll).await;
-                }
-                Ok(())
-            })
-            .await?;
-        }
-        Ok(session)
+        })
     }
 
     /// Stops observation and joins the task before releasing the journal.
@@ -734,7 +763,9 @@ impl PaidWorkSession {
         self.observer = None;
         // The observer can no longer renew readiness after suspension.
         let _ = self.client.observer().suspend().await;
-        self.client.close().await;
+        if let Err(error) = self.client.close().await {
+            tracing::warn!(%error, "paid client journal did not close cleanly");
+        }
     }
 
     /// Identifies the funded channel and its admitted execution policy.
@@ -862,7 +893,7 @@ impl PaidWorkSession {
     pub async fn run(
         &mut self,
         prepared: Option<PreparedInvocation>,
-        content: &InvocationContent,
+        content: &(LocalStore, Scope),
         recover: bool,
         progress: Option<hellas_channel::work::PaidProgress>,
     ) -> Result<Option<PaidWorkResult>> {
@@ -877,7 +908,7 @@ impl PaidWorkSession {
     pub(crate) async fn run_prepared(
         &mut self,
         prepared: Option<PreparedInvocation>,
-        content: &InvocationContent,
+        content: &(LocalStore, Scope),
         recover: bool,
         progress: Option<hellas_channel::work::PaidProgress>,
         accepted: Option<crate::transact::Accepted>,
@@ -960,43 +991,60 @@ impl PaidWorkSession {
                             }
                             failed || payable
                         })
-                        .map(|job| {
-                            if let Some((result, _)) = job.result()
-                                && result.outcome
-                                    == hellas_channel::model::work::ResultOutcome::Failed
-                            {
-                                return Ok(RecoveredJob::Failed(
-                                    job.work_id(),
-                                    result.transcript_content.id().digest(),
-                                ));
-                            }
-                            // Fetch journals retain accounting only. A restart cannot
-                            // reconstruct a lost request or authorize another
-                            // execution, but an already delivered result still
-                            // settles: signing payment needs no payload.
-                            if job.prepared_input().is_empty() {
-                                return Ok(
-                                    if job.phase() == hellas_channel::work_store::JobPhase::Verified
-                                    {
-                                        RecoveredJob::Delivered(job.work_id())
-                                    } else {
-                                        RecoveredJob::Unrecoverable(job.work_id())
-                                    },
-                                );
-                            }
-                            PreparedInvocation::from_canonical_bytes(
-                                job.prepared_input(),
-                                hellas_channel::content::MAX_CONTENT_BYTES,
-                            )
-                            .map(|input| {
-                                RecoveredJob::Replay(job.work_id(), job.phase(), Box::new(input))
-                            })
-                            .map_err(PaidClientError::from)
-                        })
-                        .collect::<Result<Vec<_>, _>>()
+                        .map(|job| job.work_id())
+                        .collect::<Vec<_>>()
                 })
-                .await??;
-            for recovered in pending {
+                .await?;
+            for work in pending {
+                let recovered = {
+                    let mut endpoint = client.client().await?;
+                    let settled = endpoint.state().job_by_id(work).is_some_and(|job| {
+                        job.phase() == hellas_channel::work_store::JobPhase::Verified
+                            || job.result().is_some_and(|(result, _)| {
+                                result.outcome == hellas_channel::model::work::ResultOutcome::Failed
+                            })
+                    });
+                    if !settled {
+                        endpoint.load_retained_input(work).await?;
+                    }
+                    let job = endpoint
+                        .state()
+                        .job_by_id(work)
+                        .ok_or(PaidClientError::MissingState("recovered job"))?;
+                    (|job: &hellas_channel::work_store::JobState| {
+                        if let Some((result, _)) = job.result()
+                            && result.outcome == hellas_channel::model::work::ResultOutcome::Failed
+                        {
+                            return Ok(RecoveredJob::Failed(
+                                job.work_id(),
+                                result.transcript_content.id().digest(),
+                            ));
+                        }
+                        // Fetch journals retain accounting only. A restart cannot
+                        // reconstruct a lost request or authorize another
+                        // execution, but an already delivered result still
+                        // settles: signing payment needs no payload.
+                        if job.prepared_input().is_empty()
+                            || job.phase() == hellas_channel::work_store::JobPhase::Verified
+                        {
+                            return Ok(
+                                if job.phase() == hellas_channel::work_store::JobPhase::Verified {
+                                    RecoveredJob::Delivered(job.work_id())
+                                } else {
+                                    RecoveredJob::Unrecoverable(job.work_id())
+                                },
+                            );
+                        }
+                        PreparedInvocation::from_canonical_bytes(
+                            job.prepared_input(),
+                            hellas_channel::content::MAX_CONTENT_BYTES,
+                        )
+                        .map(|input| {
+                            RecoveredJob::Replay(job.work_id(), job.phase(), Box::new(input))
+                        })
+                        .map_err(PaidClientError::from)
+                    })(job)?
+                };
                 let (work_id, phase, pending) = match recovered {
                     RecoveredJob::Failed(work_id, evidence) => {
                         client.client().await?.rejected(work_id, evidence).await?;
@@ -1130,7 +1178,9 @@ impl PaidWorkSession {
                         job.result().is_some_and(|(result, _)| {
                             result.outcome == hellas_channel::model::work::ResultOutcome::Failed
                         }) || (job.authorization().payment_deadline >= state.cursor().0
-                            && (!job.prepared_input().is_empty() || job.result().is_some()))
+                            && (!job.prepared_input().is_empty()
+                                || job.result().is_some()
+                                || state.retained_roots().contains_key(&job.work_id())))
                     })
                 })
                 .await?;
@@ -1160,7 +1210,7 @@ async fn propose_when_ready(
     dialer: &ProviderDialer,
     client: &mut ClientService,
     proposal: &JobProposal,
-    content: &InvocationContent,
+    content: &(LocalStore, Scope),
     retained: Option<hellas_auth::Digest>,
     proposed: Option<&AtomicBool>,
 ) -> Result<hellas_auth::Digest> {
@@ -1246,7 +1296,7 @@ enum JobLookup {
 async fn execute_paid_job(
     args: &PaidWorkOptions,
     prepared: PreparedInvocation,
-    content: &InvocationContent,
+    content: &(LocalStore, Scope),
     dialer: &ProviderDialer,
     client: &mut ClientService,
     ready: &hellas_channel::model::setup::ReadyChannel,
@@ -1302,7 +1352,7 @@ async fn execute_paid_job(
             .await?;
         tracing::debug!(%work_id, "retained job input restored");
     }
-    let (work_id, already_collected) = match existing.first().copied() {
+    let (work_id, collected) = match existing.first().copied() {
         Some((work_id, hellas_channel::work_store::JobPhase::HalfSigned, _)) => (
             propose_when_ready(
                 args,
@@ -1314,23 +1364,25 @@ async fn execute_paid_job(
                 proposed,
             )
             .await?,
-            false,
+            None,
         ),
         Some((work_id, hellas_channel::work_store::JobPhase::Ready, _))
         | Some((work_id, hellas_channel::work_store::JobPhase::Verified, _)) => {
-            let retained = client
-                .with_state(|state| {
-                    state
-                        .job_by_id(work_id)
-                        .is_some_and(|job| !job.transcript().is_empty())
-                })
+            let mut endpoint = client.client().await?;
+            endpoint
+                .load_retained_transcript(work_id, &proposal.prepared_input)
                 .await?;
+            let retained = endpoint
+                .state()
+                .job_by_id(work_id)
+                .filter(|job| !job.transcript().is_empty())
+                .map(|job| job.transcript.clone());
             (work_id, retained)
         }
-        Some((work_id, _, _)) => (work_id, false),
+        Some((work_id, _, _)) => (work_id, None),
         None => (
             propose_when_ready(args, dialer, client, &proposal, content, None, proposed).await?,
-            false,
+            None,
         ),
     };
     let acceptance_signature = client
@@ -1347,17 +1399,8 @@ async fn execute_paid_job(
             provider: hellas_auth::PublicKey::Secp256k1(ready.channel().provider_key().to_bytes()),
         });
     }
-    let transcript = if already_collected {
-        client
-            .with_state(|state| {
-                state
-                    .job_by_id(work_id)
-                    .map(|job| job.transcript().to_vec())
-            })
-            .await?
-            .ok_or(PaidClientError::MissingState(
-                "collected job disappeared from its journal",
-            ))?
+    let transcript = if let Some(transcript) = collected {
+        transcript
     } else {
         let mut emitted = false;
         let delivery = loop {
@@ -1429,7 +1472,11 @@ async fn execute_paid_job(
         }
         return Err(PaidClientError::InvocationFailed { work_id, reason });
     }
-    client.client().await?.verified(work_id).await?;
+    client
+        .client()
+        .await?
+        .verified(work_id, &proposal.prepared_input)
+        .await?;
     let credited = pay_when_ready(dialer, client, work_id, args.config.poll, args.timeout).await?;
     if let Some(purchase) = purchase {
         purchase.paid(work_id)?;
@@ -1442,7 +1489,7 @@ async fn execute_paid_job(
         acceptance_signature,
         job_price: ready.payment_policy().fixed_price,
         credited_cumulative: credited,
-        transcript,
+        transcript: transcript.to_vec(),
         output,
         provider_key: hellas_auth::PublicKey::Secp256k1(ready.channel().provider_key().to_bytes()),
         input: proposal.prepared_input.request.input_commitment()?,

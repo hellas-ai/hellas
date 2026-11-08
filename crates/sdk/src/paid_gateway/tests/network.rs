@@ -23,13 +23,17 @@ fn retained_gateway_policy_waits_for_chain_recovery_and_has_a_deadline() {
             .await;
             devnet.seal().await;
             let fixture = PaidFixture::on_network(devnet.network());
-            let pool = pool_options(&fixture);
+            let content = hellas_authority::test_support::content_store(
+                &fixture.root.path().join("pool-content"),
+            )
+            .await;
+            let pool = pool_options(&fixture, &content);
             let mut args = pool
                 .providers
                 .into_iter()
                 .next()
                 .unwrap()
-                .with_config(pool.config);
+                .with_config(pool.config, pool.content);
             args.timeout = Some(hellas_chain::node::RECOVERY_TIMEOUT);
             let signed = SignedPaidOffer::sign(
                 PaidOffer {

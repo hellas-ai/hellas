@@ -1,7 +1,8 @@
 //! Verified application evidence; binding a handle does not grant future access.
 use super::*;
 use hellas_auth::authority::{
-    AuthenticatedCaller, AuthenticatedSession, AuthorityError, AuthorityId, GrantId, ResourceId,
+    AuthenticatedCaller, AuthenticatedSession, AuthorityError, AuthorityId, GrantId, Permission,
+    ResourceId,
 };
 
 pub const WORK_EXECUTE: &str = "work.execute";
@@ -22,10 +23,29 @@ pub(crate) struct Access {
 }
 enum Evidence {
     Native(AuthenticatedCaller),
-    Session(AuthenticatedSession, Digest),
+    Session(Arc<AuthenticatedSession>, Digest),
 }
 
 impl Access {
+    pub(crate) fn for_caller(caller: AuthenticatedCaller, authorization: GrantId) -> Self {
+        Self {
+            evidence: Arc::new(Evidence::Native(caller)),
+            authorization,
+        }
+    }
+    pub(crate) fn for_session(
+        session: Arc<AuthenticatedSession>,
+        binding: Digest,
+        authorization: GrantId,
+    ) -> Self {
+        Self {
+            evidence: Arc::new(Evidence::Session(session, binding)),
+            authorization,
+        }
+    }
+    pub(crate) fn authorization(&self) -> GrantId {
+        self.authorization
+    }
     pub(super) fn decision(&self, action: &'static str) -> crate::audit::Decision {
         let credential = match self.evidence.as_ref() {
             Evidence::Native(caller) => caller.credential(),
@@ -92,20 +112,30 @@ impl Access {
         allowance: GrantId,
         now: UnixMillis,
     ) -> Result<UnixMillis, NodeStoreError> {
-        let mut decision = self.decision(WORK_EXECUTE);
+        self.authorize_permission(
+            store,
+            WORK_EXECUTE,
+            crate::operations::Operation::named(WORK_EXECUTE)?
+                .permission(store.state().authority().authority(), Some(allowance))?,
+            now,
+        )
+    }
+    pub(crate) fn authorize_permission(
+        &self,
+        store: &NodeStore,
+        operation: &'static str,
+        permission: Permission,
+        now: UnixMillis,
+    ) -> Result<UnixMillis, NodeStoreError> {
+        let mut decision = self.decision(operation);
         let result = (|| {
             store.check_authority()?;
             let now = store.time(now)?;
             self.observe(&mut decision, store, now);
             let authority = store.state().authority();
             let caller = self.caller(store, now)?;
-            let lineage = authority.authorize_caller(
-                caller,
-                self.authorization,
-                &crate::operations::Operation::named(WORK_EXECUTE)?
-                    .permission(authority.authority(), Some(allowance))?,
-                now,
-            )?;
+            let lineage =
+                authority.authorize_caller(caller, self.authorization, &permission, now)?;
             let mut expires = caller.expires();
             if let Evidence::Session(session, _) = self.evidence.as_ref() {
                 expires = expires.min(session.expires());
@@ -124,8 +154,8 @@ impl Access {
 /// under the node writer; retaining this handle never retains revoked rights.
 #[derive(Clone)]
 pub struct GrantWork {
-    pub(super) service: GrantService,
-    pub(super) access: Access,
+    pub(crate) service: GrantService,
+    pub(crate) access: Access,
 }
 impl GrantService {
     pub fn for_caller(&self, caller: AuthenticatedCaller, authorization: GrantId) -> GrantWork {
@@ -139,7 +169,7 @@ impl GrantService {
         binding: Digest,
         authorization: GrantId,
     ) -> GrantWork {
-        self.with_evidence(Evidence::Session(session, binding), authorization)
+        self.with_evidence(Evidence::Session(Arc::new(session), binding), authorization)
     }
 
     fn with_evidence(&self, evidence: Evidence, authorization: GrantId) -> GrantWork {

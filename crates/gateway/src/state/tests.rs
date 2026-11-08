@@ -77,7 +77,7 @@ async fn authenticated_prefixes_arrive_before_the_paid_terminal() {
         payment_ack: payment_ack.clone(),
     }))
     .await;
-    let mut live = state.prepare_ids(vec![0], 1, None).unwrap();
+    let mut live = state.prepare_ids(vec![0], 1, None).await.unwrap();
     let prefix = live.prepared.next().await.unwrap().unwrap();
     assert!(matches!(
         prefix,
@@ -121,6 +121,7 @@ async fn paid_capacity_is_a_retryable_error_and_uses_the_pool_deadline() {
     assert_eq!(state.inference_timeout, Some(Duration::from_secs(17)));
     let error = state
         .prepare_ids(vec![0], 1, None)
+        .await
         .err()
         .expect("busy backend must reject admission");
     assert_eq!(
@@ -323,7 +324,7 @@ async fn responses_string_input_matches_a_user_message_array() {
     });
     let state = open(work.clone()).await;
     let adaptor = OpenAiResponsesAdaptor;
-    let prepare = |input: serde_json::Value| {
+    let prepare = async |input: serde_json::Value| {
         let parsed = adaptor
             .parse(
                 RawRequest::from_value(
@@ -333,10 +334,10 @@ async fn responses_string_input_matches_a_user_message_array() {
             )
             .unwrap();
         let request = adaptor.to_execution_request(&parsed).unwrap();
-        state.prepare_wire_execution(&request).unwrap();
+        state.prepare_wire_execution(&request).await.unwrap();
     };
-    prepare(json!("hi"));
-    prepare(json!([{"role": "user", "content": "hi"}]));
+    prepare(json!("hi")).await;
+    prepare(json!([{"role": "user", "content": "hi"}])).await;
 
     let jobs = work.jobs.lock().unwrap();
     assert_eq!(jobs.len(), 2);
@@ -372,7 +373,8 @@ async fn generation_controls_are_honoured_or_rejected() {
             .unwrap();
         adaptor.to_execution_request(&parsed).unwrap()
     };
-    let prepare = |request: &WireExecutionRequest| state.prepare_wire_execution(request);
+    let prepare =
+        async |request: &WireExecutionRequest| state.prepare_wire_execution(request).await;
 
     for (field, value) in [
         ("temperature", json!(0.5)),
@@ -386,6 +388,7 @@ async fn generation_controls_are_honoured_or_rejected() {
         });
         body[field] = value;
         let error = prepare(&chat(body))
+            .await
             .err()
             .expect("unsupported sampling must be rejected");
         assert!(
@@ -400,6 +403,7 @@ async fn generation_controls_are_honoured_or_rejected() {
         "max_output_tokens": 1,
         "truncation": "auto"
     })))
+    .await
     .err()
     .expect("truncation must be rejected");
     assert!(matches!(error, BackendError::Rejected(_)));
@@ -415,6 +419,7 @@ async fn generation_controls_are_honoured_or_rejected() {
         }}],
         "parallel_tool_calls": false
     })))
+    .await
     .unwrap();
     let mut turn = prepared.chat.expect("tool request prepares a chat turn");
     let call = "<tool_call>\n{\"name\":\"bash\",\"arguments\":{}}\n</tool_call>";
@@ -504,6 +509,7 @@ async fn structured_output_is_rejected_before_native_execution() {
                 }
             }
         })))
+        .await
         .err()
         .expect("a strict schema must be rejected");
     assert!(matches!(error, BackendError::Rejected(_)));
@@ -515,6 +521,7 @@ async fn structured_output_is_rejected_before_native_execution() {
             "messages": [{"role": "user", "content": "hello"}],
             "max_tokens": 1
         })))
+        .await
         .unwrap();
     assert_eq!(work.jobs.lock().unwrap().len(), 1);
 }

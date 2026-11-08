@@ -5,18 +5,18 @@ use super::{
     whisper::Whisper,
 };
 use anyhow::{Result, bail, ensure};
-use hellas_channel::content::EphemeralContent;
 use hellas_rpc::protocol::invocation::{
     Artifact,
     compute::{Environment, Plan},
     output::InvocationOutput,
 };
-use std::path::Path;
+use hellas_store::content::{LocalStore, Scope};
+use std::{path::Path, sync::Arc};
 
 enum Family {
-    Qwen3(Box<Qwen3>),
-    Whisper(Box<Whisper>),
-    Flux(Box<Flux>),
+    Qwen3(Arc<Qwen3>),
+    Whisper(Arc<Whisper>),
+    Flux(Arc<Flux>),
 }
 
 pub struct ModelPackage {
@@ -44,7 +44,7 @@ pub struct ComputeJob {
     pub inputs: Vec<Artifact>,
     /// Always includes the environment and rendered program. Weight assets are
     /// ordinary content-addressed objects held by the provider.
-    pub content: EphemeralContent,
+    pub content: (LocalStore, Scope),
 }
 
 #[derive(Debug)]
@@ -56,14 +56,17 @@ pub enum ModelResponse {
 
 impl ModelPackage {
     /// A Qwen GGUF, or a converted Whisper or Flux package directory.
-    pub fn open(path: &Path) -> Result<Self> {
+    pub async fn open(path: &Path) -> Result<Self> {
         Ok(Self {
             family: if path.join("model_index.json").is_file() {
-                Family::Flux(Box::new(Flux::open(path)?))
+                Family::Flux(Arc::new({
+                    let path = path.to_owned();
+                    tokio::task::spawn_blocking(move || Flux::open(&path)).await??
+                }))
             } else if path.is_dir() {
-                Family::Whisper(Box::new(Whisper::open(path)?))
+                Family::Whisper(Arc::new(Whisper::open(path).await?))
             } else {
-                Family::Qwen3(Box::new(Qwen3::open(path)?))
+                Family::Qwen3(Arc::new(Qwen3::open(path).await?))
             },
         })
     }
@@ -77,9 +80,31 @@ impl ModelPackage {
             Family::Qwen3(_) | Family::Flux(_) => None,
         }
     }
-    pub fn render_job(&self, request: &ModelRequest<'_>) -> Result<ComputeJob> {
+    pub async fn render_job(&self, request: &ModelRequest<'_>) -> Result<ComputeJob> {
         match (&self.family, request) {
-            (Family::Flux(model), ModelRequest::Image(request)) => model.render_job(request),
+            (Family::Flux(model), ModelRequest::Image(request)) => {
+                let model = model.clone();
+                let prompt = request.prompt.to_owned();
+                let (seed, width, height, steps) =
+                    (request.seed, request.width, request.height, request.steps);
+                let (job, source) = tokio::task::spawn_blocking(move || {
+                    model.render_job(&ImageRequest {
+                        prompt: &prompt,
+                        seed,
+                        width,
+                        height,
+                        steps,
+                    })
+                })
+                .await??;
+                hellas_channel::content::upload_object(&job.content.0, source.as_bytes()).await?;
+                hellas_channel::content::upload_object(
+                    &job.content.0,
+                    &job.environment.canonical_bytes()?,
+                )
+                .await?;
+                Ok(job)
+            }
             (
                 Family::Qwen3(model),
                 ModelRequest::Text {
@@ -87,7 +112,12 @@ impl ModelPackage {
                     max_new,
                     stops,
                 },
-            ) => model.render_job(prompt_ids, *max_new, stops),
+            ) => {
+                let model = model.clone();
+                let (prompt, max_new, stops) = (prompt_ids.to_vec(), *max_new, stops.to_vec());
+                tokio::task::spawn_blocking(move || model.render_job(&prompt, max_new, &stops))
+                    .await?
+            }
             (
                 Family::Whisper(model),
                 ModelRequest::Transcription {
@@ -95,7 +125,18 @@ impl ModelPackage {
                     language,
                     max_new_tokens,
                 },
-            ) => model.render_job(samples, *language, *max_new_tokens),
+            ) => {
+                let model = model.clone();
+                let (samples, language, max_new_tokens) = (
+                    samples.to_vec(),
+                    language.map(str::to_owned),
+                    *max_new_tokens,
+                );
+                tokio::task::spawn_blocking(move || {
+                    model.render_job(&samples, language.as_deref(), max_new_tokens)
+                })
+                .await?
+            }
             _ => bail!("request does not match model family"),
         }
     }

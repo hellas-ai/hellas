@@ -63,6 +63,7 @@ fn refusal(response: AcceptWorkResponse) -> GrantRefusalCode {
     GrantRefusalCode::try_from(refused.grant.unwrap().code).unwrap()
 }
 async fn service(
+    root: &std::path::Path,
     store: NodeStore,
     backend: Backend,
     secret: &hellas_auth::authority::CredentialSecret,
@@ -77,6 +78,7 @@ async fn service(
         backend,
         vec![],
         Arc::new(|| UnixMillis(1_000)),
+        crate::test_support::content_store(root).await,
     )
     .unwrap();
     let (work, credential) =

@@ -665,7 +665,7 @@ impl<S: WorkSource> WorkExecutionBackend for WorkGateway<S> {
             environment: job.environment,
             plan: job.plan,
             inputs: job.inputs,
-            content: hellas_channel::content::InvocationContent::Ephemeral(job.content),
+            content: Arc::new(job.content),
         }))
     }
     fn timeout(&self) -> Option<Duration> {

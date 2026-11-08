@@ -15,7 +15,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use sqlx::Connection as _;
-use sqlx::migrate::MigrateError;
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteConnection, SqliteJournalMode, SqliteLockingMode, SqliteSynchronous,
 };
@@ -29,7 +28,7 @@ const SQLITE_BUSY: i32 = 5;
 const SQLITE_LOCKED: i32 = 6;
 const SQLITE_NOTADB: i32 = 26;
 
-static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
+const SCHEMA_VERSION: i64 = 1;
 
 /// Largest metadata/result record this journal writes or reads back.
 /// Compute input bodies live in verified payload objects referenced by the
@@ -100,9 +99,8 @@ pub enum JournalError {
     Io(#[from] std::io::Error),
     #[error("journal database failed: {0}")]
     Sqlx(#[from] sqlx::Error),
-    /// The database's schema is not one this binary migrates.
-    #[error("journal schema failed: {0}")]
-    Migrate(#[from] MigrateError),
+    #[error("unsupported journal schema version {found}")]
+    Version { found: i64 },
     #[error("journal generation space exhausted")]
     GenerationExhausted,
     /// Another handle, in this process or another, holds this journal.
@@ -304,13 +302,32 @@ impl Journal {
                 .await
                 .map_err(sqlx_error)?;
             durability.sync_directory(&directory.join(PARTITION))?;
-            MIGRATOR
-                .run_direct(None, &mut connection, false)
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut connection)
                 .await
-                .map_err(|error| match error {
-                    MigrateError::Execute(error) => sqlx_error(error),
-                    error => error.into(),
-                })?;
+                .map_err(sqlx_error)?;
+            if version == 0 && create {
+                let tables: i64 =
+                    sqlx::query_scalar("SELECT count(*) FROM sqlite_schema WHERE type='table'")
+                        .fetch_one(&mut connection)
+                        .await
+                        .map_err(sqlx_error)?;
+                if tables != 0 {
+                    return Err(JournalError::Version { found: version });
+                }
+                let mut transaction = connection.begin().await.map_err(sqlx_error)?;
+                sqlx::raw_sql(include_str!("journal/schema.sql"))
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(sqlx_error)?;
+                sqlx::raw_sql("PRAGMA user_version = 1")
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(sqlx_error)?;
+                transaction.commit().await.map_err(sqlx_error)?;
+            } else if version != SCHEMA_VERSION {
+                return Err(JournalError::Version { found: version });
+            }
             let (found, generation, checkpoint) = match read_head(&mut connection, &path).await? {
                 Some(head) => head,
                 None if create => {
@@ -594,6 +611,13 @@ async fn read_head(
     connection: &mut SqliteConnection,
     path: &Path,
 ) -> Result<Option<Head>, JournalError> {
+    let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(|error| JournalError::from_sqlx(error, path))?;
+    if version != SCHEMA_VERSION {
+        return Err(JournalError::Version { found: version });
+    }
     let not_a_journal = || JournalError::NotAJournal { path: path.into() };
     let row = sqlx::query!("SELECT key, kind, role, generation, checkpoint FROM journal")
         .fetch_optional(connection)

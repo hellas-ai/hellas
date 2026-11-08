@@ -1,5 +1,4 @@
 use super::*;
-use hellas_channel::content::InvocationContent;
 use hellas_client::model::{ModelPackage, ModelRequest, ModelResponse, flux::ImageRequest};
 
 #[derive(Debug, Args)]
@@ -41,7 +40,8 @@ pub async fn image(args: ImageArgs, context: Context) -> super::super::CliResult
         request,
         args.payment.unwrap_or(0),
         &args.client.root(&context),
-    )?;
+    )
+    .await?;
     eprintln!("job: {}", directory.display());
     bounded(
         args.client.timeout,
@@ -76,32 +76,33 @@ pub async fn image(args: ImageArgs, context: Context) -> super::super::CliResult
     .await
 }
 
-fn prepare(
+async fn prepare(
     model: &Path,
     request: ImageRequest<'_>,
     payment: u64,
     root: &Path,
 ) -> anyhow::Result<(ModelPackage, Job, PathBuf)> {
     request.validate()?;
-    let package = ModelPackage::open(model)?;
-    let rendered = package.render_job(&ModelRequest::Image(request))?;
+    let package = ModelPackage::open(model).await?;
+    let rendered = package.render_job(&ModelRequest::Image(request)).await?;
     let job = Job::compute(
         payment,
         rendered.environment,
         rendered.plan,
         rendered.inputs,
-        InvocationContent::Ephemeral(rendered.content),
-    )?;
+        rendered.content,
+    )
+    .await?;
     let directory = root.join("jobs").join(job.digest().to_string());
-    job.save(&directory)?;
+    job.save(&directory).await?;
     Ok((package, job, directory))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn image_cli_prepares_a_saved_job_with_provider_held_weights() {
+    #[tokio::test]
+    async fn image_cli_prepares_a_saved_job_with_provider_held_weights() {
         let model = Path::new(env!("CARGO_MANIFEST_DIR")).join("../client/src/model/flux/fixture");
         let root = tempfile::tempdir().unwrap();
         let (_, job, directory) = prepare(
@@ -116,8 +117,9 @@ mod tests {
             20,
             root.path(),
         )
+        .await
         .unwrap();
-        let loaded = Job::load(&directory).unwrap();
+        let loaded = Job::load(&directory).await.unwrap();
         assert_eq!(loaded.digest(), job.digest());
         let JobInput::Compute {
             environment,
@@ -130,11 +132,24 @@ mod tests {
         };
         assert_eq!(plan.calls.len(), 3);
         assert_eq!(environment.sources.len(), 1);
-        assert!(content.read(environment.sources[0]).is_ok());
+        assert!(
+            content
+                .0
+                .open_verified(&content.1, environment.sources[0], None)
+                .await
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(environment.assets.len(), 3);
-        assert!(environment.assets.iter().all(|asset| matches!(
-            content.read(asset.object),
-            Err(hellas_channel::content::ContentError::Missing)
-        )));
+        for asset in &environment.assets {
+            assert!(
+                content
+                    .0
+                    .open_verified(&content.1, asset.object, None)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
 }

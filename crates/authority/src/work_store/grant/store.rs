@@ -46,7 +46,7 @@ pub struct NodeStore {
     /// Covers the encoded checkpoint of `state` plus its clock headroom.
     checkpoint_bound: CheckpointBound,
     pub(super) executions: std::collections::BTreeMap<Digest, super::execution::ActiveExecution>,
-    pub(super) deliveries: Vec<std::sync::Weak<crate::grant_service::Delivery>>,
+    pub(super) deliveries: Vec<super::delivery::DeliveryEntry>,
 }
 impl NodeStore {
     /// Release the database before returning identity ownership to another opener.

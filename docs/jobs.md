@@ -177,7 +177,10 @@ hellas convert-flux --checkpoint ./FLUX.2-klein-4B --output ./klein
 The converter validates the checkpoint and creates three ordinary provider
 assets (`text.bin`, `denoise.bin`, `vae.bin`), plus client metadata and a
 tokenizer. Text norms and VAE weights use F32; other weights use BF16, matching
-catena-models. Index the assets on the provider with `--content-root ./klein`.
+catena-models. Put the package directory in `[content] lower`, prepare it with
+`hellas store --content-config content.toml index`, then declare Jobs pins using
+the printed IDs and byte lengths. Start the provider with that `--content-config`
+file; see the [content store guide](../crates/store/README.md).
 The client needs the package's JSON files; it does not upload the weights.
 For 512×512 images, the provider must admit a 3 MiB output; allow 2 MiB of
 uploads for the program, token IDs and noise. Set its execution budget for

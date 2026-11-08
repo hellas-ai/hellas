@@ -108,7 +108,9 @@ pub use crate::pb::services;
 pub fn peer_service_aliases() -> Vec<peers::ServiceAlias> {
     crate::services::KNOWN_SERVICES
         .iter()
-        .filter(|entry| !entry.name.starts_with("hellas.host."))
+        .filter(|entry| {
+            !entry.name.starts_with("hellas.host.") && !entry.name.starts_with("hellas.resolve.")
+        })
         .flat_map(|entry| {
             [
                 peers::ServiceAlias::new(entry.alpn, entry.name),

@@ -3,11 +3,11 @@ use super::{
     memory, validate,
 };
 use catena_lang::runtime::{RuntimeModule, Value, ValueKind};
-use hellas_channel::content::InvocationContent;
 use hellas_rpc::{
     ContentRef,
     protocol::invocation::{Limits, compute::*},
 };
+use hellas_store::content::VerifiedReader;
 use std::{collections::BTreeMap, sync::Arc};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -44,14 +44,14 @@ pub fn execute(
     plan: &Plan,
     limits: &Limits,
     assets: &Assets,
-    content: &InvocationContent,
+    readers: &mut BTreeMap<hellas_rpc::ContentId, VerifiedReader>,
     mut emit: impl FnMut(u64) -> Result<()>,
 ) -> Result<Completed> {
     let descriptors = inputs
         .iter()
         .map(|(name, bytes)| (name.clone(), ContentRef::for_bytes(bytes)))
         .collect();
-    validate::validate(module, env, &descriptors, plan, limits, content)?;
+    validate::validate(module, env, &descriptors, plan, limits)?;
     let cancel = device.load(module)?;
     let deadline = std::time::Instant::now()
         .checked_add(std::time::Duration::from_millis(
@@ -69,11 +69,21 @@ pub fn execute(
     };
     let execution = (|| -> Result<Completed> {
         let mut resident = BTreeMap::new();
+        let mut objects = BTreeMap::new();
         for asset in &env.assets {
-            resident.insert(
-                asset.name.clone(),
-                assets.pin_for_job(content, asset.object, &cancel, Some(deadline))?,
-            );
+            let owner = match objects.get(&asset.object.id()) {
+                Some(owner) => Arc::clone(owner),
+                None => {
+                    let reader = readers
+                        .remove(&asset.object.id())
+                        .ok_or("missing verified asset reader")?;
+                    let owner =
+                        assets.pin_for_job(reader, asset.object, &cancel, Some(deadline))?;
+                    objects.insert(asset.object.id(), owner.clone());
+                    owner
+                }
+            };
+            resident.insert(asset.name.clone(), owner);
         }
         let mut slots = BTreeMap::new();
         let mut uploads = BTreeMap::new();
@@ -287,7 +297,7 @@ pub fn execute_signed(
     prepared: &hellas_rpc::protocol::invocation::PreparedInvocation,
     limits: &Limits,
     assets: &Assets,
-    content: &InvocationContent,
+    readers: &mut BTreeMap<hellas_rpc::ContentId, VerifiedReader>,
     key: &hellas_auth::ProducerSigningKey,
     publish: impl FnMut(hellas_rpc::OutputEventEnvelope) -> Result<()>,
 ) -> Result<(
@@ -300,7 +310,7 @@ pub fn execute_signed(
         hellas_rpc::protocol::invocation::MAX_INVOCATION_BYTES,
     )?;
     execute_signed_in(
-        device, program, prepared, limits, assets, content, key, stream, publish,
+        device, program, prepared, limits, assets, readers, key, stream, publish,
     )
 }
 
@@ -311,7 +321,7 @@ pub(crate) fn execute_signed_in(
     prepared: &hellas_rpc::protocol::invocation::PreparedInvocation,
     limits: &Limits,
     assets: &Assets,
-    content: &InvocationContent,
+    readers: &mut BTreeMap<hellas_rpc::ContentId, VerifiedReader>,
     key: &hellas_auth::ProducerSigningKey,
     mut stream: hellas_rpc::protocol::invocation::output::OutputStream<'_>,
     mut publish: impl FnMut(hellas_rpc::OutputEventEnvelope) -> Result<()>,
@@ -326,9 +336,6 @@ pub(crate) fn execute_signed_in(
         Artifact,
         output::{FailureReason, InvocationOutput, Outcome, OutputError, OutputStream},
     };
-    if request.retain != (content.retention() == hellas_rpc::Retention::Retain) {
-        return Err("compute content retention differs from the signed request".into());
-    }
     if request.runner_public_key != key.public_key() {
         return Err("runner key mismatch".into());
     }
@@ -342,7 +349,7 @@ pub(crate) fn execute_signed_in(
         plan,
         limits,
         assets,
-        content,
+        readers,
         |value| {
             let event = stream.push("emitted", "catena.u64le.v1", offset, &value.to_le_bytes())?;
             if let Err(error) = publish(event) {

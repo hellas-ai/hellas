@@ -8,11 +8,11 @@ use crate::paid_client::{
     PaidClientError, PaidWorkOptions, PaidWorkResult, PaidWorkSession, bind_paid_endpoint,
 };
 use futures::future::BoxFuture;
-use hellas_channel::content::{EphemeralContent, InvocationContent};
 use hellas_channel::model::setup::ProviderChannelPolicy;
 use hellas_gateway::{WorkGatewayError, WorkShutdownError};
 use hellas_kernel::Secp256k1Signer;
 use hellas_rpc::output::OutputEvent as FetchEvent;
+use hellas_store::content::{LocalStore, MemoryStore, Reservations, Scope};
 use iroh::Endpoint;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -158,6 +158,9 @@ async fn provider_policy<
 impl PaidGateway {
     /// Open a reusable pool. Funding, recovery, queueing and payment are shared
     /// by CLI and embedding applications. Call `drain` during host shutdown.
+    /// Configured provider roots must cover the full journal census of each
+    /// supplied unready content store. A host sharing that upper with other
+    /// roots must recover those first: opening this pool completes its barrier.
     pub async fn open(
         options: PaidGatewayOptions,
         identity: crate::NodeIdentity,
@@ -166,6 +169,7 @@ impl PaidGateway {
         Self::open_with_funding(options, identity, owner, Default::default()).await
     }
 
+    /// Uses the same complete content-recovery census contract as `open`.
     pub async fn open_with_funding(
         options: PaidGatewayOptions,
         identity: crate::NodeIdentity,
@@ -178,6 +182,23 @@ impl PaidGateway {
                 "funding owner belongs to another chain directory",
             ));
         }
+        // Restore every configured root before the shared upper opens admission.
+        for provider in &options.providers {
+            let args = provider
+                .clone()
+                .with_config(options.config.clone(), options.content.clone());
+            crate::paid_client::recover_content(
+                &args.journal_root(),
+                args.config.network(),
+                &args.content,
+            )
+            .await?;
+        }
+        options
+            .content
+            .finish_recovery()
+            .await
+            .map_err(hellas_channel::work_store::WorkStoreError::from)?;
         let settlement_key = Secp256k1Signer::from_secret_scalar(identity.node_secret_bytes())
             .map_err(|_| PoolError::Invalid("node key is not a secp256k1 channel signer"))?;
         let endpoint = bind_paid_endpoint(identity.transport_key()).await?;
@@ -188,7 +209,7 @@ impl PaidGateway {
         }
         let mut providers = Vec::with_capacity(options.providers.len());
         for provider in options.providers {
-            let args = provider.with_config(options.config.clone());
+            let args = provider.with_config(options.config.clone(), options.content.clone());
             // Retained policy journals can depend on a height behind a fast
             // validator; select a source that already serves it.
             let setups = crate::paid_client::offer::RetainedSetups::discover(
@@ -455,8 +476,13 @@ impl PaidPool {
     }
 }
 
-fn empty_content() -> InvocationContent {
-    InvocationContent::Ephemeral(EphemeralContent::default())
+fn empty_content() -> (LocalStore, Scope) {
+    (
+        LocalStore::Memory(MemoryStore::new(Reservations::ram(
+            hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
+        ))),
+        Scope::Owner,
+    )
 }
 
 async fn has_retained_setup(options: &PaidWorkOptions) -> Result<bool> {
@@ -679,9 +705,13 @@ mod tests {
     use hellas_rpc::protocol::invocation::{Admission, fetch::FetchRoutePolicy};
     use iroh::Endpoint;
 
-    fn pool_options(fixture: &crate::test_support::PaidFixture) -> PaidGatewayOptions {
+    fn pool_options(
+        fixture: &crate::test_support::PaidFixture,
+        content: &hellas_store::content::DiskStore,
+    ) -> PaidGatewayOptions {
         PaidGatewayOptions {
             config: fixture.config.clone(),
+            content: content.clone(),
             max_pending_requests: 4,
             providers: vec![GatewayProviderOptions {
                 provider: crate::test_support::address(
@@ -702,16 +732,20 @@ mod tests {
     #[cfg(feature = "integration-tests")]
     mod network;
 
-    #[test]
-    fn invalid_pool_options_are_refused_without_starting_a_gateway() {
+    #[tokio::test]
+    async fn invalid_pool_options_are_refused_without_starting_a_gateway() {
         let fixture = crate::test_support::PaidFixture::new();
-        assert!(pool_options(&fixture).validate().is_ok());
+        let content = hellas_authority::test_support::content_store(
+            &fixture.root.path().join("pool-content"),
+        )
+        .await;
+        assert!(pool_options(&fixture, &content).validate().is_ok());
 
-        let mut zero = pool_options(&fixture);
+        let mut zero = pool_options(&fixture, &content);
         zero.max_pending_requests = 0;
         assert!(matches!(zero.validate(), Err(PoolError::Invalid(_))));
 
-        let mut duplicate = pool_options(&fixture);
+        let mut duplicate = pool_options(&fixture, &content);
         let second = duplicate.providers[0].clone();
         duplicate.providers.push(second);
         assert!(matches!(
@@ -719,7 +753,7 @@ mod tests {
             Err(PoolError::DuplicateProvider(_))
         ));
 
-        let mut shared = pool_options(&fixture);
+        let mut shared = pool_options(&fixture, &content);
         let mut other = shared.providers[0].clone();
         other.provider =
             crate::test_support::address(iroh::SecretKey::from_bytes(&[4; 32]).public());
@@ -731,9 +765,13 @@ mod tests {
         fixture: &crate::test_support::PaidFixture,
         policy: ProviderChannelPolicy,
     ) -> PaidPool {
-        let mut options = pool_options(fixture);
+        let content = hellas_authority::test_support::content_store(
+            &fixture.root.path().join("pool-content"),
+        )
+        .await;
+        let mut options = pool_options(fixture, &content);
         let config = options.config.clone();
-        let args = options.providers.remove(0).with_config(config);
+        let args = options.providers.remove(0).with_config(config, content);
         PaidPool {
             funding: Default::default(),
             owner: Arc::new(
@@ -814,6 +852,7 @@ mod tests {
         let input = admitted(pool.request(fetch(&pool, "responses")));
         assert_eq!(input.manifest().unwrap(), contract.manifest());
         pool.endpoint.close().await;
+        pool.providers[0].args.content.close().await;
         drop(pool);
 
         let Admission::Fetch { admission } = &mut quoted.invocation_policy.admissions[0] else {
@@ -857,10 +896,14 @@ mod tests {
     #[tokio::test]
     async fn counter_files_do_not_trigger_funding_but_incomplete_setup_recovers() {
         let fixture = crate::test_support::PaidFixture::new();
-        let options = pool_options(&fixture);
+        let content = hellas_authority::test_support::content_store(
+            &fixture.root.path().join("pool-content"),
+        )
+        .await;
+        let options = pool_options(&fixture, &content);
         let provider = &options.providers[0]
             .clone()
-            .with_config(options.config.clone());
+            .with_config(options.config.clone(), content.clone());
         assert!(!has_retained_setup(provider).await.unwrap());
         std::fs::create_dir_all(provider.journal_root().join("apple-counters")).unwrap();
         std::fs::write(

@@ -37,6 +37,7 @@ pub(super) async fn start_host<R: hellas_attestation::RootProver + Send + Sync +
             )?))
         })
     });
+    let content = provider.content.clone();
     let factory = ProviderFactory {
         prepare,
         start: Arc::new(move |control| {
@@ -63,6 +64,7 @@ pub(super) async fn start_host<R: hellas_attestation::RootProver + Send + Sync +
         }),
     };
     Ok(HostHandle::start(HostOptions {
+        content,
         transport,
         start_provider: true,
         control,

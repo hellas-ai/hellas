@@ -120,7 +120,6 @@ sqlx = { version = "0.9", default-features = false, features = [
     "sqlite",
     "runtime-tokio",
     "macros",
-    "migrate",
 ] }
 tempfile = "3"
 thiserror = "2"

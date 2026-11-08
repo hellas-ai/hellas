@@ -109,22 +109,25 @@ async fn open(root: &std::path::Path, role: Role) -> ChannelStore {
 }
 
 async fn open_on(root: &std::path::Path, channel: PaidChannel, role: Role) -> ChannelStore {
+    let content = hellas_channel::test_support::channel::content_store(root).await;
     let origin = origin_of(&channel);
     let location = StoreLocation::for_test(root);
-    match ChannelStore::open(
+    let store = match ChannelStore::open(
         &location,
         channel,
         settlement(),
         role,
         origin,
-        hellas_store::ContentStore::new(),
+        content.clone(),
         &Secp256k1Verifier::new(),
     )
     .await
     {
         Ok(store) => store,
         Err(error) => panic!("the fixture store opens: {error}"),
-    }
+    };
+    content.finish_recovery().await.unwrap();
+    store
 }
 
 /// Where a fixture channel was opened: the block before the one a
@@ -284,7 +287,9 @@ impl Job {
         ChannelRecord::JobProposed {
             authorization: self.authorization,
             client_signature: client().sign(payload(self.work_id)),
-            prepared_input: self.input.clone(),
+            prepared_input: self.input.clone().into(),
+
+            retained_tree: None,
         }
     }
 
@@ -292,6 +297,8 @@ impl Job {
         ChannelRecord::JobAccepted {
             work_id: self.work_id,
             provider_signature: provider().sign(payload(self.work_id)),
+
+            retained_tree: None,
         }
     }
 
@@ -300,7 +307,9 @@ impl Job {
             work_id: self.work_id,
             result: self.result,
             provider_signature: provider().sign(payload(result_digest(channel, &self.result))),
-            transcript: spool(&self.transcript),
+            transcript: spool(&self.transcript).into(),
+
+            retained_tree: None,
         }
     }
 
@@ -376,28 +385,46 @@ async fn advance(store: &mut ChannelStore, height: u64) {
     }
 }
 
+// Funding tests stage their actual fixtures through the common upload engine
+// before asking the real journal to validate and commit the transition.
+async fn commit_with_content<'a, V: hellas_kernel::SigVerifier>(
+    store: &'a mut ChannelStore,
+    record: ChannelRecord,
+    verifier: &V,
+) -> Result<&'a hellas_channel::work_store::Channel, WorkStoreError> {
+    if let ChannelRecord::JobProposed {
+        authorization,
+        prepared_input,
+        ..
+    } = &record
+    {
+        fixture::seed_content(store, *authorization, prepared_input.clone()).await;
+    }
+    store.commit(record, verifier).await
+}
+
+fn durable_state(
+    state: &hellas_channel::work_store::Channel,
+) -> hellas_channel::work_store::Channel {
+    let mut state = state.clone();
+    for job in state.book.jobs.values_mut() {
+        job.prepared_input = Default::default();
+        job.transcript = Default::default();
+    }
+    state
+}
+
 async fn commit_all(store: &mut ChannelStore, records: &[ChannelRecord]) {
     let verifier = Secp256k1Verifier::new();
     for record in records {
-        if let Err(error) = store.commit(record.clone(), &verifier).await {
+        if let Err(error) = commit_with_content(store, record.clone(), &verifier).await {
             panic!("the fixture record commits: {error}");
         }
     }
 }
 
 async fn open_metadata(root: &std::path::Path) -> ChannelStore {
-    let location = StoreLocation::for_test(root);
-    ChannelStore::open(
-        &location,
-        channel(),
-        settlement(),
-        Role::Provider,
-        origin_of(&channel()),
-        hellas_store::ContentStore::new(),
-        &Secp256k1Verifier::new(),
-    )
-    .await
-    .expect("metadata provider journal opens")
+    open_on(root, channel(), Role::Provider).await
 }
 
 fn assert_payloads_absent(root: &std::path::Path, needles: &[&[u8]]) {
@@ -431,8 +458,7 @@ async fn metadata_journal_never_writes_payloads_at_any_commit_or_rotation() {
         let root = temp();
         let mut store = open_metadata(root.path()).await;
         for record in &sequence[..boundary] {
-            store
-                .commit(record.clone(), &Secp256k1Verifier::new())
+            commit_with_content(&mut store, record.clone(), &Secp256k1Verifier::new())
                 .await
                 .unwrap();
             assert_payloads_absent(root.path(), &payloads);
@@ -445,6 +471,7 @@ async fn metadata_journal_never_writes_payloads_at_any_commit_or_rotation() {
         }
         store.rotate().await.unwrap();
         assert_payloads_absent(root.path(), &payloads);
+        store.content_store().close().await;
         drop(store);
         let reopened = open_metadata(root.path()).await;
         if let Some(active) = reopened.state().job_by_id(job.work_id) {
@@ -464,14 +491,19 @@ async fn metadata_journal_can_credit_an_already_delivered_result_after_restart()
     let job = ephemeral_job_at(&channel, 1, 0);
     let mut store = open_metadata(root.path()).await;
     commit_all(&mut store, &provider_sequence(&channel, &job).await[..5]).await;
+    store.content_store().close().await;
     drop(store);
     let mut recovered = open_metadata(root.path()).await;
-    recovered
-        .commit(job.paid(&channel), &Secp256k1Verifier::new())
-        .await
-        .unwrap();
+    commit_with_content(
+        &mut recovered,
+        job.paid(&channel),
+        &Secp256k1Verifier::new(),
+    )
+    .await
+    .unwrap();
     assert_eq!(recovered.state().ledger().credited_cumulative(), PRICE);
     recovered.rotate().await.unwrap();
+    recovered.content_store().close().await;
     drop(recovered);
     assert_eq!(
         open_metadata(root.path())
@@ -494,8 +526,7 @@ async fn metadata_replay_does_not_weaken_live_payload_validation() {
         prepared_input.clear();
     }
     assert!(
-        store
-            .commit(proposal, &Secp256k1Verifier::new())
+        commit_with_content(&mut store, proposal, &Secp256k1Verifier::new())
             .await
             .is_err()
     );
@@ -507,8 +538,7 @@ async fn metadata_replay_does_not_weaken_live_payload_validation() {
     }
     let records = store.len();
     assert!(
-        store
-            .commit(result, &Secp256k1Verifier::new())
+        commit_with_content(&mut store, result, &Secp256k1Verifier::new())
             .await
             .is_err()
     );
@@ -586,8 +616,7 @@ async fn proposal_nonces_advance_monotonically() {
 
     // A lower nonce cannot be reused for another job.
     let job = job_at(&channel, 1, 0);
-    let error = store
-        .commit(job.proposed(), &Secp256k1Verifier::new())
+    let error = commit_with_content(&mut store, job.proposed(), &Secp256k1Verifier::new())
         .await
         .expect_err("the proposal nonce does not move backwards");
     assert!(
@@ -637,18 +666,20 @@ async fn a_result_must_be_the_transcript_it_is_stored_beside() {
     // MUTATION: the same signed result, spooled beside a transcript of
     // a different answer to the same request.
     let other_answer = transcript_of(&invocation_request(1), &[201, 202, 203]);
-    let error = store
-        .commit(
-            ChannelRecord::JobResult {
-                work_id: job.work_id,
-                result: job.result,
-                provider_signature: provider().sign(payload(result_digest(&channel, &job.result))),
-                transcript: spool(&other_answer),
-            },
-            &verifier,
-        )
-        .await
-        .expect_err("a result is not another answer's");
+    let error = commit_with_content(
+        &mut store,
+        ChannelRecord::JobResult {
+            work_id: job.work_id,
+            result: job.result,
+            provider_signature: provider().sign(payload(result_digest(&channel, &job.result))),
+            transcript: spool(&other_answer).into(),
+
+            retained_tree: None,
+        },
+        &verifier,
+    )
+    .await
+    .expect_err("a result is not another answer's");
     assert!(
         matches!(
             error,
@@ -665,18 +696,20 @@ async fn a_result_must_be_the_transcript_it_is_stored_beside() {
     let mut digest = altered.canonical_output_digest.into_bytes();
     digest[0] ^= 1;
     altered.canonical_output_digest = Digest::from_bytes(digest);
-    let error = store
-        .commit(
-            ChannelRecord::JobResult {
-                work_id: job.work_id,
-                result: altered,
-                provider_signature: provider().sign(payload(result_digest(&channel, &altered))),
-                transcript: spool(&job.transcript),
-            },
-            &verifier,
-        )
-        .await
-        .expect_err("a transcript is not another result's");
+    let error = commit_with_content(
+        &mut store,
+        ChannelRecord::JobResult {
+            work_id: job.work_id,
+            result: altered,
+            provider_signature: provider().sign(payload(result_digest(&channel, &altered))),
+            transcript: spool(&job.transcript).into(),
+
+            retained_tree: None,
+        },
+        &verifier,
+    )
+    .await
+    .expect_err("a transcript is not another result's");
     assert!(
         matches!(
             error,
@@ -689,7 +722,9 @@ async fn a_result_must_be_the_transcript_it_is_stored_beside() {
 
     // The control: the pair that belongs together is taken, and the
     // stored bytes are the ones offered.
-    if let Err(error) = store.commit(job.result_record(&channel), &verifier).await {
+    if let Err(error) =
+        commit_with_content(&mut store, job.result_record(&channel), &verifier).await
+    {
         panic!("a result and its own transcript record: {error}");
     }
     let Some(open) = store.state().jobs().next() else {
@@ -713,9 +748,19 @@ async fn a_restart_finds_the_transcript_the_result_was_derived_from() {
     {
         let mut store = open(dir.path(), Role::Provider).await;
         commit_all(&mut store, &provider_sequence(&channel, &job).await[..4]).await;
+        store.content_store().close().await;
     }
 
-    let recovered = open(dir.path(), Role::Provider).await;
+    let mut recovered = open(dir.path(), Role::Provider).await;
+    assert!(
+        recovered
+            .state()
+            .job_by_id(job.work_id)
+            .unwrap()
+            .transcript()
+            .is_empty()
+    );
+    recovered.load_retained_content(job.work_id).await.unwrap();
     let Some(open) = recovered.state().jobs().next() else {
         panic!("the job is still open");
     };
@@ -751,9 +796,12 @@ async fn the_terminal_deadline_is_the_last_height_a_receipt_may_be_recorded_at()
         let mut store = open(dir.path(), Role::Client).await;
         commit_all(&mut store, &[job.proposed(), job.accepted()]).await;
         advance(&mut store, height).await;
-        let recorded = store
-            .commit(job.result_record(&channel), &Secp256k1Verifier::new())
-            .await;
+        let recorded = commit_with_content(
+            &mut store,
+            job.result_record(&channel),
+            &Secp256k1Verifier::new(),
+        )
+        .await;
         if timely {
             if let Err(error) = recorded {
                 panic!("a receipt at {height} is timely: {error}");
@@ -794,7 +842,7 @@ async fn round3_transition_consumes_post_boundary_cursor() {
         let mut store = open(dir.path(), Role::Provider).await;
         advance(&mut store, height).await;
         commit_all(&mut store, &[job.proposed()]).await;
-        let accepted = store.commit(job.accepted(), &verifier).await;
+        let accepted = commit_with_content(&mut store, job.accepted(), &verifier).await;
         if timely {
             if let Err(error) = accepted {
                 panic!("acceptance at its deadline is durable: {error}");
@@ -803,7 +851,7 @@ async fn round3_transition_consumes_post_boundary_cursor() {
             // the deadline: the endpoint does not re-decide an escaped
             // authorization.
             advance(&mut store, height + 1).await;
-            if let Err(error) = store.commit(job.accepted(), &verifier).await {
+            if let Err(error) = commit_with_content(&mut store, job.accepted(), &verifier).await {
                 panic!("a retained co-signature is not re-decided: {error}");
             }
         } else {
@@ -826,14 +874,14 @@ async fn round3_transition_consumes_post_boundary_cursor() {
         let mut store = open(dir.path(), Role::Provider).await;
         commit_all(&mut store, &[job.proposed(), job.accepted()]).await;
         advance(&mut store, height).await;
-        let running = store
-            .commit(
-                ChannelRecord::JobRunning {
-                    work_id: job.work_id,
-                },
-                &verifier,
-            )
-            .await;
+        let running = commit_with_content(
+            &mut store,
+            ChannelRecord::JobRunning {
+                work_id: job.work_id,
+            },
+            &verifier,
+        )
+        .await;
         if timely {
             if let Err(error) = running {
                 panic!("dispatch at the terminal deadline is durable: {error}");
@@ -874,9 +922,8 @@ async fn the_payment_deadline_is_the_last_height_a_payment_may_be_signed_at() {
         );
         advance(&mut store, height).await;
 
-        let paid = store
-            .commit(job.paid(&channel), &Secp256k1Verifier::new())
-            .await;
+        let paid =
+            commit_with_content(&mut store, job.paid(&channel), &Secp256k1Verifier::new()).await;
         if timely {
             if let Err(error) = paid {
                 panic!("a payment at {height} is timely: {error}");
@@ -934,7 +981,7 @@ async fn a_store_opens_anchored_at_the_channels_origin() {
             payload: payload_at(RECEIPT_HEIGHT - 1),
             parent: payload_at(RECEIPT_HEIGHT - 2),
         },
-        hellas_store::ContentStore::new(),
+        store.content_store(),
         &Secp256k1Verifier::new(),
     )
     .await
@@ -970,15 +1017,15 @@ async fn a_verdict_belongs_to_a_client_holding_a_result() {
         &provider_sequence(&channel, &job).await[..4],
     )
     .await;
-    let error = provider_store
-        .commit(
-            ChannelRecord::ResultVerified {
-                work_id: job.work_id,
-            },
-            &verifier,
-        )
-        .await
-        .expect_err("a provider does not check its own answer");
+    let error = commit_with_content(
+        &mut provider_store,
+        ChannelRecord::ResultVerified {
+            work_id: job.work_id,
+        },
+        &verifier,
+    )
+    .await
+    .expect_err("a provider does not check its own answer");
     assert!(
         matches!(
             error,
@@ -999,15 +1046,15 @@ async fn a_verdict_belongs_to_a_client_holding_a_result() {
         store.state().jobs().next().map(JobState::phase),
         Some(JobPhase::Accepted)
     );
-    let error = store
-        .commit(
-            ChannelRecord::ResultVerified {
-                work_id: job.work_id,
-            },
-            &verifier,
-        )
-        .await
-        .expect_err("there is nothing yet to have checked");
+    let error = commit_with_content(
+        &mut store,
+        ChannelRecord::ResultVerified {
+            work_id: job.work_id,
+        },
+        &verifier,
+    )
+    .await
+    .expect_err("there is nothing yet to have checked");
     assert!(
         matches!(
             error,
@@ -1023,14 +1070,14 @@ async fn a_verdict_belongs_to_a_client_holding_a_result() {
     // and taken again is redundant rather than a second verdict.
     commit_all(&mut store, &sequence[3..5]).await;
     let before = store.len();
-    if let Err(error) = store
-        .commit(
-            ChannelRecord::ResultVerified {
-                work_id: job.work_id,
-            },
-            &verifier,
-        )
-        .await
+    if let Err(error) = commit_with_content(
+        &mut store,
+        ChannelRecord::ResultVerified {
+            work_id: job.work_id,
+        },
+        &verifier,
+    )
+    .await
     {
         panic!("a repeated verdict is the same verdict: {error}");
     }
@@ -1060,19 +1107,23 @@ async fn an_authenticated_result_is_payable_without_reproduction() {
     );
 
     let before = store.len();
-    assert!(store.commit(job.paid(&channel), &verifier).await.is_err());
+    assert!(
+        commit_with_content(&mut store, job.paid(&channel), &verifier)
+            .await
+            .is_err()
+    );
     assert_eq!(store.len(), before);
     assert_eq!(store.state().ledger().credited_cumulative(), 0);
-    store
-        .commit(
-            ChannelRecord::ResultVerified {
-                work_id: job.work_id,
-            },
-            &verifier,
-        )
-        .await
-        .unwrap();
-    if let Err(error) = store.commit(job.paid(&channel), &verifier).await {
+    commit_with_content(
+        &mut store,
+        ChannelRecord::ResultVerified {
+            work_id: job.work_id,
+        },
+        &verifier,
+    )
+    .await
+    .unwrap();
+    if let Err(error) = commit_with_content(&mut store, job.paid(&channel), &verifier).await {
         panic!("an authenticated result is paid for: {error}");
     }
     assert_eq!(store.state().ledger().credited_cumulative(), PRICE);
@@ -1111,20 +1162,17 @@ async fn concurrent_jobs_pay_once_each_and_survive_restart() {
             work_id: first.work_id,
         },
     ] {
-        store
-            .commit(record, &verifier)
+        commit_with_content(&mut store, record, &verifier)
             .await
             .expect("the interleaving is valid");
     }
     assert_eq!(store.state().jobs().len(), 2);
     assert_eq!(store.state().proposal_nonce_high_water(), 2);
 
-    store
-        .commit(first.paid(&channel), &verifier)
+    commit_with_content(&mut store, first.paid(&channel), &verifier)
         .await
         .expect("the first cumulative pays");
-    store
-        .commit(second.paid(&channel), &verifier)
+    commit_with_content(&mut store, second.paid(&channel), &verifier)
         .await
         .expect("the next cumulative pays");
     assert_eq!(store.state().ledger().credited_cumulative(), 2 * PRICE);
@@ -1135,6 +1183,7 @@ async fn concurrent_jobs_pay_once_each_and_survive_restart() {
         Some(second.work_id),
     );
 
+    store.content_store().close().await;
     drop(store);
     let reopened = open(dir.path(), Role::Provider).await;
     assert_eq!(reopened.state().ledger().credited_cumulative(), 2 * PRICE);
@@ -1162,6 +1211,7 @@ async fn re_sending_a_retained_payment_is_idempotent() {
     {
         let mut store = open(dir.path(), Role::Client).await;
         commit_all(&mut store, &client_sequence(&channel, &job).await).await;
+        store.content_store().close().await;
     }
 
     let mut recovered = open(dir.path(), Role::Client).await;
@@ -1175,9 +1225,12 @@ async fn re_sending_a_retained_payment_is_idempotent() {
     assert_eq!(retained.work_id, job.work_id);
 
     let before = recovered.len();
-    if let Err(error) = recovered
-        .commit(job.paid(&channel), &Secp256k1Verifier::new())
-        .await
+    if let Err(error) = commit_with_content(
+        &mut recovered,
+        job.paid(&channel),
+        &Secp256k1Verifier::new(),
+    )
+    .await
     {
         panic!("re-sending the retained payment: {error}");
     }
@@ -1187,11 +1240,9 @@ async fn re_sending_a_retained_payment_is_idempotent() {
 
 // ── Crash points ──────────────────────────────────────────────────────
 
-/// A crash after every write boundary, and what the next process holds.
-///
-/// The prefix is committed, the store is dropped without ceremony, and
-/// a new one is opened over the same files. What is asserted is the
-/// exact state — not that recovery "works".
+/// Replay each complete record prefix to its exact state. Close the SQLite
+/// pool explicitly so reopening cannot race its asynchronous Drop cleanup.
+/// Abrupt process loss is exercised separately by the SDK lifecycle target.
 #[tokio::test]
 async fn every_provider_write_boundary_recovers_to_one_state() {
     let channel = channel();
@@ -1213,6 +1264,7 @@ async fn every_provider_write_boundary_recovers_to_one_state() {
         {
             let mut store = open(dir.path(), Role::Provider).await;
             commit_all(&mut store, &sequence[..=index]).await;
+            store.content_store().close().await;
         }
         let recovered = open(dir.path(), Role::Provider).await;
         let state = recovered.state();
@@ -1249,6 +1301,7 @@ async fn a_half_signed_job_keeps_its_bytes() {
     {
         let mut store = open(dir.path(), Role::Provider).await;
         commit_all(&mut store, &[job.proposed()]).await;
+        store.content_store().close().await;
     }
 
     let mut recovered = open(dir.path(), Role::Provider).await;
@@ -1267,9 +1320,8 @@ async fn a_half_signed_job_keeps_its_bytes() {
     // The peer re-sends what it sent before the crash: the same
     // proposal, not a second one.
     let before = recovered.len();
-    if let Err(error) = recovered
-        .commit(job.proposed(), &Secp256k1Verifier::new())
-        .await
+    if let Err(error) =
+        commit_with_content(&mut recovered, job.proposed(), &Secp256k1Verifier::new()).await
     {
         panic!("an exact replay commits: {error}");
     }
@@ -1278,17 +1330,19 @@ async fn a_half_signed_job_keeps_its_bytes() {
     // The same nonce with different bytes is not a replay.
     let mut different = job.authorization;
     different.terminal_deadline = 201;
-    let error = recovered
-        .commit(
-            ChannelRecord::JobProposed {
-                authorization: different,
-                client_signature: client().sign(payload(work_id(&channel, &different))),
-                prepared_input: bundle_bytes(different.proposal_nonce),
-            },
-            &Secp256k1Verifier::new(),
-        )
-        .await
-        .expect_err("a second job while one is open");
+    let error = commit_with_content(
+        &mut recovered,
+        ChannelRecord::JobProposed {
+            authorization: different,
+            client_signature: client().sign(payload(work_id(&channel, &different))),
+            prepared_input: bundle_bytes(different.proposal_nonce).into(),
+
+            retained_tree: None,
+        },
+        &Secp256k1Verifier::new(),
+    )
+    .await
+    .expect_err("a second job while one is open");
     assert!(
         matches!(
             error,
@@ -1321,12 +1375,12 @@ async fn an_interrupted_invocation_stays_indeterminate() {
             ],
         )
         .await;
+        store.content_store().close().await;
     }
 
     let mut recovered = open(dir.path(), Role::Provider).await;
     assert!(recovered.state().is_indeterminate());
-    let error = recovered
-        .commit(job.result_record(&channel), &verifier)
+    let error = commit_with_content(&mut recovered, job.result_record(&channel), &verifier)
         .await
         .expect_err("this process did not make that invocation");
     assert!(
@@ -1340,15 +1394,15 @@ async fn an_interrupted_invocation_stays_indeterminate() {
     // The only way out is an explicit ending, and it rests the one job
     // at a permanent indeterminate terminal. The compute this provider
     // may have spent is the provider's own to bear.
-    if let Err(error) = recovered
-        .commit(
-            ChannelRecord::JobTerminated {
-                work_id: job.work_id,
-                outcome: TerminalOutcome::Indeterminate,
-            },
-            &verifier,
-        )
-        .await
+    if let Err(error) = commit_with_content(
+        &mut recovered,
+        ChannelRecord::JobTerminated {
+            work_id: job.work_id,
+            outcome: TerminalOutcome::Indeterminate,
+        },
+        &verifier,
+    )
+    .await
     {
         panic!("the ending commits: {error}");
     }
@@ -1379,8 +1433,7 @@ async fn compute_credit_bounds_what_may_be_co_signed() {
     let channel = channel_with(EdgeId::from_bytes([0xe5; 32]), limits(PRICE - 1, 1_000));
     let mut store = open_on(dir.path(), channel.clone(), Role::Provider).await;
     let job = job_at(&channel, 1, 0);
-    let error = store
-        .commit(job.proposed(), &verifier)
+    let error = commit_with_content(&mut store, job.proposed(), &verifier)
         .await
         .expect_err("the one job's price is over the compute limit");
     assert!(
@@ -1402,7 +1455,7 @@ async fn compute_credit_bounds_what_may_be_co_signed() {
     let other = temp();
     let mut store = open_on(other.path(), roomy.clone(), Role::Provider).await;
     let job = job_at(&roomy, 1, 0);
-    if let Err(error) = store.commit(job.proposed(), &verifier).await {
+    if let Err(error) = commit_with_content(&mut store, job.proposed(), &verifier).await {
         panic!("a job within the compute limit co-signs: {error}");
     }
 }
@@ -1420,15 +1473,15 @@ async fn delivery_credit_bounds_what_may_be_released() {
     let mut store = open_on(dir.path(), channel.clone(), Role::Provider).await;
     let job = job_at(&channel, 1, 0);
     commit_all(&mut store, &provider_sequence(&channel, &job).await[..4]).await;
-    let error = store
-        .commit(
-            ChannelRecord::PlaintextReleased {
-                work_id: job.work_id,
-            },
-            &verifier,
-        )
-        .await
-        .expect_err("the one job's price is over the delivery limit");
+    let error = commit_with_content(
+        &mut store,
+        ChannelRecord::PlaintextReleased {
+            work_id: job.work_id,
+        },
+        &verifier,
+    )
+    .await
+    .expect_err("the one job's price is over the delivery limit");
     assert!(
         matches!(
             error,
@@ -1477,7 +1530,9 @@ async fn a_signature_from_the_wrong_party_is_not_evidence() {
             ChannelRecord::JobProposed {
                 authorization: job.authorization,
                 client_signature: provider().sign(payload(job.work_id)),
-                prepared_input: bundle_bytes(job.authorization.proposal_nonce),
+                prepared_input: bundle_bytes(job.authorization.proposal_nonce).into(),
+
+                retained_tree: None,
             },
         ),
         (
@@ -1486,6 +1541,8 @@ async fn a_signature_from_the_wrong_party_is_not_evidence() {
             ChannelRecord::JobAccepted {
                 work_id: job.work_id,
                 provider_signature: client().sign(payload(job.work_id)),
+
+                retained_tree: None,
             },
         ),
         (
@@ -1501,7 +1558,9 @@ async fn a_signature_from_the_wrong_party_is_not_evidence() {
                 work_id: job.work_id,
                 result: job.result,
                 provider_signature: provider().sign(payload(job.work_id)),
-                transcript: spool(&job.transcript),
+                transcript: spool(&job.transcript).into(),
+
+                retained_tree: None,
             },
         ),
         (
@@ -1546,8 +1605,7 @@ async fn a_signature_from_the_wrong_party_is_not_evidence() {
         let mut store = open(dir.path(), Role::Provider).await;
         commit_all(&mut store, &prefix).await;
         let before = store.len();
-        let error = store
-            .commit(record, &verifier)
+        let error = commit_with_content(&mut store, record, &verifier)
             .await
             .expect_err("this signature is not the party's");
         assert!(
@@ -1609,26 +1667,26 @@ async fn a_payment_must_be_the_one_this_position_admits() {
         let dir = temp();
         let mut store = open(dir.path(), Role::Provider).await;
         commit_all(&mut store, &provider_sequence(&channel, &job).await[..5]).await;
-        let error = store
-            .commit(
-                ChannelRecord::JobTerminated {
-                    work_id: job.work_id,
-                    outcome: TerminalOutcome::Certified {
-                        signed_result: Box::new((
-                            job.result,
-                            provider().sign(payload(result_digest(&channel, &job.result))),
-                        )),
-                        certificate: job.certificate,
-                        binding: Box::new(binding),
-                        binding_signature: client()
-                            .sign(payload(payment_binding_digest(&channel, &binding))),
-                        certificate_signature: client().sign(job.certificate.digest(network())),
-                    },
+        let error = commit_with_content(
+            &mut store,
+            ChannelRecord::JobTerminated {
+                work_id: job.work_id,
+                outcome: TerminalOutcome::Certified {
+                    signed_result: Box::new((
+                        job.result,
+                        provider().sign(payload(result_digest(&channel, &job.result))),
+                    )),
+                    certificate: job.certificate,
+                    binding: Box::new(binding),
+                    binding_signature: client()
+                        .sign(payload(payment_binding_digest(&channel, &binding))),
+                    certificate_signature: client().sign(job.certificate.digest(network())),
                 },
-                &verifier,
-            )
-            .await
-            .expect_err("this is not the payment the position admits");
+            },
+            &verifier,
+        )
+        .await
+        .expect_err("this is not the payment the position admits");
         assert!(
             matches!(
                 error,
@@ -1670,26 +1728,26 @@ async fn a_payment_must_be_the_one_this_position_admits() {
         // case is the certificate's own field. It is also the case that
         // check cannot see: an offered certificate that is not the one
         // the binding names.
-        let error = store
-            .commit(
-                ChannelRecord::JobTerminated {
-                    work_id: job.work_id,
-                    outcome: TerminalOutcome::Certified {
-                        signed_result: Box::new((
-                            job.result,
-                            provider().sign(payload(result_digest(&channel, &job.result))),
-                        )),
-                        certificate,
-                        binding: Box::new(job.binding),
-                        binding_signature: client()
-                            .sign(payload(payment_binding_digest(&channel, &job.binding))),
-                        certificate_signature: client().sign(certificate.digest(network())),
-                    },
+        let error = commit_with_content(
+            &mut store,
+            ChannelRecord::JobTerminated {
+                work_id: job.work_id,
+                outcome: TerminalOutcome::Certified {
+                    signed_result: Box::new((
+                        job.result,
+                        provider().sign(payload(result_digest(&channel, &job.result))),
+                    )),
+                    certificate,
+                    binding: Box::new(job.binding),
+                    binding_signature: client()
+                        .sign(payload(payment_binding_digest(&channel, &job.binding))),
+                    certificate_signature: client().sign(certificate.digest(network())),
                 },
-                &verifier,
-            )
-            .await
-            .expect_err("this is not the payment the position admits");
+            },
+            &verifier,
+        )
+        .await
+        .expect_err("this is not the payment the position admits");
         assert!(
             matches!(
                 error,
@@ -1712,8 +1770,7 @@ async fn a_record_for_another_channel_is_refused() {
     let mut store = open(dir.path(), Role::Provider).await;
 
     let elsewhere = job_at(&other, 1, 0);
-    let error = store
-        .commit(elsewhere.proposed(), &verifier)
+    let error = commit_with_content(&mut store, elsewhere.proposed(), &verifier)
         .await
         .expect_err("that authorization names another channel");
     assert!(
@@ -1743,8 +1800,7 @@ async fn role_scoped_steps_belong_to_one_role() {
             work_id: job.work_id,
         },
     ] {
-        let error = client_store
-            .commit(record, &verifier)
+        let error = commit_with_content(&mut client_store, record, &verifier)
             .await
             .expect_err("that is a provider's step");
         assert!(
@@ -1778,17 +1834,17 @@ async fn the_cursor_only_moves_to_the_contiguous_next_block() {
     // repeated height carries a different payload, so it is a second
     // block at the held height rather than the retry answered below.
     for height in [anchor + 1, anchor, 0, anchor + 3, anchor + 20] {
-        let error = store
-            .commit(
-                ChannelRecord::CursorAdvanced {
-                    height,
-                    parent: payload_at(anchor + 1),
-                    payload: [0x99; 32],
-                },
-                &verifier,
-            )
-            .await
-            .expect_err("only the next height moves the cursor");
+        let error = commit_with_content(
+            &mut store,
+            ChannelRecord::CursorAdvanced {
+                height,
+                parent: payload_at(anchor + 1),
+                payload: [0x99; 32],
+            },
+            &verifier,
+        )
+        .await
+        .expect_err("only the next height moves the cursor");
         assert!(
             matches!(
                 error,
@@ -1802,17 +1858,17 @@ async fn the_cursor_only_moves_to_the_contiguous_next_block() {
     }
 
     // The next height, and the only thing varied is the parent.
-    let error = store
-        .commit(
-            ChannelRecord::CursorAdvanced {
-                height: anchor + 2,
-                parent: payload_at(anchor),
-                payload: payload_at(anchor + 2),
-            },
-            &verifier,
-        )
-        .await
-        .expect_err("a block from another history does not extend this one");
+    let error = commit_with_content(
+        &mut store,
+        ChannelRecord::CursorAdvanced {
+            height: anchor + 2,
+            parent: payload_at(anchor),
+            payload: payload_at(anchor + 2),
+        },
+        &verifier,
+    )
+    .await
+    .expect_err("a block from another history does not extend this one");
     assert!(
         matches!(
             error,
@@ -1844,7 +1900,7 @@ async fn a_second_process_cannot_hold_the_same_channel() {
         settlement(),
         Role::Provider,
         origin_of(&channel()),
-        hellas_store::ContentStore::new(),
+        held.content_store(),
         &Secp256k1Verifier::new(),
     )
     .await
@@ -1853,6 +1909,7 @@ async fn a_second_process_cannot_hold_the_same_channel() {
         matches!(error, WorkStoreError::Journal(JournalError::Locked { .. })),
         "unexpected error: {error}"
     );
+    held.content_store().close().await;
     drop(held);
     let _ = open(dir.path(), Role::Provider).await;
 }
@@ -2008,9 +2065,25 @@ fn the_record_codec_is_exact_and_ordered() {
     let mut expected = vec![1_u8];
     expected.extend_from_slice(&job.authorization.encode());
     expected.extend_from_slice(client().sign(payload(job.work_id)).as_bytes());
+    expected.push(0); // absent retained tree, before the trailing input body
     expected.extend_from_slice(&bundle_bytes(1));
     assert_eq!(bytes, expected);
     assert_eq!(ChannelRecord::decode(&bytes), Ok(proposed));
+
+    let mut with_tree = job.proposed();
+    let root = hellas_rpc::ContentRef::new(hellas_rpc::ContentId::from_bytes([0x91; 32]), 123);
+    if let ChannelRecord::JobProposed { retained_tree, .. } = &mut with_tree {
+        *retained_tree = Some(root);
+    }
+    let mut expected_tree = vec![1_u8];
+    expected_tree.extend_from_slice(&job.authorization.encode());
+    expected_tree.extend_from_slice(client().sign(payload(job.work_id)).as_bytes());
+    expected_tree.push(1);
+    expected_tree.extend_from_slice(&[0x91; 32]);
+    expected_tree.extend_from_slice(&123u64.to_be_bytes());
+    expected_tree.extend_from_slice(&bundle_bytes(1));
+    assert_eq!(with_tree.encode(), expected_tree);
+    assert_eq!(ChannelRecord::decode(&expected_tree), Ok(with_tree));
 
     // The result record: body, then signature, then the transcript as
     // the whole of the rest.
@@ -2024,6 +2097,7 @@ fn the_record_codec_is_exact_and_ordered() {
             .sign(payload(result_digest(&channel, &job.result)))
             .as_bytes(),
     );
+    expected.push(0); // absent retained tree, before the trailing transcript
     expected.extend_from_slice(&spool(&job.transcript));
     assert_eq!(bytes, expected);
     assert_eq!(ChannelRecord::decode(&bytes), Ok(recorded));
@@ -2170,7 +2244,9 @@ async fn replay_checks_the_signatures_again() {
     let forged = ChannelRecord::JobProposed {
         authorization: job.authorization,
         client_signature: provider().sign(payload(job.work_id)),
-        prepared_input: bundle_bytes(job.authorization.proposal_nonce),
+        prepared_input: bundle_bytes(job.authorization.proposal_nonce).into(),
+
+        retained_tree: None,
     };
     {
         let location = StoreLocation::for_test(dir.path());
@@ -2180,16 +2256,18 @@ async fn replay_checks_the_signatures_again() {
             settlement(),
             Role::Provider,
             origin_of(&channel),
-            hellas_store::ContentStore::new(),
+            fixture::content_store(dir.path()).await,
             &AcceptAll,
         )
         .await
         else {
             panic!("the store opens");
         };
-        if let Err(error) = credulous.commit(forged, &AcceptAll).await {
+        credulous.content_store().finish_recovery().await.unwrap();
+        if let Err(error) = commit_with_content(&mut credulous, forged, &AcceptAll).await {
             panic!("a credulous verifier accepts it: {error}");
         }
+        credulous.content_store().close().await;
     }
     let location = StoreLocation::for_test(dir.path());
     let error = ChannelStore::open(
@@ -2198,7 +2276,7 @@ async fn replay_checks_the_signatures_again() {
         settlement(),
         Role::Provider,
         origin_of(&channel),
-        hellas_store::ContentStore::new(),
+        fixture::content_store(dir.path()).await,
         &Secp256k1Verifier::new(),
     )
     .await
@@ -2236,10 +2314,13 @@ async fn a_result_needs_the_marker_that_says_the_backend_was_called() {
     let mut store = open(dir.path(), Role::Provider).await;
     commit_all(&mut store, &[job.proposed(), job.accepted()]).await;
 
-    let error = store
-        .commit(job.result_record(&channel), &Secp256k1Verifier::new())
-        .await
-        .expect_err("nothing marked this job as invoked");
+    let error = commit_with_content(
+        &mut store,
+        job.result_record(&channel),
+        &Secp256k1Verifier::new(),
+    )
+    .await
+    .expect_err("nothing marked this job as invoked");
     assert!(
         matches!(
             error,
@@ -2271,9 +2352,19 @@ async fn the_retained_dispatch_input_is_the_one_the_authorization_commits_to() {
     {
         let mut store = open(dir.path(), Role::Provider).await;
         commit_all(&mut store, &[job.proposed(), job.accepted()]).await;
+        store.content_store().close().await;
     }
 
-    let recovered = open(dir.path(), Role::Provider).await;
+    let mut recovered = open(dir.path(), Role::Provider).await;
+    assert!(
+        recovered
+            .state()
+            .job_by_id(job.work_id)
+            .unwrap()
+            .prepared_input()
+            .is_empty()
+    );
+    recovered.load_retained_content(job.work_id).await.unwrap();
     let Some(open_job) = recovered.state().jobs().next() else {
         panic!("the accepted job survives");
     };
@@ -2288,17 +2379,19 @@ async fn the_retained_dispatch_input_is_the_one_the_authorization_commits_to() {
     // job's authorization and this job's real client signature.
     let other = temp();
     let mut fresh = open(other.path(), Role::Provider).await;
-    let error = fresh
-        .commit(
-            ChannelRecord::JobProposed {
-                authorization: job.authorization,
-                client_signature: client().sign(payload(job.work_id)),
-                prepared_input: bundle_bytes(2),
-            },
-            &Secp256k1Verifier::new(),
-        )
-        .await
-        .expect_err("those are not the inputs the authorization names");
+    let error = commit_with_content(
+        &mut fresh,
+        ChannelRecord::JobProposed {
+            authorization: job.authorization,
+            client_signature: client().sign(payload(job.work_id)),
+            prepared_input: bundle_bytes(2).into(),
+
+            retained_tree: None,
+        },
+        &Secp256k1Verifier::new(),
+    )
+    .await
+    .expect_err("those are not the inputs the authorization names");
     assert!(
         matches!(error, WorkStoreError::Channel(ChannelStateError::Record(_))),
         "unexpected error: {error}"
@@ -2306,34 +2399,29 @@ async fn the_retained_dispatch_input_is_the_one_the_authorization_commits_to() {
     assert!(fresh.state().jobs().next().is_none());
 
     // And bytes that are not a bundle at all.
-    let error = fresh
-        .commit(
-            ChannelRecord::JobProposed {
-                authorization: job.authorization,
-                client_signature: client().sign(payload(job.work_id)),
-                prepared_input: vec![0xff; 8],
-            },
-            &Secp256k1Verifier::new(),
-        )
-        .await
-        .expect_err("that is not a prepared bundle");
+    let error = commit_with_content(
+        &mut fresh,
+        ChannelRecord::JobProposed {
+            authorization: job.authorization,
+            client_signature: client().sign(payload(job.work_id)),
+            prepared_input: vec![0xff; 8].into(),
+
+            retained_tree: None,
+        },
+        &Secp256k1Verifier::new(),
+    )
+    .await
+    .expect_err("that is not a prepared bundle");
     assert!(
         matches!(error, WorkStoreError::Channel(ChannelStateError::Record(_))),
         "unexpected error: {error}"
     );
 }
 
-/// Inputs swapped on the disk fault the journal rather than becoming a
-/// job to execute.
-///
-/// The other half of the property above, and the one that matters to a
-/// dispatch: an accepted job is executed from bytes nobody re-verifies
-/// at dispatch time, so what makes them the right bytes is that opening
-/// the file re-runs the same digest check that admitted them. A store
-/// that only checked on commit would hand a restarted provider a job
-/// its client never signed, and ask for no new signature to do it.
+/// Recovery discards a substituted input without executing its accepted job.
 #[tokio::test]
 async fn inputs_swapped_on_the_disk_are_not_a_job_to_execute() {
+    use hellas_store::content::{ContentStore as _, Cursor, Scope, Target};
     let channel = channel();
     let job = job_at(&channel, 1, 0);
 
@@ -2341,12 +2429,31 @@ async fn inputs_swapped_on_the_disk_are_not_a_job_to_execute() {
         let dir = temp();
         let mut store = open(dir.path(), Role::Provider).await;
         commit_all(&mut store, &[job.proposed(), job.accepted()]).await;
+        store.content_store().close().await;
         drop(store);
         let path = dir
             .path()
             .join("content/objects")
             .join(job.authorization.input_content.id().to_string());
-        hellas_private::write_atomically(&path, ".tamper", &bundle_bytes(bundle_nonce)).unwrap();
+        // Corrupt the private staged hard link too; a valid original must be recoverable.
+        std::fs::write(&path, bundle_bytes(bundle_nonce)).unwrap();
+        let content = hellas_store::content::DiskStore::open(
+            hellas_private::StoreLocation::for_test(dir.path()).child("content"),
+            vec![],
+            hellas_store::content::IndexMode::Resume,
+            None,
+            hellas_store::content::Reservations::ram(
+                hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
+            ),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            path.exists(),
+            readable,
+            "the substituted input is discarded"
+        );
         let location = StoreLocation::for_test(dir.path());
         let opened = ChannelStore::open(
             &location,
@@ -2354,21 +2461,37 @@ async fn inputs_swapped_on_the_disk_are_not_a_job_to_execute() {
             settlement(),
             Role::Provider,
             origin_of(&channel),
-            hellas_store::ContentStore::new(),
+            content.clone(),
             &Secp256k1Verifier::new(),
         )
-        .await;
-        if readable {
-            assert!(
-                opened.unwrap().state().job_by_id(job.work_id).is_some(),
-                "the accepted input reopens"
-            );
-        } else {
-            assert!(
-                opened.is_err(),
-                "a substituted object cannot become input to execution"
-            );
+        .await
+        .unwrap();
+        content.finish_recovery().await.unwrap();
+        assert_eq!(
+            opened.state().job_by_id(job.work_id).unwrap().phase(),
+            JobPhase::Accepted
+        );
+        assert!(opened.state().terminal_by_id(job.work_id).is_none());
+        let root = opened.state().retained_roots()[&job.work_id];
+        assert!(
+            content
+                .pins(&Scope::Owner, "channel/", Cursor::default())
+                .await
+                .unwrap()
+                .pins
+                .iter()
+                .any(|(_, pin)| pin.target == Target::Tree(root))
+        );
+        if !readable {
+            assert_eq!(content.stats().unwrap().outstanding, 0);
         }
+        let service = hellas_channel::work::WorkService::close_only(
+            hellas_channel::work::CloseEndpoint::new(opened, provider()).unwrap(),
+        );
+        assert_eq!(
+            service.accepted_work_ids().await.unwrap(),
+            if readable { vec![job.work_id] } else { vec![] }
+        );
     }
 }
 
@@ -2416,8 +2539,7 @@ async fn a_retained_close_start_admits_no_further_work() {
     // A later job would otherwise be valid, but the retained close is the
     // admission cutoff.
     let next = job_at(&channel, 2, PRICE);
-    let error = store
-        .commit(next.proposed(), &verifier)
+    let error = commit_with_content(&mut store, next.proposed(), &verifier)
         .await
         .expect_err("a job after the one job is refused");
     assert!(
@@ -2519,7 +2641,7 @@ async fn each_job_terminal_rejects_a_late_reply_and_a_second_proposal() {
         let mut store = open(dir.path(), role).await;
         let verifier = Secp256k1Verifier::new();
         for record in records {
-            if let Err(error) = store.commit(record, &verifier).await {
+            if let Err(error) = commit_with_content(&mut store, record, &verifier).await {
                 panic!("{name}: reaching the terminal records: {error}");
             }
         }
@@ -2534,7 +2656,7 @@ async fn each_job_terminal_rejects_a_late_reply_and_a_second_proposal() {
 
         // A late reply to the finished job: a co-signature that arrives
         // now is answering a job that is over.
-        let late = store.commit(job.accepted(), &verifier).await;
+        let late = commit_with_content(&mut store, job.accepted(), &verifier).await;
         assert!(
             matches!(
                 late,
@@ -2546,7 +2668,7 @@ async fn each_job_terminal_rejects_a_late_reply_and_a_second_proposal() {
         );
 
         // And a second proposal has nothing to open.
-        let second = store.commit(job.proposed(), &verifier).await;
+        let second = commit_with_content(&mut store, job.proposed(), &verifier).await;
         assert!(
             matches!(
                 second,
@@ -2628,7 +2750,7 @@ async fn one_contest_admits_one_answer() {
     };
 
     // There is nothing to answer yet.
-    let early = store.commit(arbitrary.clone(), &verifier).await;
+    let early = commit_with_content(&mut store, arbitrary.clone(), &verifier).await;
     assert!(
         matches!(
             early,
@@ -2653,7 +2775,7 @@ async fn one_contest_admits_one_answer() {
 
     // A digest this contest and this certificate do not derive is not
     // this endpoint's answer, whatever wrote it down.
-    let invented = store.commit(arbitrary, &verifier).await;
+    let invented = commit_with_content(&mut store, arbitrary, &verifier).await;
     assert!(
         matches!(
             invented,
@@ -2690,15 +2812,15 @@ async fn one_contest_admits_one_answer() {
     assert_eq!(store.len(), before, "the same answer is not written twice");
 
     // A second, different answer to that same contest is not a retry.
-    let disagreement = store
-        .commit(
-            ChannelRecord::CloseResponded {
-                start_id,
-                response_digest: PayloadHash::from_bytes([0x7e; 32]),
-            },
-            &verifier,
-        )
-        .await;
+    let disagreement = commit_with_content(
+        &mut store,
+        ChannelRecord::CloseResponded {
+            start_id,
+            response_digest: PayloadHash::from_bytes([0x7e; 32]),
+        },
+        &verifier,
+    )
+    .await;
     assert!(
         matches!(
             disagreement,
@@ -2708,15 +2830,15 @@ async fn one_contest_admits_one_answer() {
     );
 
     // Nor is an answer to some other contest.
-    let elsewhere = store
-        .commit(
-            ChannelRecord::CloseResponded {
-                start_id: hellas_kernel::StartId::from_bytes([0x7f; 32]),
-                response_digest: PayloadHash::from_bytes([0x7d; 32]),
-            },
-            &verifier,
-        )
-        .await;
+    let elsewhere = commit_with_content(
+        &mut store,
+        ChannelRecord::CloseResponded {
+            start_id: hellas_kernel::StartId::from_bytes([0x7f; 32]),
+            response_digest: PayloadHash::from_bytes([0x7d; 32]),
+        },
+        &verifier,
+    )
+    .await;
     assert!(
         matches!(
             elsewhere,
@@ -2749,19 +2871,19 @@ async fn one_contest_admits_one_answer() {
             }],
         )
         .await;
-        let refused = store
-            .commit(
-                ChannelRecord::CloseResponded {
+        let refused = commit_with_content(
+            &mut store,
+            ChannelRecord::CloseResponded {
+                start_id,
+                response_digest: hellas_channel::work_close::response_body_digest(
+                    &channel,
                     start_id,
-                    response_digest: hellas_channel::work_close::response_body_digest(
-                        &channel,
-                        start_id,
-                        &job.certificate,
-                    ),
-                },
-                &verifier,
-            )
-            .await;
+                    &job.certificate,
+                ),
+            },
+            &verifier,
+        )
+        .await;
         assert!(
             matches!(
                 refused,
@@ -2786,15 +2908,15 @@ async fn one_contest_admits_one_answer() {
         }],
     )
     .await;
-    let wrong_role = client_store
-        .commit(
-            ChannelRecord::CloseResponded {
-                start_id,
-                response_digest: PayloadHash::from_bytes([0x7d; 32]),
-            },
-            &verifier,
-        )
-        .await;
+    let wrong_role = commit_with_content(
+        &mut client_store,
+        ChannelRecord::CloseResponded {
+            start_id,
+            response_digest: PayloadHash::from_bytes([0x7d; 32]),
+        },
+        &verifier,
+    )
+    .await;
     assert!(
         matches!(
             wrong_role,
@@ -2908,29 +3030,26 @@ async fn proposal_ordering_survives_checkpoint_rotation() {
     let verifier = Secp256k1Verifier::new();
     let job = job_at(&channel(), 1, 0);
     let mut store = open(dir.path(), Role::Client).await;
-    store.commit(job.proposed(), &verifier).await.unwrap();
-    // A real send retains the upload closure before it leaves; without it
-    // the reopened journal would correctly report the proposal unresolved.
-    fixture::retain_proposal_content(
-        &mut store,
-        &fixture::environment().canonical_bytes().unwrap(),
-    );
+    commit_with_content(&mut store, job.proposed(), &verifier)
+        .await
+        .unwrap();
     for pending in [true, false, true] {
-        store
-            .commit(
-                ChannelRecord::ProposalExchange {
-                    work_id: job.work_id,
-                    pending,
-                },
-                &verifier,
-            )
-            .await
-            .unwrap();
+        commit_with_content(
+            &mut store,
+            ChannelRecord::ProposalExchange {
+                work_id: job.work_id,
+                pending,
+            },
+            &verifier,
+        )
+        .await
+        .unwrap();
         let expected = store.state().clone();
         store.rotate().await.unwrap();
+        store.content_store().close().await;
         drop(store);
         store = open(dir.path(), Role::Client).await;
-        assert_eq!(store.state(), &expected);
+        assert_eq!(durable_state(store.state()), durable_state(&expected));
         assert_eq!(
             store.state().job_book().pending_proposal(),
             pending.then_some(job.work_id)
@@ -2941,7 +3060,11 @@ async fn proposal_ordering_survives_checkpoint_rotation() {
         );
         let another = job_at(&channel(), 2, 0);
         if pending {
-            assert!(store.commit(another.proposed(), &verifier).await.is_err());
+            assert!(
+                commit_with_content(&mut store, another.proposed(), &verifier)
+                    .await
+                    .is_err()
+            );
             assert_eq!(store.state().proposal_nonce_high_water(), 1);
         }
     }
@@ -2961,23 +3084,33 @@ async fn invalid_pending_proposals_are_rejected_at_checkpoint_replay() {
         let channel = channel();
         let job = job_at(&channel, 1, 0);
         let mut store = open(dir.path(), role).await;
-        store.commit(job.proposed(), &verifier).await.unwrap();
+        commit_with_content(&mut store, job.proposed(), &verifier)
+            .await
+            .unwrap();
         if accepted {
-            store.commit(job.accepted(), &verifier).await.unwrap();
+            commit_with_content(&mut store, job.accepted(), &verifier)
+                .await
+                .unwrap();
         }
-        let mut bytes = store.state().checkpoint();
-        let suffix = if store.state().job_book().pending_proposal().is_some() {
-            33
+        let valid = durable_state(store.state());
+        store.rotate().await.unwrap();
+        store.content_store().close().await;
+        drop(store);
+        let reopened = open(dir.path(), role).await;
+        assert_eq!(
+            durable_state(reopened.state()),
+            valid,
+            "the unchanged checkpoint is valid before the mutation"
+        );
+        let mut invalid = valid;
+        invalid.book.pending_proposal = Some(if unknown {
+            Digest::from_bytes([0xff; 32])
         } else {
-            1
-        };
-        bytes.truncate(bytes.len() - suffix);
-        bytes.push(1);
-        bytes.extend_from_slice(if unknown {
-            &[0xff; 32]
-        } else {
-            job.work_id.as_bytes()
+            job.work_id
         });
+        let bytes = invalid.checkpoint();
+        let store = reopened;
+        store.content_store().close().await;
         drop(store);
         let stem = channel_stem(dir.path());
         let location = StoreLocation::for_test(dir.path());
@@ -2992,7 +3125,7 @@ async fn invalid_pending_proposals_are_rejected_at_checkpoint_replay() {
                 settlement(),
                 role,
                 origin_of(&channel),
-                hellas_store::ContentStore::new(),
+                fixture::content_store(dir.path()).await,
                 &verifier
             )
             .await,
@@ -3027,11 +3160,12 @@ async fn a_checkpoint_replays_to_what_the_frames_replayed_to() {
                 0,
                 "{label}: a fresh generation holds its checkpoint and nothing else",
             );
+            store.content_store().close().await;
         }
         let reopened = open(rotated.path(), Role::Provider).await;
         assert_eq!(
-            reopened.state(),
-            &expected,
+            durable_state(reopened.state()),
+            durable_state(&expected),
             "{label}: the checkpoint is the state, not a summary of it",
         );
     }
@@ -3095,6 +3229,7 @@ async fn a_duty_survives_repeated_rotation() {
             before.terminals().next(),
             "rotation moves bytes and not facts",
         );
+        store.content_store().close().await;
         store.state().clone()
     };
 
@@ -3108,7 +3243,7 @@ async fn a_duty_survives_repeated_rotation() {
     );
 
     let reopened = open(dir.path(), Role::Provider).await;
-    assert_eq!(reopened.state(), &expected);
+    assert_eq!(durable_state(reopened.state()), durable_state(&expected));
     assert!(
         reopened.state().last_payment().is_some(),
         "the certificate a close still has to carry",

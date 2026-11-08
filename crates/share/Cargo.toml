@@ -16,6 +16,7 @@ hellas-private.workspace = true
 hellas-providers.workspace = true
 hellas-rpc = { workspace = true, features = ["fetch", "work"] }
 hellas-sdk.workspace = true
+hellas-store.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

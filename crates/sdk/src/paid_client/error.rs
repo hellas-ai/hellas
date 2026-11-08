@@ -25,6 +25,8 @@ pub enum PaidClientError {
     InputMismatch(&'static str),
     #[error("paid-work state is missing: {0}")]
     MissingState(&'static str),
+    #[error("initialized client channel has no matching signed setup at {path}")]
+    UnmatchedChannel { path: PathBuf },
     #[error("multiple active jobs match this prepared input")]
     AmbiguousRecovery,
     #[error("payment deadline elapsed during result delivery")]

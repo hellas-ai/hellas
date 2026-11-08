@@ -10,15 +10,18 @@ use tokio::net::UdpSocket;
 
 const PROGRESS: Duration = Duration::from_secs(5);
 
-async fn provider() -> ProviderHandle {
+async fn provider() -> (tempfile::TempDir, ProviderHandle) {
     provider_on(0).await
 }
 
-async fn provider_on(port: u16) -> ProviderHandle {
+async fn provider_on(port: u16) -> (tempfile::TempDir, ProviderHandle) {
+    let root = tempfile::tempdir().unwrap();
+    let content = hellas_authority::test_support::content_store(root.path()).await;
     let secret_key = iroh::SecretKey::from_bytes(&[49; 32]);
     let (enrollment, signer) = crate::test_identity::enrollment(secret_key.public());
     let signer = Arc::new(signer);
-    start_fetch_provider(ProviderOptions {
+    let handle = start_fetch_provider(ProviderOptions {
+        content,
         executor: ExecutorSpawnConfig::new(
             signer.clone(),
             Assurance::ProducerSigned,
@@ -34,7 +37,8 @@ async fn provider_on(port: u16) -> ProviderHandle {
         open_identity: Arc::new(ProviderOpen::<UnusedRoot>::new(signer, enrollment, None).unwrap()),
     })
     .await
-    .unwrap()
+    .unwrap();
+    (root, handle)
 }
 
 fn socket(provider: &ProviderHandle) -> SocketAddr {
@@ -142,7 +146,7 @@ impl PausedHandshake {
 
 #[tokio::test]
 async fn stalled_handshake_does_not_block_another_client() {
-    let provider = provider().await;
+    let (_root, provider) = provider().await;
     let client = endpoint().await;
     let mut paused = PausedHandshake::new(&provider, Ipv4Addr::LOCALHOST).await;
     let slow = {
@@ -182,7 +186,7 @@ async fn stalled_handshake_does_not_block_another_client() {
 
 #[tokio::test]
 async fn completed_session_does_not_cancel_another_handshake() {
-    let provider = provider().await;
+    let (_root, provider) = provider().await;
     let client = endpoint().await;
     let target = EndpointAddr::new(provider.node_id()).with_ip_addr(socket(&provider));
     let first = client
@@ -223,7 +227,7 @@ async fn completed_session_does_not_cancel_another_handshake() {
 /// the old endpoint bound and refusing new handshakes for that identity.
 #[tokio::test]
 async fn shutdown_releases_the_identity_and_port_for_a_successor() {
-    let provider = provider().await;
+    let (_root, provider) = provider().await;
     let address = socket(&provider);
     let client = endpoint().await;
     let mut paused = PausedHandshake::new(&provider, Ipv4Addr::LOCALHOST).await;
@@ -234,7 +238,7 @@ async fn shutdown_releases_the_identity_and_port_for_a_successor() {
     };
     paused.stalled().await;
     provider.shutdown().await.unwrap();
-    let successor = provider_on(address.port()).await;
+    let (_successor_root, successor) = provider_on(address.port()).await;
     let connection = tokio::time::timeout(
         PROGRESS,
         client.connect(
@@ -283,7 +287,7 @@ async fn connect(provider: &ProviderHandle, client: &Endpoint) -> Result<Connect
 async fn local_processes_are_not_held_to_the_per_ip_cap() {
     // Per-IP and per-subnet caps bound remote peers (see hellas_wire::admission
     // tests); several local tools reaching their own node share loopback.
-    let provider = provider().await;
+    let (_root, provider) = provider().await;
     let mut local = Vec::new();
     for _ in 0..crate::transport_admission::PER_IP + 2 {
         let endpoint = endpoint().await;
@@ -301,7 +305,7 @@ async fn local_processes_are_not_held_to_the_per_ip_cap() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn held_connections_from_one_identity_are_capped_across_source_ips() {
-    let provider = provider().await;
+    let (_root, provider) = provider().await;
     let key = iroh::SecretKey::from_bytes(&[77; 32]);
     let mut attackers = Vec::new();
     for host in 1..=4 {
@@ -326,4 +330,102 @@ async fn held_connections_from_one_identity_are_capped_across_source_ips() {
     excess.close().await;
     honest.close().await;
     provider.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn standalone_grant_shutdown_releases_journal_and_identity_with_old_work_alive() {
+    use hellas_auth::{
+        authority::{GrantId, UnixMillis},
+        test_support::actors::ROOT,
+    };
+    use hellas_authority::{
+        node::SessionKey, test_support::common_node, work_store::grant::NodeStore,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let content = hellas_authority::test_support::content_store(root.path()).await;
+    let secret_key = iroh::SecretKey::from_bytes(&[49; 32]);
+    let (enrollment, signer) = crate::test_identity::enrollment(secret_key.public());
+    let signer = Arc::new(signer);
+    let journals = hellas_private::StoreLocation::for_test(&root.path().join("provider"));
+    let (store, secret) = common_node::bootstrap_node_with_credential(
+        &journals,
+        hellas_authority::model::grant::grant_network(),
+        Some(enrollment.clone()),
+        UnixMillis::now().unwrap(),
+    )
+    .await
+    .unwrap();
+    let authority = store.state().authority().authority();
+    drop(store);
+    let options = ProviderOptions {
+        content: content.clone(),
+        executor: ExecutorSpawnConfig::new(
+            signer.clone(),
+            Assurance::ProducerSigned,
+            FetchRouteRegistry::new(),
+        ),
+        grants: Some(ProviderGrants {
+            config: crate::GrantProviderOptions {
+                configuration: Default::default(),
+                max_job_millis: std::num::NonZeroU64::MIN,
+            },
+            authority: ProviderAuthority::Journal {
+                root: journals.clone(),
+            },
+        }),
+        port: Some(0),
+        build: String::new(),
+        graffiti: Vec::new(),
+        discovery: false,
+        work: None,
+        secret_key,
+        open_identity: Arc::new(
+            ProviderOpen::<UnusedRoot>::new(signer, enrollment.clone(), None).unwrap(),
+        ),
+    };
+    let handle = start_fetch_provider(options.clone()).await.unwrap();
+    let service = handle
+        .router
+        .as_ref()
+        .unwrap()
+        .grant_service()
+        .unwrap()
+        .clone();
+    let old_node = service.node();
+    let caller = old_node
+        .authenticate_session(&secret, SessionKey::Passkey(&ROOT.passkey()))
+        .await
+        .unwrap();
+    let held_work = service.for_caller(caller, GrantId([0; 16]));
+    handle.shutdown().await.unwrap();
+    // The old GrantWork still owns the old service/coordinator. Both physical
+    // locks must already be released, independently of their eventual Drop.
+    let reopened = NodeStore::open(
+        &journals,
+        hellas_authority::model::grant::grant_network(),
+        Some(enrollment),
+        UnixMillis::now().unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reopened.state().authority().authority(), authority);
+    assert!(old_node.owner().await.is_err());
+    drop(reopened);
+    let restarted = start_fetch_provider(options).await.unwrap();
+    assert_eq!(
+        restarted
+            .router
+            .as_ref()
+            .unwrap()
+            .grant_service()
+            .unwrap()
+            .node()
+            .owner()
+            .await
+            .unwrap(),
+        ROOT.principal()
+    );
+    drop(held_work);
+    restarted.shutdown().await.unwrap();
+    content.close().await;
 }

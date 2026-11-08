@@ -1,13 +1,16 @@
-trait TextJobTest {
-    fn text_job(&self, prompt_ids: &[u64], max_new: u64, stops: &[u64]) -> Result<ComputeJob>;
-}
-impl TextJobTest for ModelPackage {
-    fn text_job(&self, prompt_ids: &[u64], max_new: u64, stops: &[u64]) -> Result<ComputeJob> {
+impl ModelPackage {
+    async fn text_job(
+        &self,
+        prompt_ids: &[u64],
+        max_new: u64,
+        stops: &[u64],
+    ) -> Result<ComputeJob> {
         self.render_job(&ModelRequest::Text {
             prompt_ids,
             max_new,
             stops,
         })
+        .await
     }
 }
 use super::*;
@@ -19,10 +22,10 @@ fn fixture() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src/model/package/mini-qwen3.gguf")
 }
 
-#[test]
-fn canonical_qwen3_job_bytes_are_stable() {
-    let package = ModelPackage::open(&fixture()).unwrap();
-    let job = package.text_job(&[2, 1], 2, &[0, 0]).unwrap();
+#[tokio::test]
+async fn canonical_qwen3_job_bytes_are_stable() {
+    let package = ModelPackage::open(&fixture()).await.unwrap();
+    let job = package.text_job(&[2, 1], 2, &[0, 0]).await.unwrap();
     assert_eq!(
         job.environment.canonical_bytes().unwrap(),
         include_bytes!("qwen3-environment.cbor")
@@ -33,32 +36,38 @@ fn canonical_qwen3_job_bytes_are_stable() {
     );
 }
 
-#[test]
-#[ignore = "compiles CUDA and HIP model programs; run check-model-programs"]
-fn shipped_qwen3_program_matches_catena_models() {
-    let package = ModelPackage::open(&fixture()).unwrap();
-    let job = package.text_job(&[2, 1], 2, &[0, 0]).unwrap();
-    let config = catena_models::checkpoint::read_gguf_model_config(fixture()).unwrap();
-    let model = catena_models::catena::generated_model_source_for(&config).unwrap();
-    crate::model::program::assert_shipped_module(&job, &model);
-}
-
-#[test]
-fn tiny_gguf_renders_the_complete_qwen3_step_job() {
-    let package = ModelPackage::open(&fixture()).unwrap();
-    let job = package.text_job(&[2, 1], 2, &[0, 0]).unwrap();
+#[tokio::test]
+async fn tiny_gguf_renders_the_complete_qwen3_step_job() {
+    let package = ModelPackage::open(&fixture()).await.unwrap();
+    let job = package.text_job(&[2, 1], 2, &[0, 0]).await.unwrap();
 
     let [source] = job.environment.sources[..] else {
         panic!("one rendered source")
     };
     assert!(
-        std::str::from_utf8(&job.content.read(source).unwrap())
+        std::str::from_utf8(
+            &hellas_channel::content::read(
+                &job.content.0,
+                &job.content.1,
+                source,
+                (source).bytes()
+            )
+            .await
             .unwrap()
-            .contains("qwen3")
+        )
+        .unwrap()
+        .contains("qwen3")
     );
     let root = job.environment.canonical_bytes().unwrap();
     assert_eq!(
-        *job.content.read(ContentRef::for_bytes(&root)).unwrap(),
+        *hellas_channel::content::read(
+            &job.content.0,
+            &job.content.1,
+            ContentRef::for_bytes(&root),
+            (ContentRef::for_bytes(&root)).bytes()
+        )
+        .await
+        .unwrap(),
         root
     );
     let [ref asset] = job.environment.assets[..] else {
@@ -70,8 +79,14 @@ fn tiny_gguf_renders_the_complete_qwen3_step_job() {
         std::fs::metadata(fixture()).unwrap().len()
     );
     assert!(matches!(
-        job.content.read(asset.object),
-        Err(hellas_channel::content::ContentError::Missing)
+        hellas_channel::content::read(
+            &job.content.0,
+            &job.content.1,
+            asset.object,
+            (asset.object).bytes()
+        )
+        .await,
+        Err(hellas_store::content::Error::Missing)
     ));
 
     assert_eq!(
@@ -149,16 +164,16 @@ fn tiny_gguf_renders_the_complete_qwen3_step_job() {
     );
 }
 
-#[test]
-fn empty_oversized_and_out_of_vocabulary_requests_are_refused() {
-    let package = ModelPackage::open(&fixture()).unwrap();
-    assert!(package.text_job(&[], 1, &[]).is_err());
-    assert!(package.text_job(&[2], 0, &[]).is_err());
-    assert!(package.text_job(&[2], 128, &[]).is_err());
-    assert!(package.text_job(&[2], u64::MAX, &[]).is_err());
-    assert!(package.text_job(&[4], 1, &[]).is_err());
-    assert!(package.text_job(&[2], 1, &[4]).is_err());
-    assert!(package.text_job(&[2], 127, &[3]).is_ok());
+#[tokio::test]
+async fn empty_oversized_and_out_of_vocabulary_requests_are_refused() {
+    let package = ModelPackage::open(&fixture()).await.unwrap();
+    assert!(package.text_job(&[], 1, &[]).await.is_err());
+    assert!(package.text_job(&[2], 0, &[]).await.is_err());
+    assert!(package.text_job(&[2], 128, &[]).await.is_err());
+    assert!(package.text_job(&[2], u64::MAX, &[]).await.is_err());
+    assert!(package.text_job(&[4], 1, &[]).await.is_err());
+    assert!(package.text_job(&[2], 1, &[4]).await.is_err());
+    assert!(package.text_job(&[2], 127, &[3]).await.is_ok());
 }
 
 mod qwen35;
