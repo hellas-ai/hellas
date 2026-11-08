@@ -18,6 +18,11 @@ impl FilesystemAssertionCounterStore {
         }
     }
 
+    /// The process's counters, at their one fixed place under `home`.
+    pub fn in_home(home: &std::path::Path) -> Self {
+        Self::new(home.join("apple-app-attest-open-counters"))
+    }
+
     fn path(&self, public_key: &[u8; 33], suffix: &str) -> PathBuf {
         self.directory
             .join(format!("{}{suffix}", hex::encode(public_key)))

@@ -4,6 +4,7 @@ use hellas_auth::Digest;
 use hellas_auth::authority::PrincipalId;
 use hellas_channel::work_store::{ChannelRecord, ChannelStore, Role, SetupStore, TerminalOutcome};
 use hellas_kernel::{EdgeId, Secp256k1Verifier};
+use hellas_private::Durability;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::File,
@@ -14,6 +15,7 @@ use std::{
 #[derive(Clone, Debug)]
 pub struct PaidAttemptPath {
     path: PathBuf,
+    durability: Durability,
     state_key: String,
 }
 
@@ -24,13 +26,14 @@ impl PaidAttemptPath {
         owner: PrincipalId,
         job: Digest,
     ) -> Self {
+        let client = chain.client();
         Self {
-            path: chain
-                .client()
+            path: client
                 .join("purchases")
                 .join(provider.to_string())
                 .join(hex::encode(owner.as_bytes()))
                 .join(format!("{job}.json")),
+            durability: client.durability(),
             state_key: chain.state_key(),
         }
     }
@@ -44,12 +47,18 @@ impl PaidAttemptPath {
         ));
         Self {
             path,
+            durability: self.durability,
             state_key: self.state_key.clone(),
         }
     }
 
     pub fn as_path(&self) -> &Path {
         &self.path
+    }
+
+    /// The selected store's policy for this attempt's records.
+    pub fn durability(&self) -> Durability {
+        self.durability
     }
 
     pub(crate) fn state_key(&self) -> &str {
@@ -62,6 +71,7 @@ impl PaidAttemptPath {
     fn test(path: PathBuf) -> Self {
         Self {
             path,
+            durability: Durability::default(),
             state_key: String::new(),
         }
     }
@@ -148,13 +158,12 @@ impl Drop for PurchaseLock {
 /// The lock serializes invocations of the same job, including --buy-again.
 pub struct Purchase {
     path: PathBuf,
+    durability: Durability,
     state_key: String,
     _lock: PurchaseLock,
     job: [u8; 32],
     price: u64,
     record: Option<Record>,
-    buy_again: bool,
-    tracked: bool,
 }
 impl Purchase {
     pub(crate) fn bound_channel(&self) -> Option<(Digest, EdgeId)> {
@@ -168,25 +177,6 @@ impl Purchase {
                 )
             })
     }
-    pub fn open(path: &PaidAttemptPath, job: &Job, buy_again: bool) -> Result<Self> {
-        let mut purchase = Self::open_identity(path, job.digest(), job.price(), false)?;
-        purchase.buy_again = buy_again;
-        if let Some(record) = &purchase.record
-            && !buy_again
-            && record.phase == Phase::Paid
-        {
-            return Err(PurchaseError::ResultLost {
-                work: Digest::from_bytes(record.work.ok_or(PurchaseError::Identity)?),
-                price: record.price,
-            });
-        }
-        purchase.record = purchase.record.filter(|record| {
-            !matches!(record.phase, Phase::Reported | Phase::Rejected)
-                && !(buy_again && record.phase == Phase::Paid)
-        });
-        Ok(purchase)
-    }
-
     /// Open a caller-owned attempt without clearing a terminal record.
     pub(crate) fn open_tracked(path: &PaidAttemptPath, job: &Job) -> Result<Self> {
         Self::open_tracked_inner(path, job, true)
@@ -197,7 +187,7 @@ impl Purchase {
     }
 
     fn open_tracked_inner(path: &PaidAttemptPath, job: &Job, create: bool) -> Result<Self> {
-        let mut purchase = Self::open_identity(path, job.digest(), job.price(), true)?;
+        let mut purchase = Self::open_identity(path, job.digest(), job.price())?;
         if let Some(record) = &purchase.record
             && (record.attempt_nonce.is_none()
                 || (record.nonce != 0 && record.request_commitment.is_none()))
@@ -225,16 +215,12 @@ impl Purchase {
         Ok(purchase)
     }
 
-    fn open_identity(
-        path: &PaidAttemptPath,
-        job: Digest,
-        price: u64,
-        tracked: bool,
-    ) -> Result<Self> {
+    fn open_identity(path: &PaidAttemptPath, job: Digest, price: u64) -> Result<Self> {
         let state_key = path.state_key().to_owned();
+        let durability = path.durability();
         let path = path.as_path();
         let parent = path.parent().ok_or(PurchaseError::Identity)?;
-        hellas_private::create_dir_all_durable(parent)?;
+        durability.create_dir_all(parent)?;
         let lock = hellas_private::open_lock_beside(path)?;
         lock.try_lock().map_err(|_| PurchaseError::Busy)?;
         let lock = PurchaseLock(lock);
@@ -260,13 +246,12 @@ impl Purchase {
         }
         Ok(Self {
             path: path.to_owned(),
+            durability,
             state_key,
             _lock: lock,
             job: *job.as_bytes(),
             price,
             record,
-            buy_again: false,
-            tracked,
         })
     }
 
@@ -296,37 +281,18 @@ impl Purchase {
     /// Bind a target before funding. Returns true only when this handle wrote
     /// a new binding; an existing binding never authorizes fresh funding.
     pub(crate) fn bind_target(&mut self, target: PurchaseTarget) -> Result<bool> {
-        if !self.tracked {
-            return Err(PurchaseError::Identity);
+        let record = self.record.as_mut().ok_or(PurchaseError::Identity)?;
+        if record.phase == Phase::InputBound && record.target.is_none() {
+            record.target = Some(target);
+            record.phase = Phase::TargetBound;
+            self.persist()?;
+            return Ok(true);
         }
-        if let Some(record) = &self.record {
-            if record.phase == Phase::InputBound && record.target.is_none() {
-                let record = self.record.as_mut().ok_or(PurchaseError::Identity)?;
-                record.target = Some(target);
-                record.phase = Phase::TargetBound;
-                self.persist()?;
-                return Ok(true);
-            }
-            return if record.target.as_ref() == Some(&target) {
-                Ok(false)
-            } else {
-                Err(PurchaseError::Identity)
-            };
+        if record.target.as_ref() == Some(&target) {
+            Ok(false)
+        } else {
+            Err(PurchaseError::Identity)
         }
-        self.record = Some(Record {
-            job: self.job,
-            price: self.price,
-            channel: [0; 32],
-            bond: [0; 32],
-            nonce: 0,
-            work: None,
-            phase: Phase::TargetBound,
-            target: Some(target),
-            request_commitment: None,
-            attempt_nonce: None,
-        });
-        self.persist()?;
-        Ok(true)
     }
 
     pub(crate) fn has_target(&self) -> bool {
@@ -384,15 +350,11 @@ impl Purchase {
         if job.provider_signature().is_none() {
             return Ok(None);
         }
-        if self.tracked && record.attempt_nonce.is_none() {
+        if record.attempt_nonce.is_none()
+            || record.request_commitment
+                != Some(*authorization.request_commitment.digest().as_bytes())
+        {
             return Err(PurchaseError::Identity);
-        }
-        match record.request_commitment {
-            Some(expected) if expected != *authorization.request_commitment.digest().as_bytes() => {
-                return Err(PurchaseError::Identity);
-            }
-            None if self.tracked => return Err(PurchaseError::Identity),
-            _ => (),
         }
         // Retained input additionally checks this job and attempt's request
         // nonce. The durable commitment carries that binding through replay.
@@ -442,12 +404,6 @@ impl Purchase {
         Ok(())
     }
 
-    pub fn is_pending(&self) -> bool {
-        self.record.is_some()
-    }
-    pub(super) fn buys_again(&self) -> bool {
-        self.buy_again && self.record.is_none()
-    }
     fn unfinished(&self, reason: &'static str) -> PurchaseError {
         PurchaseError::Unfinished {
             work: self
@@ -473,12 +429,10 @@ impl Purchase {
         ) {
             return Err(self.unfinished("target or channel binding is incomplete"));
         }
-        if self.tracked
-            && matches!(
-                record.phase,
-                Phase::Paid | Phase::Reported | Phase::Rejected
-            )
-        {
+        if matches!(
+            record.phase,
+            Phase::Paid | Phase::Reported | Phase::Rejected
+        ) {
             return Ok(());
         }
         if !options.journal_root().exists() {
@@ -566,10 +520,6 @@ impl Purchase {
             {
                 self.record.as_mut().ok_or(PurchaseError::Identity)?.phase = Phase::Paid;
                 self.persist()?;
-                if self.buy_again {
-                    self.record = None;
-                    return Ok(());
-                }
                 return Err(PurchaseError::ResultLost {
                     work,
                     price: self.price,
@@ -629,43 +579,24 @@ impl Purchase {
         request_commitment: Digest,
     ) -> Result<()> {
         let request_commitment = *request_commitment.as_bytes();
-        if let Some(record) = &mut self.record {
-            if record.channel != *channel.as_bytes()
-                || record.bond != bond.to_bytes()
-                || (record.phase != Phase::ChannelBound && record.nonce != nonce)
-                || record
-                    .request_commitment
-                    .is_some_and(|held| held != request_commitment)
-            {
-                return Err(PurchaseError::Identity);
-            }
-            let changed = record.phase == Phase::ChannelBound
-                || (self.tracked && record.request_commitment.is_none());
+        let record = self.record.as_mut().ok_or(PurchaseError::Identity)?;
+        if record.channel != *channel.as_bytes()
+            || record.bond != bond.to_bytes()
+            || (record.phase != Phase::ChannelBound && record.nonce != nonce)
+            || record
+                .request_commitment
+                .is_some_and(|held| held != request_commitment)
+        {
+            return Err(PurchaseError::Identity);
+        }
+        if record.phase == Phase::ChannelBound || record.request_commitment.is_none() {
             if record.phase == Phase::ChannelBound {
                 record.nonce = nonce;
                 record.phase = Phase::Running;
             }
-            if changed {
-                // Nonce and its exact request binding must survive together,
-                // before any proposal can leave the process.
-                if self.tracked {
-                    record.request_commitment = Some(request_commitment);
-                }
-                self.persist()?;
-            }
-        } else {
-            self.record = Some(Record {
-                job: self.job,
-                price: self.price,
-                channel: *channel.as_bytes(),
-                bond: bond.to_bytes(),
-                nonce,
-                work: None,
-                phase: Phase::Running,
-                target: None,
-                request_commitment: self.tracked.then_some(request_commitment),
-                attempt_nonce: None,
-            });
+            // Nonce and its exact request binding must survive together,
+            // before any proposal can leave the process.
+            record.request_commitment = Some(request_commitment);
             self.persist()?;
         }
         Ok(())
@@ -687,18 +618,8 @@ impl Purchase {
         {
             return Err(PurchaseError::Identity);
         }
-        if self.tracked {
-            self.record.as_mut().ok_or(PurchaseError::Identity)?.phase = Phase::Rejected;
-            return self.persist();
-        }
-        match std::fs::remove_file(&self.path) {
-            Ok(()) => (),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
-            Err(error) => return Err(error.into()),
-        }
-        hellas_private::sync_directory(self.path.parent().ok_or(PurchaseError::Identity)?)?;
-        self.record = None;
-        Ok(())
+        self.record.as_mut().ok_or(PurchaseError::Identity)?.phase = Phase::Rejected;
+        self.persist()
     }
     /// Call only after all selected output writes and the result report succeed.
     pub fn reported(&mut self) -> Result<()> {
@@ -744,8 +665,13 @@ impl Purchase {
         })
     }
 
+    /// The selected store's policy, shared by this attempt's sidecars.
+    pub(crate) fn durability(&self) -> Durability {
+        self.durability
+    }
+
     fn persist(&self) -> Result<()> {
-        hellas_private::write_atomically(
+        self.durability.write_atomically(
             &self.path,
             ".writing",
             &serde_json::to_vec(self.record.as_ref().ok_or(PurchaseError::Identity)?)?,
@@ -833,26 +759,6 @@ mod tests {
             .unwrap();
             drop(Purchase::open_existing_tracked(&tracked(&path), &job).unwrap());
         }
-        // Untracked purchases are a current mode, not old tracked records.
-        let path = root.path().join("untracked");
-        let mut purchase =
-            Purchase::open(&PaidAttemptPath::test(path.clone()), &job, false).unwrap();
-        purchase
-            .begin(
-                Digest::from_bytes([1; 32]),
-                EdgeId::from_bytes([2; 32]),
-                1,
-                Digest::from_bytes([4; 32]),
-            )
-            .unwrap();
-        drop(purchase);
-        assert_eq!(
-            Purchase::open(&PaidAttemptPath::test(path.clone()), &job, false)
-                .unwrap()
-                .status()
-                .unwrap(),
-            PurchaseStatus::Running { work: None }
-        );
     }
 
     #[test]
@@ -896,6 +802,12 @@ mod tests {
                     purchase.unpaid(work).unwrap();
                 }
             }
+            // The marker holds identifiers only, never the job's input.
+            assert!(
+                !std::fs::read_to_string(&path)
+                    .unwrap()
+                    .contains("private-input-sentinel")
+            );
             let recovered = Purchase::open_existing_tracked(&tracked(&path), &job).unwrap();
             assert_eq!(
                 recovered.bound_channel().map(|(found, _)| found),
@@ -986,100 +898,36 @@ mod tests {
         assert_eq!(reopened.request_nonce(channel, 1), nonce);
         let second = Purchase::open_tracked(&tracked(&root.path().join("second")), &job).unwrap();
         assert_ne!(second.request_nonce(channel, 1), nonce);
-        let untracked = Purchase::open(
-            &PaidAttemptPath::test(root.path().join("folder")),
-            &job,
-            false,
-        )
+    }
+
+    #[test]
+    fn markers_follow_the_selected_store_durability() {
+        let passkey = hellas_kernel::SoftPasskey::from_secret_scalar([1; 32]).unwrap();
+        let owner = PrincipalId::from_public_key(hellas_auth::PublicKey::P256(
+            passkey.party_key().to_bytes(),
+        ))
         .unwrap();
-        assert_eq!(
-            untracked.request_nonce(channel, 1),
-            job.purchase_nonce(channel, 1)
-        );
+        let provider = hellas_client::ProviderAddress {
+            enrollment: hellas_rpc::ContentId::hash(b"provider"),
+            node: iroh::SecretKey::from_bytes(&[1; 32]).public(),
+        };
+        let job = job();
+        for durability in [Durability::Crash, Durability::Power] {
+            let root = tempfile::tempdir().unwrap();
+            let chain = hellas_chain::chain_dir::ChainDir::open(
+                &hellas_private::StoreLocation::from_home(root.path(), durability),
+                &hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet),
+            )
+            .unwrap();
+            let path =
+                PaidAttemptPath::new(&chain, provider, owner, job.digest()).with_nonce([1; 16]);
+            let purchase = Purchase::open_tracked(&path, &job).unwrap();
+            assert_eq!(purchase.durability(), durability);
+            assert!(path.as_path().is_file());
+        }
     }
 
     fn job() -> Job {
         Job::fetch(20, hellas_rpc::FetchContract::http().unwrap(), "http".into(), "request".into(), br#"{"url":"https://example.test/private-input-sentinel","method":"GET","tls":{"roots":{"mode":"web_pki"}},"max_response_bytes":4096}"#.to_vec(), hellas_rpc::Assurance::ProducerSigned).unwrap()
-    }
-    #[test]
-    fn paid_but_unreported_marker_refuses_a_charge_and_retains_no_payload() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("purchase.json");
-        let job = job();
-        let work = Digest::from_bytes([7; 32]);
-        {
-            let mut purchase =
-                Purchase::open(&PaidAttemptPath::test(path.clone()), &job, false).unwrap();
-            assert!(
-                matches!(
-                    Purchase::open(&PaidAttemptPath::test(path.clone()), &job, true),
-                    Err(PurchaseError::Busy)
-                ),
-                "buy-again cannot bypass the live command lock"
-            );
-            purchase
-                .begin(
-                    Digest::from_bytes([1; 32]),
-                    EdgeId::from_bytes([2; 32]),
-                    1,
-                    Digest::from_bytes([4; 32]),
-                )
-                .unwrap();
-            purchase.accepting(work).unwrap();
-            purchase.paying(work).unwrap();
-            purchase.paid(work).unwrap();
-        }
-        assert!(
-            matches!(Purchase::open(&PaidAttemptPath::test(path.clone()), &job, false), Err(PurchaseError::ResultLost { work: id, price: 20 }) if id == work)
-        );
-        let marker = std::fs::read_to_string(&path).unwrap();
-        assert!(!marker.contains("private-input-sentinel"));
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&marker)
-                .unwrap()
-                .as_object()
-                .unwrap()
-                .keys()
-                .cloned()
-                .collect::<std::collections::BTreeSet<_>>(),
-            ["job", "price", "channel", "bond", "nonce", "work", "phase"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect()
-        );
-        let purchase = Purchase::open(&PaidAttemptPath::test(path.clone()), &job, true).unwrap();
-        assert!(purchase.buys_again());
-        assert!(!purchase.is_pending());
-    }
-    #[test]
-    fn reporting_finishes_the_purchase_and_reopening_preserves_unfinished_nonce() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("purchase.json");
-        let job = job();
-        let channel = Digest::from_bytes([1; 32]);
-        {
-            let mut purchase =
-                Purchase::open(&PaidAttemptPath::test(path.clone()), &job, false).unwrap();
-            purchase
-                .begin(
-                    channel,
-                    EdgeId::from_bytes([2; 32]),
-                    3,
-                    Digest::from_bytes([4; 32]),
-                )
-                .unwrap();
-        }
-        {
-            let mut purchase =
-                Purchase::open(&PaidAttemptPath::test(path.clone()), &job, true).unwrap();
-            assert_eq!(purchase.nonce(channel).unwrap(), Some(3));
-            assert!(!purchase.buys_again());
-            assert!(purchase.nonce(Digest::from_bytes([9; 32])).is_err());
-            purchase.paid(Digest::from_bytes([7; 32])).unwrap();
-            purchase.reported().unwrap();
-        }
-        let purchase = Purchase::open(&PaidAttemptPath::test(path.clone()), &job, false).unwrap();
-        assert!(!purchase.is_pending());
-        assert_eq!(purchase.nonce(channel).unwrap(), None);
     }
 }

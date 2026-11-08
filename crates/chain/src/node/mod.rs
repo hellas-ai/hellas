@@ -12,7 +12,7 @@ use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_consensus::CertifiableBlock as _;
 use commonware_cryptography::Digestible as _;
 use commonware_runtime::{Spawner as _, Supervisor as _, tokio as runtime};
-use std::{num::NonZeroU64, path::PathBuf, sync::Arc};
+use std::{num::NonZeroU64, sync::Arc};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
@@ -37,7 +37,6 @@ pub(crate) use transport::serve_validator_archive;
 #[derive(Clone, Debug)]
 pub struct Config {
     chain: crate::chain_dir::ChainDir,
-    indexed: bool,
     /// Validator transaction ingress URLs; replication uses ChainSync peers.
     pub validators: Vec<String>,
     /// Additional untrusted sources discovered or configured by the host.
@@ -54,6 +53,17 @@ pub(crate) enum Indexing {
     },
 }
 
+impl Indexing {
+    /// An indexed node keeps its execution store apart from a plain node's.
+    fn storage(&self, chain: &crate::chain_dir::ChainDir) -> hellas_private::StoreLocation {
+        match self {
+            Self::Off => chain.node(),
+            #[cfg(feature = "indexer-api")]
+            Self::On { .. } => chain.indexer(),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("invalid node configuration: {0}")]
@@ -68,11 +78,11 @@ pub enum Error {
 
 impl Config {
     pub fn genesis(&self) -> &hellas_genesis::Genesis {
-        self.chain.profile().genesis()
+        self.chain.genesis()
     }
 
     pub fn threshold_identity(&self) -> Vec<u8> {
-        hex::decode(&self.chain.profile().trust().epochs[0].threshold_identity)
+        hex::decode(&self.chain.trust().epochs[0].threshold_identity)
             .expect("validated trust identity")
     }
 
@@ -86,10 +96,9 @@ impl Config {
         archive_blocks: Option<NonZeroU64>,
     ) -> Result<Self, Error> {
         chain
-            .profile()
             .static_threshold_identity()
             .map_err(|error| Error::Config(error.to_string()))?;
-        Ok(Self::from_profile(chain, peers, archive_blocks, false))
+        Ok(Self::from_profile(chain, peers, archive_blocks))
     }
 
     #[cfg(feature = "indexer-api")]
@@ -98,30 +107,20 @@ impl Config {
         peers: Vec<iroh::EndpointAddr>,
         archive_blocks: Option<NonZeroU64>,
     ) -> Result<Self, Error> {
-        Ok(Self::from_profile(chain, peers, archive_blocks, true))
+        Ok(Self::from_profile(chain, peers, archive_blocks))
     }
 
     fn from_profile(
         chain: crate::chain_dir::ChainDir,
         peers: Vec<iroh::EndpointAddr>,
         archive_blocks: Option<NonZeroU64>,
-        indexed: bool,
     ) -> Self {
-        let validators = chain.profile().validators().to_vec();
+        let validators = chain.validators().to_vec();
         Self {
             chain,
-            indexed,
             validators,
             peers,
             archive_blocks,
-        }
-    }
-
-    pub fn storage_dir(&self) -> PathBuf {
-        if self.indexed {
-            self.chain.indexer().into_path_buf()
-        } else {
-            self.chain.node().into_path_buf()
         }
     }
 
@@ -432,7 +431,7 @@ impl Core {
         use commonware_glue::stateful::SyncPlan;
         use commonware_resolver::opaque;
         use commonware_utils::NZUsize;
-        let storage_dir = config.storage_dir();
+        let storage_dir = indexing.storage(&config.chain);
         let lock = crate::execution::pipeline::lock(&storage_dir).map_err(storage)?;
         let info = config.info()?;
         let chain_config = ArchiveConfig::default();
@@ -461,7 +460,6 @@ impl Core {
         let genesis = application.genesis_block();
         if config
             .chain
-            .profile()
             .known_genesis_payload_pin()
             .is_some_and(|pin| genesis.digest().0 != pin)
         {
@@ -503,16 +501,16 @@ impl Core {
                 };
                 let scope = crate::edge_index::query::cursor_scope(
                     &config.genesis().network_id,
-                    &config.chain.profile().trust().genesis_sha256,
+                    &config.chain.trust().genesis_sha256,
                     verifier.trust_sha256(),
                 );
                 let index = crate::edge_index::EdgeIndex::open(
-                    &storage_dir.join(format!(
+                    &storage_dir.child(format!(
                         "{partition}-edge-index-v{}-{scope}.redb",
                         crate::edge_index::SCHEMA_VERSION
                     )),
                     config.genesis().network_id.clone(),
-                    config.chain.profile().trust().genesis_sha256.clone(),
+                    config.chain.trust().genesis_sha256.clone(),
                     verifier.trust_sha256().into(),
                 )
                 .map_err(storage)?;
@@ -710,8 +708,8 @@ impl Core {
             config.validators.clone(),
             Arc::new(
                 crate::proof_verify::ProofVerifier::with_genesis(
-                    config.chain.profile().trust().clone(),
-                    config.chain.profile().genesis_json().as_bytes(),
+                    config.chain.trust().clone(),
+                    config.chain.genesis_json().as_bytes(),
                 )
                 .map_err(|error| Error::Config(error.to_string()))?,
             ),

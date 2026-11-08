@@ -11,7 +11,6 @@ fn a_single_authenticated_route_is_usable() {
         .chain
         .with_validators(vec![" WSS://EXAMPLE.COM:443 ".into()])
         .unwrap();
-    let config = config.validate().unwrap();
     assert_eq!(config.chain.validators(), ["wss://example.com/"]);
     assert_eq!(config.network().as_str(), "hellas-devnet-2");
     assert!(config.node_config(None).is_ok());
@@ -97,6 +96,6 @@ fn paid_client_accepts_scheduled_keys_while_static_node_rejects_them() {
     let location = StoreLocation::for_test(root.path());
     let config = WorkConfig::for_chain(profile, &location).unwrap();
     assert!(config.node_config(None).is_err());
-    let error = config.threshold_identity().unwrap_err();
+    let error = config.chain.static_threshold_identity().unwrap_err();
     assert!(error.to_string().contains("one open trusted epoch"));
 }

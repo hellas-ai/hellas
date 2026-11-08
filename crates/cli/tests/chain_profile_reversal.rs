@@ -135,8 +135,9 @@ fn state_generation_resets_only_the_selected_validator_and_keeps_shared_identity
         validators: vec!["ws://127.0.0.1:9080".into()],
     })
     .unwrap();
-    let a_state = ChainDir::open(&home, &a, Crash).unwrap().validator();
-    let b_state = ChainDir::open(&home, &b, Crash).unwrap().validator();
+    let location = hellas_private::StoreLocation::from_home(&home, Crash);
+    let a_state = ChainDir::open(&location, &a).unwrap().validator();
+    let b_state = ChainDir::open(&location, &b).unwrap().validator();
     assert_ne!(a_state, b_state);
 
     let reset = |config: Option<&Path>, generation: &str| {

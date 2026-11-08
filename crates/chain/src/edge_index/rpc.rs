@@ -109,7 +109,7 @@ mod tests {
     async fn http_and_rpc_share_query_capacity_and_structured_errors() {
         let dir = tempfile::tempdir().unwrap();
         let index = EdgeIndex::open(
-            &dir.path().join("index.redb"),
+            &hellas_private::StoreLocation::for_test(&dir.path().join("index.redb")),
             "hellas-devnet-1".into(),
             "ab".repeat(32),
             "cd".repeat(32),

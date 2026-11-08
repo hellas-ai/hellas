@@ -197,7 +197,7 @@ impl Context {
                 .context("requester requires --passkey, --faucet or --faucet-account")?
                 .clone(),
             home: home.clone(),
-            chain: hellas_chain::chain_dir::ChainDir::open(home, chain, home.durability())?,
+            chain: hellas_chain::chain_dir::ChainDir::open(home, chain)?,
         })
     }
 }
@@ -301,7 +301,7 @@ fn select_attempt(
         .as_path()
         .parent()
         .context("purchase directory is missing")?;
-    hellas_private::create_dir_all_durable(parent)?;
+    path.durability().create_dir_all(parent)?;
     let pointer = path.as_path().with_extension("latest");
     struct AttemptPointerLock(std::fs::File);
     impl Drop for AttemptPointerLock {
@@ -362,7 +362,8 @@ fn select_attempt(
         "purchase attempt identity already exists"
     );
     let attempt = ExecutionAttempt::open_paid(&attempt_path, job.input(), job.price())?;
-    hellas_private::write_atomically(&pointer, ".writing", id.as_bytes())?;
+    path.durability()
+        .write_atomically(&pointer, ".writing", id.as_bytes())?;
     Ok(attempt)
 }
 

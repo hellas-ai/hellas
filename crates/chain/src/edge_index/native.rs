@@ -8,10 +8,7 @@ use crate::domain::{Object, Transaction};
 use base64ct::{Base64UrlUnpadded, Encoding};
 use commonware_codec::Encode as _;
 use hellas_kernel::{TermsProfile, Tx};
-use std::{
-    path::Path,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, thiserror::Error)]
 #[error("{code}: {message}")]
@@ -72,7 +69,7 @@ pub struct EdgeIndex {
 }
 impl EdgeIndex {
     pub fn open(
-        path: &Path,
+        path: &hellas_private::StoreLocation,
         network_id: String,
         genesis_sha256: String,
         trust_sha256: String,
@@ -81,7 +78,7 @@ impl EdgeIndex {
         validate_id(&trust_sha256).map_err(EdgeIndexError::bad)?;
         Ok(Self {
             store: IndexStore::open(
-                path,
+                path.as_path(),
                 Identity {
                     network_id,
                     genesis_sha256,

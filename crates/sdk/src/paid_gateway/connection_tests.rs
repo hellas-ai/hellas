@@ -182,14 +182,13 @@ fn an_unresponsive_paid_quote_yields_to_the_next_provider_within_the_connection_
                 hex::encode(&devnet.consensus_info().threshold_identity);
             let config = crate::work_config::WorkConfig {
                 chain: hellas_chain::chain_dir::ChainDir::open(
-                    fixture.root.path(),
+                    &hellas_private::StoreLocation::for_test(fixture.root.path()),
                     &ChainProfile::custom(CustomChainFile {
                         trust,
                         validators: devnet.light_client_urls(),
                         genesis_json,
                     })
                     .unwrap(),
-                    Default::default(),
                 )
                 .unwrap(),
                 poll: Duration::from_millis(20),

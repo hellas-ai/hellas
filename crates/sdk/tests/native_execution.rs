@@ -1364,13 +1364,6 @@ async fn paid_finish(case: PaidScenario) {
     .unwrap();
     let job_folder = root.path().join("job");
     job.save(&job_folder).await.unwrap();
-    let purchase_path = hellas_sdk::transact::PaidAttemptPath::new(
-        &options.config.chain,
-        options.provider,
-        owner.principal(),
-        job.digest(),
-    );
-    let mut purchase = hellas_sdk::transact::Purchase::open(&purchase_path, &job, false).unwrap();
     let endpoint = bind_paid_endpoint(client_transport).await.unwrap();
     let mut session = PaidWorkSession::open(
         options.clone(),
@@ -1390,7 +1383,7 @@ async fn paid_finish(case: PaidScenario) {
         !session.needs_recovery(),
         "initial recovery has completed before this request"
     );
-    // A signed failure retires unpaid, including the caller's purchase marker.
+    // A signed failure retires unpaid.
     upstream
         .fail
         .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1398,10 +1391,7 @@ async fn paid_finish(case: PaidScenario) {
         &mut session,
         &job,
         &client_producer,
-        hellas_sdk::transact::TransactionOptions {
-            purchase: Some(&mut purchase),
-            ..Default::default()
-        },
+        hellas_sdk::transact::TransactionOptions::default(),
     )
     .await
     .err()
@@ -1423,14 +1413,9 @@ async fn paid_finish(case: PaidScenario) {
         })
         .await
         .unwrap();
-    assert!(!purchase.is_pending());
-    assert!(!purchase_path.as_path().exists());
     assert!(!session.needs_recovery());
     session.shutdown().await;
     drop(session);
-    drop(purchase);
-    let mut purchase = hellas_sdk::transact::Purchase::open(&purchase_path, &job, false).unwrap();
-    purchase.reconcile(&options).await.unwrap();
     let mut session = PaidWorkSession::open(
         options.clone(),
         endpoint.clone(),
@@ -1453,10 +1438,7 @@ async fn paid_finish(case: PaidScenario) {
             &mut session,
             &job,
             &client_producer,
-            hellas_sdk::transact::TransactionOptions {
-                purchase: Some(&mut purchase),
-                ..Default::default()
-            },
+            hellas_sdk::transact::TransactionOptions::default(),
         );
         tokio::pin!(first);
         tokio::select! {
@@ -1481,9 +1463,6 @@ async fn paid_finish(case: PaidScenario) {
         .unwrap();
     session.shutdown().await;
     drop(session);
-    drop(purchase);
-    let mut purchase = hellas_sdk::transact::Purchase::open(&purchase_path, &job, false).unwrap();
-    purchase.reconcile(&options).await.unwrap();
     let mut session = PaidWorkSession::open(
         options.clone(),
         endpoint.clone(),
@@ -1513,10 +1492,7 @@ async fn paid_finish(case: PaidScenario) {
         &mut session,
         &loaded,
         &client_producer,
-        hellas_sdk::transact::TransactionOptions {
-            purchase: Some(&mut purchase),
-            ..Default::default()
-        },
+        hellas_sdk::transact::TransactionOptions::default(),
     )
     .await
     .unwrap();
@@ -1553,13 +1529,6 @@ async fn paid_finish(case: PaidScenario) {
         "the settled close paid the provider the price",
     );
     assert_eq!(upstream.calls("openai", "responses", BODY), 1);
-    let marker = std::fs::read(purchase_path.as_path()).unwrap();
-    assert!(
-        !marker.windows(BODY.len()).any(|bytes| bytes == BODY),
-        "purchase state contains no request bytes"
-    );
-    purchase.reported().unwrap();
-    drop(purchase);
 
     assert_eq!(
         approvals.0.lock().unwrap().len(),

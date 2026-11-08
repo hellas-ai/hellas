@@ -6,11 +6,11 @@ use hellas_sdk::work_config::WorkConfig;
 type CliResult<T> = super::super::CliResult<T>;
 
 pub(super) async fn config(args: &ClientArgs, context: &Context) -> CliResult<WorkConfig> {
-    let mut config = WorkConfig::from_chain_dir(context.chain.clone())?;
+    let mut chain = context.chain.clone();
     if !args.validators.is_empty() {
-        config.chain = config.chain.with_validators(args.validators.clone())?;
+        chain = chain.with_validators(args.validators.clone())?;
     }
-    Ok(config.validate()?)
+    Ok(WorkConfig::from_chain_dir(chain)?)
 }
 
 /// One client upper for all provider journals under this state root. Restore

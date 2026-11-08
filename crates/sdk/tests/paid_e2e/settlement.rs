@@ -404,7 +404,7 @@ fn empty_channel_settlement_recovers_exact_return_and_rejects_wrong_identity() {
             )
             .unwrap();
             case.options.config.chain =
-                hellas_chain::chain_dir::ChainDir::open(a_chain.home(), &b_profile, Crash).unwrap();
+                hellas_chain::chain_dir::ChainDir::open(a_chain.home(), &b_profile).unwrap();
             assert_ne!(case.options.journal_root(), a_journals);
             let mut cross_chain_attempt =
                 hellas_sdk::execution::ExecutionAttempt::open_existing_paid(
@@ -688,9 +688,8 @@ fn empty_channel_settlement_recovers_exact_return_and_rejects_wrong_identity() {
             );
             let mut missing = case.options.clone();
             missing.config.chain = hellas_chain::chain_dir::ChainDir::open(
-                &case.root.path().join("missing-journals"),
-                missing.config.chain.profile(),
-                Crash,
+                &StoreLocation::from_home(&case.root.path().join("missing-journals"), Crash),
+                &missing.config.chain,
             )
             .unwrap();
             assert!(
@@ -718,9 +717,11 @@ fn empty_channel_settlement_recovers_exact_return_and_rejects_wrong_identity() {
                 },
             )
             .unwrap();
-            wrong_network.config.chain =
-                hellas_chain::chain_dir::ChainDir::open(case.root.path(), &wrong_profile, Crash)
-                    .unwrap();
+            wrong_network.config.chain = hellas_chain::chain_dir::ChainDir::open(
+                &StoreLocation::from_home(case.root.path(), Crash),
+                &wrong_profile,
+            )
+            .unwrap();
             assert!(
                 hellas_sdk::paid_client::finalized_channel_settlement(
                     &wrong_network,
@@ -834,9 +835,8 @@ fn cli_settles_paid_channel_without_provider_or_object_proofs() {
             let root = case.root.path();
             let state = root.join("cli-state");
             let cli_chain = hellas_chain::chain_dir::ChainDir::open(
-                &state,
-                case.options.config.chain.profile(),
-                Crash,
+                &StoreLocation::from_home(&state, Crash),
+                &case.options.config.chain,
             )
             .unwrap();
             let journals = cli_chain.client_journals(&case.options.provider.to_string());

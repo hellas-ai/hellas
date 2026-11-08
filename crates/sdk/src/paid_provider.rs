@@ -113,7 +113,7 @@ impl std::fmt::Debug for AdmissionNode {
 
 impl WorkRunnerConfig {
     pub fn network(&self) -> NetworkId {
-        NetworkId::new(self.chain.network_id()).expect("validated chain profile")
+        self.chain.network()
     }
     pub fn journal_root(&self) -> StoreLocation {
         self.chain.provider_journals()
