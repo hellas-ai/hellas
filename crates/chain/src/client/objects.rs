@@ -6,23 +6,26 @@ use std::collections::{BTreeMap, BTreeSet};
 
 type OwnerCursor = Option<(SettlementKey, Option<ObjectId>)>;
 
-/// The one object request both routes share: `keys`, plus one holdings page
-/// of `owner` after its cursor.
-fn request(
-    keys: &BTreeSet<ObjectId>,
-    owner: OwnerCursor,
-) -> Result<GetObjectProofsRequest, QueryError> {
+/// The caller's keys as one set, refusing more than the limit as given,
+/// before duplicates collapse.
+fn key_set(keys: Vec<ObjectId>) -> Result<BTreeSet<ObjectId>, QueryError> {
     if keys.len() > crate::proof_verify::MAX_CURRENT_KEYS {
         return Err(QueryError::InvalidTransaction(
             "at most 32 object keys are allowed".into(),
         ));
     }
-    Ok(GetObjectProofsRequest {
+    Ok(keys.into_iter().collect())
+}
+
+/// The one object request both routes share: `keys`, plus one holdings page
+/// of `owner` after its cursor.
+fn request(keys: &BTreeSet<ObjectId>, owner: OwnerCursor) -> GetObjectProofsRequest {
+    GetObjectProofsRequest {
         object_ids: keys.iter().map(|key| key.to_vec()).collect(),
         payload: None,
         owner: owner.map(|(owner, _)| owner.to_bytes().to_vec()),
         owner_after_key: owner.and_then(|(_, after)| after).map(|key| key.to_vec()),
-    })
+    }
 }
 
 pub(super) async fn read(
@@ -30,10 +33,10 @@ pub(super) async fn read(
     keys: Vec<ObjectId>,
     owner: OwnerCursor,
 ) -> Result<Option<Verified<ObjectSnapshot>>, QueryError> {
-    let keys: BTreeSet<_> = keys.into_iter().collect();
+    let keys = key_set(keys)?;
     let response = client
         .rpc_client()
-        .get_object_proofs(request(&keys, owner)?)
+        .get_object_proofs(request(&keys, owner))
         .await
         .map_err(QueryError::from)?;
     if response.block.is_none() {
@@ -80,7 +83,7 @@ impl TrustedReader {
         &self,
         keys: Vec<ObjectId>,
     ) -> Result<Option<ObjectSnapshot>, QueryError> {
-        self.read(keys.into_iter().collect(), None).await
+        self.read(key_set(keys)?, None).await
     }
 
     pub async fn get_holdings(
@@ -98,7 +101,7 @@ impl TrustedReader {
     ) -> Result<Option<ObjectSnapshot>, QueryError> {
         let response = self
             .client
-            .get_objects(request(&keys, owner)?)
+            .get_objects(request(&keys, owner))
             .await
             .map_err(QueryError::from)?;
         let Some(snapshot) = response.snapshot else {
