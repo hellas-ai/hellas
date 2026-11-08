@@ -177,16 +177,15 @@ impl NodeCoordinator {
 
 impl State {
     pub(crate) fn machine_capacity(&self) -> Result<Option<MachineCapacity>, NodeStoreError> {
-        self.ledger()
-            .node(BudgetNode::Machine)
-            .map(|node| {
-                Ok(MachineCapacity {
-                    revision: self.machine_revision,
-                    limits: node.limits().to_vec(),
-                    max_in_flight: NonZeroU16::new(node.concurrent())
-                        .ok_or(NodeStoreError::Malformed)?,
-                })
-            })
-            .transpose()
+        let Some(node) = self.ledger().node(BudgetNode::Machine.key()) else {
+            return Ok(None);
+        };
+        let spec = node.spec();
+        Ok(Some(MachineCapacity {
+            revision: Revision(spec.revision),
+            limits: crate::work_store::grant::ledger::limits(spec).to_vec(),
+            max_in_flight: NonZeroU16::new(crate::work_store::grant::ledger::concurrent(spec))
+                .ok_or(NodeStoreError::Malformed)?,
+        }))
     }
 }

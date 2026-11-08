@@ -73,21 +73,10 @@ pub(super) async fn provider_with_limit(
         store,
         &secret,
         principal(seed).1,
-        (
-            4,
-            vec![Limit {
-                meter: Meter::Requests,
-                window: Window::Total,
-                amount: 4,
-            }],
-        ),
+        (4, vec![Limit::new(Meter::Requests, Window::Total, 4)]),
         grant.clone(),
         (
-            vec![Limit {
-                meter: Meter::Requests,
-                window: Window::Total,
-                amount: request_limit,
-            }],
+            vec![Limit::new(Meter::Requests, Window::Total, request_limit)],
             2,
         ),
     )

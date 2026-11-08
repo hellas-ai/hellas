@@ -93,14 +93,15 @@ async fn checkpoint_bound_covers_every_commit_and_replay_matches_live_state() {
     let (mut store, caller) = setup(directory.path()).await;
     // Lift the fixture's quotas; concurrency stays bounded.
     let grant = store.state().grant(GrantId([1; 16])).unwrap();
-    let mut budget = store.state().ledger().definition(grant.budget).unwrap();
+    let mut budget = ledger::definition(store.state().ledger(), grant.budget).unwrap();
     budget.revision = budget.revision.next().unwrap();
     budget.limits.clear();
     budget.max_in_flight = std::num::NonZeroU16::new(8).unwrap();
-    let machine = Change::Machine {
-        limits: vec![],
-        concurrent: 8,
-    };
+    let mut machine = ledger::definition(store.state().ledger(), BudgetNode::Machine).unwrap();
+    machine.revision = machine.revision.next().unwrap();
+    machine.limits.clear();
+    machine.max_in_flight = std::num::NonZeroU16::new(8).unwrap();
+    let machine = Change::Budget(machine);
     for change in [machine, Change::Budget(budget)] {
         store.commit(UnixMillis(1000), change, true).await.unwrap();
     }
@@ -126,7 +127,7 @@ async fn checkpoint_bound_covers_every_commit_and_replay_matches_live_state() {
                 let signature = principal(1).1.sign_digest(work).unwrap();
                 match accept(&mut store, &caller, (a, signature, &input), now).await {
                     Ok(_) => open.push((a.channel_id, work, false)),
-                    Err(NodeStoreError::Ledger(ledger::LedgerError::Concurrent(_))) => {}
+                    Err(NodeStoreError::Refused(_)) => {}
                     Err(error) => panic!("{error:?}"),
                 }
             }
@@ -166,7 +167,7 @@ async fn checkpoint_bound_covers_every_commit_and_replay_matches_live_state() {
             _ => {}
         }
         let cost = encode(&store.state.snapshot().unwrap()).unwrap().len()
-            + store.state.ledger.clock_headroom();
+            + ledger::clock_headroom(&store.state.ledger);
         let bound = store.checkpoint_bound.get();
         assert!(cost <= bound, "{cost} > {bound}");
         if step == 7 || next(16) == 0 {
@@ -181,4 +182,95 @@ async fn checkpoint_bound_covers_every_commit_and_replay_matches_live_state() {
             assert_eq!(store.state, live);
         }
     }
+}
+
+/// Kill the store while an acceptance append is in flight and another job is
+/// running. Reopening charges the running job once at its reservation, keeps
+/// its occupancy without charging it again, and the interrupted acceptance
+/// either committed whole or left nothing.
+#[tokio::test]
+async fn a_store_killed_mid_append_recovers_every_hold_exactly_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut store, caller) = setup(directory.path()).await;
+    let (a, signature, input) = proposal(&store, 1);
+    let running = grant_work_id(store.state().network(), &a);
+    accept(&mut store, &caller, (a, signature, &input), 1000)
+        .await
+        .unwrap();
+    dispatch(&mut store, &caller, (a.channel_id, running), 1000)
+        .await
+        .unwrap();
+    let reserved = store
+        .state()
+        .admission(a.channel_id, running)
+        .unwrap()
+        .reserved();
+    let before = store.state().clone();
+    let (b, signature, input) = proposal(&store, 2);
+    let interrupted = grant_work_id(store.state().network(), &b);
+    let (started, release) = store.pause_next_statement().await;
+    {
+        let mut accepting =
+            std::pin::pin!(accept(&mut store, &caller, (b, signature, &input), 1000));
+        tokio::select! {
+            entered = started => entered.unwrap(),
+            result = &mut accepting => panic!("append completed before the kill: {result:?}"),
+        }
+    }
+    assert_eq!(
+        store.state(),
+        &before,
+        "an unfinished append publishes nothing"
+    );
+    drop(release);
+    drop(store);
+
+    let location = StoreLocation::for_test(directory.path());
+    let network = hellas_channel::test_support::network();
+    let store = NodeStore::open(&location, network, None, UnixMillis(1001))
+        .await
+        .unwrap();
+    let book = store.state().ledger();
+    let machine = hellas_admission::Key::Machine;
+    assert_eq!(book.holds().count(), 0);
+    assert_eq!(
+        book.node(machine)
+            .unwrap()
+            .counter(Meter::Requests, Window::Total)
+            .used,
+        reserved.get(Meter::Requests),
+        "the running job is charged once at its reservation"
+    );
+    assert_eq!(book.occupied(machine, Meter::Requests, 1001), 1);
+    let channel = store.state().channel(a.channel_id).unwrap().job_book();
+    assert_eq!(
+        channel.terminal_by_id(running).unwrap().outcome.outcome,
+        GrantOutcome::Indeterminate
+    );
+    assert!(channel.job_by_id(interrupted).is_none());
+    assert!(
+        channel
+            .terminal_by_id(interrupted)
+            .is_none_or(|t| t.outcome.outcome == GrantOutcome::Released)
+    );
+    let mut store = store;
+    store.rotate().await.unwrap();
+    let recovered = store.state().clone();
+    drop(store);
+    let store = NodeStore::open(&location, network, None, UnixMillis(1001))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.state(),
+        &recovered,
+        "occupancy is derived again, never charged twice"
+    );
+    let deadline = a.terminal_deadline_ms.0;
+    assert_eq!(
+        store
+            .state()
+            .ledger()
+            .occupied(machine, Meter::Requests, deadline),
+        0
+    );
 }

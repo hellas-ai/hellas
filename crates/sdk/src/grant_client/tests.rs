@@ -68,23 +68,9 @@ async fn setup(
         store,
         &secret,
         principal(2).1,
-        (
-            4,
-            vec![Limit {
-                meter: Meter::Requests,
-                window: Window::Total,
-                amount: 4,
-            }],
-        ),
+        (4, vec![Limit::new(Meter::Requests, Window::Total, 4)]),
         grant,
-        (
-            vec![Limit {
-                meter: Meter::Requests,
-                window: Window::Total,
-                amount: 3,
-            }],
-            2,
-        ),
+        (vec![Limit::new(Meter::Requests, Window::Total, 3)], 2),
     )
     .await;
     (store, secret)

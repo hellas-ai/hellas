@@ -56,7 +56,7 @@ fn assert_spent(node: &TestNode, output: u64) {
         pool: common_node::POOL,
         subject: FRIEND.principal(),
     };
-    for ancestor in node.store.state().ledger().path(leaf).unwrap() {
+    for ancestor in ledger::path(node.store.state().ledger(), leaf).unwrap() {
         assert_eq!(
             node.used(ancestor, Meter::OutputTokens),
             output,
@@ -159,18 +159,9 @@ async fn only_explicit_repair_clears_persisted_quarantine() {
     )
     .await;
     let mut terms = node.store.state().grant(ids::ALLOWANCE).unwrap().clone();
-    let mut budget = node
-        .store
-        .state()
-        .ledger()
-        .definition(terms.budget)
-        .unwrap();
+    let mut budget = ledger::definition(node.store.state().ledger(), terms.budget).unwrap();
     budget.revision.0 += 1;
-    budget.limits = vec![Limit {
-        meter: Meter::Requests,
-        window: Window::Total,
-        amount: 100,
-    }];
+    budget.limits = vec![Limit::new(Meter::Requests, Window::Total, 100)];
     node.store
         .configure_budget(budget, node.clock.now())
         .await
@@ -264,7 +255,7 @@ async fn accepted_policy_history_survives_current_policy_changes() {
         node.store
             .state()
             .ledger()
-            .active_count(BudgetNode::Machine),
+            .reserved(BudgetNode::Machine.key(), Meter::Requests),
         1
     );
     assert_eq!(

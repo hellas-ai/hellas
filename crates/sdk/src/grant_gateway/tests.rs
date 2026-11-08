@@ -31,11 +31,11 @@ fn inspect_chat(request: &hellas_rpc::fetch::FetchInput) {
 #[tokio::test]
 async fn explicit_pool_shares_one_channel_and_selects_least_pending_resource() {
     let template = chat_resource("https://private.fixture", 6);
-    let mut allowance = Allowance::responses(ids::ALLOWANCE, FRIEND).with_limits(vec![Limit {
-        meter: Meter::OutputTokens,
-        window: Window::Total,
-        amount: 20,
-    }]);
+    let mut allowance = Allowance::responses(ids::ALLOWANCE, FRIEND).with_limits(vec![Limit::new(
+        Meter::OutputTokens,
+        Window::Total,
+        20,
+    )]);
     use_https(&mut allowance.definition.policies[0], template.clone());
     let first = allowance.definition.policies[0].resource;
     let mut second_policy = allowance.definition.policies[0].clone();
@@ -265,11 +265,12 @@ impl FixtureBuilder {
         self
     }
     async fn build(self) -> Fixture {
-        let mut allowance = Allowance::responses(ids::ALLOWANCE, FRIEND).with_limits(vec![Limit {
-            meter: Meter::OutputTokens,
-            window: Window::Total,
-            amount: self.budget,
-        }]);
+        let mut allowance =
+            Allowance::responses(ids::ALLOWANCE, FRIEND).with_limits(vec![Limit::new(
+                Meter::OutputTokens,
+                Window::Total,
+                self.budget,
+            )]);
         let template = chat_resource("https://private.fixture", 6);
         let resource = &mut allowance.definition.policies[0];
         resource.name = "chat".into();

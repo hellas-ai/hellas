@@ -30,11 +30,7 @@ async fn store(path: &std::path::Path) -> NodeStore {
 async fn the_configuration_builds_the_tree_once_and_replays() {
     let directory = tempfile::tempdir().unwrap();
     let mut store = store(directory.path()).await;
-    let requests = vec![Limit {
-        meter: Meter::Requests,
-        window: Window::Total,
-        amount: 9,
-    }];
+    let requests = vec![Limit::new(Meter::Requests, Window::Total, 9)];
     let configured = configuration(budget(3, requests.clone()), budget(2, vec![]));
     store
         .reconcile(&configured, UnixMillis(1001))
@@ -52,14 +48,14 @@ async fn the_configuration_builds_the_tree_once_and_replays() {
         3
     );
     assert_eq!(state.machine_capacity().unwrap().unwrap().limits, requests);
-    let definition = state.ledger.definition(account).unwrap();
+    let definition = ledger::definition(&state.ledger, account).unwrap();
     assert_eq!(
         (
             definition.parent,
             definition.revision,
             definition.max_in_flight.get()
         ),
-        (BudgetNode::Machine, Revision(1), 2)
+        (Some(BudgetNode::Machine), Revision(1), 2)
     );
     assert_eq!(state.resource(policy().resource), Some(&policy()));
 
@@ -73,7 +69,7 @@ async fn the_configuration_builds_the_tree_once_and_replays() {
     // A changed account bumps only that node; the machine keeps its revision.
     let changed = configuration(budget(3, requests), budget(5, vec![]));
     store.reconcile(&changed, UnixMillis(1003)).await.unwrap();
-    let definition = store.state().ledger.definition(account).unwrap();
+    let definition = ledger::definition(&store.state().ledger, account).unwrap();
     assert_eq!(
         (definition.revision, definition.max_in_flight.get()),
         (Revision(2), 5)
@@ -87,7 +83,7 @@ async fn the_configuration_builds_the_tree_once_and_replays() {
     let owned = |state: &super::super::state::State| {
         (
             state.machine_capacity().unwrap(),
-            state.ledger.definition(account),
+            ledger::definition(&state.ledger, account),
             state.resource(policy().resource).cloned(),
         )
     };

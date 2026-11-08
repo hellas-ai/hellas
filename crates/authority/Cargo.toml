@@ -24,6 +24,7 @@ bytes = { workspace = true, optional = true }
 flate2 = "1"
 futures.workspace = true
 getrandom = "0.4"
+hellas-admission.workspace = true
 hellas-attestation = { workspace = true, features = ["apple-app-attest"] }
 hellas-auth.workspace = true
 hellas-channel.workspace = true
@@ -35,6 +36,7 @@ hellas-webauthn.workspace = true
 hellas-wire.workspace = true
 hellas-xet.workspace = true
 hex.workspace = true
+ipld-core = { version = "0.4", features = ["serde"] }
 k256.workspace = true
 prost = { version = "0.14", default-features = false, features = ["derive"] }
 serde.workspace = true

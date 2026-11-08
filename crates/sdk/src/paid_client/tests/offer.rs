@@ -104,11 +104,7 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
             .budgets(
                 crate::test_node::POOL,
                 principal(1).0,
-                vec![Limit {
-                    meter: Meter::Requests,
-                    window: Window::Total,
-                    amount: 3,
-                }],
+                vec![Limit::new(Meter::Requests, Window::Total, 3)],
                 2,
             )
             .await;

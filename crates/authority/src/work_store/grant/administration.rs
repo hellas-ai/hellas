@@ -1,5 +1,8 @@
 use super::{NodeStore, NodeStoreError, state::Change};
-use crate::model::grant::{budget::BudgetDef, records::GrantDef};
+use crate::model::grant::{
+    budget::{BudgetDef, BudgetNode},
+    records::GrantDef,
+};
 use hellas_auth::authority::{AuthenticatedCaller, CallerRecord, GrantId as Authorization};
 use hellas_auth::authority::{GrantId, ResourceId, Revision, UnixMillis};
 use serde::{Deserialize, Serialize};
@@ -96,22 +99,23 @@ impl NodeStore {
             if usize::from(concurrent) > super::store::MAX_OPEN_JOBS {
                 return Err(hellas_auth::authority::AuthorityError::Invalid.into());
             }
-            let current = self
-                .state()
-                .ledger
-                .node(crate::model::grant::budget::BudgetNode::Machine);
-            if current.is_none_or(|node| {
-                node.limits() != machine.limits.as_slice() || node.concurrent() != concurrent
+            let current = super::ledger::definition(&self.state().ledger, BudgetNode::Machine);
+            if current.as_ref().is_none_or(|old| {
+                old.limits != machine.limits || old.max_in_flight != machine.max_in_flight
             }) {
-                let change = Change::Machine {
+                let revision = current.map_or(Revision(0), |old| old.revision);
+                let change = Change::Budget(BudgetDef {
+                    node: BudgetNode::Machine,
+                    parent: None,
+                    revision: revision.next().ok_or(NodeStoreError::Malformed)?,
                     limits: machine.limits.clone(),
-                    concurrent,
-                };
+                    max_in_flight: machine.max_in_flight,
+                });
                 self.commit(now, change, true).await?;
             }
         }
-        for definition in
-            configuration.account_changes(|node| self.state().ledger.definition(node))?
+        for definition in configuration
+            .account_changes(|node| super::ledger::definition(&self.state().ledger, node))?
         {
             self.commit(now, Change::Budget(definition), true).await?;
         }

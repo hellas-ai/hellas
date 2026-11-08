@@ -285,7 +285,7 @@ impl NodeStore {
         if id != marker.journal_id() {
             return Err(NodeStoreError::Malformed);
         }
-        let state = restore_replay(replay, network, marker.authority)?;
+        let (state, _) = restore_replay(replay, network, marker.authority)?;
         Ok(state.authority.inspect_offline(query)?)
     }
 
@@ -297,14 +297,14 @@ impl NodeStore {
         let (identity_lock, marker) = read_marker(directory, network)?;
         let (mut journal, replay) =
             Journal::open_existing(directory, "grants", marker.journal_id()).await?;
-        let state = match restore_replay(replay, network, marker.authority) {
-            Ok(state) => state,
+        let (state, migrated) = match restore_replay(replay, network, marker.authority) {
+            Ok(replayed) => replayed,
             Err(error) => {
                 journal.close().await;
                 return Err(error);
             }
         };
-        Ok(Self {
+        let mut store = Self {
             clock,
             _identity_lock: Some(identity_lock),
             journal,
@@ -312,7 +312,12 @@ impl NodeStore {
             checkpoint_bound: CheckpointBound::UNMEASURED,
             executions: Default::default(),
             deliveries: Default::default(),
-        })
+        };
+        // One-way: the v3 bytes are rewritten as a v4 checkpoint before any write.
+        if migrated {
+            store.rotate().await?;
+        }
+        Ok(store)
     }
 }
 
@@ -433,17 +438,29 @@ fn read_marker(
     Ok((identity_lock, marker))
 }
 
+/// Returns the state and whether any of it was read as v3.
 fn restore_replay(
     replay: hellas_channel::work_store::journal::Replay,
     network: NetworkId,
     authority_id: AuthorityId,
-) -> Result<State, NodeStoreError> {
+) -> Result<(State, bool), NodeStoreError> {
+    let mut migrated = false;
     let mut records = replay.records.into_iter();
     let mut state = match replay.checkpoint {
-        Some(bytes) => State::restore(decode::<Snapshot>(&bytes)?)?,
+        Some(bytes) => State::restore(match decode::<Snapshot>(&bytes) {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                migrated = true;
+                super::v3::snapshot(&bytes)?
+            }
+        })?,
         None => {
             let bytes = records.next().ok_or(NodeStoreError::Uninitialized)?;
             let mut frame: Frame = decode(&bytes)?;
+            if frame.namespace == super::v3::JOURNAL {
+                migrated = true;
+                frame.namespace = JOURNAL_NAMESPACE.into();
+            }
             if frame.namespace != JOURNAL_NAMESPACE || frame.changes.len() != 1 {
                 return Err(NodeStoreError::Malformed);
             }
@@ -470,9 +487,16 @@ fn restore_replay(
         return Err(NodeStoreError::Malformed);
     }
     for bytes in records {
-        state.apply(&decode::<Frame>(&bytes)?)?;
+        let frame = match decode::<Frame>(&bytes) {
+            Ok(frame) if frame.namespace == JOURNAL_NAMESPACE => frame,
+            _ => {
+                migrated = true;
+                super::v3::frame(&bytes, &state)?
+            }
+        };
+        state.apply(&frame, true)?;
     }
-    Ok(state)
+    Ok((state, migrated))
 }
 
 impl Marker {

@@ -27,6 +27,7 @@ use hellas_rpc::protocol::invocation::PreparedInvocation;
 use hellas_rpc::protocol::value::{decode_canonical_bounded, encode_bounded};
 use std::path::Path;
 mod bootstrap;
+mod v3;
 pub use bootstrap::{OwnerApproval, PreparedBootstrap};
 #[cfg(test)]
 mod tests;
@@ -196,7 +197,7 @@ impl NodeStore {
     ) -> Result<Vec<NodeAllowance>, NodeStoreError> {
         let def = self.state.grant(grant).ok_or(GrantError::Unauthorized)?;
         let visible = if include_ancestors {
-            self.state.ledger().path(def.budget)?
+            ledger::path(self.state.ledger(), def.budget)?
         } else {
             vec![def.budget]
         };
@@ -211,38 +212,41 @@ impl NodeStore {
         now: UnixMillis,
     ) -> Result<NodeAllowance, NodeStoreError> {
         let now = now.max(self.state.now());
-        let ledger = self.state.ledger();
-        let node = ledger.node(id).ok_or(ledger::LedgerError::UnknownNode)?;
-        let ancestors = ledger.path(id)?;
-        let mut concurrent_remaining = node.concurrent();
+        let book = self.state.ledger();
+        let node = book
+            .node(id.key())
+            .ok_or(ledger::LedgerError::UnknownNode)?;
+        let ancestors = ledger::path(book, id)?;
+        // Charged recovery occupancy holds capacity until its terminal deadline.
+        let active = |id: BudgetNode| {
+            book.reserved(id.key(), Meter::Requests)
+                + book.occupied(id.key(), Meter::Requests, now.0)
+        };
+        let mut concurrent_remaining = ledger::concurrent(node.spec());
         for ancestor in &ancestors {
-            let capacity = ledger
-                .node(*ancestor)
+            let capacity = book
+                .node(ancestor.key())
                 .ok_or(ledger::LedgerError::UnknownNode)?
-                .concurrent();
-            let active =
-                ledger.active_count(*ancestor) + self.state.recovery_holds(*ancestor, now)?;
-            concurrent_remaining =
-                concurrent_remaining.min(usize::from(capacity).saturating_sub(active) as u16);
+                .spec();
+            concurrent_remaining = concurrent_remaining.min(
+                u64::from(ledger::concurrent(capacity)).saturating_sub(active(*ancestor)) as u16,
+            );
         }
-        let mut counters = Vec::with_capacity(Meter::ALL.len() * Window::ALL.len());
+        let mut counters = Vec::with_capacity(Meter::ALL.len() * Window::CALENDAR.len());
         for meter in Meter::ALL {
-            for window in Window::ALL {
-                let counter = node.counter_at(meter, window, now);
-                let limit = node
-                    .limits()
+            for window in Window::CALENDAR {
+                let counter = node.counter_at(meter, window, now.0);
+                let limit = ledger::limits(node.spec())
                     .iter()
                     .find(|l| l.meter == meter && l.window == window)
                     .map(|l| l.amount);
                 let remaining = ancestors
                     .iter()
                     .filter_map(|id| {
-                        let limit = ledger
-                            .node(*id)?
-                            .limits()
+                        let limit = *ledger::limits(book.node(id.key())?.spec())
                             .iter()
                             .find(|l| l.meter == meter && l.window == window)?;
-                        ledger.remaining_at(*id, *limit, now)
+                        ledger::remaining(book, *id, limit, now)
                     })
                     .min();
                 counters.push(CounterAllowance {
@@ -250,7 +254,7 @@ impl NodeStore {
                     window,
                     window_id: counter.window_id,
                     used: counter.used,
-                    reserved: ledger.reserved(id, meter),
+                    reserved: book.reserved(id.key(), meter),
                     limit,
                     remaining,
                 });
@@ -258,8 +262,8 @@ impl NodeStore {
         }
         Ok(NodeAllowance {
             node: id,
-            concurrent_limit: node.concurrent(),
-            active: (ledger.active_count(id) + self.state.recovery_holds(id, now)?) as u16,
+            concurrent_limit: ledger::concurrent(node.spec()),
+            active: active(id) as u16,
             concurrent_remaining,
             counters,
         })
@@ -465,7 +469,7 @@ impl NodeStore {
         let checkpoint = encode(&self.state.snapshot()?)?;
         self.journal.rotate(&checkpoint).await?;
         self.checkpoint_bound
-            .measured(checkpoint.len() + self.state.ledger.clock_headroom());
+            .measured(checkpoint.len() + ledger::clock_headroom(&self.state.ledger));
         cancellation.0.clear();
         Ok(())
     }
@@ -490,7 +494,7 @@ impl NodeStore {
             changes,
         };
         let mut candidate = self.state.clone();
-        if candidate.apply(&frame)? == Applied::Redundant {
+        if candidate.apply(&frame, false)? == Applied::Redundant {
             return Ok(());
         }
         let record = encode(&frame);
@@ -503,11 +507,15 @@ impl NodeStore {
         // finish. Serializing the whole state to prove it would make each
         // commit O(state), so that runs only when the bound cannot.
         let len = record.as_ref().map_or(usize::MAX, Vec::len);
-        let bound = self.checkpoint_bound.admit(
-            growth(&frame, len),
-            open.saturating_mul(TERMINAL_HEADROOM),
-            || Ok(encode(&candidate.snapshot()?)?.len() + candidate.ledger.clock_headroom()),
-        )?;
+        let bound =
+            self.checkpoint_bound.admit(
+                growth(&frame, len),
+                open.saturating_mul(TERMINAL_HEADROOM),
+                || {
+                    Ok(encode(&candidate.snapshot()?)?.len()
+                        + ledger::clock_headroom(&candidate.ledger))
+                },
+            )?;
         if open > MAX_OPEN_JOBS {
             return Err(GrantError::StateCapacity.into());
         }

@@ -1,4 +1,4 @@
-//! Provider-wide grant journal and ancestor allowance ledger.
+//! Provider-wide grant journal; its budgets run on the admission book.
 mod administration;
 mod admission;
 pub use admission::{AdmissionRecord, ExecutionRecord};
@@ -64,6 +64,9 @@ pub enum NodeStoreError {
     Grant(#[from] crate::model::grant::records::GrantError),
     #[error(transparent)]
     Ledger(#[from] ledger::LedgerError),
+    /// The refusing node and limit, for diagnosis; the wire carries only its code.
+    #[error("admission refused at {0:?}")]
+    Refused(hellas_admission::Refusal),
     #[error(transparent)]
     Resource(#[from] crate::model::grant::resource::TemplateError),
     #[error(transparent)]
@@ -90,6 +93,7 @@ pub enum NodeStoreErrorKind {
     Channel,
     Grant,
     Ledger,
+    Refused,
     Resource,
     Input,
     Malformed,
@@ -112,6 +116,7 @@ impl NodeStoreError {
             Self::Channel(_) => NodeStoreErrorKind::Channel,
             Self::Grant(_) => NodeStoreErrorKind::Grant,
             Self::Ledger(_) => NodeStoreErrorKind::Ledger,
+            Self::Refused(_) => NodeStoreErrorKind::Refused,
             Self::Resource(_) => NodeStoreErrorKind::Resource,
             Self::Input(_) => NodeStoreErrorKind::Input,
             Self::Malformed => NodeStoreErrorKind::Malformed,
