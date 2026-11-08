@@ -387,6 +387,8 @@ enum Commands {
     },
     /// Transcribe one WAV with a client-rendered Whisper job.
     Transcribe(commands::transact::TranscribeArgs),
+    /// Answer one prompt with a client-rendered Qwen3 text job.
+    Text(commands::transact::TextArgs),
     /// Convert a local distilled Flux2 Klein 4B snapshot into client metadata and provider assets.
     ConvertFlux {
         #[arg(long)]
@@ -649,6 +651,7 @@ async fn async_main() {
             | Commands::Fetch(_)
             | Commands::Run(_)
             | Commands::Transcribe(_)
+            | Commands::Text(_)
             | Commands::Image(_)
             | Commands::Gateway {
                 paid_work_config: Some(_),
@@ -1334,6 +1337,21 @@ async fn async_main() {
         Commands::Transcribe(args) => {
             async {
                 commands::transact::transcribe(
+                    args,
+                    commands::transact::Context::new(
+                        &local_identity,
+                        owner.as_ref(),
+                        &home,
+                        &selected_chain,
+                    )?,
+                )
+                .await
+            }
+            .await
+        }
+        Commands::Text(args) => {
+            async {
+                commands::transact::text(
                     args,
                     commands::transact::Context::new(
                         &local_identity,

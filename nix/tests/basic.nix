@@ -34,8 +34,9 @@
         ${package}/bin/hellas serve --help | grep -F -- "--paid-work-config"
         if ${package}/bin/hellas serve --help | grep -F -- "--gfx"; then exit 1; fi
         ${package}/bin/hellas transcribe --help | grep -F -- "--local"
+        ${package}/bin/hellas text --help | grep -F -- "--max-tokens"
         # The portable CLI has no local compute: no --local, no GPU runtime.
-        for command in transcribe image run transact fetch; do
+        for command in transcribe image text run transact fetch; do
           if ${portablePackage}/bin/hellas "$command" --help | grep -F -- "--local"; then exit 1; fi
         done
         if ${portablePackage}/bin/hellas serve --help | grep -F -- "--gpu-backend"; then exit 1; fi

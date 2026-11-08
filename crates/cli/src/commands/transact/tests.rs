@@ -612,6 +612,7 @@ fn execution_helpers_choose_payment_or_an_imported_offer() {
         vec!["run", "--source", "program.hex", "--entry", "main"],
         vec!["image", "--model", "model", "--prompt", "fox"],
         vec!["transcribe", "--model", "model", "--audio", "speech.wav"],
+        vec!["text", "--model", "model.gguf", "--prompt", "hello"],
         vec!["fetch", "https://example.test", "--contract", "http"],
     ] {
         let mut base = vec!["hellas"];

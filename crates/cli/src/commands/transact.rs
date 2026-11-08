@@ -31,6 +31,8 @@ pub use run::{RunArgs, run as run_program};
 pub use transcribe::{TranscribeArgs, transcribe};
 mod image;
 pub use image::{ImageArgs, image};
+mod text;
+pub use text::{TextArgs, text};
 #[cfg(test)]
 mod tests;
 

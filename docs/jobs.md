@@ -18,7 +18,7 @@ grant job. The offer's signed first policy selects the resource, and its
 the same offer and job returns its retained result without executing again. An unresolved attempt
 reports its recorded status instead of submitting new work. A new attempt
 path (`--attempt FILE`) is an explicit request to execute again and consume the allowance.
-`run`, `image`, `transcribe` and `fetch` accept `--offer NAME.POLICY`
+`run`, `image`, `transcribe`, `text` and `fetch` accept `--offer NAME.POLICY`
 as the exclusive alternative to `--payment`; they save a zero-price job and use
 this same route.
 Grant channel journals share the imported offers' data directory with the
@@ -36,7 +36,12 @@ through `--content-config`. `--timeout` bounds it like any other job.
 
 ```sh
 hellas transcribe --model ./whisper-tiny --audio speech.wav --local
+hellas text --model ./qwen3.gguf --prompt 'Why is the sky blue?' --local
 ```
+
+`hellas text --model FILE.gguf --prompt TEXT [--system TEXT] [--max-tokens N]`
+renders one Qwen3 chat turn with the GGUF's tokenizer, runs it as a Compute job
+and prints the decoded reply.
 
 `hellas transact --job DIR` executes a caller-owned job folder for any
 application. `hellas run` (one call of a Catena program) and `hellas fetch`
