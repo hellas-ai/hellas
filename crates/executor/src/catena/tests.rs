@@ -563,6 +563,8 @@ fn hip_unseen_program_and_kill_respawn() {
     println!("increment(41) = 42 on respawned worker pid {next}");
 }
 
+// Compiling runs in the isolated compile child, which exists only on Linux.
+#[cfg(target_os = "linux")]
 async fn cached_program_still_opens_current_pin_policy(warm_gpu: bool) {
     use hellas_rpc::{
         Assurance, ContentRef, JsonBytes,
@@ -729,11 +731,13 @@ async fn cached_program_still_opens_current_pin_policy(warm_gpu: bool) {
     node.close().await;
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_warm_program_cache_cannot_bypass_removed_job_pin_policy() {
     cached_program_still_opens_current_pin_policy(false).await;
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test]
 #[ignore = "needs a HIP device; verifies a warm GPU asset cache against current pin policy"]
 async fn a_warm_gpu_asset_cache_cannot_bypass_removed_job_pin_policy() {
