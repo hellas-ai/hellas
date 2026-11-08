@@ -6,8 +6,8 @@ use crate::{
         ChainVerifier, execute_all,
         store::utxo_db_config,
         test_support::{
-            consensus_fixture, finalization, index_block, index_genesis, kernel_fixture, owner_key,
-            run_qmdb,
+            consensus_fixture, finality_envelope, index_block, index_genesis, kernel_fixture,
+            owner_key, run_qmdb,
         },
     },
     indexer::fixtures::spawn_archive,
@@ -238,11 +238,7 @@ async fn response_fixture_with_contests(
     .expect("chain indexer");
     for block in [&floor, &contest] {
         chain_indexer
-            .publish_proof(
-                block.clone(),
-                &crate::finality_proof::encode(&finalization(&consensus, block).encode(), &[])
-                    .unwrap(),
-            )
+            .publish_proof(block.clone(), &finality_envelope(&consensus, block))
             .await
             .expect("finalized ingest");
     }
@@ -488,11 +484,7 @@ fn resident_invalidated_by_finality_is_dropped_before_full() {
         let consensus = consensus_fixture(95);
         fixture
             .chain_indexer
-            .publish_proof(
-                answered.clone(),
-                &crate::finality_proof::encode(&finalization(&consensus, &answered).encode(), &[])
-                    .unwrap(),
-            )
+            .publish_proof(answered.clone(), &finality_envelope(&consensus, &answered))
             .await
             .expect("answered block finalizes");
         assert_eq!(
@@ -598,11 +590,7 @@ fn full_response_mempool_reuses_slot_invalidated_by_finality() {
         let consensus = consensus_fixture(95);
         fixture
             .chain_indexer
-            .publish_proof(
-                answered.clone(),
-                &crate::finality_proof::encode(&finalization(&consensus, &answered).encode(), &[])
-                    .unwrap(),
-            )
+            .publish_proof(answered.clone(), &finality_envelope(&consensus, &answered))
             .await
             .expect("answered block finalizes");
         assert_eq!(
@@ -654,11 +642,7 @@ async fn finalized_payload_indexer(
     .await
     .expect("chain indexer");
     indexer
-        .publish_proof(
-            finalized.clone(),
-            &crate::finality_proof::encode(&finalization(&fixture, &finalized).encode(), &[])
-                .unwrap(),
-        )
+        .publish_proof(finalized.clone(), &finality_envelope(&fixture, &finalized))
         .await
         .expect("finalized floor ingest");
     (indexer, handle)
@@ -825,11 +809,7 @@ fn work_channel_snapshot_reads_every_object_at_one_finalized_block() {
         .expect("chain indexer");
         for block in [&floor_block, &open_block] {
             chain_indexer
-                .publish_proof(
-                    block.clone(),
-                    &crate::finality_proof::encode(&finalization(&fixture, block).encode(), &[])
-                        .unwrap(),
-                )
+                .publish_proof(block.clone(), &finality_envelope(&fixture, block))
                 .await
                 .expect("finalized ingest");
         }
@@ -1332,11 +1312,7 @@ fn finalized_reads_inside_the_commit_before_publish_window_use_the_committed_blo
         chain_indexer
             .publish_proof(
                 next.clone(),
-                &crate::finality_proof::encode(
-                    &finalization(&consensus_fixture(91), &next).encode(),
-                    &[],
-                )
-                .unwrap(),
+                &finality_envelope(&consensus_fixture(91), &next),
             )
             .await
             .unwrap();
