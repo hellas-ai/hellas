@@ -18,16 +18,16 @@ mod responses_fetch;
 mod state;
 mod wrap;
 
+use axum::Router;
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::{Json, Router};
 use futures::Stream;
 use hellas_adaptors::BackendError;
 use hellas_auth::authority::UnixMillis;
 use iroh::EndpointId;
 use serde::Serialize;
-use serde_json::{Map as JsonMap, Value as JsonValue, json};
+use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -581,12 +581,21 @@ async fn bind_gateway(
     }
 }
 
+/// A refusal or failure in the OpenAI error shape.
 fn json_error(status: StatusCode, message: impl Into<String>) -> Response {
-    (
-        status,
-        Json(json!({ "error": { "message": message.into() } })),
-    )
-        .into_response()
+    path_error("", status, message)
+}
+
+/// A refusal or failure on `path`, in the error shape of the wire format
+/// served there: Anthropic's on its Messages path, OpenAI's elsewhere.
+fn path_error(path: &str, status: StatusCode, message: impl Into<String>) -> Response {
+    let render = if path == state::ANTHROPIC_PATH {
+        hellas_adaptors::anthropic::render_error
+    } else {
+        hellas_adaptors::openai::render_error
+    };
+    dispatch::wire_response(render(status.as_u16(), message.into()))
+        .unwrap_or_else(|_| status.into_response())
 }
 
 /// Wrap an event stream as an SSE response. The stream IS the producer —

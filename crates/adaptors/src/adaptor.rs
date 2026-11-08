@@ -45,4 +45,10 @@ pub trait WireAdaptor {
     /// Record provenance for the job; events rendered after it carry it.
     /// The fields it names replace those recorded before.
     fn attest(&self, state: &mut Self::StreamState, provenance: Provenance);
+
+    /// A refusal or failure with HTTP `status`, in this wire format. Streams
+    /// carry the same body as their `error` event.
+    fn render_error(&self, status: u16, message: String) -> WireResponse {
+        crate::openai::render_error(status, message)
+    }
 }

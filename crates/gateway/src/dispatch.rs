@@ -38,12 +38,12 @@ where
 {
     let (parsed, request) = match parse(&adaptor, body, model) {
         Ok(parsed) => parsed,
-        Err(err) => return adaptor_error(surface, err),
+        Err(err) => return adaptor_error(&adaptor, surface, err),
     };
     let stream = request.raw.value().get("stream") == Some(&JsonValue::Bool(true));
     let backend_stream = match backend.stream(request).await {
         Ok(stream) => stream,
-        Err(err) => return backend_error(surface, err),
+        Err(err) => return backend_error(&adaptor, surface, err),
     };
     if stream {
         stream_response(adaptor, parsed, backend_stream, context, surface).await
@@ -78,16 +78,18 @@ async fn response<A: WireAdaptor>(
 ) -> Response {
     let result = match backend_stream.collect().await {
         Ok(result) => result,
-        Err(err) => return backend_error(surface, err),
+        Err(err) => return backend_error(&adaptor, surface, err),
     };
     let provenance = result.provenance.clone();
     let wire = match adaptor.render_response(&parsed, result, context) {
         Ok(response) => response,
-        Err(err) => return adaptor_error(surface, err),
+        Err(err) => return adaptor_error(&adaptor, surface, err),
     };
     let mut response = match wire_response(wire) {
         Ok(response) => response,
-        Err(message) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, message),
+        Err(message) => {
+            return error_response(&adaptor, StatusCode::INTERNAL_SERVER_ERROR, message);
+        }
     };
     attach_wire_provenance(&mut response, provenance.as_ref());
     response
@@ -112,8 +114,14 @@ where
     // SSE headers; failures after the first output remain stream errors.
     let first = match output_events.next().await {
         Some(Ok(event)) => event,
-        Some(Err(error)) => return backend_error(surface, error),
-        None => return backend_error(surface, BackendError::failed("backend returned no output")),
+        Some(Err(error)) => return backend_error(&adaptor, surface, error),
+        None => {
+            return backend_error(
+                &adaptor,
+                surface,
+                BackendError::failed("backend returned no output"),
+            );
+        }
     };
     let mut output_events =
         futures::stream::once(std::future::ready(Ok(first))).chain(output_events);
@@ -125,7 +133,7 @@ where
             adaptor.attest(&mut state, provenance);
         }
 
-        match render_events(adaptor.render_stream_start(&parsed, &mut state)) {
+        match render_events(&adaptor, adaptor.render_stream_start(&parsed, &mut state)) {
             Ok(events) => {
                 for event in events {
                     yield Ok(event);
@@ -141,7 +149,7 @@ where
             match event {
                 Ok(BackendEvent::Provenance(provenance)) => adaptor.attest(&mut state, provenance),
                 Ok(BackendEvent::Output(output)) => {
-                    match render_events(adaptor.render_stream_event(&parsed, &mut state, output)) {
+                    match render_events(&adaptor, adaptor.render_stream_event(&parsed, &mut state, output)) {
                         Ok(events) => {
                             for event in events {
                                 yield Ok(event);
@@ -166,7 +174,7 @@ where
     response
 }
 
-fn adaptor_error(surface: &str, error: AdaptorError) -> Response {
+fn adaptor_error<A: WireAdaptor>(adaptor: &A, surface: &str, error: AdaptorError) -> Response {
     let status = match error {
         AdaptorError::InvalidJson(_)
         | AdaptorError::InvalidRequest(_)
@@ -174,14 +182,20 @@ fn adaptor_error(surface: &str, error: AdaptorError) -> Response {
         AdaptorError::InvalidResponse(_) => StatusCode::BAD_GATEWAY,
         AdaptorError::Render(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
-    json_error(status, format!("{surface}: {error}"))
+    error_response(adaptor, status, format!("{surface}: {error}"))
 }
 
-fn backend_error(surface: &str, error: BackendError) -> Response {
-    json_error(super::backend_status(&error), format!("{surface}: {error}"))
+fn backend_error<A: WireAdaptor>(adaptor: &A, surface: &str, error: BackendError) -> Response {
+    let status = super::backend_status(&error);
+    error_response(adaptor, status, format!("{surface}: {error}"))
 }
 
-fn wire_response(response: WireResponse) -> Result<Response, String> {
+fn error_response<A: WireAdaptor>(adaptor: &A, status: StatusCode, message: String) -> Response {
+    wire_response(adaptor.render_error(status.as_u16(), message))
+        .unwrap_or_else(|message| json_error(StatusCode::INTERNAL_SERVER_ERROR, message))
+}
+
+pub(super) fn wire_response(response: WireResponse) -> Result<Response, String> {
     let status = StatusCode::from_u16(response.status)
         .map_err(|err| format!("adaptor rendered invalid HTTP status: {err}"))?;
     let body = match response.body {
@@ -221,23 +235,25 @@ fn sse_event(event: WireStreamEvent) -> Event {
     }
 }
 
-fn wire_error_event(error: AdaptorError) -> Event {
-    output_error_event(error.to_string())
+/// A stream failure as `adaptor`'s `error` event.
+fn error_event<A: WireAdaptor>(adaptor: &A, message: String) -> Event {
+    let data = match adaptor.render_error(500, message).body {
+        WireBody::Json(value) => WireEventData::Json(value),
+        WireBody::Bytes(bytes) => WireEventData::Bytes(bytes),
+    };
+    sse_event(WireStreamEvent {
+        name: Some("error".into()),
+        data,
+    })
 }
 
-fn output_error_event(message: impl Into<String>) -> Event {
-    sse_event_data(
-        "error",
-        &serde_json::json!({
-            "error": { "message": message.into() }
-        }),
-    )
-}
-
-fn render_events(events: Result<Vec<WireStreamEvent>, AdaptorError>) -> Result<Vec<Event>, Event> {
+fn render_events<A: WireAdaptor>(
+    adaptor: &A,
+    events: Result<Vec<WireStreamEvent>, AdaptorError>,
+) -> Result<Vec<Event>, Event> {
     events
         .map(|events| events.into_iter().map(sse_event).collect())
-        .map_err(wire_error_event)
+        .map_err(|error| error_event(adaptor, error.to_string()))
 }
 
 fn render_error_events<A: WireAdaptor>(
@@ -246,16 +262,17 @@ fn render_error_events<A: WireAdaptor>(
     state: &mut A::StreamState,
     message: String,
 ) -> Vec<Event> {
-    match render_events(adaptor.render_stream_event(
+    let events = adaptor.render_stream_event(
         parsed,
         state,
         OutputEvent::Error {
             message: message.clone(),
             code: None,
         },
-    )) {
+    );
+    match render_events(adaptor, events) {
         Ok(events) if !events.is_empty() => events,
-        Ok(_) => vec![output_error_event(message)],
+        Ok(_) => vec![error_event(adaptor, message)],
         Err(event) => vec![event],
     }
 }

@@ -59,9 +59,12 @@ fn validate_native_text_request(canonical: &CanonicalExecution) -> Result<(), Ba
 pub(super) const PATHS: [&str; 4] = [
     "/v1/chat/completions",
     "/v1/responses",
-    "/v1/messages",
+    ANTHROPIC_PATH,
     "/v1/completions",
 ];
+
+/// The path served in the Anthropic Messages wire format.
+pub(super) const ANTHROPIC_PATH: &str = "/v1/messages";
 
 pub(super) fn router(state: Arc<TextState>) -> Router {
     Router::new()

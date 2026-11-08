@@ -6,6 +6,11 @@ pub mod responses;
 
 use serde_json::{Value as JsonValue, json};
 
+/// A refusal or failure as the OpenAI APIs report it.
+pub fn render_error(status: u16, message: String) -> crate::WireResponse {
+    crate::WireResponse::json(status, json!({ "error": { "message": message } }))
+}
+
 pub(super) fn project_response_format(value: &JsonValue) -> crate::ResponseFormat {
     match value.get("type").and_then(JsonValue::as_str) {
         Some("text") => crate::ResponseFormat::Text,
