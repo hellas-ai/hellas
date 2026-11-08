@@ -1,4 +1,4 @@
-# Evaluates every Hydra and release job without building anything and
+# Evaluates every Hydra, release and Windows job without building anything and
 # returns the names of the jobs that fail to evaluate. Module-eval tests are
 # assertions forced by evaluation, so a stale one shows up here before merge.
 { flake }:
@@ -13,4 +13,6 @@ let
     else
       [ ];
 in
-jobs "hydraJobs" flake.hydraJobs ++ jobs "releaseJobs" flake.releaseJobs
+jobs "hydraJobs" flake.hydraJobs
+++ jobs "releaseJobs" flake.releaseJobs
+++ jobs "windowsJobs" flake.windowsJobs
