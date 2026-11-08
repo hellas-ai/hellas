@@ -1145,7 +1145,7 @@ fn run(
 
         let deferred = Deferred::new(
             context.child("deferred"),
-            stateful_mailbox.clone(),
+            crate::block_time::AwaitBlockTime(stateful_mailbox.clone()),
             marshal_mailbox.clone(),
             epocher,
         );

@@ -21,9 +21,6 @@ use commonware_storage::{mmr, qmdb::sync::Target};
 pub type UtxoSyncTarget = Target<mmr::Family, Digest>;
 
 #[cfg(feature = "full-node")]
-pub(crate) const SYNCHRONY_BOUND: u64 = 5_000;
-
-#[cfg(feature = "full-node")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum ValidationError {
     #[error("context mismatch")]
@@ -32,8 +29,6 @@ pub(crate) enum ValidationError {
     ParentMismatch { parsed: Digest, expected: Digest },
     #[error("height mismatch: parsed={parsed} expected={expected}")]
     HeightMismatch { parsed: Height, expected: Height },
-    #[error("timestamp too far in the future: timestamp={timestamp} now={now}")]
-    FutureTimestamp { timestamp: u64, now: u64 },
     #[error("timestamp before parent: timestamp={timestamp} parent_timestamp={parent_timestamp}")]
     TimestampRegression {
         timestamp: u64,
@@ -128,14 +123,15 @@ impl HellasBlock {
     /// follower never runs it: it ingests blocks that already carry a
     /// finalization certificate, checked by `ConsensusVerifier`, so the
     /// context/height/timestamp agreement is already settled by the
-    /// quorum that signed them.
+    /// quorum that signed them. It reads no clock, so every validator
+    /// reaches the same verdict: consensus waits for a block from the
+    /// future before asking (`crate::block_time`).
     #[cfg(feature = "full-node")]
     pub(crate) fn validate(
         &self,
         expected_context: &Context<Digest, PublicKey>,
         expected_height: Height,
         expected_parent: Digest,
-        now: u64,
         parent_timestamp: u64,
     ) -> Result<(), ValidationError> {
         if &self.context != expected_context {
@@ -151,12 +147,6 @@ impl HellasBlock {
             return Err(ValidationError::HeightMismatch {
                 parsed: self.height,
                 expected: expected_height,
-            });
-        }
-        if self.timestamp > now.saturating_add(SYNCHRONY_BOUND) {
-            return Err(ValidationError::FutureTimestamp {
-                timestamp: self.timestamp,
-                now,
             });
         }
         if self.timestamp < parent_timestamp {
@@ -292,37 +282,19 @@ mod tests {
     }
 
     #[test]
-    fn validate_accepts_timestamp_at_synchrony_bound() {
+    fn validate_bounds_timestamp_by_parent_only() {
         let context = context();
+        let validate = |timestamp, parent_timestamp| {
+            block(timestamp).validate(&context, Height::new(1), Digest::EMPTY, parent_timestamp)
+        };
 
-        let result = block(10_000 + SYNCHRONY_BOUND).validate(
-            &context,
-            Height::new(1),
-            Digest::EMPTY,
-            10_000,
-            0,
-        );
-
-        assert_eq!(result, Ok(()));
-    }
-
-    #[test]
-    fn validate_rejects_timestamp_beyond_synchrony_bound() {
-        let context = context();
-
-        let result = block(10_000 + SYNCHRONY_BOUND + 1).validate(
-            &context,
-            Height::new(1),
-            Digest::EMPTY,
-            10_000,
-            0,
-        );
-
+        // How far a block leads real time is the consensus wait's concern.
+        assert_eq!(validate(u64::MAX, 10_000), Ok(()));
         assert_eq!(
-            result,
-            Err(ValidationError::FutureTimestamp {
-                timestamp: 10_000 + SYNCHRONY_BOUND + 1,
-                now: 10_000,
+            validate(9_999, 10_000),
+            Err(ValidationError::TimestampRegression {
+                timestamp: 9_999,
+                parent_timestamp: 10_000,
             })
         );
     }

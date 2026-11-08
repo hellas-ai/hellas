@@ -504,7 +504,7 @@ where
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> Option<<Self::Databases as DatabaseSet<E>>::Merkleized> {
         Box::pin(async move {
-            let (runtime, consensus_context) = context;
+            let (_, consensus_context) = context;
             let mut ancestry = Box::pin(ancestry);
             let block = ancestry.next().await?;
             let parent = ancestry.next().await?;
@@ -512,7 +512,6 @@ where
                 &consensus_context,
                 Height::new(parent.height().get() + 1),
                 parent.digest(),
-                runtime.current().epoch_millis(),
                 parent.timestamp(),
             ) {
                 warn!(%err, payload = ?block.digest(), "block validation failed");
