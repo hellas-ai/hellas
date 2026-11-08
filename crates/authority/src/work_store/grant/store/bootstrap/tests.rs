@@ -158,14 +158,13 @@ fn authority_change(
     Change::Authority(record)
 }
 fn machine() -> Change {
-    Change::Machine {
-        limits: vec![Limit {
-            meter: Meter::Requests,
-            window: Window::Total,
-            amount: 10,
-        }],
-        concurrent: 2,
-    }
+    Change::Budget(crate::model::grant::budget::BudgetDef {
+        node: crate::model::grant::budget::BudgetNode::Machine,
+        parent: None,
+        revision: Revision(1),
+        limits: vec![Limit::new(Meter::Requests, Window::Total, 10)],
+        max_in_flight: std::num::NonZeroU16::new(2).unwrap(),
+    })
 }
 
 #[tokio::test]

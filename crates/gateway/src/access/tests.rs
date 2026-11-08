@@ -347,3 +347,30 @@ async fn each_principal_is_admitted_under_its_own_grant() {
     let own = format!("Bearer {}", fixture.access.bearer());
     assert_eq!(status(&app, Some(&own)).await, StatusCode::OK);
 }
+#[tokio::test]
+async fn refusals_take_the_error_shape_of_their_path() {
+    for (path, expected) in [
+        (
+            "/v1/messages",
+            serde_json::json!({"type": "error", "error": {
+                "type": "authentication_error",
+                "message": "a current gateway credential is required",
+            }}),
+        ),
+        (
+            "/v1/chat/completions",
+            serde_json::json!({"error": {"message": "a current gateway credential is required"}}),
+        ),
+    ] {
+        let response = unauthorized(path);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.headers()[header::WWW_AUTHENTICATE], "Bearer");
+        let body = axum::body::to_bytes(response.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            expected
+        );
+    }
+}

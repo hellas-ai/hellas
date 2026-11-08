@@ -1,6 +1,31 @@
-{ pkgs, nix-strix-halo }:
+{ pkgs }:
 let
-  rocm = import ../rocm.nix { inherit pkgs nix-strix-halo; };
+  # One coherent ROCm prefix for hipcc, runtime loading, and device bitcode,
+  # assembled from a ROCm package set. Generated Catena sources and shared
+  # objects are runtime data elsewhere; this derivation contains only the
+  # provider toolchain.
+  mkRocmToolkit =
+    rocm:
+    pkgs.symlinkJoin {
+      name = "hellas-rocm-toolkit";
+      nativeBuildInputs = [ pkgs.makeWrapper ];
+      postBuild = ''
+        wrapProgram "$out/bin/hipcc" \
+          --add-flags "--rocm-path=$out --rocm-device-lib-path=${rocm.rocm-device-libs}/amdgcn/bitcode -I$out/include -L$out/lib" \
+          --set-default HIP_PATH "$out" \
+          --set-default ROCM_PATH "$out" \
+          --set-default HIP_CLANG_PATH "${rocm.clang}/bin"
+      '';
+      paths = [
+        rocm.clang
+        rocm.clr
+        rocm.hip-common
+        rocm.hipcc
+        rocm.rocm-core
+        rocm.rocm-device-libs
+        rocm.rocm-runtime
+      ];
+    };
 in
 {
   apiFlavor = {
@@ -16,30 +41,8 @@ in
   # path examples.
   defaultStateDir = "/var/lib/hellas";
 
-  # One coherent ROCm prefix for hipcc, runtime loading, and device bitcode.
-  # Generated Catena sources and shared objects are runtime data elsewhere;
-  # this derivation contains only the provider toolchain.
-  rocmToolkit = pkgs.symlinkJoin {
-    name = "hellas-rocm-toolkit";
-    nativeBuildInputs = [ pkgs.makeWrapper ];
-    postBuild = ''
-      wrapProgram "$out/bin/hipcc" \
-        --add-flags "--rocm-path=$out --rocm-device-lib-path=${rocm.rocm-device-libs}/amdgcn/bitcode -I$out/include -L$out/lib" \
-        --set-default HIP_PATH "$out" \
-        --set-default ROCM_PATH "$out" \
-        --set-default HIP_CLANG_PATH "${rocm.clang}/bin"
-    '';
-    paths = [
-      rocm.clang
-      rocm.clr
-      rocm.hip-common
-      rocm.hipcc
-      rocm.rocm-core
-      rocm.rocm-device-libs
-      rocm.rocm-runtime
-      pkgs.rocmPackages.rocwmma
-    ];
-  };
+  inherit mkRocmToolkit;
+  rocmToolkit = mkRocmToolkit pkgs.rocmPackages;
   cudaToolkit = pkgs.symlinkJoin {
     name = "hellas-cuda-toolkit";
     nativeBuildInputs = [ pkgs.makeWrapper ];

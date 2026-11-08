@@ -1,16 +1,10 @@
-//! Shares a vendor API account through Hellas grants: the OpenAI Responses
-//! adapter composed with Hellas authority, Work and SDK services.
-//! Generic protocol consumption and host services remain in SDK.
+//! Shares a vendor API account through Hellas grants: a sealed Fetch route
+//! backed by the owner's account, its grant terms and the host wiring that
+//! serves it. Wire formats live in adaptors; HTTP egress lives in providers.
 // The SDK host's nested transport futures exceed rustc's default query depth.
 #![recursion_limit = "256"]
 
-mod contract;
 mod host;
-pub use contract::{OPENAI_RESPONSES_ENDPOINT, responses_contract};
-mod openai;
 mod policy;
-mod responses_projector;
 pub use host::{OpenAiProviderError, OpenAiProviderOptions, start_openai_provider};
-pub use openai::{OpenAiConfigError, OpenAiResponsesFetchProvider};
 pub use policy::{ResponsesPolicyOptions, responses_policy};
-pub use responses_projector::OpenAiResponsesAdaptorFactory;

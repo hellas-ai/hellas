@@ -125,11 +125,16 @@ async fn revoke_discards_active_and_completed_bodies_without_delivery_polling() 
                 assert!(!detail.terminal.unwrap().provider_signature.is_empty());
             }
             let state = snapshot(&service).await;
-            assert_eq!(state.ledger().active_count(BudgetNode::Machine), 0);
             assert_eq!(
                 state
                     .ledger()
-                    .node(budget())
+                    .reserved(BudgetNode::Machine.key(), Meter::Requests),
+                0
+            );
+            assert_eq!(
+                state
+                    .ledger()
+                    .node(budget().key())
                     .unwrap()
                     .counter(Meter::Requests, Window::Total)
                     .used,
@@ -261,7 +266,7 @@ async fn discarded_prefix_still_verifies_usage_and_rejects_a_different_signed_co
         let state = snapshot(&service).await;
         let used = state
             .ledger()
-            .node(BudgetNode::Machine)
+            .node(BudgetNode::Machine.key())
             .unwrap()
             .counter(Meter::OutputTokens, Window::Total)
             .used;
@@ -379,7 +384,7 @@ async fn catalogue_change_discards_bodies_and_cancels_bound_responses_before_lat
         assert_eq!(
             state
                 .ledger()
-                .node(budget())
+                .node(budget().key())
                 .unwrap()
                 .counter(Meter::Requests, Window::Total)
                 .used,

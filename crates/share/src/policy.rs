@@ -30,7 +30,8 @@ pub fn responses_policy(options: ResponsesPolicyOptions<'_>) -> Result<GrantPoli
     } = options;
     let route =
         FetchRoutePolicy::sealed_route(service, method).map_err(|_| GrantError::Malformed)?;
-    let contract = crate::responses_contract().map_err(|_| GrantError::Malformed)?;
+    let contract = hellas_adaptors::openai::responses::fetch::responses_contract()
+        .map_err(|_| GrantError::Malformed)?;
     let policy = GrantPolicy {
         resource,
         account,

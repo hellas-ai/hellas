@@ -8,11 +8,11 @@ use hellas_rpc::*;
 use proptest::prelude::*;
 use {crate::model::grant::budget::*, crate::model::grant::records::*, crate::model::grant::*};
 use {
+    hellas_admission::{Ask, Book, Discharged, HoldId, Key, Refusal, Why},
     hellas_authority::work_store::grant::GrantOutcome,
     hellas_authority::work_store::grant::NodeStore,
     hellas_authority::work_store::grant::NodeStoreError,
-    hellas_authority::work_store::grant::ledger::Ledger,
-    hellas_authority::work_store::grant::ledger::LedgerError,
+    hellas_authority::work_store::grant::ledger::{self, LedgerError},
     hellas_channel::work_store::journal::Journal,
 };
 
@@ -510,15 +510,15 @@ async fn checkpoint_recovery_retains_the_original_cosignature() {
         assert_eq!(
             node.store
                 .state()
-                .recovery_holds(BudgetNode::Machine, UnixMillis(1003))
-                .unwrap(),
-            usize::from(dispatched)
+                .ledger()
+                .occupied(Key::Machine, Meter::Requests, 1003),
+            u64::from(dispatched)
         );
         assert_eq!(
             node.store
                 .state()
-                .recovery_holds(BudgetNode::Machine, UnixMillis(4000))
-                .unwrap(),
+                .ledger()
+                .occupied(Key::Machine, Meter::Requests, 4000),
             0
         );
         node.clock.set(UnixMillis(1004));
@@ -599,7 +599,7 @@ async fn paused_terms_release_queued_work_without_reusing_its_nonce() {
         node.store
             .state()
             .ledger()
-            .reserved(BudgetNode::Machine, Meter::Requests),
+            .reserved(BudgetNode::Machine.key(), Meter::Requests),
         0
     );
     let book = node
@@ -654,18 +654,9 @@ async fn revising_terms_cannot_reset_spending() {
         .await;
     let mut terms = node.store.state().grant(ids::ALLOWANCE).unwrap().clone();
     terms.revision.0 += 1;
-    let mut budget = node
-        .store
-        .state()
-        .ledger()
-        .definition(terms.budget)
-        .unwrap();
+    let mut budget = ledger::definition(node.store.state().ledger(), terms.budget).unwrap();
     budget.revision.0 += 1;
-    budget.limits = vec![Limit {
-        meter: Meter::Requests,
-        window: Window::Total,
-        amount: 1,
-    }];
+    budget.limits = vec![Limit::new(Meter::Requests, Window::Total, 1)];
     node.store
         .configure_budget(budget, node.clock.now())
         .await
@@ -678,15 +669,13 @@ async fn revising_terms_cannot_reset_spending() {
     let second = node.proposal(FRIEND, ids::ALLOWANCE, 2);
     let before = node.snapshot();
     assert_err!(node.accept(FRIEND, ids::FRIEND_GRANT, &second).await,
-        NodeStoreError::Ledger(LedgerError::OverBudget { node: budget, meter: Meter::Requests, window: Window::Total }) if budget == terms.budget);
+        NodeStoreError::Refused(Refusal { at, why: Why::Impossible(Meter::Requests, Window::Total), .. }) if at == terms.budget.key());
     assert_eq!(node.snapshot(), before);
 }
 
-fn configured_ledger(limits: Vec<Limit>, concurrent: u16) -> Ledger {
-    let mut ledger = Ledger::default();
-    ledger
-        .configure_machine(limits.clone(), concurrent)
-        .unwrap();
+fn configured_ledger(limits: Vec<Limit>, concurrent: u16) -> Book {
+    let mut ledger = Book::default();
+    configure_machine(&mut ledger, limits.clone(), concurrent).unwrap();
     for seed in [1, 3] {
         for definition in common_node::budgets(
             common_node::POOL,
@@ -694,8 +683,8 @@ fn configured_ledger(limits: Vec<Limit>, concurrent: u16) -> Ledger {
             limits.clone(),
             concurrent,
         ) {
-            if ledger.node(definition.node).is_none() {
-                ledger.configure_budget(definition).unwrap();
+            if ledger.node(definition.node.key()).is_none() {
+                ledger::configure(&mut ledger, definition).unwrap();
             }
         }
     }
@@ -742,11 +731,7 @@ async fn new_machine_meters_check_accepted_and_paused_terms() {
                 .unwrap();
         }
         store.define(def, UnixMillis(1002)).await.unwrap();
-        let limits = vec![Limit {
-            meter: Meter::OutputTokens,
-            window: Window::Day,
-            amount: 1000,
-        }];
+        let limits = vec![Limit::new(Meter::OutputTokens, Window::Day, 1000)];
         assert_err!(
             store
                 .configure_machine(limits.clone(), 4, UnixMillis(1003))
@@ -910,8 +895,8 @@ async fn ownership_recovery_preserves_spent_usage_pending_jobs_and_nonce_history
     assert_eq!(
         store
             .state()
-            .recovery_holds(BudgetNode::Machine, UnixMillis(1001))
-            .unwrap(),
+            .ledger()
+            .occupied(Key::Machine, Meter::Requests, 1001),
         1
     );
     let mut replay = queued;
@@ -943,6 +928,37 @@ async fn ownership_recovery_preserves_spent_usage_pending_jobs_and_nonce_history
     );
 }
 
+/// The machine's next budget definition, as host configuration writes it.
+fn machine(book: &Book, limits: Vec<Limit>, concurrent: u16) -> BudgetDef {
+    let revision =
+        ledger::definition(book, BudgetNode::Machine).map_or(Revision(0), |d| d.revision);
+    BudgetDef {
+        node: BudgetNode::Machine,
+        parent: None,
+        revision: revision.next().unwrap(),
+        limits,
+        max_in_flight: std::num::NonZeroU16::new(concurrent).unwrap(),
+    }
+}
+fn configure_machine(
+    book: &mut Book,
+    limits: Vec<Limit>,
+    concurrent: u16,
+) -> Result<(), LedgerError> {
+    let definition = machine(book, limits, concurrent);
+    ledger::configure(book, definition)
+}
+/// An immediate grant reservation of `charge` for `work` at `leaf`.
+fn ask(work: Digest, leaf: BudgetNode, charge: Charge) -> Ask {
+    Ask {
+        id: HoldId(*work.as_bytes()),
+        leaf: leaf.key(),
+        charge,
+        wait: false,
+        deadline: None,
+    }
+}
+
 // Raw transitions are test fixtures for journal/accounting invariants, never host APIs.
 use super::state::Change;
 impl NodeStore {
@@ -968,8 +984,8 @@ impl NodeStore {
         concurrent: u16,
         now: UnixMillis,
     ) -> Result<(), NodeStoreError> {
-        self.commit(now, Change::Machine { limits, concurrent }, true)
-            .await
+        let definition = machine(self.state().ledger(), limits, concurrent);
+        self.commit(now, Change::Budget(definition), true).await
     }
     pub(crate) async fn define(
         &mut self,

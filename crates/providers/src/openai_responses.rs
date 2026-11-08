@@ -1,11 +1,12 @@
-use crate::OPENAI_RESPONSES_ENDPOINT;
+//! Bearer-token driver for the sealed OpenAI Responses endpoint.
+
+use crate::{execute_responses_request, responses_http_client};
+use hellas_adaptors::openai::responses::fetch::{OPENAI_RESPONSES_ENDPOINT, responses_contract};
 use hellas_executor::{
     FetchProvider, FetchProviderError, FetchProviderFuture, FetchProviderResponse,
     PreparedFetchRequest,
 };
 use reqwest::Url;
-
-use hellas_providers::{execute_responses_request, responses_http_client};
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpenAiConfigError {
@@ -30,8 +31,7 @@ pub struct OpenAiResponsesFetchProvider {
 impl OpenAiResponsesFetchProvider {
     /// Construct from the upstream API key supplied by the embedding host.
     pub fn with_bearer(bearer_token: impl Into<String>) -> Result<Self, OpenAiConfigError> {
-        let bearer_token = bearer_token.into();
-        let bearer_token = bearer_token.trim().to_owned();
+        let bearer_token = bearer_token.into().trim().to_owned();
         if bearer_token.is_empty() {
             return Err(OpenAiConfigError::EmptyKey);
         }
@@ -50,7 +50,7 @@ impl OpenAiResponsesFetchProvider {
         bearer_token: String,
     ) -> Result<Self, OpenAiConfigError> {
         Ok(Self {
-            environment: crate::responses_contract()?.manifest_id(),
+            environment: responses_contract()?.manifest_id(),
             client,
             endpoint,
             bearer_token,

@@ -89,7 +89,7 @@ impl NodeConfiguration {
             };
             changes.push(BudgetDef {
                 node,
-                parent: BudgetNode::Machine,
+                parent: Some(BudgetNode::Machine),
                 revision,
                 limits: budget.limits.clone(),
                 max_in_flight: budget.max_in_flight,

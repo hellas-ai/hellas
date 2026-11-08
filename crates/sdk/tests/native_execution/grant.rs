@@ -43,23 +43,9 @@ async fn granted_compute_executes_through_the_native_facade() {
         store,
         &secret,
         principal(2).1,
-        (
-            4,
-            vec![Limit {
-                meter: Meter::Requests,
-                window: Window::Total,
-                amount: 4,
-            }],
-        ),
+        (4, vec![Limit::new(Meter::Requests, Window::Total, 4)]),
         grant.clone(),
-        (
-            vec![Limit {
-                meter: Meter::Requests,
-                window: Window::Total,
-                amount: 3,
-            }],
-            2,
-        ),
+        (vec![Limit::new(Meter::Requests, Window::Total, 3)], 2),
     )
     .await;
     let calls = Arc::new(AtomicUsize::new(0));
@@ -183,23 +169,9 @@ async fn local_grant_session_executes_without_http() {
         store,
         &secret,
         principal(2).1,
-        (
-            4,
-            vec![Limit {
-                meter: Meter::Requests,
-                window: Window::Total,
-                amount: 4,
-            }],
-        ),
+        (4, vec![Limit::new(Meter::Requests, Window::Total, 4)]),
         grant.clone(),
-        (
-            vec![Limit {
-                meter: Meter::Requests,
-                window: Window::Total,
-                amount: 3,
-            }],
-            2,
-        ),
+        (vec![Limit::new(Meter::Requests, Window::Total, 3)], 2),
     )
     .await;
     let calls = Arc::new(AtomicUsize::new(0));

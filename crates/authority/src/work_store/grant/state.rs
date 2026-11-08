@@ -1,4 +1,4 @@
-use super::ledger::{Ledger, LedgerError};
+use super::ledger::{self, LedgerError};
 use super::{
     ChannelId, Deserialize, GrantChannelState, GrantId, GrantJobAuthorizationV1, GrantOutcome,
     GrantTerminal, NodeStoreError, Serialize, Signature, SignedResult,
@@ -10,6 +10,7 @@ use crate::model::grant::{
     grant_channel_id, grant_work_id,
     records::{GrantDef, GrantError, GrantPolicy},
 };
+use hellas_admission::{Ask, Book, Discharged};
 use hellas_auth::authority::{AdministrationRecord, AuthoritySnapshot, AuthorityState};
 use hellas_auth::authority::{ResourceId, Revision, UnixMillis};
 use hellas_auth::{Digest, PublicKey};
@@ -32,14 +33,13 @@ pub struct State {
     pub(super) authority: AuthorityState,
     last_administration: Option<AdministrationRecord>,
     pub(crate) last_work_administration: Option<super::WorkRecord>,
-    pub(crate) machine_revision: hellas_auth::authority::Revision,
     paid_policy: Option<hellas_channel::model::paid_policy::StoredPaidPolicy>,
     pub(super) provider: Option<ProviderEnrollmentBundle>,
     pub(super) grants: BTreeMap<GrantId, GrantDef>,
     generations: BTreeMap<GrantId, u64>,
     pub(super) channels: BTreeMap<Digest, Channel<GrantFunding>>,
     pub(super) admissions: BTreeMap<Digest, super::AdmissionRecord>,
-    pub(super) ledger: Ledger,
+    pub(super) ledger: Book,
     pub(super) history: BTreeMap<(GrantId, Revision), GrantDef>,
     pub(super) catalogue: BTreeMap<ResourceId, GrantPolicy>,
     pub(super) resources: BTreeMap<ResourceId, ResourceHealth>,
@@ -58,7 +58,7 @@ pub struct ResourceHealth {
 /// It names the frame format, so a journal written under different semantics
 /// is refused at the boundary instead of being reinterpreted. Bump it with
 /// any change to [`Frame`] or [`Change`] that is not readable as written.
-pub(super) const JOURNAL_NAMESPACE: &str = "hellas.node.journal.v3";
+pub(super) const JOURNAL_NAMESPACE: &str = "hellas.node.journal.v4";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct Frame {
@@ -76,11 +76,8 @@ pub(super) enum Change {
     Authority(AdministrationRecord),
     Recover(hellas_auth::authority::RecoveryCommand),
     BindProvider(super::BindRecord),
-    Machine {
-        limits: Vec<Limit>,
-        concurrent: u16,
-    },
     Define(GrantDef),
+    /// Every budget node, the machine included.
     Budget(BudgetDef),
     Resource(GrantPolicy),
     Work(super::WorkRecord),
@@ -132,7 +129,7 @@ impl State {
             .as_ref()
             .ok_or(NodeStoreError::MissingProvider)
     }
-    pub fn ledger(&self) -> &Ledger {
+    pub fn ledger(&self) -> &Book {
         &self.ledger
     }
     pub fn grants(&self) -> impl Iterator<Item = &GrantDef> {
@@ -163,7 +160,7 @@ impl State {
         self.channels.get(&id.0).map(|c| &c.funding)
     }
     pub fn now(&self) -> UnixMillis {
-        self.ledger.high_water()
+        UnixMillis(self.ledger.high_water())
     }
     pub fn generation(&self, grant: GrantId) -> Option<u64> {
         self.generations.get(&grant).copied()
@@ -196,38 +193,13 @@ impl State {
         }
         Ok(())
     }
-    /// A recovered invocation can retain capacity until its enforceable lifetime
-    /// ends, even though its quota was already charged at the reserved bound.
-    pub fn recovery_holds(
-        &self,
-        node: BudgetNode,
-        now: UnixMillis,
-    ) -> Result<usize, NodeStoreError> {
-        let mut count = 0;
-        for channel in self.channels.values() {
-            let grant = self
-                .grant(channel.funding.grant)
-                .ok_or(GrantError::Unauthorized)?;
-            if self.ledger.path(grant.budget)?.contains(&node) {
-                count += channel
-                    .book
-                    .terminals()
-                    .filter(|t| {
-                        t.outcome.outcome == GrantOutcome::Indeterminate
-                            && t.outcome.authorization.terminal_deadline_ms > now
-                    })
-                    .count();
-            }
-        }
-        Ok(count)
-    }
     fn check_budget_meters(
         &self,
         node: BudgetNode,
         limits: &[Limit],
     ) -> Result<(), NodeStoreError> {
         for grant in self.grants.values() {
-            if self.ledger.path(grant.budget)?.contains(&node)
+            if ledger::path(&self.ledger, grant.budget)?.contains(&node)
                 && grant
                     .policies
                     .iter()
@@ -240,7 +212,7 @@ impl State {
             let grant = self
                 .grant(channel.funding.grant)
                 .ok_or(GrantError::Unauthorized)?;
-            if self.ledger.path(grant.budget)?.contains(&node) {
+            if ledger::path(&self.ledger, grant.budget)?.contains(&node) {
                 for job in channel.book.jobs() {
                     let policy = self.policy_for(job.authorization())?;
                     if limits.iter().any(|l| !policy.supports(l.meter)) {
@@ -259,14 +231,13 @@ impl State {
         if let Some(provider) = &provider {
             check_grant_provider(provider)?;
         }
-        let mut ledger = Ledger::default();
-        ledger.advance(authority.now());
+        let mut ledger = Book::default();
+        ledger.advance(authority.now().0);
         Ok(Self {
             network,
             authority,
             last_administration: None,
             last_work_administration: None,
-            machine_revision: hellas_auth::authority::Revision(0),
             paid_policy: None,
             provider,
             grants: BTreeMap::new(),
@@ -310,7 +281,8 @@ impl State {
         );
         Ok(())
     }
-    pub(super) fn apply(&mut self, frame: &Frame) -> Result<Applied, NodeStoreError> {
+    /// `replay` restores recorded reservations without checking limits again.
+    pub(super) fn apply(&mut self, frame: &Frame, replay: bool) -> Result<Applied, NodeStoreError> {
         if frame.namespace != JOURNAL_NAMESPACE
             || frame.now < self.now()
             || frame.changes.is_empty()
@@ -318,10 +290,10 @@ impl State {
         {
             return Err(NodeStoreError::Malformed);
         }
-        self.ledger.advance(frame.now);
+        self.ledger.advance(frame.now.0);
         let mut applied = Applied::Redundant;
         for change in &frame.changes {
-            if self.apply_change(change, frame.now)? == Applied::Changed {
+            if self.apply_change(change, frame.now, replay)? == Applied::Changed {
                 applied = Applied::Changed;
             }
         }
@@ -331,6 +303,7 @@ impl State {
         &mut self,
         change: &Change,
         now: UnixMillis,
+        replay: bool,
     ) -> Result<Applied, NodeStoreError> {
         match change {
             Change::Initialize { .. } => return Err(NodeStoreError::Malformed),
@@ -406,10 +379,10 @@ impl State {
                         if !matches!(def.node, BudgetNode::Pool(_) | BudgetNode::Subject { .. }) {
                             return Err(NodeStoreError::Malformed);
                         }
-                        self.apply_change(&Change::Budget(def.clone()), now)?;
+                        self.apply_change(&Change::Budget(def.clone()), now, replay)?;
                     }
                     super::WorkMutation::Define(def) => {
-                        self.apply_change(&Change::Define(def.as_ref().clone()), now)?;
+                        self.apply_change(&Change::Define(def.as_ref().clone()), now, replay)?;
                     }
                     super::WorkMutation::Generation { id, expected } => {
                         if self.generation(*id) != Some(*expected) {
@@ -422,6 +395,7 @@ impl State {
                                 generation,
                             },
                             now,
+                            replay,
                         )?;
                     }
                     super::WorkMutation::Repair { resource, expected } => {
@@ -431,7 +405,7 @@ impl State {
                         {
                             return Err(hellas_auth::authority::AuthorityError::Revision.into());
                         }
-                        self.apply_change(&Change::RepairResource(*resource), now)?;
+                        self.apply_change(&Change::RepairResource(*resource), now, replay)?;
                     }
                 }
                 self.last_work_administration = Some(record.clone());
@@ -446,16 +420,6 @@ impl State {
                         .ok_or(NodeStoreError::Malformed)?,
                     ..Default::default()
                 };
-            }
-            Change::Machine { limits, concurrent } => {
-                let next_revision = self
-                    .machine_revision
-                    .next()
-                    .ok_or(NodeStoreError::Malformed)?;
-                // Configured terms and accepted work must remain measurable.
-                self.check_budget_meters(BudgetNode::Machine, limits)?;
-                self.ledger.configure_machine(limits.clone(), *concurrent)?;
-                self.machine_revision = next_revision;
             }
             Change::Resource(policy) => {
                 self.configure_resource(policy.clone())?;
@@ -487,18 +451,18 @@ impl State {
             }
             Change::Budget(def) => {
                 self.check_budget_meters(def.node, &def.limits)?;
-                self.ledger.configure_budget(def.clone())?;
+                ledger::configure(&mut self.ledger, def.clone())?;
             }
             Change::Define(def) => {
                 def.validate()?;
                 self.check_resources(def, def.enabled)?;
-                for id in self.ledger.path(def.budget)? {
-                    let node = self.ledger.node(id).ok_or(LedgerError::UnknownNode)?;
-                    if def
-                        .policies
-                        .iter()
-                        .any(|p| node.limits().iter().any(|l| !p.supports(l.meter)))
-                    {
+                for id in ledger::path(&self.ledger, def.budget)? {
+                    let node = self.ledger.node(id.key()).ok_or(LedgerError::UnknownNode)?;
+                    if def.policies.iter().any(|p| {
+                        ledger::limits(node.spec())
+                            .iter()
+                            .any(|l| !p.supports(l.meter))
+                    }) {
                         return Err(GrantError::Limits.into());
                     }
                 }
@@ -602,20 +566,23 @@ impl State {
                     .grant(a.grant_id)
                     .ok_or(GrantError::Unauthorized)?
                     .budget;
-                for node in self.ledger.path(budget)? {
-                    let holds = self.recovery_holds(node, now)?;
-                    let cap = self
-                        .ledger
-                        .node(node)
-                        .ok_or(LedgerError::UnknownNode)?
-                        .concurrent();
-                    if self.ledger.active_count(node) + holds >= usize::from(cap) {
-                        return Err(LedgerError::Concurrent(node).into());
-                    }
+                // Structural checks hold on replay too; limits are checked
+                // only when the reservation is first made.
+                ledger::path(&self.ledger, budget)?;
+                if replay {
+                    self.ledger
+                        .restore(ledger::hold(id), budget.key(), *charge, now.0)
+                } else {
+                    let ask = Ask {
+                        id: ledger::hold(id),
+                        leaf: budget.key(),
+                        charge: *charge,
+                        wait: false,
+                        deadline: None,
+                    };
+                    self.ledger.admit(&ask, now.0)
                 }
-                let _reservation = self.ledger.reserve(id, budget, *charge, now)?;
-                // The only owner of this capability is the candidate journal
-                // state; reconstruction on a later durable transition is private.
+                .map_err(NodeStoreError::Refused)?;
                 let book = &mut self
                     .channels
                     .get_mut(&a.channel_id.0)
@@ -806,6 +773,10 @@ impl State {
             .authorization();
         let policy = self.policy_for(&auth)?;
         let resource = policy.resource;
+        let budget = self
+            .grant(auth.grant_id)
+            .ok_or(GrantError::Unauthorized)?
+            .budget;
         let usage = usage
             .map(|charge| policy.pricing.settle(charge))
             .transpose()
@@ -868,15 +839,26 @@ impl State {
         } else if outcome == GrantOutcome::Finished {
             return Err(NodeStoreError::Malformed);
         }
-        let reservation = self.ledger.recover(work)?;
+        let hold = ledger::hold(work);
         if outcome == GrantOutcome::Released {
-            self.ledger.release(reservation)?;
+            if self.ledger.release(hold) == Discharged::Gone {
+                return Err(LedgerError::UnknownReservation.into());
+            }
         } else {
-            let overrun = self.ledger.settle(
-                reservation,
-                usage.map_or(Usage::Unknown, Usage::Observed),
-                now,
-            )?;
+            let reserved = self
+                .ledger
+                .hold(hold)
+                .ok_or(LedgerError::UnknownReservation)?;
+            let observed = usage.map_or(Usage::Unknown, Usage::Observed);
+            let Discharged::Charged { overrun } = self.ledger.charge(hold, observed, now.0) else {
+                return Err(LedgerError::UnknownReservation.into());
+            };
+            // Charged once; the work may still run until its enforceable lifetime ends.
+            if outcome == GrantOutcome::Indeterminate {
+                self.ledger
+                    .occupy(hold, budget.key(), reserved, auth.terminal_deadline_ms.0)
+                    .map_err(NodeStoreError::Refused)?;
+            }
             let health = self
                 .resources
                 .get_mut(&resource)
@@ -920,8 +902,8 @@ fn verify(
 }
 
 /// Snapshots retain health decisions made under the frame accounting semantics.
-/// Refuse pre-v3 state even when rotation removed every old frame.
-const CHECKPOINT_NAMESPACE: &str = "hellas.node.checkpoint.v3";
+/// Refuse pre-v4 state even when rotation removed every old frame.
+const CHECKPOINT_NAMESPACE: &str = "hellas.node.checkpoint.v4";
 
 #[derive(Serialize, Deserialize)]
 pub(super) struct Snapshot {
@@ -931,13 +913,12 @@ pub(super) struct Snapshot {
     authority: AuthoritySnapshot,
     last_administration: Option<AdministrationRecord>,
     last_work_administration: Option<super::WorkRecord>,
-    machine_revision: hellas_auth::authority::Revision,
     paid_policy: Option<hellas_channel::model::paid_policy::StoredPaidPolicy>,
     #[serde(with = "super::codec::optional_provider")]
     provider: Option<ProviderEnrollmentBundle>,
     grants: Vec<GrantDef>,
     generations: Vec<(GrantId, u64)>,
-    ledger: Ledger,
+    ledger: Book,
     history: Vec<GrantDef>,
     resources: Vec<(ResourceId, ResourceHealth)>,
     catalogue: Vec<GrantPolicy>,
@@ -968,7 +949,6 @@ impl State {
             authority: self.authority.snapshot(),
             last_administration: self.last_administration.clone(),
             last_work_administration: self.last_work_administration.clone(),
-            machine_revision: self.machine_revision,
             paid_policy: self.paid_policy.clone(),
             provider: self.provider.clone(),
             grants: self.grants.values().cloned().collect(),
@@ -1030,7 +1010,7 @@ impl State {
                 || record.caller().generation() > state.authority.generation()
                 || record.caller().before().0 == 0
                 || record.caller().before() >= state.authority.revision()
-                || record.caller().at() > s.ledger.high_water()
+                || record.caller().at().0 > s.ledger.high_water()
         }) {
             return Err(NodeStoreError::Malformed);
         }
@@ -1041,15 +1021,11 @@ impl State {
                 || record.caller.generation() > state.authority.generation()
                 || record.caller.before().0 == 0
                 || record.caller.before() > state.authority.revision()
-                || record.caller.at() > s.ledger.high_water()
+                || record.caller.at().0 > s.ledger.high_water()
         }) {
             return Err(NodeStoreError::Malformed);
         }
         state.last_work_administration = s.last_work_administration;
-        if (s.machine_revision.0 == 0) != s.ledger.node(BudgetNode::Machine).is_none() {
-            return Err(NodeStoreError::Malformed);
-        }
-        state.machine_revision = s.machine_revision;
         if let Some(policy) = &s.paid_policy {
             if policy.revision.0 == 0 {
                 return Err(NodeStoreError::Malformed);
@@ -1057,7 +1033,7 @@ impl State {
             policy.policy.check()?;
         }
         state.paid_policy = s.paid_policy;
-        if s.ledger.high_water() < state.authority.now() {
+        if s.ledger.high_water() < state.authority.now().0 {
             return Err(NodeStoreError::Malformed);
         }
         state.ledger = s.ledger;
@@ -1077,7 +1053,7 @@ impl State {
             policy.validate()?;
             if state
                 .ledger
-                .node(BudgetNode::Account(policy.account))
+                .node(BudgetNode::Account(policy.account).key())
                 .is_none()
                 || state.catalogue.values().any(|p| p.name == policy.name)
                 || state.catalogue.insert(policy.resource, policy).is_some()
@@ -1268,14 +1244,20 @@ impl State {
                 if ChannelClient::recorded(admission.accepted().caller())? != c.funding.client {
                     return Err(NodeStoreError::Malformed);
                 }
-                if active && state.ledger.reservation_bound(work) != Some(admission.reserved) {
+                if active && state.ledger.hold(ledger::hold(work)) != Some(admission.reserved) {
                     return Err(NodeStoreError::Malformed);
                 }
                 if active {
                     let policy = state.policy_for(a)?;
-                    for id in state.ledger.path(current.budget)? {
-                        let node = state.ledger.node(id).ok_or(LedgerError::UnknownNode)?;
-                        if node.limits().iter().any(|l| !policy.supports(l.meter)) {
+                    for id in ledger::path(&state.ledger, current.budget)? {
+                        let node = state
+                            .ledger
+                            .node(id.key())
+                            .ok_or(LedgerError::UnknownNode)?;
+                        if ledger::limits(node.spec())
+                            .iter()
+                            .any(|l| !policy.supports(l.meter))
+                        {
                             return Err(GrantError::Limits.into());
                         }
                     }
@@ -1328,20 +1310,48 @@ impl State {
                 }
             }
         }
-        state.ledger.validate_definitions(state.grants.values())?;
+        ledger::validate_definitions(&state.ledger, state.grants.values())?;
         if retained.len() != state.admissions.len() {
             return Err(NodeStoreError::Malformed);
         }
         let mut reservations = Vec::new();
+        let mut occupied = Vec::new();
+        let now = state.ledger.high_water();
         for channel in state.channels.values() {
             let grant = state
                 .grant(channel.funding.grant)
                 .ok_or(GrantError::Unauthorized)?;
             reservations.extend(channel.book.jobs().map(|j| (j.work_id(), grant.budget)));
+            // Occupancy is derived, never serialized: these were charged at their terminal.
+            occupied.extend(
+                channel
+                    .book
+                    .terminals()
+                    .filter(|t| {
+                        t.outcome.outcome == GrantOutcome::Indeterminate
+                            && t.outcome.authorization.terminal_deadline_ms.0 > now
+                    })
+                    .map(|t| {
+                        (
+                            t.work_id,
+                            grant.budget,
+                            t.outcome.authorization.terminal_deadline_ms,
+                        )
+                    }),
+            );
         }
-        state
-            .ledger
-            .validate_reservations(reservations.into_iter())?;
+        ledger::validate_reservations(&state.ledger, reservations.into_iter())?;
+        for (work, budget, until) in occupied {
+            let reserved = state
+                .admissions
+                .get(&work)
+                .ok_or(NodeStoreError::Malformed)?
+                .reserved;
+            state
+                .ledger
+                .occupy(ledger::hold(work), budget.key(), reserved, until.0)
+                .map_err(NodeStoreError::Refused)?;
+        }
         Ok(state)
     }
 }

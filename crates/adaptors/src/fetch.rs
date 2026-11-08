@@ -1,11 +1,11 @@
-//! Shared framing and payload encoding for sealed Responses streams.
+//! Shared framing and payload encoding for sealed Fetch projectors.
 
-use hellas_adaptors::{OutputEvent, SseDecoder, WireStreamEvent};
+use crate::{OutputEvent, SseDecoder, WireStreamEvent};
 use hellas_executor::{FetchAdaptorError, ProjectedFetch};
 use hellas_rpc::fetch::{FetchPayloadError, encode_fetch_event_payload};
 
 /// Reject framing that a permissive SSE decoder would silently normalize.
-pub fn push_sse(
+pub(crate) fn push_sse(
     decoder: &mut SseDecoder,
     bytes: &[u8],
 ) -> Result<Vec<WireStreamEvent>, FetchAdaptorError> {
@@ -33,7 +33,9 @@ pub fn push_sse(
     Ok(frames)
 }
 
-pub fn project_events(events: &[OutputEvent]) -> Result<Vec<ProjectedFetch>, FetchPayloadError> {
+pub(crate) fn project_events(
+    events: &[OutputEvent],
+) -> Result<Vec<ProjectedFetch>, FetchPayloadError> {
     events
         .iter()
         .map(|event| encode_fetch_event_payload(event).map(ProjectedFetch::Event))

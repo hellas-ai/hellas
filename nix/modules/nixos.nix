@@ -12,10 +12,7 @@ let
   inherit (lib) mkIf mkOption types;
   cfg = config.services.hellas;
   inherit (cfg) gateway;
-  hellasLib = import ../lib {
-    inherit pkgs;
-    inherit (self.inputs) nix-strix-halo;
-  };
+  hellasLib = import ../lib { inherit pkgs; };
   normalizeRuntimePath = hellas.lexicallyNormalizeAbsolutePath lib;
   pathWithin =
     root: path:
@@ -61,7 +58,8 @@ let
   defaultGpuSessionAssetBytes = 128 * 1024 * 1024 * 1024;
   effectiveGpuSessionAssetBytes =
     if cfg.gpuSessionAssetBytes == null then defaultGpuSessionAssetBytes else cfg.gpuSessionAssetBytes;
-  inherit (hellasLib) rocmToolkit cudaToolkit;
+  inherit (hellasLib) cudaToolkit;
+  rocmToolkit = hellasLib.mkRocmToolkit cfg.rocmPackages;
   nvidiaDriverEnabled = builtins.elem "nvidia" config.services.xserver.videoDrivers;
   useCuda = cfg.gpuBackend == "cuda" || (cfg.gpuBackend == null && nvidiaDriverEnabled);
   useHip = cfg.gpuBackend == "hip" || (cfg.gpuBackend == null && !nvidiaDriverEnabled);
@@ -166,6 +164,16 @@ in
           '';
           description = "The hellas CLI used to run the HTTP gateway.";
         };
+      };
+      rocmPackages = mkOption {
+        type = types.raw;
+        default = pkgs.rocmPackages;
+        defaultText = lib.literalExpression "pkgs.rocmPackages";
+        description = ''
+          ROCm package set from which the HIP toolkit is assembled when the
+          HIP backend is used. It must provide clang, clr, hip-common, hipcc,
+          rocm-core, rocm-device-libs and rocm-runtime.
+        '';
       };
       openFirewall = mkOption {
         type = types.bool;

@@ -2137,11 +2137,11 @@ fn grant_composition<'a>(
             .budgets(
                 common_node::POOL,
                 subject,
-                vec![Limit {
-                    meter: Meter::Requests,
-                    window: Window::Total,
-                    amount: if cli_binary.is_some() { 3 } else { 2 },
-                }],
+                vec![Limit::new(
+                    Meter::Requests,
+                    Window::Total,
+                    if cli_binary.is_some() { 3 } else { 2 },
+                )],
                 2,
             )
             .await;

@@ -18,18 +18,24 @@
 //!
 //! Rule of thumb: if the bytes get signed, the codec belongs in rpc; if
 //! the bytes match a vendor's HTTP API, the conversion belongs here.
+//!
+//! The sealed Fetch request lenses and response projectors also live here
+//! and implement `hellas-executor`'s Fetch adaptor traits. That dependency
+//! is one-way too: executor knows no vendor format, and providers only
+//! carry the bytes these lenses build to the vendor endpoint.
 
 pub mod adaptor;
 pub mod anthropic;
 pub mod backend;
 pub mod error;
 pub mod execution;
+mod fetch;
 mod json;
 pub mod openai;
 pub mod request;
 pub mod wire;
 
-pub use adaptor::{WireAdaptor, WireIngress};
+pub use adaptor::WireAdaptor;
 pub use backend::{
     BackendError, BackendEvent, BackendEventStream, BackendFuture, BackendRequest, BackendResult,
     BackendStream, ExecutionBackend,

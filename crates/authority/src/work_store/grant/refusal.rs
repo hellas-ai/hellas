@@ -1,6 +1,7 @@
 //! Structured grant refusals. Diagnostics never select client recovery policy.
 use super::{NodeStoreError, ledger::LedgerError};
 use crate::model::grant::{records::GrantError, resource::TemplateError};
+use hellas_admission::{Why, Window};
 use hellas_channel::work_store::ChannelStateError;
 use hellas_rpc::pb::work::{GrantRefusal, GrantRefusalCode, WorkRefusalCode, WorkRefused};
 
@@ -81,9 +82,12 @@ impl From<&NodeStoreError> for WorkRefused {
                 | GrantError::UnsupportedRoot
                 | GrantError::Limits => C::Malformed,
             },
+            NodeStoreError::Refused(refusal) => match refusal.why {
+                Why::Limit(_, Window::Held) | Why::Impossible(_, Window::Held) => C::Concurrency,
+                Why::Limit(..) | Why::Impossible(..) => C::Budget,
+                _ => C::Malformed,
+            },
             NodeStoreError::Ledger(error) => match error {
-                LedgerError::OverBudget { .. } => C::Budget,
-                LedgerError::Concurrent(_) => C::Concurrency,
                 LedgerError::Revision => C::StaleRevision,
                 LedgerError::Capacity => C::StateCapacity,
                 _ => C::Malformed,
