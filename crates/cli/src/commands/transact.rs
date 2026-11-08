@@ -180,6 +180,9 @@ pub struct Context {
     pub owner: hellas_kernel::SoftPasskey,
     pub home: StoreLocation,
     pub chain: hellas_chain::chain_dir::ChainDir,
+    /// Bound on first use; [`bounded`] closes them however the command ends.
+    paid_endpoint: tokio::sync::OnceCell<iroh::Endpoint>,
+    grant_endpoint: tokio::sync::OnceCell<iroh::Endpoint>,
 }
 
 impl Context {
@@ -198,7 +201,19 @@ impl Context {
                 .clone(),
             home: home.clone(),
             chain: hellas_chain::chain_dir::ChainDir::open(home, chain)?,
+            paid_endpoint: tokio::sync::OnceCell::new(),
+            grant_endpoint: tokio::sync::OnceCell::new(),
         })
+    }
+
+    async fn paid_endpoint(&self) -> super::CliResult<iroh::Endpoint> {
+        let bind = || bind_paid_endpoint(self.transport.clone());
+        Ok(self.paid_endpoint.get_or_try_init(bind).await?.clone())
+    }
+
+    async fn grant_endpoint(&self) -> super::CliResult<iroh::Endpoint> {
+        let bind = || hellas_sdk::grant_client::bind_endpoint(self.transport.clone());
+        Ok(self.grant_endpoint.get_or_try_init(bind).await?.clone())
     }
 }
 
@@ -367,18 +382,28 @@ fn select_attempt(
     Ok(attempt)
 }
 
-/// Bound `work` by `--timeout`; without one, wait until it is done.
+/// Bound `work` by `--timeout`; without one, wait until it is done. Then
+/// close the endpoints it bound, outside the bound, so an expired command
+/// still closes them.
 async fn bounded<T>(
+    context: &Context,
     timeout: Option<Duration>,
     work: impl std::future::Future<Output = super::CliResult<T>>,
     expired: impl FnOnce(Duration) -> String,
 ) -> super::CliResult<T> {
-    match timeout {
+    let result = match timeout {
         Some(timeout) => tokio::time::timeout(timeout, work)
             .await
-            .map_err(|_| anyhow::anyhow!(expired(timeout)))?,
+            .unwrap_or_else(|_| Err(anyhow::anyhow!(expired(timeout)))),
         None => work.await,
+    };
+    for endpoint in [context.paid_endpoint.get(), context.grant_endpoint.get()]
+        .into_iter()
+        .flatten()
+    {
+        endpoint.close().await;
     }
+    result
 }
 
 async fn execute(
@@ -452,18 +477,9 @@ async fn purchase_and_execute(
     let content = options.content.clone();
     let delivered = async {
         let mut purchase = args.purchase(context, job, &options)?;
-        let endpoint = bind_paid_endpoint(context.transport.clone()).await?;
-        let result = execute(
-            args,
-            context,
-            job,
-            options.clone(),
-            endpoint.clone(),
-            &mut purchase,
-        )
-        .await;
-        hellas_wire::iroh::close(&endpoint).await;
-        deliver_paid(args, context, &options, &mut purchase, &result?, deliver).await
+        let endpoint = context.paid_endpoint().await?;
+        let result = execute(args, context, job, options.clone(), endpoint, &mut purchase).await?;
+        deliver_paid(args, context, &options, &mut purchase, &result, deliver).await
     }
     .await;
     content.close().await;
@@ -522,7 +538,7 @@ pub async fn run(args: TransactArgs, context: Context) -> super::CliResult<()> {
         Some(path) => Some(Job::load(path).await?),
         None => None,
     };
-    bounded(args.client.timeout, async {
+    bounded(&context, args.client.timeout, async {
         let Some(job) = job else { return client::settle(&args.client, &context).await; };
         if args.grant.offer.is_some() {
             return grant::run(&args.grant, &args.client, &context, &job, args.output.as_deref()).await;
@@ -547,6 +563,7 @@ pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
     let contract = args.contract()?;
     ensure!(args.payment > 0, "--payment must be positive");
     bounded(
+        &context,
         args.client.timeout,
         async {
             let options = args
@@ -554,7 +571,7 @@ pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
                 .options(&context, args.payment, args.assurance())
                 .await?;
             let content = options.content.clone();
-            let endpoint = bind_paid_endpoint(context.transport.clone()).await?;
+            let endpoint = context.paid_endpoint().await?;
             let result = async {
                 let quote = request_paid_quote(
                     &options,
@@ -633,7 +650,6 @@ pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
                 }).await
             }
             .await;
-            hellas_wire::iroh::close(&endpoint).await;
             content.close().await;
             result
         },

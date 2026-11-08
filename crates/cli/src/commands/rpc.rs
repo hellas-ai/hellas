@@ -30,7 +30,7 @@ pub async fn run(
         .context("failed to bind iroh endpoint")?;
 
     let result = query(&endpoint, node_id, node_addrs).await;
-    hellas_wire::iroh::close(&endpoint).await;
+    endpoint.close().await;
     result
 }
 

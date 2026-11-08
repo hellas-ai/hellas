@@ -201,12 +201,31 @@ impl PaidGateway {
             .map_err(hellas_channel::work_store::WorkStoreError::from)?;
         let settlement_key = Secp256k1Signer::from_secret_scalar(identity.node_secret_bytes())
             .map_err(|_| PoolError::Invalid("node key is not a secp256k1 channel signer"))?;
-        let endpoint = bind_paid_endpoint(identity.transport_key()).await?;
         if owner.delegate() != settlement_key.party_key() {
             return Err(PoolError::Invalid(
                 "funding delegate differs from the gateway settlement key",
             ));
         }
+        let endpoint = bind_paid_endpoint(identity.transport_key()).await?;
+        let assembled = Self::assemble(
+            options,
+            identity,
+            owner,
+            funding,
+            settlement_key,
+            endpoint.clone(),
+        );
+        hellas_wire::iroh::close_on_error(&endpoint, assembled).await
+    }
+
+    async fn assemble(
+        options: PaidGatewayOptions,
+        identity: crate::NodeIdentity,
+        owner: Arc<crate::client_owner::ClientOwner>,
+        funding: crate::paid_client::SessionFundingOptions,
+        settlement_key: Secp256k1Signer,
+        endpoint: Endpoint,
+    ) -> Result<Arc<Self>> {
         let mut providers = Vec::with_capacity(options.providers.len());
         for provider in options.providers {
             let args = provider.with_config(options.config.clone(), options.content.clone());
@@ -651,7 +670,7 @@ impl WorkSource for PaidPool {
                     session.shutdown().await;
                 }
             }
-            hellas_wire::iroh::close(&self.endpoint).await;
+            self.endpoint.close().await;
             Ok(())
         })
     }

@@ -56,6 +56,32 @@ fn grant_execution_requires_explicit_access_and_refuses_paid_options() {
 }
 
 #[tokio::test]
+async fn an_expired_command_closes_the_endpoint_it_bound() {
+    let root = tempfile::tempdir().unwrap();
+    let identity = crate::identity::load_or_create(&root.path().join("identity")).unwrap();
+    let cli = crate::Cli::try_parse_from(["hellas", "--faucet-account", "7", "serve"]).unwrap();
+    let chain = hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet);
+    let owner = cli.owner.load(&chain).unwrap().unwrap();
+    let context = Context::new(
+        &identity,
+        Some(&owner),
+        &StoreLocation::for_test(root.path()),
+        &chain,
+    )
+    .unwrap();
+    let endpoint = context.paid_endpoint().await.unwrap();
+    let result: crate::commands::CliResult<()> = bounded(
+        &context,
+        Some(Duration::from_millis(1)),
+        std::future::pending(),
+        |_| "expired".into(),
+    )
+    .await;
+    assert_eq!(result.unwrap_err().to_string(), "expired");
+    assert!(endpoint.is_closed());
+}
+
+#[tokio::test]
 async fn paid_deadline_options_reach_the_signed_job_configuration() {
     let root = tempfile::tempdir().unwrap();
     let identity_path = root.path().join("identity");

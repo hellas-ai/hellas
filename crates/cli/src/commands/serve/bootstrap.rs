@@ -52,7 +52,19 @@ pub async fn prepare(
         config.remote_control.clone(),
     )
     .await?;
-    let invitation = bootstrap::Invitation::create(&endpoint, now)?;
+    hellas_wire::iroh::close_on_error(&endpoint, pair(&endpoint, &config, identity, &root, now))
+        .await?;
+    Ok((config, Some(endpoint)))
+}
+
+async fn pair(
+    endpoint: &iroh::Endpoint,
+    config: &GrantConfig,
+    identity: &LocalIdentity,
+    root: &std::path::Path,
+    now: hellas_auth::authority::UnixMillis,
+) -> Result<()> {
+    let invitation = bootstrap::Invitation::create(endpoint, now)?;
     let invitation_path = root.join("invitation.json");
     hellas_private::write_atomically(
         &invitation_path,
@@ -65,7 +77,7 @@ pub async fn prepare(
     eprintln!("Obtain this pairing document through the authenticated machine console:");
     println!("{}", serde_json::to_string(&invitation)?);
     let result = bootstrap::accept(
-        &endpoint,
+        endpoint,
         &invitation,
         &config.journal_root(),
         hellas_authority::model::grant::grant_network(),
@@ -74,6 +86,5 @@ pub async fn prepare(
     .await;
     result.context(
         "owner bootstrap refused or expired; restart explicitly to create a new pairing invitation",
-    )?;
-    Ok((config, Some(endpoint)))
+    )
 }

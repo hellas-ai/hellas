@@ -129,7 +129,7 @@ pub async fn run(
             challenge.generation,
         )
         .await;
-        hellas_wire::iroh::close(&endpoint).await;
+        endpoint.close().await;
         result
     } else {
         let authorization = profile.authorization;
@@ -153,7 +153,7 @@ pub(in crate::commands) async fn connect_remote(
         .secret_key(identity.transport_key.clone())
         .bind()
         .await?;
-    let result = async {
+    let (client, challenge) = hellas_wire::iroh::close_on_error(&endpoint, async {
         let address = iroh::EndpointAddr::from_parts(
             node,
             addresses.into_iter().map(iroh::TransportAddr::Ip),
@@ -170,15 +170,9 @@ pub(in crate::commands) async fn connect_remote(
             node_control::connect_iroh(connection, profile.authority, &profile.credential, key)
                 .await?,
         )
-    }
-    .await;
-    match result {
-        Ok((client, challenge)) => Ok((endpoint, client, challenge)),
-        Err(error) => {
-            hellas_wire::iroh::close(&endpoint).await;
-            Err(error)
-        }
-    }
+    })
+    .await?;
+    Ok((endpoint, client, challenge))
 }
 pub(in crate::commands) async fn connect_local(
     profile: profile::ClientProfile,
@@ -636,7 +630,7 @@ async fn bootstrap_remote(
         .bind()
         .await?;
     let result = node_control::bootstrap::connect(&endpoint, &invitation, root, approval).await;
-    hellas_wire::iroh::close(&endpoint).await;
+    endpoint.close().await;
     result.with_context(|| format!("credential {} retained in {}; authenticate and inspect its exact ID after a lost reply", secret.id(), profile.display()))?;
     println!(
         "{}",

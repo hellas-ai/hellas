@@ -228,7 +228,7 @@ impl<L> ExecutionRuntime<L> {
     /// Long-lived callers such as the HTTP gateway keep their runtime instead.
     pub async fn close_remote(&self) {
         if let Some(remote) = &self.remote {
-            hellas_wire::iroh::close(&remote.endpoint).await;
+            remote.endpoint.close().await;
         }
     }
 

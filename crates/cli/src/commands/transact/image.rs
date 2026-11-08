@@ -44,6 +44,7 @@ pub async fn image(args: ImageArgs, context: Context) -> super::super::CliResult
     .await?;
     eprintln!("job: {}", directory.display());
     bounded(
+        &context,
         args.client.timeout,
         async {
             if args.grant.offer.is_some() {

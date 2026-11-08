@@ -1224,11 +1224,16 @@ fn run(
             .as_ref()
             .try_into()
             .expect("an Ed25519 private key is 32 bytes");
-        let peer_service = ::tokio::spawn(crate::node::serve_validator_archive(
-            chain_indexer.clone(),
-            activity_tx.clone(),
+        let peer_endpoint = crate::node::bind_validator_endpoint(
             iroh::SecretKey::from_bytes(&peer_key),
             validator_config.chain_sync_bind,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("chain peer endpoint failed to bind: {error}"));
+        let peer_service = ::tokio::spawn(crate::node::serve_validator_endpoint(
+            chain_indexer.clone(),
+            activity_tx.clone(),
+            peer_endpoint.clone(),
             databases.clone(),
             crate::ConsensusVerifier::new(&consensus_info, genesis_digest)
                 .expect("provisioned consensus identity"),
@@ -1341,6 +1346,9 @@ fn run(
         );
 
         let (trigger, _, _) = futures::future::select_all(waiters).await;
+        // Chain peer serving ends with its endpoint, which the runtime stop
+        // below would otherwise drop mid-connection.
+        peer_endpoint.close().await;
 
         let signal_triggered = matches!(trigger, ShutdownTrigger::Signal(_));
         match trigger {
