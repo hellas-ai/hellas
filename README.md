@@ -466,10 +466,8 @@ CLI or GPU releases.
 
 The `unit` check (`nix build .#checks.x86_64-linux.unit`, the PR "Unit tests"
 job) runs the workspace tests once under `cargo llvm-cov`. It fails on a
-failing test, and if any crate's production line coverage falls more than 0.5
-points below its floor in `nix/coverage-floor.json`. Its output holds
-`lcov.info`, `summary.json`, `summary.txt` and the `coverage-floor.json` the run
-would record: after raising coverage, copy that file over the committed one.
+failing test and prints line coverage, which is informational and never fails
+the check. Its output holds `lcov.info`, `summary.json` and `summary.txt`.
 
 ## Docker
 
