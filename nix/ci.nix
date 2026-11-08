@@ -1,6 +1,7 @@
 {
   bufLintCommand,
   clippyArgs,
+  cargoSelections,
   denyCommand,
   cargoDeps,
   pkgs,
@@ -11,6 +12,7 @@
 }:
 let
   isValidatorHost = pkgs.stdenv.hostPlatform.system == "x86_64-linux";
+  s = cargoSelections;
 
   mk =
     name: cmd: inputs:
@@ -96,7 +98,7 @@ let
     # Tests wait on events and fail only on a documented hang guard, so they
     # run with libtest's default parallelism rather than one at a time.
     regressions = mkCargo "check-regressions" ''
-      cargo test --locked --workspace --features integration-tests,hellas-chain/indexer-api
+      cargo test --locked ${s.workspace}
     '' (cargoEnv rustToolchain);
     # Resolve the entire locked graph with an empty Cargo home before compiling.
     # This catches source replacement regressions without runner credentials.
@@ -108,44 +110,42 @@ let
     # The default CLI includes client, gateway and daemon. Check the optional
     # execution, indexing, consensus and telemetry integrations separately.
     clippy-features = mkCargo "check-clippy-features" (builtins.concatStringsSep " && " (
-      map
-        (f: "cargo clippy -p hellas-cli --no-default-features --features ${f} --all-targets -- -D warnings")
-        (
-          [
-            "integration-tests"
-            "indexer"
-            "otel"
-          ]
-          ++ lib.optionals isValidatorHost [ "validator" ]
-        )
+      map (selection: "cargo clippy ${selection} --all-targets -- -D warnings") (
+        [
+          s.cli-only-integration
+          s.cli-only-indexer
+          s.cli-only-otel
+        ]
+        ++ lib.optionals isValidatorHost [ s.cli-only-validator ]
+      )
     )) (cargoEnv rustToolchain);
     # Compile consumers without validator feature unification masking missing
     # module gates or imports used only by the indexer API.
     chain-features = mkCargo "check-chain-features" ''
-      cargo clippy -p hellas-chain --no-default-features --features client-core --all-targets -- -D warnings
-      cargo clippy -p hellas-chain --no-default-features --features proof-verify --all-targets -- -D warnings
-      cargo clippy -p hellas-chain --no-default-features --features full-node --all-targets -- -D warnings
-      cargo check -p hellas-chain --no-default-features --features test-support,indexer-api --lib
-      cargo check -p hellas-sdk --all-features --all-targets
+      cargo clippy ${s.chain-client-core} --all-targets -- -D warnings
+      cargo clippy ${s.chain-proof-verify} --all-targets -- -D warnings
+      cargo clippy ${s.chain-full-node} --all-targets -- -D warnings
+      cargo check ${s.chain-test-support} --lib
+      cargo check ${s.sdk-all} --all-targets
     '' (cargoEnv rustToolchain);
     # Run command tests locally as well as in the release package builds.
     cli = mkCargo "check-cli" ''
-      cargo test -p hellas-cli --features integration-tests
-      cargo build -p hellas-cli --bin hellas
+      cargo test ${s.cli-integration}
+      cargo build ${s.cli} --bin hellas
       HELLAS_CLI_TEST_BINARY="$(realpath "''${CARGO_TARGET_DIR:-target}/debug/hellas")"
       export HELLAS_CLI_TEST_BINARY
-      cargo test -p hellas-sdk --features integration-tests --test native_execution cli_settles_paid_channel_without_provider_or_object_proofs -- --ignored
+      cargo test ${s.sdk-integration} --test native_execution cli_settles_paid_channel_without_provider_or_object_proofs -- --ignored
       # The paid/grant composition case re-executes a Catena compile worker,
       # whose process isolation is implemented only on Linux.
       ${lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
-        cargo test -p hellas-sdk --features integration-tests --test native_execution cli_paid_and_grant_two_provider_composition -- --ignored
+        cargo test ${s.sdk-integration} --test native_execution cli_paid_and_grant_two_provider_composition -- --ignored
       ''}
-      cargo test -p hellas-cli --features otel,integration-tests --test grant_http metrics_scrape_observes_gateway_and_serve_work
+      cargo test ${s.cli-otel-integration} --test grant_http metrics_scrape_observes_gateway_and_serve_work
     '' (cargoEnv rustToolchain);
     cloud = mkCargo "check-cloud" ''
-      cargo test -p hellas-cloud
-      cargo test -p hellas-cli
-      cargo build -p hellas-cli
+      cargo test ${s.cloud}
+      cargo test ${s.cli}
+      cargo build ${s.cli}
     '' (cargoEnv rustToolchain);
     # The kernel's whole suite, including `tests/itf.rs` — the Quint↔Rust
     # replay that the entire abstract-correspondence story rests on — and
@@ -153,10 +153,8 @@ let
     # bearing: `secp256k1`, `webauthn`, and `test-support` gate whole test
     # files, and a bare `cargo test -p hellas-kernel` compiles them away
     # to empty binaries.
-    kernel = mkCargo "check-kernel" "cargo test -p hellas-kernel --all-features" (
-      cargoEnv rustToolchain
-    );
-    executor = mkCargo "check-executor" "cargo test -p hellas-executor" (cargoEnv rustToolchain);
+    kernel = mkCargo "check-kernel" "cargo test ${s.kernel}" (cargoEnv rustToolchain);
+    executor = mkCargo "check-executor" "cargo test ${s.executor}" (cargoEnv rustToolchain);
     # Money-only consumers keep node authority, attestation and compression out
     # of their production dependency graph. Grant-aware dev fixtures are separate.
     channel-dependencies = mkCargo "check-channel-dependencies" ''
@@ -188,7 +186,7 @@ let
     # Test each complete package so service/method identity pins stay covered.
     rpc-work =
       mkCargo "check-rpc-work"
-        "cargo check -p hellas-rpc --no-default-features && cargo test -p hellas-rpc --features work && cargo test -p hellas-channel -p hellas-authority && cargo clippy -p hellas-rpc --features work --all-targets -- -D warnings && cargo clippy -p hellas-channel -p hellas-authority --all-targets -- -D warnings"
+        "cargo check ${s.rpc} && cargo test ${s.rpc-work} && cargo test ${s.channel-authority} && cargo clippy ${s.rpc-work} --all-targets -- -D warnings && cargo clippy ${s.channel-authority} --all-targets -- -D warnings"
         (cargoEnv rustToolchain);
     # The client's paid-work half and the oracle inside it. `work` is off
     # by default on `hellas-client`, so `check-clippy` compiles none of
@@ -197,20 +195,17 @@ let
     # check does. All three run only here.
     client-work =
       mkCargo "check-client-work"
-        "cargo test -p hellas-client --features work && cargo clippy -p hellas-client --features work --all-targets -- -D warnings"
+        "cargo test ${s.client-work} && cargo clippy ${s.client-work} --all-targets -- -D warnings"
         (cargoEnv rustToolchain);
     # HTTP boundaries and the bounded file primitives shared by hosts.
-    http-fetch =
-      mkCargo "check-http-fetch"
-        "cargo test -p hellas-gateway -p hellas-providers -p hellas-private -p hellas-store"
-        (cargoEnv rustToolchain);
+    http-fetch = mkCargo "check-http-fetch" "cargo test ${s.http}" (cargoEnv rustToolchain);
     # Native host composition has one implementation for both funding modes.
     sdk-paid-work = mkCargo "check-sdk-paid-work" ''
       # These native cases each start a six-validator devnet. Serializing the
       # test harness avoids cross-test resource starvation; the cases retain
       # their own concurrent-client and cancellation assertions.
-      RUST_TEST_THREADS=1 cargo test -p hellas-sdk --features integration-tests
-      cargo clippy -p hellas-sdk --features integration-tests --all-targets -- -D warnings
+      RUST_TEST_THREADS=1 cargo test ${s.sdk-integration}
+      cargo clippy ${s.sdk-integration} --all-targets -- -D warnings
     '' (cargoEnv rustToolchain);
     # The chain service's wire-id pins compile only under `chain`, which
     # `work` does not pull in. `check-validator` links hellas-rpc with
@@ -220,12 +215,11 @@ let
     # reached deployed nodes with every check green.
     rpc-chain =
       mkCargo "check-rpc-chain"
-        "cargo test -p hellas-rpc --features chain && cargo clippy -p hellas-rpc --features chain --all-targets -- -D warnings"
+        "cargo test ${s.rpc-chain} && cargo clippy ${s.rpc-chain} --all-targets -- -D warnings"
         (cargoEnv rustToolchain);
-    validator =
-      mkCargo "check-validator"
-        "cargo test -p hellas-chain --no-default-features --features validator,integration-tests"
-        (cargoEnv rustToolchain);
+    validator = mkCargo "check-validator" "cargo test ${s.chain-validator-integration}" (
+      cargoEnv rustToolchain
+    );
     # `check-validator` above runs tests, where `dead_code` is only a
     # warning, so the two feature sets a node actually ships in were the
     # only ones never linted. Three items in `execution::owner_tree` and
@@ -234,11 +228,11 @@ let
     # `kernel::execute_all`. Lint both.
     chain-validator-lint =
       mkCargo "check-chain-validator-lint"
-        "cargo clippy -p hellas-chain --no-default-features --features validator --all-targets -- -D warnings"
+        "cargo clippy ${s.chain-validator} --all-targets -- -D warnings"
         (cargoEnv rustToolchain);
     chain-indexer-lint =
       mkCargo "check-chain-indexer-lint"
-        "cargo clippy -p hellas-chain --no-default-features --features indexer --all-targets -- -D warnings && cargo clippy -p hellas-chain --no-default-features --features indexer-api,integration-tests --all-targets -- -D warnings"
+        "cargo clippy ${s.chain-indexer} --all-targets -- -D warnings && cargo clippy ${s.chain-indexer-api} --all-targets -- -D warnings"
         (cargoEnv rustToolchain);
     # The finalized-block codec without a database or a mempool: the
     # feature an endpoint enables to read the block its channel opened
@@ -246,8 +240,7 @@ let
     # also enables the execution layer the split was made to avoid — so
     # only this line fails if the codec grows a dependency back on it.
     chain-block-view =
-      mkCargo "check-chain-block-view"
-        "cargo clippy -p hellas-chain --no-default-features --features block-view --all-targets -- -D warnings"
+      mkCargo "check-chain-block-view" "cargo clippy ${s.chain-block-view} --all-targets -- -D warnings"
         (cargoEnv rustToolchain);
     # The settlement watcher's block source: the codec above plus the
     # paid endpoint's journal. It is the only dimension that compiles
@@ -256,7 +249,7 @@ let
     # hands a watcher.
     chain-work-watcher =
       mkCargo "check-chain-work-watcher"
-        "cargo clippy -p hellas-chain --no-default-features --features work-watcher --all-targets -- -D warnings"
+        "cargo clippy ${s.chain-work-watcher} --all-targets -- -D warnings"
         (cargoEnv rustToolchain);
     # The setup driver end to end. It needs both halves at once —
     # `validator` for the database, the kernel, and the indexer, and
@@ -264,10 +257,7 @@ let
     # two dimensions above runs a test with the other's code compiled
     # in. This is the only line that runs a paid channel being opened
     # against real finalized blocks.
-    chain-setup =
-      mkCargo "check-chain-setup"
-        "cargo test -p hellas-chain --no-default-features --features validator,work-watcher,indexer-api,integration-tests"
-        (cargoEnv rustToolchain);
+    chain-setup = mkCargo "check-chain-setup" "cargo test ${s.chain-setup}" (cargoEnv rustToolchain);
     sort = mk "check-sort" "cargo-sort --workspace --check --no-format" [ pkgs.cargo-sort ];
     taplo =
       mk "check-taplo" "taplo fmt --option 'indent_string=    ' --check '*.toml' 'crates/**/Cargo.toml'"
@@ -362,8 +352,7 @@ let
   fixes = {
     fmt = mk "fix-fmt" "cargo fmt --all" [ rustToolchain ];
     clippy =
-      mkCargo "fix-clippy"
-        "cargo clippy --workspace --all-targets --features integration-tests,hellas-chain/indexer-api --fix --allow-dirty --allow-staged"
+      mkCargo "fix-clippy" "cargo clippy ${s.workspace} --all-targets --fix --allow-dirty --allow-staged"
         (cargoEnv rustToolchain);
     sort = mk "fix-sort" "cargo-sort --workspace --no-format" [ pkgs.cargo-sort ];
   };
