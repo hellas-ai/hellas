@@ -23,8 +23,8 @@ pub(super) struct Source {
     observation_gate: Arc<std::sync::Mutex<Option<ObservationGate>>>,
 }
 
-// The retained, single-source opener reads applied Latest for selection,
-// setup, mounted floor, readiness, catch-up, then initial observation.
+// Latest object reads carry their own block, so the retained opener reads
+// applied Latest only for the mounted floor, catch-up, then initial observation.
 #[derive(Clone)]
 struct ObservationGate {
     reads: Arc<AtomicUsize>,
@@ -91,10 +91,10 @@ impl hellas_chain::LightClient for Source {
             && let Some(gate) = gate
         {
             let read = gate.reads.fetch_add(1, Ordering::SeqCst) + 1;
-            if read == 5 {
+            if read == 2 {
                 tokio::time::sleep(gate.delay).await;
             }
-            if read >= 6 {
+            if read >= 3 {
                 let _ = gate.first_blocked.compare_exchange(
                     0,
                     read,
@@ -721,7 +721,6 @@ pub(super) async fn opening_cancellation_releases_the_mounted_client_journal(
         let mut options = case.options.clone();
         let poll = options.config.poll();
         options.config = options.config.with_max_observation_age(poll * 2);
-        options.timeout = case.options.timeout;
         let gate = ObservationGate {
             reads: Arc::new(AtomicUsize::new(0)),
             first_blocked: Arc::new(AtomicUsize::new(0)),
@@ -746,8 +745,8 @@ pub(super) async fn opening_cancellation_releases_the_mounted_client_journal(
         }).await.unwrap();
         assert_eq!(
             gate.first_blocked.load(Ordering::SeqCst),
-            6,
-            "the controlled sixth applied read is initial observation"
+            3,
+            "the controlled third applied read is initial observation"
         );
         assert!(matches!(
             ChannelStore::recover(
