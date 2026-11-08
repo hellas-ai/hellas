@@ -587,8 +587,10 @@ pub(super) async fn proofs(runtime: commonware_runtime::tokio::Context) {
         .chain
         .with_validators(vec![relays.urls[0].clone()])
         .unwrap();
+    // Retrying is observed through the refusals below, so this deadline only
+    // guards a hang; expiry is asserted separately with a 100 ms deadline.
     relays.source.tips_unavailable.store(true, Ordering::SeqCst);
-    let connecting = hellas_sdk::client_chain::connect(&config, Duration::from_secs(2));
+    let connecting = hellas_sdk::client_chain::connect(&config, HANG_GUARD);
     tokio::pin!(connecting);
     tokio::select! {
         result = &mut connecting => panic!("source selection ended before retrying unavailable tips: {}", result.err().map_or_else(|| "unexpected success".into(), |error| error.to_string())),
@@ -598,7 +600,7 @@ pub(super) async fn proofs(runtime: commonware_runtime::tokio::Context) {
         .source
         .tips_unavailable
         .store(false, Ordering::SeqCst);
-    assert!(connecting.await.is_ok());
+    connecting.await.unwrap();
     relays.source.tips_unavailable.store(true, Ordering::SeqCst);
     assert!(matches!(
         hellas_sdk::client_chain::connect(&config, Duration::from_millis(100)).await,
