@@ -27,6 +27,16 @@ jobs:
         run: >-
           nix build --accept-flake-config --print-build-logs --no-link
           .#checks.x86_64-linux.{actions,buf,clippy,deadnix,fmt,nixfmt,no-catgrad-lock,sort,statix,taplo}
+      # Hydra only reports evaluation errors after merge, on a tab nobody
+      # watches; evaluate every job here so a broken one fails the PR.
+      - name: Nix job evaluation
+        run: |
+          failed=$(nix eval --accept-flake-config --impure --json --expr \
+            "import ./nix/ci/eval-jobs.nix { flake = builtins.getFlake (toString ./.); }")
+          if [ "$failed" != "[]" ]; then
+            echo "Jobs that fail to evaluate: $failed" >&2
+            exit 1
+          fi
       # Not derivations: deny needs the advisory database, the others inspect
       # the dependency graph or one narrow feature set.
       - name: Dependency lints
