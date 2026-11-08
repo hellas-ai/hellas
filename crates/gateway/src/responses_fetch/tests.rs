@@ -80,23 +80,15 @@ async fn fixture(name: &str, request: Value, events: Vec<OutputEvent>, expected:
             models: Vec::new(),
         },
     };
-    let adaptor = OpenAiResponsesAdaptor;
-    let (parsed, request) = super::super::dispatch::parse_backend_request(
-        &adaptor,
-        &Bytes::from(serde_json::to_vec(&request).unwrap()),
-        "OpenAI Responses",
-    )
-    .unwrap();
     // Pin only rendering metadata; compare the actual SSE body without
     // parsing, normalizing, or reserializing any event bytes.
-    let response = super::super::dispatch::backend_wire_response(
-        true,
-        adaptor,
-        parsed,
-        backend,
-        request,
-        RenderContext::new("resp-fixture", "msg-fixture", 1_700_000_000),
+    let response = super::super::dispatch::serve(
+        OpenAiResponsesAdaptor,
         "OpenAI Responses",
+        hellas_adaptors::RenderContext::new("resp-fixture", "msg-fixture", 1_700_000_000),
+        backend,
+        None,
+        &serde_json::to_vec(&request).unwrap(),
     )
     .await;
     assert_eq!(response.status(), axum::http::StatusCode::OK);

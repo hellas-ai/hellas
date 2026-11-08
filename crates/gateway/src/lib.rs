@@ -3,7 +3,6 @@ extern crate tracing;
 
 mod access;
 pub use access::GatewayAccess;
-mod anthropic;
 mod archive;
 mod audio;
 mod backend;
@@ -14,10 +13,7 @@ mod error;
 pub use error::{GatewayConfigError, GatewayError, GatewayResult};
 mod http_fetch;
 mod image;
-mod openai;
-mod plain;
 mod provenance_layer;
-mod responses;
 mod responses_fetch;
 mod state;
 mod wrap;

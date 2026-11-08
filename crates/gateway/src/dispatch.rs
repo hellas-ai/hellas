@@ -1,40 +1,34 @@
-use axum::body::{Body, Bytes};
+use axum::body::Body;
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::Response;
 use axum::response::sse::Event;
 use futures::StreamExt;
 use hellas_adaptors::{
-    AdaptorError, BackendError, BackendEvent, BackendRequest, ExecutionBackend, OutputEvent,
-    Provenance, RawRequest, RenderContext, WireAdaptor, WireBody, WireEventData, WireResponse,
-    WireStreamEvent,
+    AdaptorError, AdaptorResult, BackendError, BackendEvent, BackendRequest, BackendStream,
+    ExecutionBackend, OutputEvent, Provenance, RawRequest, RenderContext, WireAdaptor, WireBody,
+    WireEventData, WireResponse, WireStreamEvent,
 };
 use hellas_rpc::provenance::{ExecutionProvenance, parse_public_key};
 
-use super::{json_error, sse_data, sse_event_data, sse_response};
+use serde_json::Value as JsonValue;
 
-pub(super) fn parse_backend_request<A: WireAdaptor>(
-    adaptor: &A,
-    body: &Bytes,
-    surface: &str,
-) -> Result<(A::ParsedRequest, BackendRequest), Box<Response>> {
-    let raw = RawRequest::from_slice(body).map_err(|err| Box::new(adaptor_error(surface, err)))?;
-    let parsed = adaptor
-        .parse(raw.clone())
-        .map_err(|err| Box::new(adaptor_error(surface, err)))?;
-    let execution = adaptor
-        .to_execution_request(&parsed)
-        .map_err(|err| Box::new(adaptor_error(surface, err)))?;
-    Ok((parsed, BackendRequest::new(execution, raw)))
+use super::{json_error, next_id, now_unix, sse_data, sse_event_data, sse_response};
+
+/// The response ids and creation time `prefix` names for one request.
+pub(super) fn render_context(prefix: &str) -> RenderContext {
+    RenderContext::new(next_id(prefix), next_id("msg"), now_unix())
 }
 
-pub(super) async fn backend_wire_response<A, B>(
-    stream: bool,
+/// Serve one wire-format request on `backend`: parse it, run it, render the
+/// result in the same format. `model`, if given, replaces the model the
+/// request names.
+pub(super) async fn serve<A, B>(
     adaptor: A,
-    parsed: A::ParsedRequest,
-    backend: B,
-    request: BackendRequest,
-    context: RenderContext,
     surface: &'static str,
+    context: RenderContext,
+    backend: B,
+    model: Option<&str>,
+    body: &[u8],
 ) -> Response
 where
     A: WireAdaptor + Send + 'static,
@@ -42,29 +36,46 @@ where
     A::StreamState: Send + 'static,
     B: ExecutionBackend,
 {
-    if stream {
-        backend_stream_response(adaptor, parsed, backend, request, context, surface).await
-    } else {
-        backend_response(adaptor, parsed, backend, request, context, surface).await
-    }
-}
-
-async fn backend_response<A, B>(
-    adaptor: A,
-    parsed: A::ParsedRequest,
-    backend: B,
-    request: BackendRequest,
-    context: RenderContext,
-    surface: &'static str,
-) -> Response
-where
-    A: WireAdaptor,
-    B: ExecutionBackend,
-{
+    let (parsed, request) = match parse(&adaptor, body, model) {
+        Ok(parsed) => parsed,
+        Err(err) => return adaptor_error(surface, err),
+    };
+    let stream = request.raw.value().get("stream") == Some(&JsonValue::Bool(true));
     let backend_stream = match backend.stream(request).await {
         Ok(stream) => stream,
         Err(err) => return backend_error(surface, err),
     };
+    if stream {
+        stream_response(adaptor, parsed, backend_stream, context, surface).await
+    } else {
+        response(adaptor, parsed, backend_stream, context, surface).await
+    }
+}
+
+fn parse<A: WireAdaptor>(
+    adaptor: &A,
+    body: &[u8],
+    model: Option<&str>,
+) -> AdaptorResult<(A::ParsedRequest, BackendRequest)> {
+    let mut value: JsonValue = serde_json::from_slice(body)?;
+    if let Some(model) = model
+        && let Some(name @ JsonValue::String(_)) = value.get_mut("model")
+    {
+        *name = model.into();
+    }
+    let raw = RawRequest::from_value(value)?;
+    let parsed = adaptor.parse(raw.clone())?;
+    let execution = adaptor.to_execution_request(&parsed)?;
+    Ok((parsed, BackendRequest::new(execution, raw)))
+}
+
+async fn response<A: WireAdaptor>(
+    adaptor: A,
+    parsed: A::ParsedRequest,
+    backend_stream: BackendStream,
+    context: RenderContext,
+    surface: &'static str,
+) -> Response {
     let result = match backend_stream.collect().await {
         Ok(result) => result,
         Err(err) => return backend_error(surface, err),
@@ -82,11 +93,10 @@ where
     response
 }
 
-async fn backend_stream_response<A, B>(
+async fn stream_response<A>(
     adaptor: A,
     parsed: A::ParsedRequest,
-    backend: B,
-    request: BackendRequest,
+    backend_stream: BackendStream,
     context: RenderContext,
     surface: &'static str,
 ) -> Response
@@ -94,12 +104,7 @@ where
     A: WireAdaptor + Send + 'static,
     A::ParsedRequest: Send + 'static,
     A::StreamState: Send + 'static,
-    B: ExecutionBackend,
 {
-    let backend_stream = match backend.stream(request).await {
-        Ok(stream) => stream,
-        Err(err) => return backend_error(surface, err),
-    };
     let header_provenance = backend_stream.initial_provenance.clone();
     let stream_provenance = backend_stream.initial_provenance;
     let mut output_events = backend_stream.events;
@@ -161,7 +166,7 @@ where
     response
 }
 
-pub(super) fn adaptor_error(surface: &str, error: AdaptorError) -> Response {
+fn adaptor_error(surface: &str, error: AdaptorError) -> Response {
     let status = match error {
         AdaptorError::InvalidJson(_)
         | AdaptorError::InvalidRequest(_)
@@ -176,7 +181,7 @@ fn backend_error(surface: &str, error: BackendError) -> Response {
     json_error(super::backend_status(&error), format!("{surface}: {error}"))
 }
 
-pub(super) fn wire_response(response: WireResponse) -> Result<Response, String> {
+fn wire_response(response: WireResponse) -> Result<Response, String> {
     let status = StatusCode::from_u16(response.status)
         .map_err(|err| format!("adaptor rendered invalid HTTP status: {err}"))?;
     let body = match response.body {
@@ -201,7 +206,7 @@ pub(super) fn wire_response(response: WireResponse) -> Result<Response, String> 
         .map_err(|err| format!("failed to build HTTP response: {err}"))
 }
 
-pub(super) fn sse_event(event: WireStreamEvent) -> Event {
+fn sse_event(event: WireStreamEvent) -> Event {
     match (event.name, event.data) {
         (Some(name), WireEventData::Json(value)) => sse_event_data(&name, &value),
         (Some(name), WireEventData::Text(value)) => Event::default().event(name).data(value),
@@ -257,7 +262,7 @@ fn render_error_events<A: WireAdaptor>(
 
 /// Hand the accepted job's identity to the provenance layer, which renders
 /// it as response headers.
-pub(super) fn attach_wire_provenance(response: &mut Response, provenance: Option<&Provenance>) {
+fn attach_wire_provenance(response: &mut Response, provenance: Option<&Provenance>) {
     let Some(provenance) = provenance else {
         return;
     };
