@@ -1,6 +1,6 @@
 [package]
-name = "hellas-reseller"
-description = "Vendor adapters using Hellas authority, Work and host services"
+name = "hellas-share"
+description = "Shares vendor API access through Hellas authority, Work and host services"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
