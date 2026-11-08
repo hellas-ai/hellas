@@ -773,11 +773,11 @@ async fn prepared_resource_gets_fresh_admission_standing() {
     // The resource was selected and prepared from the previous standing.
     f.clock.set(UnixMillis(61_000));
     session
-        .run_current(
+        .run_resource(
             f.grant.policies[0].resource,
             input,
             &hellas_channel::test_support::channel::program_content().await,
-            None,
+            Default::default(),
             None,
             None,
         )

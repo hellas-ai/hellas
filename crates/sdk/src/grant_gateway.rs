@@ -1,8 +1,9 @@
 //! One private grant channel behind the same gateway execution interface as a
 //! paid pool. HTTP disconnects never abandon an already signed proposal.
 
+use crate::execution::{AttemptError, Controls, ExecutionError, ExecutionSession, ExecutionTerms};
 use crate::gateway_work::{
-    Completed, GatewayEvent, Requester, WorkGateway, WorkRequest, WorkSource, close_endpoints,
+    GatewayEvent, Requester, WorkGateway, WorkRequest, WorkSource, close_endpoints,
 };
 use crate::grant_client::{GrantClientError, GrantSession, GrantSessionOptions, GrantTransport};
 use futures::future::BoxFuture;
@@ -569,7 +570,7 @@ impl WorkSource for GrantPoolSource {
         self: Arc<Self>,
         selected: Self::Request,
         requester: Requester<E, Self::Error>,
-    ) -> BoxFuture<'static, Result<Option<Completed>, Self::Error>> {
+    ) -> BoxFuture<'static, Result<(), Self::Error>> {
         Box::pin(async move {
             let SelectedGrant {
                 channel,
@@ -819,87 +820,40 @@ impl GrantSource {
         self: Arc<Self>,
         (resource, request): (ResourceId, WorkRequest),
         requester: Requester<E, WorkGatewayError>,
-    ) -> BoxFuture<'static, Result<Option<Completed>, WorkGatewayError>> {
+    ) -> BoxFuture<'static, Result<(), WorkGatewayError>> {
         Box::pin(async move {
-            let mut session = tokio::select! {
-                biased;
-                _ = requester.closed() => return Ok(None),
-                session = self.session.lock() => session,
+            let stop = requester.stop();
+            let Ok(mut session) =
+                crate::execution::before_proposal(None, &stop, None, self.session.lock()).await
+            else {
+                return Ok(());
             };
-            if requester.is_closed() {
-                return Err(WorkGatewayBusy.into());
-            }
-            let mut retried = false;
-            let output = loop {
-                tokio::select! {
-                    biased;
-                    _ = requester.closed() => return Ok(None),
-                    recovered = async {
-                        session.recover().await?;
-                        session.refresh().await
-                    } => { recovered.map_err(client_error)?; }
-                }
-                // Re-admit the original request against the selected resource after refresh.
-                let offer = session.offer();
-                let policy = offer
-                    .offer()
-                    .grant
-                    .policies
-                    .iter()
-                    .find(|policy| policy.resource == resource)
-                    .ok_or_else(|| rejected(GrantGatewayError::NoMatchingPolicy))?;
-                let input = request
-                    .admitted(
-                        &policy.invocation_policy,
-                        policy.https.as_ref(),
-                        self.assurance,
-                        false,
-                    )
-                    .map_err(rejected)?;
-                let prepared = crate::execution::prepare_grant_input(
-                    &input,
-                    policy,
-                    offer,
-                    session.execution_signer(),
+            let signer = session.execution_signer().clone();
+            let completed = ExecutionSession::Grant(&mut session)
+                .run(
+                    &request,
+                    ExecutionTerms::Grant { resource },
+                    &signer,
+                    Controls {
+                        deadline: None,
+                        stop: Some(stop),
+                        observers: requester.observers(),
+                        deliver: Some(requester.delivery()),
+                    },
+                    None,
                 )
-                .map_err(rejected)?;
-                if requester.is_closed() {
-                    return Err(WorkGatewayBusy.into());
+                .await;
+            match completed {
+                Ok(_) | Err(AttemptError::Stopped(_)) => Ok(()),
+                Err(AttemptError::PreProposal(error) | AttemptError::Committed(error)) => {
+                    Err(match *error {
+                        ExecutionError::Grant(error) => client_error(error),
+                        ExecutionError::Job(error) => rejected(error),
+                        ExecutionError::Identity => rejected(GrantGatewayError::NoMatchingPolicy),
+                        error => self::error(error),
+                    })
                 }
-                let proposed = std::sync::atomic::AtomicBool::new(false);
-                let content = input.content();
-                let operation = session.run_current(
-                    resource,
-                    prepared,
-                    &content,
-                    Some(requester.progress()),
-                    Some(requester.accepted()),
-                    Some(&proposed),
-                );
-                tokio::pin!(operation);
-                let output = tokio::select! {
-                    biased;
-                    _ = requester.closed() => {
-                        if !proposed.load(std::sync::atomic::Ordering::Acquire) {
-                            return Ok(None);
-                        }
-                        operation.await
-                    }
-                    output = &mut operation => output,
-                };
-                match output {
-                    Err(GrantClientError::AdmissionExpired) if !retried => {
-                        retried = true;
-                    }
-                    result => break result.map_err(client_error)?,
-                }
-            };
-            Ok(Some(Completed {
-                transcript: hellas_channel::model::work::encode_transcript(&output.events)
-                    .map_err(error)?,
-                output: output.output,
-                provider: output.provider_key,
-            }))
+            }
         })
     }
 

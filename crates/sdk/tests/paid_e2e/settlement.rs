@@ -340,20 +340,20 @@ fn empty_channel_settlement_recovers_exact_return_and_rejects_wrong_identity() {
             )
             .unwrap();
             assert!(
-                attempt
-                    .open_paid_session(
-                        job.input(),
-                        case.options.clone(),
-                        case.endpoint.clone(),
-                        client_settlement(),
-                        case.owner.clone(),
-                        hellas_sdk::paid_client::SessionFundingOptions {
-                            max_funding: Some(CLIENT_FUNDING),
-                            approval: Some(gate.clone()),
-                        }
-                    )
-                    .await
-                    .is_err()
+                open_attempt(
+                    &mut attempt,
+                    job.input(),
+                    case.options.clone(),
+                    case.endpoint.clone(),
+                    client_settlement(),
+                    case.owner.clone(),
+                    hellas_sdk::paid_client::SessionFundingOptions {
+                        max_funding: Some(CLIENT_FUNDING),
+                        approval: Some(gate.clone()),
+                    }
+                )
+                .await
+                .is_err()
             );
             assert_eq!(*gate.amounts.lock().unwrap(), vec![CLIENT_FUNDING]);
             assert!(case.approvals.0.lock().unwrap().is_empty());
@@ -413,16 +413,16 @@ fn empty_channel_settlement_recovers_exact_return_and_rejects_wrong_identity() {
                 )
                 .unwrap();
             assert!(matches!(
-                cross_chain_attempt
-                    .open_paid_session(
-                        job.input(),
-                        case.options.clone(),
-                        case.endpoint.clone(),
-                        client_settlement(),
-                        case.owner.clone(),
-                        hellas_sdk::paid_client::SessionFundingOptions::default(),
-                    )
-                    .await,
+                open_attempt(
+                    &mut cross_chain_attempt,
+                    job.input(),
+                    case.options.clone(),
+                    case.endpoint.clone(),
+                    client_settlement(),
+                    case.owner.clone(),
+                    hellas_sdk::paid_client::SessionFundingOptions::default(),
+                )
+                .await,
                 Err(hellas_sdk::execution::ExecutionError::Identity)
             ));
             drop(cross_chain_attempt);

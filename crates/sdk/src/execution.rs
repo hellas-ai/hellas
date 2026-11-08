@@ -1,4 +1,5 @@
 //! Native work execution and caller-owned attempt tracking.
+use crate::gateway_work::WorkRequest;
 use crate::job::{Job, JobInput};
 use crate::paid_client::{PaidWorkOptions, PaidWorkResult, PaidWorkSession};
 use crate::transact::{PaidAttemptPath, Purchase, PurchaseTarget};
@@ -9,11 +10,17 @@ use hellas_channel::work::PaidProgress;
 use hellas_kernel::NetworkId;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+mod executor;
+pub use executor::{Executor, GrantExecution, PaidExecution};
 
 /// Format tag of a persisted grant attempt record.
 const GRANT_ATTEMPT_FORMAT: &str = "hellas.grant-attempt.v1";
 /// Format tag of a persisted completion receipt.
 const WORK_COMPLETION_FORMAT: &str = "hellas.work-completion.v1";
+/// Retained paid work must not monopolize a channel a new request needs.
+const PAID_RECOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecutionTerms {
@@ -35,6 +42,17 @@ pub enum ExecutionError {
     RecoveryRequired,
     #[error("paid output is unavailable; recover the original attempt or explicitly buy again")]
     ResultUnavailable,
+    #[error(
+        "the original attempt is unresolved (work {:?}, terminal {:?}, payment {:?}, result available: {}); no new work was proposed",
+        .0.work, .0.terminal, .0.payment, .0.result_available
+    )]
+    Unresolved(Box<ExecutionFacts>),
+    #[error("this attempt is already terminal; start a new attempt")]
+    Terminal,
+    #[error("delivery failed: {0}")]
+    Delivery(Box<dyn std::error::Error + Send + Sync>),
+    #[error(transparent)]
+    Stopped(#[from] RequestStopped),
     #[error(transparent)]
     Purchase(#[from] crate::transact::PurchaseError),
     #[error(transparent)]
@@ -50,7 +68,7 @@ pub enum ExecutionError {
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 }
-type Result<T> = std::result::Result<T, ExecutionError>;
+pub(crate) type Result<T> = std::result::Result<T, ExecutionError>;
 
 /// Prepare an admitted grant input using the current signed provider policy.
 pub(crate) fn prepare_grant_input(
@@ -346,9 +364,32 @@ pub enum ExecutionSession<'a> {
     Grant(&'a mut crate::grant_client::GrantSession),
 }
 
+/// One verified completion, whatever funded it.
+pub struct Completed {
+    pub work_id: Digest,
+    pub output: hellas_rpc::protocol::invocation::output::InvocationOutput,
+    /// Canonical bytes of the signed transcript the output was verified from.
+    pub transcript: Vec<u8>,
+    pub provider_key: hellas_auth::PublicKey,
+    /// Paid work only: what was paid, on which channel.
+    pub paid: Option<PaidReceipt>,
+    /// Everything the protocol proved for a live run; absent when retained
+    /// bytes are delivered again.
+    pub live: Option<ExecutionResult>,
+}
+
 pub enum ExecutionResult {
-    Paid(PaidWorkResult),
-    Grant(crate::grant_client::GrantWorkResult),
+    Paid(Box<PaidWorkResult>),
+    Grant(Box<crate::grant_client::GrantWorkResult>),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PaidReceipt {
+    pub price: u64,
+    pub channel_id: Digest,
+    pub bond_edge: hellas_kernel::EdgeId,
+    /// Provider payout once the caller settled the channel.
+    pub settled: Option<u64>,
 }
 
 #[derive(Default)]
@@ -357,66 +398,185 @@ pub struct ExecutionObservers {
     pub accepted: Option<crate::transact::Accepted>,
 }
 
-impl ExecutionAttempt {
-    /// Select and preflight a paid channel, then bind its target before funding
-    /// or setup signatures. Reopening an existing binding permits retained-channel
-    /// recovery only; it never authorizes fresh funding.
-    pub async fn open_paid_session(
-        &mut self,
-        input: &JobInput,
-        options: PaidWorkOptions,
-        endpoint: iroh::Endpoint,
-        settlement_key: hellas_kernel::Secp256k1Signer,
-        owner: std::sync::Arc<crate::client_owner::ClientOwner>,
-        funding: crate::paid_client::SessionFundingOptions,
-    ) -> Result<PaidWorkSession> {
-        let terms = ExecutionTerms::Paid {
-            price: options.expected_price,
-        };
-        self.matches(input, terms)?;
-        let job = Job::from_input(options.expected_price, input.clone())?;
-        let target = PurchaseTarget {
-            network: options.config.network().as_str().into(),
-            provider: options.provider,
-        };
-        let AttemptRecord::Paid(purchase) = &mut self.record else {
-            return Err(ExecutionError::Identity);
-        };
-        purchase
-            .ensure_state_key(&options.config.chain.state_key())
-            .map_err(|_| ExecutionError::Identity)?;
-        if purchase.has_target() && !purchase.matches_target(&target) {
-            return Err(ExecutionError::Identity);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum RequestStopped {
+    #[error("request cancelled before proposal")]
+    Disconnected,
+    #[error("request deadline elapsed, including queue wait")]
+    Deadline,
+}
+
+/// Where an attempt stopped, which decides whether a pool may try another
+/// provider. Only failures provably before this request's proposal may.
+#[derive(Debug, thiserror::Error)]
+pub enum AttemptError {
+    #[error(transparent)]
+    Stopped(#[from] RequestStopped),
+    #[error(transparent)]
+    PreProposal(Box<ExecutionError>),
+    #[error(transparent)]
+    Committed(Box<ExecutionError>),
+}
+impl From<AttemptError> for ExecutionError {
+    fn from(error: AttemptError) -> Self {
+        match error {
+            AttemptError::Stopped(stopped) => Self::Stopped(stopped),
+            AttemptError::PreProposal(error) | AttemptError::Committed(error) => *error,
         }
-        let fresh = !purchase.has_target() || self.newly_bound;
-        let mode = if fresh {
-            crate::paid_client::SessionOpenMode::Job(&job)
-        } else {
-            crate::paid_client::SessionOpenMode::Retained
+    }
+}
+
+/// The caller's cancellation: Ctrl-C for a command, a closed HTTP receiver
+/// for a gateway request.
+pub type Stop = futures::future::Shared<futures::future::BoxFuture<'static, ()>>;
+pub fn stop_on(signal: impl std::future::Future<Output = ()> + Send + 'static) -> Stop {
+    use futures::FutureExt as _;
+    signal.boxed().shared()
+}
+
+/// Hands a verified completion to its consumer before it is reported.
+pub type Delivery<'a> = Box<
+    dyn FnOnce(&Completed) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>
+        + Send
+        + 'a,
+>;
+
+#[derive(Default)]
+pub struct Controls<'a> {
+    /// One absolute deadline over queueing, execution, delivery and report.
+    pub deadline: Option<tokio::time::Instant>,
+    pub stop: Option<Stop>,
+    pub observers: ExecutionObservers,
+    pub deliver: Option<Delivery<'a>>,
+}
+
+/// `operation` under `deadline`.
+pub(crate) async fn within<T>(
+    deadline: Option<tokio::time::Instant>,
+    operation: impl std::future::Future<Output = T>,
+) -> std::result::Result<T, RequestStopped> {
+    match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, operation)
+            .await
+            .map_err(|_| RequestStopped::Deadline),
+        None => Ok(operation.await),
+    }
+}
+
+/// Run `operation` under `deadline`, abandoning it on `stop` unless
+/// `proposed` says its proposal may already have left this process.
+pub(crate) async fn before_proposal<T>(
+    deadline: Option<tokio::time::Instant>,
+    stop: &Stop,
+    proposed: Option<&AtomicBool>,
+    operation: impl std::future::Future<Output = T>,
+) -> std::result::Result<T, RequestStopped> {
+    if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+        return Err(RequestStopped::Deadline);
+    }
+    let operation = within(deadline, operation);
+    tokio::pin!(operation);
+    tokio::select! {
+        biased;
+        () = stop.clone() => {
+            if !proposed.is_some_and(|proposed| proposed.load(Ordering::Acquire)) {
+                return Err(RequestStopped::Disconnected);
+            }
+            operation.await
+        }
+        result = &mut operation => result,
+    }
+}
+
+/// What a paid session is opened for. Only a job may fund a new channel.
+pub enum PaidOpen<'a> {
+    Retained,
+    Job(&'a Job),
+    /// A tracked job: its target binds at the funding boundary, after quote
+    /// and preflight. A bound attempt reopens its retained channel only.
+    Attempt(&'a Job, &'a mut ExecutionAttempt),
+}
+
+/// The one paid channel opener, for commands and gateway pools alike. Any
+/// error is before this request's proposal. `connection_timeout` bounds
+/// reaching the provider, not owner funding or chain finality.
+pub async fn open_paid_session(
+    options: PaidWorkOptions,
+    endpoint: iroh::Endpoint,
+    settlement_key: hellas_kernel::Secp256k1Signer,
+    owner: std::sync::Arc<crate::client_owner::ClientOwner>,
+    funding: crate::paid_client::SessionFundingOptions,
+    open: PaidOpen<'_>,
+    connection_timeout: Option<std::time::Duration>,
+) -> Result<PaidWorkSession> {
+    let PaidOpen::Attempt(job, attempt) = open else {
+        let (job, allow_funding) = match open {
+            PaidOpen::Job(job) => (Some(job), true),
+            _ => (None, false),
         };
-        let mut session = PaidWorkSession::open_intent(
+        return Ok(Box::pin(PaidWorkSession::open_inner(
             options,
             endpoint,
             settlement_key,
             owner,
-            mode,
+            crate::paid_client::OpenIntent {
+                job: job.map(|job| Box::new(job.clone())),
+                allow_funding,
+                before_open: None,
+            },
+            connection_timeout,
             funding,
-            Some(Box::new(|| {
+        ))
+        .await?);
+    };
+    attempt.matches(
+        job.input(),
+        ExecutionTerms::Paid {
+            price: options.expected_price,
+        },
+    )?;
+    let target = PurchaseTarget {
+        network: options.config.network().as_str().into(),
+        provider: options.provider,
+    };
+    let AttemptRecord::Paid(purchase) = &mut attempt.record else {
+        return Err(ExecutionError::Identity);
+    };
+    purchase
+        .ensure_state_key(&options.config.chain.state_key())
+        .map_err(|_| ExecutionError::Identity)?;
+    if purchase.has_target() && !purchase.matches_target(&target) {
+        return Err(ExecutionError::Identity);
+    }
+    let fresh = !purchase.has_target() || attempt.newly_bound;
+    let newly_bound = &mut attempt.newly_bound;
+    let mut session = Box::pin(PaidWorkSession::open_inner(
+        options,
+        endpoint,
+        settlement_key,
+        owner,
+        crate::paid_client::OpenIntent {
+            job: fresh.then(|| Box::new(job.clone())),
+            allow_funding: fresh,
+            before_open: Some(Box::new(|| {
                 purchase.bind_target(target)?;
-                self.newly_bound = false;
+                *newly_bound = false;
                 Ok(())
             })),
-        )
-        .await?;
-        let descriptor = session.descriptor();
-        if let Err(error) =
-            purchase.ensure_channel(descriptor.channel().id(), descriptor.bond_edge())
-        {
-            session.shutdown().await;
-            return Err(error.into());
-        }
-        Ok(session)
+        },
+        connection_timeout,
+        funding,
+    ))
+    .await?;
+    let descriptor = session.descriptor();
+    let AttemptRecord::Paid(purchase) = &mut attempt.record else {
+        unreachable!("checked above");
+    };
+    if let Err(error) = purchase.ensure_channel(descriptor.channel().id(), descriptor.bond_edge()) {
+        session.shutdown().await;
+        return Err(error.into());
     }
+    Ok(session)
 }
 
 impl ExecutionAttempt {
@@ -449,157 +609,342 @@ impl ExecutionAttempt {
     }
 }
 
-impl<'a> ExecutionSession<'a> {
-    /// Execute the original input under the session's funding mode.
-    pub async fn execute(
+impl ExecutionAttempt {
+    /// This paid attempt's purchase, checked against the open session.
+    fn paid_on(&mut self, session: &PaidWorkSession) -> Result<&mut Purchase> {
+        let AttemptRecord::Paid(purchase) = &mut self.record else {
+            return Err(ExecutionError::Identity);
+        };
+        purchase
+            .ensure_chain(session)
+            .map_err(|_| ExecutionError::Identity)?;
+        let target = session.execution_target();
+        if !purchase.matches_target(&PurchaseTarget {
+            network: target.network.as_str().into(),
+            provider: target.provider,
+        }) {
+            return Err(ExecutionError::Identity);
+        }
+        self.newly_bound = false;
+        let descriptor = session.descriptor();
+        purchase.ensure_channel(descriptor.channel().id(), descriptor.bond_edge())?;
+        Ok(purchase)
+    }
+
+    /// This grant attempt's record, checked against the open session.
+    fn grant_on(
         &mut self,
-        input: JobInput,
+        session: &crate::grant_client::GrantSession,
+    ) -> Result<&mut GrantAttempt> {
+        let AttemptRecord::Grant(tracker) = &mut self.record else {
+            return Err(ExecutionError::Identity);
+        };
+        let target = session.execution_target()?;
+        if tracker.record.target.as_ref()
+            != Some(&GrantTarget {
+                network: target.network.as_str().into(),
+                provider: target.provider,
+            })
+        {
+            return Err(ExecutionError::Identity);
+        }
+        self.newly_bound = false;
+        tracker.bind_channel(session.store().channel().id)?;
+        Ok(tracker)
+    }
+}
+
+type Attempted<T> = std::result::Result<T, AttemptError>;
+fn pre<E: Into<ExecutionError>>(error: E) -> AttemptError {
+    AttemptError::PreProposal(Box::new(error.into()))
+}
+fn committed<E: Into<ExecutionError>>(error: E) -> AttemptError {
+    AttemptError::Committed(Box::new(error.into()))
+}
+
+impl ExecutionSession<'_> {
+    /// The one request lifecycle, on a session the caller opened and closes.
+    /// It prepares the input, proposes and collects it, retains a tracked
+    /// result, hands it to `controls.deliver` and only then reports it.
+    /// `controls.stop` abandons the request only before its proposal; after
+    /// it, collection and payment continue until `controls.deadline`.
+    pub async fn run(
+        &mut self,
+        request: &WorkRequest,
         terms: ExecutionTerms,
         signer: &ProducerSigningKey,
-        observers: ExecutionObservers,
+        controls: Controls<'_>,
         mut attempt: Option<&mut ExecutionAttempt>,
-    ) -> Result<ExecutionResult> {
+    ) -> Attempted<Completed> {
+        let Controls {
+            deadline,
+            stop,
+            observers,
+            deliver,
+        } = controls;
+        let stop = stop.unwrap_or_else(|| stop_on(std::future::pending()));
         if let Some(attempt) = attempt.as_deref() {
-            attempt.matches(&input, terms)?;
+            let WorkRequest::Job(input) = request else {
+                return Err(pre(ExecutionError::Identity));
+            };
+            attempt.matches(input, terms).map_err(pre)?;
         }
-        let result = match (self, terms) {
+        let completed = match (self, terms) {
             (Self::Paid(session), ExecutionTerms::Paid { price }) => {
-                let job = Job::from_input(price, input)?;
-                let target = session.execution_target();
-                let purchase = match attempt.as_deref_mut() {
-                    Some(attempt) => match &mut attempt.record {
-                        AttemptRecord::Paid(purchase) => {
-                            purchase
-                                .ensure_chain(session)
-                                .map_err(|_| ExecutionError::Identity)?;
-                            let target = PurchaseTarget {
-                                network: target.network.as_str().into(),
-                                provider: target.provider,
-                            };
-                            if !purchase.matches_target(&target) {
-                                return Err(ExecutionError::Identity);
-                            }
-                            attempt.newly_bound = false;
-                            purchase.ensure_channel(
-                                session.descriptor().channel().id(),
-                                session.descriptor().bond_edge(),
-                            )?;
-                            if purchase.has_proposal_intent() {
-                                return Err(ExecutionError::RecoveryRequired);
-                            }
-                            Some(purchase)
-                        }
-                        _ => return Err(ExecutionError::Identity),
-                    },
-                    None => None,
-                };
-                Ok(ExecutionResult::Paid(
-                    crate::transact::transact(
-                        session,
-                        &job,
-                        signer,
-                        crate::transact::TransactionOptions {
-                            purchase,
-                            // A fresh facade call is an explicit new attempt;
-                            // recovery never searches for a matching old job here.
-                            new_purchase: true,
-                            progress: observers.progress,
-                            accepted: observers.accepted,
-                            ..Default::default()
-                        },
-                    )
-                    .await?,
-                ))
+                run_paid(
+                    session,
+                    request,
+                    price,
+                    signer,
+                    (deadline, &stop, observers),
+                    attempt.as_deref_mut(),
+                )
+                .await?
             }
             (Self::Grant(session), ExecutionTerms::Grant { resource }) => {
-                let target = session.execution_target()?;
-                let tracker = match attempt.as_deref_mut() {
-                    Some(attempt) => match &mut attempt.record {
-                        AttemptRecord::Grant(tracker) => {
-                            let target = GrantTarget {
-                                network: target.network.as_str().into(),
-                                provider: target.provider,
-                            };
-                            if tracker.record.target.as_ref() != Some(&target) {
-                                return Err(ExecutionError::Identity);
-                            }
-                            tracker.bind_channel(session.store().channel().id)?;
-                            if tracker.record.work.is_some() {
-                                return Err(ExecutionError::RecoveryRequired);
-                            }
-                            Some(tracker)
-                        }
-                        _ => return Err(ExecutionError::Identity),
-                    },
-                    None => None,
-                };
-                session.refresh().await?;
-                let policy = session
-                    .offer()
-                    .offer()
-                    .grant
-                    .policies
-                    .iter()
-                    .find(|policy| policy.resource == resource)
-                    .ok_or(ExecutionError::Identity)?;
-                let mut input = input;
-                if let JobInput::Fetch {
-                    contract, request, ..
-                } = &mut input
-                    && contract.schema() == hellas_rpc::FetchSchema::HttpV1
-                {
-                    let template = policy.https.as_ref().ok_or(ExecutionError::Identity)?;
-                    let mut http = hellas_rpc::http_fetch::HttpFetchRequest::decode(request)
-                        .map_err(|_| ExecutionError::Identity)?;
-                    template
-                        .prepare(&mut http)
-                        .map_err(|_| ExecutionError::Identity)?;
-                    *request = serde_json::to_vec(&http)?;
-                }
-                let prepared = prepare_grant_input(
-                    &input,
-                    policy,
-                    session.offer(),
-                    session.execution_signer(),
-                )?;
-                let content = input.content();
-                Ok(ExecutionResult::Grant(
-                    session
-                        .run_tracked_current(resource, prepared, &content, observers, tracker)
-                        .await?,
-                ))
+                run_grant(
+                    session,
+                    request,
+                    resource,
+                    (deadline, &stop, observers),
+                    attempt.as_deref_mut(),
+                )
+                .await?
             }
-            _ => Err(ExecutionError::Identity),
-        }?;
-        if let Some(attempt) = attempt {
-            match &result {
-                ExecutionResult::Paid(result) => attempt.complete(
-                    result.work_id,
-                    &result.output,
-                    result.transcript.clone(),
-                    true,
-                    Some(PaidDelivery {
-                        channel_id: result.channel_id,
-                        bond_edge: result.bond_edge.to_bytes(),
-                        provider_key: result.provider_key,
-                    }),
-                )?,
-                ExecutionResult::Grant(result) => {
-                    let transcript = hellas_channel::model::work::encode_transcript(&result.events)
-                        .map_err(|_| ExecutionError::Identity)?;
-                    attempt.complete(
-                        result.work_id,
-                        &result.output,
-                        transcript,
-                        result.result.outcome
-                            == hellas_channel::model::work::ResultOutcome::Finished,
-                        None,
-                    )?;
-                }
+            _ => return Err(pre(ExecutionError::Identity)),
+        };
+        if let Some(deliver) = deliver {
+            deliver(&completed).map_err(|error| committed(ExecutionError::Delivery(error)))?;
+            if let Some(attempt) = attempt {
+                attempt.reported().map_err(committed)?;
             }
         }
-        Ok(result)
+        Ok(completed)
     }
+}
+
+type RunControls<'a> = (Option<tokio::time::Instant>, &'a Stop, ExecutionObservers);
+
+async fn run_paid(
+    session: &mut PaidWorkSession,
+    request: &WorkRequest,
+    price: u64,
+    signer: &ProducerSigningKey,
+    (deadline, stop, observers): RunControls<'_>,
+    mut attempt: Option<&mut ExecutionAttempt>,
+) -> Attempted<Completed> {
+    let WorkRequest::Job(input) = request else {
+        return Err(pre(ExecutionError::Identity));
+    };
+    let job = Job::from_input(price, input.clone()).map_err(pre)?;
+    let tracked = attempt.is_some();
+    let purchase = match attempt.as_deref_mut() {
+        Some(attempt) => {
+            let purchase = attempt.paid_on(session).map_err(pre)?;
+            if purchase.has_proposal_intent() {
+                return Err(committed(ExecutionError::RecoveryRequired));
+            }
+            Some(purchase)
+        }
+        None => None,
+    };
+    // An untracked request first resumes the channel's retained work; it
+    // never proposes this request, so its failure leaves fallback open. A
+    // tracked attempt recovers only itself.
+    if !tracked && session.needs_recovery() {
+        let bound = tokio::time::Instant::now() + PAID_RECOVERY_TIMEOUT;
+        let deadline = Some(deadline.map_or(bound, |deadline| deadline.min(bound)));
+        before_proposal(
+            deadline,
+            stop,
+            None,
+            session.run(None, &crate::paid_client::empty_content(), true, None),
+        )
+        .await?
+        .map_err(pre)?;
+    }
+    // The proposal nonce is journaled before its signature is released.
+    let floor = session
+        .with_state(|state| state.proposal_nonce_high_water())
+        .await
+        .map_err(pre)?;
+    let proposed = AtomicBool::new(false);
+    let result = before_proposal(
+        deadline,
+        stop,
+        Some(&proposed),
+        crate::transact::transact(
+            session,
+            &job,
+            signer,
+            crate::transact::TransactionOptions {
+                purchase,
+                // A request is always a new purchase; recovery never searches
+                // for a matching old job here.
+                new_purchase: true,
+                progress: observers.progress,
+                accepted: observers.accepted,
+                proposed: Some(&proposed),
+            },
+        ),
+    )
+    .await?;
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            let uncertain = matches!(
+                &error,
+                crate::transact::TransactError::Client(
+                    crate::paid_client::PaidClientError::Propose(
+                        hellas_channel::work::ProposeError::Store(_)
+                    )
+                )
+            );
+            let after = session
+                .with_state(|state| state.proposal_nonce_high_water())
+                .await
+                .ok();
+            return Err(
+                if !proposed.load(Ordering::Acquire) && !uncertain && after == Some(floor) {
+                    pre(error)
+                } else {
+                    committed(error)
+                },
+            );
+        }
+    };
+    let completed = Completed {
+        work_id: result.work_id,
+        output: result.output.clone(),
+        transcript: result.transcript.clone(),
+        provider_key: result.provider_key,
+        paid: Some(PaidReceipt {
+            price: result.job_price,
+            channel_id: result.channel_id,
+            bond_edge: result.bond_edge,
+            settled: None,
+        }),
+        live: Some(ExecutionResult::Paid(Box::new(result))),
+    };
+    if let Some(attempt) = attempt {
+        attempt
+            .complete(
+                completed.work_id,
+                &completed.output,
+                completed.transcript.clone(),
+                true,
+                completed.paid.map(|paid| PaidDelivery {
+                    channel_id: paid.channel_id,
+                    bond_edge: paid.bond_edge.to_bytes(),
+                    provider_key: completed.provider_key,
+                }),
+            )
+            .map_err(committed)?;
+    }
+    Ok(completed)
+}
+
+async fn run_grant(
+    session: &mut crate::grant_client::GrantSession,
+    request: &WorkRequest,
+    resource: ResourceId,
+    (deadline, stop, observers): RunControls<'_>,
+    mut attempt: Option<&mut ExecutionAttempt>,
+) -> Attempted<Completed> {
+    let mut tracker = match attempt.as_deref_mut() {
+        Some(attempt) => {
+            let tracker = attempt.grant_on(session).map_err(pre)?;
+            if tracker.record.work.is_some() {
+                return Err(committed(ExecutionError::RecoveryRequired));
+            }
+            Some(tracker)
+        }
+        None => None,
+    };
+    let assurance = session.assurance();
+    let mut retried = false;
+    let result = loop {
+        before_proposal(deadline, stop, None, async {
+            session.recover().await?;
+            session.refresh().await
+        })
+        .await?
+        .map_err(pre)?;
+        // Re-admit the original request under the refreshed resource terms.
+        let policy = session
+            .offer()
+            .offer()
+            .grant
+            .policies
+            .iter()
+            .find(|policy| policy.resource == resource)
+            .ok_or(pre(ExecutionError::Identity))?;
+        let input = request
+            .admitted(
+                &policy.invocation_policy,
+                policy.https.as_ref(),
+                assurance,
+                false,
+            )
+            .map_err(pre)?;
+        let prepared =
+            prepare_grant_input(&input, policy, session.offer(), session.execution_signer())
+                .map_err(pre)?;
+        let proposed = AtomicBool::new(false);
+        let content = input.content();
+        let result = before_proposal(
+            deadline,
+            stop,
+            Some(&proposed),
+            session.run_resource(
+                resource,
+                prepared,
+                &content,
+                ExecutionObservers {
+                    progress: observers.progress.clone(),
+                    accepted: observers.accepted.clone(),
+                },
+                Some(&proposed),
+                tracker.as_deref_mut(),
+            ),
+        )
+        .await?;
+        match result {
+            // Refused before acceptance with nothing pending: admit again once.
+            Err(crate::grant_client::GrantClientError::AdmissionExpired) if !retried => {
+                retried = true;
+            }
+            Err(error)
+                if !proposed.load(Ordering::Acquire)
+                    && session.store().book().pending_proposal().is_none() =>
+            {
+                return Err(pre(error));
+            }
+            result => break result.map_err(committed)?,
+        }
+    };
+    let finished = result.result.outcome == hellas_channel::model::work::ResultOutcome::Finished;
+    let completed = Completed {
+        work_id: result.work_id,
+        transcript: hellas_channel::model::work::encode_transcript(&result.events)
+            .map_err(|_| committed(ExecutionError::Identity))?,
+        output: result.output.clone(),
+        provider_key: result.provider_key,
+        paid: None,
+        live: Some(ExecutionResult::Grant(Box::new(result))),
+    };
+    if let Some(attempt) = attempt {
+        attempt
+            .complete(
+                completed.work_id,
+                &completed.output,
+                completed.transcript.clone(),
+                finished,
+                None,
+            )
+            .map_err(committed)?;
+    }
+    Ok(completed)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -635,16 +980,6 @@ struct PaidDelivery {
     provider_key: hellas_auth::PublicKey,
 }
 
-/// Retained paid output, without fabricating a new execution or settlement.
-pub struct PaidCompletion {
-    pub output: hellas_rpc::protocol::invocation::output::InvocationOutput,
-    pub transcript: Vec<u8>,
-    pub work_id: Digest,
-    pub job_price: u64,
-    pub channel_id: Digest,
-    pub bond_edge: hellas_kernel::EdgeId,
-    pub provider_key: hellas_auth::PublicKey,
-}
 const MAX_RESULT_RECEIPT_BYTES: usize =
     2 * hellas_rpc::protocol::invocation::MAX_INVOCATION_BYTES + 4096;
 
@@ -768,7 +1103,7 @@ impl ExecutionAttempt {
         }))
     }
     /// Load paid delivery without opening a channel or proposing work again.
-    pub fn retained_paid_result(&self) -> Result<Option<PaidCompletion>> {
+    pub fn retained_paid_result(&self) -> Result<Option<Completed>> {
         let Some(retained) = self.retained_result()? else {
             let facts = self.inspect()?;
             if facts.payment == Payment::Paid || facts.reported || self.read_receipt()?.is_some() {
@@ -788,14 +1123,18 @@ impl ExecutionAttempt {
         if purchase.bound_channel() != Some((paid.channel_id, bond_edge)) {
             return Err(ExecutionError::Identity);
         }
-        Ok(Some(PaidCompletion {
+        Ok(Some(Completed {
             output: retained.output,
             transcript: retained.transcript,
             work_id: Digest::from_bytes(receipt.work),
-            job_price: price,
-            channel_id: paid.channel_id,
-            bond_edge,
             provider_key: paid.provider_key,
+            paid: Some(PaidReceipt {
+                price,
+                channel_id: paid.channel_id,
+                bond_edge,
+                settled: None,
+            }),
+            live: None,
         }))
     }
 
@@ -836,6 +1175,7 @@ pub enum Payment {
     Paid,
 }
 /// Orthogonal local facts; unavailable bytes are not a retry instruction.
+#[derive(Debug)]
 pub struct ExecutionFacts {
     pub target_bound: bool,
     pub channel_bound: bool,
@@ -917,23 +1257,9 @@ impl<'a> ExecutionSession<'a> {
     /// Reconcile only the bound work. This never allocates a nonce or proposes
     /// another execution, though a previously verified paid result may be paid.
     pub async fn recover(&mut self, attempt: &mut ExecutionAttempt) -> Result<ExecutionFacts> {
-        match (self, &mut attempt.record) {
-            (Self::Paid(session), AttemptRecord::Paid(purchase)) => {
-                purchase
-                    .ensure_chain(session)
-                    .map_err(|_| ExecutionError::Identity)?;
-                let target = session.execution_target();
-                if !purchase.matches_target(&PurchaseTarget {
-                    network: target.network.as_str().into(),
-                    provider: target.provider,
-                }) {
-                    return Err(ExecutionError::Identity);
-                }
-                attempt.newly_bound = false;
-                purchase.ensure_channel(
-                    session.descriptor().channel().id(),
-                    session.descriptor().bond_edge(),
-                )?;
+        match self {
+            Self::Paid(session) => {
+                let purchase = attempt.paid_on(session)?;
                 // Unfinished accepted work is re-derived from the signed
                 // journal on each recovery; only its outcome is recorded.
                 let accepted = match purchase.outcome() {
@@ -963,18 +1289,8 @@ impl<'a> ExecutionSession<'a> {
                 }
                 return Ok(facts);
             }
-            (Self::Grant(session), AttemptRecord::Grant(tracker)) => {
-                attempt.newly_bound = false;
-                let target = session.execution_target()?;
-                if tracker.record.target.as_ref()
-                    != Some(&GrantTarget {
-                        network: target.network.as_str().into(),
-                        provider: target.provider,
-                    })
-                {
-                    return Err(ExecutionError::Identity);
-                }
-                tracker.bind_channel(session.store().channel().id)?;
+            Self::Grant(session) => {
+                let tracker = attempt.grant_on(session)?;
                 if let Some(work) = tracker.record.work.map(Digest::from_bytes) {
                     if tracker.record.rejected {
                         session.resolve_recorded_refusal(work).await?;
@@ -1016,7 +1332,6 @@ impl<'a> ExecutionSession<'a> {
                     return Ok(facts);
                 }
             }
-            _ => return Err(ExecutionError::Identity),
         }
         attempt.inspect()
     }

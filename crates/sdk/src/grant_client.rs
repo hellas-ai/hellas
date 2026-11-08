@@ -938,34 +938,14 @@ impl GrantSession {
         .await
     }
 
-    /// Run the gateway's prepared resource with fresh admission standing.
-    pub(crate) async fn run_current(
-        &mut self,
-        resource: hellas_auth::authority::ResourceId,
-        input: PreparedInvocation,
-        content: &(LocalStore, Scope),
-        progress: Option<PaidProgress>,
-        accepted: Option<crate::transact::Accepted>,
-        proposed: Option<&std::sync::atomic::AtomicBool>,
-    ) -> Result<GrantWorkResult> {
-        self.run_selected(
-            GrantSelection::Resource(resource),
-            input,
-            content,
-            progress,
-            accepted,
-            proposed,
-            None,
-        )
-        .await
-    }
-
-    pub(crate) async fn run_tracked_current(
+    /// Run a prepared resource with fresh admission standing.
+    pub(crate) async fn run_resource(
         &mut self,
         resource: hellas_auth::authority::ResourceId,
         input: PreparedInvocation,
         content: &(LocalStore, Scope),
         observers: crate::execution::ExecutionObservers,
+        proposed: Option<&std::sync::atomic::AtomicBool>,
         tracker: Option<&mut crate::execution::GrantAttempt>,
     ) -> Result<GrantWorkResult> {
         self.run_selected(
@@ -974,10 +954,14 @@ impl GrantSession {
             content,
             observers.progress,
             observers.accepted,
-            None,
+            proposed,
             tracker,
         )
         .await
+    }
+
+    pub(crate) fn assurance(&self) -> hellas_rpc::Assurance {
+        self.options.target.trust().required_assurance
     }
 
     pub(crate) fn execution_signer(&self) -> &ProducerSigningKey {

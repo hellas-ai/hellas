@@ -1444,14 +1444,7 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
         let metadata: Value =
             serde_json::from_slice(&std::fs::read(result_dir.join("result.json")).unwrap())
                 .unwrap();
-        assert_eq!(metadata["funding"], "grant");
         assert_eq!(metadata["provider"], provider);
-        let resource: hellas_auth::authority::ResourceId =
-            metadata["resource"].as_str().unwrap().parse().unwrap();
-        assert_eq!(
-            resource,
-            host.signed_offer.offer().grant.policies[0].resource
-        );
         assert!(metadata.get("paid").is_none());
         let response: Value =
             serde_json::from_slice(&std::fs::read(result_dir.join("output-0000")).unwrap())

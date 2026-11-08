@@ -5,7 +5,7 @@ pub enum PoolError {
     #[error(transparent)]
     Job(#[from] crate::job::JobError),
     #[error(transparent)]
-    Transaction(Box<crate::transact::TransactError>),
+    Execution(Box<crate::execution::ExecutionError>),
     #[error(transparent)]
     Gateway(#[from] hellas_gateway::WorkGatewayError),
     #[error("invalid paid pool: {0}")]
@@ -42,7 +42,7 @@ pub enum PoolError {
         source: serde_json::Error,
     },
     #[error(transparent)]
-    Stopped(#[from] super::RequestStopped),
+    Stopped(#[from] crate::execution::RequestStopped),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -61,4 +61,10 @@ pub enum PoolError {
     FetchPayload(#[from] hellas_rpc::fetch::FetchPayloadError),
     #[error(transparent)]
     Remote(#[from] hellas_client::ClientError),
+}
+
+impl From<crate::execution::ExecutionError> for PoolError {
+    fn from(error: crate::execution::ExecutionError) -> Self {
+        Self::Execution(Box::new(error))
+    }
 }

@@ -136,6 +136,60 @@ const CLIENT_OWNER: GenesisOwner = GenesisOwner {
     balance: 3 * CLIENT_FUNDING,
 };
 
+/// The one lifecycle without a delivery callback: the test reports.
+#[expect(
+    clippy::result_large_err,
+    reason = "tests match the SDK's own error type"
+)]
+async fn execute(
+    mut session: hellas_sdk::execution::ExecutionSession<'_>,
+    input: hellas_sdk::job::JobInput,
+    terms: hellas_sdk::execution::ExecutionTerms,
+    signer: &ProducerSigningKey,
+    observers: hellas_sdk::execution::ExecutionObservers,
+    attempt: Option<&mut hellas_sdk::execution::ExecutionAttempt>,
+) -> Result<hellas_sdk::execution::Completed, hellas_sdk::execution::ExecutionError> {
+    Ok(session
+        .run(
+            &hellas_sdk::WorkRequest::Job(input),
+            terms,
+            signer,
+            hellas_sdk::execution::Controls {
+                observers,
+                ..Default::default()
+            },
+            attempt,
+        )
+        .await?)
+}
+
+/// Open a paid channel for a tracked attempt through the shared opener.
+#[expect(
+    clippy::result_large_err,
+    reason = "tests match the SDK's own error type"
+)]
+async fn open_attempt(
+    attempt: &mut hellas_sdk::execution::ExecutionAttempt,
+    input: &hellas_sdk::job::JobInput,
+    options: PaidWorkOptions,
+    endpoint: iroh::Endpoint,
+    settlement_key: Secp256k1Signer,
+    owner: Arc<hellas_sdk::client_owner::ClientOwner>,
+    funding: hellas_sdk::paid_client::SessionFundingOptions,
+) -> Result<PaidWorkSession, hellas_sdk::execution::ExecutionError> {
+    let job = hellas_sdk::job::Job::from_input(options.expected_price, input.clone())?;
+    hellas_sdk::execution::open_paid_session(
+        options,
+        endpoint,
+        settlement_key,
+        owner,
+        funding,
+        hellas_sdk::execution::PaidOpen::Attempt(&job, attempt),
+        None,
+    )
+    .await
+}
+
 fn client_settlement() -> Secp256k1Signer {
     Secp256k1Signer::from_secret_scalar([0x21; 32]).unwrap()
 }
@@ -1511,12 +1565,22 @@ async fn paid_finish(case: PaidScenario) {
         "retry creates no second proposal"
     );
     eprintln!("H4 paid job complete; settling");
-    let settled_provider_payout =
-        sealing_while(&mut devnet, Duration::from_millis(100), session.settle())
-            .await
-            .unwrap();
+    let bond_edge = session.descriptor().bond_edge();
     session.shutdown().await;
     drop(session);
+    let settled_provider_payout = sealing_while(
+        &mut devnet,
+        Duration::from_millis(100),
+        hellas_sdk::paid_client::settle_channel(
+            &options,
+            bond_edge,
+            owner.principal(),
+            &client_settlement(),
+        ),
+    )
+    .await
+    .unwrap()
+    .provider_payout;
 
     assert_eq!(result.bond_edge, bond);
     assert_eq!(result.job_price, PRICE);

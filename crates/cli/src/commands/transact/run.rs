@@ -38,7 +38,7 @@ pub struct RunArgs {
     #[arg(long, required_unless_present = "offer", conflicts_with = "offer", value_parser = clap::value_parser!(u64).range(1..))]
     payment: Option<u64>,
     #[command(flatten)]
-    grant: super::grant::GrantArgs,
+    target: super::TargetArgs,
     /// Job folder to write (default: under the client state, by job digest).
     #[arg(long, value_name = "DIR")]
     save_job: Option<PathBuf>,
@@ -171,7 +171,7 @@ pub async fn run(args: RunArgs, context: Context) -> super::super::CliResult<()>
             client: args.client,
             job: Some(directory),
             output: args.output,
-            grant: args.grant,
+            target: args.target,
         },
         context,
     )

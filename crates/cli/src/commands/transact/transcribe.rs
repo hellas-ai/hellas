@@ -18,7 +18,7 @@ pub struct TranscribeArgs {
     #[arg(long, required_unless_present = "offer", conflicts_with = "offer", value_parser = clap::value_parser!(u64).range(1..))]
     payment: Option<u64>,
     #[command(flatten)]
-    grant: grant::GrantArgs,
+    target: TargetArgs,
     #[arg(short = 'o', long, value_name = "DIR")]
     output: Option<PathBuf>,
 }
@@ -52,35 +52,20 @@ pub async fn transcribe(args: TranscribeArgs, context: Context) -> super::super:
         .join(job.digest().to_string());
     job.save(&directory).await?;
     eprintln!("job: {}", directory.display());
-    bounded(
+    run_job(
+        &args.client,
+        &args.target,
         &context,
-        args.client.timeout,
-        async {
-            if args.grant.offer.is_some() {
-                let mut result = grant::execute(&args.grant, &args.client, &context, &job).await?;
-                if let Some(directory) = &args.output { result.save(directory, &job)?; }
-                result.ensure_succeeded()?;
-                let ModelResponse::Transcription(transcription) = package.decode(&result.retained.output)? else { bail!("expected transcription") };
-                println!("{}", transcription.text);
-                std::io::stdout().lock().flush()?;
-                result.attempt.reported()?;
-                return Ok(());
-            }
-            purchase_and_execute(&args.client, &context, &job, |result| {
-            if let Some(directory) = &args.output {
-                save_outputs(directory, &job, result)?;
-            }
-            let ModelResponse::Transcription(transcription) = package.decode(&result.output)?
+        &job,
+        args.output.as_deref(),
+        |completed, _| {
+            let ModelResponse::Transcription(transcription) = package.decode(&completed.output)?
             else {
                 bail!("expected transcription");
             };
             println!("{}", transcription.text);
             std::io::stdout().lock().flush()?;
             Ok(())
-            }).await
-        },
-        |timeout| {
-            format!("transcription exceeded {timeout:?}; use the saved job folder to recover the existing attempt")
         },
     )
     .await

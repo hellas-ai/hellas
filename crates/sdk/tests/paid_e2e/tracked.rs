@@ -86,15 +86,15 @@ fn paid_public_boundaries_reject_another_chain_before_proposal() {
             let execute_marker = std::fs::read(execute_path.as_path()).unwrap();
             let signer = ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap();
             assert!(matches!(
-                ExecutionSession::Paid(&mut session)
-                    .execute(
-                        job.input().clone(),
-                        ExecutionTerms::Paid { price: PRICE },
-                        &signer,
-                        ExecutionObservers::default(),
-                        Some(&mut execute_attempt),
-                    )
-                    .await,
+                execute(
+                    ExecutionSession::Paid(&mut session),
+                    job.input().clone(),
+                    ExecutionTerms::Paid { price: PRICE },
+                    &signer,
+                    ExecutionObservers::default(),
+                    Some(&mut execute_attempt),
+                )
+                .await,
                 Err(ExecutionError::Identity)
                     | Err(ExecutionError::Purchase(
                         hellas_sdk::transact::PurchaseError::Identity
@@ -159,22 +159,23 @@ fn paid_output_survives_settlement_identity_failure_and_replays_offline() {
             let paid_path = paid_path(&case, &job, "retained-paid");
             let path = paid_path.as_path().to_path_buf();
             let mut attempt = ExecutionAttempt::open_paid(&paid_path, job.input(), PRICE).unwrap();
-            let mut session = attempt
-                .open_paid_session(
-                    job.input(),
-                    case.options.clone(),
-                    case.endpoint.clone(),
-                    client_settlement(),
-                    case.owner.clone(),
-                    Default::default(),
-                )
-                .await
-                .unwrap();
+            let mut session = open_attempt(
+                &mut attempt,
+                job.input(),
+                case.options.clone(),
+                case.endpoint.clone(),
+                client_settlement(),
+                case.owner.clone(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
             let signer = ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap();
             sealing_while(
                 &mut case.devnet,
                 Duration::from_millis(100),
-                ExecutionSession::Paid(&mut session).execute(
+                execute(
+                    ExecutionSession::Paid(&mut session),
                     job.input().clone(),
                     terms,
                     &signer,
@@ -188,8 +189,8 @@ fn paid_output_survives_settlement_identity_failure_and_replays_offline() {
             let paid_marker = std::fs::read(&path).unwrap();
             let result = attempt.retained_paid_result().unwrap().unwrap();
             let output = result.output.content_id().unwrap();
-            let channel = result.channel_id;
-            let bond = result.bond_edge;
+            let channel = result.paid.unwrap().channel_id;
+            let bond = result.paid.unwrap().bond_edge;
             attempt.reported().unwrap();
             session.shutdown().await;
             drop(session);
@@ -213,7 +214,8 @@ fn paid_output_survives_settlement_identity_failure_and_replays_offline() {
                 ExecutionAttempt::open_existing_paid(&paid_path, job.input(), PRICE).unwrap();
             let replay = attempt.retained_paid_result().unwrap().unwrap();
             assert_eq!(replay.output.content_id().unwrap(), output);
-            assert_eq!((replay.channel_id, replay.bond_edge), (channel, bond));
+            let paid = replay.paid.unwrap();
+            assert_eq!((paid.channel_id, paid.bond_edge), (channel, bond));
             attempt.reported().unwrap();
             assert_eq!(case.approvals.0.lock().unwrap().len(), approvals);
             let result_path = path
@@ -272,6 +274,104 @@ async fn fund(case: &mut PaidScenario<()>) {
     session.shutdown().await;
 }
 
+/// The command lifecycle through `Executor::Paid`: an attempt that fails
+/// before spending stays unbound and the same attempt then succeeds; a
+/// rerun delivers the retained result without proposing again; and a
+/// settlement that cannot finalize still ends at the command deadline,
+/// after delivery and its report.
+#[test]
+fn executor_retries_unspent_attempts_replays_and_bounds_settlement() {
+    use hellas_sdk::execution::{Executor, PaidExecution, stop_on};
+    run(|runtime| {
+        Box::pin(async move {
+            let mut case = paid_fixture(runtime).await;
+            let job = job();
+            let path = paid_path(&case, &job, "executor");
+            let signer = ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap();
+            let delivered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let executor = |attempt, max_funding, settle| {
+                Executor::Paid(PaidExecution {
+                    options: case.options.clone(),
+                    endpoint: case.endpoint.clone(),
+                    settlement_key: client_settlement(),
+                    owner: case.owner.clone(),
+                    funding: SessionFundingOptions {
+                        max_funding,
+                        approval: None,
+                    },
+                    attempt,
+                    settle,
+                })
+            };
+            let deliver = || -> hellas_sdk::execution::Delivery<'static> {
+                let delivered = delivered.clone();
+                Box::new(move |_| {
+                    delivered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                })
+            };
+            let attempt = ExecutionAttempt::open_paid(&path, job.input(), PRICE).unwrap();
+            let refused = executor(attempt, Some(0), false)
+                .run(
+                    &job,
+                    &signer,
+                    None,
+                    stop_on(std::future::pending()),
+                    deliver(),
+                )
+                .await;
+            assert!(matches!(
+                refused,
+                Err(ExecutionError::Paid(PaidClientError::InvalidOptions(_)))
+            ));
+            let attempt = ExecutionAttempt::open_existing_paid(&path, job.input(), PRICE).unwrap();
+            assert!(!attempt.inspect().unwrap().target_bound);
+            let completed = sealing_while(
+                &mut case.devnet,
+                Duration::from_millis(100),
+                executor(attempt, None, false).run(
+                    &job,
+                    &signer,
+                    None,
+                    stop_on(std::future::pending()),
+                    deliver(),
+                ),
+            )
+            .await
+            .unwrap();
+            assert!(completed.live.is_some());
+            let attempt = ExecutionAttempt::open_existing_paid(&path, job.input(), PRICE).unwrap();
+            assert_eq!(attempt.inspect().unwrap().payment, Payment::Paid);
+            assert!(attempt.inspect().unwrap().reported);
+            // Nothing is sealed while settling: finality never arrives.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            let replayed = executor(attempt, None, true)
+                .run(
+                    &job,
+                    &signer,
+                    Some(deadline),
+                    stop_on(std::future::pending()),
+                    deliver(),
+                )
+                .await;
+            assert!(matches!(
+                replayed,
+                Err(ExecutionError::Stopped(
+                    hellas_sdk::execution::RequestStopped::Deadline
+                ))
+            ));
+            assert!(tokio::time::Instant::now() < deadline + Duration::from_secs(1));
+            assert_eq!(delivered.load(std::sync::atomic::Ordering::SeqCst), 2);
+            let attempt = ExecutionAttempt::open_existing_paid(&path, job.input(), PRICE).unwrap();
+            assert_eq!(attempt.inspect().unwrap().work, Some(completed.work_id));
+            case.endpoint.close().await;
+            case.provider.shutdown().await.unwrap();
+            case.relays.shutdown().await;
+            case.devnet.shutdown().await;
+        })
+    });
+}
+
 #[test]
 fn tracked_attempts_reuse_retained_policy_with_zero_funding_cap() {
     run(|runtime| {
@@ -295,19 +395,19 @@ fn tracked_attempts_reuse_retained_policy_with_zero_funding_cap() {
             let mut elsewhere = case.options.clone();
             elsewhere.provider.node = iroh::SecretKey::from_bytes(&[0x77; 32]).public();
             assert!(matches!(
-                mismatch
-                    .open_paid_session(
-                        job.input(),
-                        elsewhere,
-                        case.endpoint.clone(),
-                        client_settlement(),
-                        case.owner.clone(),
-                        SessionFundingOptions {
-                            max_funding: Some(CLIENT_FUNDING),
-                            approval: Some(gate.clone())
-                        }
-                    )
-                    .await,
+                open_attempt(
+                    &mut mismatch,
+                    job.input(),
+                    elsewhere,
+                    case.endpoint.clone(),
+                    client_settlement(),
+                    case.owner.clone(),
+                    SessionFundingOptions {
+                        max_funding: Some(CLIENT_FUNDING),
+                        approval: Some(gate.clone())
+                    }
+                )
+                .await,
                 Err(ExecutionError::Identity)
             ));
             assert_eq!(gate.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -316,38 +416,38 @@ fn tracked_attempts_reuse_retained_policy_with_zero_funding_cap() {
             let mut unfunded =
                 ExecutionAttempt::open_paid(&unfunded_path, job.input(), PRICE).unwrap();
             assert!(matches!(
-                unfunded
-                    .open_paid_session(
-                        job.input(),
-                        case.options.clone(),
-                        case.endpoint.clone(),
-                        client_settlement(),
-                        case.owner.clone(),
-                        SessionFundingOptions {
-                            max_funding: Some(0),
-                            approval: None
-                        },
-                    )
-                    .await,
+                open_attempt(
+                    &mut unfunded,
+                    job.input(),
+                    case.options.clone(),
+                    case.endpoint.clone(),
+                    client_settlement(),
+                    case.owner.clone(),
+                    SessionFundingOptions {
+                        max_funding: Some(0),
+                        approval: None
+                    },
+                )
+                .await,
                 Err(ExecutionError::Paid(PaidClientError::InvalidOptions(_)))
             ));
             assert!(case.approvals.0.lock().unwrap().is_empty());
             assert!(!unfunded.inspect().unwrap().target_bound);
             assert!(
-                unfunded
-                    .open_paid_session(
-                        job.input(),
-                        case.options.clone(),
-                        case.endpoint.clone(),
-                        client_settlement(),
-                        case.owner.clone(),
-                        SessionFundingOptions {
-                            max_funding: Some(CLIENT_FUNDING),
-                            approval: Some(gate.clone())
-                        }
-                    )
-                    .await
-                    .is_err()
+                open_attempt(
+                    &mut unfunded,
+                    job.input(),
+                    case.options.clone(),
+                    case.endpoint.clone(),
+                    client_settlement(),
+                    case.owner.clone(),
+                    SessionFundingOptions {
+                        max_funding: Some(CLIENT_FUNDING),
+                        approval: Some(gate.clone())
+                    }
+                )
+                .await
+                .is_err()
             );
             assert!(!unfunded.inspect().unwrap().target_bound);
             assert!(case.approvals.0.lock().unwrap().is_empty());
@@ -361,7 +461,8 @@ fn tracked_attempts_reuse_retained_policy_with_zero_funding_cap() {
             let mut funded = sealing_while(
                 &mut case.devnet,
                 Duration::from_millis(100),
-                unfunded.open_paid_session(
+                open_attempt(
+                    &mut unfunded,
                     job.input(),
                     case.options.clone(),
                     case.endpoint.clone(),
@@ -390,44 +491,45 @@ fn tracked_attempts_reuse_retained_policy_with_zero_funding_cap() {
                 let prefix_path = lost_path.clone();
                 let mut attempt =
                     ExecutionAttempt::open_paid(&attempt_path, job.input(), PRICE).unwrap();
-                let mut session = attempt
-                    .open_paid_session(
-                        job.input(),
-                        case.options.clone(),
-                        case.endpoint.clone(),
-                        client_settlement(),
-                        case.owner.clone(),
-                        SessionFundingOptions {
-                            max_funding: Some(if n == 0 { CLIENT_FUNDING } else { 0 }),
-                            approval: None,
-                        },
-                    )
-                    .await
-                    .unwrap();
+                let mut session = open_attempt(
+                    &mut attempt,
+                    job.input(),
+                    case.options.clone(),
+                    case.endpoint.clone(),
+                    client_settlement(),
+                    case.owner.clone(),
+                    SessionFundingOptions {
+                        max_funding: Some(if n == 0 { CLIENT_FUNDING } else { 0 }),
+                        approval: None,
+                    },
+                )
+                .await
+                .unwrap();
                 assert_eq!(
                     *bond.get_or_insert(session.descriptor().bond_edge()),
                     session.descriptor().bond_edge()
                 );
-                let ExecutionResult::Paid(result) = ExecutionSession::Paid(&mut session)
-                    .execute(
-                        job.input().clone(),
-                        terms,
-                        &signer,
-                        ExecutionObservers {
-                            accepted: Some(Arc::new(move |_| {
-                                // Save the caller's interrupted acceptance prefix;
-                                // channel processing then continues to a paid terminal.
-                                let prefix: serde_json::Value =
-                                    serde_json::from_slice(&std::fs::read(&marker_path).unwrap())
-                                        .unwrap();
-                                write_marker(&prefix_path, &prefix);
-                            })),
-                            ..Default::default()
-                        },
-                        Some(&mut attempt),
-                    )
-                    .await
-                    .unwrap()
+                let Some(ExecutionResult::Paid(result)) = execute(
+                    ExecutionSession::Paid(&mut session),
+                    job.input().clone(),
+                    terms,
+                    &signer,
+                    ExecutionObservers {
+                        accepted: Some(Arc::new(move |_| {
+                            // Save the caller's interrupted acceptance prefix;
+                            // channel processing then continues to a paid terminal.
+                            let prefix: serde_json::Value =
+                                serde_json::from_slice(&std::fs::read(&marker_path).unwrap())
+                                    .unwrap();
+                            write_marker(&prefix_path, &prefix);
+                        })),
+                        ..Default::default()
+                    },
+                    Some(&mut attempt),
+                )
+                .await
+                .unwrap()
+                .live
                 else {
                     panic!("paid result");
                 };
@@ -475,20 +577,20 @@ fn tracked_attempts_reuse_retained_policy_with_zero_funding_cap() {
             )
             .unwrap();
             assert!(
-                attempt
-                    .open_paid_session(
-                        wrong.input(),
-                        case.options.clone(),
-                        case.endpoint.clone(),
-                        client_settlement(),
-                        case.owner.clone(),
-                        SessionFundingOptions {
-                            max_funding: Some(0),
-                            approval: None
-                        },
-                    )
-                    .await
-                    .is_err()
+                open_attempt(
+                    &mut attempt,
+                    wrong.input(),
+                    case.options.clone(),
+                    case.endpoint.clone(),
+                    client_settlement(),
+                    case.owner.clone(),
+                    SessionFundingOptions {
+                        max_funding: Some(0),
+                        approval: None
+                    },
+                )
+                .await
+                .is_err()
             );
             assert!(!attempt.inspect().unwrap().target_bound);
             drop(attempt);
@@ -500,7 +602,8 @@ fn tracked_attempts_reuse_retained_policy_with_zero_funding_cap() {
                 ExecutionAttempt::open_paid(&offline_path, job.input(), PRICE).unwrap();
             let mut session = tokio::time::timeout(
                 Duration::from_secs(30),
-                attempt.open_paid_session(
+                open_attempt(
+                    &mut attempt,
                     job.input(),
                     case.options.clone(),
                     case.endpoint.clone(),
@@ -549,17 +652,17 @@ fn tracked_recovery_requires_attempt_and_request_bindings() {
             let path = interrupted_path.as_path().to_path_buf();
             let mut attempt =
                 ExecutionAttempt::open_paid(&interrupted_path, job.input(), PRICE).unwrap();
-            let mut session = attempt
-                .open_paid_session(
-                    job.input(),
-                    case.options.clone(),
-                    case.endpoint.clone(),
-                    client_settlement(),
-                    case.owner.clone(),
-                    SessionFundingOptions::default(),
-                )
-                .await
-                .unwrap();
+            let mut session = open_attempt(
+                &mut attempt,
+                job.input(),
+                case.options.clone(),
+                case.endpoint.clone(),
+                client_settlement(),
+                case.owner.clone(),
+                SessionFundingOptions::default(),
+            )
+            .await
+            .unwrap();
             let signer = ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap();
             let (work, nonce) =
                 accept_paused(&mut session, &mut attempt, &job, &signer, &upstream).await;
@@ -604,20 +707,20 @@ fn tracked_recovery_requires_attempt_and_request_bindings() {
             let mut attempt =
                 ExecutionAttempt::open_existing_paid(&interrupted_path, job.input(), PRICE)
                     .unwrap();
-            let mut session = attempt
-                .open_paid_session(
-                    job.input(),
-                    case.options.clone(),
-                    case.endpoint.clone(),
-                    client_settlement(),
-                    case.owner.clone(),
-                    SessionFundingOptions {
-                        max_funding: Some(0),
-                        approval: None,
-                    },
-                )
-                .await
-                .unwrap();
+            let mut session = open_attempt(
+                &mut attempt,
+                job.input(),
+                case.options.clone(),
+                case.endpoint.clone(),
+                client_settlement(),
+                case.owner.clone(),
+                SessionFundingOptions {
+                    max_funding: Some(0),
+                    approval: None,
+                },
+            )
+            .await
+            .unwrap();
             assert!(
                 session
                     .with_state(|state| state.job_by_id(work).unwrap().prepared_input().is_empty())
@@ -678,15 +781,15 @@ fn tracked_recovery_requires_attempt_and_request_bindings() {
             assert_eq!(facts.payment, Payment::Pending);
             assert!(!facts.result_available);
             assert!(matches!(
-                ExecutionSession::Paid(&mut session)
-                    .execute(
-                        job.input().clone(),
-                        terms,
-                        &signer,
-                        Default::default(),
-                        Some(&mut attempt),
-                    )
-                    .await,
+                execute(
+                    ExecutionSession::Paid(&mut session),
+                    job.input().clone(),
+                    terms,
+                    &signer,
+                    Default::default(),
+                    Some(&mut attempt),
+                )
+                .await,
                 Err(ExecutionError::RecoveryRequired)
             ));
             let saved: serde_json::Value =
@@ -719,20 +822,20 @@ fn tracked_recovery_requires_attempt_and_request_bindings() {
             let mut attempt =
                 ExecutionAttempt::open_existing_paid(&unsigned_paid_path, job.input(), PRICE)
                     .unwrap();
-            let mut session = attempt
-                .open_paid_session(
-                    job.input(),
-                    case.options.clone(),
-                    case.endpoint.clone(),
-                    client_settlement(),
-                    case.owner.clone(),
-                    SessionFundingOptions {
-                        max_funding: Some(0),
-                        approval: None,
-                    },
-                )
-                .await
-                .unwrap();
+            let mut session = open_attempt(
+                &mut attempt,
+                job.input(),
+                case.options.clone(),
+                case.endpoint.clone(),
+                client_settlement(),
+                case.owner.clone(),
+                SessionFundingOptions {
+                    max_funding: Some(0),
+                    approval: None,
+                },
+            )
+            .await
+            .unwrap();
             assert!(
                 session
                     .with_state(|state| state
@@ -798,15 +901,15 @@ async fn assert_pending(
     assert_eq!(facts.payment, Payment::Pending);
     assert!(!facts.result_available);
     assert!(matches!(
-        ExecutionSession::Paid(session)
-            .execute(
-                job.input().clone(),
-                ExecutionTerms::Paid { price: PRICE },
-                signer,
-                Default::default(),
-                Some(attempt),
-            )
-            .await,
+        execute(
+            ExecutionSession::Paid(session),
+            job.input().clone(),
+            ExecutionTerms::Paid { price: PRICE },
+            signer,
+            Default::default(),
+            Some(attempt),
+        )
+        .await,
         Err(ExecutionError::RecoveryRequired)
     ));
 }
@@ -898,8 +1001,8 @@ async fn accept_paused(
     let accepted = Arc::new(tokio::sync::Notify::new());
     let signal = accepted.clone();
     {
-        let mut execution = ExecutionSession::Paid(session);
-        let running = execution.execute(
+        let running = execute(
+            ExecutionSession::Paid(session),
             job.input().clone(),
             ExecutionTerms::Paid { price: PRICE },
             signer,
@@ -958,35 +1061,35 @@ fn reused_nonce_scenario(
         let first_path = first_paid_path.as_path().to_path_buf();
         let mut first_attempt =
             ExecutionAttempt::open_paid(&first_paid_path, first.input(), PRICE).unwrap();
-        let mut session = first_attempt
-            .open_paid_session(
-                first.input(),
-                case.options.clone(),
-                case.endpoint.clone(),
-                client_settlement(),
-                case.owner.clone(),
-                SessionFundingOptions {
-                    max_funding: Some(0),
-                    approval: None,
-                },
-            )
-            .await
-            .unwrap();
+        let mut session = open_attempt(
+            &mut first_attempt,
+            first.input(),
+            case.options.clone(),
+            case.endpoint.clone(),
+            client_settlement(),
+            case.owner.clone(),
+            SessionFundingOptions {
+                max_funding: Some(0),
+                approval: None,
+            },
+        )
+        .await
+        .unwrap();
         // Suspending readiness stops public execution after its durable nonce
         // intent but before JobProposed: the pre-proposal crash prefix.
         session.shutdown().await;
         let signer = ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap();
         assert!(
-            ExecutionSession::Paid(&mut session)
-                .execute(
-                    first.input().clone(),
-                    terms,
-                    &signer,
-                    Default::default(),
-                    Some(&mut first_attempt)
-                )
-                .await
-                .is_err()
+            execute(
+                ExecutionSession::Paid(&mut session),
+                first.input().clone(),
+                terms,
+                &signer,
+                Default::default(),
+                Some(&mut first_attempt)
+            )
+            .await
+            .is_err()
         );
         let first_record: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&first_path).unwrap()).unwrap();
@@ -1006,20 +1109,20 @@ fn reused_nonce_scenario(
         let second_paid_path = paid_path(&case, &second, "later-attempt");
         let mut second_attempt =
             ExecutionAttempt::open_paid(&second_paid_path, second.input(), PRICE).unwrap();
-        let mut session = second_attempt
-            .open_paid_session(
-                second.input(),
-                case.options.clone(),
-                case.endpoint.clone(),
-                client_settlement(),
-                case.owner.clone(),
-                SessionFundingOptions {
-                    max_funding: Some(0),
-                    approval: None,
-                },
-            )
-            .await
-            .unwrap();
+        let mut session = open_attempt(
+            &mut second_attempt,
+            second.input(),
+            case.options.clone(),
+            case.endpoint.clone(),
+            client_settlement(),
+            case.owner.clone(),
+            SessionFundingOptions {
+                max_funding: Some(0),
+                approval: None,
+            },
+        )
+        .await
+        .unwrap();
         let (work, nonce) = accept_paused(
             &mut session,
             &mut second_attempt,
@@ -1044,20 +1147,20 @@ fn reused_nonce_scenario(
         drop(second_attempt);
         let mut first_attempt =
             ExecutionAttempt::open_existing_paid(&first_paid_path, first.input(), PRICE).unwrap();
-        let mut session = first_attempt
-            .open_paid_session(
-                first.input(),
-                case.options.clone(),
-                case.endpoint.clone(),
-                client_settlement(),
-                case.owner.clone(),
-                SessionFundingOptions {
-                    max_funding: Some(0),
-                    approval: None,
-                },
-            )
-            .await
-            .unwrap();
+        let mut session = open_attempt(
+            &mut first_attempt,
+            first.input(),
+            case.options.clone(),
+            case.endpoint.clone(),
+            client_settlement(),
+            case.owner.clone(),
+            SessionFundingOptions {
+                max_funding: Some(0),
+                approval: None,
+            },
+        )
+        .await
+        .unwrap();
         assert!(
             session
                 .with_state(|state| state.job_by_id(work).unwrap().prepared_input().is_empty())

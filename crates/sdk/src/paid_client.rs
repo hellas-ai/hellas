@@ -236,7 +236,6 @@ pub struct PaidWorkResult {
     pub job_price: u64,
     pub provider_key: hellas_auth::PublicKey,
     pub input: hellas_rpc::InputCommitment,
-    pub settled_provider_payout: Option<u64>,
 }
 
 /// A funded client channel. Keep one session per journal and serialize its jobs.
@@ -383,10 +382,22 @@ async fn check_payment_window(client: &ClientService, work_id: hellas_auth::Dige
         .await?
 }
 
-struct OpenIntent<'a> {
-    job: Option<Box<crate::job::Job>>,
-    allow_funding: bool,
-    before_open: Option<crate::client_owner::FundingBinding<'a>>,
+pub(crate) struct OpenIntent<'a> {
+    pub(crate) job: Option<Box<crate::job::Job>>,
+    pub(crate) allow_funding: bool,
+    pub(crate) before_open: Option<crate::client_owner::FundingBinding<'a>>,
+}
+
+/// The empty content a recovery-only run reads.
+pub(crate) fn empty_content() -> (LocalStore, Scope) {
+    (
+        LocalStore::Memory(hellas_store::content::MemoryStore::new(
+            hellas_store::content::Reservations::ram(
+                hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
+            ),
+        )),
+        Scope::Owner,
+    )
 }
 
 /// Admission mode for session opening. Retained opening cannot fund a channel.
@@ -423,74 +434,30 @@ impl PaidWorkSession {
         mode: SessionOpenMode<'_>,
         funding: SessionFundingOptions,
     ) -> impl Future<Output = Result<Self>> {
-        Self::open_intent(args, endpoint, settlement_key, owner, mode, funding, None)
-    }
-
-    /// Opens a session that binds its target before funding or setup signatures.
-    ///
-    /// `before_open` runs after selected-policy admission and application
-    /// reservation, so a refusal there leaves no signature and no reservation
-    /// behind. The job it belongs to is `mode`'s, not a second copy.
-    pub(crate) fn open_intent(
-        args: PaidWorkOptions,
-        endpoint: Endpoint,
-        settlement_key: Secp256k1Signer,
-        owner: Arc<ClientOwner>,
-        mode: SessionOpenMode<'_>,
-        funding: SessionFundingOptions,
-        before_open: Option<crate::client_owner::FundingBinding<'_>>,
-    ) -> impl Future<Output = Result<Self>> {
-        Box::pin(async move {
-            let (job, allow_funding) = match mode {
-                SessionOpenMode::Any => (None, true),
-                SessionOpenMode::Job(job) => (Some(Box::new(job.clone())), true),
-                SessionOpenMode::Retained => (None, false),
-            };
-            Box::pin(Self::open_inner(
-                args,
-                endpoint,
-                settlement_key,
-                owner,
-                OpenIntent {
-                    job,
-                    allow_funding,
-                    before_open,
-                },
-                None,
-                funding,
-            ))
-            .await
-        })
-    }
-
-    /// A gateway limits provider reachability separately from owner funding and
-    /// chain finality. The enclosing request still bounds the whole opening.
-    pub(crate) async fn open_for_gateway(
-        args: PaidWorkOptions,
-        endpoint: Endpoint,
-        settlement_key: Secp256k1Signer,
-        owner: Arc<ClientOwner>,
-        connection_timeout: Duration,
-        funding: SessionFundingOptions,
-        job: Option<&crate::job::Job>,
-    ) -> Result<Self> {
-        Self::open_inner(
+        let (job, allow_funding) = match mode {
+            SessionOpenMode::Any => (None, true),
+            SessionOpenMode::Job(job) => (Some(Box::new(job.clone())), true),
+            SessionOpenMode::Retained => (None, false),
+        };
+        Box::pin(Self::open_inner(
             args,
             endpoint,
             settlement_key,
             owner,
             OpenIntent {
-                job: job.map(|job| Box::new(job.clone())),
-                allow_funding: job.is_some(),
+                job,
+                allow_funding,
                 before_open: None,
             },
-            Some(connection_timeout),
+            None,
             funding,
-        )
-        .await
+        ))
     }
 
-    async fn open_inner(
+    /// `before_open` runs after selected-policy admission and application
+    /// reservation, so a refusal there leaves no signature and no reservation
+    /// behind. `connection_timeout` bounds reaching the provider only.
+    pub(crate) async fn open_inner(
         args: PaidWorkOptions,
         endpoint: Endpoint,
         settlement_key: Secp256k1Signer,
@@ -832,58 +799,6 @@ impl PaidWorkSession {
     /// True after reopening a journal or an interrupted request.
     pub fn needs_recovery(&self) -> bool {
         self.needs_recovery
-    }
-
-    /// Opens a close and drives it to finality.
-    ///
-    /// The same progress loop as offline settlement: a retained start is
-    /// offered again while it can land, replaced once its window has passed,
-    /// and a source that fails is reconnected. There is no deadline here:
-    /// with the observer stopped or validators unreachable this waits as long
-    /// as the process runs. Callers that need a bound should wrap it in one.
-    pub async fn settle(&mut self) -> Result<u64> {
-        if let Some(settled) = self
-            .client
-            .with_state(|state| state.close_settled())
-            .await?
-        {
-            return Ok(settled.provider_payout);
-        }
-        let poll = self.args.config.poll;
-        let timeout = read_timeout(self.args.timeout);
-        loop {
-            let floor = self.client.with_state(|state| state.cursor().0).await?;
-            let remote =
-                match crate::client_chain::connect_at(&self.args.config, timeout, floor).await {
-                    Ok(remote) => remote,
-                    Err(error) => {
-                        tracing::debug!(%error, "paid settlement is waiting for a chain source");
-                        #[expect(
-                            clippy::disallowed_methods,
-                            reason = "inventory class C: chain connection backoff"
-                        )]
-                        tokio::time::sleep(poll).await;
-                        continue;
-                    }
-                };
-            let chain = WorkBlocks::new(remote).with_min_height(floor);
-            match settlement::settle_close(&mut self.client, &chain, &chain, poll).await {
-                Ok(provider_payout) => return Ok(provider_payout),
-                Err(PaidClientError::CatchUp(
-                    hellas_channel::work_close::CatchUpError::Source(_)
-                    | hellas_channel::work_close::CatchUpError::Missing { .. },
-                )) => {
-                    // The observer may still reach finality through another
-                    // source; reconnect and let the shared loop observe it.
-                    #[expect(
-                        clippy::disallowed_methods,
-                        reason = "inventory class B: chain catch-up; rollout 3"
-                    )]
-                    tokio::time::sleep(poll).await;
-                }
-                Err(error) => return Err(error),
-            }
-        }
     }
 
     /// Runs a request and pays only after verifying its complete result.
@@ -1493,7 +1408,6 @@ async fn execute_paid_job(
         output,
         provider_key: hellas_auth::PublicKey::Secp256k1(ready.channel().provider_key().to_bytes()),
         input: proposal.prepared_input.request.input_commitment()?,
-        settled_provider_payout: None,
     })
 }
 

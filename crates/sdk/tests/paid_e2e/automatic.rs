@@ -904,17 +904,17 @@ async fn compute_and_settle_inner(
             provider: options.provider,
         })
         .unwrap();
-    let result = hellas_sdk::execution::ExecutionSession::Paid(&mut session)
-        .execute(
-            job.input().clone(),
-            terms,
-            &client_key,
-            Default::default(),
-            Some(&mut attempt),
-        )
-        .await
-        .unwrap();
-    let hellas_sdk::execution::ExecutionResult::Paid(result) = result else {
+    let result = execute(
+        hellas_sdk::execution::ExecutionSession::Paid(&mut session),
+        job.input().clone(),
+        terms,
+        &client_key,
+        Default::default(),
+        Some(&mut attempt),
+    )
+    .await
+    .unwrap();
+    let Some(hellas_sdk::execution::ExecutionResult::Paid(result)) = result.live else {
         panic!("paid result")
     };
     let first_work = result.work_id;
@@ -928,16 +928,16 @@ async fn compute_and_settle_inner(
     attempt.reported().unwrap();
     assert!(attempt.inspect().unwrap().reported);
     assert!(
-        hellas_sdk::execution::ExecutionSession::Paid(&mut session)
-            .execute(
-                job.input().clone(),
-                terms,
-                &client_key,
-                Default::default(),
-                Some(&mut attempt)
-            )
-            .await
-            .is_err()
+        execute(
+            hellas_sdk::execution::ExecutionSession::Paid(&mut session),
+            job.input().clone(),
+            terms,
+            &client_key,
+            Default::default(),
+            Some(&mut attempt)
+        )
+        .await
+        .is_err()
     );
     assert_eq!(compute.calls(), 1);
     // A paid marker whose receipt was never written remains paid, with no
@@ -962,15 +962,15 @@ async fn compute_and_settle_inner(
     assert!(!facts.result_available);
     assert!(!facts.reported);
     assert!(matches!(
-        hellas_sdk::execution::ExecutionSession::Paid(&mut session)
-            .execute(
-                job.input().clone(),
-                terms,
-                &client_key,
-                Default::default(),
-                Some(&mut paid_without_receipt)
-            )
-            .await,
+        execute(
+            hellas_sdk::execution::ExecutionSession::Paid(&mut session),
+            job.input().clone(),
+            terms,
+            &client_key,
+            Default::default(),
+            Some(&mut paid_without_receipt)
+        )
+        .await,
         Err(hellas_sdk::execution::ExecutionError::RecoveryRequired)
     ));
     assert_eq!(compute.calls(), 1);
@@ -996,15 +996,15 @@ async fn compute_and_settle_inner(
     )
     .unwrap();
     assert!(matches!(
-        hellas_sdk::execution::ExecutionSession::Paid(&mut session)
-            .execute(
-                job.input().clone(),
-                terms,
-                &client_key,
-                Default::default(),
-                Some(&mut interrupted_attempt)
-            )
-            .await,
+        execute(
+            hellas_sdk::execution::ExecutionSession::Paid(&mut session),
+            job.input().clone(),
+            terms,
+            &client_key,
+            Default::default(),
+            Some(&mut interrupted_attempt)
+        )
+        .await,
         Err(hellas_sdk::execution::ExecutionError::RecoveryRequired)
     ));
     assert_eq!(compute.calls(), 1);
@@ -1160,17 +1160,17 @@ async fn compute_and_settle_inner(
         })
         .unwrap();
     let calls = compute.calls();
-    let hellas_sdk::execution::ExecutionResult::Paid(second_result) =
-        hellas_sdk::execution::ExecutionSession::Paid(&mut session)
-            .execute(
-                first_job.input().clone(),
-                terms,
-                &client_key,
-                Default::default(),
-                Some(&mut second),
-            )
-            .await
-            .unwrap()
+    let Some(hellas_sdk::execution::ExecutionResult::Paid(second_result)) = execute(
+        hellas_sdk::execution::ExecutionSession::Paid(&mut session),
+        first_job.input().clone(),
+        terms,
+        &client_key,
+        Default::default(),
+        Some(&mut second),
+    )
+    .await
+    .unwrap()
+    .live
     else {
         panic!("paid result")
     };
@@ -2241,19 +2241,19 @@ fn grant_composition<'a>(
             .open_grant_session(options.clone(), GrantTransport::Remote(transport.clone()))
             .await
             .unwrap();
-        let result = hellas_sdk::execution::ExecutionSession::Grant(&mut session)
-            .execute(
-                input,
-                terms,
-                &principal(1).1,
-                Default::default(),
-                Some(&mut attempt),
-            )
-            .await
-            .unwrap();
+        let result = execute(
+            hellas_sdk::execution::ExecutionSession::Grant(&mut session),
+            input,
+            terms,
+            &principal(1).1,
+            Default::default(),
+            Some(&mut attempt),
+        )
+        .await
+        .unwrap();
         assert!(matches!(
-            result,
-            hellas_sdk::execution::ExecutionResult::Grant(_)
+            result.live,
+            Some(hellas_sdk::execution::ExecutionResult::Grant(_))
         ));
         session.shutdown().await.unwrap();
         drop(session);
@@ -2540,10 +2540,10 @@ async fn finish(case: Box<Case>) {
         .unavailable
         .load(std::sync::atomic::Ordering::SeqCst);
     let open = PaidWorkSession::open(
-        fresh_args,
+        fresh_args.clone(),
         endpoint.clone(),
         keys[3].clone(),
-        agent_owner,
+        agent_owner.clone(),
         SessionOpenMode::Any,
         SessionFundingOptions::default(),
     );
@@ -2572,14 +2572,25 @@ async fn finish(case: Box<Case>) {
         third.offer().proposal.bond_edge(),
         "expired client revision one cannot pin recovery to a dead offer"
     );
-    assert_eq!(
-        sealing_while(&mut devnet, Duration::from_millis(100), fresh.settle())
-            .await
-            .unwrap(),
-        0
-    );
+    let bond = fresh.descriptor().bond_edge();
     fresh.shutdown().await;
     drop(fresh);
+    assert_eq!(
+        sealing_while(
+            &mut devnet,
+            Duration::from_millis(100),
+            hellas_sdk::paid_client::settle_channel(
+                &fresh_args,
+                bond,
+                agent_owner.principal(),
+                &keys[3],
+            )
+        )
+        .await
+        .unwrap()
+        .provider_payout,
+        0
+    );
     grant_composition(&provider, &secret, root.path()).await;
     provider.grants.drain().await.unwrap();
     provider.shutdown().await;

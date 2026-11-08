@@ -121,17 +121,17 @@ async fn granted_compute_executes_through_the_native_facade() {
         .open_grant_session(options, GrantTransport::Local(service.clone()))
         .await
         .unwrap();
-    let result = hellas_sdk::execution::ExecutionSession::Grant(&mut session)
-        .execute(
-            input,
-            terms,
-            &principal(1).1,
-            Default::default(),
-            Some(&mut attempt),
-        )
-        .await
-        .unwrap();
-    let hellas_sdk::execution::ExecutionResult::Grant(result) = result else {
+    let result = super::execute(
+        hellas_sdk::execution::ExecutionSession::Grant(&mut session),
+        input,
+        terms,
+        &principal(1).1,
+        Default::default(),
+        Some(&mut attempt),
+    )
+    .await
+    .unwrap();
+    let Some(hellas_sdk::execution::ExecutionResult::Grant(result)) = result.live else {
         panic!("grant result")
     };
     assert_eq!(result.output.artifacts[0].bytes.as_bytes(), &[0]);
@@ -251,17 +251,17 @@ async fn local_grant_session_executes_without_http() {
         .await
         .unwrap();
     finish.release();
-    let result = hellas_sdk::execution::ExecutionSession::Grant(&mut session)
-        .execute(
-            input.clone(),
-            terms,
-            &principal(1).1,
-            Default::default(),
-            Some(&mut attempt),
-        )
-        .await
-        .unwrap();
-    let hellas_sdk::execution::ExecutionResult::Grant(result) = result else {
+    let result = super::execute(
+        hellas_sdk::execution::ExecutionSession::Grant(&mut session),
+        input.clone(),
+        terms,
+        &principal(1).1,
+        Default::default(),
+        Some(&mut attempt),
+    )
+    .await
+    .unwrap();
+    let Some(hellas_sdk::execution::ExecutionResult::Grant(result)) = result.live else {
         panic!("grant result")
     };
     hellas_auth::signature::verify_digest_signature(
@@ -293,16 +293,16 @@ async fn local_grant_session_executes_without_http() {
     attempt.reported().unwrap();
     assert!(attempt.inspect().unwrap().reported);
     assert!(
-        hellas_sdk::execution::ExecutionSession::Grant(&mut session)
-            .execute(
-                input.clone(),
-                terms,
-                &principal(1).1,
-                Default::default(),
-                Some(&mut attempt)
-            )
-            .await
-            .is_err()
+        super::execute(
+            hellas_sdk::execution::ExecutionSession::Grant(&mut session),
+            input.clone(),
+            terms,
+            &principal(1).1,
+            Default::default(),
+            Some(&mut attempt)
+        )
+        .await
+        .is_err()
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     drop(attempt);
@@ -333,15 +333,15 @@ async fn local_grant_session_executes_without_http() {
         hellas_sdk::execution::ExecutionAttempt::open_existing(&orphan_path, &input, terms)
             .unwrap();
     assert!(matches!(
-        hellas_sdk::execution::ExecutionSession::Grant(&mut session)
-            .execute(
-                input.clone(),
-                terms,
-                &principal(1).1,
-                Default::default(),
-                Some(&mut orphan_attempt)
-            )
-            .await,
+        super::execute(
+            hellas_sdk::execution::ExecutionSession::Grant(&mut session),
+            input.clone(),
+            terms,
+            &principal(1).1,
+            Default::default(),
+            Some(&mut orphan_attempt)
+        )
+        .await,
         Err(hellas_sdk::execution::ExecutionError::RecoveryRequired)
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -366,15 +366,15 @@ async fn local_grant_session_executes_without_http() {
         hellas_sdk::execution::Terminal::Rejected
     );
     assert!(matches!(
-        hellas_sdk::execution::ExecutionSession::Grant(&mut session)
-            .execute(
-                input.clone(),
-                terms,
-                &principal(1).1,
-                Default::default(),
-                Some(&mut rejected_attempt)
-            )
-            .await,
+        super::execute(
+            hellas_sdk::execution::ExecutionSession::Grant(&mut session),
+            input.clone(),
+            terms,
+            &principal(1).1,
+            Default::default(),
+            Some(&mut rejected_attempt)
+        )
+        .await,
         Err(hellas_sdk::execution::ExecutionError::RecoveryRequired)
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -404,16 +404,16 @@ async fn local_grant_session_executes_without_http() {
         })
         .unwrap();
     finish.release();
-    hellas_sdk::execution::ExecutionSession::Grant(&mut session)
-        .execute(
-            input.clone(),
-            terms,
-            &principal(1).1,
-            Default::default(),
-            Some(&mut second),
-        )
-        .await
-        .unwrap();
+    super::execute(
+        hellas_sdk::execution::ExecutionSession::Grant(&mut session),
+        input.clone(),
+        terms,
+        &principal(1).1,
+        Default::default(),
+        Some(&mut second),
+    )
+    .await
+    .unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     let mut third = hellas_sdk::execution::ExecutionAttempt::open(
         &root.path().join("third.json"),
@@ -429,10 +429,10 @@ async fn local_grant_session_executes_without_http() {
         .unwrap();
     let accepted = Arc::new(tokio::sync::Notify::new());
     {
-        let mut execution = hellas_sdk::execution::ExecutionSession::Grant(&mut session);
         let notified = accepted.clone();
         let signer = principal(1).1;
-        let operation = execution.execute(
+        let operation = super::execute(
+            hellas_sdk::execution::ExecutionSession::Grant(&mut session),
             input.clone(),
             terms,
             &signer,
@@ -459,16 +459,16 @@ async fn local_grant_session_executes_without_http() {
     assert_eq!(facts.terminal, hellas_sdk::execution::Terminal::Unknown);
     assert!(!facts.result_available);
     assert!(
-        hellas_sdk::execution::ExecutionSession::Grant(&mut session)
-            .execute(
-                input.clone(),
-                terms,
-                &principal(1).1,
-                Default::default(),
-                Some(&mut third)
-            )
-            .await
-            .is_err()
+        super::execute(
+            hellas_sdk::execution::ExecutionSession::Grant(&mut session),
+            input.clone(),
+            terms,
+            &principal(1).1,
+            Default::default(),
+            Some(&mut third)
+        )
+        .await
+        .is_err()
     );
     while calls.load(Ordering::SeqCst) < 3 {
         started.notified().await;
@@ -525,16 +525,16 @@ async fn local_grant_session_executes_without_http() {
     );
     assert!(!recovered.result_available);
     assert!(
-        hellas_sdk::execution::ExecutionSession::Grant(&mut recovered_session)
-            .execute(
-                input,
-                terms,
-                &principal(1).1,
-                Default::default(),
-                Some(&mut third)
-            )
-            .await
-            .is_err()
+        super::execute(
+            hellas_sdk::execution::ExecutionSession::Grant(&mut recovered_session),
+            input,
+            terms,
+            &principal(1).1,
+            Default::default(),
+            Some(&mut third)
+        )
+        .await
+        .is_err()
     );
     assert_eq!(calls.load(Ordering::SeqCst), 3);
     recovered_session.shutdown().await.unwrap();

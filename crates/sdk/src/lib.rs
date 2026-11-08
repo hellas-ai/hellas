@@ -63,7 +63,7 @@ pub mod grant_config;
 pub mod node_control;
 
 mod gateway_work;
-pub use gateway_work::{GatewayServeOptions, WorkGateway, serve_gateway};
+pub use gateway_work::{GatewayServeOptions, WorkGateway, WorkRequest, serve_gateway};
 pub mod grant_gateway;
 pub mod grant_store;
 

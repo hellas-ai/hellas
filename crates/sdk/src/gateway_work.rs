@@ -263,14 +263,6 @@ impl GatewayEvent for ComputeEvent {
     }
 }
 
-/// A verified completion, the provider key that signed it, and the
-/// canonical bytes of the signed transcript it was verified from.
-pub struct Completed {
-    pub output: InvocationOutput,
-    pub provider: hellas_auth::PublicKey,
-    pub transcript: Vec<u8>,
-}
-
 /// What one event charges against the requester's output budget.
 fn event_bytes<E: GatewayEvent>(event: &WorkEvent<E>) -> usize {
     match event {
@@ -378,11 +370,36 @@ impl<E: GatewayEvent, X: std::fmt::Display + Send + 'static> Requester<E, X> {
             Ok(())
         })
     }
+    #[cfg(test)]
     pub(crate) fn is_closed(&self) -> bool {
         self.sender.is_closed()
     }
-    pub(crate) async fn closed(&self) {
-        self.sender.closed().await
+    /// Disconnecting stops a request only before its proposal.
+    pub(crate) fn stop(&self) -> crate::execution::Stop {
+        let sender = self.sender.clone();
+        crate::execution::stop_on(async move { sender.closed().await })
+    }
+    pub(crate) fn observers(&self) -> crate::execution::ExecutionObservers {
+        crate::execution::ExecutionObservers {
+            progress: Some(self.progress()),
+            accepted: Some(self.accepted()),
+        }
+    }
+    /// The signed transcript, then the completion. Queueing is the handoff.
+    pub(crate) fn delivery(&self) -> crate::execution::Delivery<'static>
+    where
+        X: From<WorkGatewayError>,
+    {
+        let requester = self.clone();
+        Box::new(move |completed| {
+            requester.emit(Ok(WorkEvent::Transcript(completed.transcript.clone())));
+            requester.emit(
+                E::completed(&completed.output, &completed.provider_key)
+                    .map(WorkEvent::Output)
+                    .map_err(Into::into),
+            );
+            Ok(())
+        })
     }
 }
 
@@ -391,8 +408,8 @@ pub enum WorkRequest {
     /// Pinned to one provider by the HTTP account router; the contract comes
     /// from the admitting policy.
     Fetch(WorkFetchRequest),
-    /// A complete program input; any admitting provider may run it.
-    Compute(JobInput),
+    /// A complete input; any admitting provider may run it.
+    Job(JobInput),
 }
 
 impl WorkRequest {
@@ -400,13 +417,14 @@ impl WorkRequest {
     pub fn pinned(&self) -> Option<iroh::EndpointId> {
         match self {
             WorkRequest::Fetch(request) => Some(request.provider),
-            WorkRequest::Compute(_) => None,
+            WorkRequest::Job(_) => None,
         }
     }
 
     /// The one input `policy` admits for this request. A Fetch tries each
     /// Fetch contract of `policy`; an HTTPS body is first repaired under
-    /// `https`. Two admitting contracts are refused, never chosen between.
+    /// `https`, a complete HTTPS job's body too. Two admitting contracts are
+    /// refused, never chosen between.
     pub fn admitted(
         &self,
         policy: &InvocationPolicy,
@@ -415,9 +433,20 @@ impl WorkRequest {
         retain: bool,
     ) -> Result<JobInput, JobError> {
         let request = match self {
-            WorkRequest::Compute(input) => {
+            WorkRequest::Job(input) => {
+                let mut input = input.clone();
+                if let (
+                    Some(https),
+                    JobInput::Fetch {
+                        contract, request, ..
+                    },
+                ) = (https, &mut input)
+                    && contract.schema() == hellas_rpc::FetchSchema::HttpV1
+                {
+                    *request = repair(https, request)?;
+                }
                 input.admits(policy, retain)?;
-                return Ok(input.clone());
+                return Ok(input);
             }
             WorkRequest::Fetch(request) => request,
         };
@@ -434,12 +463,7 @@ impl WorkRequest {
         for contract in contracts {
             let body = match https {
                 Some(https) if contract.schema() == hellas_rpc::FetchSchema::HttpV1 => {
-                    let mut http = HttpFetchRequest::decode(&request.body)
-                        .map_err(|e| JobError::Invalid(e.to_string()))?;
-                    https
-                        .prepare(&mut http)
-                        .map_err(|e| JobError::Invalid(e.to_string()))?;
-                    serde_json::to_vec(&http)?
+                    repair(https, &request.body)?
                 }
                 _ => request.body.clone(),
             };
@@ -466,6 +490,15 @@ impl WorkRequest {
     }
 }
 
+/// An HTTPS body completed under the granted resource's template.
+fn repair(https: &HttpsResource, body: &[u8]) -> Result<Vec<u8>, JobError> {
+    let mut http = HttpFetchRequest::decode(body).map_err(|e| JobError::Invalid(e.to_string()))?;
+    https
+        .prepare(&mut http)
+        .map_err(|e| JobError::Invalid(e.to_string()))?;
+    Ok(serde_json::to_vec(&http)?)
+}
+
 /// How one source funds and runs gateway requests.
 pub trait WorkSource: Send + Sync + Sized + 'static {
     type Error: From<WorkGatewayError> + std::fmt::Display + Send + 'static;
@@ -474,13 +507,14 @@ pub trait WorkSource: Send + Sync + Sized + 'static {
     fn fetch_routes(&self) -> Vec<hellas_gateway::FetchRoute>;
     /// Matches the request to this source's policies and builds its input.
     fn request(&self, request: WorkRequest) -> Result<Self::Request, Self::Error>;
-    /// Runs the request to its verified completion. Work not yet proposed
-    /// stops when the requester disconnects; proposed work runs to completion.
+    /// Runs the request and delivers its verified completion to `requester`.
+    /// Work not yet proposed stops when the requester disconnects; proposed
+    /// work runs to completion.
     fn run<E: GatewayEvent>(
         self: Arc<Self>,
         request: Self::Request,
         requester: Requester<E, Self::Error>,
-    ) -> BoxFuture<'static, Result<Option<Completed>, Self::Error>>;
+    ) -> BoxFuture<'static, Result<(), Self::Error>>;
     fn timeout(&self) -> Option<Duration>;
     fn gateway_error(error: Self::Error) -> WorkGatewayError;
     fn shutdown(&self) -> BoxFuture<'_, Result<(), WorkShutdownError>>;
@@ -601,17 +635,8 @@ impl<S: WorkSource> WorkGateway<S> {
         self.tasks
             .spawn(async move {
                 let _permit = permit;
-                match source.run(request, requester.clone()).await {
-                    Ok(Some(completed)) => {
-                        requester.emit(Ok(WorkEvent::Transcript(completed.transcript.clone())));
-                        requester.emit(
-                            E::completed(&completed.output, &completed.provider)
-                                .map(WorkEvent::Output)
-                                .map_err(Into::into),
-                        )
-                    }
-                    Ok(None) => {}
-                    Err(error) => requester.emit(Err(error)),
+                if let Err(error) = source.run(request, requester.clone()).await {
+                    requester.emit(Err(error));
                 }
             })
             .map_err(|busy| S::Error::from(busy.into()))?;
@@ -661,7 +686,7 @@ impl<S: WorkSource> WorkExecutionBackend for WorkGateway<S> {
         &self,
         job: hellas_client::model::ComputeJob,
     ) -> Result<WorkOutputStream<ComputeEvent>, WorkGatewayError> {
-        self.request(WorkRequest::Compute(JobInput::Compute {
+        self.request(WorkRequest::Job(JobInput::Compute {
             environment: job.environment,
             plan: job.plan,
             inputs: job.inputs,
