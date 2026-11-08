@@ -821,18 +821,27 @@ fn run(tree: &[Vec<Limit>; 5], ops: &[Op]) -> Result<Book, TestCaseError> {
             }
         }
         // I5: after any mutation every waiter re-decides, in order; none
-        // that could admit or must refuse stays parked.
-        for w in queue.waiters().to_vec() {
-            match decide(&book, &queue, &w, model.now) {
-                Decision::Admit => {
-                    book.admit(&w, model.now).unwrap();
-                    model
-                        .holds
-                        .push((w.id, w.leaf, w.charge.get(Meter::OutputTokens)));
-                    queue.withdraw(w.id);
+        // that could admit or must refuse stays parked. A waiter leaving is
+        // itself a mutation, so passes repeat until one changes nothing.
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for w in queue.waiters().to_vec() {
+                match decide(&book, &queue, &w, model.now) {
+                    Decision::Admit => {
+                        book.admit(&w, model.now).unwrap();
+                        model
+                            .holds
+                            .push((w.id, w.leaf, w.charge.get(Meter::OutputTokens)));
+                        queue.withdraw(w.id);
+                        changed = true;
+                    }
+                    Decision::Refuse(_) => {
+                        queue.withdraw(w.id);
+                        changed = true;
+                    }
+                    Decision::Wait { .. } => {}
                 }
-                Decision::Refuse(_) => queue.withdraw(w.id),
-                Decision::Wait { .. } => {}
             }
         }
         for w in queue.waiters() {
