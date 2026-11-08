@@ -1863,6 +1863,33 @@ pub trait WorkBackend: Sync {
     }
 }
 
+/// The one execution core: classify `input` under `policy`, then run it on
+/// `backend`. A grant service, and local execution, add only their funding
+/// admission and transport around it.
+pub async fn run_admitted<B: WorkBackend>(
+    backend: &B,
+    input: PreparedInvocation,
+    policy: &hellas_rpc::protocol::invocation::InvocationPolicy,
+    content: (
+        hellas_store::content::LocalStore,
+        hellas_store::content::Scope,
+    ),
+    admission: WorkAdmission,
+    progress: PaidProgress,
+) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
+    let facts = policy
+        .classify_manifest(&input.manifest().map_err(BackendFault::caused_by)?)
+        .map_err(BackendFault::caused_by)?;
+    let input = Admitted::new(
+        input,
+        facts.limits,
+        facts.capacity_domain,
+        content,
+        admission,
+    );
+    backend.execute_stream(input, progress).await
+}
+
 /// What [`ProviderEndpoint::begin_run`] found, and what may be done next.
 #[derive(Debug)]
 pub enum RunAdmission {
