@@ -53,6 +53,7 @@ pub async fn transcribe(args: TranscribeArgs, context: Context) -> super::super:
     job.save(&directory).await?;
     eprintln!("job: {}", directory.display());
     bounded(
+        &context,
         args.client.timeout,
         async {
             if args.grant.offer.is_some() {

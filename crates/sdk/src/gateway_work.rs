@@ -641,7 +641,7 @@ impl<S: WorkSource> WorkGateway<S> {
 pub(crate) async fn close_endpoints(endpoints: &mut Vec<iroh::Endpoint>) {
     while let Some(endpoint) = endpoints.last() {
         if !endpoint.is_closed() {
-            hellas_wire::iroh::close(endpoint).await;
+            endpoint.close().await;
         }
         endpoints.pop();
     }

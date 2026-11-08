@@ -273,7 +273,7 @@ impl GrantPool {
             Ok(source) => source,
             Err(error) => {
                 if let Some(endpoint) = endpoint {
-                    hellas_wire::iroh::close(&endpoint).await;
+                    endpoint.close().await;
                 }
                 return Err(error);
             }

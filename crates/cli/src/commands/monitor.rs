@@ -74,7 +74,9 @@ pub async fn run(
         .await
         .context("failed to bind iroh endpoint")?;
 
-    let discovery = build_client_registry(&endpoint)?;
+    let discovery =
+        hellas_wire::iroh::close_on_error(&endpoint, async { build_client_registry(&endpoint) })
+            .await?;
     let mdns_ready = discovery_readiness(discovery.mdns_subscribed);
     tokio::pin!(mdns_ready);
     let mut registry = discovery.registry;
@@ -222,7 +224,7 @@ pub async fn run(
         unique_peers, interrogated, interrogation_ok, interrogation_failed, hinted_peers
     );
 
-    hellas_wire::iroh::close(&endpoint).await;
+    endpoint.close().await;
     Ok(())
 }
 

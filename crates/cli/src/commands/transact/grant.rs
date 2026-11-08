@@ -139,17 +139,10 @@ pub(super) async fn execute(
             )?,
             control_timeout: Duration::from_secs(90),
         };
-        let endpoint = hellas_sdk::grant_client::bind_endpoint(context.transport.clone()).await?;
-        let session = attempt
-            .open_grant_session(options, GrantTransport::Remote(endpoint.clone()))
-            .await;
-        let mut session = match session {
-            Ok(session) => session,
-            Err(error) => {
-                hellas_wire::iroh::close(&endpoint).await;
-                return Err(error.into());
-            }
-        };
+        let endpoint = context.grant_endpoint().await?;
+        let mut session = attempt
+            .open_grant_session(options, GrantTransport::Remote(endpoint))
+            .await?;
         let result = async {
             let mut session = ExecutionSession::Grant(&mut session);
             match session.execute(job.input().clone(), terms, &context.producer, Default::default(), Some(&mut attempt)).await {
@@ -166,9 +159,6 @@ pub(super) async fn execute(
             }
         }.await;
         let closed = session.shutdown().await;
-        // Closing acknowledges the provider's final frames; dropping the
-        // endpoint would leave it waiting for them until its write timeout.
-        hellas_wire::iroh::close(&endpoint).await;
         let result = result?;
         closed?;
         result

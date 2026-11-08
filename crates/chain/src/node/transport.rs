@@ -60,10 +60,17 @@ impl FullNode {
                 let runtime = runtime::Config::new().with_storage_directory(indexing.storage(&config.chain).into_path_buf());
                 runtime::Runner::new(runtime).start(move |context| async move {
                     let mut serving = tokio::task::JoinSet::new();
+                    let bound = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+                        .alpns(vec![ChainSync::ALPN.as_bytes().to_vec(), Node::ALPN.as_bytes().to_vec()])
+                        .bind().await.map_err(storage);
+                    let endpoint = match bound {
+                        Ok(endpoint) => endpoint,
+                        Err(error) => {
+                            let _ = context.child("shutdown").stop(0, Some(RPC_TIMEOUT)).await;
+                            let _ = started.send(Err(error)); return;
+                        }
+                    };
                     let opened = async {
-                        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-                            .alpns(vec![ChainSync::ALPN.as_bytes().to_vec(), Node::ALPN.as_bytes().to_vec()])
-                            .bind().await.map_err(storage)?;
                         let trust = match &indexing {
                             Indexing::Off => Trust::Genesis(Arc::new(ConsensusVerifier::new(&config.info()?, crate::genesis_digest(config.genesis())).map_err(invalid)?)),
                             #[cfg(feature = "indexer-api")]
@@ -89,6 +96,7 @@ impl FullNode {
                         Ok(value) => value,
                         Err(error) => {
                             serving.shutdown().await;
+                            endpoint.close().await;
                             let _ = context.child("shutdown").stop(0, Some(RPC_TIMEOUT)).await;
                             let _ = started.send(Err(error)); return;
                         }
@@ -106,7 +114,7 @@ impl FullNode {
                     core.readiness.halt(reason);
                     serving.shutdown().await;
                     tasks.stop(&context).await;
-                    hellas_wire::iroh::close(&network.endpoint).await;
+                    network.endpoint.close().await;
                 });
             })
             .map_err(storage)?;
@@ -467,15 +475,12 @@ async fn serve(service: SyncService, network: Network) {
 }
 
 /// Consensus nodes serve their existing archive; no second executor is started.
+/// The validator closes this endpoint at shutdown; serving ends with it.
 #[cfg(feature = "validator")]
-pub(crate) async fn serve_validator_archive(
-    indexer: ChainIndexer,
-    activity: tokio::sync::broadcast::Sender<crate::ConsensusActivity>,
+pub(crate) async fn bind_validator_endpoint(
     key: iroh::SecretKey,
     bind: Option<std::net::SocketAddr>,
-    database: UtxoDatabase<runtime::Context>,
-    verifier: ConsensusVerifier,
-) -> Result<(), Error> {
+) -> Result<iroh::Endpoint, Error> {
     let mut builder = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
         .secret_key(key)
         .alpns(vec![
@@ -487,8 +492,7 @@ pub(crate) async fn serve_validator_archive(
     }
     let endpoint = builder.bind().await.map_err(storage)?;
     tracing::info!(chain_peer = %endpoint.id(), "serving finalized chain over iroh");
-    serve_validator_endpoint(indexer, activity, endpoint, database, verifier).await;
-    Ok(())
+    Ok(endpoint)
 }
 
 #[cfg(feature = "validator")]
@@ -533,7 +537,7 @@ pub(crate) async fn serve_validator_endpoint(
         _ = serve(service, network) => {},
         _ = notify => {},
     }
-    hellas_wire::iroh::close(&endpoint).await;
+    endpoint.close().await;
 }
 
 /// ChainSync admission is shared across connections, including the host mount.

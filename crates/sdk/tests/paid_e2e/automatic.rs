@@ -369,8 +369,11 @@ impl Provider {
         node: hellas_sdk::FullNode,
         compute: HostCompute,
         identity: NodeIdentity,
+        port: u16,
     ) -> impl std::future::Future<Output = Self> + 'a {
-        Box::pin(Self::start_inner(root, config, node, compute, identity))
+        Box::pin(Self::start_inner(
+            root, config, node, compute, identity, port,
+        ))
     }
 
     async fn start_inner(
@@ -379,6 +382,7 @@ impl Provider {
         node: hellas_sdk::FullNode,
         compute: HostCompute,
         identity: NodeIdentity,
+        port: u16,
     ) -> Self {
         let enrollment = provider_enrollment(&identity);
         let location = StoreLocation::for_test(&root.join("authority"));
@@ -428,7 +432,11 @@ impl Provider {
                 WorkSetup::ALPN.as_bytes().to_vec(),
                 hellas_rpc::services::work::Work::ALPN.as_bytes().to_vec(),
             ])
-            .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+            // One socket, kept across restarts: a client dialing this identity
+            // again retains its earlier paths, and a path to a released port
+            // can reach an unrelated endpoint that bound it since.
+            .clear_ip_transports()
+            .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
             .unwrap()
             .bind()
             .await
@@ -555,6 +563,9 @@ impl Provider {
             )
             .await
             .unwrap();
+    }
+    fn port(&self) -> u16 {
+        self.endpoint.bound_sockets()[0].port()
     }
     fn addr(&self) -> EndpointAddr {
         EndpointAddr::from_parts(
@@ -1615,6 +1626,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         devnet.full_node(0).clone(),
         compute.clone(),
         identity.clone(),
+        0,
     )
     .await;
     let endpoint = bind_paid_endpoint(iroh::SecretKey::generate())
@@ -1796,6 +1808,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         .is_err(),
         "an ambiguous durable failure cannot be followed by another allocation"
     );
+    let port = provider.port();
     provider.shutdown().await;
     provider = Provider::start(
         root.path(),
@@ -1803,6 +1816,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         devnet.full_node(0).clone(),
         compute.clone(),
         identity.clone(),
+        port,
     )
     .await;
     let first = granted(
@@ -2057,6 +2071,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         );
     }
     // A restart reads both standing terms and original offers from their journals.
+    let port = provider.port();
     provider.shutdown().await;
     provider = Provider::start(
         root.path(),
@@ -2064,6 +2079,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         devnet.full_node(0).clone(),
         compute.clone(),
         identity.clone(),
+        port,
     )
     .await;
     assert_eq!(
@@ -2466,6 +2482,7 @@ async fn finish(case: Box<Case>) {
         }
     }).await.expect("the unanswered offer durably expires at its horizon");
     drop(transport);
+    let port = provider.port();
     provider.shutdown().await;
     let location = StoreLocation::for_test(&config.chain.provider().join("channels"));
     let store = SetupStore::open(
@@ -2488,6 +2505,7 @@ async fn finish(case: Box<Case>) {
         devnet.full_node(0).clone(),
         compute.clone(),
         identity.clone(),
+        port,
     )
     .await;
     policy.offers.max_stake_per_client = 11;

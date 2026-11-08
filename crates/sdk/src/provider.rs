@@ -378,10 +378,6 @@ impl ProviderHandle {
             Err(error) => Err(ProviderError::Task(error)),
         };
         result = result.and(joined);
-        // Wait for the close itself, not `hellas_wire::iroh::close`'s grace: a
-        // restart starts its successor with this identity and port as soon as
-        // this returns. Until the close completes, the old socket stays bound
-        // and refuses every new handshake addressed to this identity.
         if self.peer_store.is_some() {
             self.endpoint.close().await;
         }
@@ -540,10 +536,6 @@ where
                 hellas_rpc::services::content::Content,
             >(endpoint.clone(), Default::default()))
     });
-    let discovery = config
-        .discovery
-        .then(|| discovery::start_server_advertising(&endpoint, &advertised_alpns))
-        .transpose()?;
     let node_id = endpoint.id();
 
     let local_peer = PeerId::from_bytes(*node_id.as_bytes());
@@ -561,34 +553,46 @@ where
     node_handler.chain = chain.clone();
 
     let open_identity = config.open_identity;
-    let (grants, administration, admin) = if let Some((grants, store)) = prepared_grants {
-        let service = hellas_authority::grant_service::GrantService::from_node(
-            store,
-            &open_identity.enrollment,
-            signer,
-            handle,
-            endpoint
-                .addr()
-                .ip_addrs()
-                .map(ToString::to_string)
-                .collect(),
-            content.clone(),
-        )
-        .await?;
-        let administration = hellas_authority::grant_service::WorkAdministration::new(
-            service.clone(),
-            grants.config.configuration,
-            grants.config.max_job_millis,
-        );
-        // The node's own configuration is current before any work is admitted.
-        administration.reconcile().await?;
-        let admin = match grants.authority {
-            ProviderAuthority::Host(control) => Some(*control),
-            ProviderAuthority::Journal { .. } => None,
+    let setup = async {
+        let discovery = config
+            .discovery
+            .then(|| discovery::start_server_advertising(&endpoint, &advertised_alpns))
+            .transpose()?;
+        let (grants, administration, admin) = if let Some((grants, store)) = prepared_grants {
+            let service = hellas_authority::grant_service::GrantService::from_node(
+                store,
+                &open_identity.enrollment,
+                signer,
+                handle,
+                endpoint
+                    .addr()
+                    .ip_addrs()
+                    .map(ToString::to_string)
+                    .collect(),
+                content.clone(),
+            )
+            .await?;
+            let administration = hellas_authority::grant_service::WorkAdministration::new(
+                service.clone(),
+                grants.config.configuration,
+                grants.config.max_job_millis,
+            );
+            // The node's own configuration is current before any work is admitted.
+            administration.reconcile().await?;
+            let admin = match grants.authority {
+                ProviderAuthority::Host(control) => Some(*control),
+                ProviderAuthority::Journal { .. } => None,
+            };
+            (Some(service), Some(administration), admin)
+        } else {
+            (None, None, None)
         };
-        (Some(service), Some(administration), admin)
+        Ok::<_, ProviderError>((discovery, grants, administration, admin))
+    };
+    let (discovery, grants, administration, admin) = if owns_endpoint {
+        hellas_wire::iroh::close_on_error(&endpoint, setup).await?
     } else {
-        (None, None, None)
+        setup.await?
     };
     let work = runner.map(WorkWatcher::spawn);
     let serves_work = match (work.is_some(), grants.as_ref()) {

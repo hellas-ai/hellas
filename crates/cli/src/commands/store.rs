@@ -170,7 +170,7 @@ pub async fn run(
                 let repo = hellas_store::hf::Repo::from_uri(&uri)?;
                 Ok(resolving.resolve_hf(&Scope::Owner, repo).await?)
             }).await;
-            if let Some(endpoint) = peer { hellas_wire::iroh::close(&endpoint).await; }
+            if let Some(endpoint) = peer { endpoint.close().await; }
             result
         }.await;
         store.close().await;
@@ -194,7 +194,7 @@ pub async fn run(
             crate::commands::admin::connect_remote(identity, node, args.addresses, &profile, key)
                 .await?;
         let result = remote(client.transport().clone(), args.command).await;
-        hellas_wire::iroh::close(&endpoint).await;
+        endpoint.close().await;
         result
     } else {
         ensure!(

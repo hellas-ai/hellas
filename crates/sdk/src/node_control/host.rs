@@ -132,7 +132,22 @@ impl HostHandle {
         .await
     }
 
+    /// The host owns the transport it is given, so a failed start closes it.
     async fn start_inner(
+        options: HostOptions,
+        deferred: Option<GatewayConfiguration>,
+    ) -> Result<Self, HostError> {
+        let transport = options.transport.clone();
+        let started = Self::assemble(options, deferred).await;
+        if started.is_err()
+            && let Some(endpoint) = transport
+        {
+            endpoint.close().await;
+        }
+        started
+    }
+
+    async fn assemble(
         options: HostOptions,
         deferred: Option<GatewayConfiguration>,
     ) -> Result<Self, HostError> {
@@ -276,7 +291,7 @@ impl HostHandle {
         let mut result = listener.and(stopped);
         // Accepted remote Work drains while the host-owned endpoint is alive.
         if let Some((endpoint, task)) = self.transport.take() {
-            hellas_wire::iroh::close(&endpoint).await;
+            endpoint.close().await;
             result = result.and(task.await.map_err(HostError::from));
         }
         if let Some(node) = self.node.take() {

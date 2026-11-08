@@ -31,7 +31,7 @@ pub const RECOVERY_TIMEOUT: std::time::Duration = replication::STREAM_IDLE_TIMEO
     ))
     .saturating_add(replication::TIMEOUT.saturating_mul(2));
 #[cfg(feature = "validator")]
-pub(crate) use transport::serve_validator_archive;
+pub(crate) use transport::{bind_validator_endpoint, serve_validator_endpoint};
 
 /// Independently provisioned execution inputs. Peers supply blocks, never these pins.
 #[derive(Clone, Debug)]

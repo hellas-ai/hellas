@@ -185,7 +185,6 @@ struct Validator {
     task: Handle<()>,
     light_client_url: String,
     chain_sync: iroh::EndpointAddr,
-    #[cfg(all(test, feature = "integration-tests"))]
     sync_endpoint: iroh::Endpoint,
     #[cfg(all(test, feature = "integration-tests"))]
     sync_task: tokio::task::AbortHandle,
@@ -348,7 +347,6 @@ impl Devnet {
                     .await
                     .unwrap();
                 let chain_sync = endpoint.addr();
-                #[cfg(all(test, feature = "integration-tests"))]
                 let sync_endpoint = endpoint.clone();
                 let _sync_task = rpc.spawn(crate::node::transport::serve_validator_endpoint(
                     indexer.archive.clone(),
@@ -381,7 +379,6 @@ impl Devnet {
                     task,
                     light_client_url,
                     chain_sync,
-                    #[cfg(all(test, feature = "integration-tests"))]
                     sync_endpoint,
                     #[cfg(all(test, feature = "integration-tests"))]
                     sync_task: _sync_task,
@@ -849,6 +846,7 @@ async fn stop(
     }
     rpc.shutdown().await;
     for validator in validators {
+        validator.sync_endpoint.close().await;
         validator.task.abort();
         let _ = validator.task.await;
     }

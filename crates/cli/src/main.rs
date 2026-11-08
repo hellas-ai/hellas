@@ -869,7 +869,7 @@ async fn async_main() {
             {
                 Err(error) => Err(error),
                 Ok(paid) => {
-                    async {
+                    closing_endpoints(async |endpoints| {
                         // The key every settlement this node signs is signed
                         // with, taken from the identity loaded above and
                         // never made here.
@@ -908,6 +908,9 @@ async fn async_main() {
                                 grants,
                             )
                             .await?;
+                            // The host closes it at shutdown; this covers every exit
+                            // before the host owns it.
+                            endpoints.extend(transport.clone());
                             (Some(grants), transport)
                         } else {
                             (grants, None)
@@ -952,7 +955,7 @@ async fn async_main() {
                             assurance,
                         })
                         .await
-                    }
+                    })
                     .await
                 }
             }
@@ -985,7 +988,7 @@ async fn async_main() {
             responses_models,
             wrap,
             wrap_args,
-        } => async {
+        } => closing_endpoints(async |endpoints| {
             let assurance = remote_trust.assurance;
             let pool_options = if let Some(path) = grant_pool_config.as_deref() {
                 let client = commands::contributions::require_principal(passkey)?;
@@ -1050,9 +1053,12 @@ async fn async_main() {
                         client,
                         work_application()?,
                     )?,
-                    hellas_sdk::grant_client::GrantTransport::Remote(
-                        hellas_sdk::grant_client::bind_endpoint(secret_key.clone()).await?,
-                    ),
+                    hellas_sdk::grant_client::GrantTransport::Remote({
+                        let endpoint =
+                            hellas_sdk::grant_client::bind_endpoint(secret_key.clone()).await?;
+                        endpoints.push(endpoint.clone());
+                        endpoint
+                    }),
                 ))
             } else if let Some(grant) = local_grant.as_deref() {
                 anyhow::ensure!(
@@ -1172,6 +1178,7 @@ async fn async_main() {
             let mut paid_content = None;
             let gateway = if let Some(pool) = pool_options {
                 let endpoint = hellas_sdk::grant_client::bind_endpoint(secret_key.clone()).await?;
+                endpoints.push(endpoint.clone());
                 let transports = (0..pool.channels.len())
                     .map(|_| hellas_sdk::grant_client::GrantTransport::Remote(endpoint.clone()))
                     .collect();
@@ -1258,7 +1265,7 @@ async fn async_main() {
             };
             node.close().await;
             stopped
-        }
+        })
         .await,
         Commands::Rpc {
             node_id,
@@ -1383,4 +1390,16 @@ async fn async_main() {
 mod parsers;
 #[cfg(test)]
 mod tests;
+
+/// Runs a command that binds remote endpoints into `endpoints`, then closes
+/// them however it ended. A host or gateway handed one has closed it already.
+async fn closing_endpoints<T>(command: impl AsyncFnOnce(&mut Vec<iroh::Endpoint>) -> T) -> T {
+    let mut endpoints = Vec::new();
+    let result = command(&mut endpoints).await;
+    for endpoint in endpoints {
+        endpoint.close().await;
+    }
+    result
+}
+
 use parsers::*;
