@@ -46,22 +46,3 @@ pub trait WireAdaptor {
     /// The fields it names replace those recorded before.
     fn attest(&self, state: &mut Self::StreamState, provenance: Provenance);
 }
-
-pub trait WireIngress: WireAdaptor {
-    type IngressState;
-
-    fn decode_response(
-        &self,
-        request: &Self::ParsedRequest,
-        bytes: &[u8],
-    ) -> AdaptorResult<ExecutionResult>;
-
-    fn initial_ingress_state(&self, request: &Self::ParsedRequest) -> Self::IngressState;
-
-    fn decode_stream_event(
-        &self,
-        request: &Self::ParsedRequest,
-        state: &mut Self::IngressState,
-        event: WireStreamEvent,
-    ) -> AdaptorResult<Vec<OutputEvent>>;
-}
