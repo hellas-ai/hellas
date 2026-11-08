@@ -1,6 +1,6 @@
 [package]
 name = "hellas-providers"
-description = "Sealed upstream providers and response projectors for Hellas Fetch"
+description = "Sealed upstream HTTP egress for Hellas Fetch"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

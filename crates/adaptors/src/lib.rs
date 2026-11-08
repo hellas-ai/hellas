@@ -29,7 +29,7 @@ pub mod anthropic;
 pub mod backend;
 pub mod error;
 pub mod execution;
-pub mod fetch;
+mod fetch;
 mod json;
 pub mod openai;
 pub mod request;

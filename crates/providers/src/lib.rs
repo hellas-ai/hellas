@@ -1,5 +1,5 @@
-//! Audited sealed-Fetch upstream drivers and projectors shared by native
-//! hosts and the Hellas CLI.
+//! Audited sealed-Fetch HTTP egress shared by native hosts and the Hellas
+//! CLI: clients, deadlines, credentials and the fixed vendor endpoints.
 
 mod codex_responses;
 mod http;
