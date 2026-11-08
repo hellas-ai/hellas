@@ -90,15 +90,14 @@ let
           pkgs.actionlint
           pkgs.shellcheck
         ];
-    # The same suite as `checks.<system>.unit`, uninstrumented: the regression
-    # feature set on the validator host, the default set elsewhere. Coverage
-    # and its floors are enforced only by that derivation.
-    unit = mkCargo "check-unit" (
-      if isValidatorHost then
-        "cargo test --locked --workspace --features integration-tests,hellas-chain/indexer-api"
-      else
-        "cargo test --locked --workspace"
-    ) (cargoEnv rustToolchain);
+    # The same tests as `checks.<system>.unit`, uninstrumented; coverage and
+    # its floors are enforced only by that derivation.
+    unit = mkCargo "check-unit" "cargo test --locked --workspace" (cargoEnv rustToolchain);
+    # Tests wait on events and fail only on a documented hang guard, so they
+    # run with libtest's default parallelism rather than one at a time.
+    regressions = mkCargo "check-regressions" ''
+      cargo test --locked --workspace --features integration-tests,hellas-chain/indexer-api
+    '' (cargoEnv rustToolchain);
     # Resolve the entire locked graph with an empty Cargo home before compiling.
     # This catches source replacement regressions without runner credentials.
     cargo-sources =
@@ -325,6 +324,7 @@ let
       else
         builtins.removeAttrs baseChecks [
           "validator"
+          "regressions"
           "chain-setup"
           # Same reason as `validator` above: validators are deployed on x86
           # only, so the feature set is not built on other hosts. Linting it
@@ -351,9 +351,12 @@ let
     "xet-no-alloc"
   ];
   lintChecks = lib.filterAttrs (name: _: builtins.elem name lintNames) checks;
-  mergeChecks = lintChecks // {
-    inherit (checks) unit;
-  };
+  mergeChecks =
+    lintChecks
+    // {
+      inherit (checks) unit;
+    }
+    // lib.optionalAttrs isValidatorHost { inherit (checks) regressions; };
 
   # Auto-fix variants. Not all checks have one (e.g. test, wasm-rpc).
   fixes = {

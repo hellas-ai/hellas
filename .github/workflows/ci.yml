@@ -48,8 +48,8 @@ jobs:
             nix run --accept-flake-config ".#check-$check"
           done
 
-  # One instrumented run of the regression feature set: it fails on a failing
-  # test and on a crate falling below its floor in nix/coverage-floor.json.
+  # One instrumented run of the workspace tests: it fails on a failing test
+  # and on a crate falling below its floor in nix/coverage-floor.json.
   # The job name is a required status check; keep it.
   unit-tests:
     name: Unit tests

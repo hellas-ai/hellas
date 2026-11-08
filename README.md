@@ -464,7 +464,7 @@ artifacts. `devnet` tracks chain rollout; it does not trigger
 CLI or GPU releases.
 
 The `unit` check (`nix build .#checks.x86_64-linux.unit`, the PR "Unit tests"
-job) runs the regression suite once under `cargo llvm-cov`. It fails on a
+job) runs the workspace tests once under `cargo llvm-cov`. It fails on a
 failing test, and if any crate's production line coverage falls more than 0.5
 points below its floor in `nix/coverage-floor.json`. Its output holds
 `lcov.info`, `summary.json`, `summary.txt` and the `coverage-floor.json` the run

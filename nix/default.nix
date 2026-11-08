@@ -465,6 +465,7 @@ in
 
   checks = hydraLints // {
     unit = hydraUnit;
+    inherit (nativePkg.craneChecks) regressions;
     # Published so later builds substitute compiled dependencies.
     cargo-deps = nativePkg.cargoDeps;
   };

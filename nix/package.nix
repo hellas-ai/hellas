@@ -200,15 +200,15 @@ let
         cargoClippyExtraArgs = clippyArgs;
       }
     );
-    # The test suite, run once with line-coverage instrumentation. On the
-    # validator host it is the whole regression feature set, and the run both
-    # fails on a failing test and enforces the per-crate floors in
-    # coverage-floor.json. cargo-llvm-cov instruments only workspace crates
-    # through its rustc wrapper, so the dependencies in `cargoDeps` stay valid;
-    # keeping its target directory at `target` is what lets Cargo reuse them.
-    # The output holds lcov.info, summary.json, summary.txt and the
-    # coverage-floor.json this run would record (copy it over the committed
-    # one after raising coverage).
+    # The workspace tests, run once with line-coverage instrumentation. On
+    # the validator host the run fails on a failing test and on a crate below
+    # its floor in coverage-floor.json. cargo-llvm-cov instruments only
+    # workspace crates through its rustc wrapper, so the dependencies in
+    # `cargoDeps` stay valid; keeping its target directory at `target` is what
+    # lets Cargo reuse them. The output holds lcov.info, summary.json,
+    # summary.txt and the coverage-floor.json this run would record (copy it
+    # over the committed one after raising coverage). Other hosts run the same
+    # tests uninstrumented; the floors are measured on the validator host.
     unit =
       if pkgs.stdenv.hostPlatform.system == "x86_64-linux" then
         craneLib.mkCargoDerivation (
@@ -226,9 +226,9 @@ let
             CARGO_LLVM_COV_TARGET_DIR = "target";
             NEXTEST_SHOW_PROGRESS = "counter";
             buildPhaseCargoCommand = ''
-              cargo llvm-cov nextest --locked --workspace --features ${integrationFeatures} --no-report
+              cargo llvm-cov nextest --locked --workspace --no-report
               # nextest does not run doctests; the compile_fail ones pin type safety.
-              cargo test --locked --workspace --features ${integrationFeatures} --doc
+              cargo test --locked --workspace --doc
               mkdir -p "$out"
               cargo llvm-cov report --lcov --output-path "$out/lcov.info"
               cargo llvm-cov report --json --summary-only --output-path "$out/summary.json"
@@ -239,13 +239,12 @@ let
           }
         )
       else
-        # Validators deploy on x86 only, so other hosts run the default feature
-        # set uninstrumented; the floors are measured on the validator host.
         craneLib.cargoTest (
           craneArgs
           // {
             pname = "hellas-unit";
             cargoArtifacts = cargoDeps;
+            # Terminal check: nothing consumes its target directory.
             doInstallCargoArtifacts = false;
             cargoTestExtraArgs = "--workspace";
           }
@@ -253,6 +252,16 @@ let
             RUST_TEST_THREADS = "1";
           }
         );
+    regressions = craneLib.cargoTest (
+      craneArgs
+      // {
+        pname = "hellas-regressions";
+        cargoArtifacts = cargoDeps;
+        # Terminal check: nothing consumes its target directory.
+        doInstallCargoArtifacts = false;
+        cargoTestExtraArgs = "--workspace --features ${integrationFeatures} -- --test-threads=1";
+      }
+    );
   };
 
   # Stamp the revision only on shipped artifacts. Checks and validation builds
