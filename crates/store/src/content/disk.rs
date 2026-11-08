@@ -888,6 +888,10 @@ impl DiskStore {
         self.core.state.lock().expect("content state").peers = Some(peers);
         self
     }
+    /// Drops the peer pool, and with it the pool's clone of its endpoint.
+    pub fn clear_peers(&self) {
+        self.core.state.lock().expect("content state").peers = None;
+    }
 }
 
 impl Drop for FileObject {

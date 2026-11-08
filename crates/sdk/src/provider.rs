@@ -306,7 +306,10 @@ pub struct ProviderHandle {
     drained: Option<oneshot::Sender<()>>,
     alpns: Vec<Vec<u8>>,
     endpoint: Endpoint,
-    owns_endpoint: bool,
+    /// Set when this handle bound its own endpoint and lent it to the
+    /// caller's content store for peer reads. The store outlives the
+    /// provider, so drop takes the endpoint back to release its sockets.
+    owned_endpoint: Option<hellas_store::content::DiskStore>,
     accept_task: tokio::task::JoinHandle<()>,
     work: Option<WorkWatcher>,
     owned_authority: Option<hellas_authority::node::NodeCoordinator>,
@@ -375,7 +378,7 @@ impl ProviderHandle {
             Err(error) => Err(ProviderError::Task(error)),
         };
         result = result.and(joined);
-        if self.owns_endpoint {
+        if self.owned_endpoint.is_some() {
             hellas_wire::iroh::close(&self.endpoint).await;
         }
         if let Some(node) = self.owned_authority.take() {
@@ -388,6 +391,9 @@ impl ProviderHandle {
 impl Drop for ProviderHandle {
     fn drop(&mut self) {
         self.accept_task.abort();
+        if let Some(content) = &self.owned_endpoint {
+            content.clear_peers();
+        }
     }
 }
 
@@ -522,9 +528,14 @@ where
             (builder.bind().await?, None, true)
         }
     };
-    let content = content.with_peers(hellas_wire::iroh::Pool::for_service::<
-        hellas_rpc::services::content::Content,
-    >(endpoint.clone(), Default::default()));
+    // A host endpoint is already the host's content peer pool.
+    let owned_endpoint = owns_endpoint.then(|| {
+        content
+            .clone()
+            .with_peers(hellas_wire::iroh::Pool::for_service::<
+                hellas_rpc::services::content::Content,
+            >(endpoint.clone(), Default::default()))
+    });
     let discovery = config
         .discovery
         .then(|| discovery::start_server_advertising(&endpoint, &advertised_alpns))
@@ -690,7 +701,7 @@ where
         drained: Some(drained),
         accept_task,
         endpoint,
-        owns_endpoint,
+        owned_endpoint,
         owned_authority,
         work,
     })
