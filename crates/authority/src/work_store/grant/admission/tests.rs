@@ -62,7 +62,7 @@ async fn reserved_checkpoint_space_covers_maximum_metadata() {
     // ancestor's used/window counters may grow to a nine-byte CBOR integer.
     let counters = crate::model::grant::budget::MAX_BUDGET_PATH_LEN
         * Meter::ALL.len()
-        * Window::ALL.len()
+        * Window::CALENDAR.len()
         * 2
         * 8;
     let other_metadata = 64;
@@ -198,7 +198,7 @@ async fn execution_audit_retains_the_lineage_at_each_effect() {
         store
             .state()
             .ledger()
-            .node(BudgetNode::Machine)
+            .node(BudgetNode::Machine.key())
             .unwrap()
             .counter(Meter::Requests, Window::Total)
             .used,
@@ -275,11 +275,14 @@ async fn another_application_can_reconcile_but_cannot_replace_or_dispatch_the_ad
         },
     ] {
         assert_err!(
-            before.clone().apply(&Frame {
-                namespace: JOURNAL_NAMESPACE.into(),
-                now: UnixMillis(1000),
-                changes: vec![change]
-            }),
+            before.clone().apply(
+                &Frame {
+                    namespace: JOURNAL_NAMESPACE.into(),
+                    now: UnixMillis(1000),
+                    changes: vec![change]
+                },
+                false
+            ),
             NodeStoreError::Malformed
         );
     }
@@ -396,7 +399,7 @@ async fn replay_requires_the_exact_authorized_lineage() {
         (case.change)(&mut execution);
         let mut state = fixture.before.clone();
         assert_err!(
-            state.apply(&fixture.frame(execution)),
+            state.apply(&fixture.frame(execution), true),
             NodeStoreError::Malformed
         );
         assert_eq!(state, fixture.before, "{}", case.name);
@@ -404,11 +407,46 @@ async fn replay_requires_the_exact_authorized_lineage() {
     let mut valid = fixture.before.clone();
     assert_eq!(
         valid
-            .apply(&fixture.frame(fixture.record().accepted.clone()))
+            .apply(&fixture.frame(fixture.record().accepted.clone()), true)
             .unwrap(),
         Applied::Changed
     );
     assert_eq!(valid, fixture.node.snapshot());
+}
+
+/// Ruling 1: replay is reconstruction. A reservation admitted under earlier
+/// limits is restored even where a fresh admission would now be refused.
+#[tokio::test]
+async fn replay_restores_a_reservation_without_rechecking_limits() {
+    let fixture = Accepted::new().await;
+    let mut lowered = fixture.before.clone();
+    let budget = lowered
+        .grant(fixture.request.authorization.grant_id)
+        .unwrap()
+        .budget;
+    let mut definition = super::super::ledger::definition(&lowered.ledger, budget).unwrap();
+    definition.revision.0 += 1;
+    definition.limits = vec![crate::model::grant::budget::Limit::new(
+        Meter::Requests,
+        Window::Total,
+        0,
+    )];
+    super::super::ledger::configure(&mut lowered.ledger, definition).unwrap();
+    let frame = fixture.frame(fixture.record().accepted.clone());
+    assert_err!(
+        lowered.clone().apply(&frame, false),
+        NodeStoreError::Refused(hellas_admission::Refusal {
+            why: hellas_admission::Why::Impossible(..),
+            ..
+        })
+    );
+    lowered.apply(&frame, true).unwrap();
+    assert_eq!(
+        lowered
+            .ledger
+            .hold(super::super::ledger::hold(fixture.request.work())),
+        Some(fixture.record().reserved)
+    );
 }
 
 #[tokio::test]
@@ -418,7 +456,7 @@ async fn replay_cannot_substitute_a_different_authorizing_grant() {
     execution.lineage[0].0 = crate::test_support::ids::ROOT_GRANT;
     let mut state = fixture.before.clone();
     assert_err!(
-        state.apply(&fixture.frame(execution)),
+        state.apply(&fixture.frame(execution), false),
         NodeStoreError::Authority(hellas_auth::authority::AuthorityError::Denied)
     );
     assert_eq!(state, fixture.before);

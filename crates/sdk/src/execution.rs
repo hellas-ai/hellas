@@ -409,7 +409,8 @@ impl ExecutionAttempt {
         )
         .await?;
         let descriptor = session.descriptor();
-        if let Err(error) = purchase.bind_channel(descriptor.channel().id(), descriptor.bond_edge())
+        if let Err(error) =
+            purchase.ensure_channel(descriptor.channel().id(), descriptor.bond_edge())
         {
             session.shutdown().await;
             return Err(error.into());
@@ -479,7 +480,7 @@ impl<'a> ExecutionSession<'a> {
                                 return Err(ExecutionError::Identity);
                             }
                             attempt.newly_bound = false;
-                            purchase.bind_channel(
+                            purchase.ensure_channel(
                                 session.descriptor().channel().id(),
                                 session.descriptor().bond_edge(),
                             )?;
@@ -811,9 +812,6 @@ impl ExecutionAttempt {
                 &serde_json::to_vec(&receipt)?,
             )?;
         }
-        if let AttemptRecord::Paid(purchase) = &mut self.record {
-            purchase.reported()?;
-        }
         Ok(())
     }
 }
@@ -852,106 +850,56 @@ impl ExecutionAttempt {
     /// Bounded local inspection; does not open a session or modify markers.
     pub fn inspect(&self) -> Result<ExecutionFacts> {
         let receipt = self.read_receipt()?;
-        let (target_bound, channel_bound, work, acceptance, terminal, payment, paid_reported) =
-            match &self.record {
-                AttemptRecord::Paid(purchase) => {
-                    use crate::transact::PurchaseStatus as P;
-                    match purchase.status()? {
-                        P::Absent | P::InputBound => (
-                            false,
-                            false,
-                            None,
-                            Acceptance::Unknown,
-                            Terminal::Unknown,
-                            Payment::Pending,
-                            false,
-                        ),
-                        P::TargetBound => (
-                            true,
-                            false,
-                            None,
-                            Acceptance::Unknown,
-                            Terminal::Unknown,
-                            Payment::Pending,
-                            false,
-                        ),
-                        P::ChannelBound => (
-                            true,
-                            true,
-                            None,
-                            Acceptance::Unknown,
-                            Terminal::Unknown,
-                            Payment::Pending,
-                            false,
-                        ),
-                        P::Running { work } => (
-                            purchase.has_target(),
-                            true,
-                            work,
-                            if work.is_some() {
-                                Acceptance::Accepted
-                            } else {
-                                Acceptance::Unknown
-                            },
-                            Terminal::Unknown,
-                            Payment::Pending,
-                            false,
-                        ),
-                        P::Paying { work } => (
-                            purchase.has_target(),
-                            true,
-                            Some(work),
-                            Acceptance::Accepted,
-                            Terminal::Verified,
-                            Payment::Pending,
-                            false,
-                        ),
-                        P::Paid { work, reported } => (
-                            purchase.has_target(),
-                            true,
-                            Some(work),
-                            Acceptance::Accepted,
-                            Terminal::Verified,
-                            Payment::Paid,
-                            reported,
-                        ),
-                        P::Rejected { work } => (
-                            purchase.has_target(),
-                            true,
-                            Some(work),
-                            Acceptance::Accepted,
-                            Terminal::Rejected,
-                            Payment::Unpaid,
-                            false,
-                        ),
-                    }
-                }
-                AttemptRecord::Grant(attempt) => (
-                    attempt.record.target.is_some(),
-                    attempt.record.channel.is_some(),
-                    attempt.record.work.map(Digest::from_bytes),
-                    if attempt.record.rejected {
-                        Acceptance::Rejected
-                    } else if receipt.is_some() {
+        let (target_bound, channel_bound, work, acceptance, terminal, payment) = match &self.record
+        {
+            AttemptRecord::Paid(purchase) => {
+                let outcome = purchase.outcome();
+                (
+                    purchase.has_target(),
+                    purchase.has_proposal_intent(),
+                    outcome.map(|(work, _)| work),
+                    if outcome.is_some() {
                         Acceptance::Accepted
                     } else {
                         Acceptance::Unknown
                     },
-                    if attempt.record.rejected {
-                        Terminal::Rejected
-                    } else if let Some(receipt) = &receipt {
-                        if receipt.finished {
-                            Terminal::Verified
-                        } else {
-                            Terminal::Rejected
-                        }
-                    } else {
-                        Terminal::Unknown
+                    match outcome {
+                        Some((_, true)) => Terminal::Verified,
+                        Some((_, false)) => Terminal::Rejected,
+                        None => Terminal::Unknown,
                     },
-                    Payment::NotApplicable,
-                    false,
-                ),
-            };
+                    match outcome {
+                        Some((_, true)) => Payment::Paid,
+                        Some((_, false)) => Payment::Unpaid,
+                        None => Payment::Pending,
+                    },
+                )
+            }
+            AttemptRecord::Grant(attempt) => (
+                attempt.record.target.is_some(),
+                attempt.record.channel.is_some(),
+                attempt.record.work.map(Digest::from_bytes),
+                if attempt.record.rejected {
+                    Acceptance::Rejected
+                } else if receipt.is_some() {
+                    Acceptance::Accepted
+                } else {
+                    Acceptance::Unknown
+                },
+                if attempt.record.rejected {
+                    Terminal::Rejected
+                } else if let Some(receipt) = &receipt {
+                    if receipt.finished {
+                        Terminal::Verified
+                    } else {
+                        Terminal::Rejected
+                    }
+                } else {
+                    Terminal::Unknown
+                },
+                Payment::NotApplicable,
+            ),
+        };
         Ok(ExecutionFacts {
             target_bound,
             channel_bound,
@@ -960,7 +908,7 @@ impl ExecutionAttempt {
             terminal,
             payment,
             result_available: self.retained_result()?.is_some(),
-            reported: paid_reported || receipt.as_ref().is_some_and(|receipt| receipt.reported),
+            reported: receipt.as_ref().is_some_and(|receipt| receipt.reported),
         })
     }
 }
@@ -982,24 +930,21 @@ impl<'a> ExecutionSession<'a> {
                     return Err(ExecutionError::Identity);
                 }
                 attempt.newly_bound = false;
-                purchase.bind_channel(
+                purchase.ensure_channel(
                     session.descriptor().channel().id(),
                     session.descriptor().bond_edge(),
                 )?;
-                if purchase.work_id().is_none()
-                    && let Some(work) = session
-                        .with_state(|state| purchase.accepted_work(state))
-                        .await??
-                {
-                    // Persist identity before reconciling a result or payment.
-                    purchase.accepting(work)?;
-                }
-                if !matches!(
-                    purchase.status()?,
-                    crate::transact::PurchaseStatus::Paid { .. }
-                        | crate::transact::PurchaseStatus::Rejected { .. }
-                ) && let Some(work) = purchase.work_id()
-                {
+                // Unfinished accepted work is re-derived from the signed
+                // journal on each recovery; only its outcome is recorded.
+                let accepted = match purchase.outcome() {
+                    Some(_) => None,
+                    None => {
+                        session
+                            .with_state(|state| purchase.accepted_work(state))
+                            .await??
+                    }
+                };
+                if let Some(work) = accepted {
                     match session.recorded_terminal(work).await? {
                         Some(true) => purchase.paid(work)?,
                         Some(false) => purchase.unpaid(work)?,
@@ -1009,6 +954,14 @@ impl<'a> ExecutionSession<'a> {
                         None => (),
                     }
                 }
+                let mut facts = attempt.inspect()?;
+                if let Some(work) = accepted
+                    && facts.work.is_none()
+                {
+                    facts.work = Some(work);
+                    facts.acceptance = Acceptance::Accepted;
+                }
+                return Ok(facts);
             }
             (Self::Grant(session), AttemptRecord::Grant(tracker)) => {
                 attempt.newly_bound = false;

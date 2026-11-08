@@ -117,7 +117,7 @@ impl Standing {
         for node in &value.nodes {
             if !nodes.insert(node.node)
                 || node.node != own
-                || node.counters.len() != Meter::ALL.len() * Window::ALL.len()
+                || node.counters.len() != Meter::ALL.len() * Window::CALENDAR.len()
                 || node.concurrent_limit == 0
                 || node.concurrent_remaining > node.concurrent_limit
             {
@@ -125,8 +125,9 @@ impl Standing {
             }
             let mut counters = std::collections::BTreeSet::new();
             for counter in &node.counters {
-                if !counters.insert((counter.meter, counter.window))
-                    || counter.window_id != counter.window.id(value.now)
+                if !Window::CALENDAR.contains(&counter.window)
+                    || !counters.insert((counter.meter, counter.window))
+                    || counter.window_id != counter.window.id(value.now.0)
                     || counter
                         .limit
                         .zip(counter.remaining)

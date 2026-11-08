@@ -690,14 +690,6 @@ in
       .config.systemd.services.hellas-validator-devnet-node0.unitConfig.RequiresMountsFor;
     assert defaultProviderService.serviceConfig.WorkingDirectory == "/var/lib/hellas";
     assert gatewayService.serviceConfig.WorkingDirectory == "/var/lib/hellas-gateway";
-    assert lib.hasInfix "chain validator state-generation --generation 2"
-      (evalValidators { stateGeneration = 2; })
-      .config.systemd.services.hellas-validator-devnet-node0.serviceConfig.ExecStartPre;
-    assert
-      !(lib.hasPrefix "+"
-        (evalValidators { stateGeneration = 2; })
-        .config.systemd.services.hellas-validator-devnet-node0.serviceConfig.ExecStartPre
-      );
     assert service.environment ? ROCM_PATH;
     assert service.environment ? HIP_PATH;
     assert service.environment.TMPDIR == "/run/hellas";
@@ -996,6 +988,8 @@ in
         "serve"
         "--home"
         "/Users/hellas/Library/Application Support/Hellas"
+        "--durability"
+        "crash"
         "--port"
         "31145"
         "--assurance"
@@ -1011,6 +1005,8 @@ in
         "serve"
         "--home"
         "/Users/hellas/.hellas"
+        "--durability"
+        "crash"
         "--port"
         "31145"
         "--assurance"

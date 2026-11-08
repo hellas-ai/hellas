@@ -267,8 +267,8 @@ let
           type = types.int;
           default = 0;
           description = ''
-            Idempotent state reset generation. A positive generation resets only
-            the selected chain's validator state once when it changes.
+            Idempotent state reset generation. A positive generation deletes
+            this validator's chain state once when it changes.
           '';
         };
         home = mkOption {
@@ -517,7 +517,17 @@ in
                 }
                 // optionalAttrs (validator.memoryMax != null) { MemoryMax = validator.memoryMax; }
                 // optionalAttrs (validator.stateGeneration > 0) {
-                  ExecStartPre = "${getExe validator.package} --home ${escapeShellArg home}${chainArgs} chain validator state-generation --generation ${toString validator.stateGeneration}";
+                  # Runs as the service user, so the recreated state stays its own.
+                  ExecStartPre = pkgs.writeShellScript "${serviceName}-state-generation" ''
+                    set -eu
+                    home=${escapeShellArg home}
+                    generation=${toString validator.stateGeneration}
+                    if [ "$(cat "$home/.state-generation" 2>/dev/null)" != "$generation" ]; then
+                      rm -rf "$home/chains"
+                      echo "$generation" > "$home/.state-generation.new"
+                      mv "$home/.state-generation.new" "$home/.state-generation"
+                    fi
+                  '';
                 };
               };
             }

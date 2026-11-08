@@ -24,19 +24,18 @@ fn paid_settlement_finishes_after_full_provider_shutdown_without_object_proofs()
             .await
             .unwrap();
             let bond = session.descriptor().bond_edge();
-            let result = sealing_while(
-                &mut case.devnet,
-                Duration::from_millis(100),
-                session.run(
+            // A job on a ready channel needs no new blocks. Sealing here would
+            // only advance the chain past the proposal's acceptance deadline.
+            let result = session
+                .run(
                     Some(case.prepared_input.clone()),
                     &InvocationContent::Ephemeral(Default::default()),
                     false,
                     None,
-                ),
-            )
-            .await
-            .unwrap()
-            .unwrap();
+                )
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(result.credited_cumulative, PRICE);
             session.shutdown().await;
             drop(session);
@@ -544,7 +543,7 @@ fn empty_channel_settlement_recovers_exact_return_and_rejects_wrong_identity() {
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             assert!(
                 tokio::time::timeout(
-                    Duration::from_secs(1),
+                    SETTLE_CANCEL_AFTER,
                     hellas_sdk::paid_client::settle_channel(
                         &case.options,
                         bond,
@@ -816,19 +815,18 @@ fn cli_settles_paid_channel_without_provider_or_object_proofs() {
             .await
             .unwrap();
             let bond = session.descriptor().bond_edge();
-            let result = sealing_while(
-                &mut case.devnet,
-                Duration::from_millis(100),
-                session.run(
+            // A job on a ready channel needs no new blocks. Sealing here would
+            // only advance the chain past the proposal's acceptance deadline.
+            let result = session
+                .run(
                     Some(case.prepared_input.clone()),
                     &InvocationContent::Ephemeral(Default::default()),
                     false,
                     None,
-                ),
-            )
-            .await
-            .unwrap()
-            .unwrap();
+                )
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(result.credited_cumulative, PRICE);
             session.shutdown().await;
             drop(session);
@@ -905,7 +903,7 @@ fn cli_settles_paid_channel_without_provider_or_object_proofs() {
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             assert!(
                 tokio::time::timeout(
-                    Duration::from_secs(1),
+                    SETTLE_CANCEL_AFTER,
                     hellas_sdk::paid_client::settle_channel(
                         &case.options,
                         bond,
@@ -1049,19 +1047,18 @@ fn settlement_replays_a_finalized_response_after_full_provider_shutdown() {
             )
             .await
             .unwrap();
-            let result = sealing_while(
-                &mut case.devnet,
-                Duration::from_millis(100),
-                session.run(
+            // A job on a ready channel needs no new blocks. Sealing here would
+            // only advance the chain past the proposal's acceptance deadline.
+            let result = session
+                .run(
                     Some(case.prepared_input.clone()),
                     &InvocationContent::Ephemeral(Default::default()),
                     false,
                     None,
-                ),
-            )
-            .await
-            .unwrap()
-            .unwrap();
+                )
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(result.credited_cumulative, PRICE);
             let certificate = session
                 .with_state(|state| state.executable_certificate())
@@ -1187,3 +1184,9 @@ fn settlement_replays_a_finalized_response_after_full_provider_shutdown() {
         })
     });
 }
+
+/// When the settlement-cancellation tests drop an in-flight settlement. It
+/// journals its prepared close within about a second on an idle machine and
+/// cannot finish with its object-proof source down (its read timeout is 60 s);
+/// 20 s falls between the two even on a loaded machine.
+const SETTLE_CANCEL_AFTER: Duration = Duration::from_secs(20);

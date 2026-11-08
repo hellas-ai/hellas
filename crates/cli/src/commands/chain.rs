@@ -231,11 +231,6 @@ pub enum IndexerCommand {
 #[cfg(feature = "validator")]
 #[derive(Subcommand)]
 pub enum ValidatorCommand {
-    /// Reset this chain's validator state once when its generation changes.
-    StateGeneration {
-        #[arg(long)]
-        generation: u64,
-    },
     /// Export public epoch-zero explorer trust from a validator config and exact genesis file
     ExportTrust {
         #[arg(long)]
@@ -685,9 +680,8 @@ async fn connect_with_verified_snapshots(
     let rpc = rpc
         .or_else(|| profile.validators().first().cloned())
         .context("selected chain has no validator routes")?;
-    let verifier = std::sync::Arc::new(hellas_chain::proof_verify::ProofVerifier::with_digest(
-        profile.trust().clone(),
-        profile.consensus_digest(),
+    let verifier = std::sync::Arc::new(hellas_chain::proof_verify::ProofVerifier::for_profile(
+        profile,
     )?);
     Ok(RemoteLightClient::connect(rpc, verifier).await?)
 }
@@ -874,9 +868,6 @@ async fn run_validator(
     home: &hellas_private::StoreLocation,
 ) -> CliResult {
     let command = match command {
-        ValidatorCommand::StateGeneration { generation } => {
-            return reset_validator_generation(profile, home, generation);
-        }
         ValidatorCommand::ExportTrust { config, genesis } => {
             hellas_chain::validator::Command::ExportTrust { config, genesis }
         }
@@ -947,38 +938,6 @@ async fn run_validator(
         },
     };
     tokio::task::spawn_blocking(move || hellas_chain::validator::run_command(command)).await??;
-    Ok(())
-}
-
-#[cfg(feature = "validator")]
-fn reset_validator_generation(
-    profile: &ChainProfile,
-    home: &hellas_private::StoreLocation,
-    generation: u64,
-) -> CliResult {
-    anyhow::ensure!(generation > 0, "generation must be positive");
-    let chain = hellas_chain::chain_dir::ChainDir::open(home, profile)?;
-    let state = chain.validator();
-    let stamp = state.join(".state-generation");
-    let current = match fs::read_to_string(&stamp) {
-        Ok(value) => value.trim().parse::<u64>().ok(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.into()),
-    };
-    if current == Some(generation) {
-        return Ok(());
-    }
-    hellas_private::create_dir_all_durable(&state)?;
-    for entry in fs::read_dir(&state)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            fs::remove_dir_all(entry.path())?;
-        } else {
-            fs::remove_file(entry.path())?;
-        }
-    }
-    // Durable regardless of --durability: losing the stamp would wipe again.
-    hellas_private::write_atomically(&stamp, ".new", generation.to_string().as_bytes())?;
     Ok(())
 }
 

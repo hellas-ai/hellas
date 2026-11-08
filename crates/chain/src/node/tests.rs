@@ -6,7 +6,7 @@ use crate::execution::{
 };
 use crate::{
     domain::{self, SettlementKey},
-    execution::test_support::{ConsensusFixture, consensus_fixture, finalization, run_qmdb},
+    execution::test_support::{ConsensusFixture, consensus_fixture, finality_envelope, run_qmdb},
 };
 use commonware_codec::Decode as _;
 use commonware_consensus::{Block as _, Heightable as _, Reporter};
@@ -203,11 +203,7 @@ impl Fixture {
                 height: block.height().get(),
                 payload: block.digest(),
                 state_root: block.state_root(),
-                finalization: crate::finality_proof::encode(
-                    &finalization(&self.committee, &block).encode(),
-                    &[],
-                )
-                .unwrap(),
+                finalization: finality_envelope(&self.committee, &block),
             },
             block: block.encode().to_vec(),
         }

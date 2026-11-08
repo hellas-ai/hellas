@@ -40,11 +40,7 @@ pub async fn connect_at(
     min_height: u64,
 ) -> Result<RemoteLightClient, QueryError> {
     let verifier = Arc::new(
-        hellas_chain::proof_verify::ProofVerifier::with_digest(
-            config.chain.trust().clone(),
-            config.chain.consensus_digest(),
-        )
-        .map_err(invalid)?,
+        hellas_chain::proof_verify::ProofVerifier::for_profile(&config.chain).map_err(invalid)?,
     );
     let mut reason = "no finalized remote snapshot is available".to_owned();
     let deadline = tokio::time::Instant::now() + timeout;

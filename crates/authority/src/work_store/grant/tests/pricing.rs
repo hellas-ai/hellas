@@ -36,18 +36,14 @@ pub(super) async fn prices(
 }
 async fn limit(store: &mut NodeStore, amount: u64) -> Result<(), NodeStoreError> {
     let budget = store.state().grant(ids::ALLOWANCE).unwrap().budget;
-    let mut definition = store.state().ledger().definition(budget).unwrap();
+    let mut definition = ledger::definition(store.state().ledger(), budget).unwrap();
     definition.revision.0 += 1;
-    definition.limits = vec![Limit {
-        meter: Meter::UsdMicros,
-        window: Window::Total,
-        amount,
-    }];
+    definition.limits = vec![Limit::new(Meter::UsdMicros, Window::Total, amount)];
     store.configure_budget(definition, UnixMillis(1000)).await
 }
 fn counters(node: &TestNode, expected_used: u64, reserved: u64) {
     let budget = node.store.state().grant(ids::ALLOWANCE).unwrap().budget;
-    for ancestor in node.store.state().ledger().path(budget).unwrap() {
+    for ancestor in ledger::path(node.store.state().ledger(), budget).unwrap() {
         assert_eq!(
             node.used(ancestor, Meter::UsdMicros),
             expected_used,
@@ -57,7 +53,7 @@ fn counters(node: &TestNode, expected_used: u64, reserved: u64) {
             node.store
                 .state()
                 .ledger()
-                .reserved(ancestor, Meter::UsdMicros),
+                .reserved(ancestor.key(), Meter::UsdMicros),
             reserved,
             "{ancestor:?}"
         );

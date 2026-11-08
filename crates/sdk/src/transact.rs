@@ -9,7 +9,7 @@ use hellas_channel::work::PaidProgress;
 use hellas_rpc::ContentRef;
 use hellas_rpc::protocol::invocation::PreparedInvocation;
 pub(crate) use purchase::PurchaseTarget;
-pub use purchase::{PaidAttemptPath, Purchase, PurchaseError, PurchaseStatus};
+pub use purchase::{PaidAttemptPath, Purchase, PurchaseError};
 use std::sync::atomic::AtomicBool;
 
 #[derive(Debug, thiserror::Error)]
@@ -141,7 +141,6 @@ pub async fn transact(
 ) -> Result<PaidWorkResult> {
     if let Some(purchase) = options.purchase.as_deref() {
         purchase.ensure_chain(session)?;
-        purchase.ensure_executable()?;
     }
     let quoted = session.descriptor().payment_policy().fixed_price;
     if quoted != job.price() {

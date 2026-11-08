@@ -237,8 +237,9 @@ mod id_pins {
             GetAppliedFinalizedBlock, GetStateRoot, LightClient, SubmitWorkResponse,
             SubscribeFinalized,
         };
-        // Applied witness checkpoints deliberately rotate the LightClient service.
-        assert_eq!(<LightClient as ServiceMarker>::SERVICE_ID, 0xf06c_d7ee);
+        // Removing the unverified coin and edge reads, which GetObjectProofs
+        // replaces, deliberately rotates the LightClient service.
+        assert_eq!(<LightClient as ServiceMarker>::SERVICE_ID, 0x6a5a_dd5a);
         assert_eq!(
             <GetAppliedFinalizedBlock as MethodMarker>::METHOD_ID,
             0x6d407974
