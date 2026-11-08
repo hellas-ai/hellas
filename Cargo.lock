@@ -3459,37 +3459,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hellas-reseller"
-version = "0.1.0"
-dependencies = [
- "axum",
- "futures",
- "hellas-adaptors",
- "hellas-attestation",
- "hellas-auth",
- "hellas-authority",
- "hellas-channel",
- "hellas-executor",
- "hellas-kernel",
- "hellas-private",
- "hellas-providers",
- "hellas-rpc",
- "hellas-sdk",
- "iroh",
- "rcgen",
- "reqwest",
- "rustls",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tokio-rustls",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "hellas-rpc"
 version = "0.1.0"
 dependencies = [
@@ -3587,6 +3556,37 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "zeroize",
+]
+
+[[package]]
+name = "hellas-share"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "futures",
+ "hellas-adaptors",
+ "hellas-attestation",
+ "hellas-auth",
+ "hellas-authority",
+ "hellas-channel",
+ "hellas-executor",
+ "hellas-kernel",
+ "hellas-private",
+ "hellas-providers",
+ "hellas-rpc",
+ "hellas-sdk",
+ "iroh",
+ "rcgen",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
