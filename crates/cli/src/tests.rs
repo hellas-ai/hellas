@@ -646,3 +646,48 @@ fn grant_pool_gateway_flags_enforce_source_exclusivity() {
     }
     assert!(parse_gateway(&["--check-config"]).is_err());
 }
+
+#[test]
+fn serve_admits_configured_programs_and_acknowledges_any_only_from_configuration() {
+    let manifest = "ab".repeat(32);
+    let Commands::Serve {
+        programs,
+        knowingly_unsafe,
+        ..
+    } = Cli::try_parse_from(["hellas", "serve", "--await-owner", "--program", &manifest])
+        .unwrap()
+        .command
+    else {
+        panic!("serve")
+    };
+    assert_eq!(programs, vec![manifest.parse().unwrap()]);
+    assert!(!knowingly_unsafe);
+    // An acknowledgement for configuration that admits any program, never a mode.
+    for args in [
+        vec!["hellas", "serve", "--knowingly-unsafe", "--grant-config", "g.json"],
+        vec!["hellas", "serve", "--knowingly-unsafe", "--paid-work-config", "p.toml"],
+    ] {
+        assert!(Cli::try_parse_from(&args).is_ok(), "{args:?}");
+    }
+    for args in [
+        vec!["hellas", "serve", "--program", &manifest],
+        vec![
+            "hellas",
+            "serve",
+            "--await-owner",
+            "--program",
+            &manifest,
+            "--grant-config",
+            "g.json",
+        ],
+        vec![
+            "hellas",
+            "serve",
+            "--await-owner",
+            "--program",
+            "not-a-hash",
+        ],
+    ] {
+        assert!(Cli::try_parse_from(&args).is_err(), "{args:?}");
+    }
+}

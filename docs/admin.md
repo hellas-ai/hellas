@@ -7,11 +7,14 @@ CLI acts for the principal of a software passkey file given with `--passkey`
 
 For first setup, `hellas --software-root identity init --passkey-out owner.passkey`
 creates both the client device identity and a fresh private owner key. It never
-overwrites an existing key. Start a model worker with `serve --audio-model DIR
---await-owner`: the converted Whisper package supplies a model-pinned
-resource, a machine/account budget, and the indexed weights. The directory's
-basename is its resource name; one job may run at a time. Use `--grant-config`
-instead for custom resources or budgets.
+overwrites an existing key. Start a worker with `serve --await-owner` and
+`--program MANIFEST` for each Compute program it admits, plus `--content
+hf://ORG/REPO@COMMIT` for the published weights those programs name. That
+configures one `compute` resource with a machine/account budget; one job runs at
+a time. `--knowingly-unsafe` admits any program instead: compiling and running a
+program from an unknown author hands that author roughly root on the host, so use
+it only on hardware you own, for people you trust. Use `--grant-config` instead
+for custom resources or budgets.
 
 The worker writes a private `<home>/provider/invitation.json`. Pair with
 `hellas --passkey owner.passkey admin bootstrap-remote --invitation FILE

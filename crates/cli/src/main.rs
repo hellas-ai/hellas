@@ -230,9 +230,16 @@ enum Commands {
         /// Resources and listeners for an explicitly initialized authority store.
         #[arg(long = "grant-config")]
         grant_config_file: Option<PathBuf>,
-        /// Serve a converted Whisper model with model-pinned grants and one concurrent job.
-        #[arg(long, requires = "await_owner", conflicts_with = "grant_config_file")]
-        audio_model: Option<PathBuf>,
+        /// Admit this exact Compute program manifest (64-hex content ID) in the
+        /// one shared `compute` resource; repeat for each program.
+        #[arg(long = "program", value_name = "MANIFEST", requires = "await_owner", conflicts_with = "grant_config_file")]
+        programs: Vec<hellas_rpc::ContentId>,
+        /// Serve a configuration that admits any Compute program (`mode =
+        /// "any"` in paid terms, or `Any` in a grant resource); without it
+        /// such a node refuses to start. Compiling and running a program from
+        /// an unknown author hands that author roughly root on this host.
+        #[arg(long)]
+        knowingly_unsafe: bool,
         /// Wait for one owner pairing if the home provider authority is uninitialized.
         #[arg(long)]
         await_owner: bool,
@@ -611,21 +618,12 @@ async fn async_main() {
         check_config: true,
         fetch_config_file,
         grant_config_file,
-        audio_model,
         native,
         ..
     } = &cli.command
     {
         let result = async {
-            anyhow::ensure!(fetch_config_file.is_some() || grant_config_file.is_some() || audio_model.is_some() || native.content_config.is_some(), "--check-config requires --content-config, --fetch-config, --grant-config or --audio-model");
-            if let Some(model) = audio_model {
-                commands::serve::audio_model::precheck(
-                    native.content_config.as_deref(),
-                    model,
-                    &home,
-                )?;
-                commands::serve::audio_model::configure(model, &home).await?;
-            }
+            anyhow::ensure!(fetch_config_file.is_some() || grant_config_file.is_some() || native.content_config.is_some() || !native.content.is_empty(), "--check-config requires --content, --content-config, --fetch-config or --grant-config");
             commands::serve::validate_provider_config(
                 fetch_config_file.as_deref(),
                 grant_config_file.as_deref(),
@@ -843,14 +841,15 @@ async fn async_main() {
         }
 
         Commands::Serve {
-            mut native,
+            native,
             assurance,
             port,
             no_discovery,
             queue_size,
             work_config_file,
             grant_config_file,
-            audio_model,
+            programs,
+            knowingly_unsafe,
             await_owner,
             #[cfg(feature = "otel")]
                 metrics_port: _,
@@ -893,23 +892,33 @@ async fn async_main() {
                             );
                             let config = hellas_sdk::grant_config::GrantConfig::load(path, &home)?;
                             Some(config)
-                        } else if let Some(model) = audio_model.as_deref() {
+                        } else if !programs.is_empty() {
                             anyhow::ensure!(
                                 assurance == hellas_rpc::Assurance::ProducerSigned,
                                 "grants require producer-signed assurance"
                             );
-                            commands::serve::audio_model::precheck(
-                                native.content_config.as_deref(),
-                                model,
+                            Some(hellas_sdk::grant_config::GrantConfig::compute(
                                 &home,
-                            )?;
-                            let (grants, weights) =
-                                commands::serve::audio_model::configure(model, &home).await?;
-                            native.model = Some((std::path::absolute(model)?, vec![weights]));
-                            Some(grants)
+                                hellas_rpc::protocol::invocation::ComputePrograms::Only {
+                                    manifests: programs,
+                                },
+                            )?)
                         } else {
                             None
                         };
+                        let admits_any =
+                            paid.as_ref().is_some_and(|paid| paid.admits_any_program())
+                                || grants.as_ref().is_some_and(|grants| {
+                                    grants.configuration.resources().iter().any(|resource| {
+                                        resource.invocation_policy.admits_any_program()
+                                    })
+                                });
+                        anyhow::ensure!(
+                            !admits_any || knowingly_unsafe,
+                            "this configuration admits any Compute program, which hands anyone \
+                             who can submit jobs roughly root on this host; pass \
+                             --knowingly-unsafe to serve it anyway"
+                        );
 
                         let (grants, transport) = if await_owner {
                             let (grants, transport) = commands::serve::bootstrap::prepare(

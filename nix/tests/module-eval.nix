@@ -489,6 +489,10 @@ let
     workConfigFile = "/run/hellas/work.toml";
     gpuBackend = "hip";
   };
+  anyProgramProvider = evalProvider {
+    workConfigFile = "/run/hellas/work.toml";
+    knowinglyUnsafe = true;
+  };
   grantOnlyHipProvider = evalProvider {
     content.lower = [ "/srv/hellas/grant-content" ];
     grantConfigFile = "/run/hellas/grant.json";
@@ -988,6 +992,10 @@ in
       hipProvider.config.systemd.services.hellas.serviceConfig.ExecStart;
     assert hipProvider.config.systemd.services.hellas.environment ? ROCM_PATH;
     assert !(hipProvider.config.systemd.services.hellas.environment ? CUDA_PATH);
+    assert lib.hasInfix "--knowingly-unsafe"
+      anyProgramProvider.config.systemd.services.hellas.serviceConfig.ExecStart;
+    assert
+      !(lib.hasInfix "--knowingly-unsafe" hipProvider.config.systemd.services.hellas.serviceConfig.ExecStart);
     assert lib.hasInfix "--grant-config /run/hellas/grant.json"
       grantOnlyHipProvider.config.systemd.services.hellas.serviceConfig.ExecStart;
     assert grantOnlyHipProvider.config.systemd.services.hellas.environment ? ROCM_PATH;

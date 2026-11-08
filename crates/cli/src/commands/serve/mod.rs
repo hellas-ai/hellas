@@ -13,7 +13,6 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub mod audio_model;
 pub mod bootstrap;
 mod codex_provider;
 mod configuration;
@@ -73,7 +72,7 @@ pub fn validate_provider_config(
     home: &StoreLocation,
 ) -> CliResult<()> {
     if let Some(path) = content {
-        crate::content_configuration::ContentConfiguration::load(Some(path.into()), None)?;
+        crate::content_configuration::ContentConfiguration::load(Some(path.into()), None, vec![])?;
     }
     let routes = fetch
         .map(|path| load_fetch_config(path, home))

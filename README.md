@@ -138,19 +138,18 @@ curl -fL https://raw.githubusercontent.com/ggml-org/whisper.cpp/b0a11594aec50892
 printf '%s  speech.wav\n' 59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e | sha256sum -c -
 ```
 
-Start a worker with the converted model. `--audio-model` declares its weights pin, admits its program as signed Work
-input, creates its machine/account budgets, and serves one job at a time; no
-resource JSON is required. The resource is named after the directory,
-`whisper-tiny`. Here is the CUDA container command for an NVIDIA CDI host:
+Start a worker that admits the Whisper program. `--program` takes the program's
+manifest content ID, `--content` names the published weights it reads, and the
+worker serves one `compute` resource, one job at a time; no resource JSON is
+required. Here is the CUDA container command for an NVIDIA CDI host:
 
 ```sh
 mkdir -m 700 worker
 docker run -d --name hellas-gpu --network host --device nvidia.com/gpu=all \
-  --user "$(id -u):$(id -g)" \
-  -v "$PWD/worker:/state" -v "$PWD/whisper-tiny:/models/whisper-tiny:ro" \
+  --user "$(id -u):$(id -g)" -v "$PWD/worker:/state" \
   "ghcr.io/hellas-ai/hellas:sha-${REVISION}-cuda" \
-  --home /state --software-root \
-  --await-owner --audio-model /models/whisper-tiny \
+  --home /state --software-root --await-owner \
+  --program "$WHISPER_MANIFEST" --content "$WHISPER_WEIGHTS" \
   --gpu-session-asset-bytes 2147483648 --gpu-session-programs 1
 ```
 
@@ -181,10 +180,10 @@ Give your principal and device a one-request share, import it, and transcribe:
 hellas --passkey owner.passkey contact export --display-name me --out me.contact
 hellas identity show-holder > me.holder
 hellas --passkey owner.passkey admin --profile operator/profile.json share \
-  --contact me.contact --holder me.holder --resource whisper-tiny \
+  --contact me.contact --holder me.holder --resource compute \
   --limit requests:total:1 --max-job 15m --expires 1h --out me.access
 hellas --passkey owner.passkey offer import-bundle me.access --name box
-hellas --passkey owner.passkey transcribe --offer box.whisper-tiny \
+hellas --passkey owner.passkey transcribe --offer box.compute \
   --model ./whisper-tiny --audio speech.wav --language en --output my-result
 ```
 
@@ -199,10 +198,10 @@ hellas --home guest-home --software-root identity init --passkey-out guest.passk
 hellas --passkey guest.passkey contact export --display-name guest --out guest.contact
 hellas --home guest-home identity show-holder > guest.holder
 hellas --passkey owner.passkey admin --profile operator/profile.json share \
-  --contact guest.contact --holder guest.holder --resource whisper-tiny \
+  --contact guest.contact --holder guest.holder --resource compute \
   --limit requests:total:1 --max-job 15m --expires 1h --out guest.access
 hellas --home guest-home --passkey guest.passkey offer import-bundle guest.access --name box
-hellas --home guest-home --passkey guest.passkey transcribe --offer box.whisper-tiny \
+hellas --home guest-home --passkey guest.passkey transcribe --offer box.compute \
   --model ./whisper-tiny --audio speech.wav --language en --output guest-result
 ```
 
@@ -213,7 +212,7 @@ its existing counters. See [renewal](docs/admin.md) before replacing a credentia
 A different request must now fail the guest's one-request quota:
 
 ```sh
-hellas --home guest-home --passkey guest.passkey transcribe --offer box.whisper-tiny \
+hellas --home guest-home --passkey guest.passkey transcribe --offer box.compute \
   --model ./whisper-tiny --audio speech.wav --language en --max-tokens 255
 ```
 
@@ -222,7 +221,7 @@ result and consumes no additional request:
 
 ```sh
 docker stop hellas-gpu
-hellas --home guest-home --passkey guest.passkey transcribe --offer box.whisper-tiny \
+hellas --home guest-home --passkey guest.passkey transcribe --offer box.compute \
   --model ./whisper-tiny --audio speech.wav --language en --output guest-replay
 cmp guest-result/transcript.cbor guest-replay/transcript.cbor
 ```

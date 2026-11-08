@@ -132,6 +132,18 @@ pub struct InvocationPolicy {
     pub limits: Limits,
 }
 impl InvocationPolicy {
+    /// Whether this policy admits Compute programs nobody configured.
+    pub fn admits_any_program(&self) -> bool {
+        self.admissions.iter().any(|admission| {
+            matches!(
+                admission,
+                Admission::Compute {
+                    programs: ComputePrograms::Any {},
+                    ..
+                }
+            )
+        })
+    }
     pub fn validate(&self) -> Result<(), CanonicalDecodeError> {
         self.limits.validate()?;
         if self.admissions.is_empty() || self.admissions.len() > MAX_ADMISSIONS {

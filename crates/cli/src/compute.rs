@@ -9,6 +9,10 @@ pub(crate) struct ServeArgs {
     /// Node content configuration containing [content].
     #[arg(long, value_name = "FILE")]
     pub(crate) content_config: Option<PathBuf>,
+    /// Hold an immutable published tree, `hf://ORG/REPO@COMMIT`, for jobs that
+    /// name its objects by content ID; repeat for each.
+    #[arg(long = "content", value_name = "SOURCE")]
+    pub(crate) content: Vec<String>,
     #[arg(skip)]
     pub(crate) model: Option<crate::content_configuration::Model>,
     #[cfg(feature = "compute")]
@@ -45,7 +49,11 @@ impl ServeArgs {
         }
         #[cfg(not(feature = "compute"))]
         let _ = executor;
-        crate::content_configuration::ContentConfiguration::load(self.content_config, self.model)
+        crate::content_configuration::ContentConfiguration::load(
+            self.content_config,
+            self.model,
+            self.content,
+        )
     }
 }
 

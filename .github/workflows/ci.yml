@@ -44,7 +44,7 @@ jobs:
           CARGO_INCREMENTAL: "0"
           CARGO_PROFILE_DEV_DEBUG: "0"
         run: |
-          for check in cargo-sources deny channel-dependencies xet-no-alloc; do
+          for check in cargo-sources deny channel-dependencies provider-dependencies xet-no-alloc; do
             nix run --accept-flake-config ".#check-$check"
           done
 

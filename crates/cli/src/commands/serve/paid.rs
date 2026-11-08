@@ -53,6 +53,13 @@ pub struct PaidWork {
     policy: PaidPolicy,
 }
 
+impl PaidWork {
+    /// Whether these terms admit Compute programs nobody configured.
+    pub fn admits_any_program(&self) -> bool {
+        self.policy.invocation_policy.admits_any_program()
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Bootstrap {

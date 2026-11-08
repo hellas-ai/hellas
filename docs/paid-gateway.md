@@ -36,8 +36,8 @@ hellas convert-whisper --checkpoint /models/whisper-tiny-original --output /mode
 The resulting `weights.bf16` is the only model asset a provider holds; supply it
 through a Jobs pin in the provider's `--content-config` declaration.
 Providers need no renderer, tokenizer, preprocessing code, or preinstalled program.
-The converted directory and its metadata stay on the client. An existing gateway
-configuration can add `--audio-model /models/whisper-tiny` alongside `--text-model`.
+The converted directory and its metadata stay on the client. A gateway
+can add `--audio-model ./whisper-tiny` (the client package) alongside `--text-model`.
 The directory name (`whisper-tiny` here) is its HTTP model name. The same option
 works with a paid pool, `--offer` for an owned remote node, or `--local-grant` with
 a `--content-config` declaration for those weights on a supported local GPU.

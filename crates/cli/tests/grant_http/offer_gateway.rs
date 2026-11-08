@@ -54,6 +54,7 @@ impl OfferHost {
         client_identity: Option<&Path>,
         invocation_policy: hellas_rpc::protocol::invocation::InvocationPolicy,
     ) -> Self {
+        let any_program = invocation_policy.admits_any_program();
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         hellas_private::restrict_directory(root).unwrap();
@@ -156,21 +157,22 @@ impl OfferHost {
         }}}]}).to_string()).unwrap();
         std::fs::write(&resources,json!({"remote_control_peers":[client.run(&["identity", "show-node-id"]).await.trim()],"max_job_millis":10000,"machine":{"max_in_flight":2,"limits":[]},"accounts":[{"account":hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),"max_in_flight":256,"limits":[]}],"resources":[{"resource":hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test resource")),"account":hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),"revision":1,"pricing":{"revision":1,"rates":null},"name":"glm","invocation_policy":invocation_policy,
             "https":{"origin":https.origin,"paths":["/v1/chat/completions"],"methods":["POST"],"credential":"glm-account","tls":{"roots":{"mode":"certificates","der_base64":[https.root_der]},"spki_sha256":[]},"accounting":"openai-chat","max_output_tokens":8,"max_response_bytes":65536}}]}).to_string()).unwrap();
-        let mut node = provider.spawn(
-            &[
-                "serve",
-                #[cfg(feature = "otel")]
-                "--metrics-port",
-                #[cfg(feature = "otel")]
-                "0",
-                "--no-discovery",
-                "--fetch-config",
-                string(&fetch),
-                "--grant-config",
-                string(&resources),
-            ],
-            "provider.log",
-        );
+        let mut serve = vec![
+            "serve",
+            #[cfg(feature = "otel")]
+            "--metrics-port",
+            #[cfg(feature = "otel")]
+            "0",
+            "--no-discovery",
+            "--fetch-config",
+            string(&fetch),
+            "--grant-config",
+            string(&resources),
+        ];
+        if any_program {
+            serve.push("--knowingly-unsafe");
+        }
+        let mut node = provider.spawn(&serve, "provider.log");
         node.wait_for("RPC server running.").await;
         #[cfg(feature = "otel")]
         let metrics = node

@@ -200,6 +200,7 @@ rec {
     "--chain-config"
     "--grant-config"
     "--await-owner"
+    "--knowingly-unsafe"
     "--passkey"
     "--metrics-port"
     "--metrics-addr"
@@ -461,6 +462,13 @@ rec {
           storing authority state under the configured home/provider directory.
         '';
       };
+      knowinglyUnsafe = lib.mkEnableOption ''
+        serving workConfigFile or grantConfigFile when it admits any Compute
+        program (`mode = "any"`, or `Any` in a resource). Without this the node
+        refuses to start on such a configuration: compiling and running a
+        program from an unknown author hands that author roughly root on the
+        host
+      '';
       passkey = mkOption {
         type = types.nullOr runtimePath;
         default = null;
@@ -757,6 +765,7 @@ rec {
     ++ optArg "--chain-config" serve.chainConfig
     ++ optArg "--grant-config" serve.grantConfigFile
     ++ lib.optional serve.awaitOwner "--await-owner"
+    ++ lib.optional serve.knowinglyUnsafe "--knowingly-unsafe"
     ++ optArg "--passkey" serve.passkey
     ++ lib.optionals (otel.enable && serve.metricsPort != null) [
       "--metrics-port"

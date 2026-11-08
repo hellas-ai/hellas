@@ -15,6 +15,7 @@ pub(crate) type Model = (PathBuf, Vec<hellas_rpc::ContentRef>);
 pub(crate) struct ContentConfiguration {
     path: Option<PathBuf>,
     model: Option<Model>,
+    sources: Vec<String>,
     config: Config,
     default_upper: Option<PathBuf>,
     watcher: Option<notify::RecommendedWatcher>,
@@ -22,7 +23,13 @@ pub(crate) struct ContentConfiguration {
 }
 
 impl ContentConfiguration {
-    pub(crate) fn load(path: Option<PathBuf>, model: Option<Model>) -> Result<Self> {
+    /// `sources` are immutable published trees (`hf://ORG/REPO@COMMIT`) this
+    /// node holds for jobs, each as one `config/content-NNNN` Jobs pin.
+    pub(crate) fn load(
+        path: Option<PathBuf>,
+        model: Option<Model>,
+        sources: Vec<String>,
+    ) -> Result<Self> {
         let path = path.map(std::path::absolute).transpose()?;
         let (changed, changes) = watch::channel(());
         let watcher = if let Some(path) = &path {
@@ -49,10 +56,11 @@ impl ContentConfiguration {
         } else {
             None
         };
-        let config = read(path.as_deref(), model.as_ref())?;
+        let config = read(path.as_deref(), model.as_ref(), &sources)?;
         Ok(Self {
             path,
             model,
+            sources,
             config,
             default_upper: None,
             watcher,
@@ -95,7 +103,7 @@ impl ContentConfiguration {
                 changed = changes.changed() => if changed.is_err() { break; },
             }
             let result = async {
-                let mut config = read(self.path.as_deref(), self.model.as_ref())?;
+                let mut config = read(self.path.as_deref(), self.model.as_ref(), &self.sources)?;
                 if config.upper.is_none() {
                     config.upper = self.default_upper.clone();
                 }
@@ -122,7 +130,7 @@ impl ContentReload {
     }
 }
 
-fn read(path: Option<&Path>, model: Option<&Model>) -> Result<Config> {
+fn read(path: Option<&Path>, model: Option<&Model>, sources: &[String]) -> Result<Config> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct File {
@@ -171,6 +179,17 @@ fn read(path: Option<&Path>, model: Option<&Model>) -> Result<Config> {
             );
         }
     }
+    for (index, source) in sources.iter().enumerate() {
+        let name = format!("config/content-{index:04}");
+        anyhow::ensure!(
+            !config.pins.contains_key(&name),
+            "{name} is reserved for --content"
+        );
+        config.pins.insert(
+            name,
+            hellas_store::content::config::Declaration::Hf(source.clone()),
+        );
+    }
     config.validate()?;
     Ok(config)
 }
@@ -193,11 +212,11 @@ mod tests {
     fn explicit_files_fail_closed_and_paths_are_relative_to_the_file() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("content.toml");
-        assert!(ContentConfiguration::load(Some(path.clone()), None).is_err());
+        assert!(ContentConfiguration::load(Some(path.clone()), None, vec![]).is_err());
         std::fs::write(&path, "[content]\nunknown = true\n").unwrap();
-        assert!(ContentConfiguration::load(Some(path.clone()), None).is_err());
+        assert!(ContentConfiguration::load(Some(path.clone()), None, vec![]).is_err());
         std::fs::write(&path, document("model")).unwrap();
-        let loaded = ContentConfiguration::load(Some(path), None).unwrap();
+        let loaded = ContentConfiguration::load(Some(path), None, vec![]).unwrap();
         assert_eq!(
             loaded
                 .config
@@ -208,6 +227,23 @@ mod tests {
         assert_eq!(loaded.config.lower, vec![root.path().join("lower")]);
     }
 
+    #[test]
+    fn content_sources_become_reserved_jobs_pins() {
+        let source = format!("hf://org/repo@{}", "a".repeat(40));
+        let loaded = ContentConfiguration::load(None, None, vec![source.clone()]).unwrap();
+        assert_eq!(
+            loaded.config.pins.get("config/content-0000"),
+            Some(&hellas_store::content::config::Declaration::Hf(
+                source.clone()
+            ))
+        );
+        assert!(ContentConfiguration::load(None, None, vec!["hf://org/repo".into()]).is_err());
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("content.toml");
+        std::fs::write(&path, document("content-0000")).unwrap();
+        assert!(ContentConfiguration::load(Some(path), None, vec![source]).is_err());
+    }
+
     #[tokio::test]
     async fn atomic_replacements_reload_the_declared_set_and_shutdown_joins_the_watcher() {
         let root = tempfile::tempdir().unwrap();
@@ -215,7 +251,7 @@ mod tests {
         std::fs::create_dir(root.path().join("lower")).unwrap();
         std::fs::write(root.path().join("lower/weights"), b"weights").unwrap();
         std::fs::write(&path, document("before")).unwrap();
-        let loaded = ContentConfiguration::load(Some(path.clone()), None).unwrap();
+        let loaded = ContentConfiguration::load(Some(path.clone()), None, vec![]).unwrap();
         let store = loaded
             .config
             .open(
@@ -262,7 +298,7 @@ mod tests {
         let path = root.path().join("content.toml");
         std::fs::create_dir(root.path().join("lower")).unwrap();
         std::fs::write(&path, "[content]\nupper = 'upper'\n").unwrap();
-        let loaded = ContentConfiguration::load(Some(path.clone()), None).unwrap();
+        let loaded = ContentConfiguration::load(Some(path.clone()), None, vec![]).unwrap();
         let store = loaded
             .config
             .open(
