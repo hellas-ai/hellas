@@ -239,7 +239,7 @@ fn an_unresponsive_paid_quote_yields_to_the_next_provider_within_the_connection_
                 request: crate::test_support::BODY.to_vec(),
                 assurance: hellas_rpc::Assurance::ProducerSigned,
             };
-            let request = pool.request(WorkRequest::Compute(input)).unwrap();
+            let request = pool.request(WorkRequest::Job(input)).unwrap();
             let pool = Arc::new(pool);
             let (requester, _receiver) = Requester::<FetchEvent, PoolError>::new();
             let result = pool.clone().run(request, requester).await;

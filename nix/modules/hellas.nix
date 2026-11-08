@@ -1,8 +1,9 @@
 { self }:
 rec {
-  # The ordinary CLI omits OTEL. Modules opt in through the package override.
-  # It carries the network, chain, gateway and local Catena execution surfaces.
-  normalCliPackage = pkgs: self.packages.${pkgs.stdenv.hostPlatform.system}.cli;
+  # A node runs local Catena Compute, so modules select the compute build.
+  # It omits OTEL; modules opt in through the package override.
+  normalCliPackage =
+    pkgs: self.packages.${pkgs.stdenv.hostPlatform.system}.cli.override { compute = true; };
   catenaPlatform = pkgs: pkgs.stdenv.hostPlatform.system == "x86_64-linux";
 
   renderEnvironment = builtins.mapAttrs (_: toString);

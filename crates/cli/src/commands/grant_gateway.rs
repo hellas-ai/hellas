@@ -1,5 +1,4 @@
 use hellas_private::StoreLocation;
-pub mod local;
 
 use super::CliResult;
 use crate::identity::LocalIdentity;
@@ -88,6 +87,70 @@ pub fn session(
         journal_root: super::contributions::client_journal_root(home, &client)?,
         control_timeout: Duration::from_secs(90),
     })
+}
+
+/// `gateway --local-grant`: this node's configured allowance, its policies
+/// run on this machine through the shared local core. No chain, no remote
+/// provider and no ledger.
+#[cfg(feature = "compute")]
+pub struct Local {
+    gateway: Arc<hellas_sdk::execution::local::LocalGateway>,
+    content: hellas_store::content::DiskStore,
+    reload: crate::content_configuration::ContentReload,
+}
+
+#[cfg(feature = "compute")]
+impl Local {
+    pub async fn open(
+        home: &StoreLocation,
+        grant: &str,
+        policy: Option<&str>,
+        native: crate::compute::ServeArgs,
+        identity: &LocalIdentity,
+    ) -> CliResult<Self> {
+        use anyhow::Context as _;
+        let grant = grant
+            .parse()
+            .context("--local-grant must be a 16-byte hexadecimal ID")?;
+        let store = hellas_authority::work_store::grant::NodeStore::open(
+            &hellas_sdk::grant_config::GrantConfig::journal_dir(home),
+            hellas_authority::model::grant::grant_network(),
+            Some(identity.enrollment.clone()),
+            hellas_auth::authority::UnixMillis::now().unwrap_or_default(),
+        )
+        .await?;
+        let policies: Vec<_> = store
+            .state()
+            .grant(grant)
+            .context("local allowance is not configured")?
+            .policies
+            .iter()
+            .filter(|granted| policy.is_none_or(|name| granted.name == name))
+            .map(|granted| granted.invocation_policy.clone())
+            .collect();
+        anyhow::ensure!(
+            !policies.is_empty(),
+            "--grant-policy names no policy of the local allowance"
+        );
+        let signer = Arc::new(identity.node_key.clone());
+        let (execution, reload) = crate::compute::local(home, native, signer.clone()).await?;
+        Ok(Self {
+            content: execution.content.clone(),
+            gateway: hellas_sdk::execution::local::LocalGateway::open(execution, policies, signer),
+            reload,
+        })
+    }
+
+    pub fn work(&self) -> Arc<dyn hellas_gateway::WorkExecutionBackend> {
+        self.gateway.clone()
+    }
+
+    /// After the gateway has stopped: the content outlives its readers.
+    pub async fn shutdown(self) -> CliResult<()> {
+        let stopped = self.reload.shutdown().await;
+        self.content.close().await;
+        stopped
+    }
 }
 
 #[cfg(test)]

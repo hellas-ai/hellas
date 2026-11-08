@@ -2,7 +2,6 @@ use super::*;
 use hellas_client::model::{ModelPackage, ModelRequest, ModelResponse, flux::ImageRequest};
 
 #[derive(Debug, Args)]
-#[command(group(clap::ArgGroup::new("execution_target").required(true).multiple(true).args(["provider", "offer"])))]
 pub struct ImageArgs {
     #[command(flatten)]
     client: ClientArgs,
@@ -19,10 +18,11 @@ pub struct ImageArgs {
     height: usize,
     #[arg(long, default_value_t = 4)]
     steps: usize,
-    #[arg(long, required_unless_present = "offer", conflicts_with = "offer", value_parser = clap::value_parser!(u64).range(1..))]
+    /// Flat price the provider charges per job; paid work only.
+    #[arg(long, conflicts_with = "offer", value_parser = clap::value_parser!(u64).range(1..))]
     payment: Option<u64>,
     #[command(flatten)]
-    grant: grant::GrantArgs,
+    target: TargetArgs,
     #[arg(short = 'o', long, default_value = "image.png", value_name = "PNG")]
     output: PathBuf,
 }
@@ -43,35 +43,22 @@ pub async fn image(args: ImageArgs, context: Context) -> super::super::CliResult
     )
     .await?;
     eprintln!("job: {}", directory.display());
-    bounded(
+    let mut target = args.target;
+    target.model = Some(args.model.clone());
+    run_job(
+        &args.client,
+        target,
         &context,
-        args.client.timeout,
-        async {
-            if args.grant.offer.is_some() {
-                let mut result = grant::execute(&args.grant, &args.client, &context, &job).await?;
-                result.save(&directory.join("result"), &job)?;
-                result.ensure_succeeded()?;
-                let ModelResponse::Image(image) = package.decode(&result.retained.output)? else { bail!("expected image") };
-                std::fs::write(&args.output, image.png(args.width, args.height)?)?;
-                println!("{}", args.output.display());
-                std::io::stdout().lock().flush()?;
-                result.attempt.reported()?;
-                return Ok(());
-            }
-            purchase_and_execute(&args.client, &context, &job, |result| {
-            let ModelResponse::Image(image) = package.decode(&result.output)? else {
+        &job,
+        Some(&directory.join("result")),
+        |completed, _| {
+            let ModelResponse::Image(image) = package.decode(&completed.output)? else {
                 bail!("expected image");
             };
-            let png = image.png(args.width, args.height)?;
-            std::fs::write(&args.output, png)?;
-            save_outputs(&directory.join("result"), &job, result)?;
+            std::fs::write(&args.output, image.png(args.width, args.height)?)?;
             println!("{}", args.output.display());
             std::io::stdout().lock().flush()?;
             Ok(())
-            }).await
-        },
-        |timeout| {
-            format!("image generation exceeded {timeout:?}; use the saved job folder to recover the existing attempt")
         },
     )
     .await

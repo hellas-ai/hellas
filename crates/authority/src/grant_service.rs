@@ -15,7 +15,7 @@ use hellas_auth::{Digest, ProducerSigningKey, PublicKey, Signature};
 use hellas_channel::job::WorkContext;
 use hellas_channel::model::work::{PrivateRecord, bound_result_digest, encode_transcript};
 use hellas_channel::work::admission::{CapacityDomain, WorkAdmission, WorkPermit};
-use hellas_channel::work::{Admitted, BackendFault, PaidProgress, PaidResultStream, WorkBackend};
+use hellas_channel::work::{BackendFault, PaidProgress, PaidResultStream, WorkBackend};
 use hellas_rpc::OutputEventEnvelope;
 use hellas_rpc::pb::work::Refusable;
 use hellas_rpc::pb::work::{
@@ -287,18 +287,15 @@ impl GrantService {
             move |input: PreparedInvocation, policy: GrantPolicy, content, admission, progress| {
                 let backend = backend.clone();
                 Box::pin(async move {
-                    let facts = policy
-                        .invocation_policy
-                        .classify_manifest(&input.manifest().map_err(BackendFault::caused_by)?)
-                        .map_err(BackendFault::caused_by)?;
-                    let input = Admitted::new(
+                    hellas_channel::work::run_admitted(
+                        &*backend,
                         input,
-                        facts.limits,
-                        facts.capacity_domain,
+                        &policy.invocation_policy,
                         content,
                         admission,
-                    );
-                    backend.execute_stream(input, progress).await
+                        progress,
+                    )
+                    .await
                 }) as BoxFuture<'static, _>
             },
         );

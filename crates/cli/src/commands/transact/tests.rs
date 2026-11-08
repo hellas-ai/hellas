@@ -3,32 +3,6 @@ use clap::Parser as _;
 use hellas_private::Durability::Crash;
 use hellas_private::StoreLocation;
 
-#[tokio::test]
-async fn paid_output_is_flushed_before_a_failed_settlement() {
-    let directory = tempfile::tempdir().unwrap();
-    let output = directory.path().join("output");
-    let result = deliver_then_settle(
-        || {
-            let mut writer = std::io::BufWriter::new(std::fs::File::create(&output)?);
-            writer.write_all(b"paid result")?;
-            writer.flush()?;
-            Ok(())
-        },
-        async {
-            assert_eq!(std::fs::read(&output).unwrap(), b"paid result");
-            bail!("injected settlement failure")
-        },
-    )
-    .await;
-    assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("injected settlement failure")
-    );
-    assert_eq!(std::fs::read(output).unwrap(), b"paid result");
-}
-
 #[test]
 fn grant_execution_requires_explicit_access_and_refuses_paid_options() {
     let base = ["hellas", "transact", "--job", "job"];
@@ -70,14 +44,17 @@ async fn an_expired_command_closes_the_endpoint_it_bound() {
     )
     .unwrap();
     let endpoint = context.paid_endpoint().await.unwrap();
-    let result: crate::commands::CliResult<()> = bounded(
-        &context,
-        Some(Duration::from_millis(1)),
-        std::future::pending(),
-        |_| "expired".into(),
-    )
-    .await;
-    assert_eq!(result.unwrap_err().to_string(), "expired");
+    let result: crate::commands::CliResult<()> =
+        bounded(&context, Some(Duration::from_millis(1)), async |deadline| {
+            within(deadline, std::future::pending()).await
+        })
+        .await;
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .starts_with("exceeded --timeout")
+    );
     assert!(endpoint.is_closed());
 }
 
@@ -504,9 +481,7 @@ fn output_claims_only_provider_signature_and_job_binding() {
         Assurance::ProducerSigned,
     )
     .unwrap();
-    let result = PaidCompletion {
-        bond_edge: hellas_kernel::EdgeId::from_bytes([1; 32]),
-        channel_id: hellas_auth::Digest::from_bytes([3; 32]),
+    let result = Completed {
         transcript: vec![],
         output: hellas_rpc::protocol::invocation::output::InvocationOutput {
             outcome: hellas_rpc::protocol::invocation::output::Outcome::Succeeded,
@@ -514,12 +489,19 @@ fn output_claims_only_provider_signature_and_job_binding() {
             metadata: hellas_rpc::JsonBytes(vec![]),
         },
         work_id: hellas_auth::Digest::from_bytes([4; 32]),
-        job_price: 20,
         provider_key: ProducerSigningKey::from_secret_bytes([8; 32])
             .unwrap()
             .public_key(),
+        paid: Some(hellas_sdk::execution::PaidReceipt {
+            price: 20,
+            channel_id: hellas_auth::Digest::from_bytes([3; 32]),
+            bond_edge: hellas_kernel::EdgeId::from_bytes([1; 32]),
+            settled: None,
+        }),
+        live: None,
     };
-    let output = wording(args.client.paid_provider().unwrap(), &job, &result);
+    let address = args.client.paid_provider().unwrap().address.to_string();
+    let output = wording(&address, &job, &result);
     assert_eq!(
         output.lines().nth(1),
         Some(
@@ -630,6 +612,8 @@ fn execution_helpers_choose_payment_or_an_imported_offer() {
         vec!["run", "--source", "program.hex", "--entry", "main"],
         vec!["image", "--model", "model", "--prompt", "fox"],
         vec!["transcribe", "--model", "model", "--audio", "speech.wav"],
+        vec!["text", "--model", "model.gguf", "--prompt", "hello"],
+        vec!["fetch", "https://example.test", "--contract", "http"],
     ] {
         let mut base = vec!["hellas"];
         base.extend(helper);
@@ -644,6 +628,10 @@ fn execution_helpers_choose_payment_or_an_imported_offer() {
         assert!(parse(&["--offer", "box.model", "--provider", &provider]).is_ok());
         assert!(parse(&["--payment", "20", "--offer", "box.model"]).is_err());
         assert!(parse(&["--offer", "box.model", "--buy-again"]).is_err());
+        // Local execution exists only in the compute build.
+        assert_eq!(parse(&["--local"]).is_ok(), cfg!(feature = "compute"));
+        assert!(parse(&["--local", "--offer", "box.model"]).is_err());
+        assert!(parse(&["--local", "--provider", &provider]).is_err());
     }
 }
 
@@ -667,4 +655,31 @@ fn paid_commands_require_a_provider_before_opening_chain_state() {
             .expect("missing paid provider");
         assert!(error.to_string().contains("--provider"), "{error}");
     }
+}
+
+#[test]
+fn multiple_policy_offers_require_and_honor_explicit_resource_selection() {
+    let first = hellas_authority::test_support::policy();
+    let mut second = first.clone();
+    second.resource = ResourceId(hellas_auth::Digest::hash(b"second resource"));
+    let policies = [first, second];
+    assert!(select_policy(&policies, None).is_err());
+    assert_eq!(
+        select_policy(&policies, Some(policies[1].resource))
+            .unwrap()
+            .resource,
+        policies[1].resource
+    );
+    assert!(
+        select_policy(
+            &policies,
+            Some(ResourceId(hellas_auth::Digest::hash(b"absent")))
+        )
+        .is_err()
+    );
+    assert!(select_policy(&[], None).is_err());
+    assert_eq!(
+        select_policy(&policies[..1], None).unwrap().resource,
+        policies[0].resource
+    );
 }

@@ -199,18 +199,25 @@ fn consecutive_jobs_reuse_bounded_funding_and_closing_channels_never_refund_it()
                 0
             );
             assert_eq!(budget.0.lock().unwrap().calls, 1);
+            let bond = session.descriptor().bond_edge();
+            session.shutdown().await;
+            drop(session);
             assert_eq!(
                 sealing_while(
                     &mut case.devnet,
                     Duration::from_millis(100),
-                    session.settle()
+                    hellas_sdk::paid_client::settle_channel(
+                        &case.options,
+                        bond,
+                        case.owner.principal(),
+                        &client_settlement(),
+                    )
                 )
                 .await
-                .unwrap(),
+                .unwrap()
+                .provider_payout,
                 PRICE * 10
             );
-            session.shutdown().await;
-            drop(session);
             eprintln!("retained-budget: interrupted close finalized its ten payments");
             // Use a new reservation for a deliberate replacement channel. Closing
             // alone does not release budget: until verified returns are recorded,

@@ -40,7 +40,6 @@ pub type Accepted =
 
 #[derive(Default)]
 pub struct TransactionOptions<'a> {
-    pub settle: bool,
     pub purchase: Option<&'a mut Purchase>,
     /// Gateways start a new purchase for each HTTP request. Folder commands
     /// instead resume an unpaid matching authorization after interruption.
@@ -160,7 +159,7 @@ pub async fn transact(
         )?;
     }
     let content = job.content();
-    let mut result = session
+    let result = session
         .run_prepared(
             Some(prepared),
             &content,
@@ -172,8 +171,5 @@ pub async fn transact(
         )
         .await?
         .ok_or(PaidClientError::MissingState("transaction result"))?;
-    if options.settle {
-        result.settled_provider_payout = Some(session.settle().await?);
-    }
     Ok(result)
 }

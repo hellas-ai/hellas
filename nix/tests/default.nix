@@ -3,10 +3,11 @@
   pkgs,
   lib,
   package,
+  portablePackage,
   validatorPackage,
 }:
 (import ./basic.nix {
-  inherit pkgs package;
+  inherit pkgs package portablePackage;
 })
 // (import ./module-eval.nix {
   inherit

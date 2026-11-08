@@ -23,6 +23,9 @@ gateway-vm-fixture = [
     "hellas-channel/test-support",
 ]
 default = []
+# Local Catena Compute: the executor's native runtime, `--local`, and
+# serving Compute. Without it this build runs and serves Fetch only.
+compute = ["hellas-sdk/compute", "hellas-executor/compute"]
 
 indexer = ["hellas-chain/indexer-api"]
 validator = ["indexer", "hellas-chain/validator"]
@@ -120,6 +123,8 @@ commonware-runtime.workspace = true
 hellas-authority = { workspace = true, features = ["test-support"] }
 hellas-chain = { workspace = true, features = ["client", "test-support"] }
 hellas-channel = { workspace = true, features = ["test-support"] }
+# Tests check rendered Catena programs against the compiler.
+hellas-executor = { workspace = true, features = ["compute"] }
 hellas-providers = { workspace = true, features = ["test-support"] }
 p256.workspace = true
 reqwest = { workspace = true, features = ["json"] }

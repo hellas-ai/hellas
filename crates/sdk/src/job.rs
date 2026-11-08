@@ -188,8 +188,8 @@ impl JobInput {
         })
     }
 
-    /// Builds the signed invocation for `runner` under `policy`. Paid jobs are
-    /// retained by the provider; grant and local jobs are memory-only.
+    /// Builds the signed invocation for `runner` under `policy`. Paid and
+    /// local jobs are retained by their store; grant jobs are memory-only.
     pub fn prepare(
         &self,
         manifest: &ProgramManifest,

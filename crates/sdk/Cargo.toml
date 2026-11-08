@@ -10,6 +10,8 @@ documentation.workspace = true
 [features]
 # Opt in to tests that start local nodes or exercise complete host processes.
 integration-tests = []
+# Local Catena Compute through the executor's native runtime.
+compute = ["hellas-executor/compute"]
 
 [dependencies]
 async-stream = { workspace = true }
@@ -82,6 +84,8 @@ ctor = "1"
 hellas-authority = { workspace = true, features = ["test-support"] }
 hellas-chain = { workspace = true, features = ["test-support"] }
 hellas-channel = { workspace = true, features = ["test-support"] }
+# Provider fixtures run Compute in this test binary's Catena child.
+hellas-executor = { workspace = true, features = ["compute"] }
 libloading = "0.9"
 rcgen = "0.14"
 reqwest = { workspace = true, features = ["json"] }

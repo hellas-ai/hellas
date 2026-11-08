@@ -1,20 +1,19 @@
 //! Reusable paid gateway pool over durable client-owned state channels.
 
-use crate::gateway_work::{
-    Completed, GatewayEvent, Requester, WorkGateway, WorkRequest, WorkSource,
+use crate::execution::{
+    AttemptError, Controls, ExecutionSession, ExecutionTerms, PaidOpen, before_proposal,
+    open_paid_session,
 };
+use crate::gateway_work::{GatewayEvent, Requester, WorkGateway, WorkRequest, WorkSource};
 use crate::job::{Job, JobInput};
-use crate::paid_client::{
-    PaidClientError, PaidWorkOptions, PaidWorkResult, PaidWorkSession, bind_paid_endpoint,
-};
+use crate::paid_client::{PaidClientError, PaidWorkOptions, PaidWorkSession, bind_paid_endpoint};
 use futures::future::BoxFuture;
 use hellas_channel::model::setup::ProviderChannelPolicy;
 use hellas_gateway::{WorkGatewayError, WorkShutdownError};
 use hellas_kernel::Secp256k1Signer;
 use hellas_rpc::output::OutputEvent as FetchEvent;
-use hellas_store::content::{LocalStore, MemoryStore, Reservations, Scope};
 use iroh::Endpoint;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex as AsyncMutex;
@@ -295,37 +294,37 @@ impl PaidGateway {
 
 impl PaidPool {
     /// Tries each candidate in order until one accepts the request. A provider
-    /// that fails before this request is proposed yields to the next one.
+    /// that fails provably before this request's proposal yields to the next.
     async fn route<E: GatewayEvent>(
         &self,
-        candidates: Vec<(Arc<Provider>, Route, Option<JobInput>)>,
+        candidates: Vec<(Arc<Provider>, Route, JobInput)>,
         mut occupied: Option<ProviderUse>,
         deadline: tokio::time::Instant,
         requester: &Requester<E, PoolError>,
-    ) -> Result<Option<PaidWorkResult>> {
+    ) -> Result<()> {
         let span = tracing::Span::current();
-        let recovery = occupied.is_none();
-        let streamed = !recovery;
-        let progress = requester.progress();
-        let accepted = requester.accepted();
+        let stop = requester.stop();
         let mut provider_errors = Vec::new();
         let last = candidates.len() - 1;
         for (index, (provider, route, input)) in candidates.into_iter().enumerate() {
             let _occupied = occupied
                 .take()
-                .or_else(|| streamed.then(|| ProviderUse::new(provider.clone())));
+                .unwrap_or_else(|| ProviderUse::new(provider.clone()));
             span.record(
                 "hellas.provider.id",
                 tracing::field::display(provider.args.provider),
             );
             span.record("hellas.route.pending", route.pending);
             // Serialize jobs on one funded channel; its observer runs independently.
-            let mut session = if recovery || index == last {
-                before_proposal(requester, streamed, deadline, |_| {
+            let mut session = if index == last {
+                before_proposal(
+                    Some(deadline),
+                    &stop,
+                    None,
                     provider.serial.lock().instrument(
                         hellas_rpc::request_span!(target: "hellas_request", "paid.queue"),
-                    )
-                })
+                    ),
+                )
                 .await?
             } else {
                 match tokio::time::timeout(CHANNEL_QUEUE_BUDGET, provider.serial.lock()).await {
@@ -337,9 +336,6 @@ impl PaidPool {
                     }
                 }
             };
-            if recovery && !has_retained_setup(&provider.args).await? {
-                continue;
-            }
             // Recheck after queueing, including restored channels whose
             // setup journal opened without contacting the provider.
             if !provider.available() {
@@ -349,159 +345,99 @@ impl PaidPool {
                 ));
                 continue;
             }
-            let job = input
-                .map(|input| Job::from_input(provider.args.expected_price, input))
-                .transpose()?;
             if session.is_none() {
-                let opened = before_proposal(requester, streamed, deadline, |_| async {
-                    PaidWorkSession::open_for_gateway(
-                        provider.args.clone(),
-                        self.endpoint.clone(),
-                        self.settlement_key.clone(),
-                        self.owner.clone(),
-                        PROVIDER_CONNECTION_TIMEOUT,
-                        self.funding.clone(),
-                        job.as_ref(),
-                    )
-                    .await
-                    .map_err(PoolError::from)
-                })
-                .await
-                .and_then(|result| result);
+                let job = Job::from_input(provider.args.expected_price, input.clone())?;
+                let opened = before_proposal(
+                    Some(deadline),
+                    &stop,
+                    None,
+                    self.open(&provider, PaidOpen::Job(&job)),
+                )
+                .await?;
                 match opened {
                     Ok(opened) => *session = Some(opened),
                     Err(error) => {
-                        if !recovery && matches!(error, PoolError::Stopped(_)) {
-                            return Err(error);
-                        }
                         provider.connection_failed();
                         tracing::debug!(provider = %provider.args.provider, error = %format!("{error:#}"),
-                            recovery, "paid provider channel could not be opened");
+                            "paid provider channel could not be opened");
                         provider_errors.push(format!("{}: {error:#}", provider.args.provider));
                         continue;
                     }
                 }
             }
             let session = session.as_mut().expect("channel was opened");
-            if streamed && session.needs_recovery() {
-                let recovery_deadline =
-                    deadline.min(tokio::time::Instant::now() + RECOVERY_ATTEMPT_TIMEOUT);
-                let recovered = tokio::time::timeout_at(
-                    recovery_deadline,
-                    session.run(None, &empty_content(), true, None),
+            let result = ExecutionSession::Paid(session)
+                .run(
+                    &WorkRequest::Job(input),
+                    ExecutionTerms::Paid {
+                        price: provider.args.expected_price,
+                    },
+                    &self.producer_key,
+                    Controls {
+                        deadline: Some(deadline),
+                        stop: Some(stop.clone()),
+                        observers: requester.observers(),
+                        deliver: Some(requester.delivery()),
+                    },
+                    None,
                 )
-                .await
-                .map_err(|_| PoolError::RecoveryTimeout)
-                .and_then(|result| result.map_err(PoolError::from));
-                if let Err(error) = recovered {
-                    // Nothing in this path has proposed the fresh request.
-                    // Keep the journal for a later recovery and route this
-                    // interactive request to another paid provider now.
-                    provider.connection_failed();
-                    tracing::debug!(provider = %provider.args.provider, error = %format!("{error:#}"),
-                        "retained paid work deferred before a fresh request");
-                    provider_errors.push(format!(
-                        "{}: retained work recovery deferred: {error:#}",
-                        provider.args.provider
-                    ));
-                    continue;
+                .await;
+            match result {
+                Ok(_) => {
+                    provider.connection_succeeded();
+                    return Ok(());
                 }
-            }
-            // ClientEndpoint journals the proposal nonce before releasing
-            // its signature. Recovery and a failed dial need not propose
-            // this request; a lost acceptance response does advance it.
-            let proposal_nonce = session
-                .with_state(|state| state.proposal_nonce_high_water())
-                .await?;
-            let request_session = &mut *session;
-            let signer = self.producer_key.clone();
-            let on_progress = streamed.then(|| progress.clone());
-            let on_accepted = streamed.then(|| accepted.clone());
-            let result = before_proposal(requester, streamed, deadline, |proposed| async move {
-                match job {
-                    Some(job) => crate::transact::transact(
-                        request_session,
-                        &job,
-                        &signer,
-                        crate::transact::TransactionOptions {
-                            new_purchase: true,
-                            progress: on_progress,
-                            accepted: on_accepted,
-                            proposed: Some(&proposed),
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                    .map(Some)
-                    .map_err(|error| match error {
-                        crate::transact::TransactError::Client(client) => PoolError::Client(client),
-                        error => PoolError::Transaction(Box::new(error)),
-                    }),
-                    None => request_session
-                        .run(None, &empty_content(), true, on_progress)
-                        .await
-                        .map_err(PoolError::from),
-                }
-            })
-            .await
-            .flatten();
-            if let Err(error) = &result {
-                if !recovery
-                    && matches!(error, PoolError::Stopped(_))
-                    && session
-                        .with_state(|state| state.proposal_nonce_high_water())
-                        .await?
-                        == proposal_nonce
-                {
-                    return result;
-                }
-                if recovery {
-                    provider.connection_failed();
-                    return result.map_err(|source| PoolError::Provider {
-                        provider: provider.args.provider,
-                        source: Box::new(source),
-                    });
-                }
-                // A failed journal append can leave a durable proposal that
-                // is not reflected in memory yet. Keep that failure with
-                // this provider, just like a proposal with no response.
-                let uncertain_append = matches!(
-                    error,
-                    PoolError::Client(PaidClientError::Propose(
-                        hellas_channel::work::ProposeError::Store(_)
-                    )),
-                );
-                if !uncertain_append
-                    && session
-                        .with_state(|state| state.proposal_nonce_high_water())
-                        .await?
-                        == proposal_nonce
-                {
+                Err(AttemptError::Stopped(stopped)) => return Err(stopped.into()),
+                Err(AttemptError::PreProposal(error)) => {
                     provider.connection_failed();
                     tracing::debug!(provider = %provider.args.provider, error = %format!("{error:#}"),
                         "paid provider failed before proposing new work");
                     provider_errors.push(format!("{}: {error:#}", provider.args.provider));
-                    continue;
                 }
-            } else {
-                provider.connection_succeeded();
+                Err(AttemptError::Committed(error)) => {
+                    return Err(PoolError::Provider {
+                        provider: provider.args.provider,
+                        source: Box::new(PoolError::Execution(error)),
+                    });
+                }
             }
-            return result.map_err(|source| PoolError::Provider {
-                provider: provider.args.provider,
-                source: Box::new(source),
-            });
         }
         Err(PoolError::ProvidersUnavailable(provider_errors))
     }
-}
 
-fn empty_content() -> (LocalStore, Scope) {
-    (
-        LocalStore::Memory(MemoryStore::new(Reservations::ram(
-            hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
-        ))),
-        Scope::Owner,
-    )
+    fn open<'a>(
+        &'a self,
+        provider: &'a Provider,
+        open: PaidOpen<'a>,
+    ) -> impl std::future::Future<Output = crate::execution::Result<PaidWorkSession>> + 'a {
+        open_paid_session(
+            provider.args.clone(),
+            self.endpoint.clone(),
+            self.settlement_key.clone(),
+            self.owner.clone(),
+            self.funding.clone(),
+            open,
+            Some(PROVIDER_CONNECTION_TIMEOUT),
+        )
+    }
+
+    /// Restart recovery of retained work, never a new job.
+    async fn recover(&self, provider: &Provider) -> Result<()> {
+        let mut session = provider.serial.lock().await;
+        if !has_retained_setup(&provider.args).await? {
+            return Ok(());
+        }
+        if session.is_none() {
+            let opened = self.open(provider, PaidOpen::Retained).await;
+            *session = Some(opened.inspect_err(|_| provider.connection_failed())?);
+        }
+        let session = session.as_mut().expect("channel was opened");
+        session
+            .run(None, &crate::paid_client::empty_content(), true, None)
+            .await
+            .inspect_err(|_| provider.connection_failed())?;
+        Ok(())
+    }
 }
 
 async fn has_retained_setup(options: &PaidWorkOptions) -> Result<bool> {
@@ -587,43 +523,42 @@ impl WorkSource for PaidPool {
         self: Arc<Self>,
         request: PaidRequest,
         requester: Requester<E, PoolError>,
-    ) -> BoxFuture<'static, Result<Option<Completed>>> {
-        let (candidates, occupied) = match request.0 {
-            Routed::Job {
-                candidates,
-                occupied,
-            } => (
-                candidates
-                    .into_iter()
-                    .map(|(provider, route, input)| (provider, route, Some(input)))
-                    .collect::<Vec<_>>(),
-                Some(occupied),
-            ),
-            Routed::Recover(provider) => {
-                let route = provider.route();
-                (vec![(provider, route, None)], None)
+    ) -> BoxFuture<'static, Result<()>> {
+        let (provider, _route, recovery) = match &request.0 {
+            Routed::Job { candidates, .. } => {
+                (candidates[0].0.clone(), candidates[0].1.pending, false)
             }
+            Routed::Recover(provider) => (provider.clone(), provider.route().pending, true),
         };
-        let (first, _route, _) = &candidates[0];
-        let recovery = occupied.is_none();
         let span = hellas_rpc::request_span!(
             target: "hellas_request", "paid.gateway",
-            hellas.provider.id = %first.args.provider,
+            hellas.provider.id = %provider.args.provider,
             hellas.work.recovery = recovery,
-            hellas.route.pending = _route.pending,
+            hellas.route.pending = _route,
         );
-        // Queueing, recovery and fallback all consume the same request budget.
-        let timeout = if recovery {
-            RECOVERY_ATTEMPT_TIMEOUT
-        } else {
-            request_timeout(&first.args)
-        };
-        let deadline = tokio::time::Instant::now() + timeout;
         Box::pin(
             async move {
-                let result = self
-                    .route(candidates, occupied, deadline, &requester)
-                    .await;
+                let result = match request.0 {
+                    Routed::Job {
+                        candidates,
+                        occupied,
+                    } => {
+                        // Queueing, recovery and fallback all consume the same request budget.
+                        let deadline =
+                            tokio::time::Instant::now() + request_timeout(&provider.args);
+                        self.route(candidates, Some(occupied), deadline, &requester)
+                            .await
+                    }
+                    Routed::Recover(provider) => {
+                        tokio::time::timeout(RECOVERY_ATTEMPT_TIMEOUT, self.recover(&provider))
+                            .await
+                            .unwrap_or(Err(PoolError::RecoveryTimeout))
+                            .map_err(|source| PoolError::Provider {
+                                provider: provider.args.provider,
+                                source: Box::new(source),
+                            })
+                    }
+                };
                 if let Err(error) = &result {
                     if recovery {
                         tracing::debug!(error = %format!("{error:#}"),
@@ -633,14 +568,7 @@ impl WorkSource for PaidPool {
                             "paid gateway operation failed; durable journals retained for recovery");
                     }
                 }
-                // A disconnected request stops before proposal. After proposal, it
-                // still collects and pays until the deadline; journals retain any
-                // unfinished operation for recovery.
-                Ok(result?.map(|output| Completed {
-                    output: output.output,
-                    provider: output.provider_key,
-                    transcript: output.transcript,
-                }))
+                result
             }
             .instrument(span),
         )
@@ -674,44 +602,6 @@ impl WorkSource for PaidPool {
             Ok(())
         })
     }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum RequestStopped {
-    #[error("paid request disconnected before proposal")]
-    Disconnected,
-    #[error("paid request deadline elapsed, including queue wait")]
-    Deadline,
-}
-
-/// Cancel an unproposed HTTP operation without interrupting work whose
-/// proposal signature may already have reached a provider.
-async fn before_proposal<T, F: std::future::Future<Output = T>, E: GatewayEvent>(
-    requester: &Requester<E, PoolError>,
-    cancel_on_disconnect: bool,
-    deadline: tokio::time::Instant,
-    operation: impl FnOnce(Arc<AtomicBool>) -> F,
-) -> Result<T> {
-    if tokio::time::Instant::now() >= deadline {
-        return Err(RequestStopped::Deadline.into());
-    }
-    // This flag belongs to this operation, never to retained matching input.
-    // A prior journal record may prevent fallback but cannot authorize a new
-    // request after its HTTP receiver has gone away.
-    let proposed = Arc::new(AtomicBool::new(false));
-    let operation = tokio::time::timeout_at(deadline, operation(proposed.clone()));
-    tokio::pin!(operation);
-    let result = tokio::select! {
-        biased;
-        _ = requester.closed(), if cancel_on_disconnect => {
-            if !proposed.load(Ordering::Acquire) {
-                return Err(RequestStopped::Disconnected.into());
-            }
-            operation.await
-        }
-        result = &mut operation => result,
-    };
-    result.map_err(|_| RequestStopped::Deadline.into())
 }
 
 #[cfg(test)]
@@ -968,14 +858,29 @@ mod tests {
         assert!(has_retained_setup(provider).await.unwrap());
     }
 
+    /// A pool operation under the request's stop and deadline.
+    async fn stop_before_proposal<T, F: std::future::Future<Output = T>>(
+        requester: &Requester<FetchEvent, PoolError>,
+        deadline: tokio::time::Instant,
+        operation: impl FnOnce(Arc<std::sync::atomic::AtomicBool>) -> F,
+    ) -> Result<T> {
+        let proposed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        Ok(before_proposal(
+            Some(deadline),
+            &requester.stop(),
+            Some(&proposed),
+            operation(proposed.clone()),
+        )
+        .await?)
+    }
+
     #[tokio::test]
     async fn disconnected_queued_request_never_starts_work() {
         let (sender, receiver) = Requester::<FetchEvent, PoolError>::new();
         drop(receiver);
-        let started = AtomicBool::new(false);
-        let result = before_proposal(
+        let started = std::sync::atomic::AtomicBool::new(false);
+        let result = stop_before_proposal(
             &sender,
-            true,
             tokio::time::Instant::now() + Duration::from_secs(1),
             |_| async {
                 started.store(true, Ordering::Relaxed);
@@ -991,9 +896,8 @@ mod tests {
         let (sender, receiver) = Requester::<FetchEvent, PoolError>::new();
         let (proposal_sent, proposal_seen) = tokio::sync::oneshot::channel();
         let (payment_ready, payment_wait) = tokio::sync::oneshot::channel();
-        let work = before_proposal(
+        let work = stop_before_proposal(
             &sender,
-            true,
             tokio::time::Instant::now() + Duration::from_secs(1),
             |proposed| async move {
                 proposed.store(true, Ordering::Release);
@@ -1015,12 +919,11 @@ mod tests {
     #[tokio::test]
     async fn disconnect_during_dial_cancels_before_signature_release() {
         let (sender, receiver) = Requester::<FetchEvent, PoolError>::new();
-        let signed = AtomicBool::new(false);
+        let signed = std::sync::atomic::AtomicBool::new(false);
         let signed_ref = &signed;
         let (dial_started, dial_seen) = tokio::sync::oneshot::channel();
-        let operation = before_proposal(
+        let operation = stop_before_proposal(
             &sender,
-            true,
             tokio::time::Instant::now() + Duration::from_secs(1),
             |proposed| async move {
                 dial_started.send(()).unwrap();
@@ -1042,7 +945,7 @@ mod tests {
     async fn previous_proposal_does_not_authorize_disconnected_next_operation() {
         let (sender, receiver) = Requester::<FetchEvent, PoolError>::new();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-        before_proposal(&sender, true, deadline, |proposed| async move {
+        stop_before_proposal(&sender, deadline, |proposed| async move {
             proposed.store(true, Ordering::Release);
         })
         .await
@@ -1050,8 +953,8 @@ mod tests {
         // A retained proposal from the earlier operation may still exist, but
         // the next operation must establish its own signature-release boundary.
         drop(receiver);
-        let started = AtomicBool::new(false);
-        let result = before_proposal(&sender, true, deadline, |_| async {
+        let started = std::sync::atomic::AtomicBool::new(false);
+        let result = stop_before_proposal(&sender, deadline, |_| async {
             started.store(true, Ordering::Release);
         })
         .await;
@@ -1085,9 +988,8 @@ mod tests {
         let (sender, _receiver) = Requester::<FetchEvent, PoolError>::new();
         let serial = AsyncMutex::new(());
         let _busy = serial.lock().await;
-        let result = before_proposal(
+        let result = stop_before_proposal(
             &sender,
-            true,
             tokio::time::Instant::now() + Duration::from_millis(20),
             |_| serial.lock(),
         )
@@ -1103,8 +1005,8 @@ mod tests {
     #[tokio::test]
     async fn expired_request_does_not_start_a_fallback_provider() {
         let (sender, _receiver) = Requester::<FetchEvent, PoolError>::new();
-        let started = AtomicBool::new(false);
-        let result = before_proposal(&sender, true, tokio::time::Instant::now(), |_| async {
+        let started = std::sync::atomic::AtomicBool::new(false);
+        let result = stop_before_proposal(&sender, tokio::time::Instant::now(), |_| async {
             started.store(true, Ordering::Relaxed);
         })
         .await;

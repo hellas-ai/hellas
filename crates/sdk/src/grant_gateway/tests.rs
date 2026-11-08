@@ -1155,13 +1155,18 @@ async fn queued_requests_wait_without_a_deadline_and_cancel_on_disconnect() {
         if disconnect {
             drop(stream);
             // Finish while the other request still owns the mutex.
-            assert!(within(run).await.unwrap().is_none());
+            within(run).await.unwrap();
             assert_eq!(held.store().next_nonce().unwrap(), 2);
             drop(held);
         } else {
             drop(held);
-            assert!(within(run).await.unwrap().is_some());
-            drop(stream);
+            within(run).await.unwrap();
+            let events: Vec<_> = futures::StreamExt::collect(stream).await;
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, Ok(WorkEvent::Transcript(_))))
+            );
         }
     }
     assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 1);
@@ -1222,7 +1227,7 @@ async fn disconnect_during_control_does_not_propose() {
     tokio::pin!(run);
     assert!(futures::poll!(run.as_mut()).is_pending());
     drop(stream);
-    assert!(within(run).await.unwrap().is_none());
+    within(run).await.unwrap();
     assert_eq!(
         fixture.gateway.source.channels[0]
             .session
@@ -1311,4 +1316,102 @@ async fn single_signed_model_responses_route_tracks_continuation() {
     assert_eq!(host.backend.calls.load(Ordering::SeqCst), 2);
     server.shutdown().await.unwrap();
     gateway.drain().await.unwrap();
+}
+
+/// A command's grant target runs a job once through the same lifecycle, and
+/// a rerun of its attempt delivers the retained result without executing.
+#[tokio::test]
+async fn the_command_executor_runs_a_grant_once_and_replays_it() {
+    use crate::execution::{ExecutionAttempt, ExecutionTerms, Executor, GrantExecution, stop_on};
+    let template = chat_resource("https://private.fixture", 6);
+    let mut allowance = Allowance::responses(ids::ALLOWANCE, FRIEND);
+    use_https(&mut allowance.definition.policies[0], template.clone());
+    let host = crate::test_support::Host::builder()
+        .with_allowance(allowance)
+        .with_backend(Backend {
+            finish: Completion::Immediate,
+            reply: Reply::events(Reply::http(
+                200,
+                "application/json",
+                r#"{"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+            )),
+            ..Backend::default()
+        })
+        .build()
+        .await;
+    let options = host.options(vec![]);
+    let policy = options.target.offer().grant.policies[0].clone();
+    let http = hellas_rpc::http_fetch::HttpFetchRequest {
+        url: format!("{}{}", template.origin, template.paths[0]),
+        method: "POST".into(),
+        headers: vec![],
+        body_base64: STANDARD.encode(br#"{"messages":[],"max_tokens":6}"#),
+        tls: template.tls.clone(),
+        credential: None,
+        max_response_bytes: template.max_response_bytes,
+    };
+    let input = WorkRequest::Fetch(WorkFetchRequest {
+        resource: None,
+        channel: None,
+        provider: iroh::EndpointId::from_bytes(
+            &grant_transport(&options.target.offer().provider).unwrap(),
+        )
+        .unwrap(),
+        service: "openai".into(),
+        method: "responses".into(),
+        body: serde_json::to_vec(&http).unwrap(),
+    })
+    .admitted(
+        &policy.invocation_policy,
+        policy.https.as_ref(),
+        hellas_rpc::Assurance::ProducerSigned,
+        false,
+    )
+    .unwrap();
+    let job = crate::job::Job::from_input(0, input).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("attempt.json");
+    let terms = ExecutionTerms::Grant {
+        resource: policy.resource,
+    };
+    let delivered = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let signer = ProducerSigningKey::generate();
+    let run = |attempt| {
+        let delivered = delivered.clone();
+        Executor::Grant(GrantExecution {
+            options: options.clone(),
+            transport: GrantTransport::Local(host.world.service.clone()),
+            resource: policy.resource,
+            attempt,
+        })
+        .run(
+            &job,
+            &signer,
+            None,
+            stop_on(std::future::pending()),
+            Box::new(move |_| {
+                delivered.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }),
+        )
+    };
+    let first = run(ExecutionAttempt::open(&path, job.input(), terms).unwrap())
+        .await
+        .unwrap();
+    assert!(first.live.is_some());
+    let replay = run(ExecutionAttempt::open_existing(&path, job.input(), terms).unwrap())
+        .await
+        .unwrap();
+    assert!(replay.live.is_none());
+    assert_eq!(replay.work_id, first.work_id);
+    assert_eq!(replay.transcript, first.transcript);
+    assert_eq!(host.backend.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(delivered.load(Ordering::SeqCst), 2);
+    assert!(
+        ExecutionAttempt::open_existing(&path, job.input(), terms)
+            .unwrap()
+            .inspect()
+            .unwrap()
+            .reported
+    );
 }

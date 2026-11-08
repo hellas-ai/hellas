@@ -1,21 +1,14 @@
 //! Shared owner, grant and gateway for the manual model comparisons.
 use super::*;
-use hellas_authority::model::grant::{
-    ChannelClient, ChannelId, grant_channel_id, grant_network, owner_grant_id, records::*,
-};
+use hellas_authority::model::grant::{grant_network, owner_grant_id, records::*};
 use hellas_private::StoreLocation;
-use hellas_rpc::protocol::invocation::{
-    Admission, InvocationPolicy, Limits, compute, output::InvocationOutput,
-};
+use hellas_rpc::protocol::invocation::{Admission, InvocationPolicy, Limits, compute};
 
 pub(super) struct LocalCompute {
     pub gateway: Process,
     pub http: reqwest::Client,
     pub address: String,
     pub provider: hellas_auth::PublicKey,
-    journal: PathBuf,
-    enrollment: hellas_rpc::ProviderEnrollmentBundle,
-    channel: ChannelId,
     _directory: tempfile::TempDir,
 }
 
@@ -75,10 +68,6 @@ impl LocalCompute {
             decoder.fixed_bytes("node key").unwrap(),
         )
         .unwrap();
-        let client = ChannelClient {
-            principal,
-            node: hellas_auth::authority::NodeKey::from_public_key(signer.public_key()).unwrap(),
-        };
         let mut definition = common_node::allowance(allowance, principal, vec![policy]);
         if let Some(millis) = job_millis {
             definition.max_job_millis = millis;
@@ -93,13 +82,6 @@ impl LocalCompute {
             (vec![], 256),
         )
         .await;
-        let channel = grant_channel_id(
-            grant_network(),
-            enrollment.content_id(),
-            allowance,
-            client,
-            store.state().generation(allowance).unwrap(),
-        );
         let node = hellas_authority::node::NodeCoordinator::new(
             store,
             Arc::new(|| hellas_auth::authority::UnixMillis::now().unwrap_or_default()),
@@ -160,50 +142,8 @@ impl LocalCompute {
             http,
             address,
             provider,
-            journal,
-            enrollment,
-            channel,
             _directory: directory,
         }
-    }
-
-    pub async fn verify_result(
-        &self,
-        commitment: &str,
-        transcript: &[u8],
-        expected: &InvocationOutput,
-    ) {
-        let location = StoreLocation::for_test(&self.journal);
-        let store = hellas_authority::work_store::grant::NodeStore::open(
-            &location,
-            grant_network(),
-            Some(self.enrollment.clone()),
-            hellas_auth::authority::UnixMillis::now().unwrap(),
-        )
-        .await
-        .unwrap();
-        let book = store.state().channel(self.channel).unwrap().job_book();
-        let actual: Vec<_> = book
-            .jobs()
-            .filter_map(|job| job.result().map(|(result, _)| result))
-            .chain(book.terminals().filter_map(|terminal| {
-                terminal
-                    .outcome
-                    .result
-                    .as_ref()
-                    .map(|signed| &signed.result)
-            }))
-            .collect();
-        assert_eq!(actual.len(), 1, "one signed model result");
-        assert_eq!(hex::encode(actual[0].work_id.as_bytes()), commitment);
-        assert_eq!(
-            actual[0].transcript_content,
-            hellas_rpc::ContentRef::for_bytes(transcript)
-        );
-        assert_eq!(
-            actual[0].canonical_output_digest,
-            expected.content_id().unwrap().digest()
-        );
     }
 }
 

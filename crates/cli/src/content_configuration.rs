@@ -9,9 +9,12 @@ use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use tokio::{sync::watch, task::JoinHandle};
 
+/// A model file or package directory and the weight objects it holds.
+pub(crate) type Model = (PathBuf, Vec<hellas_rpc::ContentRef>);
+
 pub(crate) struct ContentConfiguration {
     path: Option<PathBuf>,
-    audio: Option<(PathBuf, hellas_rpc::ContentRef)>,
+    model: Option<Model>,
     config: Config,
     default_upper: Option<PathBuf>,
     watcher: Option<notify::RecommendedWatcher>,
@@ -19,10 +22,7 @@ pub(crate) struct ContentConfiguration {
 }
 
 impl ContentConfiguration {
-    pub(crate) fn load(
-        path: Option<PathBuf>,
-        audio: Option<(PathBuf, hellas_rpc::ContentRef)>,
-    ) -> Result<Self> {
+    pub(crate) fn load(path: Option<PathBuf>, model: Option<Model>) -> Result<Self> {
         let path = path.map(std::path::absolute).transpose()?;
         let (changed, changes) = watch::channel(());
         let watcher = if let Some(path) = &path {
@@ -49,10 +49,10 @@ impl ContentConfiguration {
         } else {
             None
         };
-        let config = read(path.as_deref(), audio.as_ref())?;
+        let config = read(path.as_deref(), model.as_ref())?;
         Ok(Self {
             path,
-            audio,
+            model,
             config,
             default_upper: None,
             watcher,
@@ -60,6 +60,7 @@ impl ContentConfiguration {
         })
     }
 
+    #[cfg(feature = "compute")]
     pub(crate) fn with_default_upper(mut self, upper: PathBuf) -> Self {
         if self.config.upper.is_none() {
             self.config.upper = Some(upper.clone());
@@ -94,7 +95,7 @@ impl ContentConfiguration {
                 changed = changes.changed() => if changed.is_err() { break; },
             }
             let result = async {
-                let mut config = read(self.path.as_deref(), self.audio.as_ref())?;
+                let mut config = read(self.path.as_deref(), self.model.as_ref())?;
                 if config.upper.is_none() {
                     config.upper = self.default_upper.clone();
                 }
@@ -121,7 +122,7 @@ impl ContentReload {
     }
 }
 
-fn read(path: Option<&Path>, audio: Option<&(PathBuf, hellas_rpc::ContentRef)>) -> Result<Config> {
+fn read(path: Option<&Path>, model: Option<&Model>) -> Result<Config> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct File {
@@ -146,24 +147,29 @@ fn read(path: Option<&Path>, audio: Option<&(PathBuf, hellas_rpc::ContentRef)>) 
             *lower = parent.join(&*lower);
         }
     }
-    if let Some((model, weights)) = audio {
+    if let Some((model, weights)) = model {
         use hellas_store::content::config::{Declaration, Object};
         config.lower.push(model.clone());
         anyhow::ensure!(
-            !config.pins.contains_key("config/audio-model"),
-            "config/audio-model is reserved by --audio-model"
+            !config
+                .pins
+                .keys()
+                .any(|name| name.starts_with("config/model-")),
+            "config/model-* is reserved for the model's weights"
         );
-        config.pins.insert(
-            "config/audio-model".into(),
-            Declaration::Object(Object {
-                url: None,
-                path: None,
-                bytes: Some(weights.bytes()),
-                expect: Some(weights.id().to_string()),
-                sha256: None,
-                policy: None,
-            }),
-        );
+        for (index, weights) in weights.iter().enumerate() {
+            config.pins.insert(
+                format!("config/model-{index:04}"),
+                Declaration::Object(Object {
+                    url: None,
+                    path: None,
+                    bytes: Some(weights.bytes()),
+                    expect: Some(weights.id().to_string()),
+                    sha256: None,
+                    policy: None,
+                }),
+            );
+        }
     }
     config.validate()?;
     Ok(config)
