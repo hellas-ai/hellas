@@ -14,6 +14,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 mod executor;
 pub use executor::{Executor, GrantExecution, PaidExecution};
+#[cfg(feature = "compute")]
+pub mod local;
 
 /// Format tag of a persisted grant attempt record.
 const GRANT_ATTEMPT_FORMAT: &str = "hellas.grant-attempt.v1";
@@ -51,6 +53,9 @@ pub enum ExecutionError {
     Terminal,
     #[error("delivery failed: {0}")]
     Delivery(Box<dyn std::error::Error + Send + Sync>),
+    #[cfg(feature = "compute")]
+    #[error("local execution failed: {0}")]
+    Local(String),
     #[error(transparent)]
     Stopped(#[from] RequestStopped),
     #[error(transparent)]

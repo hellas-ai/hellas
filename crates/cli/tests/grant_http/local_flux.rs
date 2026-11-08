@@ -97,7 +97,6 @@ async fn local_grant_flux_matches_reference_image_without_a_chain() {
         png,
         "HTTP image must match signed pixels"
     );
-    node.verify_result(commitment, &transcript, &output).await;
     println!(
         "verified exact Flux PNG and signed pixels: seed42, 512x512, steps4, png={}",
         hellas_rpc::ContentRef::for_bytes(&png).id()

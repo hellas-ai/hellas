@@ -123,7 +123,6 @@ pub struct ClientArgs {
 }
 
 #[derive(Debug, Args)]
-#[command(group(clap::ArgGroup::new("execution_target").required(true).multiple(true).args(["provider", "offer"])))]
 pub struct TransactArgs {
     #[command(flatten)]
     client: ClientArgs,
@@ -137,8 +136,17 @@ pub struct TransactArgs {
     target: TargetArgs,
 }
 
-/// Grant access, when the job does not run as paid work.
-#[derive(Debug, Default, Args)]
+/// Where a job runs: paid under `--provider`, granted under `--offer`, or,
+/// with local compute, on this machine.
+#[derive(Debug, Args)]
+#[cfg_attr(
+    not(feature = "compute"),
+    command(group(clap::ArgGroup::new("execution_target").required(true).multiple(true).args(["provider", "offer"])))
+)]
+#[cfg_attr(
+    feature = "compute",
+    command(group(clap::ArgGroup::new("execution_target").required(true).multiple(true).args(["provider", "offer", "local"])))
+)]
 pub(super) struct TargetArgs {
     /// Imported access bundle offer NAME.POLICY. Executes using its bound Work profile.
     #[arg(long, conflicts_with_all = ["settle", "buy_again", "validators", "addresses", "acceptance_blocks", "terminal_blocks", "payment_blocks"])]
@@ -149,15 +157,27 @@ pub(super) struct TargetArgs {
     /// Durable attempt record (default: under the client state, by offer and job).
     #[arg(long, requires = "offer", value_name = "FILE")]
     attempt: Option<PathBuf>,
+    /// Run on this machine's executor under your own limits; nothing is
+    /// paid, granted or tracked.
+    #[cfg(feature = "compute")]
+    #[arg(long, conflicts_with_all = ["offer", "provider", "settle", "buy_again", "validators", "addresses", "acceptance_blocks", "terminal_blocks", "payment_blocks", "trust_store"])]
+    local: bool,
+    #[cfg(feature = "compute")]
+    #[command(flatten)]
+    native: crate::compute::ServeArgs,
+    /// The model file or package a helper rendered its job from; local
+    /// execution reads the job's weights from it.
+    #[arg(skip)]
+    pub(super) model: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
-#[command(group(clap::ArgGroup::new("execution_target").required(true).multiple(true).args(["provider", "offer"])))]
 pub struct FetchArgs {
     url: String,
     #[command(flatten)]
     client: ClientArgs,
-    #[arg(long, required_unless_present = "offer", conflicts_with = "offer", value_parser = clap::value_parser!(u64).range(1..))]
+    /// Flat price the provider charges; paid work only.
+    #[arg(long, conflicts_with = "offer", value_parser = clap::value_parser!(u64).range(1..))]
     payment: Option<u64>,
     #[arg(long, default_value = "producer-signed", value_parser = ["producer-signed", "apple-app-attest"])]
     assurance: String,
@@ -193,7 +213,7 @@ pub struct Context {
     pub transport: iroh::SecretKey,
     pub settlement: Secp256k1Signer,
     pub producer: ProducerSigningKey,
-    pub owner: hellas_kernel::SoftPasskey,
+    owner: Option<hellas_kernel::SoftPasskey>,
     pub home: StoreLocation,
     pub chain: hellas_chain::chain_dir::ChainDir,
     /// Bound on first use; [`bounded`] closes them however the command ends,
@@ -213,14 +233,19 @@ impl Context {
             transport: identity.transport_key.clone(),
             settlement: crate::identity::settlement_signer(identity)?,
             producer: identity.node_key.clone(),
-            owner: owner
-                .context("requester requires --passkey, --faucet or --faucet-account")?
-                .clone(),
+            owner: owner.cloned(),
             home: home.clone(),
             chain: hellas_chain::chain_dir::ChainDir::open(home, chain)?,
             paid_endpoint: tokio::sync::OnceCell::new(),
             grant_endpoint: tokio::sync::OnceCell::new(),
         })
+    }
+
+    /// Paid and granted work act for an owner; local work needs none.
+    fn owner(&self) -> super::CliResult<&hellas_kernel::SoftPasskey> {
+        self.owner
+            .as_ref()
+            .context("requester requires --passkey, --faucet or --faucet-account")
     }
 
     async fn paid_endpoint(&self) -> super::CliResult<iroh::Endpoint> {
@@ -249,7 +274,7 @@ impl ClientArgs {
         context: &Context,
     ) -> super::CliResult<Arc<hellas_sdk::client_owner::ClientOwner>> {
         Ok(Arc::new(hellas_sdk::client_owner::ClientOwner::new(
-            Arc::new(context.owner.clone()),
+            Arc::new(context.owner()?.clone()),
             context.settlement.party_key(),
             &context.chain,
         )?))
@@ -440,7 +465,8 @@ async fn within<T>(
     }
 }
 
-/// Where one job runs: paid under `--provider`, or under `--offer`'s grant.
+/// Where one job runs: paid under `--provider`, under `--offer`'s grant, or
+/// on this machine.
 #[expect(clippy::large_enum_variant, reason = "one per command")]
 enum Target {
     Paid(PaidWorkOptions),
@@ -449,16 +475,37 @@ enum Target {
         policy: hellas_authority::model::grant::records::GrantPolicy,
         attempt: Option<PathBuf>,
     },
+    #[cfg(feature = "compute")]
+    Local {
+        native: Option<crate::compute::ServeArgs>,
+        model: Option<PathBuf>,
+        timeout: Duration,
+        opened: Option<(
+            hellas_store::content::DiskStore,
+            crate::content_configuration::ContentReload,
+        )>,
+    },
 }
 
 impl TargetArgs {
     async fn resolve(
-        &self,
+        self,
         client: &ClientArgs,
         context: &Context,
         price: u64,
         assurance: Assurance,
     ) -> super::CliResult<Target> {
+        #[cfg(feature = "compute")]
+        if self.local {
+            ensure!(price == 0, "local work is not paid; drop --payment");
+            return Ok(Target::Local {
+                native: Some(self.native),
+                model: self.model,
+                // Bounded by the command deadline; the evaluator needs a limit.
+                timeout: client.timeout.unwrap_or(Duration::from_secs(86_400)),
+                opened: None,
+            });
+        }
         let Some(offer) = self.offer.as_deref() else {
             ensure!(
                 price > 0,
@@ -468,7 +515,7 @@ impl TargetArgs {
                 client.options(context, price, assurance).await?,
             ));
         };
-        let principal = super::contributions::principal(&context.owner)?;
+        let principal = super::contributions::principal(context.owner()?)?;
         let holder = NodeKey::from_public_key(context.producer.public_key())?;
         let store = hellas_sdk::grant_store::GrantStore::new(super::contributions::data_root(
             &context.home,
@@ -513,7 +560,7 @@ impl TargetArgs {
                 control_timeout: Duration::from_secs(90),
             },
             policy,
-            attempt: self.attempt.clone(),
+            attempt: self.attempt,
         })
     }
 }
@@ -538,12 +585,16 @@ impl Target {
                 .invocation_policy
             }
             Target::Grant { policy, .. } => policy.invocation_policy.clone(),
+            #[cfg(feature = "compute")]
+            Target::Local { .. } => {
+                bail!("local execution runs Compute jobs; Fetch needs --provider or --offer")
+            }
         })
     }
 
     /// Open `job`'s attempt on this target. The endpoint stays the command's.
     async fn executor(
-        &self,
+        &mut self,
         client: &ClientArgs,
         context: &Context,
         job: &Job,
@@ -599,13 +650,54 @@ impl Target {
                     provider.to_string(),
                 )
             }
+            #[cfg(feature = "compute")]
+            Target::Local {
+                native,
+                model,
+                timeout,
+                opened,
+            } => {
+                let mut native = native.take().context("local target is already open")?;
+                if let (Some(model), JobInput::Compute { environment, .. }) = (model, job.input()) {
+                    native.model = Some((
+                        std::path::absolute(model)?,
+                        environment
+                            .assets
+                            .iter()
+                            .map(|asset| asset.object)
+                            .collect(),
+                    ));
+                }
+                let (execution, reload) = crate::compute::local(
+                    &context.home,
+                    native,
+                    Arc::new(context.producer.clone()),
+                )
+                .await?;
+                *opened = Some((execution.content.clone(), reload));
+                let policy = hellas_sdk::execution::local::policy(job.input(), *timeout)?;
+                (
+                    Executor::Local(execution, policy),
+                    hex::encode(context.producer.public_key().bytes()),
+                )
+            }
         })
     }
 
-    async fn close(&self) {
-        if let Target::Paid(options) = self {
-            options.content.close().await;
+    async fn close(self) -> super::CliResult<()> {
+        match self {
+            Target::Paid(options) => options.content.close().await,
+            Target::Grant { .. } => {}
+            #[cfg(feature = "compute")]
+            Target::Local { opened, .. } => {
+                if let Some((content, reload)) = opened {
+                    let stopped = reload.shutdown().await;
+                    content.close().await;
+                    stopped?;
+                }
+            }
         }
+        Ok(())
     }
 }
 
@@ -632,21 +724,29 @@ fn select_policy(
 /// executor, keep the signed evidence in `evidence`, then present it.
 async fn run_job(
     client: &ClientArgs,
-    target: &TargetArgs,
+    target: TargetArgs,
     context: &Context,
     job: &Job,
     evidence: Option<&Path>,
     present: impl FnOnce(&Completed, &str) -> super::CliResult<()> + Send,
 ) -> super::CliResult<()> {
     bounded(context, client.timeout, async |deadline| {
-        let target = within(
+        let mut target = within(
             deadline,
             target.resolve(client, context, job.price(), job.assurance()),
         )
         .await?;
-        let result = execute(client, context, &target, job, deadline, evidence, present).await;
-        target.close().await;
-        result
+        let result = execute(
+            client,
+            context,
+            &mut target,
+            job,
+            deadline,
+            evidence,
+            present,
+        )
+        .await;
+        result.and(target.close().await)
     })
     .await
 }
@@ -654,7 +754,7 @@ async fn run_job(
 async fn execute(
     client: &ClientArgs,
     context: &Context,
-    target: &Target,
+    target: &mut Target,
     job: &Job,
     deadline: Option<tokio::time::Instant>,
     evidence: Option<&Path>,
@@ -706,7 +806,7 @@ pub async fn run(args: TransactArgs, context: Context) -> super::CliResult<()> {
     let job = Job::load(job).await?;
     run_job(
         &args.client,
-        &args.target,
+        args.target,
         &context,
         &job,
         args.output.as_deref(),
@@ -734,11 +834,12 @@ pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
     let mut request = args.request()?;
     let contract = args.contract()?;
     let payment = args.payment.unwrap_or(0);
+    let assurance = args.assurance();
+    let target = args.target;
     bounded(&context, args.client.timeout, async |deadline| {
-        let target = within(
+        let mut target = within(
             deadline,
-            args.target
-                .resolve(&args.client, &context, payment, args.assurance()),
+            target.resolve(&args.client, &context, payment, assurance),
         )
         .await?;
         let result = async {
@@ -775,7 +876,7 @@ pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
                 service,
                 method,
                 serde_json::to_vec(&request)?,
-                args.assurance(),
+                assurance,
             )?;
             let directory = args.save_job.clone().unwrap_or_else(|| {
                 args.client
@@ -788,7 +889,7 @@ pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
             execute(
                 &args.client,
                 &context,
-                &target,
+                &mut target,
                 &job,
                 deadline,
                 None,
@@ -808,8 +909,7 @@ pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
             .await
         }
         .await;
-        target.close().await;
-        result
+        result.and(target.close().await)
     })
     .await
 }

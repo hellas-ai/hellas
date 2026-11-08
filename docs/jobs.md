@@ -18,13 +18,25 @@ grant job. The offer's signed first policy selects the resource, and its
 the same offer and job returns its retained result without executing again. An unresolved attempt
 reports its recorded status instead of submitting new work. A new attempt
 path (`--attempt FILE`) is an explicit request to execute again and consume the allowance.
-`run`, `image` and `transcribe` accept `--offer NAME.POLICY` as the exclusive
-alternative to `--payment`; they save a zero-price job and use this same route.
+`run`, `image`, `transcribe` and `fetch` accept `--offer NAME.POLICY`
+as the exclusive alternative to `--payment`; they save a zero-price job and use
+this same route.
 Grant channel journals share the imported offers' data directory with the
 gateway under `<home>/grants`; paid execution lives under `<home>/chains/<full consensus digest>/`.
 Grant Compute uses ephemeral provider retention for job payloads. Compiled
 programs are cached independently of payload retention. A signed failed result
 makes the command fail on both first delivery and saved-result replay.
+
+With the compute-enabled package (the NixOS module and the CUDA/HIP images;
+the portable release has no local compute), every Compute command also accepts
+`--local`: the job runs on this machine's executor under your own limits, with
+no chain, channel, grant or attempt record. A helper reads the model's weights
+from its `--model` file or directory; `run` and `transact --job` read assets
+through `--content-config`. `--timeout` bounds it like any other job.
+
+```sh
+hellas transcribe --model ./whisper-tiny --audio speech.wav --local
+```
 
 `hellas transact --job DIR` executes a caller-owned job folder for any
 application. `hellas run` (one call of a Catena program) and `hellas fetch`

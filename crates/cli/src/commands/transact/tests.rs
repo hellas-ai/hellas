@@ -612,6 +612,7 @@ fn execution_helpers_choose_payment_or_an_imported_offer() {
         vec!["run", "--source", "program.hex", "--entry", "main"],
         vec!["image", "--model", "model", "--prompt", "fox"],
         vec!["transcribe", "--model", "model", "--audio", "speech.wav"],
+        vec!["fetch", "https://example.test", "--contract", "http"],
     ] {
         let mut base = vec!["hellas"];
         base.extend(helper);
@@ -626,6 +627,10 @@ fn execution_helpers_choose_payment_or_an_imported_offer() {
         assert!(parse(&["--offer", "box.model", "--provider", &provider]).is_ok());
         assert!(parse(&["--payment", "20", "--offer", "box.model"]).is_err());
         assert!(parse(&["--offer", "box.model", "--buy-again"]).is_err());
+        // Local execution exists only in the compute build.
+        assert_eq!(parse(&["--local"]).is_ok(), cfg!(feature = "compute"));
+        assert!(parse(&["--local", "--offer", "box.model"]).is_err());
+        assert!(parse(&["--local", "--provider", &provider]).is_err());
     }
 }
 

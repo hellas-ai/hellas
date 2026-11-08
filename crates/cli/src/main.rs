@@ -51,14 +51,10 @@ fn load_command_identity(
         Commands::Admin(_)
             | Commands::Store(_)
             | Commands::Gateway { offer: Some(_), .. }
-            | Commands::Gateway {
-                local_grant: Some(_),
-                ..
-            }
             | Commands::Offer {
                 command: commands::contributions::OfferCommand::ImportBundle { .. },
             }
-    );
+    ) || local_gateway(command);
     let read_only = grant_identity
         || matches!(
             command,
@@ -294,15 +290,16 @@ enum Commands {
         /// Content store, and with --local-grant the local GPU executor.
         #[command(flatten)]
         native: compute::ServeArgs,
-        /// Run this node's own, already configured allowance in process: no
-        /// chain and no remote provider.
+        /// Run this node's own, already configured allowance's policies on
+        /// this machine: no chain, no remote provider and no ledger.
+        #[cfg(feature = "compute")]
         #[arg(long, value_name = "ID", conflicts_with_all = ["offer", "paid_work_config", "grant_pool_config"])]
         local_grant: Option<String>,
         /// Use a private Offer previously verified by `offer import`.
         #[arg(long, value_name = "ALIAS", conflicts_with_all = ["paid_work_config", "grant_pool_config"])]
         offer: Option<String>,
         /// Use an explicit list of private grant channels and resources.
-        #[arg(long, value_name = "FILE", conflicts_with_all = ["offer", "local_grant", "paid_work_config", "grant_policy", "work_profile", "http_fetch_config", "trust_policy"])]
+        #[arg(long, value_name = "FILE", conflicts_with_all = ["offer", "paid_work_config", "grant_policy", "work_profile", "http_fetch_config", "trust_policy"])]
         grant_pool_config: Option<PathBuf>,
         /// Check grant pool aliases, trust and saved terms without connecting.
         #[arg(long, requires = "grant_pool_config")]
@@ -388,7 +385,7 @@ enum Commands {
         #[arg(long, value_name = "DIR")]
         output: PathBuf,
     },
-    /// Transcribe one WAV with a client-rendered Whisper job on a paid provider.
+    /// Transcribe one WAV with a client-rendered Whisper job.
     Transcribe(commands::transact::TranscribeArgs),
     /// Convert a local distilled Flux2 Klein 4B snapshot into client metadata and provider assets.
     ConvertFlux {
@@ -397,7 +394,7 @@ enum Commands {
         #[arg(short = 'o', long)]
         output: PathBuf,
     },
-    /// Generate one PNG with a client-rendered Flux job on a paid provider.
+    /// Generate one PNG with a client-rendered Flux job.
     Image(commands::transact::ImageArgs),
     /// Inspect and manage node content with Owner authority.
     Store(commands::store::StoreArgs),
@@ -463,10 +460,6 @@ fn validate_identity_options(command: &Commands, software_root: bool) -> Result<
                 grant_pool_config: Some(_),
                 ..
             }
-            | Commands::Gateway {
-                local_grant: Some(_),
-                ..
-            }
             | Commands::Offer {
                 command: commands::contributions::OfferCommand::ImportBundle { .. },
             }
@@ -477,7 +470,7 @@ fn validate_identity_options(command: &Commands, software_root: bool) -> Result<
                     | IdentityCommand::ShowHolder
                     | IdentityCommand::ExportEnrollment { .. },
             }
-    );
+    ) || local_gateway(command);
     if software_root && reads_existing_identity {
         return Err(
             "--software-root only selects the root when creating an identity; this command reads an existing identity"
@@ -487,11 +480,29 @@ fn validate_identity_options(command: &Commands, software_root: bool) -> Result<
     Ok(())
 }
 
+/// `gateway --local-grant`, which exists only with local compute.
+fn local_gateway(command: &Commands) -> bool {
+    #[cfg(feature = "compute")]
+    return matches!(
+        command,
+        Commands::Gateway {
+            local_grant: Some(_),
+            ..
+        }
+    );
+    #[cfg(not(feature = "compute"))]
+    return {
+        let _ = command;
+        false
+    };
+}
+
 fn main() {
     // SafeRuntime launches the current executable as a worker child. This
     // must run before Tokio creates worker threads and before clap, tracing,
     // or any stdout-producing command so the child speaks only Catena's worker
     // protocol on stdout.
+    #[cfg(feature = "compute")]
     match hellas_executor::child_main() {
         Ok(true) => return,
         Ok(false) => {}
@@ -894,7 +905,7 @@ async fn async_main() {
                             )?;
                             let (grants, weights) =
                                 commands::serve::audio_model::configure(model, &home).await?;
-                            native.audio_content = Some((std::path::absolute(model)?, weights));
+                            native.model = Some((std::path::absolute(model)?, vec![weights]));
                             Some(grants)
                         } else {
                             None
@@ -965,6 +976,7 @@ async fn async_main() {
             audio_model,
             image_model,
             native,
+            #[cfg(feature = "compute")]
             local_grant,
             offer,
             grant_pool_config,
@@ -1031,8 +1043,35 @@ async fn async_main() {
                     .clone()
                     .ok_or_else(|| anyhow::anyhow!("--work-profile is required for grant Work"))
             };
-            let mut local_content = None;
-            let mut local_service = None;
+            #[cfg(feature = "compute")]
+            let local = match local_grant.as_deref() {
+                Some(grant) => {
+                    anyhow::ensure!(
+                        assurance == hellas_rpc::Assurance::ProducerSigned,
+                        "local Work requires producer-signed assurance"
+                    );
+                    Some(
+                        commands::grant_gateway::Local::open(
+                            &home,
+                            grant,
+                            grant_policy.as_deref(),
+                            native,
+                            &local_identity,
+                        )
+                        .await?,
+                    )
+                }
+                None => None,
+            };
+            #[cfg(feature = "compute")]
+            let local_work = local.as_ref().map(commands::grant_gateway::Local::work);
+            #[cfg(not(feature = "compute"))]
+            let local_work: Option<
+                std::sync::Arc<dyn hellas_gateway::WorkExecutionBackend>,
+            > = {
+                let _ = native;
+                None
+            };
             let grant_source = if let Some(name) = offer.as_deref() {
                 let client = commands::contributions::require_principal(passkey)?;
                 let offer = commands::contributions::load_offer(&home, &client, name)?;
@@ -1060,32 +1099,11 @@ async fn async_main() {
                         endpoint
                     }),
                 ))
-            } else if let Some(grant) = local_grant.as_deref() {
-                anyhow::ensure!(
-                    assurance == hellas_rpc::Assurance::ProducerSigned,
-                    "local Work requires producer-signed assurance"
-                );
-                let ((session, service), reload) = commands::grant_gateway::local::prepare(
-                    &home,
-                    grant,
-                    native,
-                    &local_identity,
-                    commands::contributions::require_principal(passkey)?,
-                    work_application()?,
-                    remote_trust.load(&home)?,
-                )
-                .await?;
-                local_content = Some(reload);
-                local_service = Some(service.clone());
-                Some((
-                    session,
-                    hellas_sdk::grant_client::GrantTransport::Local(service),
-                ))
             } else {
                 None
             };
             anyhow::ensure!(
-                grant_policy.is_none() || grant_source.is_some(),
+                grant_policy.is_none() || grant_source.is_some() || local_work.is_some(),
                 "--grant-policy requires a remote or local allowance"
             );
             let hellas_sdk::node_control::profile::GatewayHost {
@@ -1237,6 +1255,8 @@ async fn async_main() {
                 )
                 .await?;
                 hellas_sdk::serve_gateway(paid, serve).await?
+            } else if let Some(work) = local_work {
+                hellas_sdk::serve_gateway(work, serve).await?
             } else {
                 anyhow::bail!(
                     "the gateway needs a work source: --local-grant, --offer or --paid-work-config"
@@ -1252,16 +1272,11 @@ async fn async_main() {
                 Some(control) => served.and(control.shutdown().await.map_err(anyhow::Error::from)),
                 None => served,
             };
-            // The gateway's session only drained the local service it borrowed.
-            let stopped = match local_service {
-                Some(service) => stopped.and(service.shutdown().await.map_err(anyhow::Error::from)),
+            // The local content store outlives the gateway that reads it.
+            #[cfg(feature = "compute")]
+            let stopped = match local {
+                Some(local) => stopped.and(local.shutdown().await),
                 None => stopped,
-            };
-            // The local content store outlives the service that reads it.
-            let stopped = if let Some(content) = local_content {
-                stopped.and(content.shutdown().await)
-            } else {
-                stopped
             };
             node.close().await;
             stopped

@@ -73,7 +73,7 @@ pub(super) async fn settle(args: &ClientArgs, context: &Context) -> CliResult<()
         return Ok(());
     }
     let owner = hellas_auth::authority::PrincipalId::from_public_key(
-        hellas_auth::PublicKey::P256(context.owner.party_key().to_bytes()),
+        hellas_auth::PublicKey::P256(context.owner()?.party_key().to_bytes()),
     )?;
     let channels = retained_settlement_channels(
         &journals,

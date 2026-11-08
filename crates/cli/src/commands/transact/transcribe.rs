@@ -2,7 +2,6 @@ use super::*;
 use hellas_client::model::{ModelPackage, ModelRequest, ModelResponse, wav};
 
 #[derive(Debug, Args)]
-#[command(group(clap::ArgGroup::new("execution_target").required(true).multiple(true).args(["provider", "offer"])))]
 pub struct TranscribeArgs {
     #[command(flatten)]
     client: ClientArgs,
@@ -15,7 +14,8 @@ pub struct TranscribeArgs {
     language: Option<String>,
     #[arg(long, default_value_t = 256)]
     max_tokens: usize,
-    #[arg(long, required_unless_present = "offer", conflicts_with = "offer", value_parser = clap::value_parser!(u64).range(1..))]
+    /// Flat price the provider charges per job; paid work only.
+    #[arg(long, conflicts_with = "offer", value_parser = clap::value_parser!(u64).range(1..))]
     payment: Option<u64>,
     #[command(flatten)]
     target: TargetArgs,
@@ -52,9 +52,11 @@ pub async fn transcribe(args: TranscribeArgs, context: Context) -> super::super:
         .join(job.digest().to_string());
     job.save(&directory).await?;
     eprintln!("job: {}", directory.display());
+    let mut target = args.target;
+    target.model = Some(args.model.clone());
     run_job(
         &args.client,
-        &args.target,
+        target,
         &context,
         &job,
         args.output.as_deref(),

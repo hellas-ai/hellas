@@ -15,7 +15,6 @@ use std::path::PathBuf;
 const BYTES_FORMAT: &str = "catena.bytes.v1";
 
 #[derive(Debug, Args)]
-#[command(group(clap::ArgGroup::new("execution_target").required(true).multiple(true).args(["provider", "offer"])))]
 pub struct RunArgs {
     #[command(flatten)]
     pub(super) client: ClientArgs,
@@ -34,8 +33,8 @@ pub struct RunArgs {
     /// Kind of each returned value, in order: bool, u16, u32, u64, f32 or buffer:MAX_BYTES.
     #[arg(long = "returns", value_name = "KIND", value_parser = parse_returns)]
     returns: Vec<OutputKind>,
-    /// Flat price the provider charges per job.
-    #[arg(long, required_unless_present = "offer", conflicts_with = "offer", value_parser = clap::value_parser!(u64).range(1..))]
+    /// Flat price the provider charges per job; paid work only.
+    #[arg(long, conflicts_with = "offer", value_parser = clap::value_parser!(u64).range(1..))]
     payment: Option<u64>,
     #[command(flatten)]
     target: super::TargetArgs,

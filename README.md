@@ -252,10 +252,11 @@ For upstream APIs, [HTTP Fetch routes](docs/http-gateway.md) preserve the vendor
 request, response and streaming formats. CLI gateways archive payloads by default;
 `--zdr` or `x-hellas-zdr: true` disables application payload persistence.
 
-`--text-model` also runs without a chain: `--local-grant ID` serves this
-node's own configured allowance in process (with the `serve` content and GPU
-flags), and `--offer ALIAS` reaches an allowance on another node you own. Such
-memory-only jobs read weights the provider already holds; they never write them.
+`--text-model` also runs without a chain: with the compute-enabled package,
+`--local-grant ID` runs this node's own configured allowance's policies on its
+executor (with the `serve` content and GPU flags; no ledger), and `--offer
+ALIAS` reaches an allowance on another node you own. Such memory-only jobs read
+weights the provider already holds; they never write them.
 
 `--text-model FILE.gguf` serves a dense Qwen3 GGUF on the text routes. The
 gateway renders each request as a Compute job from the GGUF's configuration

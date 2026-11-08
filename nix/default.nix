@@ -189,13 +189,16 @@ let
       cli = lib.makeOverridable (
         {
           otel ? false,
+          # Local Catena Compute (the executor runtime, --local, serving
+          # Compute). Off for the portable release; node packages enable it.
+          compute ? false,
         }:
         pkgSpec.mkHellasPackage (
           pkgSpec.revEnv
           // {
             buildNoDefaultFeatures = true;
             # Client, gateway and daemon share one native composition.
-            buildFeatures = lib.optional otel "otel";
+            buildFeatures = lib.optional otel "otel" ++ lib.optional compute "compute";
           }
         )
       ) { };
@@ -295,13 +298,13 @@ let
       };
       dockerCuda = import ./docker.nix {
         inherit pkgs rustToolchain;
-        inherit (nativePackages) cli;
+        cli = nativePackages.cli.override { compute = true; };
         backend = "cuda";
         revision = self.rev or self.dirtyRev or "unknown";
       };
       dockerHip = import ./docker.nix {
         inherit pkgs rustToolchain;
-        inherit (nativePackages) cli;
+        cli = nativePackages.cli.override { compute = true; };
         backend = "hip";
         revision = self.rev or self.dirtyRev or "unknown";
       };
@@ -309,7 +312,8 @@ let
       nixosTests = lib.optionalAttrs isX86_64Linux (
         import ./tests {
           inherit self pkgs lib;
-          package = nativePackages.cli;
+          package = nativePackages.cli.override { compute = true; };
+          portablePackage = nativePackages.cli;
           validatorPackage = nativePackages.cli-validator;
         }
       );

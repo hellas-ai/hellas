@@ -143,7 +143,7 @@ let
   );
 
   # Feature set that clippy and the regression suite build with.
-  integrationFeatures = "integration-tests,hellas-chain/indexer-api";
+  integrationFeatures = "integration-tests,hellas-chain/indexer-api,hellas-cli/compute";
   # Shared with the `check-clippy` app in ci.nix.
   clippyArgs = "--workspace --all-targets --features ${integrationFeatures} -- -D warnings -W clippy::large_futures -W clippy::large_stack_frames";
 
@@ -161,8 +161,10 @@ let
     {
       workspace = "--workspace --features ${integrationFeatures}";
       cli = "-p hellas-cli";
-      cli-integration = "-p hellas-cli --features integration-tests";
-      cli-otel-integration = "-p hellas-cli --features otel,integration-tests";
+      cli-compute = "-p hellas-cli --features compute";
+      # Command tests serve and run Compute through the CLI binary.
+      cli-integration = "-p hellas-cli --features compute,integration-tests";
+      cli-otel-integration = "-p hellas-cli --features compute,otel,integration-tests";
       cli-only-integration = cliOnly "integration-tests";
       cli-only-indexer = cliOnly "indexer";
       cli-only-otel = cliOnly "otel";
@@ -175,7 +177,8 @@ let
       channel-authority = "-p hellas-channel -p hellas-authority";
       sdk-integration = "-p hellas-sdk --features integration-tests";
       sdk-all = "-p hellas-sdk --all-features";
-      executor = "-p hellas-executor";
+      executor = "-p hellas-executor --features compute";
+      executor-fetch = "-p hellas-executor";
       kernel = "-p hellas-kernel --all-features";
       chain-client-core = chain "client-core";
       chain-proof-verify = chain "proof-verify";

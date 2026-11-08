@@ -12,6 +12,12 @@ use hellas_auth::ProducerSigningKey;
 pub enum Executor {
     Paid(PaidExecution),
     Grant(GrantExecution),
+    /// This machine, under the caller's own policy; nothing is tracked.
+    #[cfg(feature = "compute")]
+    Local(
+        super::local::LocalExecution,
+        hellas_rpc::protocol::invocation::InvocationPolicy,
+    ),
 }
 
 pub struct PaidExecution {
@@ -48,6 +54,21 @@ impl Executor {
         match self {
             Self::Paid(target) => target.run(job, signer, deadline, stop, deliver).await,
             Self::Grant(target) => target.run(job, deadline, stop, deliver).await,
+            #[cfg(feature = "compute")]
+            Self::Local(target, policy) => {
+                let completed = target
+                    .run(
+                        job.input(),
+                        &policy,
+                        signer,
+                        deadline,
+                        &stop,
+                        Default::default(),
+                    )
+                    .await?;
+                deliver(&completed).map_err(ExecutionError::Delivery)?;
+                Ok(completed)
+            }
         }
     }
 }

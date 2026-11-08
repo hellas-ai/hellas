@@ -1,6 +1,7 @@
 {
   pkgs,
   package,
+  portablePackage,
 }:
 {
   basic =
@@ -31,7 +32,13 @@
         ${package}/bin/hellas serve --help | grep -F -- "--gpu-session-programs"
         ${package}/bin/hellas serve --help | grep -F -- "--gpu-session-asset-bytes"
         ${package}/bin/hellas serve --help | grep -F -- "--paid-work-config"
-        ! ${package}/bin/hellas serve --help | grep -F -- "--gfx"
+        if ${package}/bin/hellas serve --help | grep -F -- "--gfx"; then exit 1; fi
+        ${package}/bin/hellas transcribe --help | grep -F -- "--local"
+        # The portable CLI has no local compute: no --local, no GPU runtime.
+        for command in transcribe image run transact fetch; do
+          if ${portablePackage}/bin/hellas "$command" --help | grep -F -- "--local"; then exit 1; fi
+        done
+        if ${portablePackage}/bin/hellas serve --help | grep -F -- "--gpu-backend"; then exit 1; fi
         ${package}/bin/hellas identity --help | grep -F -- "show-enrollment-id"
 
         ${package}/bin/hellas --home "$TMPDIR/hellas-home" --software-root \

@@ -9,14 +9,23 @@ documentation.workspace = true
 
 [features]
 otel = ["hellas-rpc/otel", "dep:opentelemetry", "dep:tracing-opentelemetry"]
+# Catena Compute and its native runtime loading. Without it, Fetch only.
+compute = [
+    "dep:bincode",
+    "dep:catena-lang",
+    "dep:libloading",
+    "dep:metacat",
+    "dep:sha2",
+    "dep:tempfile",
+]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dependencies]
 async-trait = "0.1"
-bincode = "1.3"
-catena-lang.workspace = true
+bincode = { version = "1.3", optional = true }
+catena-lang = { workspace = true, optional = true }
 futures-core = { workspace = true }
 futures-util = "0.3"
 hellas-auth.workspace = true
@@ -26,15 +35,15 @@ hellas-private.workspace = true
 hellas-rpc = { workspace = true, features = ["execute", "fetch", "work"] }
 hellas-store.workspace = true
 hellas-wire = { workspace = true }
-libloading = "0.9"
-metacat = "0.3"
+libloading = { version = "0.9", optional = true }
+metacat = { version = "0.3", optional = true }
 opentelemetry = { workspace = true, optional = true }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_ipld_dagcbor.workspace = true
 serde_json = { workspace = true }
-sha2.workspace = true
-tempfile.workspace = true
+sha2 = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
@@ -45,6 +54,7 @@ zeroize = "1"
 
 [dev-dependencies]
 ctor = "1"
+tempfile.workspace = true
 hellas-channel = { workspace = true, features = ["test-support"] }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["test-util"] }
