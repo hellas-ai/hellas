@@ -64,7 +64,8 @@ async fn main() {
     let _: [u8; 32] = decoder.fixed_bytes("root key").unwrap();
     let signer =
         ProducerSigningKey::from_secret_bytes(decoder.fixed_bytes("node key").unwrap()).unwrap();
-    let journal = hellas_sdk::grant_config::GrantConfig::journal_dir(&home);
+    let journal =
+        hellas_sdk::grant_config::GrantConfig::journal_dir(&StoreLocation::for_test(&home));
     let now = UnixMillis::now().unwrap();
     let (store, admin) = common_node::bootstrap_node_with_credential(
         &journal,
