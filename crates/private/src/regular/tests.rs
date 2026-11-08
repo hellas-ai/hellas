@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 /// Bound for a hung wait, not a performance requirement: CI runs many suites at
 /// once on shared machines, and the property never depends on how fast that is.
+#[cfg(target_os = "linux")]
 const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// The Linux primitive is the contract, not merely an implementation
