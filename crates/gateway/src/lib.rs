@@ -508,11 +508,6 @@ fn finish_cleanup<T>(
     }
 }
 
-/// CLI lifecycle wrapper around [`start`].
-pub async fn run(options: GatewayOptions) -> crate::GatewayResult<()> {
-    wait_for_shutdown(start(options).await?).await
-}
-
 /// Wait for a process signal or wrapped child, then join every gateway listener.
 pub async fn wait_for_shutdown(mut handle: GatewayHandle) -> crate::GatewayResult<()> {
     tokio::select! {
