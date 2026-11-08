@@ -66,6 +66,16 @@ pub struct OwnerPageProof {
     pub after_path: Option<OwnerPathProof>,
 }
 
+impl OwnerPageProof {
+    /// The owner's summary leaf; an owner with no holdings has none.
+    pub fn summary(&self) -> OwnerCommitment {
+        match self.summary.leaf {
+            Some(OwnerLeaf::Summary(summary)) => summary,
+            _ => OwnerCommitment::default(),
+        }
+    }
+}
+
 #[cfg(feature = "proof-verify")]
 impl OwnerPageProof {
     pub(crate) fn into_proto(self) -> hellas_rpc::pb::chain::OwnerPageProof {
@@ -180,7 +190,7 @@ impl OwnerPathProof {
 
 #[cfg(feature = "proof-verify")]
 impl OwnerCommitment {
-    fn into_proto(self) -> hellas_rpc::pb::chain::OwnerCommitment {
+    pub(crate) fn into_proto(self) -> hellas_rpc::pb::chain::OwnerCommitment {
         hellas_rpc::pb::chain::OwnerCommitment {
             hash: self.hash.to_vec(),
             count: self.count,

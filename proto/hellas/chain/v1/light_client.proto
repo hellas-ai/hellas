@@ -39,6 +39,8 @@ service LightClient {
   rpc GetValidators(GetValidatorsRequest) returns (GetValidatorsResponse);
   rpc GetRelayInfo(GetRelayInfoRequest) returns (GetRelayInfoResponse);
   rpc GetConsensusInfo(GetConsensusInfoRequest) returns (GetConsensusInfoResponse);
+  // GetObjectProofs without the proofs, for a peer the caller trusts.
+  rpc GetObjects(GetObjectProofsRequest) returns (GetObjectsResponse);
 }
 
 message GetObjectProofsRequest {
@@ -60,6 +62,26 @@ message GetObjectProofsResponse {
   FinalizedBlock block = 1;
   repeated ObjectProof proofs = 2;
   OwnerPageProof owner_page = 3;
+}
+
+// What GetObjectProofsResponse proves, without the proofs: `snapshot` is
+// `block.snapshot`, `objects` are the `proofs` without their `proof`, and
+// `owner_page` is the summary leaf, offset and holding keys of `owner_page`.
+message GetObjectsResponse {
+  FinalizedSnapshot snapshot = 1;
+  repeated ObjectEntry objects = 2;
+  OwnerPage owner_page = 3;
+}
+
+message ObjectEntry {
+  bytes object_id = 1;
+  optional bytes object = 2;
+}
+
+message OwnerPage {
+  OwnerCommitment summary = 1;
+  uint64 offset = 2;
+  repeated bytes holdings = 3;
 }
 
 message OwnerCommitment {

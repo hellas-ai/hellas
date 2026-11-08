@@ -282,6 +282,16 @@ where
             .map_err(WireStatus::from)
     }
 
+    async fn get_objects(
+        &self,
+        request: pb::GetObjectProofsRequest,
+    ) -> Result<pb::GetObjectsResponse, WireStatus> {
+        self.client
+            .get_plain_objects(request)
+            .await
+            .map_err(WireStatus::from)
+    }
+
     async fn subscribe_finalized(
         &self,
         _request: pb::GetLatestBlockRequest,
@@ -641,7 +651,7 @@ pub(crate) fn finalized_block_to_proto(block: FinalizedBlock) -> ProtoFinalizedB
     }
 }
 
-fn latest_block_to_proto(latest: LatestBlock) -> FinalizedSnapshot {
+pub(crate) fn latest_block_to_proto(latest: LatestBlock) -> FinalizedSnapshot {
     FinalizedSnapshot {
         height: latest.height,
         payload: latest.payload.to_vec(),

@@ -1565,13 +1565,22 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         .await
         .unwrap();
     devnet.seal().await;
-    let tip = chain.get_latest_block().await.unwrap().unwrap();
-    for (index, id) in &alternate_coins {
-        let coin = chain
-            .get_coin(tip.payload, id.to_bytes().into())
+    let coin_at = async |id: CoinId| {
+        let key = hellas_chain::domain::coin_object_id(id);
+        match chain
+            .get_objects(vec![key])
             .await
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .objects
+            .get(&key)
+        {
+            Some(hellas_chain::domain::Object::Coin(coin)) => *coin,
+            other => panic!("expected a live coin, found {other:?}"),
+        }
+    };
+    for (index, id) in &alternate_coins {
+        let coin = coin_at(*id).await;
         let delegate = if *index == 1 {
             keys[2].party_key()
         } else {
@@ -1581,11 +1590,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         assert_eq!(coin.delegate.map(|key| key.into_kernel()), Some(delegate));
         assert_eq!(coin.value, FUNDING);
     }
-    let short = chain
-        .get_coin(tip.payload, short_coin.to_bytes().into())
-        .await
-        .unwrap()
-        .unwrap();
+    let short = coin_at(short_coin).await;
     assert_eq!(short.owner.into_kernel(), owners[1].key().into_kernel());
     assert_eq!(
         short.delegate.map(|key| key.into_kernel()),
@@ -1701,13 +1706,14 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         .unwrap(),
         OfferRefusalCode::NeedsFunding,
     );
+    let delegate = keys[0].party_key().into();
     let stake = devnet
         .light_client(0)
-        .get_coins_by_delegate(keys[0].party_key().into())
+        .get_holdings(delegate, None)
         .await
         .unwrap()
         .unwrap()
-        .coins[0]
+        .delegated_coins(delegate)[0]
         .0;
     refused(
         request(

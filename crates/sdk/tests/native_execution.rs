@@ -602,12 +602,18 @@ async fn wait_for_holdings(
         let chain = node.wait_ready().await.unwrap().client();
         loop {
             finalized.borrow_and_update();
-            match chain.get_coins_by_owner(owner).await {
+            match chain.get_holdings(owner, None).await {
                 Ok(Some(listing)) => {
+                    assert!(
+                        listing
+                            .holdings
+                            .as_ref()
+                            .is_some_and(|page| page.next.is_none())
+                    );
                     let coins: Vec<_> = listing
-                        .coins
+                        .owned_coins(owner)
                         .into_iter()
-                        .map(|(id, value)| (CoinId::from_bytes(id.0), value))
+                        .map(|(id, coin)| (CoinId::from_bytes(id.0), coin.value))
                         .collect();
                     if ready(&coins) {
                         break;

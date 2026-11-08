@@ -1,6 +1,6 @@
 use super::*;
-use crate::domain::{Coin, ObjectId, SettlementKey};
-use crate::{CoinListing, EdgeLookup, Mempool, OwnerEdges, light_client::QueryError};
+use crate::domain::ObjectId;
+use crate::{Mempool, light_client::QueryError};
 use bytes::Bytes;
 use hellas_channel::test_support::HANG_GUARD;
 use hellas_kernel::test_support::valid_open_tx;
@@ -51,22 +51,6 @@ impl LightClientApi for MempoolClient {
         panic!("unused test method")
     }
 
-    async fn get_coin(
-        &self,
-        _payload: Digest,
-        _object_id: ObjectId,
-    ) -> Result<Option<Coin>, QueryError> {
-        panic!("unused test method")
-    }
-
-    async fn get_edge(
-        &self,
-        _payload: Digest,
-        _object_id: ObjectId,
-    ) -> Result<Option<EdgeLookup>, QueryError> {
-        panic!("unused test method")
-    }
-
     async fn get_finalization(&self, _payload: Digest) -> Result<Option<Vec<u8>>, QueryError> {
         panic!("unused test method")
     }
@@ -112,27 +96,6 @@ impl LightClientApi for MempoolClient {
     }
 
     async fn get_consensus_info(&self) -> Result<ConsensusInfo, QueryError> {
-        panic!("unused test method")
-    }
-
-    async fn get_coins_by_owner(
-        &self,
-        _owner: SettlementKey,
-    ) -> Result<Option<CoinListing>, QueryError> {
-        panic!("unused test method")
-    }
-
-    async fn get_coins_by_delegate(
-        &self,
-        _delegate: SettlementKey,
-    ) -> Result<Option<CoinListing>, QueryError> {
-        panic!("unused test method")
-    }
-
-    async fn get_edges_by_owner(
-        &self,
-        _owner: SettlementKey,
-    ) -> Result<Option<OwnerEdges>, QueryError> {
         panic!("unused test method")
     }
 }

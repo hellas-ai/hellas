@@ -372,13 +372,14 @@ fn full_nodes_exchange_executed_state_without_a_validator() {
         let view = b.wait_ready().await.unwrap();
         let coins = view
             .client()
-            .get_coins_by_owner(fixture.allocations[0].0)
+            .get_holdings(fixture.allocations[0].0, None)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(coins.coins.len(), 1);
-        assert_eq!(coins.coins[0].1, 5000);
-        assert_eq!(coins.snapshot.payload, block2.snapshot.payload);
+        let owned = coins.owned_coins(fixture.allocations[0].0);
+        assert_eq!(owned.len(), 1);
+        assert_eq!(owned[0].1.value, 5000);
+        assert_eq!(coins.block.payload, block2.snapshot.payload);
         b.finalized()
             .wait_for(|state| {
                 matches!(state, NodeState::Halted { .. }) || state.executed_height() >= 2
@@ -541,12 +542,12 @@ fn pruned_archive_restarts_with_live_owner_state() {
             .view()
             .unwrap()
             .client()
-            .get_coins_by_owner(fixture.allocations[0].0)
+            .get_holdings(fixture.allocations[0].0, None)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(coins.coins[0].1, 5000);
-        assert_eq!(coins.snapshot.payload, last.snapshot.payload);
+        assert_eq!(coins.owned_coins(fixture.allocations[0].0)[0].1.value, 5000);
+        assert_eq!(coins.block.payload, last.snapshot.payload);
         apply(&node, fixture.next().await).await.unwrap();
         assert_eq!(node.status().executed_height(), 261);
         node.shutdown().await.unwrap();
@@ -781,12 +782,12 @@ fn indexed_node_publishes_from_its_execution_database_and_reopens_pruned_state()
             .view()
             .unwrap()
             .client()
-            .get_coins_by_owner(owner)
+            .get_holdings(owner, None)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(coins.snapshot.payload, proof.block().view().payload());
-        assert_eq!(coins.coins.len(), 1);
+        assert_eq!(coins.block.payload, proof.block().view().payload());
+        assert_eq!(coins.owned_coins(owner).len(), 1);
         assert!(!archived(&node, 1).await);
         node.shutdown().await.unwrap();
         let node = FullNode::start_indexed(fixture.config.clone(), "read".into())
@@ -1177,13 +1178,17 @@ fn full_node_and_validator_execution_roles_share_the_same_directory() {
                     config.info().unwrap(),
                 );
                 assert_eq!(
-                    client
-                        .get_coins_by_owner(genesis_allocations(config.genesis()).unwrap()[0].0)
-                        .await
-                        .unwrap()
-                        .unwrap()
-                        .coins[0]
-                        .1,
+                    {
+                        let owner = genesis_allocations(config.genesis()).unwrap()[0].0;
+                        client
+                            .get_holdings(owner, None)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .owned_coins(owner)[0]
+                            .1
+                            .value
+                    },
                     5000
                 );
                 let block = HellasBlock::decode(next.block.as_slice()).unwrap();

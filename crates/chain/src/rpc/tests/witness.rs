@@ -20,9 +20,6 @@ struct Operations {
     saved: Option<hellas_rpc::pb::chain::ObjectProof>,
     old_response: Option<GetObjectProofsResponse>,
     replay_old: bool,
-    pause_second_owner_page: bool,
-    owner_page_entered: Option<Arc<tokio::sync::Semaphore>>,
-    owner_page_release: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 #[derive(Clone)]
@@ -46,7 +43,7 @@ impl LightClient for ObservedClient {
         &self,
         request: GetObjectProofsRequest,
     ) -> Result<GetObjectProofsResponse, QueryError> {
-        let (corrupt, saved, old_response, replay_old, pause) = {
+        let (corrupt, saved, old_response, replay_old) = {
             let mut operations = self.operations.lock().unwrap();
             operations.requests.push(request.clone());
             (
@@ -54,20 +51,8 @@ impl LightClient for ObservedClient {
                 operations.saved.clone(),
                 operations.old_response.clone(),
                 operations.replay_old,
-                if request.owner_after_key.is_some() && operations.pause_second_owner_page {
-                    Some((
-                        operations.owner_page_entered.as_ref().unwrap().clone(),
-                        operations.owner_page_release.as_ref().unwrap().clone(),
-                    ))
-                } else {
-                    None
-                },
             )
         };
-        if let Some((entered, release)) = pause {
-            entered.add_permits(1);
-            release.acquire().await.expect("test release").forget();
-        }
         if replay_old {
             return Ok(old_response.expect("prior response"));
         }
@@ -123,17 +108,13 @@ impl LightClient for ObservedClient {
     forward! {
         get_state_root() -> Option<Digest>;
         get_proof(object_id: ObjectId) -> Option<Vec<u8>>;
-        get_coin(payload: Digest, object_id: ObjectId) -> Option<crate::domain::Coin>;
-        get_edge(payload: Digest, object_id: ObjectId) -> Option<crate::EdgeLookup>;
+        get_plain_objects(request: GetObjectProofsRequest) -> hellas_rpc::pb::chain::GetObjectsResponse;
         get_finalization(payload: Digest) -> Option<Vec<u8>>;
         get_latest_block() -> Option<LatestBlock>;
         get_applied_finalized_block(query: FinalizedBlockQuery) -> Option<FinalizedBlock>;
         submit_tx(tx: Transaction) -> hellas_rpc::SubmitTxOutcome;
         get_validators() -> Vec<String>;
         get_consensus_info() -> ConsensusInfo;
-        get_coins_by_owner(owner: SettlementKey) -> Option<crate::CoinListing>;
-        get_coins_by_delegate(delegate: SettlementKey) -> Option<crate::CoinListing>;
-        get_edges_by_owner(owner: SettlementKey) -> Option<crate::OwnerEdges>;
     }
 }
 
@@ -142,6 +123,7 @@ struct Fixture {
     owners: OwnerIndex,
     chain_indexer: crate::indexer::fixtures::ArchiveSource,
     remote: RemoteLightClient,
+    trusted: crate::client::TrustedReader,
     applied: HellasBlock,
     archived: HellasBlock,
     pending: Option<Pending>,
@@ -321,11 +303,18 @@ async fn fixture_with_allocations(
     let remote = RemoteLightClient::connect(format!("ws://{address}"), proof_verifier.clone())
         .await
         .unwrap();
+    let trusted = crate::client::TrustedReader::connect(
+        format!("ws://{address}"),
+        crate::domain::TEST_NETWORK,
+    )
+    .await
+    .unwrap();
     Fixture {
         database,
         owners,
         chain_indexer: archive,
         remote,
+        trusted,
         applied,
         archived,
         pending: Some(pending),
@@ -365,7 +354,7 @@ fn empty_current_database_absence_is_verified_by_hellas() {
                 None,
             )
             .unwrap();
-        assert!(verified.objects().is_empty());
+        assert!(verified.objects.is_empty());
         let mut invalid = response;
         invalid.proofs[0].proof[0] ^= 1;
         assert!(
@@ -383,21 +372,43 @@ fn empty_current_database_absence_is_verified_by_hellas() {
     });
 }
 
+/// Every page of `owner`'s holdings, each verified at its own root.
+async fn pages(remote: &RemoteLightClient, owner: SettlementKey) -> Vec<crate::ObjectSnapshot> {
+    let mut pages = Vec::new();
+    let mut after = None;
+    loop {
+        let page = remote
+            .get_holdings(owner, after)
+            .await
+            .unwrap()
+            .unwrap()
+            .into_inner();
+        after = page.holdings.as_ref().unwrap().next;
+        pages.push(page);
+        if after.is_none() {
+            return pages;
+        }
+    }
+}
+
+fn values(coins: Vec<(ObjectId, crate::domain::Coin)>) -> Vec<(ObjectId, u64)> {
+    coins
+        .into_iter()
+        .map(|(id, coin)| (id, coin.value))
+        .collect()
+}
+
 #[test]
 fn owner_listing_completes_across_five_verified_pages() {
     run_qmdb(|runtime| async move {
         let fixture = fixture_with_allocations(runtime, 129).await;
-        let listing = fixture
-            .remote
-            .get_coins_by_owner(fixture.owner)
+        let coins: Vec<_> = pages(&fixture.remote, fixture.owner)
             .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(listing.coins.len(), 129);
-        assert_eq!(
-            listing.coins.iter().map(|(_, value)| *value).sum::<u64>(),
-            12_900
-        );
+            .iter()
+            .flat_map(|page| values(page.owned_coins(fixture.owner)))
+            .collect();
+        assert_eq!(coins.len(), 129);
+        assert_eq!(coins.iter().map(|(_, value)| *value).sum::<u64>(), 12_900);
         assert_eq!(
             fixture.operations.lock().unwrap().requests.len(),
             5,
@@ -423,17 +434,18 @@ fn owner_cursor_pages_remain_complete_while_every_page_has_a_new_finalized_root(
         for index in 0..5_u64 {
             let page = fixture
                 .remote
-                .get_coins_by_owner_page(fixture.owner, after)
+                .get_holdings(fixture.owner, after)
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(page.snapshot.height, index + 2);
-            assert_eq!(page.coins.len(), if index == 4 { 1 } else { 32 });
-            for (id, value) in &page.coins {
+            assert_eq!(page.block.height, index + 2);
+            let coins = values(page.owned_coins(fixture.owner));
+            assert_eq!(coins.len(), if index == 4 { 1 } else { 32 });
+            for (id, value) in &coins {
                 assert_eq!(*value, 100);
                 assert!(ids.insert(*id), "cursor repeated an owner holding");
             }
-            after = page.next;
+            after = page.holdings.as_ref().unwrap().next;
             if index < 4 {
                 assert!(after.is_some());
                 let (next, batch) = prepare(
@@ -593,82 +605,27 @@ fn old_current_proof_cannot_authenticate_a_new_root() {
 }
 
 #[test]
-fn remote_point_reads_use_a_finalized_floor_after_the_current_root_advances() {
-    run_qmdb(|runtime| async move {
-        let mut fixture = fixture(runtime).await;
-        let floor = fixture.applied.digest();
-        let newer = fixture.archived.digest();
-        let edge_id = crate::domain::edge_object_id(hellas_kernel::EdgeId::from_bytes([0x77; 32]));
-
-        assert!(matches!(
-            fixture.remote.get_coin(newer, fixture.new_coin).await,
-            Err(QueryError::StateUnavailable(_))
-        ));
-        assert_eq!(
-            fixture
-                .remote
-                .get_coin(floor, fixture.old_coin)
-                .await
-                .unwrap()
-                .unwrap()
-                .value,
-            100
-        );
-
-        fixture
-            .database
-            .finalize(fixture.pending.take().unwrap())
-            .await;
-        let coin = fixture
-            .remote
-            .get_coin(floor, fixture.new_coin)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(coin.value, 100, "H1 is a floor for a coin proved at H2");
-        let edge = fixture
-            .remote
-            .get_edge(floor, edge_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(edge.state_root, fixture.archived.state_root());
-        assert!(edge.edge.is_none(), "edge absence is proved at the H2 root");
-
-        fixture.stop().await;
-    });
-}
-
-#[test]
 fn owner_page_and_coin_proofs_share_one_root_and_reject_omission() {
     run_qmdb(|runtime| async move {
         let mut fixture = fixture(runtime).await;
         let owner = fixture.owner;
         let first = fixture
             .remote
-            .get_coins_by_owner(owner)
+            .get_holdings(owner, None)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(first.snapshot.payload, fixture.applied.digest());
-        assert_eq!(first.coins, vec![(fixture.old_coin, 100)]);
-        let edges = fixture
-            .remote
-            .get_edges_by_owner(owner)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(edges.snapshot.payload, first.snapshot.payload);
-        assert!(edges.edges.is_empty());
+        assert_eq!(first.block.payload, fixture.applied.digest());
+        assert_eq!(
+            values(first.owned_coins(owner)),
+            vec![(fixture.old_coin, 100)]
+        );
+        assert!(first.edges().is_empty());
         for mode in [2, 6, 7] {
             fixture.operations.lock().unwrap().corrupt = mode;
             assert!(
-                fixture.remote.get_coins_by_owner(owner).await.is_err(),
+                fixture.remote.get_holdings(owner, None).await.is_err(),
                 "owner proof mutation {mode}"
-            );
-            assert!(
-                fixture.remote.get_edges_by_owner(owner).await.is_err(),
-                "edge owner proof mutation {mode}"
             );
         }
         fixture.operations.lock().unwrap().corrupt = 0;
@@ -678,21 +635,27 @@ fn owner_page_and_coin_proofs_share_one_root_and_reject_omission() {
             .await;
         let second = fixture
             .remote
-            .get_coins_by_owner(owner)
+            .get_holdings(owner, None)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(second.snapshot.payload, fixture.archived.digest());
-        assert_eq!(second.coins, vec![(fixture.new_coin, 100)]);
+        assert_eq!(second.block.payload, fixture.archived.digest());
+        assert_eq!(
+            values(second.owned_coins(owner)),
+            vec![(fixture.new_coin, 100)]
+        );
         let delegate = owner_key(42);
         let delegated = fixture
             .remote
-            .get_coins_by_delegate(delegate)
+            .get_holdings(delegate, None)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(delegated.snapshot.payload, fixture.archived.digest());
-        assert_eq!(delegated.coins, vec![(fixture.new_coin, 100)]);
+        assert_eq!(delegated.block.payload, fixture.archived.digest());
+        assert_eq!(
+            values(delegated.delegated_coins(delegate)),
+            vec![(fixture.new_coin, 100)]
+        );
         fixture.stop().await;
     });
 }
@@ -729,63 +692,64 @@ fn self_delegated_coin_is_listed_once_for_owner_and_delegate() {
             .await
             .unwrap();
         fixture.owners.apply_finalized(&block).unwrap();
-        let owned = fixture
+        let page = fixture
             .remote
-            .get_coins_by_owner(fixture.owner)
+            .get_holdings(fixture.owner, None)
             .await
             .unwrap()
             .unwrap();
-        let delegated = fixture
-            .remote
-            .get_coins_by_delegate(fixture.owner)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(owned.coins, vec![(ids[0], 100)]);
-        assert_eq!(delegated.coins, vec![(ids[0], 100)]);
+        assert_eq!(values(page.owned_coins(fixture.owner)), vec![(ids[0], 100)]);
+        assert_eq!(
+            values(page.delegated_coins(fixture.owner)),
+            vec![(ids[0], 100)]
+        );
         fixture.stop().await;
     });
 }
 
 #[test]
-fn human_owner_listing_reports_changed_root_between_verified_pages() {
+fn trusted_reads_answer_the_proven_read_without_proofs() {
     run_qmdb(|runtime| async move {
-        let mut fixture = fixture_with_allocations(runtime, 33).await;
-        let entered = Arc::new(tokio::sync::Semaphore::new(0));
-        let release = Arc::new(tokio::sync::Semaphore::new(0));
-        {
-            let mut operations = fixture.operations.lock().unwrap();
-            operations.pause_second_owner_page = true;
-            operations.owner_page_entered = Some(entered.clone());
-            operations.owner_page_release = Some(release.clone());
-        }
-        let remote = fixture.remote.clone();
-        let owner = fixture.owner;
-        let listing = tokio::spawn(async move { remote.get_coins_by_owner(owner).await });
-        entered.acquire().await.unwrap().forget();
-        fixture
-            .database
-            .finalize(fixture.pending.take().unwrap())
-            .await;
-        fixture.owners.apply_finalized(&fixture.archived).unwrap();
-        fixture.operations.lock().unwrap().pause_second_owner_page = false;
-        release.add_permits(1);
-        assert!(matches!(
-            listing.await.unwrap(),
-            Err(QueryError::StateUnavailable(_))
-        ));
-        let first_page_requests = {
-            let operations = fixture.operations.lock().unwrap();
-            operations
-                .requests
-                .iter()
-                .filter(|request| request.owner_after_key.is_none())
-                .count()
-        };
+        let fixture = fixture_with_allocations(runtime, 33).await;
+        let keys = vec![fixture.old_coin, fixture.new_coin];
+        let proven = fixture
+            .remote
+            .get_objects(keys.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        let plain = fixture.trusted.get_objects(keys).await.unwrap().unwrap();
+        assert_eq!(plain.block, proven.block);
+        assert_eq!(plain.objects, proven.objects);
+        assert!(plain.holdings.is_none());
+
+        let proven = fixture
+            .remote
+            .get_holdings(fixture.owner, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let plain = fixture
+            .trusted
+            .get_holdings(fixture.owner, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(plain.holdings, proven.holdings);
+        assert_eq!(plain.owned_coins(fixture.owner).len(), 32);
         assert_eq!(
-            first_page_requests, 1,
-            "human listing does not restart old roots"
+            plain.owned_coins(fixture.owner),
+            proven.owned_coins(fixture.owner)
         );
+        let after = plain.holdings.as_ref().unwrap().next;
+        let rest = fixture
+            .trusted
+            .get_holdings(fixture.owner, after)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rest.owned_coins(fixture.owner).len(), 1);
+        assert_eq!(rest.holdings.as_ref().unwrap().next, None);
         fixture.stop().await;
     });
 }

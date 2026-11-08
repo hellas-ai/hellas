@@ -202,28 +202,20 @@ impl OwnerReshape {
         let mut after = None;
         loop {
             let page = chain
-                .get_coins_by_owner_page(owner.into(), after)
+                .get_holdings(owner.into(), after)
                 .await?
                 .ok_or(CoinOwnerError::NoSnapshot)?;
-            let candidates = page
-                .coins
-                .into_iter()
-                .map(|(id, _)| id)
-                .filter(|id| !reserved.contains(&CoinId::from_bytes((*id).into())))
-                .collect();
-            let snapshot = chain
-                .get_objects(candidates)
-                .await?
-                .ok_or(CoinOwnerError::NoSnapshot)?;
-            eligible.extend(snapshot.objects.into_iter().filter_map(|(id, object)| {
-                let hellas_chain::domain::Object::Coin(coin) = object else {
-                    return None;
-                };
-                (coin.owner == owner.into()
-                    && coin.value > 0
-                    && (coin.delegate.is_none() || coin.delegate == Some(delegate.into())))
-                .then_some((CoinId::from_bytes(id.into()), coin.value))
-            }));
+            eligible.extend(
+                page.owned_coins(owner.into())
+                    .into_iter()
+                    .filter_map(|(id, coin)| {
+                        let id = CoinId::from_bytes(id.into());
+                        (!reserved.contains(&id)
+                            && coin.value > 0
+                            && (coin.delegate.is_none() || coin.delegate == Some(delegate.into())))
+                        .then_some((id, coin.value))
+                    }),
+            );
             eligible.sort_unstable_by(|a, b| {
                 b.1.cmp(&a.1)
                     .then_with(|| a.0.to_bytes().cmp(&b.0.to_bytes()))
@@ -237,7 +229,7 @@ impl OwnerReshape {
             {
                 break;
             }
-            after = page.next;
+            after = page.holdings.as_ref().and_then(|holdings| holdings.next);
             if after.is_none() {
                 break;
             }
@@ -371,67 +363,69 @@ mod tests {
         reads: std::sync::Arc<std::sync::Mutex<Vec<Vec<hellas_chain::domain::ObjectId>>>>,
     }
 
+    impl PagedFunding {
+        fn coin(&self, id: hellas_chain::domain::ObjectId) -> hellas_chain::domain::Object {
+            let value = if id.0[0] == 129 { 200 } else { 1 };
+            hellas_chain::domain::Object::Coin(hellas_chain::domain::Coin::owned(self.owner, value))
+        }
+    }
+
     impl hellas_chain::LightClient for PagedFunding {
-        async fn get_coins_by_owner_page(
+        async fn get_holdings(
             &self,
             owner: hellas_chain::domain::SettlementKey,
             after: Option<hellas_chain::domain::ObjectId>,
-        ) -> Result<Option<hellas_chain::light_client::CoinPage>, hellas_chain::QueryError>
-        {
+        ) -> Result<
+            Option<hellas_chain::Verified<hellas_chain::ObjectSnapshot>>,
+            hellas_chain::QueryError,
+        > {
             assert_eq!(owner, self.owner);
             let start = after.map_or(1, |id| id.0[0] as usize + 1);
             let end = (start + 32).min(130);
             let page = self.pages.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-            let coins = (start..end)
-                .map(|index| {
-                    (
-                        hellas_chain::domain::ObjectId::from([index as u8; 32]),
-                        if index == 129 { 200 } else { 1 },
-                    )
-                })
+            let keys: Vec<_> = (start..end)
+                .map(|index| hellas_chain::domain::ObjectId::from([index as u8; 32]))
                 .collect();
-            Ok(Some(hellas_chain::light_client::CoinPage {
-                snapshot: hellas_chain::LatestBlock {
-                    height: page + 1,
-                    payload: hellas_chain::domain::Digest::from([page as u8; 32]),
-                    state_root: hellas_chain::domain::Digest::from([page as u8; 32]),
-                    finalization: Vec::new(),
+            Ok(Some(hellas_chain::Verified::assume_for_tests(
+                hellas_chain::ObjectSnapshot {
+                    network: self.network,
+                    block: hellas_chain::LatestBlock {
+                        height: page + 1,
+                        payload: hellas_chain::domain::Digest::from([page as u8; 32]),
+                        state_root: hellas_chain::domain::Digest::from([page as u8; 32]),
+                        finalization: Vec::new(),
+                    },
+                    objects: keys.iter().map(|id| (*id, self.coin(*id))).collect(),
+                    holdings: Some(hellas_chain::Holdings {
+                        next: (end < 130).then(|| keys[keys.len() - 1]),
+                        keys,
+                    }),
                 },
-                coins,
-                next: (end < 130)
-                    .then(|| hellas_chain::domain::ObjectId::from([(end - 1) as u8; 32])),
-            }))
+            )))
         }
 
         async fn get_objects(
             &self,
             keys: Vec<hellas_chain::domain::ObjectId>,
-        ) -> Result<Option<hellas_chain::light_client::ObjectSnapshot>, hellas_chain::QueryError>
-        {
+        ) -> Result<
+            Option<hellas_chain::Verified<hellas_chain::ObjectSnapshot>>,
+            hellas_chain::QueryError,
+        > {
             self.reads.lock().unwrap().push(keys.clone());
             let page = self.pages.load(std::sync::atomic::Ordering::SeqCst);
-            let objects = keys
-                .into_iter()
-                .map(|id| {
-                    let value = if id.0[0] == 129 { 200 } else { 1 };
-                    (
-                        id,
-                        hellas_chain::domain::Object::Coin(hellas_chain::domain::Coin::owned(
-                            self.owner, value,
-                        )),
-                    )
-                })
-                .collect();
-            Ok(Some(hellas_chain::light_client::ObjectSnapshot {
-                network: self.network,
-                block: hellas_chain::LatestBlock {
-                    height: page + 2,
-                    payload: hellas_chain::domain::Digest::from([(page + 1) as u8; 32]),
-                    state_root: hellas_chain::domain::Digest::from([(page + 1) as u8; 32]),
-                    finalization: Vec::new(),
+            Ok(Some(hellas_chain::Verified::assume_for_tests(
+                hellas_chain::ObjectSnapshot {
+                    network: self.network,
+                    block: hellas_chain::LatestBlock {
+                        height: page + 2,
+                        payload: hellas_chain::domain::Digest::from([(page + 1) as u8; 32]),
+                        state_root: hellas_chain::domain::Digest::from([(page + 1) as u8; 32]),
+                        finalization: Vec::new(),
+                    },
+                    objects: keys.into_iter().map(|id| (id, self.coin(id))).collect(),
+                    holdings: None,
                 },
-                objects,
-            }))
+            )))
         }
 
         async fn get_state_root(
@@ -443,20 +437,6 @@ mod tests {
             &self,
             _: hellas_chain::domain::ObjectId,
         ) -> Result<Option<Vec<u8>>, hellas_chain::QueryError> {
-            unreachable!()
-        }
-        async fn get_coin(
-            &self,
-            _: hellas_chain::domain::Digest,
-            _: hellas_chain::domain::ObjectId,
-        ) -> Result<Option<hellas_chain::domain::Coin>, hellas_chain::QueryError> {
-            unreachable!()
-        }
-        async fn get_edge(
-            &self,
-            _: hellas_chain::domain::Digest,
-            _: hellas_chain::domain::ObjectId,
-        ) -> Result<Option<hellas_chain::EdgeLookup>, hellas_chain::QueryError> {
             unreachable!()
         }
         async fn get_finalization(
@@ -488,24 +468,6 @@ mod tests {
         async fn get_consensus_info(
             &self,
         ) -> Result<hellas_chain::ConsensusInfo, hellas_chain::QueryError> {
-            unreachable!()
-        }
-        async fn get_coins_by_owner(
-            &self,
-            _: hellas_chain::domain::SettlementKey,
-        ) -> Result<Option<hellas_chain::CoinListing>, hellas_chain::QueryError> {
-            panic!("whole owner listing must not fund")
-        }
-        async fn get_coins_by_delegate(
-            &self,
-            _: hellas_chain::domain::SettlementKey,
-        ) -> Result<Option<hellas_chain::CoinListing>, hellas_chain::QueryError> {
-            unreachable!()
-        }
-        async fn get_edges_by_owner(
-            &self,
-            _: hellas_chain::domain::SettlementKey,
-        ) -> Result<Option<hellas_chain::OwnerEdges>, hellas_chain::QueryError> {
             unreachable!()
         }
     }

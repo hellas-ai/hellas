@@ -767,17 +767,23 @@ impl Devnet {
     ) -> Vec<(CoinId, Coin)> {
         let Some(held) = self
             .light_client(node)
-            .get_coins_by_owner(owner)
+            .get_holdings(owner, None)
             .await
             .expect("the owner index answers")
         else {
             panic!("the owner index has a finalized cursor");
         };
-        let projected_root = held.snapshot.state_root;
+        assert!(
+            held.holdings
+                .as_ref()
+                .is_some_and(|page| page.next.is_none()),
+            "a devnet owner fits one holdings page"
+        );
+        let projected_root = held.block.state_root;
         let mut projected = held
-            .coins
+            .owned_coins(owner)
             .into_iter()
-            .map(|(id, value)| (CoinId::from_bytes(id.into()), value))
+            .map(|(id, coin)| (CoinId::from_bytes(id.into()), coin.value))
             .collect::<Vec<_>>();
         projected.sort_by_key(|(id, value)| (*value, *id));
 

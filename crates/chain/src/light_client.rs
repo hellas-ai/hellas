@@ -106,45 +106,101 @@ pub enum FinalizedBlockQuery {
     Payload(Digest),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CoinListing {
-    pub snapshot: LatestBlock,
-    pub coins: Vec<(ObjectId, u64)>,
-}
+/// A value read from finalized chain state that this process has checked:
+/// a remote reply whose proof verified, or a read of state this process
+/// executed itself. Only those two paths construct one, so code that takes a
+/// `Verified` cannot be handed an unproven reply.
+#[derive(Debug, Clone)]
+pub struct Verified<T>(T);
 
-/// One authenticated Latest owner page. `next` is the last holding key, not
-/// necessarily a coin: subsequent pages skip all earlier owner-tree ranks.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CoinPage {
-    pub snapshot: LatestBlock,
-    pub coins: Vec<(ObjectId, u64)>,
-    pub next: Option<ObjectId>,
-}
+impl<T> Verified<T> {
+    pub(crate) fn new(value: T) -> Self {
+        Self(value)
+    }
 
-fn page_from_local_listing(listing: CoinListing, after: Option<ObjectId>) -> CoinPage {
-    let limit = crate::owner_proof::OWNER_PAGE_LIMIT as usize;
-    let mut all = listing.coins;
-    all.sort_unstable_by_key(|(id, _)| *id);
-    let coins: Vec<_> = all
-        .into_iter()
-        .filter(|(id, _)| after.is_none_or(|key| *id > key))
-        .take(limit + 1)
-        .collect();
-    let next = (coins.len() > limit).then(|| coins[limit - 1].0);
-    CoinPage {
-        snapshot: listing.snapshot,
-        coins: coins.into_iter().take(limit).collect(),
-        next,
+    /// Test doubles stand in for a verified chain without one.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn assume_for_tests(value: T) -> Self {
+        Self(value)
+    }
+
+    pub fn into_inner(self) -> T {
+        self.0
     }
 }
 
-/// Requested current objects at one finalized root. Missing keys are absent.
-/// Remote clients verify one ordered current-state proof per requested key.
+impl<T> std::ops::Deref for Verified<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+/// Current objects at one finalized root. Missing keys are absent. An owner
+/// read also lists one page of the owner's holdings, whose objects are in
+/// `objects`.
 #[derive(Debug, Clone)]
 pub struct ObjectSnapshot {
     pub network: hellas_kernel::NetworkId,
     pub block: LatestBlock,
     pub objects: std::collections::BTreeMap<ObjectId, Object>,
+    pub holdings: Option<Holdings>,
+}
+
+/// One page of an owner's holdings in owner-tree order. `next` is the last
+/// listed key while more follow, and continues the listing at a later root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Holdings {
+    pub keys: Vec<ObjectId>,
+    pub next: Option<ObjectId>,
+}
+
+impl Holdings {
+    pub(crate) fn new(keys: Vec<ObjectId>, offset: u64, count: u64) -> Self {
+        let more = offset.saturating_add(keys.len() as u64) < count;
+        let next = more.then(|| keys.last().copied()).flatten();
+        Self { keys, next }
+    }
+}
+
+impl ObjectSnapshot {
+    fn listed(&self) -> impl Iterator<Item = (ObjectId, &Object)> {
+        self.holdings
+            .iter()
+            .flat_map(|holdings| holdings.keys.iter())
+            .filter_map(|key| self.objects.get(key).map(|object| (*key, object)))
+    }
+
+    /// Listed coins whose owner is `owner`.
+    pub fn owned_coins(&self, owner: SettlementKey) -> Vec<(ObjectId, Coin)> {
+        self.listed()
+            .filter_map(|(key, object)| match object {
+                Object::Coin(coin) if coin.owner == owner => Some((key, *coin)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Listed coins delegated to `delegate`: spendable funding, not its balance.
+    pub fn delegated_coins(&self, delegate: SettlementKey) -> Vec<(ObjectId, Coin)> {
+        self.listed()
+            .filter_map(|(key, object)| match object {
+                Object::Coin(coin) if coin.delegate == Some(delegate) => Some((key, *coin)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Listed edges.
+    pub fn edges(&self) -> Vec<(ObjectId, EdgeState)> {
+        self.listed()
+            .filter_map(|(key, object)| match object {
+                Object::Edge(edge) => Some((key, EdgeState::from(*edge))),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,25 +229,6 @@ impl From<hellas_kernel::Edge> for EdgeState {
             terms_hash: edge.terms(),
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EdgeLookup {
-    pub state_root: Digest,
-    pub edge: Option<EdgeState>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EdgeRecord {
-    pub object_id: ObjectId,
-    pub maker: SettlementKey,
-    pub taker: SettlementKey,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OwnerEdges {
-    pub snapshot: LatestBlock,
-    pub edges: Vec<EdgeRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -279,7 +316,11 @@ impl From<WireStatus> for QueryError {
 }
 
 /// Transport-agnostic query interface for light clients.
+///
+/// Object reads return [`Verified`] values: implementations either verify a
+/// proof or read state their own process executed.
 pub trait LightClient: Clone + Send + Sync + 'static {
+    /// Serves `GetObjectProofs`; only a node holding state answers.
     fn get_object_proofs(
         &self,
         _request: hellas_rpc::pb::chain::GetObjectProofsRequest,
@@ -292,13 +333,40 @@ pub trait LightClient: Clone + Send + Sync + 'static {
         }
     }
 
+    /// Serves `GetObjects`, the same read without proofs.
+    fn get_plain_objects(
+        &self,
+        _request: hellas_rpc::pb::chain::GetObjectProofsRequest,
+    ) -> impl Future<Output = Result<hellas_rpc::pb::chain::GetObjectsResponse, QueryError>> + Send
+    {
+        async {
+            Err(QueryError::StateUnavailable(
+                "current objects are unavailable".into(),
+            ))
+        }
+    }
+
+    /// At most [`crate::proof_verify::MAX_CURRENT_KEYS`] objects at the latest root.
     fn get_objects(
         &self,
         _keys: Vec<ObjectId>,
-    ) -> impl Future<Output = Result<Option<ObjectSnapshot>, QueryError>> + Send {
+    ) -> impl Future<Output = Result<Option<Verified<ObjectSnapshot>>, QueryError>> + Send {
         async {
             Err(QueryError::StateUnavailable(
                 "finalized objects are unavailable".into(),
+            ))
+        }
+    }
+
+    /// One page of `owner`'s holdings after `after`, at the latest root.
+    fn get_holdings(
+        &self,
+        _owner: SettlementKey,
+        _after: Option<ObjectId>,
+    ) -> impl Future<Output = Result<Option<Verified<ObjectSnapshot>>, QueryError>> + Send {
+        async {
+            Err(QueryError::StateUnavailable(
+                "finalized holdings are unavailable".into(),
             ))
         }
     }
@@ -309,18 +377,6 @@ pub trait LightClient: Clone + Send + Sync + 'static {
         &self,
         object_id: ObjectId,
     ) -> impl Future<Output = Result<Option<Vec<u8>>, QueryError>> + Send;
-
-    fn get_coin(
-        &self,
-        payload: Digest,
-        object_id: ObjectId,
-    ) -> impl Future<Output = Result<Option<Coin>, QueryError>> + Send;
-
-    fn get_edge(
-        &self,
-        payload: Digest,
-        object_id: ObjectId,
-    ) -> impl Future<Output = Result<Option<EdgeLookup>, QueryError>> + Send;
 
     fn get_finalization(
         &self,
@@ -354,49 +410,6 @@ pub trait LightClient: Clone + Send + Sync + 'static {
     fn get_validators(&self) -> impl Future<Output = Result<Vec<String>, QueryError>> + Send;
 
     fn get_consensus_info(&self) -> impl Future<Output = Result<ConsensusInfo, QueryError>> + Send;
-
-    fn get_coins_by_owner(
-        &self,
-        owner: SettlementKey,
-    ) -> impl Future<Output = Result<Option<CoinListing>, QueryError>> + Send;
-
-    fn get_coins_by_owner_page(
-        &self,
-        owner: SettlementKey,
-        after: Option<ObjectId>,
-    ) -> impl Future<Output = Result<Option<CoinPage>, QueryError>> + Send {
-        async move {
-            let Some(listing) = self.get_coins_by_owner(owner).await? else {
-                return Ok(None);
-            };
-            Ok(Some(page_from_local_listing(listing, after)))
-        }
-    }
-
-    /// Coins whose committed delegate is this node. Values are spendable funding,
-    /// not the node's owned balance.
-    fn get_coins_by_delegate(
-        &self,
-        delegate: SettlementKey,
-    ) -> impl Future<Output = Result<Option<CoinListing>, QueryError>> + Send;
-
-    fn get_coins_by_delegate_page(
-        &self,
-        delegate: SettlementKey,
-        after: Option<ObjectId>,
-    ) -> impl Future<Output = Result<Option<CoinPage>, QueryError>> + Send {
-        async move {
-            let Some(listing) = self.get_coins_by_delegate(delegate).await? else {
-                return Ok(None);
-            };
-            Ok(Some(page_from_local_listing(listing, after)))
-        }
-    }
-
-    fn get_edges_by_owner(
-        &self,
-        owner: SettlementKey,
-    ) -> impl Future<Output = Result<Option<OwnerEdges>, QueryError>> + Send;
 }
 
 #[cfg(test)]

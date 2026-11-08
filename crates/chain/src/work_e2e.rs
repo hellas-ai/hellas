@@ -377,6 +377,7 @@ impl WorkDevnet {
             .await
             .expect("a channel snapshot reads")
             .expect("finalized channel state exists")
+            .into_inner()
     }
 
     async fn shutdown(self) {

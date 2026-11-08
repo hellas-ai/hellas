@@ -73,7 +73,7 @@ pub struct WorkBlocks<C> {
 #[derive(Debug)]
 pub struct PaidWorkClockAdvance {
     /// The verified snapshot already read for settlement, reusable by admission.
-    pub snapshot: Option<WorkChannelSnapshot>,
+    pub snapshot: Option<crate::light_client::Verified<WorkChannelSnapshot>>,
     /// The shared start, response, and final adjudication drive that ran first.
     pub close: CloseProgress,
     /// Submission outcome for a due adjudicated payment close.
@@ -319,7 +319,7 @@ impl<C: LightClient + FinalizedWorkView> FinalizedWorkView for WorkBlocks<C> {
     async fn work_channel_snapshot(
         &self,
         query: WorkChannelQuery,
-    ) -> Result<Option<WorkChannelSnapshot>, QueryError> {
+    ) -> Result<Option<crate::light_client::Verified<WorkChannelSnapshot>>, QueryError> {
         self.read(|| async {
             let snapshot = self.client.work_channel_snapshot(query.clone()).await?;
             if snapshot.as_ref().map_or(0, |value| value.block().height) < self.min_height {

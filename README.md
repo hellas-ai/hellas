@@ -314,7 +314,9 @@ validator host's WireGuard IP before deploying this change.
 
 `chain query --rpc URL` supports `latest-block`, `state-root`, `finalization`,
 `finalized-block`, `coin`, `edge`, `validators`, `coins-by-owner`, and
-`edges-by-owner`.
+`edges-by-owner`. Coin and edge reads are proven at the latest applied root;
+`--trusted-rpc URL` reads them without proofs from an endpoint you trust, such
+as your own node.
 
 `chain open` reads each 32-byte secret scalar from `--maker-key FILE` and
 `--taker-key FILE`; `--maker-auth` and `--taker-auth` accept `webauthn` or
@@ -356,10 +358,7 @@ OPEN=$(
 EDGE_ID=$(printf '%s\n' "$OPEN" | awk '$1 == "edge_id" { print $2 }')
 
 # After the open finalizes:
-PAYLOAD=$(cargo run -- \
-  chain query --rpc "$RPC" latest-block | awk '$1 == "payload" { print $2 }')
-cargo run -- \
-  chain query --rpc "$RPC" edge --object-id "$EDGE_ID" --payload "$PAYLOAD"
+cargo run -- chain query --rpc "$RPC" edge --object-id "$EDGE_ID"
 
 cargo run -- chain close \
   --rpc "$RPC" --edge-id "$EDGE_ID" --kind mutual \

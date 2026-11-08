@@ -6,8 +6,7 @@ use crate::{
         ChainVerifier, execute_all,
         store::utxo_db_config,
         test_support::{
-            consensus_fixture, finality_envelope, index_block, index_genesis, kernel_fixture,
-            owner_key, run_qmdb,
+            consensus_fixture, finality_envelope, index_block, index_genesis, owner_key, run_qmdb,
         },
     },
     indexer::fixtures::spawn_archive,
@@ -649,31 +648,6 @@ async fn finalized_payload_indexer(
 }
 
 #[test]
-fn owner_index_wrong_kind_maps_structurally() {
-    let id = ObjectId::from([0x42; 32]);
-    let error = owner_lookup_error(OwnerIndexError::WrongObjectKind {
-        id,
-        expected: ObjectKind::Coin,
-        actual: ObjectKind::Edge,
-    });
-    assert!(matches!(
-        error,
-        QueryError::WrongObjectKind {
-            expected: ObjectKind::Coin,
-            actual: ObjectKind::Edge,
-        }
-    ));
-}
-
-/// One work channel, opened for real, read back as one answer.
-///
-/// Everything here comes from one QMDB reader at one finalized
-/// block: both edges, both lease slots, and the pending-close slot.
-/// The lease is `Present` because a payment open wrote it, not
-/// because this test wrote a chunk that looks like one — which is
-/// the only way to find out that the endpoint derives the same slots
-/// the kernel does.
-#[test]
 fn work_channel_snapshot_reads_every_object_at_one_finalized_block() {
     use hellas_kernel::{
         Auth, BlockHeight, CoinId, Funding, LeaseSlots, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS,
@@ -1011,201 +985,6 @@ async fn apply(
     root
 }
 
-#[test]
-fn get_edge_reads_qmdb_with_served_root_and_typed_kind() {
-    run_qmdb(|runtime| async move {
-        let indexer_context = runtime.child("chain_indexer");
-        let config = utxo_db_config(&runtime, "rpc_get_edge", 1024, 8);
-        let database = <UtxoDatabase<_> as DatabaseSet<_>>::init(runtime, config).await;
-        let fixture = kernel_fixture(3).expect("kernel fixture");
-        let mut allocations = fixture.allocations.clone();
-        allocations.push((owner_key(41), 7));
-        let genesis = index_genesis();
-
-        let batches = database.new_batches().await;
-        let batches = execute_all(
-            KernelContext::with_fees(
-                crate::domain::TEST_NETWORK,
-                BlockHeight::new(1),
-                BlockHash::from_bytes([0; BlockHash::LENGTH]),
-                KERNEL_FEES,
-            ),
-            &ChainVerifier::new(),
-            &[],
-            &allocations,
-            batches,
-        )
-        .await
-        .expect("genesis allocations execute");
-        let merkleized = batches.merkleize().await.expect("genesis merkleizes");
-        let floor_root = merkleized.root();
-        database.finalize(merkleized).await;
-
-        let floor_block = index_block(&genesis, floor_root, Vec::new());
-        let (chain_indexer, _indexer_handle) =
-            finalized_payload_indexer(indexer_context, genesis.clone(), floor_block.clone()).await;
-        let latest = chain_indexer
-            .get_latest_block()
-            .await
-            .expect("latest block query")
-            .expect("finalized floor");
-        assert_eq!(latest.payload, floor_block.digest());
-        let finalized_payload = latest.payload;
-        let uninitialized_index =
-            OwnerIndex::new(crate::domain::TEST_NETWORK, &genesis, allocations.clone());
-        assert!(matches!(
-            get_edge_at(
-                &database,
-                &uninitialized_index,
-                &chain_indexer,
-                Digest::from([0x10; 32]),
-                ObjectId::from([0x20; 32]),
-            )
-            .await,
-            Ok(None)
-        ));
-
-        let transactions = vec![Transaction::Kernel(fixture.open.clone())];
-        let batches = database.new_batches().await;
-        let batches = execute_all(
-            KernelContext::with_fees(
-                crate::domain::TEST_NETWORK,
-                BlockHeight::new(2),
-                BlockHash::from_bytes([0; BlockHash::LENGTH]),
-                KERNEL_FEES,
-            ),
-            &ChainVerifier::new(),
-            &transactions,
-            &allocations,
-            batches,
-        )
-        .await
-        .expect("open executes");
-        let merkleized = batches.merkleize().await.expect("state merkleizes");
-        let state_root = merkleized.root();
-        database.finalize(merkleized).await;
-
-        let index = OwnerIndex::new(crate::domain::TEST_NETWORK, &genesis, allocations.clone());
-        assert_eq!(
-            index.apply_finalized(&floor_block),
-            Ok(ApplyOutcome::Applied)
-        );
-        let block = index_block(&floor_block, state_root, transactions.clone());
-        assert_eq!(index.apply_finalized(&block), Ok(ApplyOutcome::Applied));
-        assert_ne!(index.cursor().payload, finalized_payload);
-        let edge_id = edge_object_id(fixture.edge);
-        let expected_edge = match database
-            .read()
-            .await
-            .get(&edge_id)
-            .await
-            .expect("edge read")
-        {
-            Some(Object::Edge(edge)) => EdgeState::from(edge),
-            other => panic!("expected stored edge, found {other:?}"),
-        };
-
-        let found = get_edge_at(
-            &database,
-            &index,
-            &chain_indexer,
-            finalized_payload,
-            edge_id,
-        )
-        .await
-        .expect("edge lookup")
-        .expect("indexed state is available");
-        assert_eq!(found.state_root, state_root);
-        assert_eq!(found.edge, Some(expected_edge));
-
-        let absent = get_edge_at(
-            &database,
-            &index,
-            &chain_indexer,
-            finalized_payload,
-            ObjectId::from([0xa5; 32]),
-        )
-        .await
-        .expect("absent edge lookup")
-        .expect("indexed state is available");
-        assert_eq!(absent.state_root, state_root);
-        assert_eq!(absent.edge, None);
-
-        assert!(matches!(
-            get_edge_at(
-                &database,
-                &index,
-                &chain_indexer,
-                Digest::from([0x44; 32]),
-                edge_id,
-            )
-            .await,
-            Err(QueryError::StateUnavailable(_))
-        ));
-
-        assert!(matches!(
-            get_edge_at(
-                &database,
-                &index,
-                &chain_indexer,
-                finalized_payload,
-                genesis_object_id(2),
-            )
-            .await,
-            Err(QueryError::WrongObjectKind {
-                expected: ObjectKind::Edge,
-                actual: ObjectKind::Coin,
-            })
-        ));
-
-        assert!(
-            get_coin_at(
-                &index,
-                &chain_indexer,
-                finalized_payload,
-                genesis_object_id(2),
-            )
-            .await
-            .expect("finalized coin floor")
-            .is_some()
-        );
-        assert!(matches!(
-            get_coin_at(
-                &index,
-                &chain_indexer,
-                Digest::from([0x44; 32]),
-                genesis_object_id(2),
-            )
-            .await,
-            Err(QueryError::StateUnavailable(_))
-        ));
-
-        let skewed_index = OwnerIndex::new(crate::domain::TEST_NETWORK, &genesis, allocations);
-        assert_eq!(
-            skewed_index.apply_finalized(&floor_block),
-            Ok(ApplyOutcome::Applied)
-        );
-        let skewed_block = index_block(&floor_block, Digest::from([0x55; 32]), transactions);
-        assert_eq!(
-            skewed_index.apply_finalized(&skewed_block),
-            Ok(ApplyOutcome::Applied)
-        );
-        assert!(matches!(
-            get_edge_at(
-                &database,
-                &skewed_index,
-                &chain_indexer,
-                finalized_payload,
-                ObjectId::from([0xa6; 32]),
-            )
-            .await,
-            Err(QueryError::StateUnavailable(_))
-        ));
-        let qmdb_root = database.read().await.root();
-        assert_ne!(skewed_index.cursor().state_root, qmdb_root);
-    });
-}
-
 /// The extracted validator is sampled for every response it judged,
 /// and for nothing it did not judge.
 ///
@@ -1324,26 +1103,33 @@ fn finalized_reads_inside_the_commit_before_publish_window_use_the_committed_blo
         };
         // Every read resolves at once against the committed block; none waits
         // for the cursor, and nothing is published below.
-        let (coin, held, edge, snapshot) =
+        let edge = edge_object_id(query.bond_edge);
+        let (objects, held, snapshot) =
             tokio::time::timeout(hellas_channel::test_support::HANG_GUARD, async {
                 tokio::join!(
-                    local.get_coin(floor.digest(), ids[0]),
-                    local.get_coins_by_owner(owner),
-                    local.get_edge(floor.digest(), edge_object_id(query.bond_edge)),
+                    local.get_objects(vec![ids[0], edge]),
+                    local.get_holdings(owner, None),
                     local.work_channel_snapshot(query.clone()),
                 )
             })
             .await
             .expect("reads inside the window do not wait for publication");
         assert_eq!(index.cursor().payload, floor.digest());
-        assert_eq!(coin.unwrap().unwrap().value, 100);
+        let objects = objects.unwrap().unwrap();
+        assert_eq!(objects.block.state_root, root);
+        assert!(
+            matches!(objects.objects.get(&ids[0]), Some(Object::Coin(coin)) if coin.value == 100)
+        );
+        assert!(!objects.objects.contains_key(&edge));
         let held = held.unwrap().unwrap();
-        assert_eq!(held.snapshot.payload, next.digest());
-        assert_eq!(held.snapshot.state_root, root);
-        assert_eq!(held.coins, vec![(ids[0], 100)]);
-        let edge = edge.unwrap().unwrap();
-        assert_eq!(edge.state_root, root);
-        assert!(edge.edge.is_none());
+        assert_eq!(held.block.payload, next.digest());
+        assert_eq!(held.block.state_root, root);
+        let coins: Vec<_> = held
+            .owned_coins(owner)
+            .into_iter()
+            .map(|(id, coin)| (id, coin.value))
+            .collect();
+        assert_eq!(coins, vec![(ids[0], 100)]);
         assert_eq!(snapshot.unwrap().unwrap().block().payload, next.digest());
 
         // State that is not the next finalized block is refused at once, rather
@@ -1352,7 +1138,7 @@ fn finalized_reads_inside_the_commit_before_publish_window_use_the_committed_blo
             crate::execution::test_support::reshape(41, &[ids[0]], &[(owner, None, 100)]);
         apply(&database, &allocations, 3, &[spend]).await;
         for result in [
-            local.get_coins_by_owner(owner).await.map(|_| ()),
+            local.get_holdings(owner, None).await.map(|_| ()),
             local.work_channel_snapshot(query).await.map(|_| ()),
         ] {
             assert!(matches!(result, Err(QueryError::StateUnavailable(message))

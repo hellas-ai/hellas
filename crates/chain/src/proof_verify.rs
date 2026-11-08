@@ -72,40 +72,6 @@ type CurrentInclusion = KeyValueProof<mmr::Family, ObjectId, Digest, 32>;
 type CurrentExclusion = ExclusionProof<mmr::Family, ObjectId, FixedEncoding<Object>, Digest, 32>;
 type CurrentOperation = Operation<mmr::Family, ObjectId, FixedEncoding<Object>>;
 
-pub struct VerifiedObjects {
-    block: VerifiedBlock,
-    objects: BTreeMap<ObjectId, Object>,
-    owner_page: Option<(
-        crate::owner_proof::OwnerPageProof,
-        crate::owner_proof::OwnerCommitment,
-    )>,
-}
-
-impl VerifiedObjects {
-    pub fn block(&self) -> &VerifiedBlock {
-        &self.block
-    }
-    pub fn objects(&self) -> &BTreeMap<ObjectId, Object> {
-        &self.objects
-    }
-    pub fn owner_page(
-        &self,
-    ) -> Option<&(
-        crate::owner_proof::OwnerPageProof,
-        crate::owner_proof::OwnerCommitment,
-    )> {
-        self.owner_page.as_ref()
-    }
-    pub fn into_snapshot(self) -> crate::light_client::ObjectSnapshot {
-        crate::light_client::ObjectSnapshot {
-            network: hellas_kernel::NetworkId::new(&self.block.bundle.network_id)
-                .expect("verified trust network"),
-            block: self.block.view.snapshot().clone(),
-            objects: self.objects,
-        }
-    }
-}
-
 pub struct ProofVerifier {
     trust: TrustDocument,
     trust_sha256: String,
@@ -314,7 +280,8 @@ impl ProofVerifier {
         requested: &BTreeSet<ObjectId>,
         query: FinalizedBlockQuery,
         owner: Option<(crate::domain::SettlementKey, Option<[u8; 32]>)>,
-    ) -> Result<VerifiedObjects, VerificationError> {
+    ) -> Result<crate::light_client::Verified<crate::light_client::ObjectSnapshot>, VerificationError>
+    {
         let block = response.block.ok_or(VerificationError::Query)?;
         let finalized = crate::client::finalized_block_from_proto(block)
             .map_err(|_| VerificationError::Query)?;
@@ -398,11 +365,37 @@ impl ProofVerifier {
                 }
             }
         }
-        Ok(VerifiedObjects {
-            block: verified,
-            objects,
-            owner_page,
-        })
+        let holdings = match owner_page {
+            Some((page, summary)) => {
+                let owner = owner.ok_or(VerificationError::Query)?.0;
+                for holding in &page.holdings {
+                    let object = objects
+                        .get(&ObjectId::from(holding.object_id))
+                        .ok_or(VerificationError::InvalidProof)?;
+                    crate::owner_proof::validate_holding(owner, holding, object)
+                        .map_err(|_| VerificationError::InvalidProof)?;
+                }
+                let keys = page
+                    .holdings
+                    .iter()
+                    .map(|holding| ObjectId::from(holding.object_id))
+                    .collect();
+                Some(crate::light_client::Holdings::new(
+                    keys,
+                    page.offset,
+                    summary.count,
+                ))
+            }
+            None => None,
+        };
+        Ok(crate::light_client::Verified::new(
+            crate::light_client::ObjectSnapshot {
+                network: self.network(),
+                block: verified.view.snapshot().clone(),
+                objects,
+                holdings,
+            },
+        ))
     }
 }
 
