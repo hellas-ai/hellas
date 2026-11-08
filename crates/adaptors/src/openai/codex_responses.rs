@@ -2,6 +2,8 @@
 //! Request admission and upstream response validation live in the attested
 //! Fetch adaptor; this lens only reconstructs the already-typed wire events.
 
+pub mod fetch;
+
 use serde_json::{Value as JsonValue, json};
 
 use crate::{
