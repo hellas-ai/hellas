@@ -1,9 +1,18 @@
 //! The text presentation: requests rendered locally into Compute text jobs.
 use super::{TextOptions, WorkExecutionBackend};
 use crate::ComputeEvent;
-use axum::{Router, routing::post};
+use axum::Router;
+use axum::body::Bytes;
+use axum::extract::State;
+use axum::routing::{MethodRouter, post};
+use hellas_adaptors::anthropic::AnthropicMessagesAdaptor;
+use hellas_adaptors::openai::{
+    chat_completions::OpenAiChatCompletionsAdaptor, completions::OpenAiCompletionsAdaptor,
+    responses::OpenAiResponsesAdaptor,
+};
 use hellas_adaptors::{
     BackendError, CanonicalExecution, ExecutionRequest as WireExecutionRequest, ResponseFormat,
+    WireAdaptor,
 };
 use hellas_client::model::ModelPackage;
 use hellas_presentation::{ChatTemplate, TextPresentation};
@@ -50,17 +59,53 @@ fn validate_native_text_request(canonical: &CanonicalExecution) -> Result<(), Ba
 pub(super) const PATHS: [&str; 4] = [
     "/v1/chat/completions",
     "/v1/responses",
-    "/v1/messages",
+    ANTHROPIC_PATH,
     "/v1/completions",
 ];
 
+/// The path served in the Anthropic Messages wire format.
+pub(super) const ANTHROPIC_PATH: &str = "/v1/messages";
+
 pub(super) fn router(state: Arc<TextState>) -> Router {
     Router::new()
-        .route(PATHS[0], post(super::openai::handle))
-        .route(PATHS[1], post(super::responses::handle))
-        .route(PATHS[2], post(super::anthropic::handle))
-        .route(PATHS[3], post(super::plain::handle))
+        .route(
+            PATHS[0],
+            text(
+                OpenAiChatCompletionsAdaptor,
+                "OpenAI Chat Completions",
+                "chatcmpl",
+            ),
+        )
+        .route(
+            PATHS[1],
+            text(OpenAiResponsesAdaptor, "OpenAI Responses", "resp"),
+        )
+        .route(
+            PATHS[2],
+            text(AnthropicMessagesAdaptor, "Anthropic Messages", "msg"),
+        )
+        .route(
+            PATHS[3],
+            text(OpenAiCompletionsAdaptor, "OpenAI Completions", "cmpl"),
+        )
         .with_state(state)
+}
+
+/// Serve `adaptor`'s wire format as a local text job on the loaded model.
+fn text<A>(adaptor: A, surface: &'static str, id: &'static str) -> MethodRouter<Arc<TextState>>
+where
+    A: WireAdaptor + Copy + Send + Sync + 'static,
+    A::ParsedRequest: Send + 'static,
+    A::StreamState: Send + 'static,
+{
+    post(
+        move |State(state): State<Arc<TextState>>, body: Bytes| async move {
+            let model = state.model_name.clone();
+            let backend = super::backend::GatewayBackend::new(state);
+            let context = super::dispatch::render_context(id);
+            super::dispatch::serve(adaptor, surface, context, backend, Some(&model), &body).await
+        },
+    )
 }
 
 pub(super) struct TextState {

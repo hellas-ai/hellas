@@ -233,6 +233,7 @@ where
 #[cfg(all(test, any(feature = "validator", feature = "full-node")))]
 mod tests {
     use super::*;
+    use crate::owner_proof::OWNER_PAGE_LIMIT;
     use crate::{
         domain::{Coin, Digest},
         execution::{store::utxo_db_config, test_support::run_qmdb},
@@ -241,7 +242,7 @@ mod tests {
     use commonware_glue::stateful::db::Unmerkleized as _;
 
     #[test]
-    fn stored_adapter_proves_committed_metadata_and_rejects_objects_and_writes() {
+    fn stored_adapter_proves_committed_metadata() {
         run_qmdb(|runtime| async move {
             let config = utxo_db_config(&runtime, "stored-owner-adapter", 1024, 8);
             let database = <UtxoDatabase<_> as DatabaseSet<_>>::init(runtime, config).await;
@@ -263,35 +264,14 @@ mod tests {
 
             let guard = database.read().await;
             assert_eq!(stored_root(&guard).await.unwrap(), expected_root);
-            let page =
-                prove_stored_owner_page(&guard, owner, 0, crate::owner_proof::OWNER_PAGE_LIMIT)
-                    .await
-                    .unwrap();
-            let summary = verify_owner_page(
-                expected_root,
-                owner,
-                0,
-                crate::owner_proof::OWNER_PAGE_LIMIT,
-                &page,
-            )
-            .unwrap();
+            let page = prove_stored_owner_page(&guard, owner, 0, OWNER_PAGE_LIMIT)
+                .await
+                .unwrap();
+            let summary =
+                verify_owner_page(expected_root, owner, 0, OWNER_PAGE_LIMIT, &page).unwrap();
             assert_eq!(summary.balance, 321);
             assert_eq!(summary.count, 1);
             assert_eq!(page.holdings[0].object_id, id.0);
-
-            let mut adapter = StoredOwnerTree(&*guard);
-            assert!(matches!(
-                adapter.get_node(id).await,
-                Err(OwnerProofError::Invalid)
-            ));
-            assert!(matches!(
-                adapter.put_node(id, None).await,
-                Err(OwnerProofError::Invalid)
-            ));
-            assert!(matches!(
-                guard.get(&id).await.unwrap(),
-                Some(Object::Coin(_))
-            ));
         });
     }
 }

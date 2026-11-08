@@ -1,9 +1,8 @@
 //! Caller purchase/report state. This contains identifiers only, never input or output.
-use super::super::{job::Job, paid_client::PaidWorkOptions};
+use super::super::job::Job;
 use hellas_auth::Digest;
 use hellas_auth::authority::PrincipalId;
-use hellas_channel::work_store::{ChannelRecord, ChannelStore, Role, SetupStore, TerminalOutcome};
-use hellas_kernel::{EdgeId, Secp256k1Verifier};
+use hellas_kernel::EdgeId;
 use hellas_private::Durability;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -80,16 +79,6 @@ impl PaidAttemptPath {
 #[derive(Debug, thiserror::Error)]
 pub enum PurchaseError {
     #[error(
-        "already paid (work {work}, price {price}), result lost. No new charge. Use --buy-again to deliberately purchase again, or transact --settle to close the channel."
-    )]
-    ResultLost { work: Digest, price: u64 },
-    #[error("this tracked purchase was already reported; create a new attempt to buy again")]
-    AlreadyReported,
-    #[error(
-        "this tracked purchase was rejected without payment; create a new attempt to try again"
-    )]
-    Rejected,
-    #[error(
         "unfinished purchase {work} cannot resume: {reason}. No new charge. Resume or settle the original channel."
     )]
     Unfinished { work: String, reason: &'static str },
@@ -101,40 +90,43 @@ pub enum PurchaseError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
-    #[error(transparent)]
-    Store(#[from] hellas_channel::work_store::WorkStoreError),
-    #[error(transparent)]
-    Setup(#[from] hellas_channel::model::setup::WorkSetupError),
 }
 type Result<T> = std::result::Result<T, PurchaseError>;
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-enum Phase {
-    InputBound,
-    TargetBound,
-    ChannelBound,
-    Running,
-    Paying,
-    Paid,
-    Reported,
-    Rejected,
-}
+/// A record's state is which facts it holds: a target before funding, a
+/// proposal before the request leaves, and an outcome once work is terminal.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Record {
     job: [u8; 32],
     price: u64,
-    channel: [u8; 32],
-    bond: [u8; 32],
-    nonce: u64,
-    work: Option<[u8; 32]>,
-    phase: Phase,
+    attempt_nonce: [u8; 32],
     #[serde(default, skip_serializing_if = "Option::is_none")]
     target: Option<PurchaseTarget>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    request_commitment: Option<[u8; 32]>,
+    proposal: Option<Proposal>,
+}
+
+/// Written once, before the proposal can leave the process, so recovery reuses
+/// this exact nonce and attaches only an acceptance of this exact request.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct Proposal {
+    channel: [u8; 32],
+    bond: [u8; 32],
+    nonce: u64,
+    request_commitment: [u8; 32],
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    attempt_nonce: Option<[u8; 32]>,
+    outcome: Option<Outcome>,
+}
+
+/// Terminal work, kept so a paid attempt whose result was lost is refused
+/// offline and the completion receipt can be bound to its work.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct Outcome {
+    work: [u8; 32],
+    paid: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -161,21 +153,16 @@ pub struct Purchase {
     durability: Durability,
     state_key: String,
     _lock: PurchaseLock,
-    job: [u8; 32],
-    price: u64,
-    record: Option<Record>,
+    record: Record,
 }
 impl Purchase {
     pub(crate) fn bound_channel(&self) -> Option<(Digest, EdgeId)> {
-        self.record
-            .as_ref()
-            .filter(|record| !matches!(record.phase, Phase::InputBound | Phase::TargetBound))
-            .map(|record| {
-                (
-                    Digest::from_bytes(record.channel),
-                    EdgeId::from_bytes(record.bond),
-                )
-            })
+        self.record.proposal.as_ref().map(|proposal| {
+            (
+                Digest::from_bytes(proposal.channel),
+                EdgeId::from_bytes(proposal.bond),
+            )
+        })
     }
     /// Open a caller-owned attempt without clearing a terminal record.
     pub(crate) fn open_tracked(path: &PaidAttemptPath, job: &Job) -> Result<Self> {
@@ -187,35 +174,6 @@ impl Purchase {
     }
 
     fn open_tracked_inner(path: &PaidAttemptPath, job: &Job, create: bool) -> Result<Self> {
-        let mut purchase = Self::open_identity(path, job.digest(), job.price())?;
-        if let Some(record) = &purchase.record
-            && (record.attempt_nonce.is_none()
-                || (record.nonce != 0 && record.request_commitment.is_none()))
-        {
-            return Err(PurchaseError::Identity);
-        }
-        if purchase.record.is_none() {
-            if !create {
-                return Err(PurchaseError::Identity);
-            }
-            purchase.record = Some(Record {
-                job: purchase.job,
-                price: purchase.price,
-                channel: [0; 32],
-                bond: [0; 32],
-                nonce: 0,
-                work: None,
-                phase: Phase::InputBound,
-                target: None,
-                request_commitment: None,
-                attempt_nonce: Some(rand::random()),
-            });
-            purchase.persist()?;
-        }
-        Ok(purchase)
-    }
-
-    fn open_identity(path: &PaidAttemptPath, job: Digest, price: u64) -> Result<Self> {
         let state_key = path.state_key().to_owned();
         let durability = path.durability();
         let path = path.as_path();
@@ -224,35 +182,37 @@ impl Purchase {
         let lock = hellas_private::open_lock_beside(path)?;
         lock.try_lock().map_err(|_| PurchaseError::Busy)?;
         let lock = PurchaseLock(lock);
-        let record: Option<Record> = match hellas_private::read_bounded_regular_file(path, 4096) {
-            Ok(bytes) => Some(serde_json::from_slice(&bytes)?),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        let (record, created) = match hellas_private::read_bounded_regular_file(path, 4096) {
+            Ok(bytes) => (serde_json::from_slice::<Record>(&bytes)?, false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => (
+                Record {
+                    job: *job.digest().as_bytes(),
+                    price: job.price(),
+                    attempt_nonce: rand::random(),
+                    target: None,
+                    proposal: None,
+                },
+                true,
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(PurchaseError::Identity);
+            }
             Err(error) => return Err(error.into()),
         };
-        if let Some(record) = &record
-            && (record.job != *job.as_bytes()
-                || record.price != price
-                || (record.nonce == 0
-                    && !matches!(
-                        record.phase,
-                        Phase::InputBound | Phase::TargetBound | Phase::ChannelBound
-                    ))
-                || (matches!(
-                    record.phase,
-                    Phase::Paying | Phase::Paid | Phase::Reported | Phase::Rejected
-                ) && record.work.is_none()))
-        {
+        if record.job != *job.digest().as_bytes() || record.price != job.price() {
             return Err(PurchaseError::Identity);
         }
-        Ok(Self {
+        let purchase = Self {
             path: path.to_owned(),
             durability,
             state_key,
             _lock: lock,
-            job: *job.as_bytes(),
-            price,
             record,
-        })
+        };
+        if created {
+            purchase.persist()?;
+        }
+        Ok(purchase)
     }
 
     pub(crate) fn ensure_state_key(&self, state_key: &str) -> Result<()> {
@@ -266,76 +226,58 @@ impl Purchase {
         self.ensure_state_key(&session.state_key())
     }
 
-    pub(super) fn ensure_executable(&self) -> Result<()> {
-        match self.record.as_ref() {
-            Some(record) if record.phase == Phase::Reported => Err(PurchaseError::AlreadyReported),
-            Some(record) if record.phase == Phase::Rejected => Err(PurchaseError::Rejected),
-            Some(record) if record.phase == Phase::Paid => Err(PurchaseError::ResultLost {
-                work: Digest::from_bytes(record.work.ok_or(PurchaseError::Identity)?),
-                price: record.price,
-            }),
-            _ => Ok(()),
-        }
-    }
-
     /// Bind a target before funding. Returns true only when this handle wrote
     /// a new binding; an existing binding never authorizes fresh funding.
     pub(crate) fn bind_target(&mut self, target: PurchaseTarget) -> Result<bool> {
-        let record = self.record.as_mut().ok_or(PurchaseError::Identity)?;
-        if record.phase == Phase::InputBound && record.target.is_none() {
-            record.target = Some(target);
-            record.phase = Phase::TargetBound;
-            self.persist()?;
-            return Ok(true);
-        }
-        if record.target.as_ref() == Some(&target) {
-            Ok(false)
-        } else {
-            Err(PurchaseError::Identity)
+        match &self.record.target {
+            None => {
+                self.record.target = Some(target);
+                self.persist()?;
+                Ok(true)
+            }
+            Some(held) if *held == target => Ok(false),
+            Some(_) => Err(PurchaseError::Identity),
         }
     }
 
     pub(crate) fn has_target(&self) -> bool {
-        self.record
-            .as_ref()
-            .is_some_and(|record| record.target.is_some())
+        self.record.target.is_some()
     }
     pub(crate) fn matches_target(&self, target: &PurchaseTarget) -> bool {
-        self.record
-            .as_ref()
-            .and_then(|record| record.target.as_ref())
-            == Some(target)
+        self.record.target.as_ref() == Some(target)
     }
     pub(crate) fn work_id(&self) -> Option<Digest> {
+        self.outcome().map(|(work, _)| work)
+    }
+    /// Terminal work and whether it was paid.
+    pub(crate) fn outcome(&self) -> Option<(Digest, bool)> {
         self.record
+            .proposal
             .as_ref()
-            .and_then(|record| record.work)
-            .map(Digest::from_bytes)
+            .and_then(|proposal| proposal.outcome)
+            .map(|outcome| (Digest::from_bytes(outcome.work), outcome.paid))
     }
 
-    /// Recover the accepted identity after the channel journal was committed
-    /// but before the caller marker's work ID was saved. Channel replay has
-    /// checked both signatures. The request commitment distinguishes this
+    /// Recover the accepted identity from the channel journal, which is
+    /// committed before the caller marker records an outcome. Channel replay
+    /// has checked both signatures. The request commitment distinguishes this
     /// intent from a later attempt that reused a nonce never proposed here.
     pub(crate) fn accepted_work(
         &self,
         state: &hellas_channel::work_store::Channel,
     ) -> Result<Option<Digest>> {
-        let Some(record) = &self.record else {
+        let Some(proposal) = &self.record.proposal else {
             return Ok(None);
         };
-        if record.nonce == 0 {
-            return Ok(None);
-        }
         let channel = state.channel().id();
-        if record.channel != *channel.as_bytes() {
+        if proposal.channel != *channel.as_bytes() {
             return Err(PurchaseError::Identity);
         }
         let Some(job) = state
             .jobs()
-            .find(|job| job.authorization().proposal_nonce == record.nonce)
+            .find(|job| job.authorization().proposal_nonce == proposal.nonce)
         else {
-            return if record.nonce <= state.proposal_nonce_high_water() {
+            return if proposal.nonce <= state.proposal_nonce_high_water() {
                 Err(self.unfinished(
                     "the proposal nonce was consumed but no active request-bound acceptance remains",
                 ))
@@ -344,16 +286,13 @@ impl Purchase {
             };
         };
         let authorization = job.authorization();
-        if authorization.channel_id != channel || authorization.price != record.price {
+        if authorization.channel_id != channel || authorization.price != self.record.price {
             return Err(PurchaseError::Identity);
         }
         if job.provider_signature().is_none() {
             return Ok(None);
         }
-        if record.attempt_nonce.is_none()
-            || record.request_commitment
-                != Some(*authorization.request_commitment.digest().as_bytes())
-        {
+        if proposal.request_commitment != *authorization.request_commitment.digest().as_bytes() {
             return Err(PurchaseError::Identity);
         }
         // Retained input additionally checks this job and attempt's request
@@ -365,40 +304,35 @@ impl Purchase {
                 MAX_INVOCATION_BYTES,
             )
             .map_err(|_| PurchaseError::Identity)?;
-            if prepared.request.nonce != self.request_nonce(channel, record.nonce) {
+            if prepared.request.nonce != self.request_nonce(channel, proposal.nonce) {
                 return Err(PurchaseError::Identity);
             }
         }
         Ok(Some(job.work_id()))
     }
 
-    /// A recorded nonce is an irrevocable proposal intent for tracked attempts.
+    /// A recorded proposal is an irrevocable intent for tracked attempts.
     pub(crate) fn has_proposal_intent(&self) -> bool {
-        self.record.as_ref().is_some_and(|record| record.nonce != 0)
+        self.record.proposal.is_some()
     }
 
     pub(super) fn request_nonce(&self, channel: Digest, nonce: u64) -> [u8; 32] {
         crate::job::purchase_nonce(
-            Digest::from_bytes(self.job),
+            Digest::from_bytes(self.record.job),
             channel,
             nonce,
-            self.record
-                .as_ref()
-                .and_then(|record| record.attempt_nonce.as_ref()),
+            Some(&self.record.attempt_nonce),
         )
     }
 
-    pub(crate) fn bind_channel(&mut self, channel: Digest, bond: EdgeId) -> Result<()> {
-        let record = self.record.as_mut().ok_or(PurchaseError::Identity)?;
-        if record.target.is_none() {
-            return Err(PurchaseError::Identity);
-        }
-        if record.phase == Phase::TargetBound {
-            record.channel = *channel.as_bytes();
-            record.bond = bond.to_bytes();
-            record.phase = Phase::ChannelBound;
-            self.persist()?;
-        } else if record.channel != *channel.as_bytes() || record.bond != bond.to_bytes() {
+    /// Check a session's channel against the target and any recorded proposal.
+    /// Before a proposal, any retained channel to the target may serve it.
+    pub(crate) fn ensure_channel(&self, channel: Digest, bond: EdgeId) -> Result<()> {
+        if self.record.target.is_none()
+            || self.record.proposal.as_ref().is_some_and(|proposal| {
+                proposal.channel != *channel.as_bytes() || proposal.bond != bond.to_bytes()
+            })
+        {
             return Err(PurchaseError::Identity);
         }
         Ok(())
@@ -407,170 +341,21 @@ impl Purchase {
     fn unfinished(&self, reason: &'static str) -> PurchaseError {
         PurchaseError::Unfinished {
             work: self
-                .record
-                .as_ref()
-                .and_then(|r| r.work)
-                .map(Digest::from_bytes)
+                .work_id()
                 .map_or_else(|| "not yet accepted".into(), |id| id.to_string()),
             reason,
         }
     }
 
-    /// Resolve the crash window between payment intent and payment completion
-    /// from the existing signed channel journal, even after channel settlement.
-    pub async fn reconcile(&mut self, options: &PaidWorkOptions) -> Result<()> {
-        self.ensure_state_key(&options.config.chain.state_key())?;
-        let Some(record) = self.record.clone() else {
-            return Ok(());
-        };
-        if matches!(
-            record.phase,
-            Phase::InputBound | Phase::TargetBound | Phase::ChannelBound
-        ) {
-            return Err(self.unfinished("target or channel binding is incomplete"));
-        }
-        if matches!(
-            record.phase,
-            Phase::Paid | Phase::Reported | Phase::Rejected
-        ) {
-            return Ok(());
-        }
-        if !options.journal_root().exists() {
-            return Err(self.unfinished("channel journal is missing"));
-        }
-        let found = hellas_channel::work_store::discover_setups(
-            &options.journal_root(),
-            options.config.network(),
-        )
-        .await?;
-        if !found.unidentified.is_empty()
-            || !found.setups.iter().any(|setup| {
-                setup.role == Role::Client && setup.bond_edge.to_bytes() == record.bond
-            })
-        {
-            return Err(self.unfinished("its setup journal is unavailable"));
-        }
-        let setup = SetupStore::open(
-            &options.journal_root(),
-            options.config.network(),
-            EdgeId::from_bytes(record.bond),
-            Role::Client,
-            &Secp256k1Verifier::new(),
-        )
-        .await?;
-        let setup = setup.into_state().await;
-        let descriptor = setup
-            .close_descriptor()
-            .ok_or_else(|| self.unfinished("channel descriptor is missing"))?;
-        if descriptor.channel().id().as_bytes() != &record.channel {
-            return Err(PurchaseError::Identity);
-        }
-        let origin = setup
-            .origin()
-            .ok_or_else(|| self.unfinished("channel origin is missing"))?;
-        let channel = descriptor.channel().clone();
-        let settlement = descriptor.expected_settlement()?;
-        let mut store = ChannelStore::open(
-            &options.journal_root(),
-            channel,
-            settlement,
-            Role::Client,
-            origin,
-            options.content.clone(),
-            &Secp256k1Verifier::new(),
-        )
-        .await?;
-        let result = async {
-            if let Some(work) = record.work.map(Digest::from_bytes)
-                && let Some((result, _)) =
-                    store.state().job_by_id(work).and_then(|job| job.result())
-                && result.outcome == hellas_channel::model::work::ResultOutcome::Failed
-            {
-                let outcome = TerminalOutcome::Rejected {
-                    result_digest: hellas_channel::model::work::result_digest(
-                        store.state().channel(),
-                        result,
-                    ),
-                    evidence_digest: result.transcript_content.id().digest(),
-                };
-                store
-                    .commit(
-                        ChannelRecord::JobTerminated {
-                            work_id: work,
-                            outcome,
-                        },
-                        &Secp256k1Verifier::new(),
-                    )
-                    .await?;
-            }
-            if let Some(work) = record.work.map(Digest::from_bytes)
-                && store.state().terminal_by_id(work).is_some_and(|terminal| {
-                    matches!(
-                        terminal.outcome,
-                        TerminalOutcome::Rejected { .. } | TerminalOutcome::Expired { .. }
-                    )
-                })
-            {
-                return self.unpaid(work);
-            }
-            if let Some(work) = record.work.map(Digest::from_bytes)
-                && store.state().terminal_by_id(work).is_some_and(|terminal| {
-                    matches!(terminal.outcome, TerminalOutcome::Certified { .. })
-                })
-            {
-                self.record.as_mut().ok_or(PurchaseError::Identity)?.phase = Phase::Paid;
-                self.persist()?;
-                return Err(PurchaseError::ResultLost {
-                    work,
-                    price: self.price,
-                });
-            }
-            if let Some(job) = store
-                .state()
-                .jobs()
-                .find(|job| job.authorization().proposal_nonce == record.nonce)
-            {
-                if job.authorization().payment_deadline < store.state().cursor().0
-                    || (job.phase() == hellas_channel::work_store::JobPhase::HalfSigned
-                        && job.authorization().acceptance_deadline < store.state().cursor().0)
-                {
-                    return Err(self.unfinished("its authorization expired"));
-                }
-                if record
-                    .work
-                    .is_some_and(|id| id != *job.work_id().as_bytes())
-                {
-                    return Err(PurchaseError::Identity);
-                }
-                return Ok(());
-            }
-            if record.work.is_none()
-                && record.nonce == store.state().proposal_nonce_high_water().saturating_add(1)
-                && !store.state().is_closing()
-            {
-                return Ok(());
-            }
-            Err(self.unfinished("no unfinished authorized work remains"))
-        }
-        .await;
-        let closed = store.close().await;
-        result?;
-        closed?;
-        Ok(())
-    }
-
     pub(super) fn nonce(&self, channel: Digest) -> Result<Option<u64>> {
-        match &self.record {
-            Some(record)
-                if record.channel == *channel.as_bytes() && record.phase == Phase::ChannelBound =>
-            {
-                Ok(None)
-            }
-            Some(record) if record.channel == *channel.as_bytes() => Ok(Some(record.nonce)),
+        match &self.record.proposal {
+            Some(proposal) if proposal.channel == *channel.as_bytes() => Ok(Some(proposal.nonce)),
             Some(_) => Err(self.unfinished("the original channel is unavailable")),
             None => Ok(None),
         }
     }
+    /// Channel, bond, nonce and its exact request binding must survive
+    /// together, before any proposal can leave the process.
     pub(super) fn begin(
         &mut self,
         channel: Digest,
@@ -578,91 +363,49 @@ impl Purchase {
         nonce: u64,
         request_commitment: Digest,
     ) -> Result<()> {
-        let request_commitment = *request_commitment.as_bytes();
-        let record = self.record.as_mut().ok_or(PurchaseError::Identity)?;
-        if record.channel != *channel.as_bytes()
-            || record.bond != bond.to_bytes()
-            || (record.phase != Phase::ChannelBound && record.nonce != nonce)
-            || record
-                .request_commitment
-                .is_some_and(|held| held != request_commitment)
-        {
+        if self.record.target.is_none() {
             return Err(PurchaseError::Identity);
         }
-        if record.phase == Phase::ChannelBound || record.request_commitment.is_none() {
-            if record.phase == Phase::ChannelBound {
-                record.nonce = nonce;
-                record.phase = Phase::Running;
-            }
-            // Nonce and its exact request binding must survive together,
-            // before any proposal can leave the process.
-            record.request_commitment = Some(request_commitment);
-            self.persist()?;
-        }
-        Ok(())
-    }
-    pub(crate) fn accepting(&mut self, work: Digest) -> Result<()> {
-        self.advance(work, Phase::Running)
-    }
-    pub(crate) fn paying(&mut self, work: Digest) -> Result<()> {
-        self.advance(work, Phase::Paying)
-    }
-    pub(crate) fn paid(&mut self, work: Digest) -> Result<()> {
-        self.advance(work, Phase::Paid)
-    }
-    /// Clear only after the channel journal durably retires this unpaid result.
-    pub(crate) fn unpaid(&mut self, work: Digest) -> Result<()> {
-        let record = self.record.as_ref().ok_or(PurchaseError::Identity)?;
-        if record.work != Some(*work.as_bytes())
-            || matches!(record.phase, Phase::Paid | Phase::Reported)
-        {
-            return Err(PurchaseError::Identity);
-        }
-        self.record.as_mut().ok_or(PurchaseError::Identity)?.phase = Phase::Rejected;
-        self.persist()
-    }
-    /// Call only after all selected output writes and the result report succeed.
-    pub fn reported(&mut self) -> Result<()> {
-        let record = self.record.as_mut().ok_or(PurchaseError::Identity)?;
-        if record.phase == Phase::Reported {
-            return Ok(());
-        }
-        if record.phase != Phase::Paid {
-            return Err(PurchaseError::Identity);
-        }
-        record.phase = Phase::Reported;
-        self.persist()
-    }
-    fn advance(&mut self, work: Digest, phase: Phase) -> Result<()> {
-        let record = self.record.as_mut().ok_or(PurchaseError::Identity)?;
-        if record.work.is_some_and(|id| id != *work.as_bytes()) {
-            return Err(PurchaseError::Identity);
-        }
-        record.work = Some(*work.as_bytes());
-        record.phase = phase;
-        self.persist()
-    }
-    pub(crate) fn status(&self) -> Result<PurchaseStatus> {
-        let Some(record) = &self.record else {
-            return Ok(PurchaseStatus::Absent);
+        let proposal = Proposal {
+            channel: *channel.as_bytes(),
+            bond: bond.to_bytes(),
+            nonce,
+            request_commitment: *request_commitment.as_bytes(),
+            outcome: None,
         };
-        let work = record.work.map(Digest::from_bytes);
-        Ok(match record.phase {
-            Phase::InputBound => PurchaseStatus::InputBound,
-            Phase::TargetBound => PurchaseStatus::TargetBound,
-            Phase::ChannelBound => PurchaseStatus::ChannelBound,
-            Phase::Running => PurchaseStatus::Running { work },
-            Phase::Paying => PurchaseStatus::Paying {
-                work: work.ok_or(PurchaseError::Identity)?,
-            },
-            Phase::Paid | Phase::Reported => PurchaseStatus::Paid {
-                work: work.ok_or(PurchaseError::Identity)?,
-                reported: record.phase == Phase::Reported,
-            },
-            Phase::Rejected => PurchaseStatus::Rejected {
-                work: work.ok_or(PurchaseError::Identity)?,
-            },
-        })
+        match &self.record.proposal {
+            None => {
+                self.record.proposal = Some(proposal);
+                self.persist()
+            }
+            Some(held) if *held == proposal => Ok(()),
+            Some(_) => Err(PurchaseError::Identity),
+        }
+    }
+    /// Record only after the channel journal holds this work's payment.
+    pub(crate) fn paid(&mut self, work: Digest) -> Result<()> {
+        self.finish(work, true)
+    }
+    /// Record only after the channel journal durably retires this unpaid result.
+    pub(crate) fn unpaid(&mut self, work: Digest) -> Result<()> {
+        self.finish(work, false)
+    }
+    fn finish(&mut self, work: Digest, paid: bool) -> Result<()> {
+        let proposal = self
+            .record
+            .proposal
+            .as_mut()
+            .ok_or(PurchaseError::Identity)?;
+        let outcome = Outcome {
+            work: *work.as_bytes(),
+            paid,
+        };
+        match proposal.outcome {
+            None => proposal.outcome = Some(outcome),
+            Some(held) if held == outcome => return Ok(()),
+            Some(_) => return Err(PurchaseError::Identity),
+        }
+        self.persist()
     }
 
     /// The selected store's policy, shared by this attempt's sidecars.
@@ -674,24 +417,10 @@ impl Purchase {
         self.durability.write_atomically(
             &self.path,
             ".writing",
-            &serde_json::to_vec(self.record.as_ref().ok_or(PurchaseError::Identity)?)?,
+            &serde_json::to_vec(&self.record)?,
         )?;
         Ok(())
     }
-}
-
-/// Local purchase facts. An absent marker cannot establish whether an older
-/// application attempt existed before its metadata was retained.
-#[derive(Debug, PartialEq, Eq)]
-pub enum PurchaseStatus {
-    Absent,
-    InputBound,
-    TargetBound,
-    ChannelBound,
-    Running { work: Option<Digest> },
-    Paying { work: Digest },
-    Paid { work: Digest, reported: bool },
-    Rejected { work: Digest },
 }
 
 #[cfg(test)]
@@ -702,102 +431,35 @@ mod tests {
         PaidAttemptPath::test(path.to_owned())
     }
 
-    #[test]
-    fn tracked_open_requires_attempt_and_proposed_request_bindings() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("attempt");
-        let job = job();
-        drop(Purchase::open_tracked(&tracked(&path), &job).unwrap());
-        let initial: Record = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        for phase in [
-            Phase::InputBound,
-            Phase::TargetBound,
-            Phase::ChannelBound,
-            Phase::Running,
-        ] {
-            for work in [None, Some([7; 32])] {
-                let mut record = initial.clone();
-                record.phase = phase;
-                record.work = work;
-                if phase == Phase::Running {
-                    record.nonce = 1;
-                    record.request_commitment = Some([4; 32]);
-                }
-                for field in ["attempt_nonce", "request_commitment"] {
-                    if field == "request_commitment" && record.nonce == 0 {
-                        continue;
-                    }
-                    let mut missing = record.clone();
-                    if field == "attempt_nonce" {
-                        missing.attempt_nonce = None;
-                    } else {
-                        missing.request_commitment = None;
-                    }
-                    let bytes = serde_json::to_vec(&missing).unwrap();
-                    hellas_private::write_atomically(&path, ".writing", &bytes).unwrap();
-                    assert!(
-                        matches!(
-                            Purchase::open_existing_tracked(&tracked(&path), &job),
-                            Err(PurchaseError::Identity)
-                        ),
-                        "{phase:?} {field}, known work: {}",
-                        work.is_some()
-                    );
-                    assert_eq!(std::fs::read(&path).unwrap(), bytes);
-                }
-            }
-        }
-        // An unproposed current attempt has an attempt identity but no request yet.
-        for phase in [Phase::InputBound, Phase::TargetBound, Phase::ChannelBound] {
-            let mut record = initial.clone();
-            record.phase = phase;
-            hellas_private::write_atomically(
-                &path,
-                ".writing",
-                &serde_json::to_vec(&record).unwrap(),
-            )
-            .unwrap();
-            drop(Purchase::open_existing_tracked(&tracked(&path), &job).unwrap());
+    fn target() -> PurchaseTarget {
+        PurchaseTarget {
+            network: "fixture".into(),
+            provider: hellas_client::ProviderAddress {
+                enrollment: hellas_rpc::ContentId::hash(b"provider"),
+                node: iroh::SecretKey::from_bytes(&[1; 32]).public(),
+            },
         }
     }
 
     #[test]
-    fn tracked_terminal_records_survive_reopen_and_cannot_execute_again() {
+    fn tracked_outcomes_survive_reopen_and_cannot_change() {
         let root = tempfile::tempdir().unwrap();
         let job = job();
         let channel = Digest::from_bytes([1; 32]);
+        let bond = EdgeId::from_bytes([2; 32]);
         let work = Digest::from_bytes([7; 32]);
-        for reported in [false, true] {
-            let path = root
-                .path()
-                .join(if reported { "reported" } else { "rejected" });
+        for paid in [false, true] {
+            let path = root.path().join(if paid { "paid" } else { "rejected" });
             {
                 let mut purchase = Purchase::open_tracked(&tracked(&path), &job).unwrap();
+                purchase.bind_target(target()).unwrap();
                 purchase
-                    .bind_target(PurchaseTarget {
-                        network: "fixture".into(),
-                        provider: hellas_client::ProviderAddress {
-                            enrollment: hellas_rpc::ContentId::hash(b"provider"),
-                            node: iroh::SecretKey::from_bytes(&[1; 32]).public(),
-                        },
-                    })
+                    .begin(channel, bond, 3, Digest::from_bytes([4; 32]))
                     .unwrap();
-                purchase
-                    .bind_channel(channel, EdgeId::from_bytes([2; 32]))
-                    .unwrap();
-                purchase
-                    .begin(
-                        channel,
-                        EdgeId::from_bytes([2; 32]),
-                        3,
-                        Digest::from_bytes([4; 32]),
-                    )
-                    .unwrap();
-                purchase.accepting(work).unwrap();
-                if reported {
+                if paid {
                     purchase.paid(work).unwrap();
-                    purchase.reported().unwrap();
-                    purchase.reported().unwrap();
+                    purchase.paid(work).unwrap();
+                    assert!(purchase.unpaid(work).is_err());
                 } else {
                     purchase.unpaid(work).unwrap();
                 }
@@ -809,66 +471,40 @@ mod tests {
                     .contains("private-input-sentinel")
             );
             let recovered = Purchase::open_existing_tracked(&tracked(&path), &job).unwrap();
-            assert_eq!(
-                recovered.bound_channel().map(|(found, _)| found),
-                Some(channel)
-            );
-            assert_eq!(
-                recovered.status().unwrap(),
-                if reported {
-                    PurchaseStatus::Paid {
-                        work,
-                        reported: true,
-                    }
-                } else {
-                    PurchaseStatus::Rejected { work }
-                }
-            );
-            drop(recovered);
-            let purchase = Purchase::open_tracked(&tracked(&path), &job).unwrap();
-            assert!(matches!(
-                purchase.ensure_executable(),
-                Err(PurchaseError::AlreadyReported | PurchaseError::Rejected)
-            ));
+            assert_eq!(recovered.bound_channel(), Some((channel, bond)));
+            assert_eq!(recovered.outcome(), Some((work, paid)));
+            assert!(recovered.has_proposal_intent());
         }
     }
 
     #[test]
-    fn tracked_target_and_channel_bindings_cannot_change() {
+    fn tracked_target_and_proposal_bindings_cannot_change() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("purchase");
         let job = job();
-        let target = PurchaseTarget {
-            network: "fixture".into(),
-            provider: hellas_client::ProviderAddress {
-                enrollment: hellas_rpc::ContentId::hash(b"provider"),
-                node: iroh::SecretKey::from_bytes(&[1; 32]).public(),
-            },
-        };
         let channel = Digest::from_bytes([1; 32]);
         let bond = EdgeId::from_bytes([2; 32]);
         {
             let mut attempt = Purchase::open_tracked(&tracked(&path), &job).unwrap();
-            assert!(attempt.bind_target(target.clone()).unwrap());
-            assert!(!attempt.bind_target(target.clone()).unwrap());
-            let mut other = target.clone();
+            assert!(attempt.bind_target(target()).unwrap());
+            assert!(!attempt.bind_target(target()).unwrap());
+            let mut other = target();
             other.network = "other".into();
             assert!(attempt.bind_target(other).is_err());
-            attempt.bind_channel(channel, bond).unwrap();
-            attempt.bind_channel(channel, bond).unwrap();
-            assert!(
-                attempt
-                    .bind_channel(Digest::from_bytes([8; 32]), bond)
-                    .is_err()
-            );
         }
         let mut attempt = Purchase::open_tracked(&tracked(&path), &job).unwrap();
-        assert!(!attempt.bind_target(target).unwrap());
+        assert!(!attempt.bind_target(target()).unwrap());
         assert_eq!(attempt.nonce(channel).unwrap(), None);
         attempt
             .begin(channel, bond, 3, Digest::from_bytes([4; 32]))
             .unwrap();
         assert_eq!(attempt.nonce(channel).unwrap(), Some(3));
+        attempt.ensure_channel(channel, bond).unwrap();
+        assert!(
+            attempt
+                .ensure_channel(Digest::from_bytes([8; 32]), bond)
+                .is_err()
+        );
         let before = std::fs::read(&path).unwrap();
         assert!(
             attempt
@@ -876,7 +512,6 @@ mod tests {
                 .is_err()
         );
         assert_eq!(std::fs::read(&path).unwrap(), before);
-        assert!(attempt.has_proposal_intent());
         drop(attempt);
         assert!(
             Purchase::open_tracked(&tracked(&path), &job)

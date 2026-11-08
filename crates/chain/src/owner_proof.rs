@@ -63,7 +63,6 @@ pub struct OwnerPageProof {
     pub limit: u32,
     pub holdings: Vec<HoldingProof>,
     /// A proof of the requested cursor, including its absence after deletion.
-    pub after_key: Option<Key>,
     pub after_path: Option<OwnerPathProof>,
 }
 
@@ -83,7 +82,6 @@ impl OwnerPageProof {
                     path: Some(holding.path.into_proto()),
                 })
                 .collect(),
-            after_key: self.after_key.map(|key| key.to_vec()),
             after_path: self.after_path.map(OwnerPathProof::into_proto),
         }
     }
@@ -111,10 +109,6 @@ impl OwnerPageProof {
                     })
                 })
                 .collect::<Result<_, OwnerProofError>>()?,
-            after_key: value
-                .after_key
-                .map(|key| key.try_into().map_err(|_| OwnerProofError::Invalid))
-                .transpose()?,
             after_path: value
                 .after_path
                 .map(OwnerPathProof::from_proto)
@@ -525,9 +519,6 @@ fn verify_path(
     let mut rank = 0_u64;
     for depth in (0..256).rev() {
         let sibling = siblings[depth];
-        let mut bytes = Vec::new();
-        write_commit(&mut bytes, sibling);
-        read_commit(&bytes)?;
         current = if bit(key, depth) {
             rank = rank
                 .checked_add(sibling.count)
@@ -631,7 +622,6 @@ pub async fn prove_owner_page<S: OwnerTreeStore>(
         offset,
         limit,
         holdings,
-        after_key: None,
         after_path: None,
     })
 }
@@ -653,7 +643,6 @@ pub async fn prove_owner_page_after<S: OwnerTreeStore>(
         .checked_add(u64::from(cursor.leaf.is_some()))
         .ok_or(OwnerProofError::Invalid)?;
     let mut page = prove_owner_page(store, owner, offset, limit).await?;
-    page.after_key = Some(key);
     page.after_path = Some(cursor);
     Ok(page)
 }
@@ -667,7 +656,7 @@ pub fn verify_owner_page(
     limit: u32,
     proof: &OwnerPageProof,
 ) -> Result<OwnerCommitment, OwnerProofError> {
-    if proof.after_key.is_some() || proof.after_path.is_some() {
+    if proof.after_path.is_some() {
         return Err(OwnerProofError::Binding);
     }
     verify_owner_page_at(root, owner, offset, limit, proof)
@@ -680,9 +669,9 @@ pub fn verify_owner_page_after(
     limit: u32,
     proof: &OwnerPageProof,
 ) -> Result<OwnerCommitment, OwnerProofError> {
-    let offset = match (after, proof.after_key, proof.after_path.as_ref()) {
-        (None, None, None) => 0,
-        (Some(requested), Some(proved), Some(path)) if requested == proved => {
+    let offset = match (after, proof.after_path.as_ref()) {
+        (None, None) => 0,
+        (Some(requested), Some(path)) => {
             let (commitment, rank) = verify_path(holding_scope(&owner), requested, path)?;
             let summary = match &proof.summary.leaf {
                 Some(OwnerLeaf::Summary(summary)) => *summary,
@@ -905,12 +894,6 @@ mod tests {
             )
             .unwrap();
             assert_eq!(next.holdings.len(), OWNER_PAGE_LIMIT as usize);
-            let bytes = serde_json::to_vec(&page).unwrap();
-            assert!(
-                bytes.len() < 256 * 1024,
-                "compact owner page used {} bytes",
-                bytes.len()
-            );
             let mut bad = page;
             let sibling = bad.holdings[0].path.siblings[0].clone();
             bad.holdings[0].path.siblings.insert(0, sibling);

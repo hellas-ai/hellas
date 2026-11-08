@@ -2981,13 +2981,25 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 name = "hellas-adaptors"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "futures-core",
  "futures-executor",
  "futures-util",
+ "hellas-auth",
+ "hellas-executor",
  "hellas-rpc",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "hellas-admission"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3042,6 +3054,7 @@ dependencies = [
  "flate2",
  "futures",
  "getrandom 0.4.3",
+ "hellas-admission",
  "hellas-attestation",
  "hellas-auth",
  "hellas-authority",
@@ -3174,7 +3187,6 @@ dependencies = [
  "commonware-cryptography",
  "commonware-runtime",
  "futures",
- "hellas-adaptors",
  "hellas-attestation",
  "hellas-auth",
  "hellas-authority",
@@ -3235,7 +3247,6 @@ dependencies = [
  "catena-models",
  "ciborium",
  "futures",
- "hellas-adaptors",
  "hellas-attestation",
  "hellas-auth",
  "hellas-authority",
@@ -3451,6 +3462,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "tempfile",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
  "tracing",
@@ -3459,38 +3471,6 @@ dependencies = [
  "url",
  "webpki-roots",
  "x509-cert",
-]
-
-[[package]]
-name = "hellas-reseller"
-version = "0.1.0"
-dependencies = [
- "axum",
- "futures",
- "hellas-adaptors",
- "hellas-attestation",
- "hellas-auth",
- "hellas-authority",
- "hellas-channel",
- "hellas-executor",
- "hellas-kernel",
- "hellas-private",
- "hellas-providers",
- "hellas-rpc",
- "hellas-sdk",
- "hellas-store",
- "iroh",
- "rcgen",
- "reqwest",
- "rustls",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tokio-rustls",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -3593,6 +3573,37 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "zeroize",
+]
+
+[[package]]
+name = "hellas-share"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "futures",
+ "hellas-adaptors",
+ "hellas-attestation",
+ "hellas-auth",
+ "hellas-authority",
+ "hellas-channel",
+ "hellas-executor",
+ "hellas-kernel",
+ "hellas-private",
+ "hellas-providers",
+ "hellas-rpc",
+ "hellas-sdk",
+ "hellas-store",
+ "iroh",
+ "rcgen",
+ "reqwest",
+ "rustls",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

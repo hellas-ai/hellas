@@ -181,11 +181,7 @@ impl OfferHost {
         for definition in common_node::budgets(
             common_node::POOL,
             grantee,
-            vec![Limit {
-                meter: Meter::OutputTokens,
-                window: Window::Total,
-                amount: 20,
-            }],
+            vec![Limit::new(Meter::OutputTokens, Window::Total, 20)],
             1,
         )
         .into_iter()

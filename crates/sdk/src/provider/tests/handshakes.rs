@@ -11,6 +11,10 @@ use tokio::net::UdpSocket;
 const PROGRESS: Duration = Duration::from_secs(5);
 
 async fn provider() -> (tempfile::TempDir, ProviderHandle) {
+    provider_on(0).await
+}
+
+async fn provider_on(port: u16) -> (tempfile::TempDir, ProviderHandle) {
     let root = tempfile::tempdir().unwrap();
     let content = hellas_authority::test_support::content_store(root.path()).await;
     let secret_key = iroh::SecretKey::from_bytes(&[49; 32]);
@@ -24,7 +28,7 @@ async fn provider() -> (tempfile::TempDir, ProviderHandle) {
             FetchRouteRegistry::new(),
         ),
         grants: None,
-        port: Some(0),
+        port: Some(port),
         build: String::new(),
         graffiti: Vec::new(),
         discovery: false,
@@ -216,6 +220,40 @@ async fn completed_session_does_not_cancel_another_handshake() {
     client.close().await;
     other.close().await;
     provider.shutdown().await.unwrap();
+}
+
+/// A restart starts its successor as soon as `shutdown` returns, with the same
+/// identity and port. A peer that cannot acknowledge the close must not leave
+/// the old endpoint bound and refusing new handshakes for that identity.
+#[tokio::test]
+async fn shutdown_releases_the_identity_and_port_for_a_successor() {
+    let (_root, provider) = provider().await;
+    let address = socket(&provider);
+    let client = endpoint().await;
+    let mut paused = PausedHandshake::new(&provider, Ipv4Addr::LOCALHOST).await;
+    let unanswered = {
+        let endpoint = client.clone();
+        let target = paused.target.clone();
+        tokio::spawn(async move { endpoint.connect(target, Node::ALPN.as_bytes()).await })
+    };
+    paused.stalled().await;
+    provider.shutdown().await.unwrap();
+    let (_successor_root, successor) = provider_on(address.port()).await;
+    let connection = tokio::time::timeout(
+        PROGRESS,
+        client.connect(
+            EndpointAddr::new(successor.node_id()).with_ip_addr(address),
+            Node::ALPN.as_bytes(),
+        ),
+    )
+    .await
+    .expect("the successor answers its identity")
+    .unwrap();
+    info(&connection, successor.node_id()).await;
+    unanswered.abort();
+    drop(paused);
+    client.close().await;
+    successor.shutdown().await.unwrap();
 }
 
 // These fixtures bind separate addresses in Linux's 127/8 loopback range.

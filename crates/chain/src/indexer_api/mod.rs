@@ -537,6 +537,7 @@ fn proof_bundle(state: &OriginState, finalized: crate::FinalizedBlock) -> ProofB
 #[cfg(all(test, feature = "integration-tests"))]
 mod tests {
     use super::*;
+    use crate::owner_proof::OWNER_PAGE_LIMIT;
     use commonware_cryptography::Digestible as _;
     use commonware_runtime::Supervisor as _;
     use tower::ServiceExt as _;
@@ -804,8 +805,6 @@ mod tests {
                 object_ids: vec![Digest::from([1; 32]).to_vec()],
                 payload: None,
                 owner: None,
-                owner_offset: 0,
-                owner_limit: 0,
                 owner_after_key: None,
             };
             let response = app
@@ -838,7 +837,7 @@ mod tests {
             .await;
             assert!(
                 h.node
-                    .owner_proof(owner, 0, crate::owner_proof::OWNER_PAGE_LIMIT, None)
+                    .owner_proof(owner, 0, OWNER_PAGE_LIMIT, None)
                     .await
                     .unwrap()
                     .is_none()
@@ -851,23 +850,13 @@ mod tests {
             let first_block = h.head.clone();
             let first_address = h
                 .node
-                .owner_proof(
-                    owner,
-                    0,
-                    crate::owner_proof::OWNER_PAGE_LIMIT,
-                    Some(&first.payload),
-                )
+                .owner_proof(owner, 0, OWNER_PAGE_LIMIT, Some(&first.payload))
                 .await
                 .unwrap()
                 .unwrap();
             assert_eq!(
                 h.verifier
-                    .verify_address(
-                        first_address.bundle().clone(),
-                        owner,
-                        0,
-                        crate::owner_proof::OWNER_PAGE_LIMIT
-                    )
+                    .verify_address(first_address.bundle().clone(), owner, 0, OWNER_PAGE_LIMIT)
                     .unwrap()
                     .summary()
                     .count,
@@ -882,8 +871,6 @@ mod tests {
                 object_ids: Vec::new(),
                 payload: Some(first_block.digest().to_vec()),
                 owner: Some(owner.to_bytes().to_vec()),
-                owner_offset: 0,
-                owner_limit: 1,
                 owner_after_key: None,
             };
             let response = app
@@ -936,7 +923,7 @@ mod tests {
                     FinalizedBlockQuery::Payload(Digest::from(
                         <[u8; 32]>::try_from(hex::decode(&latest.payload).unwrap()).unwrap(),
                     )),
-                    Some((owner, 0, 1)),
+                    Some((owner, None)),
                 )
                 .unwrap();
             assert_eq!(verified_objects.owner_page().unwrap().1.count, 1);
@@ -963,7 +950,7 @@ mod tests {
                     <crate::proof_verify::AddressProofBundle as prost::Message>::decode(bytes)
                         .unwrap();
                 let verified = verifier
-                    .verify_address(bundle, owner, 0, crate::owner_proof::OWNER_PAGE_LIMIT)
+                    .verify_address(bundle, owner, 0, OWNER_PAGE_LIMIT)
                     .unwrap();
                 assert_eq!(verified.block().view().height(), latest.height);
                 assert_eq!(verified.summary().count, 1);

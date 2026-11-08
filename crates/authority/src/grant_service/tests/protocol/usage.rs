@@ -54,7 +54,7 @@ async fn verified_usage_survives_error_status_and_late_settlement_without_faulti
         assert_eq!(
             state
                 .ledger()
-                .node(BudgetNode::Machine)
+                .node(BudgetNode::Machine.key())
                 .unwrap()
                 .counter(Meter::OutputTokens, Window::Total)
                 .used,

@@ -11,7 +11,6 @@ documentation.workspace = true
 default = []
 iroh = [
     "dep:hellas-authority",
-    "dep:hellas-adaptors",
     "dep:serde_ipld_dagcbor",
     "dep:tracing",
     "dep:async-stream",
@@ -55,7 +54,6 @@ anyhow = { workspace = true, optional = true }
 async-stream = { workspace = true, optional = true }
 catena-models = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
-hellas-adaptors = { workspace = true, optional = true }
 hellas-attestation = { workspace = true, features = [
     "apple-app-attest",
 ], optional = true }

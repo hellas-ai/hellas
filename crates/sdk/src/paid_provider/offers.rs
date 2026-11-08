@@ -358,26 +358,33 @@ impl OfferAllocator {
                 .await
                 .map_err(unavailable)?
                 .ok_or_else(|| unavailable("delegated stake unavailable"))?;
+            let candidates: Vec<_> = page
+                .coins
+                .into_iter()
+                .map(|(id, _)| id)
+                .filter(|id| !reserved.contains(&CoinId::from_bytes(id.0)))
+                .collect();
             let mut found = None;
-            for (id, _) in page.coins {
-                let coin_id = CoinId::from_bytes(id.0);
-                if reserved.contains(&coin_id) {
-                    continue;
-                }
+            if !candidates.is_empty() {
                 let snapshot = chain
-                    .get_objects(vec![id])
+                    .get_objects(candidates.clone())
                     .await
                     .map_err(unavailable)?
                     .ok_or_else(|| unavailable("stake object unavailable"))?;
-                if let Some(hellas_chain::domain::Object::Coin(coin)) = snapshot.objects.get(&id)
-                    && coin.owner == Key::from_bytes(*owner.as_bytes()).into()
-                    && coin.delegate == Some(self.config.settlement_key.party_key().into())
-                    && coin.value > 0
-                    && coin.value <= current.policy.offers.max_stake_per_client
-                {
-                    found = Some((coin_id, coin.value));
-                    break;
-                }
+                found = candidates
+                    .iter()
+                    .find_map(|id| match snapshot.objects.get(id) {
+                        Some(hellas_chain::domain::Object::Coin(coin))
+                            if coin.owner == Key::from_bytes(*owner.as_bytes()).into()
+                                && coin.delegate
+                                    == Some(self.config.settlement_key.party_key().into())
+                                && coin.value > 0
+                                && coin.value <= current.policy.offers.max_stake_per_client =>
+                        {
+                            Some((CoinId::from_bytes(id.0), coin.value))
+                        }
+                        _ => None,
+                    });
             }
             if found.is_some() || page.next.is_none() {
                 break found;

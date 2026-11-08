@@ -1305,7 +1305,7 @@ async fn execute_paid_job(
     accepted: Option<&crate::transact::Accepted>,
     lookup: JobLookup,
     proposed: Option<&AtomicBool>,
-    mut purchase: Option<&mut crate::transact::Purchase>,
+    purchase: Option<&mut crate::transact::Purchase>,
 ) -> Result<PaidWorkResult> {
     let prepared_bytes = prepared.canonical_bytes()?;
     let current = client.with_state(|state| state.cursor().0).await?;
@@ -1393,9 +1393,6 @@ async fn execute_paid_job(
         })
         .await?
         .ok_or(PaidClientError::MissingState("accepted work signature"))?;
-    if let Some(purchase) = purchase.as_deref_mut() {
-        purchase.accepting(work_id)?;
-    }
     if let Some(accepted) = accepted {
         accepted(hellas_rpc::provenance::ExecutionProvenance {
             commitment_id: *work_id.as_bytes(),
@@ -1480,9 +1477,6 @@ async fn execute_paid_job(
         .await?
         .verified(work_id, &proposal.prepared_input)
         .await?;
-    if let Some(purchase) = purchase.as_deref_mut() {
-        purchase.paying(work_id)?;
-    }
     let credited = pay_when_ready(dialer, client, work_id, args.config.poll, args.timeout).await?;
     if let Some(purchase) = purchase {
         purchase.paid(work_id)?;

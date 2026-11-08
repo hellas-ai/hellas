@@ -52,7 +52,6 @@ axum = { workspace = true }
 base64.workspace = true
 clap = { version = "4", features = ["derive"] }
 futures = { workspace = true }
-hellas-adaptors.workspace = true
 hellas-attestation = { workspace = true, features = ["apple-app-attest"] }
 hellas-auth.workspace = true
 hellas-authority = { workspace = true }

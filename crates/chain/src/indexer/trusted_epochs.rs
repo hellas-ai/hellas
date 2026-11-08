@@ -95,7 +95,7 @@ impl Provider for TrustedEpochs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution::test_support::{finalization, index_block, index_genesis};
+    use crate::execution::test_support::{finality_envelope, index_block, index_genesis};
     use commonware_consensus::{
         simplex::types::Context,
         types::{Round, View},
@@ -168,8 +168,7 @@ mod tests {
             let check = |block: &HellasBlock, committee| {
                 let bundle = verifier.bundle(super::finalized_block(
                     block.clone(),
-                    crate::finality_proof::encode(&finalization(committee, block).encode(), &[])
-                        .unwrap(),
+                    finality_envelope(committee, block),
                 ));
                 verifier.verify(
                     bundle,

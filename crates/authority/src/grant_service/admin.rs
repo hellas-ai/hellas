@@ -304,10 +304,9 @@ fn budget_status(
     now: UnixMillis,
 ) -> Result<WorkControlReply, NodeStoreError> {
     Ok(WorkControlReply::Budget {
-        definition: store
-            .state()
-            .ledger()
-            .definition(node)
+        // The machine belongs to host configuration, not Work control.
+        definition: crate::work_store::grant::ledger::definition(store.state().ledger(), node)
+            .filter(|d| d.parent.is_some())
             .ok_or(GrantError::OutOfScope)?,
         now,
         allowance: store.allowance(node, now)?,

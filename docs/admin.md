@@ -171,7 +171,7 @@ catalogue through checked inspection.
 Each Fetch admission in a resource's `invocation_policy` carries a required
 `contract` descriptor. The descriptor selects a compiled request/result
 schema and commits the adapter, driver and egress terms. For example, the current
-reseller Responses contract is:
+`hellas-share` OpenAI Responses contract is:
 
 ```json
 {"adaptor":"openai-responses-0.0.3","schema":"stateless_responses_v1","driver":"openai-responses-driver-0.0.2","egress":{"fixed_https":"https://api.openai.com/v1/responses"}}
@@ -201,7 +201,7 @@ descriptor file. It never takes the contract from the provider's quote; a quote
 that does not admit the named contract is refused before funding. The signed
 request includes the contract's canonical bytes; `--save-job DIR` retains the reusable caller-owned input. Provider policy and input must commit the
 same descriptor. Ordinary clients select descriptors from resource policy, without
-linking the reseller implementation. Missing descriptors and old bundle shapes deny.
+linking the `hellas-share` implementation. Missing descriptors and old bundle shapes deny.
 
 Every resource also requires a `pricing` block. For example, this fragment rates a
 request at two USD micro-units plus three micro-units per four output tokens:
@@ -524,13 +524,13 @@ The SDK Fetch provider follows the same sequence: initialize offline, start, the
 use its checked administration service. Its options describe available policies and
 maximum job duration; there is no contact list that silently grants execution.
 
-Embedding hosts now use `hellas_reseller::start_openai_provider` for the OpenAI
+Embedding hosts now use `hellas_share::start_openai_provider` for the OpenAI
 Responses adapter. Its explicit account/resource configuration uses SDK's same
 checked service; no resources or allowances are created at startup. The core CLI's
 `openai-responses` serving destination is removed. Ordinary Fetch clients and gateways
 continue to consume the protocol independently of this hosting library.
 
-OpenAI grant resources require a `responses` block, also supplied by the reseller host
+OpenAI grant resources require a `responses` block, also supplied by the `hellas-share` host
 options. For example, this resource fragment permits text requests for one exact model:
 
 ```json
@@ -602,9 +602,9 @@ Share execution through a signed allowance offer, import it, then select
 ## Embedded host lifecycle
 
 `sdk::node_control::host::HostHandle::start` owns an existing `NodeCoordinator`,
-an authenticated local control listener and a bounded lifecycle supervisor. Provider startup is selected with `start_provider`; the gateway begins stopped. Supply `OpenAiProviderOptions::into_factory()` from the
-core reseller crate for Gate's vendor relay, preserving its injected App Attest
-prover and enrollment. Other providers prepare the shared SDK provider options
+an authenticated local control listener and a bounded lifecycle supervisor. Provider startup is selected with `start_provider`; the gateway begins stopped. `hellas-share`'s `OpenAiProviderOptions::into_factory()` returns a provider
+factory for the OpenAI Responses adapter that keeps the caller's root prover and
+enrollment as supplied. Other providers prepare the shared SDK provider options
 and select `on_host(control)` before startup. That attaches the existing writer;
 it cannot open a second journal. A gateway over a grant uses the same writer and
 `grant_gateway::GrantServeOptions::into_factory`.

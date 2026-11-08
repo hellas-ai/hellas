@@ -931,9 +931,8 @@ async fn compute_and_settle_inner(
     assert_eq!(compute.calls(), 1);
     // A paid marker whose receipt was never written remains paid, with no
     // locally deliverable output, and cannot authorize another execution.
-    let mut paid_without_receipt: serde_json::Value =
+    let paid_without_receipt: serde_json::Value =
         serde_json::from_slice(&std::fs::read(attempt_path.as_path()).unwrap()).unwrap();
-    paid_without_receipt["phase"] = serde_json::json!("Paid");
     let paid_without_receipt_path = attempt_path.with_nonce([1; 16]);
     hellas_private::write_atomically(
         paid_without_receipt_path.as_path(),
@@ -968,8 +967,10 @@ async fn compute_and_settle_inner(
     // attempt has no recorded acceptance, it may only be recovered.
     let mut interrupted_record: serde_json::Value =
         serde_json::from_slice(&std::fs::read(attempt_path.as_path()).unwrap()).unwrap();
-    interrupted_record["phase"] = serde_json::json!("Running");
-    interrupted_record["work"] = serde_json::Value::Null;
+    interrupted_record["proposal"]
+        .as_object_mut()
+        .unwrap()
+        .remove("outcome");
     let interrupted_path = attempt_path.with_nonce([2; 16]);
     hellas_private::write_atomically(
         interrupted_path.as_path(),
@@ -1423,11 +1424,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
     let trust_config = work_config(&devnet, root.path().join("paid"));
     let profile = &trust_config.chain;
     let verifier = std::sync::Arc::new(
-        hellas_chain::proof_verify::ProofVerifier::with_digest(
-            profile.trust().clone(),
-            profile.consensus_digest(),
-        )
-        .unwrap(),
+        hellas_chain::proof_verify::ProofVerifier::for_profile(profile).unwrap(),
     );
     let chain = RemoteLightClient::connect(devnet.light_client_url(0), verifier)
         .await
@@ -2148,11 +2145,11 @@ fn grant_composition<'a>(
             .budgets(
                 common_node::POOL,
                 subject,
-                vec![Limit {
-                    meter: Meter::Requests,
-                    window: Window::Total,
-                    amount: if cli_binary.is_some() { 3 } else { 2 },
-                }],
+                vec![Limit::new(
+                    Meter::Requests,
+                    Window::Total,
+                    if cli_binary.is_some() { 3 } else { 2 },
+                )],
                 2,
             )
             .await;

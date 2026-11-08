@@ -1,6 +1,7 @@
 use super::*;
 use crate::{ComputeEvent, WorkEvent};
 use axum::body::Body;
+use base64::Engine as _;
 use hellas_rpc::{
     JsonBytes,
     protocol::invocation::{

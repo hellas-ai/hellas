@@ -1,0 +1,15 @@
+[package]
+name = "hellas-admission"
+description = "Pure admission accounting over trees of limits"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+proptest = "1.11"
+serde_json.workspace = true

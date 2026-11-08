@@ -13,11 +13,7 @@ fn shared_budget() -> BudgetNode {
     }
 }
 fn requests(amount: u64) -> Vec<Limit> {
-    vec![Limit {
-        meter: Meter::Requests,
-        window: Window::Total,
-        amount,
-    }]
+    vec![Limit::new(Meter::Requests, Window::Total, amount)]
 }
 struct Household {
     node: TestNode,
@@ -137,13 +133,13 @@ async fn distinct_application_credentials_share_one_subject_budget() {
             .store
             .state()
             .ledger()
-            .reserved(shared_budget(), Meter::Requests),
+            .reserved(shared_budget().key(), Meter::Requests),
         2
     );
     let extra = house.node.proposal(FRIEND, ids::LAPTOP_ALLOWANCE, 2);
     let before = house.node.snapshot();
     assert_err!(submit(&mut house.node, &house.laptop, &extra).await,
-        NodeStoreError::Ledger(LedgerError::Concurrent(node)) if node == shared_budget());
+        NodeStoreError::Refused(Refusal { at, why: Why::Limit(_, Window::Held), .. }) if at == shared_budget().key());
     assert_eq!(house.node.snapshot(), before);
 }
 
@@ -158,13 +154,8 @@ async fn recovery_retains_duties_above_a_narrowed_concurrency_limit() {
     submit(&mut house.node, &house.laptop, &laptop)
         .await
         .unwrap();
-    let mut budget = house
-        .node
-        .store
-        .state()
-        .ledger()
-        .definition(shared_budget())
-        .unwrap();
+    let mut budget =
+        ledger::definition(house.node.store.state().ledger(), shared_budget()).unwrap();
     budget.revision.0 += 1;
     budget.max_in_flight = NonZeroU16::new(1).unwrap();
     budget.limits = requests(1);
@@ -179,14 +170,7 @@ async fn recovery_retains_duties_above_a_narrowed_concurrency_limit() {
     house.node.store.rotate().await.unwrap();
     house.node.clock.set(UnixMillis(1001));
     house.node = house.node.reopen().await;
-    for node in house
-        .node
-        .store
-        .state()
-        .ledger()
-        .path(shared_budget())
-        .unwrap()
-    {
+    for node in ledger::path(house.node.store.state().ledger(), shared_budget()).unwrap() {
         assert_eq!(house.node.used(node, Meter::Requests), 2);
         assert_eq!(
             house
@@ -194,22 +178,21 @@ async fn recovery_retains_duties_above_a_narrowed_concurrency_limit() {
                 .store
                 .state()
                 .ledger()
-                .reserved(node, Meter::Requests),
+                .reserved(node.key(), Meter::Requests),
             0
         );
         assert_eq!(
-            house
-                .node
-                .store
-                .state()
-                .recovery_holds(node, house.node.clock.now())
-                .unwrap(),
+            house.node.store.state().ledger().occupied(
+                node.key(),
+                Meter::Requests,
+                house.node.clock.now().0
+            ),
             2
         );
     }
     let extra = house.node.proposal(FRIEND, ids::LAPTOP_ALLOWANCE, 2);
     assert_err!(submit(&mut house.node, &house.laptop, &extra).await,
-        NodeStoreError::Ledger(LedgerError::Concurrent(node)) if node == shared_budget());
+        NodeStoreError::Refused(Refusal { at, why: Why::Limit(_, Window::Held), .. }) if at == shared_budget().key());
 }
 
 #[tokio::test]
@@ -294,15 +277,10 @@ async fn creating_an_allowance_cannot_hide_spending_by_the_same_subject() {
     let request = house.node.proposal(FRIEND, ids::NEW_ALLOWANCE, 1);
     let before = house.node.snapshot();
     assert_err!(submit(&mut house.node, &house.desktop, &request).await,
-        NodeStoreError::Ledger(LedgerError::OverBudget { node, meter: Meter::Requests, window: Window::Total }) if node == shared_budget());
+        NodeStoreError::Refused(Refusal { at, why: Why::Impossible(Meter::Requests, Window::Total), .. }) if at == shared_budget().key());
     assert_eq!(house.node.snapshot(), before);
-    let mut budget = house
-        .node
-        .store
-        .state()
-        .ledger()
-        .definition(shared_budget())
-        .unwrap();
+    let mut budget =
+        ledger::definition(house.node.store.state().ledger(), shared_budget()).unwrap();
     budget.revision.0 += 1;
     budget.limits = requests(3);
     house
@@ -321,7 +299,7 @@ async fn creating_an_allowance_cannot_hide_spending_by_the_same_subject() {
             .store
             .state()
             .ledger()
-            .reserved(shared_budget(), Meter::Requests),
+            .reserved(shared_budget().key(), Meter::Requests),
         1
     );
 }

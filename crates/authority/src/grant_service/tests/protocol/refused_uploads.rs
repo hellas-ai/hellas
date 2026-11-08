@@ -244,11 +244,7 @@ async fn quota_refusal_releases_staging_for_the_next_proposal_without_waiting() 
         .await
         .unwrap()
         .configure_machine(
-            vec![Limit {
-                meter: Meter::Requests,
-                window: Window::Total,
-                amount: 0,
-            }],
+            vec![Limit::new(Meter::Requests, Window::Total, 0)],
             4,
             f.clock.now(),
         )

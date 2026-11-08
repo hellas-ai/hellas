@@ -211,11 +211,7 @@ fn parse_limit(value: &str) -> Result<hellas_authority::model::grant::budget::Li
     let amount = amount
         .parse()
         .map_err(|_| "amount is a non-negative integer")?;
-    Ok(Limit {
-        meter,
-        window,
-        amount,
-    })
+    Ok(Limit::new(meter, window, amount))
 }
 
 #[cfg(test)]

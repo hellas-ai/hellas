@@ -833,11 +833,7 @@ async fn paid_fixture(runtime: commonware_runtime::tokio::Context) -> PaidScenar
     );
     let profile = devnet.profile(0);
     let verifier = std::sync::Arc::new(
-        hellas_chain::proof_verify::ProofVerifier::with_digest(
-            profile.trust().clone(),
-            profile.consensus_digest(),
-        )
-        .unwrap(),
+        hellas_chain::proof_verify::ProofVerifier::for_profile(&profile).unwrap(),
     );
     let submitter = RemoteLightClient::connect(devnet.light_client_url(2), verifier)
         .await

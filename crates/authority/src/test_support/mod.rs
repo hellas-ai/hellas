@@ -274,13 +274,7 @@ pub async fn setup_with_credential(
     )
     .await
     .unwrap();
-    let requests = |amount| {
-        vec![Limit {
-            meter: Meter::Requests,
-            window: Window::Total,
-            amount,
-        }]
-    };
+    let requests = |amount| vec![Limit::new(Meter::Requests, Window::Total, amount)];
     let store = common_node::provision(
         path,
         store,
@@ -514,7 +508,7 @@ pub fn used(store: &NodeStore, node: BudgetNode, meter: Meter) -> u64 {
     store
         .state()
         .ledger()
-        .node(node)
+        .node(node.key())
         .unwrap()
         .counter(meter, Window::Total)
         .used

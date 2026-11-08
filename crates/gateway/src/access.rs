@@ -172,7 +172,7 @@ where
         let mut inner = std::mem::replace(&mut self.inner, clone);
         Box::pin(async move {
             if !access.authorizes(request.headers()).await {
-                return Ok(unauthorized());
+                return Ok(unauthorized(request.uri().path()));
             }
             // This credential belongs to local HTTP admission, never upstream.
             request.headers_mut().remove(header::AUTHORIZATION);
@@ -180,8 +180,9 @@ where
         })
     }
 }
-fn unauthorized() -> Response<Body> {
-    let mut response = crate::json_error(
+fn unauthorized(path: &str) -> Response<Body> {
+    let mut response = crate::path_error(
+        path,
         StatusCode::UNAUTHORIZED,
         "a current gateway credential is required",
     );

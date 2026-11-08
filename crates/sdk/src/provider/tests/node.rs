@@ -4331,11 +4331,7 @@ async fn provider_startup_preserves_explicit_allowances_and_machine_limits() {
     .await
     .unwrap();
     let routes = FetchRouteRegistry::default();
-    let limit = Limit {
-        meter: Meter::Requests,
-        window: Window::Day,
-        amount: 7,
-    };
+    let limit = Limit::new(Meter::Requests, Window::Day, 7);
     let id = GrantId([8; 16]);
     let definition = common_node::allowance(
         id,
@@ -4547,14 +4543,7 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
         store,
         &secret,
         provider_key.clone(),
-        (
-            2,
-            vec![Limit {
-                meter: Meter::Requests,
-                window: Window::Total,
-                amount: 3,
-            }],
-        ),
+        (2, vec![Limit::new(Meter::Requests, Window::Total, 3)]),
         definition,
         (vec![], 1),
     )

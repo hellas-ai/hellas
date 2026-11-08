@@ -5,20 +5,33 @@ use hellas_rpc::protocol::invocation::{
     fetch::{FetchAdmission, FetchLimits, FetchRoutePolicy},
 };
 
-#[allow(clippy::too_many_arguments)]
-pub fn responses_policy(
-    resource: ResourceId,
-    account: ResourceId,
-    revision: Revision,
-    service: &str,
-    method: &str,
-    responses: hellas_authority::model::grant::responses::ResponsesResource,
-    pricing: hellas_authority::model::grant::pricing::Pricing,
-    max_job_millis: std::num::NonZeroU64,
-) -> Result<GrantPolicy, GrantError> {
+/// Terms of one OpenAI Responses grant resource.
+pub struct ResponsesPolicyOptions<'a> {
+    pub resource: ResourceId,
+    pub account: ResourceId,
+    pub revision: Revision,
+    pub service: &'a str,
+    pub method: &'a str,
+    pub responses: hellas_authority::model::grant::responses::ResponsesResource,
+    pub pricing: hellas_authority::model::grant::pricing::Pricing,
+    pub max_job_millis: std::num::NonZeroU64,
+}
+
+pub fn responses_policy(options: ResponsesPolicyOptions<'_>) -> Result<GrantPolicy, GrantError> {
+    let ResponsesPolicyOptions {
+        resource,
+        account,
+        revision,
+        service,
+        method,
+        responses,
+        pricing,
+        max_job_millis,
+    } = options;
     let route =
         FetchRoutePolicy::sealed_route(service, method).map_err(|_| GrantError::Malformed)?;
-    let contract = crate::responses_contract().map_err(|_| GrantError::Malformed)?;
+    let contract = hellas_adaptors::openai::responses::fetch::responses_contract()
+        .map_err(|_| GrantError::Malformed)?;
     let policy = GrantPolicy {
         resource,
         account,

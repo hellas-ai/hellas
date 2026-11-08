@@ -309,7 +309,7 @@ pub struct ProviderHandle {
     /// Set when this handle bound its own endpoint and lent it to the
     /// caller's content store for peer reads. The store outlives the
     /// provider, so drop takes the endpoint back to release its sockets.
-    owned_endpoint: Option<hellas_store::content::DiskStore>,
+    peer_store: Option<hellas_store::content::DiskStore>,
     accept_task: tokio::task::JoinHandle<()>,
     work: Option<WorkWatcher>,
     owned_authority: Option<hellas_authority::node::NodeCoordinator>,
@@ -378,8 +378,12 @@ impl ProviderHandle {
             Err(error) => Err(ProviderError::Task(error)),
         };
         result = result.and(joined);
-        if self.owned_endpoint.is_some() {
-            hellas_wire::iroh::close(&self.endpoint).await;
+        // Wait for the close itself, not `hellas_wire::iroh::close`'s grace: a
+        // restart starts its successor with this identity and port as soon as
+        // this returns. Until the close completes, the old socket stays bound
+        // and refuses every new handshake addressed to this identity.
+        if self.peer_store.is_some() {
+            self.endpoint.close().await;
         }
         if let Some(node) = self.owned_authority.take() {
             node.close().await;
@@ -391,7 +395,7 @@ impl ProviderHandle {
 impl Drop for ProviderHandle {
     fn drop(&mut self) {
         self.accept_task.abort();
-        if let Some(content) = &self.owned_endpoint {
+        if let Some(content) = &self.peer_store {
             content.clear_peers();
         }
     }
@@ -529,7 +533,7 @@ where
         }
     };
     // A host endpoint is already the host's content peer pool.
-    let owned_endpoint = owns_endpoint.then(|| {
+    let peer_store = owns_endpoint.then(|| {
         content
             .clone()
             .with_peers(hellas_wire::iroh::Pool::for_service::<
@@ -701,7 +705,7 @@ where
         drained: Some(drained),
         accept_task,
         endpoint,
-        owned_endpoint,
+        peer_store,
         owned_authority,
         work,
     })

@@ -21,7 +21,7 @@ pub fn budgets(
     let account = BudgetNode::Account(auth::ResourceId(Digest::hash(b"test account")));
     let definition = |node, parent, limits, concurrent| BudgetDef {
         node,
-        parent,
+        parent: Some(parent),
         revision: auth::Revision(1),
         limits,
         max_in_flight: std::num::NonZeroU16::new(concurrent).unwrap(),

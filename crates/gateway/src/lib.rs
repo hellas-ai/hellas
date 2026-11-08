@@ -3,7 +3,6 @@ extern crate tracing;
 
 mod access;
 pub use access::GatewayAccess;
-mod anthropic;
 mod archive;
 mod audio;
 mod backend;
@@ -14,24 +13,21 @@ mod error;
 pub use error::{GatewayConfigError, GatewayError, GatewayResult};
 mod http_fetch;
 mod image;
-mod openai;
-mod plain;
 mod provenance_layer;
-mod responses;
 mod responses_fetch;
 mod state;
 mod wrap;
 
+use axum::Router;
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::{Json, Router};
 use futures::Stream;
 use hellas_adaptors::BackendError;
 use hellas_auth::authority::UnixMillis;
 use iroh::EndpointId;
 use serde::Serialize;
-use serde_json::{Map as JsonMap, Value as JsonValue, json};
+use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -512,11 +508,6 @@ fn finish_cleanup<T>(
     }
 }
 
-/// CLI lifecycle wrapper around [`start`].
-pub async fn run(options: GatewayOptions) -> crate::GatewayResult<()> {
-    wait_for_shutdown(start(options).await?).await
-}
-
 /// Wait for a process signal or wrapped child, then join every gateway listener.
 pub async fn wait_for_shutdown(mut handle: GatewayHandle) -> crate::GatewayResult<()> {
     tokio::select! {
@@ -585,12 +576,27 @@ async fn bind_gateway(
     }
 }
 
+/// A refusal or failure in the OpenAI error shape.
 fn json_error(status: StatusCode, message: impl Into<String>) -> Response {
-    (
-        status,
-        Json(json!({ "error": { "message": message.into() } })),
-    )
-        .into_response()
+    path_error("", status, message)
+}
+
+/// A request an adaptor rejected, in the OpenAI error shape.
+fn request_error(error: hellas_adaptors::openai::RequestError) -> Response {
+    let status = StatusCode::from_u16(error.status).expect("an adaptor status is valid");
+    json_error(status, error.message)
+}
+
+/// A refusal or failure on `path`, in the error shape of the wire format
+/// served there: Anthropic's on its Messages path, OpenAI's elsewhere.
+fn path_error(path: &str, status: StatusCode, message: impl Into<String>) -> Response {
+    let render = if path == state::ANTHROPIC_PATH {
+        hellas_adaptors::anthropic::render_error
+    } else {
+        hellas_adaptors::openai::render_error
+    };
+    dispatch::wire_response(render(status.as_u16(), message.into()))
+        .unwrap_or_else(|_| status.into_response())
 }
 
 /// Wrap an event stream as an SSE response. The stream IS the producer —

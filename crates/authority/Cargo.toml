@@ -23,6 +23,7 @@ bytes.workspace = true
 flate2 = "1"
 futures.workspace = true
 getrandom = "0.4"
+hellas-admission.workspace = true
 hellas-attestation = { workspace = true, features = ["apple-app-attest"] }
 hellas-auth.workspace = true
 hellas-channel.workspace = true

@@ -66,7 +66,10 @@ async fn sponsored_terms_bind_each_channel_to_its_authenticated_actor_across_rev
         .await
         .unwrap();
     assert_eq!(
-        store.state().ledger().reserved(budget(), Meter::Requests),
+        store
+            .state()
+            .ledger()
+            .reserved(budget().key(), Meter::Requests),
         2
     );
     for (job, caller, authorization) in

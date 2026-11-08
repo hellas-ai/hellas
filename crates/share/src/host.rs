@@ -11,7 +11,7 @@ use std::sync::Arc;
 #[derive(Debug, thiserror::Error)]
 pub enum OpenAiProviderError {
     #[error(transparent)]
-    Config(#[from] crate::OpenAiConfigError),
+    Config(#[from] hellas_providers::OpenAiConfigError),
     #[error(transparent)]
     Grant(#[from] hellas_authority::model::grant::records::GrantError),
     #[error(transparent)]
@@ -53,20 +53,23 @@ pub async fn start_openai_provider<R>(
 where
     R: RootProver + Send + Sync + 'static,
 {
-    let policy = crate::responses_policy(
-        options.resource,
-        options.account,
-        options.policy_revision,
-        &options.service,
-        &options.method,
-        options.responses.clone(),
-        options.pricing.clone(),
-        options.max_job_millis,
-    )?;
-    let upstream = Arc::new(crate::OpenAiResponsesFetchProvider::with_bearer(
+    let policy = crate::responses_policy(crate::ResponsesPolicyOptions {
+        resource: options.resource,
+        account: options.account,
+        revision: options.policy_revision,
+        service: &options.service,
+        method: &options.method,
+        responses: options.responses.clone(),
+        pricing: options.pricing.clone(),
+        max_job_millis: options.max_job_millis,
+    })?;
+    let upstream = Arc::new(hellas_providers::OpenAiResponsesFetchProvider::with_bearer(
         options.bearer_token.clone(),
     )?);
-    let adaptor = Arc::new(crate::OpenAiResponsesAdaptorFactory::new()?);
+    let adaptor = Arc::new(
+        hellas_adaptors::openai::responses::fetch::OpenAiResponsesAdaptorFactory::new()
+            .map_err(hellas_providers::OpenAiConfigError::from)?,
+    );
     let mut routes = FetchRouteRegistry::new();
     routes.register(
         FetchRoute::new(options.service.clone(), options.method.clone()),
@@ -102,8 +105,9 @@ where
 }
 
 impl<R: RootProver + Send + Sync + 'static> OpenAiProviderOptions<R> {
-    /// Gate supplies its App Attest prover and vendor configuration here; SDK
-    /// owns the shared writer, control listener and serialized service lifetime.
+    /// Wraps these options as a host provider factory. The caller's root prover
+    /// and enrollment are kept as supplied; SDK owns the shared writer, control
+    /// listener and serialized service lifetime.
     pub fn into_factory(self) -> hellas_sdk::node_control::host::ProviderFactory {
         let options = Arc::new(self);
         hellas_sdk::node_control::host::ProviderFactory {

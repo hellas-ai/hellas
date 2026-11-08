@@ -45,7 +45,7 @@ async fn revoked_queued_grant_never_dispatches_and_wrong_application_never_reser
         assert_eq!(
             state
                 .ledger()
-                .node(BudgetNode::Machine)
+                .node(BudgetNode::Machine.key())
                 .unwrap()
                 .counter(Meter::Requests, Window::Total)
                 .used,
@@ -144,7 +144,12 @@ async fn committed_revocation_cancels_execution_but_retains_physical_ownership_a
             .expect("revocation must signal idle execution without delivery polling");
         assert_eq!(backend.slots.available_permits(), 0);
         let state = snapshot(&service).await;
-        assert_eq!(state.ledger().active_count(BudgetNode::Machine), 1);
+        assert_eq!(
+            state
+                .ledger()
+                .reserved(BudgetNode::Machine.key(), Meter::Requests),
+            1
+        );
         assert_eq!(
             state
                 .channel(authorization.channel_id)
@@ -161,7 +166,12 @@ async fn committed_revocation_cancels_execution_but_retains_physical_ownership_a
         drain.await.unwrap();
         assert_eq!(backend.slots.available_permits(), 1);
         let state = snapshot(&service).await;
-        assert_eq!(state.ledger().active_count(BudgetNode::Machine), 0);
+        assert_eq!(
+            state
+                .ledger()
+                .reserved(BudgetNode::Machine.key(), Meter::Requests),
+            0
+        );
         assert_eq!(
             state
                 .channel(authorization.channel_id)
@@ -177,7 +187,7 @@ async fn committed_revocation_cancels_execution_but_retains_physical_ownership_a
             assert_eq!(
                 state
                     .ledger()
-                    .node(budget())
+                    .node(budget().key())
                     .unwrap()
                     .counter(meter, Window::Total)
                     .used,
@@ -263,7 +273,7 @@ fn interrupted_authority_append_cancels_execution_and_recovery_keeps_the_charge(
                 reopened
                     .state()
                     .ledger()
-                    .node(budget())
+                    .node(budget().key())
                     .unwrap()
                     .counter(Meter::Requests, Window::Total)
                     .used,
@@ -340,11 +350,16 @@ async fn auth_revocation_stops_open_result_delivery_without_dropping_running_acc
             .unwrap()
             .unwrap();
         let state = snapshot(&service).await;
-        assert_eq!(state.ledger().active_count(BudgetNode::Machine), 0);
         assert_eq!(
             state
                 .ledger()
-                .node(budget())
+                .reserved(BudgetNode::Machine.key(), Meter::Requests),
+            0
+        );
+        assert_eq!(
+            state
+                .ledger()
+                .node(budget().key())
                 .unwrap()
                 .counter(Meter::Requests, Window::Total)
                 .used,

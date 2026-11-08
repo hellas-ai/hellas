@@ -470,7 +470,7 @@ fn restore_replay(
         return Err(NodeStoreError::Malformed);
     }
     for bytes in records {
-        state.apply(&decode::<Frame>(&bytes)?)?;
+        state.apply(&decode::<Frame>(&bytes)?, true)?;
     }
     Ok(state)
 }
