@@ -775,7 +775,6 @@ struct PaidScenario<S = PaidWorkSession> {
     provider_node: hellas_sdk::FullNode,
     provider: hellas_sdk::ProviderHandle,
     provider_content: hellas_store::content::DiskStore,
-    upstream: PausedFetch,
     relays: remote::Relays,
     approvals: Arc<Approvals>,
     owner: Arc<hellas_sdk::client_owner::ClientOwner>,
@@ -860,7 +859,7 @@ async fn paid_fixture(runtime: commonware_runtime::tokio::Context) -> PaidScenar
     drop(store);
     let config = work_config(&devnet, root.path().join("provider-journal"));
     let relays = remote::Relays::start(&devnet).await;
-    let (provider, upstream, provider_content) = start_provider(
+    let (provider, _, provider_content) = start_provider(
         root.path(),
         config.clone(),
         provider_node.clone(),
@@ -1033,7 +1032,6 @@ async fn paid_fixture(runtime: commonware_runtime::tokio::Context) -> PaidScenar
         provider_node,
         provider,
         provider_content,
-        upstream,
         relays,
         approvals,
         owner,
@@ -1059,7 +1057,6 @@ async fn paid_setup(
         provider_node,
         provider,
         provider_content,
-        upstream,
         mut relays,
         approvals,
         owner,
@@ -1142,7 +1139,6 @@ async fn paid_setup(
         provider_node,
         provider,
         provider_content,
-        upstream,
         relays,
         approvals,
         owner,
@@ -1166,7 +1162,6 @@ async fn paid_finish(case: PaidScenario) {
         provider_node,
         provider,
         provider_content,
-        upstream: _,
         mut relays,
         approvals,
         owner,
