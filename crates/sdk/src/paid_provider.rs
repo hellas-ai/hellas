@@ -1180,28 +1180,31 @@ impl WorkRunner {
                     return false;
                 }
             };
-        let mut answered = true;
         for ((index, question), snapshot) in asked.iter().zip(snapshots) {
             let Some(snapshot) = snapshot else {
-                answered = false;
-                continue;
+                return false;
             };
             let Some(clock) = self.clocks.get_mut(*index) else {
                 continue;
             };
-            answered &= clock
+            if !clock
                 .tick(
                     question,
                     &snapshot,
-                    source,
+                    &BoundedSink(source),
                     &self.signer,
                     &self.work_mount,
                     &self.setup_mount,
                 )
                 .instrument(hellas_rpc::request_span!(target: "hellas_request", parent: None, "paid.channel.observe", hellas.channel.role = "provider"))
-                .await;
+                .await
+            {
+                // The source failed: stop here and let the loop redial
+                // rather than wait it out once per journal.
+                return false;
+            }
         }
-        answered
+        true
     }
 
     /// Suspends every channel's admission while no fresh read can arrive.
@@ -1312,6 +1315,29 @@ impl WorkRunner {
             runner: self,
             chain,
         }
+    }
+}
+
+/// The chain a journal step submits to, with the same bound as a read.
+///
+/// One loop drives every journal, so a submission the source never answers
+/// would stall every channel's watcher behind it. A source that does not
+/// answer within [`MAX_CERTIFIED_AGE`] is a failed source: the step reports
+/// it and the loop redials.
+struct BoundedSink<'a, S>(&'a S);
+
+impl<S: TxSink + Sync> TxSink for BoundedSink<'_, S> {
+    async fn submit(
+        &self,
+        tx: hellas_kernel::Tx,
+    ) -> Result<hellas_rpc::SubmitTxOutcome, hellas_channel::work_close::BlockSourceError> {
+        tokio::time::timeout(MAX_CERTIFIED_AGE, self.0.submit(tx))
+            .await
+            .unwrap_or_else(|_| {
+                Err(hellas_channel::work_close::BlockSourceError::new(
+                    "the chain did not take the transaction within the certified-age bound",
+                ))
+            })
     }
 }
 

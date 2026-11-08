@@ -923,6 +923,58 @@ async fn requests_use_local_observation_and_one_contested_route_does_not_disable
     );
 }
 
+/// A source whose submissions never answer, over the fixture chain's reads.
+#[derive(Clone)]
+struct UnansweredSubmissions(Chain);
+
+impl FinalizedWorkView for UnansweredSubmissions {
+    async fn work_channel_snapshot(
+        &self,
+        query: WorkChannelQuery,
+    ) -> Result<Option<hellas_chain::Verified<WorkChannelSnapshot>>, QueryError> {
+        self.0.work_channel_snapshot(query).await
+    }
+}
+
+impl TxSink for UnansweredSubmissions {
+    async fn submit(&self, _tx: Tx) -> Result<SubmitTxOutcome, BlockSourceError> {
+        std::future::pending().await
+    }
+}
+
+/// One loop drives every journal, so a submission the chain never answers
+/// must not stall it: the step gives up at the certified-age bound and the
+/// tick reports a failed source, which the loop answers by redialling.
+#[tokio::test]
+async fn an_unanswered_submission_fails_the_source_instead_of_stalling_the_clock() {
+    let dir = temp();
+    let first = OfferFixture::first();
+    let second = OfferFixture::second();
+    first.write_completed_setup(dir.path()).await;
+    second.write_completed_setup(dir.path()).await;
+    write_contested_channel(dir.path()).await;
+    let source = UnansweredSubmissions(Chain::routed([
+        first.channel_snapshot(RESPONSE_HEIGHT, None, Some(pending_contest(false))),
+        second.channel_snapshot(
+            second.bond_terms().timeout.get(),
+            Some(second.live_bond()),
+            None,
+        ),
+    ]));
+    let work_mount = MountedWork::default();
+    let content = hellas_channel::test_support::channel::content_store(dir.path()).await;
+    let setup_mount = MountedSetup::with_content_store(content.clone());
+    let mut runner =
+        discover_two_route_runner(dir.path(), &work_mount, &setup_mount, &content).await;
+
+    // The clock jumps over the bound once the step is only waiting on it.
+    tokio::time::pause();
+    assert!(
+        !runner.tick(&source).await,
+        "an unanswered submission is a failed source"
+    );
+}
+
 /// Connections are irrelevant to close duty. With neither peer dialled,
 /// one tick still advances every owned journal and submits both unrelated
 /// permissionless closes that their coherent snapshots make due.
