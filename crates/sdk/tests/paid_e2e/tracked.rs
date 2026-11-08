@@ -417,10 +417,9 @@ fn tracked_attempts_reuse_retained_policy_with_zero_funding_cap() {
                             accepted: Some(Arc::new(move |_| {
                                 // Save the caller's interrupted acceptance prefix;
                                 // channel processing then continues to a paid terminal.
-                                let mut prefix: serde_json::Value =
+                                let prefix: serde_json::Value =
                                     serde_json::from_slice(&std::fs::read(&marker_path).unwrap())
                                         .unwrap();
-                                prefix["work"] = serde_json::Value::Null;
                                 write_marker(&prefix_path, &prefix);
                             })),
                             ..Default::default()
@@ -561,13 +560,12 @@ fn tracked_recovery_requires_attempt_and_request_bindings() {
             let signer = ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap();
             let (work, nonce) =
                 accept_paused(&mut session, &mut attempt, &job, &signer, &upstream).await;
-            let mut prefix: serde_json::Value =
+            let prefix: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-            assert_eq!(prefix["phase"], "Running");
-            prefix["work"] = serde_json::Value::Null;
-            assert!(prefix["request_commitment"].is_array());
+            assert!(prefix["proposal"]["outcome"].is_null());
+            assert!(prefix["proposal"]["request_commitment"].is_array());
             assert!(prefix["attempt_nonce"].is_array());
-            assert_missing_bindings_refused(&case, &prefix, work);
+            assert_missing_bindings_refused(&case, &prefix);
             // While input bytes are present, a different caller job must not attach
             // to this acceptance even if its marker names this channel and nonce.
             let other = hellas_sdk::job::Job::fetch(
@@ -597,8 +595,8 @@ fn tracked_recovery_requires_attempt_and_request_bindings() {
             session.shutdown().await;
             drop(session);
             drop(attempt);
-            // The durable prefix after JobAccepted but before purchase.accepting:
-            // the original nonce and its request commitment, still no work ID.
+            // The durable prefix after JobAccepted: the original nonce and its
+            // request commitment, no work ID.
             write_marker(&path, &prefix);
             let mut attempt =
                 ExecutionAttempt::open_existing_paid(&interrupted_path, job.input(), PRICE)
@@ -628,7 +626,7 @@ fn tracked_recovery_requires_attempt_and_request_bindings() {
                 let mut wrong = prefix.clone();
                 match field {
                     "channel" | "bond" => {
-                        wrong[field] = serde_json::to_value([0x55u8; 32]).unwrap()
+                        wrong["proposal"][field] = serde_json::to_value([0x55u8; 32]).unwrap()
                     }
                     "network" => wrong["target"][field] = serde_json::json!("wrong-network"),
                     "provider" => {
@@ -655,7 +653,7 @@ fn tracked_recovery_requires_attempt_and_request_bindings() {
             let pending_paid_path = paid_path(&case, &job, "no-proof");
             let pending_path = pending_paid_path.as_path().to_path_buf();
             let mut pending = prefix.clone();
-            pending["nonce"] = serde_json::json!(nonce + 1);
+            pending["proposal"]["nonce"] = serde_json::json!(nonce + 1);
             write_marker(&pending_path, &pending);
             let mut pending_attempt =
                 ExecutionAttempt::open_existing_paid(&pending_paid_path, job.input(), PRICE)
@@ -690,8 +688,7 @@ fn tracked_recovery_requires_attempt_and_request_bindings() {
             ));
             let saved: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-            assert_eq!(saved["nonce"], nonce);
-            assert_eq!(saved["work"], serde_json::json!(work.as_bytes()));
+            assert_eq!(saved, prefix);
             assert_eq!(
                 session
                     .with_state(|state| (
@@ -708,16 +705,11 @@ fn tracked_recovery_requires_attempt_and_request_bindings() {
             session.shutdown().await;
             drop(session);
             drop(attempt);
-            // The recovered ID survives another caller reopen without changing nonce.
-            let attempt =
-                ExecutionAttempt::open_existing_paid(&interrupted_path, job.input(), PRICE)
-                    .unwrap();
-            assert_eq!(attempt.inspect().unwrap().work, Some(work));
-            drop(attempt);
             // A client signature alone does not establish provider acceptance.
             let (unsigned, request_commitment) =
                 record_unsigned_proposal(&case, &job, &signer, bond, nonce + 1).await;
-            pending["request_commitment"] = serde_json::json!(request_commitment.as_bytes());
+            pending["proposal"]["request_commitment"] =
+                serde_json::json!(request_commitment.as_bytes());
             let unsigned_paid_path = paid_path(&case, &job, "unsigned");
             let unsigned_path = unsigned_paid_path.as_path().to_path_buf();
             write_marker(&unsigned_path, &pending);
@@ -990,9 +982,8 @@ fn reused_nonce_scenario(
         );
         let first_record: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&first_path).unwrap()).unwrap();
-        assert_eq!(first_record["phase"], "Running");
-        assert_eq!(first_record["nonce"], 1);
-        assert_eq!(first_record["work"], serde_json::Value::Null);
+        assert_eq!(first_record["proposal"]["nonce"], 1);
+        assert!(first_record["proposal"]["outcome"].is_null());
         assert_eq!(
             session
                 .with_state(|state| (state.proposal_nonce_high_water(), state.jobs().len()))
@@ -1037,8 +1028,8 @@ fn reused_nonce_scenario(
             second_record["attempt_nonce"]
         );
         assert_ne!(
-            first_record["request_commitment"],
-            second_record["request_commitment"]
+            first_record["proposal"]["request_commitment"],
+            second_record["proposal"]["request_commitment"]
         );
         session.shutdown().await;
         drop(session);
@@ -1102,33 +1093,26 @@ fn reused_nonce_scenario(
     })
 }
 
-fn assert_missing_bindings_refused(
-    case: &PaidScenario<()>,
-    prefix: &serde_json::Value,
-    work: Digest,
-) {
+fn assert_missing_bindings_refused(case: &PaidScenario<()>, prefix: &serde_json::Value) {
     let job = job();
     for field in ["attempt_nonce", "request_commitment"] {
-        for known_work in [false, true] {
-            let mut record = prefix.clone();
+        let mut record = prefix.clone();
+        if field == "attempt_nonce" {
             record.as_object_mut().unwrap().remove(field);
-            record["work"] = if known_work {
-                serde_json::json!(work.as_bytes())
-            } else {
-                serde_json::Value::Null
-            };
-            let paid_path = paid_path(case, &job, &format!("missing-{field}-{known_work}"));
-            let path = paid_path.as_path();
-            write_marker(path, &record);
-            let before = std::fs::read(path).unwrap();
-            assert!(matches!(
-                ExecutionAttempt::open_existing_paid(&paid_path, job.input(), PRICE),
-                Err(ExecutionError::Purchase(
-                    hellas_sdk::transact::PurchaseError::Identity
-                ))
-            ));
-            assert_eq!(std::fs::read(path).unwrap(), before);
+        } else {
+            record["proposal"].as_object_mut().unwrap().remove(field);
         }
+        let paid_path = paid_path(case, &job, &format!("missing-{field}"));
+        let path = paid_path.as_path();
+        write_marker(path, &record);
+        let before = std::fs::read(path).unwrap();
+        assert!(matches!(
+            ExecutionAttempt::open_existing_paid(&paid_path, job.input(), PRICE),
+            Err(ExecutionError::Purchase(
+                hellas_sdk::transact::PurchaseError::Json(_)
+            ))
+        ));
+        assert_eq!(std::fs::read(path).unwrap(), before);
     }
 }
 

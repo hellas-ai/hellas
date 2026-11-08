@@ -910,9 +910,8 @@ async fn compute_and_settle_inner(
     assert_eq!(compute.calls(), 1);
     // A paid marker whose receipt was never written remains paid, with no
     // locally deliverable output, and cannot authorize another execution.
-    let mut paid_without_receipt: serde_json::Value =
+    let paid_without_receipt: serde_json::Value =
         serde_json::from_slice(&std::fs::read(attempt_path.as_path()).unwrap()).unwrap();
-    paid_without_receipt["phase"] = serde_json::json!("Paid");
     let paid_without_receipt_path = attempt_path.with_nonce([1; 16]);
     hellas_private::write_atomically(
         paid_without_receipt_path.as_path(),
@@ -947,8 +946,10 @@ async fn compute_and_settle_inner(
     // attempt has no recorded acceptance, it may only be recovered.
     let mut interrupted_record: serde_json::Value =
         serde_json::from_slice(&std::fs::read(attempt_path.as_path()).unwrap()).unwrap();
-    interrupted_record["phase"] = serde_json::json!("Running");
-    interrupted_record["work"] = serde_json::Value::Null;
+    interrupted_record["proposal"]
+        .as_object_mut()
+        .unwrap()
+        .remove("outcome");
     let interrupted_path = attempt_path.with_nonce([2; 16]);
     hellas_private::write_atomically(
         interrupted_path.as_path(),
