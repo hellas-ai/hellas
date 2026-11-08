@@ -18,10 +18,6 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     crane.url = "github:ipetkov/crane";
-    # Public, pinned HIP 7.15+ ROCm package set.
-    nix-strix-halo = {
-      url = "github:hellas-ai/nix-strix-halo/e24b2efcfaee1cefd326ff65ff7a955a908fd5ee";
-    };
   };
 
   outputs =
@@ -29,7 +25,6 @@
       self,
       nixpkgs,
       rust-overlay,
-      nix-strix-halo,
       # crane is used through self.inputs in nix/package.nix.
       ...
     }:
@@ -98,10 +93,7 @@
 
       overlays.default = final: _prev: {
         hellas = self.packages.${final.system};
-        hellasLib = import ./nix/lib {
-          pkgs = final;
-          inherit nix-strix-halo;
-        };
+        hellasLib = import ./nix/lib { pkgs = final; };
       };
 
       nixosModules = {

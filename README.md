@@ -507,9 +507,9 @@ Jobs pins needed by the workload. Both GPU images default to `serve` with their 
 the GPU driver and model content stays on runtime volumes. Published images are
 the Hydra-built artifacts of a commit whose CLI and GPU releases both passed.
 
-A GPU asset owner uploads verified weights once and execution workers map them
-read-only. Worker replacement retains weights; asset pressure recreates the
-owner. HIP resident sharing requires version 7.15 or newer.
+A GPU asset owner uploads verified weights once and execution workers receive
+them as read-only views over GPU IPC. Worker replacement retains weights; asset
+pressure recreates the owner.
 
 ## Recording and replaying jobs
 
