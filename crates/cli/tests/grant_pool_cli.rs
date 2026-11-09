@@ -1,7 +1,5 @@
 //! Exercise the real offline gateway command using private provisioning state.
-use hellas_auth::authority::{
-    AuthorityId, CredentialHolder, CredentialId, CredentialSecret, GrantId, UnixMillis,
-};
+use hellas_auth::authority::{AuthorityId, CredentialId, CredentialSecret, GrantId, UnixMillis};
 use hellas_authority::model::grant::records::{Offer, SignedOffer};
 use hellas_authority::test_support::definition;
 use hellas_channel::test_support::{network, principal, software_enrollment};
@@ -25,23 +23,24 @@ fn gateway_checks_a_real_pool_before_startup() {
         "{}",
         String::from_utf8_lossy(&init.stderr)
     );
-    let show = Command::new(binary)
+    let contact = Command::new(binary)
         .args([
             "--home",
             dir.path().to_str().unwrap(),
-            "identity",
-            "show-holder",
+            "contact",
+            "--name",
+            "pool",
         ])
         .output()
         .unwrap();
     assert!(
-        show.status.success(),
+        contact.status.success(),
         "{}",
-        String::from_utf8_lossy(&show.stderr)
+        String::from_utf8_lossy(&contact.stderr)
     );
-    let CredentialHolder::Node(holder) = serde_json::from_slice(&show.stdout).unwrap() else {
-        panic!("expected node holder")
-    };
+    let holder = hellas_sdk::contact::Contact::decode(&String::from_utf8(contact.stdout).unwrap())
+        .unwrap()
+        .holder;
     let subject = principal(7).0;
     let passkey = dir.path().join("passkey");
     std::fs::write(&passkey, [0x87; 32]).unwrap();

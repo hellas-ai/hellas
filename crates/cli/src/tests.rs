@@ -297,25 +297,20 @@ fn gateway_responses_fetch_takes_overrides_and_its_models() {
 }
 
 #[test]
-fn identity_show_holder_accepts_global_home() {
+fn identity_commands_accept_global_home() {
     let cli = Cli::try_parse_from([
         "hellas",
         "--home",
         "/state/hellas",
         "identity",
-        "show-holder",
+        "show-node-id",
     ])
     .unwrap();
     assert_eq!(
         cli.home.as_deref(),
         Some(std::path::Path::new("/state/hellas"))
     );
-    assert!(matches!(
-        cli.command,
-        Commands::Identity {
-            command: IdentityCommand::ShowHolder
-        }
-    ));
+    assert!(Cli::try_parse_from(["hellas", "identity", "show-holder"]).is_err());
     assert!(Cli::try_parse_from(["hellas", "producer-key", "show"]).is_err());
 }
 

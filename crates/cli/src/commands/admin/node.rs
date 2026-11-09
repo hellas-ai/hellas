@@ -21,7 +21,7 @@ use hellas_rpc::{
 use hellas_sdk::node_control::{self, profile};
 mod share;
 use hellas_wire::{ServiceMarker, StreamTransport};
-use share::{ShareRequest, share};
+use share::ShareRequest;
 use std::{path::Path, time::Duration};
 
 fn read<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
@@ -76,6 +76,74 @@ pub async fn run(
         }
         _ => {}
     }
+    connected(
+        Connection {
+            profile: args.profile,
+            control_socket: args.control_socket,
+            node_enrollment: args.node_enrollment,
+            addresses: args.addresses,
+        },
+        Operation::Admin(args.command),
+        identity,
+        passkey,
+        home,
+    )
+    .await
+}
+
+/// Share with the contact on the paired node: one access file, bound to the
+/// contact's device.
+pub async fn share(
+    args: super::ShareArgs,
+    identity: &LocalIdentity,
+    passkey: Option<&dyn Authenticator>,
+    home: &StoreLocation,
+) -> Result<()> {
+    let contact = hellas_sdk::contact::Contact::decode(&args.to)?;
+    let request = ShareRequest {
+        contact: contact.card,
+        holder: contact.holder,
+        resource: args.resource,
+        limits: args.limits,
+        max_job: args.max_job,
+        expires: args.expires,
+        label: args.label,
+        out: args.out,
+    };
+    connected(
+        Connection {
+            profile: args.profile,
+            control_socket: args.control_socket,
+            node_enrollment: None,
+            addresses: vec![],
+        },
+        Operation::Share(request),
+        identity,
+        passkey,
+        home,
+    )
+    .await
+}
+
+struct Connection {
+    profile: Option<std::path::PathBuf>,
+    control_socket: Option<std::path::PathBuf>,
+    node_enrollment: Option<String>,
+    addresses: Vec<std::net::SocketAddr>,
+}
+
+enum Operation {
+    Admin(AdminCommand),
+    Share(ShareRequest),
+}
+
+async fn connected(
+    args: Connection,
+    operation: Operation,
+    identity: &LocalIdentity,
+    passkey: Option<&dyn Authenticator>,
+    home: &StoreLocation,
+) -> Result<()> {
     let key = passkey.map_or(SessionKey::Node(&identity.node_key), SessionKey::Passkey);
     let profile_path = match args.profile {
         Some(path) => path,
@@ -111,7 +179,7 @@ pub async fn run(
         let (endpoint, client, challenge) =
             connect_remote(identity, node, args.addresses, &profile, key).await?;
         let result = command(
-            args.command,
+            operation,
             client,
             profile.authorization,
             challenge.generation,
@@ -122,7 +190,7 @@ pub async fn run(
     } else {
         let authorization = profile.authorization;
         let (client, challenge) = connect_local(profile, args.control_socket, home, key).await?;
-        command(args.command, client, authorization, challenge.generation).await
+        command(operation, client, authorization, challenge.generation).await
     }
 }
 
@@ -190,7 +258,7 @@ pub(in crate::commands) async fn connect_local(
 }
 
 async fn command<T>(
-    command: AdminCommand,
+    operation: Operation,
     client: HostControlClientImpl<T>,
     authorization: GrantId,
     generation: u64,
@@ -199,6 +267,12 @@ where
     T: StreamTransport + Send + Sync,
     T::Stream: Send + 'static,
 {
+    let command = match operation {
+        Operation::Share(request) => {
+            return share::share(&client, authorization, generation, request).await;
+        }
+        Operation::Admin(command) => command,
+    };
     match command {
         AdminCommand::Inspect { command } => {
             let query: hellas_auth::authority::InspectionQuery = read(&command)?;
@@ -293,33 +367,6 @@ where
                     "authority": hex::encode(scope.authority.0.as_bytes()),
                 })
             );
-        }
-        AdminCommand::Share {
-            contact,
-            holder,
-            resource,
-            limits,
-            max_job,
-            expires,
-            label,
-            out,
-        } => {
-            let request = ShareRequest {
-                contact: hellas_authority::model::grant::records::decode_contact_card(
-                    &hellas_private::read_bounded_regular_file(
-                        &contact,
-                        hellas_authority::model::grant::records::MAX_CONTACT_CARD_BYTES,
-                    )?,
-                )?,
-                holder: read(&holder)?,
-                resource,
-                limits,
-                max_job,
-                expires,
-                label,
-                out,
-            };
-            share(&client, authorization, generation, request).await?;
         }
         AdminCommand::RevokeCredential {
             credential_id,

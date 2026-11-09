@@ -1,89 +1,43 @@
 use super::*;
 
 #[tokio::test]
-async fn contact_cards_introduce_the_passkey_principal() {
+async fn a_contact_is_one_string_naming_the_principal_and_this_device() {
     let directory = tempfile::tempdir().unwrap();
     let provider = Cli::new(directory.path(), "provider", [0x51; 32]);
-    let friend = Cli::new(directory.path(), "friend", [0x52; 32]);
-    let card = directory.path().join("card");
-    let exported = provider
-        .output(&[
-            "contact",
-            "export",
-            "--display-name",
-            "Provider",
-            "--out",
-            string(&card),
-        ])
-        .await;
-    assert!(
-        exported.status.success(),
-        "{}",
-        String::from_utf8_lossy(&exported.stderr)
-    );
-    let fingerprint = provider.principal().fingerprint();
-    assert!(
-        String::from_utf8_lossy(&exported.stderr)
-            .contains(&format!("Principal fingerprint: {fingerprint}"))
-    );
-    let imported: Value = serde_json::from_str(
-        &friend
-            .run(&["contact", "import", string(&card), "--name", "provider"])
-            .await,
-    )
-    .unwrap();
-    assert_eq!(imported["fingerprint"], fingerprint);
-    assert_eq!(
-        imported["principal"],
-        hex::encode(provider.principal().as_bytes())
-    );
-    assert_eq!(imported["display_name"], "Provider");
-    // The card is the friend's, saved under the importer's principal.
-    let decoded = hellas_authority::model::grant::records::decode_contact_card(
-        &std::fs::read(&card).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(decoded.principal(), provider.principal());
-    assert!(
-        friend
-            .home
-            .join("grants")
-            .join(format!(
-                "p256-{}",
-                hex::encode(friend.principal().as_bytes())
-            ))
-            .join("contacts/provider")
-            .exists()
-    );
-    // Another card cannot silently replace the alias.
-    let other = directory.path().join("other");
-    friend
-        .run(&[
-            "contact",
-            "export",
-            "--display-name",
-            "Friend",
-            "--out",
-            string(&other),
-        ])
-        .await;
-    assert!(
-        !friend
-            .output(&["contact", "import", string(&other), "--name", "provider"])
-            .await
-            .status
-            .success()
-    );
-    // A tampered card is refused.
-    let mut forged = std::fs::read(&card).unwrap();
-    let last = forged.len() - 1;
-    forged[last] ^= 1;
-    std::fs::write(&other, forged).unwrap();
-    assert!(
-        !friend
-            .output(&["contact", "import", string(&other), "--name", "forged"])
-            .await
-            .status
-            .success()
-    );
+    let line = provider.contact().await;
+    let contact = hellas_sdk::contact::Contact::decode(&line).unwrap();
+    assert_eq!(contact.card.principal(), provider.principal());
+    assert_eq!(contact.card.name(), "provider");
+    let hellas_auth::authority::CredentialHolder::Node(holder) = provider.holder().await else {
+        panic!()
+    };
+    assert_eq!(contact.holder, holder);
+
+    // Without --passkey the home principal key is created once and reused.
+    let home = directory.path().join("fresh");
+    let contact = |name: &'static str| {
+        let home = home.clone();
+        async move {
+            let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_hellas"))
+                .arg("--home")
+                .arg(&home)
+                .args(["contact", "--name", name])
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            hellas_sdk::contact::Contact::decode(&String::from_utf8(output.stdout).unwrap())
+                .unwrap()
+        }
+    };
+    let first = contact("Friend").await;
+    let again = contact("Friend again").await;
+    assert!(home.join("principal.key").is_file());
+    assert_eq!(first.card.principal(), again.card.principal());
+    assert_eq!(first.holder, again.holder);
+    assert_eq!(again.card.name(), "Friend again");
 }

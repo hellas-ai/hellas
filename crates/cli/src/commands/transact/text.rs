@@ -17,7 +17,7 @@ pub struct TextArgs {
     #[arg(long, default_value_t = 256, value_parser = clap::value_parser!(u64).range(1..))]
     max_tokens: u64,
     /// Flat price the provider charges per job; paid work only.
-    #[arg(long, conflicts_with = "offer", value_parser = clap::value_parser!(u64).range(1..))]
+    #[arg(long, conflicts_with = "access", value_parser = clap::value_parser!(u64).range(1..))]
     payment: Option<u64>,
     #[command(flatten)]
     target: TargetArgs,
@@ -116,8 +116,8 @@ mod tests {
                 "hello",
                 "--max-tokens",
                 "3",
-                "--offer",
-                "box.model",
+                "--access",
+                "box.access",
             ];
             argv.extend(system);
             let crate::Commands::Text(args) = crate::Cli::try_parse_from(argv).unwrap().command

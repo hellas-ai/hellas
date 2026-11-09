@@ -95,24 +95,12 @@ impl OfferHost {
             .spec()
             .clone();
         let contact = root.join("contact");
-        client
-            .run(&[
-                "contact",
-                "export",
-                "--display-name",
-                "Client",
-                "--out",
-                string(&contact),
-            ])
-            .await;
-        provider
-            .run(&["contact", "import", string(&contact), "--name", "client"])
-            .await;
-        let grantee = hellas_authority::model::grant::records::decode_contact_card(
-            &std::fs::read(&contact).unwrap(),
-        )
-        .unwrap()
-        .principal();
+        std::fs::write(&contact, client.contact().await).unwrap();
+        let grantee =
+            hellas_sdk::contact::Contact::decode(&std::fs::read_to_string(&contact).unwrap())
+                .unwrap()
+                .card
+                .principal();
         reader.subject = grantee;
         reader.permissions = [hellas_auth::authority::Permission {
             operation: hellas_auth::authority::OperationId::new(
@@ -845,7 +833,7 @@ async fn gateway_control_issues_and_revokes_live_credentials() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_restricted_administrator_can_share_and_the_recipient_can_import_renewal() {
+async fn a_restricted_administrator_can_share_and_renew() {
     use hellas_auth::authority as auth;
     let host = OfferHost::start().await;
     let root = host.root();
@@ -989,21 +977,17 @@ async fn a_restricted_administrator_can_share_and_the_recipient_can_import_renew
     };
     assert!(!records.iter().any(|grant| grant.id() == authorization));
 
-    let contact = root.join("contact");
-    let holder = host.client.holder_file().await;
+    let contact = std::fs::read_to_string(root.join("contact")).unwrap();
     let share = async |out: &Path, expires: &str| {
         let output = administrator
             .run(&[
-                "admin",
+                "share",
                 "--profile",
                 string(&administrator_profile),
                 "--control-socket",
                 string(&host.socket),
-                "share",
-                "--contact",
-                string(&contact),
-                "--holder",
-                string(&holder),
+                "--to",
+                &contact,
                 "--resource",
                 "glm",
                 "--limit",
@@ -1018,22 +1002,19 @@ async fn a_restricted_administrator_can_share_and_the_recipient_can_import_renew
             .await;
         serde_json::from_str::<Value>(&output).unwrap()
     };
+    let auth::CredentialHolder::Node(holder) = host.client.holder().await else {
+        panic!()
+    };
+    let load = |file: &Path| {
+        hellas_sdk::access_bundle::AccessBundle::load(file, &host.client.principal(), &holder)
+            .unwrap()
+    };
     let first_file = root.join("restricted.access");
     let first = share(&first_file, "5m").await;
-    let first_import: Value = serde_json::from_str(
-        &host
-            .client
-            .run(&[
-                "offer",
-                "import-bundle",
-                string(&first_file),
-                "--name",
-                "restricted",
-            ])
-            .await,
-    )
-    .unwrap();
-    assert_eq!(first_import["offers"][0]["name"], "restricted.glm");
+    assert_eq!(
+        load(&first_file).offers[0].offer().grant.policies[0].name,
+        "glm"
+    );
     let renewed_file = root.join("restricted-renewed.access");
     let renewed = share(&renewed_file, "6m").await;
     for field in ["pool", "allowance", "grant"] {
@@ -1041,43 +1022,7 @@ async fn a_restricted_administrator_can_share_and_the_recipient_can_import_renew
     }
     assert!(renewed["expires"].as_u64().unwrap() > first["expires"].as_u64().unwrap());
     assert_ne!(first["credential_id"], renewed["credential_id"]);
-    let same_alias = host
-        .client
-        .output(&[
-            "offer",
-            "import-bundle",
-            string(&renewed_file),
-            "--name",
-            "restricted",
-        ])
-        .await;
-    assert!(
-        !same_alias.status.success(),
-        "renewal must not overwrite the existing profile"
-    );
-    let imported: Value = serde_json::from_str(
-        &host
-            .client
-            .run(&[
-                "offer",
-                "import-bundle",
-                string(&renewed_file),
-                "--name",
-                "restricted-renewed",
-            ])
-            .await,
-    )
-    .unwrap();
-    assert_eq!(imported["offers"][0]["name"], "restricted-renewed.glm");
-    let auth::CredentialHolder::Node(holder) = host.client.holder().await else {
-        panic!()
-    };
-    let installed = hellas_sdk::node_control::profile::ClientProfile::load_bound(
-        Path::new(imported["work_profile"].as_str().unwrap()),
-        &host.client.principal(),
-        &holder,
-    )
-    .unwrap();
+    let installed = load(&renewed_file);
     assert_eq!(
         installed.credential.id().to_string(),
         renewed["credential_id"]
@@ -1103,29 +1048,26 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
         .unwrap()
         .authority;
     let bundle = root.join("client.access");
-    let contact = root.join("contact");
     let export = |resource: String,
                   out: PathBuf,
-                  holder: PathBuf,
+                  contact: String,
                   limit: &'static str,
                   max_job: &'static str| {
-        let (provider, profile, socket, contact) = (
+        let (provider, profile, socket) = (
             &host.provider,
             host.provider_profile.clone(),
             host.socket.clone(),
-            contact.clone(),
         );
         async move {
             provider
                 .output(&[
-                    "admin",
+                    "share",
                     "--profile",
                     string(&profile),
                     "--control-socket",
                     string(&socket),
-                    "share",
-                    "--contact",
-                    string(&contact),
+                    "--to",
+                    &contact,
                     "--resource",
                     &resource,
                     "--limit",
@@ -1134,8 +1076,6 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
                     max_job,
                     "--expires",
                     "5m",
-                    "--holder",
-                    string(&holder),
                     "--out",
                     string(&out),
                 ])
@@ -1145,20 +1085,20 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
     let refused = export(
         "missing".into(),
         root.join("refused.access"),
-        host.client.holder_file().await,
+        host.client.contact().await,
         "requests:total:100",
         "5s",
     )
     .await;
     assert!(!refused.status.success());
     assert!(!root.join("refused.access").exists());
-    let holder_file = host.client.holder_file().await;
+    let client_contact = host.client.contact().await;
     // Failure after budgets were created is resumable: the corrected call
     // reuses them at revision 1 and creates only the missing allowance/grant.
     let interrupted = export(
         "glm".into(),
         root.join("interrupted.access"),
-        holder_file.clone(),
+        client_contact.clone(),
         "requests:total:100",
         "11s",
     )
@@ -1168,7 +1108,7 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
     let exported = export(
         "glm".into(),
         bundle.clone(),
-        holder_file.clone(),
+        client_contact.clone(),
         "requests:total:100",
         "5s",
     )
@@ -1208,7 +1148,7 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
     let unchanged = export(
         "glm".into(),
         root.join("unchanged.access"),
-        holder_file.clone(),
+        client_contact.clone(),
         "requests:total:100",
         "5s",
     )
@@ -1271,7 +1211,7 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
     let revised = export(
         "glm".into(),
         root.join("revised.access"),
-        holder_file.clone(),
+        client_contact.clone(),
         "requests:total:101",
         "6s",
     )
@@ -1317,7 +1257,7 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
         !export(
             "glm".into(),
             bundle.clone(),
-            holder_file,
+            client_contact,
             "requests:total:101",
             "6s"
         )
@@ -1325,30 +1265,13 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
         .status
         .success()
     );
-    // Another device of the same principal cannot import the credential.
     let other_device = Cli::new(root, "client-laptop", FRIEND_PASSKEY);
-    other_device.run(&["identity", "init"]).await;
-    let wrong = other_device
-        .output(&[
-            "offer",
-            "import-bundle",
-            string(&bundle),
-            "--name",
-            "shared",
-        ])
-        .await;
-    assert!(!wrong.status.success());
-    assert!(
-        String::from_utf8_lossy(&wrong.stderr).contains("bound to another device"),
-        "{}",
-        String::from_utf8_lossy(&wrong.stderr)
-    );
     // A second device gets its own credential on the same share. The first
     // device's original credential must continue to execute below.
     let laptop = export(
         "glm".into(),
         root.join("laptop.access"),
-        other_device.holder_file().await,
+        other_device.contact().await,
         "requests:total:101",
         "6s",
     )
@@ -1362,23 +1285,16 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
     assert_eq!(laptop["grant"], shared["grant"]);
     assert_eq!(laptop["allowance"], shared["allowance"]);
     assert_ne!(laptop["credential_id"], shared["credential_id"]);
-    let imported: Value = serde_json::from_str(
-        &host
-            .client
-            .run(&[
-                "offer",
-                "import-bundle",
-                string(&bundle),
-                "--name",
-                "shared",
-            ])
-            .await,
-    )
-    .unwrap();
-    assert_eq!(imported["offers"][0]["name"], "shared.glm");
-    assert_eq!(imported["offers"][0]["grant"], hex::encode(allowance.0));
-    // The same imported bundle works directly through the CLI, without an
-    // HTTP gateway or any chain funding. Retry must not consume it twice.
+    let auth::CredentialHolder::Node(holder) = host.client.holder().await else {
+        panic!()
+    };
+    let access =
+        hellas_sdk::access_bundle::AccessBundle::load(&bundle, &host.client.principal(), &holder)
+            .unwrap();
+    assert_eq!(access.offers[0].offer().grant.policies[0].name, "glm");
+    assert_eq!(access.offers[0].offer().grant.id, allowance);
+    // The access file works directly through the CLI, without an HTTP
+    // gateway or any chain funding. Retry must not consume it twice.
     let request = hellas_rpc::http_fetch::HttpFetchRequest {
         url: format!("{}/v1/chat/completions", host.https.origin),
         method: "POST".into(),
@@ -1415,8 +1331,8 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
     let result_dir = root.join("grant-result");
     let args = [
         "transact",
-        "--offer",
-        "shared.glm",
+        "--access",
+        string(&bundle),
         "--attempt",
         string(&attempt),
         "--job",
@@ -1435,7 +1351,14 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
     refused.extend(["--provider", &wrong_provider]);
     assert!(!host.client.output(&refused).await.status.success());
     assert!(!attempt.exists());
-    assert!(!other_device.output(&args).await.status.success());
+    // Another device of the same principal cannot use the credential.
+    let wrong = other_device.output(&args).await;
+    assert!(!wrong.status.success());
+    assert!(
+        String::from_utf8_lossy(&wrong.stderr).contains("bound to another device"),
+        "{}",
+        String::from_utf8_lossy(&wrong.stderr)
+    );
     assert_eq!(host.https.calls.load(Ordering::SeqCst), 0);
     for _ in 0..2 {
         host.client.run(&args).await;
@@ -1470,6 +1393,13 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
     assert!(!host.client.output(&changed_args).await.status.success());
     assert_eq!(host.https.calls.load(Ordering::SeqCst), 1);
     let trust_root = host.approve_trust().await;
+    // The pool reads bundles from the principal's grant store.
+    hellas_sdk::grant_store::GrantStore::new(host.client.home.join("grants").join(format!(
+        "p256-{}",
+        hex::encode(host.client.principal().as_bytes())
+    )))
+    .import_bundle(&bundle, "shared", &host.client.principal(), &holder, false)
+    .unwrap();
     let pool = root.join("grant-pool.json");
     std::fs::write(
         &pool,
@@ -1535,8 +1465,8 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
         "main",
         "--returns",
         "u64",
-        "--offer",
-        "shared.glm",
+        "--access",
+        string(&bundle),
         "--save-job",
         string(&invalid_dir),
         "--output",
@@ -1602,10 +1532,13 @@ async fn pool_gateway_opens_two_independent_providers() {
         };
         let path = root.join(format!("{name}.access"));
         bundle.save(&path).unwrap();
-        first
-            .client
-            .run(&["offer", "import-bundle", string(&path), "--name", name])
-            .await;
+        // The pool reads bundles from the principal's grant store.
+        hellas_sdk::grant_store::GrantStore::new(first.client.home.join("grants").join(format!(
+            "p256-{}",
+            hex::encode(first.client.principal().as_bytes())
+        )))
+        .import_bundle(&path, name, &first.client.principal(), &holder, false)
+        .unwrap();
         TrustPolicyStore::new(&trust_root)
             .approve(
                 name,

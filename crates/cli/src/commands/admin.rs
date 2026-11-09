@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 mod node;
 mod owner_scope;
 pub(super) use node::{connect_local, connect_remote};
-pub use node::{inspect_offline, pair, run};
+pub use node::{inspect_offline, pair, run, share};
 pub(crate) const CONTROL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Each paired node's profile is `<home>/nodes/NAME/profile.json`.
@@ -60,6 +60,42 @@ pub struct AdminArgs {
     pub addresses: Vec<std::net::SocketAddr>,
     #[command(subcommand)]
     pub command: AdminCommand,
+}
+
+/// Give a contact metered access to one resource of a node you administer,
+/// as an access file bound to the contact's device. Rerunning with the same
+/// contact and resource revises that one share.
+#[derive(clap::Args)]
+pub struct ShareArgs {
+    /// The `hellas-contact:...` string the contact sent you.
+    #[arg(long, value_name = "CONTACT")]
+    pub to: String,
+    /// New private access file to hand to the contact; the secret is never printed.
+    #[arg(long)]
+    pub out: PathBuf,
+    /// The configured resource name (default: the node's only resource).
+    #[arg(long)]
+    pub resource: Option<String>,
+    /// A budget limit METER:WINDOW:AMOUNT, e.g. `requests:total:100`; repeat
+    /// for each. Without any, only concurrency bounds the share.
+    #[arg(long = "limit", value_parser = parse_limit)]
+    pub limits: Vec<hellas_authority::model::grant::budget::Limit>,
+    /// The longest one job may run, e.g. `15m` (default: the resource's
+    /// execution timeout).
+    #[arg(long, value_parser = crate::commands::transact::duration)]
+    pub max_job: Option<std::time::Duration>,
+    /// How long the share's grant and credential stay valid, e.g. `30d`.
+    #[arg(long, default_value = "30d", value_parser = crate::commands::transact::duration)]
+    pub expires: std::time::Duration,
+    /// Provider display name shown to the contact.
+    #[arg(long)]
+    pub label: Option<String>,
+    /// The node's profile (default: the only node paired with `hellas pair`).
+    #[arg(long)]
+    pub profile: Option<PathBuf>,
+    /// Local node socket for a local profile; defaults to this home's control.sock.
+    #[arg(long)]
+    pub control_socket: Option<PathBuf>,
 }
 
 #[derive(clap::Args)]
@@ -144,38 +180,6 @@ pub enum AdminCommand {
         #[arg(long)]
         offer_out: Option<PathBuf>,
     },
-    /// Give a contact's principal metered access to one configured resource,
-    /// as an access bundle bound to one of the contact's devices. Rerunning
-    /// with the same contact and resource revises that one share.
-    Share {
-        /// The verified contact card naming the principal; your own card shares
-        /// with yourself.
-        #[arg(long)]
-        contact: PathBuf,
-        /// JSON CredentialHolder naming the receiving device's node key, as
-        /// `hellas identity show-holder` prints it.
-        #[arg(long)]
-        holder: PathBuf,
-        /// The configured resource name, e.g. `klein`.
-        #[arg(long)]
-        resource: String,
-        /// A budget limit METER:WINDOW:AMOUNT, e.g. `requests:total:100`; repeat
-        /// for each. Without any, only concurrency bounds the share.
-        #[arg(long = "limit", value_parser = parse_limit)]
-        limits: Vec<hellas_authority::model::grant::budget::Limit>,
-        /// The longest one job may run, e.g. `15m`.
-        #[arg(long, value_parser = crate::commands::transact::duration)]
-        max_job: std::time::Duration,
-        /// How long the share's grant and credential stay valid, e.g. `30d`.
-        #[arg(long, default_value = "30d", value_parser = crate::commands::transact::duration)]
-        expires: std::time::Duration,
-        /// Provider display name shown to the contact.
-        #[arg(long)]
-        label: Option<String>,
-        /// New private output file; the secret is never printed.
-        #[arg(long)]
-        out: PathBuf,
-    },
     /// Initialize an empty node store and issue the first application credential.
     Bootstrap {
         #[arg(long)]
@@ -237,24 +241,17 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn share_requires_an_explicit_contact_and_holder_and_parses_limits() {
+    fn share_needs_a_contact_and_an_output_and_parses_limits() {
         let base = [
             "hellas",
-            "admin",
             "share",
-            "--contact",
-            "me.contact",
-            "--holder",
-            "me.holder",
-            "--resource",
-            "model",
-            "--max-job",
-            "15m",
+            "--to",
+            "hellas-contact:x",
             "--out",
-            "me.access",
+            "friend.access",
         ];
         assert!(crate::Cli::try_parse_from(base).is_ok());
-        for missing in [3, 5] {
+        for missing in [2, 4] {
             assert!(
                 crate::Cli::try_parse_from(
                     base.iter()
@@ -268,13 +265,18 @@ mod tests {
         }
         assert!(
             crate::Cli::try_parse_from(base.into_iter().chain([
+                "--resource",
+                "compute",
+                "--max-job",
+                "15m",
                 "--expires",
-                "30d",
+                "1d",
                 "--limit",
-                "requests:total:100"
+                "requests:total:10"
             ]))
             .is_ok()
         );
+        assert!(crate::Cli::try_parse_from(["hellas", "admin", "share"]).is_err());
         for value in [
             "requests:100",
             "requests:total:-1",

@@ -1,17 +1,16 @@
-use hellas_authority::model::grant::records::decode_contact_card;
 use hellas_chain::genesis::{Chain, ChainProfile, FaucetAccount, HELLAS_DEVNET_3_FAUCET_JSON};
 use sha2::Digest as _;
 use std::process::Command;
 
 #[test]
-fn faucet_flags_sign_as_the_announced_account_without_creating_a_node() {
+fn faucet_flags_sign_as_the_announced_account() {
     let accounts: Vec<FaucetAccount> = serde_json::from_str(HELLAS_DEVNET_3_FAUCET_JSON).unwrap();
     for selection in [vec!["--faucet"], vec!["--faucet-account", "7"]] {
         let home = tempfile::tempdir().unwrap();
         let output = Command::new(env!("CARGO_BIN_EXE_hellas"))
             .env("HOME", home.path())
             .env("XDG_DATA_HOME", home.path().join("data"))
-            .args(["contact", "export", "--display-name", "Public devnet user"])
+            .args(["contact", "--name", "Public devnet user"])
             .args(&selection)
             .output()
             .unwrap();
@@ -20,7 +19,9 @@ fn faucet_flags_sign_as_the_announced_account_without_creating_a_node() {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let card = decode_contact_card(&output.stdout).unwrap();
+        let card = hellas_sdk::contact::Contact::decode(&String::from_utf8(output.stdout).unwrap())
+            .unwrap()
+            .card;
         let account = accounts
             .iter()
             .find(|account| {
@@ -43,7 +44,6 @@ fn faucet_flags_sign_as_the_announced_account_without_creating_a_node() {
         if selection.len() == 2 {
             assert_eq!(account.index, 7);
         }
-        assert!(!home.path().join(".hellas").exists());
     }
 }
 
@@ -77,7 +77,7 @@ fn faucet_rejects_another_authenticated_chain_before_identity_side_effects() {
         .arg("--chain-config")
         .arg(&path)
         .arg("--faucet")
-        .args(["contact", "export", "--display-name", "Public devnet user"])
+        .args(["contact", "--name", "Public devnet user"])
         .output()
         .unwrap();
     assert!(!output.status.success());

@@ -40,6 +40,7 @@ fn acts_for_principal(command: &Commands) -> bool {
     matches!(
         command,
         Commands::Contact { .. }
+            | Commands::Share(_)
             | Commands::Offer { .. }
             | Commands::Identity {
                 command: IdentityCommand::Init
@@ -130,9 +131,6 @@ enum IdentityCommand {
     ShowNodeId,
     /// Print the ContentId of the canonical enrollment bundle
     ShowEnrollmentId,
-    /// Print the JSON CredentialHolder naming this node's key, for issuing a
-    /// credential this node will hold
-    ShowHolder,
     /// Write this node's canonical enrollment, which operators pin to reach it
     ExportEnrollment {
         #[arg(long)]
@@ -164,11 +162,15 @@ enum Commands {
     #[cfg(unix)]
     /// Create, list and destroy machines through a configured provider.
     Machines(machines::MachinesArgs),
-    /// Introduce the principal with a signed contact card, or save a contact's.
+    /// Print the one `hellas-contact:` string to send to someone who will
+    /// share with you: your principal, signed, and this device.
     Contact {
-        #[command(subcommand)]
-        command: commands::contributions::ContactCommand,
+        /// The name you introduce yourself by (default: $USER).
+        #[arg(long)]
+        name: Option<String>,
     },
+    /// Give a contact metered access to a node you administer.
+    Share(commands::admin::ShareArgs),
     /// Import a private provider Offer addressed to this principal.
     Offer {
         #[command(subcommand)]
@@ -617,29 +619,6 @@ async fn async_main() {
             }
             return;
         }
-        command @ (Commands::Contact { .. }
-        | Commands::Offer {
-            command: commands::contributions::OfferCommand::Import { .. },
-        }) => {
-            let result: anyhow::Result<()> = async {
-                match command {
-                    Commands::Contact { command } => {
-                        commands::contributions::contact(command, passkey, &home).await
-                    }
-                    Commands::Offer { command } => {
-                        commands::contributions::offer(command, passkey, None, &home)
-                    }
-                    _ => Ok(()),
-                }
-            }
-            .await;
-            tracer_provider.shutdown();
-            if let Err(err) = result {
-                eprintln!("error: {err:#}");
-                std::process::exit(1);
-            }
-            return;
-        }
         Commands::ConvertFlux { checkpoint, output } => {
             let result = hellas_client::model::flux::convert_flux(&checkpoint, &output);
             tracer_provider.shutdown();
@@ -727,11 +706,25 @@ async fn async_main() {
     }
 
     let result = match command {
-        Commands::Offer { command } => {
-            commands::contributions::offer(command, passkey, Some(&local_identity.node_key), &home)
+        Commands::Offer { command } => commands::contributions::offer(command, passkey, &home),
+        Commands::Contact { name } => {
+            async {
+                let name = match name {
+                    Some(name) => name,
+                    None => std::env::var("USER")
+                        .map_err(|_| anyhow::anyhow!("pass --name: $USER is not set"))?,
+                };
+                let passkey = passkey.expect("a contact acts for the principal");
+                let contact =
+                    commands::contributions::contact(&name, passkey, &local_identity.node_key)
+                        .await?;
+                println!("{contact}");
+                Ok(())
+            }
+            .await
         }
-        Commands::Contact { .. } => {
-            unreachable!("contact commands handled before identity load")
+        Commands::Share(args) => {
+            commands::admin::share(args, &local_identity, passkey, &home).await
         }
         Commands::Admin(args) => commands::admin::run(args, &local_identity, passkey, &home).await,
         Commands::Pair { invite, name } => {
@@ -1265,9 +1258,6 @@ async fn async_main() {
             IdentityCommand::ShowNodeId => commands::identity::show_node_id(&secret_key),
             IdentityCommand::ShowEnrollmentId => {
                 commands::identity::show_enrollment_id(&local_identity.enrollment)
-            }
-            IdentityCommand::ShowHolder => {
-                commands::identity::show_holder(&local_identity.node_key)
             }
             IdentityCommand::ExportEnrollment { out } => {
                 commands::identity::export_enrollment(&local_identity.enrollment, out.as_deref())

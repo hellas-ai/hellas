@@ -6,7 +6,7 @@ use hellas_private::StoreLocation;
 #[test]
 fn grant_execution_requires_explicit_access_and_refuses_paid_options() {
     let base = ["hellas", "transact", "--job", "job"];
-    let grant = ["--offer", "shared.model"];
+    let grant = ["--access", "shared.access"];
     let parse = |extra: &[&str]| {
         crate::Cli::try_parse_from(base.iter().chain(grant.iter()).chain(extra.iter()).copied())
     };
@@ -625,13 +625,13 @@ fn execution_helpers_choose_payment_or_an_imported_offer() {
         assert!(parse(&["--payment", "20"]).is_err());
         assert!(parse(&["--payment", "20", "--provider", &provider]).is_ok());
         assert!(parse(&["--payment", "0", "--provider", &provider]).is_err());
-        assert!(parse(&["--offer", "box.model"]).is_ok());
-        assert!(parse(&["--offer", "box.model", "--provider", &provider]).is_ok());
-        assert!(parse(&["--payment", "20", "--offer", "box.model"]).is_err());
-        assert!(parse(&["--offer", "box.model", "--buy-again"]).is_err());
+        assert!(parse(&["--access", "box.access"]).is_ok());
+        assert!(parse(&["--access", "box.access", "--provider", &provider]).is_ok());
+        assert!(parse(&["--payment", "20", "--access", "box.access"]).is_err());
+        assert!(parse(&["--access", "box.access", "--buy-again"]).is_err());
         // Local execution exists only in the compute build.
         assert_eq!(parse(&["--local"]).is_ok(), cfg!(feature = "compute"));
-        assert!(parse(&["--local", "--offer", "box.model"]).is_err());
+        assert!(parse(&["--local", "--access", "box.access"]).is_err());
         assert!(parse(&["--local", "--provider", &provider]).is_err());
     }
 }

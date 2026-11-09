@@ -58,6 +58,7 @@ pub mod grant_client;
 
 pub mod access_bundle;
 mod application_handshake;
+pub mod contact;
 pub mod grant_config;
 pub mod node_control;
 

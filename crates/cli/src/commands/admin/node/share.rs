@@ -16,10 +16,13 @@ use std::{
 
 pub(super) struct ShareRequest {
     pub contact: ContactCard,
-    pub holder: CredentialHolder,
-    pub resource: String,
+    /// The contact's device, which holds the shared credential.
+    pub holder: hellas_auth::authority::NodeKey,
+    /// Default: the node's only resource.
+    pub resource: Option<String>,
     pub limits: Vec<Limit>,
-    pub max_job: Duration,
+    /// Default: the resource's execution timeout.
+    pub max_job: Option<Duration>,
     pub expires: Duration,
     pub label: Option<String>,
     pub out: PathBuf,
@@ -162,9 +165,7 @@ where
             .is_none_or(|label| label.len() <= MAX_LABEL_BYTES),
         "label exceeds {MAX_LABEL_BYTES} bytes"
     );
-    let CredentialHolder::Node(holder) = request.holder else {
-        anyhow::bail!("a share's credential is held by the receiving device");
-    };
+    let holder = request.holder;
     request
         .limits
         .sort_by_key(|limit| (limit.meter, limit.window));
@@ -174,20 +175,31 @@ where
         ),
         "a meter/window limit may be specified only once"
     );
-    let max_job_millis = NonZeroU64::new(
-        u64::try_from(request.max_job.as_millis()).context("--max-job is too long")?,
-    )
-    .context("--max-job must be positive")?;
     let subject = request.contact.principal();
     let WorkControlReply::Catalogue(catalogue) =
         work(client, authorization, &WorkControlCommand::Catalogue).await?
     else {
         anyhow::bail!("catalogue reply required")
     };
-    let policy = catalogue
-        .into_iter()
-        .find(|policy| policy.name == request.resource)
-        .with_context(|| format!("the node serves no resource named {:?}", request.resource))?;
+    let policy = match &request.resource {
+        Some(name) => catalogue
+            .into_iter()
+            .find(|policy| &policy.name == name)
+            .with_context(|| format!("the node serves no resource named {name:?}"))?,
+        None => {
+            let names: Vec<_> = catalogue.iter().map(|policy| policy.name.clone()).collect();
+            <[_; 1]>::try_from(catalogue)
+                .map(|[policy]| policy)
+                .map_err(|_| {
+                    anyhow::anyhow!("pick one of the node's resources {names:?} with --resource")
+                })?
+        }
+    };
+    let max_job_millis = match request.max_job {
+        Some(max_job) => u64::try_from(max_job.as_millis()).context("--max-job is too long")?,
+        None => policy.invocation_policy.limits.execution_timeout_ms,
+    };
+    let max_job_millis = NonZeroU64::new(max_job_millis).context("--max-job must be positive")?;
     // A restricted issuer's own administrative grant can be outside its
     // issuance ceiling. Page metadata is visible without exposing that grant.
     let grants = inspect(

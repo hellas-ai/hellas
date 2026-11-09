@@ -19,7 +19,7 @@ pub struct ImageArgs {
     #[arg(long, default_value_t = 4)]
     steps: usize,
     /// Flat price the provider charges per job; paid work only.
-    #[arg(long, conflicts_with = "offer", value_parser = clap::value_parser!(u64).range(1..))]
+    #[arg(long, conflicts_with = "access", value_parser = clap::value_parser!(u64).range(1..))]
     payment: Option<u64>,
     #[command(flatten)]
     target: TargetArgs,

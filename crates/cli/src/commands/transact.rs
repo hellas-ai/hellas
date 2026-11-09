@@ -89,7 +89,7 @@ pub(crate) fn duration(value: &str) -> Result<Duration, String> {
 #[derive(Clone, Debug, Args)]
 pub struct ClientArgs {
     /// Provider address ENROLLMENT_ID@NODE_ID, optionally followed by @IP:PORT.
-    /// Paid work requires it; --offer derives it from the signed offer.
+    /// Paid work requires it; --access derives it from the signed offer.
     #[arg(long)]
     provider: Option<Provider>,
     /// Additional direct UDP addresses for the provider.
@@ -138,31 +138,32 @@ pub struct TransactArgs {
     target: TargetArgs,
 }
 
-/// Where a job runs: paid under `--provider`, granted under `--offer`, or,
+/// Where a job runs: paid under `--provider`, granted under `--access`, or,
 /// with local compute, on this machine.
 #[derive(Debug, Args)]
 #[cfg_attr(
     not(feature = "compute"),
-    command(group(clap::ArgGroup::new("execution_target").required(true).multiple(true).args(["provider", "offer"])))
+    command(group(clap::ArgGroup::new("execution_target").required(true).multiple(true).args(["provider", "access"])))
 )]
 #[cfg_attr(
     feature = "compute",
-    command(group(clap::ArgGroup::new("execution_target").required(true).multiple(true).args(["provider", "offer", "local"])))
+    command(group(clap::ArgGroup::new("execution_target").required(true).multiple(true).args(["provider", "access", "local"])))
 )]
 pub(super) struct TargetArgs {
-    /// Imported access bundle offer NAME.POLICY. Executes using its bound Work profile.
-    #[arg(long, conflicts_with_all = ["settle", "buy_again", "validators", "addresses", "acceptance_blocks", "terminal_blocks", "payment_blocks"])]
-    offer: Option<String>,
-    /// Select a resource ID in an imported allowance containing several policies.
-    #[arg(long, requires = "offer")]
+    /// The access file someone shared with you (`hellas share`); the job runs
+    /// under its grant on the sharing node.
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["settle", "buy_again", "validators", "addresses", "acceptance_blocks", "terminal_blocks", "payment_blocks"])]
+    access: Option<PathBuf>,
+    /// Select a resource ID when the access file's offer has several.
+    #[arg(long, requires = "access")]
     resource: Option<ResourceId>,
     /// Durable attempt record (default: under the client state, by offer and job).
-    #[arg(long, requires = "offer", value_name = "FILE")]
+    #[arg(long, requires = "access", value_name = "FILE")]
     attempt: Option<PathBuf>,
     /// Run on this machine's executor under your own limits; nothing is
     /// paid, granted or tracked.
     #[cfg(feature = "compute")]
-    #[arg(long, conflicts_with_all = ["offer", "provider", "settle", "buy_again", "validators", "addresses", "acceptance_blocks", "terminal_blocks", "payment_blocks", "trust_store"])]
+    #[arg(long, conflicts_with_all = ["access", "provider", "settle", "buy_again", "validators", "addresses", "acceptance_blocks", "terminal_blocks", "payment_blocks", "trust_store"])]
     local: bool,
     #[cfg(feature = "compute")]
     #[command(flatten)]
@@ -179,7 +180,7 @@ pub struct FetchArgs {
     #[command(flatten)]
     client: ClientArgs,
     /// Flat price the provider charges; paid work only.
-    #[arg(long, conflicts_with = "offer", value_parser = clap::value_parser!(u64).range(1..))]
+    #[arg(long, conflicts_with = "access", value_parser = clap::value_parser!(u64).range(1..))]
     payment: Option<u64>,
     #[arg(long, default_value = "producer-signed", value_parser = ["producer-signed", "apple-app-attest"])]
     assurance: String,
@@ -475,7 +476,7 @@ async fn within<T>(
     }
 }
 
-/// Where one job runs: paid under `--provider`, under `--offer`'s grant, or
+/// Where one job runs: paid under `--provider`, under `--access`'s grant, or
 /// on this machine.
 #[expect(clippy::large_enum_variant, reason = "one per command")]
 enum Target {
@@ -516,10 +517,10 @@ impl TargetArgs {
                 opened: None,
             });
         }
-        let Some(offer) = self.offer.as_deref() else {
+        let Some(access) = self.access.as_deref() else {
             ensure!(
                 price > 0,
-                "paid execution requires a positive job payment; select --offer for grant work"
+                "paid execution requires a positive job payment; select --access for grant work"
             );
             return Ok(Target::Paid(
                 client.options(context, price, assurance).await?,
@@ -527,11 +528,12 @@ impl TargetArgs {
         };
         let principal = super::contributions::principal(context.owner()?)?;
         let holder = NodeKey::from_public_key(context.producer.public_key())?;
-        let store = hellas_sdk::grant_store::GrantStore::new(super::contributions::data_root(
-            &context.home,
-            &principal,
-        )?);
-        let (offer, application) = store.load_access(offer, &principal, &holder)?;
+        let (offers, application) =
+            hellas_sdk::access_bundle::AccessBundle::load(access, &principal, &holder)
+                .with_context(|| format!("access file {}", access.display()))?
+                .into_parts();
+        let [offer] = <[_; 1]>::try_from(offers)
+            .map_err(|_| anyhow::anyhow!("a job uses an access file with one offer"))?;
         let provider = hellas_sdk::client::ProviderAddress::of(&offer.offer().provider)?;
         if let Some(expected) = &client.provider {
             ensure!(
@@ -597,7 +599,7 @@ impl Target {
             Target::Grant { policy, .. } => policy.invocation_policy.clone(),
             #[cfg(feature = "compute")]
             Target::Local { .. } => {
-                bail!("local execution runs Compute jobs; Fetch needs --provider or --offer")
+                bail!("local execution runs Compute jobs; Fetch needs --provider or --access")
             }
         })
     }

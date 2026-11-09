@@ -44,8 +44,6 @@ async fn main() {
     };
     run(&["identity", "init"]);
     let enrollment = decode_enrollment(&run(&["identity", "export-enrollment"])).unwrap();
-    let holder: CredentialHolder =
-        serde_json::from_slice(&run(&["identity", "show-holder"])).unwrap();
     let passkey = hellas_kernel::SoftPasskey::from_secret_scalar(PASSKEY).unwrap();
     let principal =
         PrincipalId::from_public_key(hellas_auth::PublicKey::P256(passkey.party_key().to_bytes()))
@@ -64,6 +62,9 @@ async fn main() {
     let _: [u8; 32] = decoder.fixed_bytes("root key").unwrap();
     let signer =
         ProducerSigningKey::from_secret_bytes(decoder.fixed_bytes("node key").unwrap()).unwrap();
+    let holder = CredentialHolder::Node(
+        hellas_auth::authority::NodeKey::from_public_key(signer.public_key()).unwrap(),
+    );
     let journal =
         hellas_sdk::grant_config::GrantConfig::journal_dir(&StoreLocation::for_test(&home));
     let now = UnixMillis::now().unwrap();

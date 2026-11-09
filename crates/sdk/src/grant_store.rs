@@ -15,8 +15,6 @@ pub enum GrantStoreError {
     Conflict,
     #[error("offer import would roll back saved standing")]
     Rollback,
-    #[error("offer must use its imported bundle alias NAME.POLICY")]
-    AccessAlias,
     #[error("bundle has duplicate or missing policy aliases")]
     BundleAliases,
     #[error(transparent)]
@@ -82,28 +80,6 @@ impl GrantStore {
             subject,
             holder,
         )?)
-    }
-    /// Resolve NAME.POLICY using the signed first policy's exact name, which
-    /// may itself contain dots. The profile stays under accesses/NAME.
-    pub fn load_access(
-        &self,
-        name: &str,
-        subject: &PrincipalId,
-        holder: &NodeKey,
-    ) -> Result<(SignedOffer, ClientProfile)> {
-        let offer = self.load_offer(name)?;
-        let policy = offer
-            .offer()
-            .grant
-            .policies
-            .first()
-            .ok_or(GrantStoreError::AccessAlias)?;
-        let suffix = format!(".{}", policy.name);
-        let bundle = name
-            .strip_suffix(&suffix)
-            .ok_or(GrantStoreError::AccessAlias)?;
-        let profile = self.load_profile(bundle, subject, holder)?;
-        Ok((offer, profile))
     }
     fn lock_offer(&self, name: &str) -> Result<std::fs::File> {
         let path = self.offer_path(name)?;

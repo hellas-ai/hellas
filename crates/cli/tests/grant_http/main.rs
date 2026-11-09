@@ -184,16 +184,33 @@ impl Cli {
         ))
         .unwrap()
     }
-    /// The holder naming this CLI's node key, as `identity show-holder` prints it.
+    /// This CLI's `hellas contact` string, named after its home.
+    async fn contact(&self) -> String {
+        let name = self
+            .home
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        self.run(&["contact", "--name", &name])
+            .await
+            .trim()
+            .to_owned()
+    }
+    /// The holder naming this CLI's node key, as its contact names it.
     async fn holder(&self) -> hellas_auth::authority::CredentialHolder {
-        serde_json::from_str(&self.run(&["identity", "show-holder"]).await).unwrap()
+        hellas_auth::authority::CredentialHolder::Node(
+            hellas_sdk::contact::Contact::decode(&self.contact().await)
+                .unwrap()
+                .holder,
+        )
     }
     async fn holder_file(&self) -> PathBuf {
         let path = self.root.join(format!(
             "{}-holder.json",
             self.home.file_name().unwrap().to_string_lossy()
         ));
-        std::fs::write(&path, self.run(&["identity", "show-holder"]).await).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&self.holder().await).unwrap()).unwrap();
         path
     }
     fn command(&self, args: &[&str]) -> Command {
