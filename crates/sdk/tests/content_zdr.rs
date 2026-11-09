@@ -58,7 +58,14 @@ fn check(bytes: &[u8], canaries: &[Vec<u8>], path: &Path) -> Result<(), PathBuf>
 }
 async fn scan(root: &Path, canaries: &[Vec<u8>]) -> Result<(), PathBuf> {
     for path in files(root) {
-        let bytes = std::fs::read(&path).unwrap();
+        // SQLite deletes a database's -wal file when its last connection
+        // closes, after checkpointing it into the database this scan also
+        // reads; a file gone since the listing has nothing left to check.
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => panic!("reading {}: {error}", path.display()),
+        };
         check(&bytes, canaries, &path)?;
         if !bytes.starts_with(b"SQLite format 3\0") {
             continue;
@@ -71,10 +78,12 @@ async fn scan(root: &Path, canaries: &[Vec<u8>]) -> Result<(), PathBuf> {
         for suffix in ["-wal", "-shm"] {
             let mut original = path.as_os_str().to_owned();
             original.push(suffix);
-            if Path::new(&original).exists() {
-                let mut destination = copied.as_os_str().to_owned();
-                destination.push(suffix);
-                std::fs::copy(&original, &destination).unwrap();
+            let mut destination = copied.as_os_str().to_owned();
+            destination.push(suffix);
+            match std::fs::copy(&original, &destination) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("copying {}: {error}", Path::new(&original).display()),
             }
         }
         let options = sqlx::sqlite::SqliteConnectOptions::new()
