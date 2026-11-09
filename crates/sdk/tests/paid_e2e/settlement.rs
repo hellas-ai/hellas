@@ -787,7 +787,6 @@ fn empty_channel_settlement_recovers_exact_return_and_rejects_wrong_identity() {
 #[test]
 #[ignore = "requires the CLI executable supplied by the CLI integration gate"]
 fn cli_settles_paid_channel_without_provider() {
-    use commonware_cryptography::{Hasher as _, Sha256};
     let binary =
         std::env::var_os("HELLAS_CLI_TEST_BINARY").expect("CLI integration gate supplies binary");
     run(|runtime| {
@@ -835,51 +834,7 @@ fn cli_settles_paid_channel_without_provider() {
             std::fs::rename(case.options.journal_root(), &journals).unwrap();
             case.options.config.chain = cli_chain;
 
-            // The client's already-funded node signer is [0x21; 32]. Encode a
-            // normal private identity containing exactly that signer for the CLI.
-            let root_key = ProducerSigningKey::from_secret_bytes([0x41; 32]).unwrap();
-            let node_key = ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap();
-            let transport = iroh::SecretKey::from_bytes(&[0x42; 32]);
-            let enrollment = enrollment(
-                &root_key,
-                &node_key,
-                *transport.public().as_bytes(),
-                [0x43; 32],
-            );
-            let mut identity = hellas_rpc::DagCborEncoder::new();
-            identity.array(6);
-            identity.str("hellas.provider.identity.persistence.v3");
-            identity.u64(3);
-            identity.array(2);
-            identity.u64(0);
-            identity.bytes(&[0x41; 32]);
-            identity.bytes(&[0x21; 32]);
-            identity.bytes(&[0x42; 32]);
-            identity.bytes(&enrollment.canonical_bytes());
-            let identity_path = state.join("identity");
-            hellas_private::write_atomically(&identity_path, ".writing", &identity.into_bytes())
-                .unwrap();
-            let passkey = root.join("cli-passkey");
-            hellas_private::write_atomically(&passkey, ".writing", &[0x13; 32]).unwrap();
-            let genesis = serde_json::to_vec(case.devnet.genesis()).unwrap();
-            let trust = serde_json::json!({
-                "schema_version": 1,
-                "network_id": case.devnet.network().as_str(),
-                "genesis_sha256": hex::encode(Sha256::hash(&genesis)),
-                "epochs": [{"epoch":0,"start_height":0,"end_height":null,
-                            "threshold_identity":hex::encode(&case.devnet.consensus_info().threshold_identity)}],
-            });
-            let chain_path = root.join("cli-chain.json");
-            std::fs::write(
-                &chain_path,
-                serde_json::to_vec(&serde_json::json!({
-                    "trust": trust,
-                    "validators": case.relays.urls,
-                    "genesis_json": String::from_utf8(genesis).unwrap(),
-                }))
-                .unwrap(),
-            )
-            .unwrap();
+            let (passkey, chain_path) = write_cli_home(&case, &state);
             case.provider.shutdown().await.unwrap();
             // Drain execution-phase RPCs before counting settlement proof reads.
             case.relays.shutdown().await;
@@ -1301,6 +1256,138 @@ fn a_client_understatement_is_answered_by_the_provider_clock_within_the_window()
             );
             case.provider.shutdown().await.unwrap();
             case.endpoint.close().await;
+            case.relays.shutdown().await;
+            case.devnet.shutdown().await;
+        })
+    });
+}
+
+/// Writes the CLI's view of this scenario into `state`: the client identity
+/// whose node signer ([0x21; 32]) already holds the funding delegation, the
+/// owner passkey, and a custom chain file naming this devnet and its relays.
+/// Returns the passkey path and the chain file path.
+fn write_cli_home(
+    case: &PaidScenario<()>,
+    state: &std::path::Path,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let root = case.root.path();
+    // The client's already-funded node signer is [0x21; 32]. Encode a
+    // normal private identity containing exactly that signer for the CLI.
+    let root_key = ProducerSigningKey::from_secret_bytes([0x41; 32]).unwrap();
+    let node_key = ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap();
+    let transport = iroh::SecretKey::from_bytes(&[0x42; 32]);
+    let enrollment = enrollment(
+        &root_key,
+        &node_key,
+        *transport.public().as_bytes(),
+        [0x43; 32],
+    );
+    let mut identity = hellas_rpc::DagCborEncoder::new();
+    identity.array(6);
+    identity.str("hellas.provider.identity.persistence.v3");
+    identity.u64(3);
+    identity.array(2);
+    identity.u64(0);
+    identity.bytes(&[0x41; 32]);
+    identity.bytes(&[0x21; 32]);
+    identity.bytes(&[0x42; 32]);
+    identity.bytes(&enrollment.canonical_bytes());
+    let identity_path = state.join("identity");
+    hellas_private::write_atomically(&identity_path, ".writing", &identity.into_bytes()).unwrap();
+    let passkey = root.join("cli-passkey");
+    hellas_private::write_atomically(&passkey, ".writing", &[0x13; 32]).unwrap();
+    let genesis = serde_json::to_vec(case.devnet.genesis()).unwrap();
+    let trust = serde_json::json!({
+        "schema_version": 1,
+        "network_id": case.devnet.network().as_str(),
+        "genesis_sha256": hex::encode(Sha256::hash(&genesis)),
+        "epochs": [{"epoch":0,"start_height":0,"end_height":null,
+                    "threshold_identity":hex::encode(&case.devnet.consensus_info().threshold_identity)}],
+    });
+    let chain_path = root.join("cli-chain.json");
+    std::fs::write(
+        &chain_path,
+        serde_json::to_vec(&serde_json::json!({
+            "trust": trust,
+            "validators": case.relays.urls,
+            "genesis_json": String::from_utf8(genesis).unwrap(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    (passkey, chain_path)
+}
+
+/// Run the public CLI's paid purchase end to end: quote, fund a channel
+/// with the owner passkey, upload, execute, verify and pay, all from one
+/// `hellas transact --job` process against the simulated chain.
+#[test]
+#[ignore = "requires the CLI executable supplied by the CLI integration gate"]
+fn cli_buys_a_paid_job_end_to_end() {
+    let binary =
+        std::env::var_os("HELLAS_CLI_TEST_BINARY").expect("CLI integration gate supplies binary");
+    run(|runtime| {
+        Box::pin(async move {
+            let mut case = paid_fixture(runtime).await;
+            let root = case.root.path().to_path_buf();
+            let state = root.join("cli-buyer");
+            std::fs::create_dir_all(&state).unwrap();
+            let (passkey, chain_path) = write_cli_home(&case, &state);
+            let job = hellas_sdk::job::Job::fetch(
+                PRICE,
+                test_responses_contract(),
+                "openai".into(),
+                "responses".into(),
+                BODY.to_vec(),
+                Assurance::ProducerSigned,
+            )
+            .unwrap();
+            let job_dir = root.join("cli-job");
+            job.save(&job_dir).await.unwrap();
+            let mut command = tokio::process::Command::new(&binary);
+            command
+                .arg("--home")
+                .arg(&state)
+                .arg("--passkey")
+                .arg(&passkey)
+                .arg("--chain-config")
+                .arg(&chain_path)
+                .arg("transact")
+                .arg("--job")
+                .arg(&job_dir)
+                .arg("--provider")
+                .arg(case.options.provider.to_string())
+                .arg("--timeout")
+                .arg("120s")
+                // Inside the fixture bond's short admission horizon.
+                .args(["--acceptance-blocks", "60"])
+                .args(["--terminal-blocks", "40"])
+                .args(["--payment-blocks", "40"]);
+            for address in &case.options.provider_addrs {
+                command.arg("--address").arg(address.to_string());
+            }
+            for validator in &case.relays.urls {
+                command.arg("--validator").arg(validator);
+            }
+            let output = sealing_while(
+                &mut case.devnet,
+                Duration::from_millis(100),
+                command.output(),
+            )
+            .await
+            .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "stdout: {stdout}\nstderr: {stderr}"
+            );
+            assert!(
+                stdout.contains(&format!("paid {PRICE}"))
+                    || stderr.contains(&format!("paid {PRICE}")),
+                "the CLI paid the job's price\nstdout: {stdout}\nstderr: {stderr}"
+            );
+            case.provider.shutdown().await.unwrap();
             case.relays.shutdown().await;
             case.devnet.shutdown().await;
         })
