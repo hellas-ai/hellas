@@ -1158,6 +1158,11 @@ async fn propose_when_ready(
             Ok(work_id) => return Ok(work_id),
             Err(hellas_channel::work::ProposeError::Refused { refusal, .. })
                 if refusal.is_retryable() => {}
+            // A confirmation that lapsed while this proposal waited is renewed
+            // by the observer; it is not an answer to the job either.
+            Err(hellas_channel::work::ProposeError::Endpoint(
+                hellas_channel::work::EndpointError::ObservationStale,
+            )) => {}
             // Finalized setup can reach the client before the provider's clock
             // mounts Work. Upload has no structured NotReady response; the
             // retained half-signed proposal makes this retry the same purchase.
