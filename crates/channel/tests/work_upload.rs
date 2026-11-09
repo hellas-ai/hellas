@@ -412,7 +412,7 @@ async fn twelve_mib_compute_input_retries_accepts_reopens_and_reuses_verified_co
     input.request.input = input.input.content_id().unwrap();
     let mut policy = work_policy();
     policy.limits.max_upload_bytes = 13 * 1024 * 1024;
-    let ready = ready_of(&descriptor_with(policy), CURSOR);
+    let ready = ready_of(&descriptor_with(policy.clone()), CURSOR);
     input.application_policy =
         hellas_rpc::JsonBytes(ready.invocation_policy().canonical_bytes().unwrap());
     let provider_root = root.path().join("provider");
@@ -516,6 +516,10 @@ async fn twelve_mib_compute_input_retries_accepts_reopens_and_reuses_verified_co
     );
     drop(admitted);
     service.end_run(work).await.unwrap();
+    // Two 12 MiB uploads and three restarts can outlive one certified age on
+    // a loaded host; propose the next job from a fresh read.
+    let fresh = ready_of(&descriptor_with(policy), CURSOR + 1);
+    hellas_channel::test_support::channel::refresh(&caller, &service, &fresh, CURSOR + 1).await;
     let next = caller
         .propose(
             &JobProposal {
