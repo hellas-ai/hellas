@@ -625,7 +625,12 @@ impl PaidWorkSession {
         endpoint.observe(&snapshot.observed_channel()).await?;
         let client = ClientService::new(endpoint);
         if let Some(ready) = ready {
-            client.observer().observe_ready(ready).await?;
+            // A first read that aged out while the journal mounted is not a
+            // refusal: the initial observation below waits for a fresh one.
+            match client.observer().observe_ready(ready).await {
+                Ok(()) | Err(hellas_channel::work::EndpointError::ObservationStale) => {}
+                Err(error) => return Err(error.into()),
+            }
         }
         if initially_ready {
             // Keep initial observation in the opening future. Cancellation must
