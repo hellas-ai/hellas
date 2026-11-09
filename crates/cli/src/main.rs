@@ -41,7 +41,6 @@ fn acts_for_principal(command: &Commands) -> bool {
         command,
         Commands::Contact { .. }
             | Commands::Share(_)
-            | Commands::Offer { .. }
             | Commands::Identity {
                 command: IdentityCommand::Init
             }
@@ -129,11 +128,6 @@ enum Commands {
     },
     /// Give a contact metered access to a node you administer.
     Share(commands::admin::ShareArgs),
-    /// Import a private provider Offer addressed to this principal.
-    Offer {
-        #[command(subcommand)]
-        command: commands::contributions::OfferCommand,
-    },
     /// Become the owner of a fresh node with the invite its `serve` printed.
     Pair {
         /// The `hellas-invite:...` line, copied from the node's own console.
@@ -217,20 +211,17 @@ enum Commands {
     },
     /// Run HTTP gateway exposing OpenAI/Anthropic/plain APIs over Hellas network
     ///
-    /// Every route requires `Authorization: Bearer <token>`. Use
-    /// --gateway-profile to select its provisioned Auth authority and credential.
-    /// Hellas routes run --text-model as paid Compute jobs; the shared model
-    /// adapter handles text and tool calls with the GGUF's tokenizer.
+    /// Every route requires `Authorization: Bearer <token>`. On loopback the
+    /// gateway keeps its own authority under the home and its bearer in
+    /// `gateway/bearer` there, so a web page cannot spend what it runs on;
+    /// --gateway-profile selects an explicitly provisioned one instead.
     Gateway {
-        /// Qwen3 GGUF served by the text routes. Providers must already hold it.
-        #[arg(long, value_name = "FILE")]
-        text_model: Option<PathBuf>,
-        /// Converted Whisper package served at /v1/audio/transcriptions.
-        #[arg(long, value_name = "DIR")]
-        audio_model: Option<PathBuf>,
-        /// Converted Flux2 Klein package served at /v1/images/generations.
-        #[arg(long, value_name = "DIR")]
-        image_model: Option<PathBuf>,
+        /// A model the routes render jobs from, named after its file or
+        /// directory: a Qwen GGUF serves the text routes, a converted Whisper
+        /// package /v1/audio/transcriptions and a converted Flux package
+        /// /v1/images/generations. Providers must hold the same weights.
+        #[arg(long = "model", value_name = "PATH")]
+        models: Vec<PathBuf>,
         /// Where requests run: the job commands' --access, --pay or --local.
         #[command(flatten)]
         execution: commands::transact::GatewayArgs,
@@ -241,11 +232,11 @@ enum Commands {
         /// Disable payload archives and require ZDR for every HTTP request.
         #[arg(long)]
         zdr: bool,
-        /// Private profile selecting the local HTTP authority and scoped credential.
+        /// Private profile selecting a provisioned HTTP authority and scoped credential.
         #[arg(long = "gateway-profile", value_name = "FILE")]
         gateway_profile: Option<PathBuf>,
         /// Allow a non-loopback listener using the provisioned gateway authority.
-        #[arg(long)]
+        #[arg(long, requires = "gateway_profile")]
         allow_remote: bool,
         /// Host interface to bind. Every request requires bearer authentication.
         #[arg(long, default_value = "127.0.0.1")]
@@ -617,7 +608,6 @@ async fn async_main() {
     }
 
     let result = match command {
-        Commands::Offer { command } => commands::contributions::offer(command, passkey, &home),
         Commands::Contact { name } => {
             async {
                 let name = match name {
@@ -751,9 +741,7 @@ async fn async_main() {
             }
         }
         Commands::Gateway {
-            text_model,
-            audio_model,
-            image_model,
+            models,
             execution,
             http_fetch_config,
             zdr,
@@ -772,16 +760,41 @@ async fn async_main() {
             wrap_args,
         } => {
             async {
+                let principal = match owner.as_ref() {
+                    Some(owner) => owner.clone(),
+                    None => owner::principal(&home)?,
+                };
+                let directory = home.join("gateway");
+                let own = gateway_profile.is_none();
+                let profile = match gateway_profile {
+                    Some(profile) => profile,
+                    None => {
+                        commands::admin::gateway_profile(
+                            &directory,
+                            &home,
+                            &local_identity,
+                            &principal,
+                        )
+                        .await?
+                    }
+                };
                 let hellas_sdk::node_control::profile::GatewayHost {
                     node,
                     access,
                     control,
-                } = hellas_sdk::node_control::profile::GatewayProfile::load(&home.child(
-                    gateway_profile.as_deref().ok_or_else(|| {
-                        anyhow::anyhow!("--gateway-profile is required to serve HTTP")
-                    })?,
-                ))
-                .await?;
+                } = hellas_sdk::node_control::profile::GatewayProfile::load(&home.child(profile))
+                    .await?;
+                if own {
+                    let bearer = directory.join("bearer");
+                    if !bearer.try_exists()? {
+                        hellas_private::write_atomically(
+                            &bearer,
+                            ".writing",
+                            access.bearer().as_bytes(),
+                        )?;
+                    }
+                    eprintln!("gateway bearer: {}", bearer.display());
+                }
                 let http = http_fetch_config
                     .map(
                         |path| -> anyhow::Result<hellas_gateway::HttpGatewayConfig> {
@@ -794,49 +807,29 @@ async fn async_main() {
                         },
                     )
                     .transpose()?;
-                let text = text_model.map(|model| hellas_gateway::TextOptions {
-                    model_name: model
-                        .file_stem()
-                        .map_or_else(String::new, |stem| stem.to_string_lossy().into_owned()),
-                    model,
-                    default_max_tokens,
-                });
-                let mut models: Vec<_> = text
+                let models = models
                     .into_iter()
-                    .map(hellas_gateway::ModelOptions::Text)
+                    .map(|model| hellas_gateway::ModelOptions::at(model, default_max_tokens))
                     .collect();
-                if let Some(model) = audio_model {
-                    models.push(hellas_gateway::ModelOptions::Whisper(
-                        hellas_gateway::AudioOptions {
-                            model_name: model
-                                .file_name()
-                                .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
-                            model,
-                            default_max_tokens: default_max_tokens as usize,
-                        },
-                    ));
-                }
-                if let Some(model) = image_model {
-                    models.push(hellas_gateway::ModelOptions::Flux(
-                        hellas_gateway::ImageOptions {
-                            model_name: model
-                                .file_name()
-                                .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
-                            model,
-                        },
-                    ));
-                }
-                #[cfg(feature = "otel")]
-                if let Some((address, bundle)) = metrics {
-                    metrics::spawn_metrics_server(address, bundle).await?;
-                }
                 let context = commands::transact::Context::new(
                     &local_identity,
-                    owner.as_ref(),
+                    Some(&principal),
                     &home,
                     &selected_chain,
                 )?;
                 let served = commands::transact::gateway(execution, context, async |work| {
+                    #[cfg(feature = "otel")]
+                    if let Some((address, bundle)) = metrics {
+                        let bundle = match work.target().endpoint() {
+                            Some(endpoint) => {
+                                let (_, receiver) =
+                                    tokio::sync::watch::channel(Some(endpoint.clone()));
+                                bundle.with_iroh(receiver)
+                            }
+                            None => bundle,
+                        };
+                        metrics::spawn_metrics_server(address, bundle).await?;
+                    }
                     let http = match http {
                         Some(http) => Some(http),
                         None => work.target().http_config()?,

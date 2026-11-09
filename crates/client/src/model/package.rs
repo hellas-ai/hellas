@@ -23,6 +23,29 @@ pub struct ModelPackage {
     family: Family,
 }
 
+/// What a model path serves, from its layout alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelKind {
+    /// A Qwen GGUF file.
+    Text,
+    /// A converted Whisper package directory.
+    Transcription,
+    /// A converted Flux package directory.
+    Image,
+}
+
+impl ModelKind {
+    pub fn of(path: &Path) -> Self {
+        if path.join("model_index.json").is_file() {
+            Self::Image
+        } else if path.is_dir() {
+            Self::Transcription
+        } else {
+            Self::Text
+        }
+    }
+}
+
 pub enum ModelRequest<'a> {
     Image(ImageRequest<'a>),
     Text {
@@ -58,15 +81,13 @@ impl ModelPackage {
     /// A Qwen GGUF, or a converted Whisper or Flux package directory.
     pub async fn open(path: &Path) -> Result<Self> {
         Ok(Self {
-            family: if path.join("model_index.json").is_file() {
-                Family::Flux(Arc::new({
+            family: match ModelKind::of(path) {
+                ModelKind::Image => Family::Flux(Arc::new({
                     let path = path.to_owned();
                     tokio::task::spawn_blocking(move || Flux::open(&path)).await??
-                }))
-            } else if path.is_dir() {
-                Family::Whisper(Arc::new(Whisper::open(path).await?))
-            } else {
-                Family::Qwen3(Arc::new(Qwen3::open(path).await?))
+                })),
+                ModelKind::Transcription => Family::Whisper(Arc::new(Whisper::open(path).await?)),
+                ModelKind::Text => Family::Qwen3(Arc::new(Qwen3::open(path).await?)),
             },
         })
     }

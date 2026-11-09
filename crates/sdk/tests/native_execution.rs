@@ -763,7 +763,9 @@ async fn check_gateway_quote(
     owner: Arc<hellas_sdk::client_owner::ClientOwner>,
 ) {
     use hellas_gateway::WorkExecutionBackend as _;
-    let endpoint = bind_paid_endpoint(iroh::SecretKey::generate()).await.unwrap();
+    let endpoint = bind_paid_endpoint(iroh::SecretKey::generate())
+        .await
+        .unwrap();
     let settlement = client_settlement();
     let quote = hellas_sdk::paid_client::request_paid_quote(
         options,
@@ -826,7 +828,11 @@ async fn check_gateway_quote(
         "gateway admits the whole request before requesting funding"
     );
     gateway.drain().await.unwrap();
-    assert_eq!(setups().await, before, "a refused request never funds a channel");
+    assert_eq!(
+        setups().await,
+        before,
+        "a refused request never funds a channel"
+    );
 }
 
 /// The provider earns exactly the price from the payment close, and its

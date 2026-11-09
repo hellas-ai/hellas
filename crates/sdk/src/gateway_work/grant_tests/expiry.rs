@@ -50,10 +50,7 @@ async fn slow_durable_admission_retries_once() {
 
 #[tokio::test]
 async fn ambiguous_acceptance_recovers_original_work_without_replacement() {
-    let fixture = Fixture::builder()
-        .with_max_job_millis(30_000)
-        .build()
-        .await;
+    let fixture = Fixture::builder().with_max_job_millis(30_000).build().await;
     let ticking = follow_clock(&fixture);
     // The actual Accepted INSERT commits, but its acknowledgement misses the
     // control timeout. The provider continues independently of the client RPC.

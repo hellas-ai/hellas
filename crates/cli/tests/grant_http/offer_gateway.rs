@@ -19,11 +19,8 @@ struct OfferHost {
     reader_grant: GrantId,
     root_grant: GrantId,
     signed_offer: hellas_authority::model::grant::records::SignedOffer,
-    offer: PathBuf,
-    id: GrantId,
     work_profile: PathBuf,
     exported_offer: std::process::Output,
-    imported_offer: std::process::Output,
 }
 impl OfferHost {
     async fn start() -> Self {
@@ -226,14 +223,6 @@ impl OfferHost {
             id,
         )
         .await;
-        let import = client
-            .output(&["offer", "import", string(&offer), "--name", "lan"])
-            .await;
-        assert!(
-            import.status.success(),
-            "{}",
-            String::from_utf8_lossy(&import.stderr)
-        );
         OfferHost {
             directory,
             https,
@@ -250,11 +239,8 @@ impl OfferHost {
             reader_grant,
             root_grant,
             signed_offer,
-            offer,
-            id,
             work_profile,
             exported_offer,
-            imported_offer: import,
         }
     }
     fn root(&self) -> &Path {
@@ -315,29 +301,13 @@ struct Gateway {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn offer_import_reports_the_exported_provider_identity() {
+async fn offer_export_reports_the_provider_identity() {
     let host = OfferHost::start().await;
     let fingerprint = format!(
         "Provider enrollment: {}",
         host.provider_enrollment.content_id()
     );
     assert!(String::from_utf8_lossy(&host.exported_offer.stderr).contains(&fingerprint));
-    assert!(String::from_utf8_lossy(&host.imported_offer.stderr).contains(&fingerprint));
-    assert_eq!(
-        String::from_utf8_lossy(&host.imported_offer.stdout).trim(),
-        hex::encode(host.id.0)
-    );
-    // Import is a public description, independent of execution authority.
-    let stranger = Cli::new(host.root(), "stranger", STRANGER_PASSKEY);
-    stranger
-        .run(&[
-            "offer",
-            "import",
-            string(&host.offer),
-            "--name",
-            "forwarded",
-        ])
-        .await;
     host.stop().await;
 }
 
@@ -1413,4 +1383,3 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
     assert!(String::from_utf8_lossy(&replay.stderr).contains("Compilation"));
     assert_eq!(std::fs::read(retained_path).unwrap(), retained);
 }
-

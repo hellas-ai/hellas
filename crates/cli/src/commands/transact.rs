@@ -697,12 +697,9 @@ impl Target {
         let mut native = native.take().context("local target is already open")?;
         // The job reads its weights from the model it was rendered from.
         native.content.extend(model.clone());
-        let (execution, reload) = crate::compute::local(
-            &context.home,
-            native,
-            Arc::new(context.producer.clone()),
-        )
-        .await?;
+        let (execution, reload) =
+            crate::compute::local(&context.home, native, Arc::new(context.producer.clone()))
+                .await?;
         *opened = Some((execution.content.clone(), reload));
         Ok(execution)
     }
@@ -723,7 +720,9 @@ impl Target {
                 settlement_key: context.settlement.clone(),
                 owner: client.owner(context)?,
             },
-            Target::Grant { options, policy, .. } => GatewayTarget::Grant {
+            Target::Grant {
+                options, policy, ..
+            } => GatewayTarget::Grant {
                 options: options.clone(),
                 transport: hellas_sdk::grant_client::GrantTransport::Remote(
                     context.grant_endpoint().await?,
@@ -777,14 +776,23 @@ pub async fn gateway(
     context: Context,
     serve: impl AsyncFnOnce(Arc<ExecutorGateway>) -> super::CliResult<()>,
 ) -> super::CliResult<()> {
-    let GatewayArgs { client, pay, target } = args;
+    let GatewayArgs {
+        client,
+        pay,
+        target,
+    } = args;
     ensure!(
         !client.settle && !client.buy_again && target.attempt.is_none(),
         "gateway requests are not tracked attempts: drop --settle, --buy-again and --attempt"
     );
     bounded(&context, None, async |_| {
         let mut target = target
-            .resolve(&client, &context, pay.unwrap_or(0), Assurance::ProducerSigned)
+            .resolve(
+                &client,
+                &context,
+                pay.unwrap_or(0),
+                Assurance::ProducerSigned,
+            )
             .await?;
         let result = async {
             let (policy, _) = target.quote(&client, &context).await?;

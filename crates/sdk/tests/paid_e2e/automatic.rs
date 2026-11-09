@@ -2146,11 +2146,7 @@ fn grant_composition<'a>(
             .budgets(
                 common_node::POOL,
                 subject,
-                vec![Limit::new(
-                    Meter::Requests,
-                    Window::Total,
-                    2,
-                )],
+                vec![Limit::new(Meter::Requests, Window::Total, 2)],
                 2,
             )
             .await;
@@ -2240,7 +2236,6 @@ fn grant_composition<'a>(
         ));
         session.shutdown().await.unwrap();
         drop(session);
-
     })
 }
 

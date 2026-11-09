@@ -64,7 +64,6 @@ mod gateway_work;
 pub use gateway_work::{
     ExecutorGateway, GatewayServeOptions, GatewayTarget, WorkRequest, serve_gateway,
 };
-pub mod grant_store;
 
 mod resource_config;
 pub use resource_config::ResourceConfigError;

@@ -13,7 +13,7 @@ use hellas_auth::authority::{
 use hellas_authority::model::grant::records::{GrantError, MAX_OFFER_BYTES, SignedOffer};
 use hellas_rpc::protocol::value::{BoundedCborError, canonical_dag_cbor, decode_canonical_bounded};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use zeroize::{Zeroize, Zeroizing};
 
 const TAG: &str = "hellas.access-bundle.v2";
@@ -191,8 +191,7 @@ impl AccessBundle {
     }
 
     /// Read a bundle file within the decode bound. A received copy usually
-    /// arrives with ordinary permissions, so they are not required here; the
-    /// credential is stored privately by [`Self::install_profile`].
+    /// arrives with ordinary permissions, so they are not required here.
     pub fn load(
         path: &Path,
         expected_subject: &PrincipalId,
@@ -212,20 +211,7 @@ impl AccessBundle {
         Self::decode(&bytes, expected_subject, expected_holder)
     }
 
-    /// Install the remote-only client profile and its private credential into a
-    /// new or empty directory, returning the profile path.
-    pub fn install_profile(&self, directory: &Path) -> Result<PathBuf, AccessBundleError> {
-        Ok(profile::install_remote_bound(
-            directory,
-            self.authority,
-            self.authorization,
-            &self.credential,
-            self.subject,
-            self.holder,
-        )?)
-    }
-
-    /// The Offers to import and the remote-only profile they connect with.
+    /// The Offers and the remote-only profile they connect with.
     pub fn into_parts(self) -> (Vec<SignedOffer>, ClientProfile) {
         (
             self.offers,

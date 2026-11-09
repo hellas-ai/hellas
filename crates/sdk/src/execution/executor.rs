@@ -74,7 +74,8 @@ impl Executor {
                 let completed = target
                     .run(job.input(), &policy, signer, deadline, &stop, observers)
                     .await?;
-                deliver.map_or(Ok(()), |deliver| deliver(&completed))
+                deliver
+                    .map_or(Ok(()), |deliver| deliver(&completed))
                     .map_err(ExecutionError::Delivery)?;
                 Ok(completed)
             }

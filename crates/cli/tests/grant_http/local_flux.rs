@@ -2,17 +2,11 @@
 use super::*;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs HIP, HELLAS_TEST_FLUX_MODEL and HELLAS_TEST_FLUX_REFERENCE_DIR"]
-async fn local_grant_flux_matches_reference_image_without_a_chain() {
+async fn local_gateway_flux_matches_reference_image_without_a_chain() {
     use hellas_rpc::protocol::invocation::compute;
     let model = PathBuf::from(std::env::var("HELLAS_TEST_FLUX_MODEL").unwrap());
     let reference = PathBuf::from(std::env::var("HELLAS_TEST_FLUX_REFERENCE_DIR").unwrap());
-    let mut node = super::local_compute::LocalCompute::start(
-        &model,
-        "--image-model",
-        &model,
-        &[],
-    )
-    .await;
+    let mut node = super::local_compute::LocalCompute::start(&model, &model, &[]).await;
     let http = &node.http;
     let address = &node.address;
     let label = model.file_name().unwrap().to_string_lossy();

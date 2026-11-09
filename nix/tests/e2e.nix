@@ -31,33 +31,6 @@ let
     ];
   };
 
-  # This test-only example provisions a signed local allowance and an
-  # independent bearer authority inside the VM's managed StateDirectory.
-  gatewayFixture = package.overrideAttrs (_: {
-    pname = "hellas-gateway-vm-fixture";
-    cargoBuildFlags = [
-      "-p"
-      "hellas-cli"
-      "--example"
-      "gateway-fixture"
-      "--features"
-      "gateway-vm-fixture"
-    ];
-    doCheck = false;
-    installPhase = ''
-      mkdir -p "$out/bin"
-      mapfile -t binaries < <(find target -type f -name 'gateway-fixture' -executable)
-      test "''${#binaries[@]}" -eq 1
-      install -m 755 "''${binaries[0]}" "$out/bin/gateway-fixture"
-    '';
-  });
-
-  gatewayFixtureRunner = pkgs.writeShellScript "provision-fresh-hellas-gateway" ''
-    export HELLAS_GATEWAY_FIXTURE_ROOT=/var/lib/hellas-gateway
-    export HELLAS_CLI_BIN=${package}/bin/hellas
-    exec ${gatewayFixture}/bin/gateway-fixture
-  '';
-
   chainValidatorFollowerPrelude =
     {
       homePrefix,
@@ -185,18 +158,17 @@ in
           services.hellas.gateway = {
             enable = true;
             inherit package;
-            gatewayProfile = "/var/lib/hellas-gateway/gateway-profile.json";
-            localGrant = "07070707070707070707070707070707";
-            passkey = "/var/lib/hellas-gateway/principal.passkey";
-            workProfile = "/var/lib/hellas-gateway/work-profile.json";
-            trustStore = "/var/lib/hellas-gateway/local-trust";
-            trustPolicy = "local";
+            local = true;
+            models = [ "/srv/hellas/whisper-mini" ];
+            # The fixture decodes at most eight tokens.
+            defaultMaxTokens = 4;
             port = 18080;
           };
-          systemd.services.hellas-gateway = {
-            wantedBy = lib.mkForce [ ];
-            serviceConfig.ExecStartPre = gatewayFixtureRunner;
-          };
+          # The client renders transcription jobs from this converted package.
+          systemd.tmpfiles.rules = [
+            "C /srv/hellas/whisper-mini - - - - ${../../crates/client/src/model/whisper/mini}"
+          ];
+          systemd.services.hellas-gateway.wantedBy = lib.mkForce [ ];
           virtualisation.cores = 2;
           virtualisation.memorySize = 2048;
         }
@@ -208,18 +180,20 @@ in
       machine.succeed("systemctl start hellas-gateway.service")
       machine.wait_for_unit("hellas-gateway.service")
       machine.wait_for_open_port(18080)
-      machine.succeed("test -f /var/lib/hellas-gateway/gateway-profile.json")
+      # A loopback gateway creates its own authority, owned by the home principal.
+      machine.succeed("test -f /var/lib/hellas-gateway/.hellas/gateway/profile.json")
+      machine.succeed("test -f /var/lib/hellas-gateway/.hellas/principal.key")
       machine.succeed("test -f /var/lib/hellas-gateway/.hellas/identity")
       unit = machine.succeed("systemctl show hellas-gateway.service --property=WorkingDirectory")
       assert "WorkingDirectory=/var/lib/hellas-gateway" in unit
       unauth = machine.succeed(
-          "curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/v1/responses"
+          "curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/v1/audio/transcriptions"
       ).strip()
       assert unauth == "401", unauth
       authorized = machine.succeed(
           "curl -sS -o /dev/null -w '%{http_code}' "
-          "-H \"Authorization: Bearer $(cat /var/lib/hellas-gateway/gateway.token)\" "
-          "http://127.0.0.1:18080/v1/responses"
+          "-H \"Authorization: Bearer $(cat /var/lib/hellas-gateway/.hellas/gateway/bearer)\" "
+          "http://127.0.0.1:18080/v1/audio/transcriptions"
       ).strip()
       assert authorized == "405", authorized
     '';

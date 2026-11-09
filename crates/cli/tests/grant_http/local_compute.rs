@@ -11,7 +11,7 @@ pub(super) struct LocalCompute {
 }
 
 impl LocalCompute {
-    pub async fn start(model: &Path, model_flag: &str, content: &Path, extra: &[&str]) -> Self {
+    pub async fn start(model: &Path, content: &Path, extra: &[&str]) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         hellas_private::restrict_directory(root).unwrap();
@@ -26,7 +26,7 @@ impl LocalCompute {
         let mut args = vec![
             "gateway",
             "--local",
-            model_flag,
+            "--model",
             string(model),
             "--content-config",
             string(&configuration),

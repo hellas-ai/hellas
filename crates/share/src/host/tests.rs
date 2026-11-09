@@ -3,9 +3,7 @@ use hellas_authority::model::grant::budget::*;
 use hellas_executor::{FetchProvider, FetchProviderFuture, PreparedFetchRequest};
 use hellas_private::StoreLocation;
 use hellas_rpc::{Assurance, RootProof};
-use hellas_sdk::{
-    GrantProviderOptions, grant_client::UnpinnedOffer,
-};
+use hellas_sdk::{GrantProviderOptions, grant_client::UnpinnedOffer};
 use std::{
     num::NonZeroU64,
     sync::atomic::{AtomicUsize, Ordering},

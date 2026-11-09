@@ -1,4 +1,4 @@
-//! Contacts and private Offers belong to the principal a command acts for.
+//! Contacts belong to the principal a command acts for.
 use super::CliResult;
 use hellas_auth::authority::{ContactCard, PrincipalId};
 use hellas_authority::authenticator::Authenticator;
@@ -6,30 +6,11 @@ use hellas_authority::model::grant::records::SignedOffer;
 use hellas_private::StoreLocation;
 use std::path::{Path, PathBuf};
 
-#[derive(clap::Subcommand)]
-pub enum OfferCommand {
-    /// Verify the provider signature and save the Work terms.
-    Import {
-        file: PathBuf,
-        #[arg(long)]
-        name: String,
-        #[arg(long)]
-        replace: bool,
-    },
-}
 /// The principal controlled by this authenticator.
 pub fn principal(passkey: &dyn Authenticator) -> CliResult<PrincipalId> {
     Ok(PrincipalId::from_public_key(hellas_auth::PublicKey::P256(
         passkey.public_key()?.to_compressed(),
     ))?)
-}
-/// The principal of a command that acts for one.
-pub fn require_principal(passkey: Option<&dyn Authenticator>) -> CliResult<PrincipalId> {
-    principal(passkey.ok_or_else(|| {
-        anyhow::anyhow!(
-            "this command acts for a principal; pass its software passkey with --passkey"
-        )
-    })?)
 }
 /// One private tree per principal, named by its curve and compressed key.
 pub(crate) fn data_root(home: &Path, principal: &PrincipalId) -> CliResult<PathBuf> {
@@ -59,28 +40,6 @@ pub async fn contact(
         holder: hellas_auth::authority::NodeKey::from_public_key(device.public_key())?,
     }
     .encode()?)
-}
-
-pub fn offer(
-    command: OfferCommand,
-    passkey: Option<&dyn Authenticator>,
-    home: &Path,
-) -> CliResult<()> {
-    let identity = require_principal(passkey)?;
-    let root = data_root(home, &identity)?;
-    let store = hellas_sdk::grant_store::GrantStore::new(root);
-    match command {
-        OfferCommand::Import {
-            file,
-            name,
-            replace,
-        } => {
-            let imported = store.import_offer(&file, &name, replace)?;
-            println!("{}", hex::encode(imported.offer.offer().grant.id.0));
-            offer_fingerprints(&imported.offer)?;
-        }
-    }
-    Ok(())
 }
 
 /// The provider is a machine: show its enrollment, never a principal.
@@ -126,6 +85,5 @@ mod tests {
             root.file_name().unwrap().to_str().unwrap(),
             format!("p256-{}", hex::encode(principal.as_bytes()))
         );
-        assert!(require_principal(None).is_err());
     }
 }

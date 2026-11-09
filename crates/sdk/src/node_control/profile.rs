@@ -3,9 +3,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use super::HostControl;
-use hellas_auth::authority::{
-    AuthorityId, CredentialId, CredentialSecret, GrantId, NodeKey, PrincipalId,
-};
+use hellas_auth::authority::{AuthorityId, CredentialId, CredentialSecret, GrantId};
 use hellas_private::StoreLocation;
 use hellas_wire::ServiceMarker;
 use rustls::{ClientConfig, RootCertStore, ServerConfig, pki_types::*};
@@ -28,10 +26,6 @@ struct ProfileFile {
     local: Option<LocalTrust>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     remote_node: Option<iroh::EndpointId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    subject: Option<PrincipalId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    holder: Option<NodeKey>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -61,16 +55,6 @@ impl ClientProfile {
     pub fn load(path: &Path) -> io::Result<Self> {
         let profile: ProfileFile = serde_json::from_slice(&read_private(path)?)
             .map_err(|_| invalid("invalid control profile"))?;
-        Self::from_file(path, profile)
-    }
-
-    /// Load an imported profile only for the principal and device it names.
-    pub fn load_bound(path: &Path, subject: &PrincipalId, holder: &NodeKey) -> io::Result<Self> {
-        let profile: ProfileFile = serde_json::from_slice(&read_private(path)?)
-            .map_err(|_| invalid("invalid control profile"))?;
-        if profile.subject.as_ref() != Some(subject) || profile.holder.as_ref() != Some(holder) {
-            return Err(invalid("profile is not bound to this principal and device"));
-        }
         Self::from_file(path, profile)
     }
 
@@ -214,33 +198,6 @@ pub fn install_remote(
     authorization: GrantId,
     credential: &CredentialSecret,
 ) -> io::Result<PathBuf> {
-    install_remote_inner(directory, authority, authorization, credential, None)
-}
-
-pub(crate) fn install_remote_bound(
-    directory: &Path,
-    authority: AuthorityId,
-    authorization: GrantId,
-    credential: &CredentialSecret,
-    subject: PrincipalId,
-    holder: NodeKey,
-) -> io::Result<PathBuf> {
-    install_remote_inner(
-        directory,
-        authority,
-        authorization,
-        credential,
-        Some((subject, holder)),
-    )
-}
-
-fn install_remote_inner(
-    directory: &Path,
-    authority: AuthorityId,
-    authorization: GrantId,
-    credential: &CredentialSecret,
-    binding: Option<(PrincipalId, NodeKey)>,
-) -> io::Result<PathBuf> {
     hellas_private::create_dir_all_durable(directory)?;
     if std::fs::read_dir(directory)?.next().is_some() {
         return Err(io::Error::new(
@@ -257,8 +214,6 @@ fn install_remote_inner(
         credential: "credential".into(),
         local: None,
         remote_node: None,
-        subject: binding.map(|binding| binding.0),
-        holder: binding.map(|binding| binding.1),
     })
     .map_err(io::Error::other)?;
     let path = directory.join("profile.json");
@@ -368,8 +323,6 @@ mod pin_tests {
             credential: "credential".into(),
             local: None,
             remote_node: None,
-            subject: None,
-            holder: None,
         };
         hellas_private::write_atomically(&path, ".writing", &serde_json::to_vec(&profile).unwrap())
             .unwrap();

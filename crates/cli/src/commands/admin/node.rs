@@ -620,6 +620,94 @@ async fn owner_approval(
     })
 }
 
+/// The loopback gateway's own HTTP authority in `directory`, created on first
+/// use and owned by the home principal. Its one bearer credential may only
+/// invoke the gateway; the profile is written last, so a profile names a
+/// complete authority.
+pub async fn gateway_profile(
+    directory: &Path,
+    home: &StoreLocation,
+    identity: &LocalIdentity,
+    passkey: &dyn Authenticator,
+) -> Result<std::path::PathBuf> {
+    let profile = directory.join("profile.json");
+    if profile.try_exists()? {
+        return Ok(profile);
+    }
+    hellas_private::create_dir_all_durable(directory)?;
+    hellas_private::restrict_directory(directory)?;
+    let journal = directory.join("authority");
+    ensure!(
+        !journal.try_exists()?,
+        "{} holds an authority without its profile; remove the directory to create a new one",
+        directory.display()
+    );
+    let administrator = super::owner_scope::administrator(passkey.public_key()?)?;
+    let authority = administrator.authority;
+    let root = GrantId([0; 16]);
+    let holder = hellas_auth::authority::NodeKey::from_public_key(identity.node_key.public_key())?;
+    let approval = owner_approval(
+        passkey,
+        Ownership::Bootstrap { root, target: None },
+        &administrator,
+        &administrator,
+        holder,
+    )
+    .await?;
+    let now = hellas_auth::authority::UnixMillis::now()?;
+    let (store, secret) = NodeStore::bootstrap(
+        &home.child(&journal),
+        hellas_authority::model::grant::grant_network(),
+        root,
+        approval,
+        None,
+        now,
+    )
+    .await?;
+    let node = hellas_authority::node::NodeCoordinator::new(
+        store,
+        std::sync::Arc::new(|| hellas_auth::authority::UnixMillis::now().unwrap_or_default()),
+    );
+    let issued = async {
+        let caller = node
+            .authenticate_session(&secret, SessionKey::Passkey(passkey))
+            .await?;
+        let invoke =
+            hellas_authority::operations::Operation::named(hellas_authority::node::GATEWAY_INVOKE)
+                .context("gateway.invoke is a known operation")?
+                .permission(authority, None)?;
+        let scope = GrantSpec {
+            authority,
+            subject: administrator.subject,
+            permissions: [invoke].into(),
+            issuance: None,
+            delegation_depth: 0,
+            not_before: now,
+            expires: administrator.expires,
+        };
+        let (credential, bearer) =
+            Credential::prepare(scope, CredentialHolder::Bearer, caller.generation())?;
+        let path = directory.join("credential");
+        profile::save_credential(credential_output(&path)?, &path, &bearer)?;
+        node.issue_credential(&caller, root, credential).await?;
+        anyhow::Ok(())
+    }
+    .await;
+    node.close().await;
+    issued?;
+    hellas_private::write_atomically(
+        &profile,
+        ".writing",
+        &serde_json::to_vec(&serde_json::json!({
+            "journal": "authority",
+            "authority": authority,
+            "authorization": root,
+            "credential": "credential",
+        }))?,
+    )?;
+    Ok(profile)
+}
+
 /// Claim a fresh node with the invite it printed, as its administrator with
 /// the default owner scope, and keep the profile as paired node `name`.
 pub async fn pair(
@@ -630,7 +718,15 @@ pub async fn pair(
     home: &Path,
 ) -> Result<()> {
     let invitation = node_control::bootstrap::Invitation::decode(invite)?;
-    hellas_sdk::grant_store::validate_alias(name)?;
+    ensure!(
+        !name.is_empty()
+            && name.len() <= 64
+            && name.as_bytes()[0].is_ascii_alphanumeric()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte)),
+        "a node name is 1..64 ASCII letters, digits, dots, underscores or hyphens, starting with a letter or digit"
+    );
     let root = GrantId([0; 16]);
     let scope = super::owner_scope::administrator(passkey.public_key()?)?;
     let holder = hellas_auth::authority::NodeKey::from_public_key(identity.node_key.public_key())?;

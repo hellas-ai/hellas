@@ -606,6 +606,18 @@ pub enum GatewayTarget {
 }
 
 impl GatewayTarget {
+    /// The endpoint requests reach their provider through, if remote.
+    pub fn endpoint(&self) -> Option<&iroh::Endpoint> {
+        match self {
+            Self::Paid { endpoint, .. }
+            | Self::Grant {
+                transport: crate::grant_client::GrantTransport::Remote(endpoint),
+                ..
+            } => Some(endpoint),
+            _ => None,
+        }
+    }
+
     /// The provider every request runs on; none for this machine.
     fn provider(&self) -> Result<Option<iroh::EndpointId>, WorkGatewayError> {
         Ok(match self {
@@ -948,15 +960,7 @@ impl WorkExecutionBackend for ExecutorGateway {
         self.tasks.close();
         Box::pin(async move {
             let drained = self.tasks.drain().await;
-            let endpoint = match &self.inner.target {
-                GatewayTarget::Paid { endpoint, .. }
-                | GatewayTarget::Grant {
-                    transport: crate::grant_client::GrantTransport::Remote(endpoint),
-                    ..
-                } => Some(endpoint),
-                _ => None,
-            };
-            if let Some(endpoint) = endpoint
+            if let Some(endpoint) = self.inner.target.endpoint()
                 && !endpoint.is_closed()
             {
                 endpoint.close().await;

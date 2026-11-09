@@ -42,8 +42,8 @@ let
             inherit package;
             gateway = {
               enable = true;
-              gatewayProfile = "/run/hellas/gateway-profile.json";
-              textModel = "/srv/hellas/test.gguf";
+              access = "/run/hellas/friend.access";
+              models = [ "/srv/hellas/test.gguf" ];
             }
             // gateway;
           }
@@ -52,11 +52,6 @@ let
       ];
     };
   evalGateway = evalGatewayWithServe { };
-  providerAssertion =
-    evaluation:
-    lib.findFirst (
-      assertion: lib.hasInfix "services.hellas.gateway execution requires" assertion.message
-    ) (throw "missing gateway provider assertion") evaluation.config.assertions;
   runtimeStoreAssertion =
     evaluation:
     lib.findFirst (
@@ -92,26 +87,26 @@ let
     lib.findFirst (
       assertion: lib.hasInfix "trustStore and trustPolicy" assertion.message
     ) (throw "missing Apple trust pair assertion") evaluation.config.assertions;
-  trustRequiredAssertion =
-    evaluation:
-    lib.findFirst (
-      assertion: lib.hasInfix "grant execution requires" assertion.message
-    ) (throw "missing required Apple trust assertion") evaluation.config.assertions;
   fundingAssertion =
     evaluation:
     lib.findFirst (
       assertion: lib.hasInfix "services.hellas.gateway execution requires exactly one" assertion.message
     ) (throw "missing gateway funding assertion") evaluation.config.assertions;
-  grantPoolAssertion =
+  payProviderAssertion =
     evaluation:
     lib.findFirst (
-      assertion: lib.hasInfix "services.hellas.gateway grant pool requires" assertion.message
-    ) (throw "missing grant pool assertion") evaluation.config.assertions;
-  localGrantAssertion =
+      assertion: lib.hasInfix "services.hellas.gateway.pay and provider" assertion.message
+    ) (throw "missing gateway pay/provider assertion") evaluation.config.assertions;
+  allowRemoteAssertion =
     evaluation:
     lib.findFirst (
-      assertion: lib.hasInfix "services.hellas.gateway.localGrant requires" assertion.message
-    ) (throw "missing localGrant assertion") evaluation.config.assertions;
+      assertion: lib.hasInfix "services.hellas.gateway.allowRemote requires" assertion.message
+    ) (throw "missing gateway allowRemote assertion") evaluation.config.assertions;
+  gatewayContentLocalAssertion =
+    evaluation:
+    lib.findFirst (
+      assertion: lib.hasInfix "services.hellas.gateway.content requires local" assertion.message
+    ) (throw "missing gateway content assertion") evaluation.config.assertions;
   memoryHeadroomAssertion =
     evaluation:
     lib.findFirst (
@@ -368,15 +363,15 @@ let
       };
     };
   discoveryGateway = evalGateway { };
-  nativeGatewayWithoutModel = evalGateway { textModel = null; };
+  nativeGatewayWithoutModel = evalGateway { models = [ ]; };
   storePathGateway = evalGateway {
     environmentFile = "${builtins.storeDir}/secret.env";
   };
   storePathIdentityGateway = evalGateway {
     home = "${builtins.storeDir}/hellas";
   };
-  storePathTextModelGateway = evalGateway {
-    textModel = "${builtins.storeDir}/model.gguf";
+  storePathModelGateway = evalGateway {
+    models = [ "${builtins.storeDir}/model.gguf" ];
   };
   storePathIdentityProvider = evalProvider {
     home = "${builtins.storeDir}/hellas";
@@ -406,7 +401,7 @@ let
     extraArgs = [ "--assurance=producer-signed" ];
   };
   unsafeGatewayExtraArgs = evalGateway {
-    extraArgs = [ "--text-model=${builtins.storeDir}/model.gguf" ];
+    extraArgs = [ "--model=${builtins.storeDir}/model.gguf" ];
   };
   harmlessExtraArgs = evalProvider {
     extraArgs = [ "--no-discovery" ];
@@ -417,60 +412,52 @@ let
   incompleteTrust = evalGateway {
     trustPolicy = "provider";
   };
-  missingRequiredTrust = evalGateway {
-    offer = "provider";
+  noTargetGateway = evalGateway { access = null; };
+  twoTargetGateway = evalGateway { local = true; };
+  payGateway = evalGateway {
+    access = null;
+    pay = 20;
+    provider = "provider-id";
   };
-  grantPoolGateway = evalGateway {
-    grantPoolConfig = "/run/hellas/grant-pool.json";
-    trustStore = "/var/lib/hellas-gateway/trust";
-    passkey = "/run/hellas/principal.passkey";
+  payWithoutProviderGateway = evalGateway {
+    access = null;
+    pay = 20;
   };
-  grantPoolWithTrustPolicy = evalGateway {
-    grantPoolConfig = "/run/hellas/grant-pool.json";
-    trustStore = "/var/lib/hellas-gateway/trust";
-    trustPolicy = "provider";
-    passkey = "/run/hellas/principal.passkey";
+  remoteWithoutProfileGateway = evalGateway { allowRemote = true; };
+  contentWithoutLocalGateway = evalGateway {
+    content.lower = [ "/var/lib/hellas-gateway/models" ];
   };
-  localGrantGateway = evalGateway {
-    localGrant = "00000000000000000000000000000000";
-    trustStore = "/var/lib/hellas-gateway/trust";
-    trustPolicy = "provider";
-    workProfile = "/run/hellas/work-profile.json";
-    passkey = "/run/hellas/principal.passkey";
+  localGateway = evalGateway {
+    access = null;
+    local = true;
   };
-  localGrantHipGateway = evalGatewayWithServe { gpuBackend = "hip"; } {
-    localGrant = "00000000000000000000000000000000";
-    trustStore = "/var/lib/hellas-gateway/trust";
-    trustPolicy = "provider";
-    workProfile = "/run/hellas/work-profile.json";
-    passkey = "/run/hellas/principal.passkey";
+  localHipGateway = evalGatewayWithServe { gpuBackend = "hip"; } {
+    access = null;
+    local = true;
   };
   managedGatewayContent = evalGateway {
-    localGrant = "00000000000000000000000000000000";
+    access = null;
+    local = true;
     authorityJournal = "/var/lib/hellas-gateway/http-authority";
     content.lower = [ "/var/lib/hellas-gateway/models" ];
-    trustStore = "/var/lib/hellas-gateway/trust";
-    trustPolicy = "provider";
-    workProfile = "/run/hellas/work-profile.json";
     passkey = "/run/hellas/principal.passkey";
   };
   gatewayLowerOverGrantData = evalGateway {
-    localGrant = "00000000000000000000000000000000";
+    access = null;
+    local = true;
     content.lower = [ "/var/lib/hellas-gateway/.hellas/grants" ];
   };
   gatewayLowerOverAuthority = evalGateway {
-    localGrant = "00000000000000000000000000000000";
+    access = null;
+    local = true;
     authorityJournal = "/var/lib/hellas-gateway/authority";
     content.lower = [ "/var/lib/hellas-gateway/authority/models" ];
   };
   gatewayLowerOverUpper = evalGateway {
-    localGrant = "00000000000000000000000000000000";
+    access = null;
+    local = true;
     content.upper = "/var/lib/hellas-gateway/store";
     content.lower = [ "/var/lib/hellas-gateway/store/models" ];
-  };
-  paidContentGateway = evalGateway {
-    paidWorkConfig = "/run/hellas/pool.json";
-    passkey = "/run/hellas/principal.passkey";
   };
   gatewayContentDisjointAssertion =
     evaluation:
@@ -676,14 +663,12 @@ let
           gateway = {
             enable = true;
             gatewayProfile = "/run/hellas/gateway-profile.json";
-            textModel = "/srv/hellas/qwen3.gguf";
-            offer = "provider";
+            access = "/run/hellas/friend.access";
+            models = [ "/srv/hellas/qwen3.gguf" ];
             passkey = "/run/hellas/principal.passkey";
-            workProfile = "/run/hellas/work-profile.json";
             metricsPort = 9401;
             metricsAddress = "::1";
             defaultMaxTokens = 4294967295;
-            assurance = "apple-app-attest";
             trustPolicy = "provider";
             trustStore = "/var/lib/hellas-gateway/trust";
             responsesOverrides = {
@@ -890,8 +875,9 @@ in
       gatewayService.serviceConfig.ExecStart;
     assert lib.elem "/run/hellas/principal.passkey" gatewayService.unitConfig.RequiresMountsFor;
     assert lib.hasInfix "--default-max-tokens 4294967295" gatewayService.serviceConfig.ExecStart;
-    assert lib.hasInfix "--text-model /srv/hellas/qwen3.gguf" gatewayService.serviceConfig.ExecStart;
-    assert lib.hasInfix "--assurance apple-app-attest" gatewayService.serviceConfig.ExecStart;
+    assert lib.hasInfix "--model /srv/hellas/qwen3.gguf" gatewayService.serviceConfig.ExecStart;
+    assert lib.hasInfix "--access /run/hellas/friend.access" gatewayService.serviceConfig.ExecStart;
+    assert lib.elem "/run/hellas/friend.access" gatewayService.unitConfig.RequiresMountsFor;
     assert lib.hasInfix "--trust-policy provider" gatewayService.serviceConfig.ExecStart;
     assert lib.hasInfix "--trust-store /var/lib/hellas-gateway/trust"
       gatewayService.serviceConfig.ExecStart;
@@ -899,7 +885,7 @@ in
     assert gatewayService.serviceConfig.EnvironmentFile == "/run/hellas/gateway.env";
     assert !(runtimeStoreAssertion storePathGateway).assertion;
     assert !(runtimeStoreAssertion storePathIdentityGateway).assertion;
-    assert !(runtimeStoreAssertion storePathTextModelGateway).assertion;
+    assert !(runtimeStoreAssertion storePathModelGateway).assertion;
     assert !(runtimeStoreAssertion storePathIdentityProvider).assertion;
     assert !(runtimeStoreAssertion storePathContentProvider).assertion;
     assert !(runtimeStoreAssertion storePathWorkConfig).assertion;
@@ -911,60 +897,39 @@ in
     assert (serveExtraArgsAssertion harmlessExtraArgs).assertion;
     assert !(providerAssuranceAssertion unsupportedProviderApple).assertion;
     assert !(trustPairAssertion incompleteTrust).assertion;
-    assert !(trustRequiredAssertion missingRequiredTrust).assertion;
-    assert (grantPoolAssertion grantPoolGateway).assertion;
-    assert !(grantPoolAssertion grantPoolWithTrustPolicy).assertion;
-    assert (localGrantAssertion localGrantGateway).assertion;
-    assert (fundingAssertion grantPoolGateway).assertion;
-    assert (fundingAssertion localGrantGateway).assertion;
-    assert lib.hasInfix "--grant-pool-config /run/hellas/grant-pool.json"
-      grantPoolGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart;
-    assert lib.hasInfix "--trust-store /var/lib/hellas-gateway/trust"
-      grantPoolGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart;
-    assert lib.hasInfix "--passkey /run/hellas/principal.passkey"
-      grantPoolGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart;
+    assert (fundingAssertion discoveryGateway).assertion;
+    assert !(fundingAssertion noTargetGateway).assertion;
+    assert !(fundingAssertion twoTargetGateway).assertion;
+    assert (payProviderAssertion payGateway).assertion;
+    assert !(payProviderAssertion payWithoutProviderGateway).assertion;
+    assert lib.hasInfix "--pay 20 --provider provider-id"
+      payGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart;
     assert
-      !(lib.hasInfix "--trust-policy" grantPoolGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart);
+      !(lib.hasInfix "--access" payGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart);
+    assert !(allowRemoteAssertion remoteWithoutProfileGateway).assertion;
+    assert !(gatewayContentLocalAssertion contentWithoutLocalGateway).assertion;
+    assert (gatewayContentLocalAssertion managedGatewayContent).assertion;
+    assert lib.hasInfix " --local"
+      localGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart;
     assert
-      !(lib.hasInfix "--paid-work-config" grantPoolGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart);
+      !(lib.hasInfix "--access" localGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart);
+    assert lib.hasInfix " --local"
+      localHipGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart;
+    assert localHipGateway.config.systemd.services.hellas-gateway.environment ? ROCM_PATH;
+    assert localHipGateway.config.systemd.services.hellas-gateway.environment ? HIP_PATH;
+    assert !(localHipGateway.config.systemd.services.hellas-gateway.environment ? CUDA_PATH);
+    assert localHipGateway.config.systemd.services.hellas-gateway.path != [ ];
     assert
-      !(lib.hasInfix "--offer" grantPoolGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart);
-    assert
-      !(lib.hasInfix "--local-grant" grantPoolGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart);
-    assert lib.elem "/run/hellas/grant-pool.json"
-      grantPoolGateway.config.systemd.services.hellas-gateway.unitConfig.RequiresMountsFor;
-    assert lib.hasInfix "--local-grant 00000000000000000000000000000000"
-      localGrantGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart;
-    assert lib.hasInfix "--work-profile /run/hellas/work-profile.json"
-      localGrantGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart;
-    assert
-      !(lib.hasInfix "--paid-work-config" localGrantGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart);
-    assert
-      !(lib.hasInfix "--grant-pool-config" localGrantGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart);
-    assert
-      !(lib.hasInfix "--offer" localGrantGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart);
-    assert lib.hasInfix "--local-grant 00000000000000000000000000000000"
-      localGrantHipGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart;
-    assert localGrantHipGateway.config.systemd.services.hellas-gateway.environment ? ROCM_PATH;
-    assert localGrantHipGateway.config.systemd.services.hellas-gateway.environment ? HIP_PATH;
-    assert !(localGrantHipGateway.config.systemd.services.hellas-gateway.environment ? CUDA_PATH);
-    assert localGrantHipGateway.config.systemd.services.hellas-gateway.path != [ ];
-    assert
-      localGrantHipGateway.config.systemd.services.hellas-gateway.serviceConfig.SupplementaryGroups == [
+      localHipGateway.config.systemd.services.hellas-gateway.serviceConfig.SupplementaryGroups == [
         "render"
         "video"
       ];
     assert lib.elem "/dev/kfd rw"
-      localGrantHipGateway.config.systemd.services.hellas-gateway.serviceConfig.DeviceAllow;
+      localHipGateway.config.systemd.services.hellas-gateway.serviceConfig.DeviceAllow;
     assert lib.elem "char-drm rw"
-      localGrantHipGateway.config.systemd.services.hellas-gateway.serviceConfig.DeviceAllow;
+      localHipGateway.config.systemd.services.hellas-gateway.serviceConfig.DeviceAllow;
     assert
-      localGrantHipGateway.config.systemd.services.hellas-gateway.serviceConfig.LimitMEMLOCK
-      == "infinity";
-    assert lib.elem "/run/hellas/pool.content"
-      paidContentGateway.config.systemd.services.hellas-gateway.serviceConfig.ReadWritePaths;
-    assert lib.elem "/run/hellas/pool.content"
-      paidContentGateway.config.systemd.services.hellas-gateway.unitConfig.RequiresMountsFor;
+      localHipGateway.config.systemd.services.hellas-gateway.serviceConfig.LimitMEMLOCK == "infinity";
     assert (gatewayContentDisjointAssertion managedGatewayContent).assertion;
     assert
       managedGatewayContent.config.systemd.services.hellas-gateway.serviceConfig.ReadOnlyPaths
@@ -974,8 +939,8 @@ in
     assert !(gatewayContentDisjointAssertion gatewayLowerOverGrantData).assertion;
     assert !(gatewayContentDisjointAssertion gatewayLowerOverAuthority).assertion;
     assert !(gatewayContentDisjointAssertion gatewayLowerOverUpper).assertion;
-    assert !(grantPoolGateway.config.systemd.services.hellas-gateway.environment ? ROCM_PATH);
-    assert !(grantPoolGateway.config.systemd.services.hellas-gateway.serviceConfig ? LimitMEMLOCK);
+    assert !(discoveryGateway.config.systemd.services.hellas-gateway.environment ? ROCM_PATH);
+    assert !(discoveryGateway.config.systemd.services.hellas-gateway.serviceConfig ? LimitMEMLOCK);
     assert !(memoryHeadroomAssertion insufficientMemoryHeadroom).assertion;
     assert !(memoryHeadroomAssertion insufficientDefaultMemoryHeadroom).assertion;
     assert !(writableRootAssertion rootJournalGateway).assertion;
@@ -1111,9 +1076,8 @@ in
     assert (homeManagerCatenaAssertion homeManagerDarwinContent).assertion;
     assert !homeManagerRelativeEnvironmentFile.success;
     assert !homeManagerNixPathEnvironmentFile.success;
-    assert !(providerAssertion discoveryGateway).assertion;
     assert
-      !(lib.hasInfix "--text-model" nativeGatewayWithoutModel.config.systemd.services.hellas-gateway.serviceConfig.ExecStart);
+      !(lib.hasInfix "--model" nativeGatewayWithoutModel.config.systemd.services.hellas-gateway.serviceConfig.ExecStart);
     pkgs.runCommand "hellas-provider-content-module-eval" { nativeBuildInputs = [ pkgs.python3 ]; } ''
       python3 - ${providerContentFile} <<'PYCONTENT'
       import sys, tomllib

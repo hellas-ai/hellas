@@ -2,7 +2,6 @@ mod expiry;
 
 use super::*;
 use crate::grant_client::{GrantSession, GrantTransport};
-use std::time::Duration;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures::StreamExt;
 use hellas_auth::{ProducerSigningKey, PublicKey};
@@ -12,6 +11,7 @@ use hellas_gateway::{WorkEvent, WorkExecutionBackend, WorkFetchRequest};
 use hellas_rpc::output::OutputEvent;
 use hellas_rpc::output::{AdaptorEvent, HttpResponseEvent};
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 use tokio::sync::Semaphore;
 use {
     hellas_authority::test_support::Allowance, hellas_authority::test_support::Capacity,

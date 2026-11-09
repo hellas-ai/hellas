@@ -72,14 +72,17 @@ fn image_cli_and_gateway_surfaces_are_available() {
     ])
     .unwrap();
     assert!(matches!(image.command, Commands::Image(_)));
-    let gateway = parse_gateway(&["--image-model", "klein"]).unwrap();
-    assert!(matches!(
-        gateway.command,
-        Commands::Gateway {
-            image_model: Some(_),
-            ..
-        }
-    ));
+    let gateway = parse_gateway(&["--model", "klein", "--model", "qwen.gguf"]).unwrap();
+    let Commands::Gateway { models, .. } = gateway.command else {
+        panic!("gateway")
+    };
+    assert_eq!(
+        models,
+        [
+            std::path::Path::new("klein"),
+            std::path::Path::new("qwen.gguf")
+        ]
+    );
 }
 
 #[cfg(unix)]
@@ -176,7 +179,11 @@ fn serve_accepts_only_its_command_local_assurance() {
 fn gateway_takes_the_job_commands_targets() {
     let provider = format!("{}@{}", "11".repeat(32), "22".repeat(32));
     let gateway = |args: &[&str]| {
-        Cli::try_parse_from(["hellas", "gateway"].into_iter().chain(args.iter().copied()))
+        Cli::try_parse_from(
+            ["hellas", "gateway"]
+                .into_iter()
+                .chain(args.iter().copied()),
+        )
     };
     assert!(gateway(&["--access", "friend.access"]).is_ok());
     assert!(gateway(&["--pay", "20", "--provider", &provider]).is_ok());
@@ -184,9 +191,21 @@ fn gateway_takes_the_job_commands_targets() {
     for refused in [
         &[][..],
         &["--pay", "20"][..],
-        &["--access", "friend.access", "--pay", "20", "--provider", &provider][..],
+        &[
+            "--access",
+            "friend.access",
+            "--pay",
+            "20",
+            "--provider",
+            &provider,
+        ][..],
         &["--offer", "lan"][..],
-        &["--paid-work-config", "pool.json", "--access", "friend.access"][..],
+        &[
+            "--paid-work-config",
+            "pool.json",
+            "--access",
+            "friend.access",
+        ][..],
     ] {
         assert!(gateway(refused).is_err(), "{refused:?}");
     }
