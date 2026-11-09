@@ -645,7 +645,7 @@ async fn open_channel(
         "the provider's channel begins at its first sighting of the payment edge",
     );
     let _ = bond_block;
-    let Some(provider_store) = advance.mounted else {
+    let Some(mut provider_store) = advance.mounted else {
         panic!("a completed setup hands back the channel it mounted");
     };
 
@@ -661,12 +661,15 @@ async fn open_channel(
     .await;
     let client_advance = client_step(&mut client_setup, &client_blocks).await;
     assert_eq!(client_advance.progress, SetupProgress::Complete(origin));
-    let Some(client_store) = client_advance.mounted else {
+    let Some(mut client_store) = client_advance.mounted else {
         panic!("the client's completed setup hands back its channel");
     };
 
     // One coherent finalized read, and the readiness decision made from
-    // it. Both parties take their own.
+    // it. Both parties take their own. Admission refuses a read older than
+    // MAX_CERTIFIED_AGE, and the setup's own reads are blocks old by now, so
+    // the chain certifies a block first, as a live chain would have.
+    devnet.seal().await;
     let provider_snapshot = devnet.snapshot(PROVIDER_NODE, &allocations).await;
     let client_snapshot = devnet.snapshot(CLIENT_NODE, &allocations).await;
     let payment = provider_snapshot
@@ -700,6 +703,21 @@ async fn open_channel(
         ready.settlement().capacity(),
         CLIENT_FUNDING - OMISSION_BOND,
     );
+
+    // Each journal records the read its readiness came from, as a watcher's
+    // does, so admission is as fresh as that read.
+    for (store, snapshot) in [
+        (&mut provider_store, &provider_snapshot),
+        (&mut client_store, &client_snapshot),
+    ] {
+        hellas_channel::work_close::observe(
+            store,
+            &snapshot.observed_channel(),
+            &Secp256k1Verifier::new(),
+        )
+        .await
+        .expect("the readiness read applies");
+    }
 
     // The mount, in the runner's own order: close-only first, then a
     // readiness decision admits work.
