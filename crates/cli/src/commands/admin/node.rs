@@ -149,7 +149,9 @@ async fn connected(
         Some(path) => path,
         None => super::paired_profile(home)?,
     };
-    let pinned_node = profile::ClientProfile::remote_node(&profile_path)?;
+    let (pinned_node, mut addresses) = profile::ClientProfile::remote_node(&profile_path)?
+        .map_or((None, vec![]), |(node, addresses)| (Some(node), addresses));
+    addresses.extend(args.addresses);
     let profile = profile::ClientProfile::load(&profile_path)?;
     let remote = args
         .node_enrollment
@@ -177,7 +179,7 @@ async fn connected(
     );
     if let Some(node) = remote {
         let (endpoint, client, challenge) =
-            connect_remote(identity, node, args.addresses, &profile, key).await?;
+            connect_remote(identity, node, addresses, &profile, key).await?;
         let result = command(
             operation,
             client,
@@ -748,7 +750,7 @@ pub async fn pair(
         root,
         &secret,
     )?;
-    profile::pin_remote(&profile, invitation.node)?;
+    profile::pin_remote(&profile, invitation.node, &invitation.addresses)?;
     let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
         .secret_key(identity.transport_key.clone())
         .bind()

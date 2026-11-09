@@ -26,6 +26,9 @@ struct ProfileFile {
     local: Option<LocalTrust>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     remote_node: Option<iroh::EndpointId>,
+    /// The addresses the node's invite named; dialed beside discovery.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    remote_addresses: Vec<std::net::SocketAddr>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -45,11 +48,16 @@ pub struct ClientProfile {
 }
 
 impl ClientProfile {
-    /// The transport pin established by an explicit owner pairing.
-    pub fn remote_node(path: &Path) -> io::Result<Option<iroh::EndpointId>> {
+    /// The transport pin established by an explicit owner pairing, and the
+    /// addresses its invite named.
+    pub fn remote_node(
+        path: &Path,
+    ) -> io::Result<Option<(iroh::EndpointId, Vec<std::net::SocketAddr>)>> {
         let profile: ProfileFile = serde_json::from_slice(&read_private(path)?)
             .map_err(|_| invalid("invalid control profile"))?;
-        Ok(profile.remote_node)
+        Ok(profile
+            .remote_node
+            .map(|node| (node, profile.remote_addresses)))
     }
 
     pub fn load(path: &Path) -> io::Result<Self> {
@@ -72,13 +80,18 @@ impl ClientProfile {
 }
 
 /// Retain the independently trusted pairing target beside its new credential.
-pub fn pin_remote(path: &Path, node: iroh::EndpointId) -> io::Result<()> {
+pub fn pin_remote(
+    path: &Path,
+    node: iroh::EndpointId,
+    addresses: &[std::net::SocketAddr],
+) -> io::Result<()> {
     let mut profile: ProfileFile = serde_json::from_slice(&read_private(path)?)
         .map_err(|_| invalid("invalid control profile"))?;
     if profile.local.is_some() || profile.remote_node.is_some_and(|existing| existing != node) {
         return Err(invalid("profile already pins a different server"));
     }
     profile.remote_node = Some(node);
+    profile.remote_addresses = addresses.to_vec();
     hellas_private::write_atomically(
         path,
         ".pinning",
@@ -214,6 +227,7 @@ pub fn install_remote(
         credential: "credential".into(),
         local: None,
         remote_node: None,
+        remote_addresses: vec![],
     })
     .map_err(io::Error::other)?;
     let path = directory.join("profile.json");
@@ -323,15 +337,18 @@ mod pin_tests {
             credential: "credential".into(),
             local: None,
             remote_node: None,
+            remote_addresses: vec![],
         };
         hellas_private::write_atomically(&path, ".writing", &serde_json::to_vec(&profile).unwrap())
             .unwrap();
         let first = iroh::SecretKey::from_bytes(&[1; 32]).public();
         let second = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        let addresses = vec!["127.0.0.1:31145".parse().unwrap()];
         assert_eq!(ClientProfile::remote_node(&path).unwrap(), None);
-        pin_remote(&path, first).unwrap();
-        assert_eq!(ClientProfile::remote_node(&path).unwrap(), Some(first));
-        assert!(pin_remote(&path, second).is_err());
-        assert_eq!(ClientProfile::remote_node(&path).unwrap(), Some(first));
+        pin_remote(&path, first, &addresses).unwrap();
+        let pinned = Some((first, addresses.clone()));
+        assert_eq!(ClientProfile::remote_node(&path).unwrap(), pinned);
+        assert!(pin_remote(&path, second, &[]).is_err());
+        assert_eq!(ClientProfile::remote_node(&path).unwrap(), pinned);
     }
 }
