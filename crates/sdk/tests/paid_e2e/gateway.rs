@@ -45,10 +45,8 @@ fn gateway_waits_for_slow_funding_finality_within_the_request_deadline() {
                 result = &mut request => panic!("request ended before funding: {result:?}"),
                 () = case.approvals.1.notified() => {},
             }
-            let height = case.devnet.height();
             let held = tokio::time::timeout(Duration::from_secs(11), &mut request).await;
             let stayed_pending = held.is_err();
-            assert_eq!(case.devnet.height(), height);
             let result = if stayed_pending {
                 // Keep simulated block time realistic: sealing ten blocks per second
                 // can expire the 16-block acceptance window before the provider

@@ -126,10 +126,10 @@ fn a_full_node_recovers_when_its_chain_sync_source_returns_after_an_outage() {
         }
         let (indexer, events, endpoint, database, verifier) = (
             validator.indexer.archive.clone(),
-            devnet.activity[0].clone(),
+            devnet.sealer.activity[0].clone(),
             validator.sync_endpoint.clone(),
             validator.database.clone(),
-            devnet.fixture.verifier.clone(),
+            devnet.sealer.fixture.verifier.clone(),
         );
         let started = tokio::time::Instant::now();
         // Long enough for several failed reconnects with growing backoff. The

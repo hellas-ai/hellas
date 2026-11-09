@@ -136,6 +136,13 @@ pub(crate) fn read_timeout(timeout: Option<Duration>) -> Duration {
     })
 }
 
+/// How long owner funding may wait for its transaction to finalize. That
+/// spans blocks, not one read, so the caller's deadline bounds it; without
+/// one it keeps the read bound.
+pub(crate) fn funding_timeout(timeout: Option<Duration>) -> Duration {
+    timeout.unwrap_or(hellas_channel::work::MAX_CERTIFIED_AGE)
+}
+
 /// Bounds `work` by the caller's timeout; without one it waits until done.
 async fn within<T>(
     timeout: Option<Duration>,
@@ -490,7 +497,7 @@ impl PaidWorkSession {
                     quote,
                     crate::client_owner::FundingControls {
                         poll: hellas_channel::work::SETUP_POLL,
-                        timeout: read_timeout,
+                        timeout: funding_timeout(args.timeout),
                         approval: funding.approval.as_deref(),
                         before_sign: intent.before_open.take(),
                     },
@@ -618,7 +625,12 @@ impl PaidWorkSession {
         endpoint.observe(&snapshot.observed_channel()).await?;
         let client = ClientService::new(endpoint);
         if let Some(ready) = ready {
-            client.observer().observe_ready(ready).await?;
+            // A first read that aged out while the journal mounted is not a
+            // refusal: the initial observation below waits for a fresh one.
+            match client.observer().observe_ready(ready).await {
+                Ok(()) | Err(hellas_channel::work::EndpointError::ObservationStale) => {}
+                Err(error) => return Err(error.into()),
+            }
         }
         if initially_ready {
             // Keep initial observation in the opening future. Cancellation must

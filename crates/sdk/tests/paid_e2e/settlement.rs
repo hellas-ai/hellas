@@ -820,6 +820,11 @@ fn cli_settles_paid_channel_without_provider() {
                 .unwrap()
                 .unwrap();
             assert_eq!(result.credited_cumulative, PRICE);
+            let query = hellas_chain::work_view::WorkChannelQuery {
+                bond_edge: bond,
+                payment_edge: Some(session.descriptor().channel().payment_edge()),
+                funding: Default::default(),
+            };
             session.shutdown().await;
             drop(session);
             let root = case.root.path();
@@ -900,13 +905,9 @@ fn cli_settles_paid_channel_without_provider() {
             for validator in &case.relays.urls {
                 command.arg("--validator").arg(validator);
             }
-            let output = sealing_while(
-                &mut case.devnet,
-                Duration::from_millis(100),
-                command.output(),
-            )
-            .await
-            .unwrap();
+            let output = sealing_through_close(&mut case.devnet, query, command.output())
+                .await
+                .unwrap();
             assert!(
                 output.status.success(),
                 "stdout: {}\nstderr: {}",

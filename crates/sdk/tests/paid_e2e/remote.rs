@@ -640,6 +640,9 @@ pub(super) async fn opening_cancellation_releases_the_mounted_client_journal(
     .await
     .unwrap();
     let descriptor = session.descriptor().clone();
+    // Reopening against a replayed tip must anchor nothing new, so every
+    // retained journal has to stop at that tip: halt the chain for this part.
+    case.devnet.stop_certifying().await;
     let height = case.devnet.height();
     tokio::time::timeout(HANG_GUARD, async {
         while session.with_state(|state| state.cursor().0).await.unwrap() < height {
@@ -715,6 +718,8 @@ pub(super) async fn opening_cancellation_releases_the_mounted_client_journal(
         drop(recovered);
         *case.relays.source.observation_gate.lock().unwrap() = None;
         gate.release.close();
+        case.relays.source.replay.store(0, Ordering::SeqCst);
+        case.devnet.keep_certifying();
         let mut reopened = PaidWorkSession::open(
             case.options.clone(),
             case.endpoint.clone(),
