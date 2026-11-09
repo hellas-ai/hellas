@@ -143,6 +143,31 @@ pub(crate) fn funding_timeout(timeout: Option<Duration>) -> Duration {
     timeout.unwrap_or(hellas_channel::work::MAX_CERTIFIED_AGE)
 }
 
+/// The channel's readiness from a confirmed read that has not lapsed. The
+/// observer renews it from the chain; a job that arrives while the last
+/// confirmation has lapsed waits for the next one, as session open does,
+/// within the caller's deadline. Every other refusal is final.
+async fn fresh_readiness(
+    client: &ClientService,
+    timeout: Option<Duration>,
+) -> Result<hellas_channel::model::setup::ReadyChannel> {
+    within(timeout, "channel readiness", async {
+        loop {
+            match client.readiness().await {
+                Err(hellas_channel::work::EndpointError::ObservationStale) => {
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "inventory class A: channel readiness"
+                    )]
+                    tokio::time::sleep(hellas_channel::work::SETUP_POLL).await;
+                }
+                ready => return ready.map_err(Into::into),
+            }
+        }
+    })
+    .await
+}
+
 /// Bounds `work` by the caller's timeout; without one it waits until done.
 async fn within<T>(
     timeout: Option<Duration>,
@@ -842,7 +867,7 @@ impl PaidWorkSession {
                 Err(hellas_channel::work::EndpointError::NotAdmitting.into())
             };
         }
-        let ready = client.readiness().await?;
+        let ready = fresh_readiness(client, args.timeout).await?;
         if recover && *needs_recovery {
             enum RecoveredJob {
                 /// The result was delivered, verified and committed before the
@@ -1039,7 +1064,7 @@ impl PaidWorkSession {
         }
         let result = match prepared {
             Some(prepared) => {
-                let ready = client.readiness().await?;
+                let ready = fresh_readiness(client, args.timeout).await?;
                 execute_paid_job(
                     args,
                     prepared,
