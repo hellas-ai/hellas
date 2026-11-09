@@ -20,7 +20,7 @@ use commonware_consensus::{
         standard::{Deferred, Standard},
     },
     simplex::{self, config::ForwardingPolicy, elector::RoundRobin},
-    types::{Epoch, FixedEpocher, ViewDelta},
+    types::{Epoch, FixedEpocher, View, ViewDelta},
 };
 use commonware_cryptography::bls12381::dkg::feldman_desmedt::deal;
 use commonware_cryptography::{Digestible as _, Signer, ed25519};
@@ -1143,9 +1143,13 @@ fn run(
             archive_blocks,
         );
 
+        let (finalized_tx, finalized) = ::tokio::sync::watch::channel(View::zero());
         let deferred = Deferred::new(
             context.child("deferred"),
-            stateful_mailbox.clone(),
+            crate::block_time::AwaitBlockTime {
+                inner: stateful_mailbox.clone(),
+                finalized,
+            },
             marshal_mailbox.clone(),
             epocher,
         );
@@ -1156,7 +1160,11 @@ fn run(
             blocker: oracle.clone(),
             automaton: deferred.clone(),
             relay: deferred,
-            reporter: ActivityReporter::new(marshal_mailbox.clone(), activity_tx.clone()),
+            reporter: ActivityReporter::new(
+                marshal_mailbox.clone(),
+                activity_tx.clone(),
+                finalized_tx,
+            ),
             strategy: Sequential,
             partition: format!("{partition_prefix}-simplex"),
             mailbox_size,

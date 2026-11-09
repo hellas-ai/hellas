@@ -662,7 +662,8 @@ impl Book {
 }
 
 /// Volatile FIFO of asks that chose to wait, kept beside the book. Earlier
-/// waiters of the same or higher class count as already reserved.
+/// waiters of the same or higher class count as already reserved. After any
+/// change, re-decide every waiter in order until a pass changes nothing.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Queue(Vec<Ask>);
 impl Queue {

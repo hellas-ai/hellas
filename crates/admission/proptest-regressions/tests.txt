@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 1fdd277a0eec781194ca690cc482d148afba186842f5e91757a331a5301e5b91 # shrinks to an owner waiter refused at its deadline after an earlier ordinary waiter re-decided in the same pass

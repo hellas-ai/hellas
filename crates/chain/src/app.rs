@@ -25,6 +25,7 @@ use commonware_consensus::{CertifiableBlock, Heightable, types::Height};
 use commonware_consensus::{
     Reporter,
     simplex::types::{Activity as SimplexActivity, Proposal},
+    types::View,
 };
 #[cfg(feature = "full-node")]
 use commonware_cryptography::Digestible;
@@ -59,7 +60,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 #[cfg(feature = "full-node")]
 use tokio::sync::Mutex;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 #[cfg(feature = "full-node")]
 use tracing::{error, info, warn};
 
@@ -504,7 +505,7 @@ where
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> Option<<Self::Databases as DatabaseSet<E>>::Merkleized> {
         Box::pin(async move {
-            let (runtime, consensus_context) = context;
+            let (_, consensus_context) = context;
             let mut ancestry = Box::pin(ancestry);
             let block = ancestry.next().await?;
             let parent = ancestry.next().await?;
@@ -512,7 +513,6 @@ where
                 &consensus_context,
                 Height::new(parent.height().get() + 1),
                 parent.digest(),
-                runtime.current().epoch_millis(),
                 parent.timestamp(),
             ) {
                 warn!(%err, payload = ?block.digest(), "block validation failed");
@@ -696,11 +696,21 @@ where
 pub struct ActivityReporter<R> {
     inner: R,
     activity_tx: broadcast::Sender<ConsensusActivity>,
+    /// The highest finalized view; it only rises.
+    finalized: watch::Sender<View>,
 }
 
 impl<R> ActivityReporter<R> {
-    pub fn new(inner: R, activity_tx: broadcast::Sender<ConsensusActivity>) -> Self {
-        Self { inner, activity_tx }
+    pub fn new(
+        inner: R,
+        activity_tx: broadcast::Sender<ConsensusActivity>,
+        finalized: watch::Sender<View>,
+    ) -> Self {
+        Self {
+            inner,
+            activity_tx,
+            finalized,
+        }
     }
 }
 
@@ -711,6 +721,11 @@ where
     type Activity = Activity;
 
     fn report(&mut self, activity: Self::Activity) -> Feedback {
+        if let SimplexActivity::Finalization(f) = &activity {
+            let view = f.proposal.round.view();
+            self.finalized
+                .send_modify(|highest| *highest = (*highest).max(view));
+        }
         if let Some(converted) = convert_activity(&activity) {
             let _ = self.activity_tx.send(converted);
         }

@@ -64,6 +64,16 @@ pub const MAX_EDGE_INPUTS: usize = MAX_PARTY_INPUTS * 2;
 /// fanout. Raising this is also a chain-version change.
 pub const MAX_EDGE_OUTPUTS: usize = 4;
 
+// ── Block time ────────────────────────────────────────────────────────
+
+/// The skew bound: furthest a certified block's timestamp may lead real
+/// time.
+///
+/// A validator holds its verdict on a block until its own clock is within
+/// this bound of the block's timestamp. It waits rather than rejects, so
+/// every honest validator reaches the same verdict whatever its clock.
+pub const MAX_BLOCK_TIME_LEAD_MS: u64 = 5_000;
+
 // ── Work-channel bounds ───────────────────────────────────────────────
 
 /// Largest response window a work-payment channel may commit.
