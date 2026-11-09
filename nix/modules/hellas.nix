@@ -462,7 +462,7 @@ rec {
       passkey = mkOption {
         type = types.nullOr runtimePath;
         default = null;
-        description = "Private software passkey of the provider's owner, passed as --passkey; required by workConfigFile unless extraArgs selects a faucet account.";
+        description = "Private software passkey of the provider's owner, passed as --passkey. Without it, workConfigFile uses the principal key in the provider's home, or an owner-approved policy.";
       };
       fetchConfigFile = mkOption {
         type = types.nullOr runtimePath;

@@ -66,9 +66,6 @@ impl ChainDir {
     pub fn validator(&self) -> StoreLocation {
         self.root.child("validator")
     }
-    pub fn faucet_account(&self) -> StoreLocation {
-        self.root.child("faucet-account")
-    }
 }
 
 impl std::ops::Deref for ChainDir {

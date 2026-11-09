@@ -46,6 +46,7 @@ fn acts_for_principal(command: &Commands) -> bool {
                 command: IdentityCommand::Init
             }
             | Commands::Pair { .. }
+            | Commands::Faucet { .. }
             | Commands::Gateway { offer: Some(_), .. }
             | Commands::Gateway {
                 grant_pool_config: Some(_),
@@ -388,6 +389,11 @@ enum Commands {
     Image(commands::transact::ImageArgs),
     /// Inspect and manage node content with Owner authority.
     Store(commands::store::StoreArgs),
+    /// Get devnet coins for this principal from a public faucet account.
+    Faucet {
+        #[arg(long, default_value_t = commands::faucet::DEFAULT_AMOUNT)]
+        amount: u64,
+    },
     /// Query or run Hellas chain components
     Chain {
         #[command(subcommand)]
@@ -539,27 +545,7 @@ async fn async_main() {
         return;
     }
 
-    // A selected faucet account stays with this identity across restarts.
-    let persistent_owner = matches!(
-        &cli.command,
-        Commands::Serve { .. }
-            | Commands::Transact(_)
-            | Commands::Fetch(_)
-            | Commands::Run(_)
-            | Commands::Transcribe(_)
-            | Commands::Text(_)
-            | Commands::Image(_)
-            | Commands::Gateway {
-                paid_work_config: Some(_),
-                ..
-            }
-    );
-    let owner = match if persistent_owner {
-        cli.owner.load_persistent(&home, &selected_chain)
-    } else {
-        cli.owner.load(&selected_chain, &home)
-    }
-    .and_then(|owner| match owner {
+    let owner = match cli.owner.load(&home).and_then(|owner| match owner {
         None if acts_for_principal(&cli.command) => owner::principal(&home).map(Some),
         owner => Ok(owner),
     }) {
@@ -652,6 +638,20 @@ async fn async_main() {
     };
 
     let command = match command {
+        Commands::Faucet { amount } => {
+            let result = commands::faucet::faucet(
+                amount,
+                owner.as_ref().expect("the faucet pays the principal"),
+                &selected_chain,
+            )
+            .await;
+            tracer_provider.shutdown();
+            if let Err(err) = result {
+                eprintln!("error: {err:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
         Commands::Chain { command } => {
             let result =
                 commands::chain::run(command, owner.as_ref(), &selected_chain, &home).await;
@@ -1084,9 +1084,9 @@ async fn async_main() {
                     content.clone(),
                 )?;
                 paid_content = Some(content);
-                let passkey = owner.clone().ok_or_else(|| {
-                    anyhow::anyhow!("paid work requires --passkey, --faucet or --faucet-account")
-                })?;
+                let passkey = owner
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("paid work acts for the principal"))?;
                 let payer = std::sync::Arc::new(hellas_sdk::client_owner::ClientOwner::new(
                     std::sync::Arc::new(passkey),
                     identity::settlement_signer(&local_identity)?.party_key(),
@@ -1227,7 +1227,9 @@ async fn async_main() {
             unreachable!("conversion handled before identity load")
         }
         Commands::Trust(args) => commands::trust::run(args),
-        Commands::Chain { .. } => unreachable!("chain commands handled before identity load"),
+        Commands::Chain { .. } | Commands::Faucet { .. } => {
+            unreachable!("chain commands handled before identity load")
+        }
         #[cfg(unix)]
         Commands::Machines(_) => {
             unreachable!("management commands handled before identity load")

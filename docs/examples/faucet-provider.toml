@@ -1,5 +1,5 @@
-# Paid terms for `hellas serve --faucet --paid-work-config faucet-provider.toml`.
-# The selected owner (here a public devnet faucet account) approves exactly
+# Paid terms for `hellas serve --paid-work-config faucet-provider.toml`, after
+# `hellas faucet` funds this home's principal. The principal approves exactly
 # these terms at startup and delegates the stake its offers bond. Nothing
 # here has a built-in default; every field is required unless noted.
 

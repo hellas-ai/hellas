@@ -33,9 +33,8 @@ fn grant_execution_requires_explicit_access_and_refuses_paid_options() {
 async fn an_expired_command_closes_the_endpoint_it_bound() {
     let root = tempfile::tempdir().unwrap();
     let identity = crate::identity::load_or_create(&root.path().join("identity")).unwrap();
-    let cli = crate::Cli::try_parse_from(["hellas", "--faucet-account", "7", "serve"]).unwrap();
     let chain = hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet);
-    let owner = cli.owner.load(&chain, root.path()).unwrap().unwrap();
+    let owner = hellas_kernel::SoftPasskey::from_secret_scalar([7; 32]).unwrap();
     let context = Context::new(
         &identity,
         Some(&owner),
@@ -63,15 +62,7 @@ async fn paid_deadline_options_reach_the_signed_job_configuration() {
     let root = tempfile::tempdir().unwrap();
     let identity_path = root.path().join("identity");
     let identity = crate::identity::load_or_create(&identity_path).unwrap();
-    let cli = crate::Cli::try_parse_from(["hellas", "--faucet-account", "7", "serve"]).unwrap();
-    let owner = cli
-        .owner
-        .load(
-            &hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet),
-            root.path(),
-        )
-        .unwrap()
-        .unwrap();
+    let owner = hellas_kernel::SoftPasskey::from_secret_scalar([7; 32]).unwrap();
     let location = StoreLocation::for_test(root.path());
     let context = Context::new(
         &identity,
@@ -299,7 +290,7 @@ fn command_shapes_require_a_job_or_settlement_and_remove_paid_work() {
         p.addresses,
         vec!["127.0.0.1:1234".parse::<SocketAddr>().unwrap()]
     );
-    assert!(fetch_args(&["--faucet"]).client.timeout.is_none());
+    assert!(fetch_args(&[]).client.timeout.is_none());
 }
 
 #[test]

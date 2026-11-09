@@ -1,56 +1,10 @@
-use hellas_chain::genesis::{Chain, ChainProfile, FaucetAccount, HELLAS_DEVNET_3_FAUCET_JSON};
 use sha2::Digest as _;
 use std::process::Command;
 
 #[test]
-fn faucet_flags_sign_as_the_announced_account() {
-    let accounts: Vec<FaucetAccount> = serde_json::from_str(HELLAS_DEVNET_3_FAUCET_JSON).unwrap();
-    for selection in [vec!["--faucet"], vec!["--faucet-account", "7"]] {
-        let home = tempfile::tempdir().unwrap();
-        let output = Command::new(env!("CARGO_BIN_EXE_hellas"))
-            .env("HOME", home.path())
-            .env("XDG_DATA_HOME", home.path().join("data"))
-            .args(["contact", "--name", "Public devnet user"])
-            .args(&selection)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let card = hellas_sdk::contact::Contact::decode(&String::from_utf8(output.stdout).unwrap())
-            .unwrap()
-            .card;
-        let account = accounts
-            .iter()
-            .find(|account| {
-                let secret: [u8; 32] = hex::decode(&account.secret_scalar)
-                    .unwrap()
-                    .try_into()
-                    .unwrap();
-                let passkey = hellas_kernel::SoftPasskey::from_secret_scalar(secret).unwrap();
-                card.principal()
-                    == hellas_auth::authority::PrincipalId::from_public_key(
-                        hellas_auth::PublicKey::P256(passkey.party_key().to_bytes()),
-                    )
-                    .unwrap()
-            })
-            .expect("the contact assertion verifies as one published faucet principal");
-        assert!(String::from_utf8_lossy(&output.stderr).contains(&format!(
-            "devnet faucet account {}: {}",
-            account.index, account.address
-        )));
-        if selection.len() == 2 {
-            assert_eq!(account.index, 7);
-        }
-    }
-}
-
-#[test]
-fn faucet_rejects_another_authenticated_chain_before_identity_side_effects() {
+fn faucet_refuses_a_chain_without_faucet_accounts_before_creating_an_identity() {
     let home = tempfile::tempdir().unwrap();
-    let known = ChainProfile::known(Chain::Devnet);
+    let known = hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet);
     let mut trust = known.trust().clone();
     trust.network_id = "custom-faucet-test".into();
     let mut genesis: serde_json::Value =
@@ -69,21 +23,23 @@ fn faucet_rejects_another_authenticated_chain_before_identity_side_effects() {
         .unwrap(),
     )
     .unwrap();
-    let identity = home.path().join("app").join("identity");
+    let app = home.path().join("app");
     let output = Command::new(env!("CARGO_BIN_EXE_hellas"))
         .env("HOME", home.path())
         .arg("--home")
-        .arg(home.path().join("app"))
+        .arg(&app)
         .arg("--chain-config")
         .arg(&path)
-        .arg("--faucet")
-        .args(["contact", "--name", "Public devnet user"])
+        .arg("faucet")
         .output()
         .unwrap();
     assert!(!output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("selected chain has no faucet accounts")
+        String::from_utf8_lossy(&output.stderr).contains("selected chain has no faucet accounts"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    assert!(!identity.exists());
-    assert!(!home.path().join("app").exists());
+    // The faucet pays the principal; it needs no device identity.
+    assert!(app.join("principal.key").is_file());
+    assert!(!app.join("identity").exists());
 }

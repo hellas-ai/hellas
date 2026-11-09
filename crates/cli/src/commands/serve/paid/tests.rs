@@ -1,5 +1,4 @@
 use super::*;
-use clap::Parser as _;
 use hellas_private::StoreLocation;
 
 #[tokio::test]
@@ -36,14 +35,7 @@ async fn fleet_paid_startup_requires_exact_owner_approval_without_owner_key() {
     );
     assert!(!paid.root.join("bootstrap.json").exists());
 
-    let cli = crate::Cli::try_parse_from(["hellas", "serve", "--faucet-account", "7"]).unwrap();
-    paid.owner = cli
-        .owner
-        .load(
-            &hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet),
-            std::path::Path::new("/"),
-        )
-        .unwrap();
+    paid.owner = Some(hellas_kernel::SoftPasskey::from_secret_scalar([7; 32]).unwrap());
     let credential = paid
         .prepare(&config, &identity.enrollment, &identity.node_key)
         .await
@@ -163,15 +155,7 @@ fn power_durability_reaches_paid_chain_journals() {
 async fn interrupted_bootstrap_reuses_prepared_owner_approval_credential_and_tls() {
     let root = tempfile::tempdir().unwrap();
     let identity = crate::identity::load_or_create(&root.path().join("identity")).unwrap();
-    let cli = crate::Cli::try_parse_from(["hellas", "serve", "--faucet-account", "7"]).unwrap();
-    let owner = cli
-        .owner
-        .load(
-            &hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet),
-            std::path::Path::new("/"),
-        )
-        .unwrap()
-        .unwrap();
+    let owner = hellas_kernel::SoftPasskey::from_secret_scalar([7; 32]).unwrap();
     let example =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples/faucet-provider.toml");
     let location = StoreLocation::for_test(&root.path().join("provider"));
@@ -221,15 +205,7 @@ async fn interrupted_bootstrap_reuses_prepared_owner_approval_credential_and_tls
 fn paid_fetch_admission_derives_the_configured_route_contract() {
     use hellas_executor::FetchAdaptorFactory as _;
     let root = tempfile::tempdir().unwrap();
-    let cli = crate::Cli::try_parse_from(["hellas", "serve", "--faucet-account", "7"]).unwrap();
-    let owner = cli
-        .owner
-        .load(
-            &hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet),
-            std::path::Path::new("/"),
-        )
-        .unwrap()
-        .unwrap();
+    let owner = hellas_kernel::SoftPasskey::from_secret_scalar([7; 32]).unwrap();
     let example =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples/faucet-provider.toml");
     let mut terms: toml::Value =
