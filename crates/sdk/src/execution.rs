@@ -673,7 +673,21 @@ impl ExecutionSession<'_> {
     /// result, hands it to `controls.deliver` and only then reports it.
     /// `controls.stop` abandons the request only before its proposal; after
     /// it, collection and payment continue until `controls.deadline`.
-    pub async fn run(
+    ///
+    /// Boxed rather than an `async fn`: every command and gateway awaits it
+    /// inside its own future, and its state must not be composed inline there.
+    pub fn run(
+        &mut self,
+        request: &WorkRequest,
+        terms: ExecutionTerms,
+        signer: &ProducerSigningKey,
+        controls: Controls<'_>,
+        attempt: Option<&mut ExecutionAttempt>,
+    ) -> impl std::future::Future<Output = Attempted<Completed>> {
+        Box::pin(self.run_inner(request, terms, signer, controls, attempt))
+    }
+
+    async fn run_inner(
         &mut self,
         request: &WorkRequest,
         terms: ExecutionTerms,

@@ -65,6 +65,7 @@ let
     ignore = [
       { id = "RUSTSEC-2024-0436", reason = "Transitive through commonware/gemm; no safe upgrade is available." },
       { id = "RUSTSEC-2025-0141", reason = "Transitive through upstream catena-lang; bincode 1.3.3 is final and no safe upgrade is available." },
+      { id = "RUSTSEC-2026-0459", reason = "sqlx 0.9.0, the newest release, caps libsqlite3-sys below 0.38 and the patched version is 0.39; nixpkgs SQLite 3.53.3 is affected too. Hellas only opens database and WAL files it wrote itself under the user's home. Remove once sqlx supports libsqlite3-sys 0.39." },
     ]
 
     [licenses]
