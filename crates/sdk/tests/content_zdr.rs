@@ -451,6 +451,13 @@ async fn child(root: &Path, funding: &str, phase: &str, seed: &str) -> ! {
             .verified(work, &input)
             .await
             .unwrap();
+        // Delivering a multi-chunk transcript can outlive one certified age
+        // on a loaded host; pay from a fresh read.
+        let fresh = fixture::ready_of(
+            &fixture::descriptor_with(policy.clone()),
+            fixture::CURSOR + 1,
+        );
+        fixture::refresh(&client, &service, &fresh, fixture::CURSOR + 1).await;
         let payment = client.client().await.unwrap().pay(work).await.unwrap();
         use hellas_rpc::services::work::WorkHandler as _;
         service
