@@ -234,7 +234,19 @@ async fn finalized_channel_settlement_inner(
 /// certified reads of the channel. This requires no provider connection,
 /// owner funding authority, or new purchase. Callers bound its
 /// lifetime; cancellation preserves the close intent for the next attempt.
-pub async fn settle_channel(
+///
+/// Boxed rather than an `async fn`: callers bound it with deadlines, and its
+/// state must not be composed inline in theirs.
+pub fn settle_channel(
+    args: &PaidWorkOptions,
+    bond: EdgeId,
+    owner: PrincipalId,
+    signer: &Secp256k1Signer,
+) -> impl Future<Output = Result<FinalizedChannelSettlement>> {
+    Box::pin(settle_channel_inner(args, bond, owner, signer))
+}
+
+async fn settle_channel_inner(
     args: &PaidWorkOptions,
     bond: EdgeId,
     owner: PrincipalId,

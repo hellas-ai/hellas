@@ -305,7 +305,9 @@ impl LightClient for RemoteLightClient {
         tx: Transaction,
     ) -> impl Future<Output = Result<DomainSubmitTxOutcome, QueryError>> + Send {
         let client = self.rpc_client().clone();
-        async move {
+        // Boxed: a transaction and its RPC call are large, and every chain
+        // caller would otherwise compose them inline in its own future.
+        Box::pin(async move {
             // `rpc_ms`: one submission to one validator, measured where a
             // submitter actually waits — the whole call, not the part of
             // it this process can see. §4 maximises it over six
@@ -334,7 +336,7 @@ impl LightClient for RemoteLightClient {
                 );
             }
             outcome
-        }
+        })
     }
 
     fn get_validators(&self) -> impl Future<Output = Result<Vec<String>, QueryError>> + Send {

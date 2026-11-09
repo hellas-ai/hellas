@@ -132,7 +132,18 @@ async fn prepare(
     ))
 }
 
-pub async fn transact(
+/// Boxed rather than an `async fn`: callers nest it under deadlines and
+/// selects, and its state must not be composed inline in their futures.
+pub fn transact(
+    session: &mut PaidWorkSession,
+    job: &Job,
+    key: &ProducerSigningKey,
+    options: TransactionOptions<'_>,
+) -> impl Future<Output = Result<PaidWorkResult>> {
+    Box::pin(transact_inner(session, job, key, options))
+}
+
+async fn transact_inner(
     session: &mut PaidWorkSession,
     job: &Job,
     key: &ProducerSigningKey,

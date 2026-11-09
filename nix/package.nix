@@ -94,7 +94,6 @@ let
     };
     inherit stdenv;
     auditable = false;
-    RUST_MIN_STACK = "16777216";
     # sqlx's query macros check against the committed `.sqlx` metadata, so a
     # build never needs a live database.
     SQLX_OFFLINE = "true";
@@ -122,7 +121,7 @@ let
           # Bound test execution only; invoking Cargo again can trigger rebuilds.
           timeout 120 "$bootstrapTestBinary" "$bootstrapTest" --exact
           startupTest=node_control::bootstrap::tests::provider_runtime_dials_tls_relay_with_default_stack
-          env -u RUST_MIN_STACK "$bootstrapTestBinary" "$startupTest" --exact
+          "$bootstrapTestBinary" "$startupTest" --exact
         '';
     checkInputs = with pkgs; [ cargo-outdated ];
     separateDebugInfo = true;
@@ -220,7 +219,6 @@ let
     CARGO_PROFILE_DEV_DEBUG = "0";
     CARGO_PROFILE_TEST_DEBUG = "0";
     inherit (commonArgs)
-      RUST_MIN_STACK
       SQLX_OFFLINE
       SSL_CERT_FILE
       NIX_SSL_CERT_FILE
