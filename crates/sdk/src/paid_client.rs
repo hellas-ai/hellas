@@ -329,11 +329,18 @@ fn spawn_observer(
                     }
                 }
             }
+            // Read again before the last confirmation lapses. A read of an
+            // aged block leaves less than the age bound, and waiting a whole
+            // POLL after it would refuse new money while fresher blocks exist.
+            let left = client.freshness().await.unwrap_or_default();
+            let next = hellas_channel::work::POLL
+                .min(left / 2)
+                .max(hellas_channel::work::SETUP_POLL);
             #[expect(
                 clippy::disallowed_methods,
                 reason = "inventory class B/C: the certified-read poll the response window is sized for"
             )]
-            tokio::time::sleep(hellas_channel::work::POLL).await;
+            tokio::time::sleep(next).await;
         }
     })
 }

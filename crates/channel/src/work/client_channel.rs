@@ -188,6 +188,18 @@ impl ClientObserver {
         Ok(())
     }
 
+    /// How much longer the last confirmed read keeps admitting; zero once
+    /// it no longer does. Never contacts a validator.
+    pub async fn freshness(&self) -> Result<std::time::Duration, EndpointError> {
+        Ok(self
+            .endpoint()
+            .await?
+            .observation
+            .as_ref()
+            .and_then(Observation::remaining)
+            .unwrap_or_default())
+    }
+
     /// Returns local readiness; never contacts a validator.
     pub async fn readiness(&self) -> Result<ReadyChannel, EndpointError> {
         let endpoint = self.endpoint().await?;
