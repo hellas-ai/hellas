@@ -8,6 +8,7 @@
 use hellas_private::Durability::Crash;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use commonware_codec::Encode as _;
 use commonware_consensus::{
@@ -206,16 +207,41 @@ pub struct Devnet {
     validators: Vec<Validator>,
     runtime_guard: Option<Runtime>,
     executor: tokio::runtime::Handle,
-    fixture: ConsensusFixture,
     document: Genesis,
     consensus_info: ConsensusInfo,
     genesis_payload: Digest,
     owners: Vec<GenesisOwner>,
-    allocations: Vec<(SettlementKey, u64)>,
     full_nodes: Vec<crate::node::FullNode>,
     rpc: tokio::task::JoinSet<()>,
-    activity: Vec<tokio::sync::broadcast::Sender<crate::ConsensusActivity>>,
     storage: Option<tempfile::TempDir>,
+    sealer: Arc<Sealer>,
+    /// Stops [`Devnet::keep_certifying`]'s heartbeat between seals.
+    heartbeat: Option<(tokio::sync::watch::Sender<()>, tokio::task::JoinHandle<()>)>,
+}
+
+/// Everything a seal writes, as shared handles onto the validators' and
+/// full nodes' state, so the heartbeat seals the same chain the test does.
+struct Sealer {
+    fixture: ConsensusFixture,
+    allocations: Vec<(SettlementKey, u64)>,
+    activity: Vec<tokio::sync::broadcast::Sender<crate::ConsensusActivity>>,
+    validators: Vec<SealTarget>,
+    full_nodes: Vec<crate::node::FullNode>,
+    /// Held across a whole seal, so blocks are sealed one at a time.
+    tip: tokio::sync::Mutex<Tip>,
+    /// The last sealed block, for reads that cannot wait out a seal.
+    head: std::sync::Mutex<HellasBlock>,
+}
+
+/// One validator's state a seal executes against and publishes to.
+struct SealTarget {
+    database: UtxoDatabase<Runtime>,
+    index: OwnerIndex,
+    indexer: crate::indexer::fixtures::ArchiveSource,
+    mempool: Mempool,
+}
+
+struct Tip {
     head: HellasBlock,
     height: u64,
     /// Every transaction already in finalized history, by digest.
@@ -227,6 +253,15 @@ pub struct Devnet {
     /// proposer's own rule, spelled here because there is no proposer.
     included: BTreeSet<Digest>,
 }
+
+/// The longest [`Devnet::keep_certifying`] lets the chain sit idle.
+///
+/// A paid watcher re-reads every `RESPONSE_WINDOW_MS / 16` and refuses a
+/// read whose block is `RESPONSE_WINDOW_MS / 8` old, as it must on a
+/// halted chain. A block at most a quarter of that poll old at each read
+/// leaves the rest of the bound for the read and the seal on a loaded host.
+const HEARTBEAT: std::time::Duration =
+    std::time::Duration::from_millis(hellas_kernel::RESPONSE_WINDOW_MS / 64);
 
 impl Devnet {
     pub fn start(
@@ -385,23 +420,40 @@ impl Devnet {
                 });
             }
 
+            let sealer = Sealer {
+                validators: validators
+                    .iter()
+                    .map(|validator| SealTarget {
+                        database: validator.database.clone(),
+                        index: validator.index.clone(),
+                        indexer: validator.indexer.clone(),
+                        mempool: validator.mempool.clone(),
+                    })
+                    .collect(),
+                fixture,
+                allocations,
+                activity,
+                full_nodes: Vec::new(),
+                tip: tokio::sync::Mutex::new(Tip {
+                    head: genesis.clone(),
+                    height: 0,
+                    included: BTreeSet::new(),
+                }),
+                head: std::sync::Mutex::new(genesis.clone()),
+            };
             let mut devnet = Self {
                 validators,
                 runtime_guard: Some(runtime.child("devnet_teardown")),
                 executor: tokio::runtime::Handle::current(),
-                fixture,
                 document,
                 consensus_info,
                 genesis_payload: genesis.digest(),
                 owners,
-                allocations,
                 full_nodes: Vec::new(),
                 rpc,
-                activity,
                 storage: Some(storage),
-                head: genesis,
-                height: 0,
-                included: BTreeSet::new(),
+                sealer: Arc::new(sealer),
+                heartbeat: None,
             };
             for ordinal in 0..full_node_count {
                 let mut config = devnet.full_node_config(
@@ -414,6 +466,10 @@ impl Devnet {
                 let node = crate::node::FullNode::start(config).await.unwrap();
                 devnet.full_nodes.push(node);
             }
+            Arc::get_mut(&mut devnet.sealer)
+                .expect("nothing shares the sealer before start returns")
+                .full_nodes
+                .clone_from(&devnet.full_nodes);
             devnet
         })
     }
@@ -478,7 +534,7 @@ impl Devnet {
 
     /// Genesis allocations in the order the chain minted them.
     pub fn allocations(&self) -> &[(SettlementKey, u64)] {
-        &self.allocations
+        &self.sealer.allocations
     }
 
     /// The file holding `owner`'s secret scalar: 32 raw bytes, which is a
@@ -571,13 +627,51 @@ impl Devnet {
     }
 
     /// The last sealed block.
-    pub const fn head(&self) -> &HellasBlock {
-        &self.head
+    pub fn head(&self) -> HellasBlock {
+        self.sealer.head.lock().unwrap().clone()
     }
 
     /// The height of the last sealed block.
     pub fn height(&self) -> u64 {
-        self.height
+        commonware_consensus::Heightable::height(&self.head()).get()
+    }
+
+    /// Keeps the chain certifying while the test seals nothing, as a live
+    /// chain does: whenever the head is [`HEARTBEAT`] old, seal an empty
+    /// block. Transactions still land only when the test seals, and the
+    /// heartbeat stops between seals at shutdown.
+    pub fn keep_certifying(&mut self) {
+        let sealer = self.sealer.clone();
+        let (stop, mut stopped) = tokio::sync::watch::channel(());
+        let task = tokio::spawn(async move {
+            loop {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "test fixture: the heartbeat is a wall-clock idle check"
+                )]
+                let idle = tokio::time::sleep(HEARTBEAT);
+                tokio::select! {
+                    _ = stopped.changed() => return,
+                    () = idle => {},
+                }
+                let mut tip = sealer.tip.lock().await;
+                let now = hellas_auth::authority::UnixMillis::now().map_or(0, |now| now.0);
+                let heartbeat = u64::try_from(HEARTBEAT.as_millis()).unwrap_or(u64::MAX);
+                if now >= tip.head.timestamp().saturating_add(heartbeat) {
+                    sealer.seal(&mut tip, 0, false).await;
+                }
+            }
+        });
+        self.heartbeat = Some((stop, task));
+    }
+
+    /// Stops [`Self::keep_certifying`] between seals, halting the chain
+    /// until the test seals again.
+    pub async fn stop_certifying(&mut self) {
+        if let Some((stop, task)) = self.heartbeat.take() {
+            drop(stop);
+            let _ = task.await;
+        }
     }
 
     /// Plays the proposer: everything every validator's mempool has taken
@@ -590,144 +684,17 @@ impl Devnet {
     /// asserts can rest on one validator's private opinion of the state.
     /// Returns once every full node this devnet started has executed it.
     pub fn seal(&mut self) -> impl std::future::Future<Output = HellasBlock> + '_ {
+        self.seal_stamped(0)
+    }
+
+    /// [`Self::seal`], stamping the block no earlier than `not_before`.
+    pub fn seal_stamped(
+        &mut self,
+        not_before: u64,
+    ) -> impl std::future::Future<Output = HellasBlock> + '_ {
         Box::pin(async move {
-            let mut fresh = Vec::new();
-            let mut proposed = BTreeSet::new();
-            for validator in &self.validators {
-                for transaction in validator.mempool.test_transactions().await {
-                    let digest =
-                        <commonware_cryptography::Sha256 as commonware_cryptography::Hasher>::hash(
-                            &commonware_codec::Encode::encode(&transaction),
-                        );
-                    if self.included.contains(&digest) || !proposed.insert(digest) {
-                        continue;
-                    }
-                    fresh.push(transaction);
-                }
-            }
-            self.included.extend(proposed);
-            self.height += 1;
-            let timestamp = self.next_timestamp();
-
-            let mut root = None;
-            let mut owner_root = None;
-            let mut target = None;
-            let mut executed = Vec::with_capacity(self.validators.len());
-            for validator in &self.validators {
-                let batches = validator.database.new_batches().await;
-                let batches = execute_all(
-                    KernelContext::with_fees(
-                        TEST_NETWORK,
-                        BlockHeight::new(self.height),
-                        timestamp,
-                        BlockHash::from_bytes(self.head.digest().0),
-                        KERNEL_FEES,
-                    ),
-                    &ChainVerifier::new(),
-                    &fresh,
-                    &self.allocations,
-                    batches,
-                )
-                .await
-                .expect("the block executes");
-                let owners = crate::execution::owner_tree::root(&batches).await.unwrap();
-                if let Some(expected) = owner_root {
-                    assert_eq!(owners, expected);
-                }
-                owner_root = Some(owners);
-                let merkleized = batches.merkleize().await.expect("state merkleizes");
-                let validator_target = crate::execution::store::sync_target(&merkleized);
-                if let Some(expected) = &target {
-                    assert_eq!(&validator_target, expected);
-                }
-                target = Some(validator_target);
-                let validator_root = merkleized.root();
-                match root {
-                    None => root = Some(validator_root),
-                    Some(agreed) => assert_eq!(
-                        validator_root, agreed,
-                        "every validator's own execution reaches the same state root",
-                    ),
-                }
-                executed.push(merkleized);
-            }
-            let Some(root) = root else {
-                panic!("a devnet has at least one validator");
-            };
-
-            let block = HellasBlock::new(
-                Context {
-                    round: Round::new(Epoch::zero(), View::new(self.height)),
-                    leader: self.fixture.leaders[0].clone(),
-                    parent: (self.head.context().round.view(), self.head.digest()),
-                },
-                self.head.digest(),
-                Height::new(self.height),
-                timestamp,
-                root,
-                target.unwrap(),
-                fresh,
-            )
-            .with_owner_root(owner_root.unwrap());
-            let certificate = finalization(&self.fixture, &block);
-            // Marshal publishes certification before Stateful commits execution.
-            for (validator, executed) in self.validators.iter().zip(executed) {
-                validator
-                    .indexer
-                    .publish_proof(
-                        block.clone(),
-                        &crate::finality_proof::encode(&certificate.clone().encode(), &[]).unwrap(),
-                    )
-                    .await
-                    .expect("a certified block is ingested");
-                validator.database.finalize(executed).await;
-                assert_eq!(
-                    validator.index.apply_finalized(&block),
-                    Ok(ApplyOutcome::Applied),
-                );
-            }
-            self.head = block.clone();
-            for events in &self.activity {
-                let _ = events.send(crate::ConsensusActivity::Finalization {
-                    proposal: crate::ProposalInfo {
-                        epoch: 0,
-                        view: self.height,
-                        parent_view: self.height - 1,
-                        parent_payload: block.parent(),
-                        payload: block.digest(),
-                    },
-                    signers: vec![],
-                    certificate: certificate.encode().to_vec(),
-                });
-            }
-            for node in &self.full_nodes {
-                let mut progress = node.finalized();
-                tokio::time::timeout(crate::node::RECOVERY_TIMEOUT, async {
-                    while progress.borrow_and_update().executed_height() < self.height {
-                        progress.changed().await.unwrap();
-                    }
-                    node.wait_ready().await.unwrap();
-                })
-                .await
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "full node at {:?} did not reach {}: {error}; {:?}",
-                        *node.finalized().borrow(),
-                        self.height,
-                        node.peer_registry()
-                    )
-                });
-                assert_eq!(
-                    node.view()
-                        .unwrap()
-                        .client()
-                        .get_state_root()
-                        .await
-                        .unwrap(),
-                    Some(root)
-                );
-            }
-            block
+            let mut tip = self.sealer.tip.lock().await;
+            self.sealer.seal(&mut tip, not_before, true).await
         })
     }
 
@@ -735,13 +702,14 @@ impl Devnet {
     /// has included yet: the event a test awaits instead of sleeping until
     /// a submission has probably arrived.
     pub async fn has_pending_transactions(&self) -> bool {
+        let tip = self.sealer.tip.lock().await;
         for validator in &self.validators {
             for transaction in validator.mempool.test_transactions().await {
                 let digest =
                     <commonware_cryptography::Sha256 as commonware_cryptography::Hasher>::hash(
                         &commonware_codec::Encode::encode(&transaction),
                     );
-                if !self.included.contains(&digest) {
+                if !tip.included.contains(&digest) {
                     return true;
                 }
             }
@@ -750,26 +718,20 @@ impl Devnet {
     }
 
     pub async fn seal_through(&mut self, height: u64) {
-        while self.height < height {
+        while self.height() < height {
             self.seal().await;
         }
     }
 
-    /// Seals until the head is stamped at or after `block_time_ms`: the
-    /// way a test reaches a close deadline, which is block time.
+    /// Seals one block stamped at or after `block_time_ms`, unless the head
+    /// already is: the way a test reaches a close deadline, which is block
+    /// time. One block, as when a live chain's next block lands after the
+    /// deadline, so the test's length does not depend on how fast this host
+    /// seals.
     pub async fn seal_past(&mut self, block_time_ms: u64) {
-        while self.head.timestamp() < block_time_ms {
-            self.seal().await;
+        if self.head().timestamp() < block_time_ms {
+            self.seal_stamped(block_time_ms).await;
         }
-    }
-
-    /// The stamp the next block carries: never behind the local clock, so
-    /// certified reads are as fresh as a live chain's, and at least one
-    /// second after its parent, so a test reaches a block-time deadline by
-    /// sealing rather than by waiting.
-    fn next_timestamp(&self) -> u64 {
-        let now = hellas_auth::authority::UnixMillis::now().map_or(0, |now| now.0);
-        now.max(self.head.timestamp().saturating_add(1_000))
     }
 
     /// The coins among `candidates` that `owner` holds at the finalized
@@ -847,6 +809,7 @@ impl Devnet {
     /// Stops every full node and server, then every follower indexer
     /// before the commonware runtime that owns it is dropped.
     pub async fn shutdown(mut self) {
+        self.stop_certifying().await;
         stop(
             std::mem::take(&mut self.full_nodes),
             std::mem::take(&mut self.rpc),
@@ -855,6 +818,160 @@ impl Devnet {
         .await
         .unwrap();
     }
+}
+
+impl Sealer {
+    /// Seals the next block on `tip`; with `include_mempool`, everything
+    /// the validators' mempools have taken since the last block goes in.
+    async fn seal(&self, tip: &mut Tip, not_before: u64, include_mempool: bool) -> HellasBlock {
+        let mut fresh = Vec::new();
+        let mut proposed = BTreeSet::new();
+        for validator in self.validators.iter().filter(|_| include_mempool) {
+            for transaction in validator.mempool.test_transactions().await {
+                let digest =
+                    <commonware_cryptography::Sha256 as commonware_cryptography::Hasher>::hash(
+                        &commonware_codec::Encode::encode(&transaction),
+                    );
+                if tip.included.contains(&digest) || !proposed.insert(digest) {
+                    continue;
+                }
+                fresh.push(transaction);
+            }
+        }
+        tip.included.extend(proposed);
+        tip.height += 1;
+        let timestamp = next_timestamp(&tip.head).max(not_before);
+
+        let mut root = None;
+        let mut owner_root = None;
+        let mut target = None;
+        let mut executed = Vec::with_capacity(self.validators.len());
+        for validator in &self.validators {
+            let batches = validator.database.new_batches().await;
+            let batches = execute_all(
+                KernelContext::with_fees(
+                    TEST_NETWORK,
+                    BlockHeight::new(tip.height),
+                    timestamp,
+                    BlockHash::from_bytes(tip.head.digest().0),
+                    KERNEL_FEES,
+                ),
+                &ChainVerifier::new(),
+                &fresh,
+                &self.allocations,
+                batches,
+            )
+            .await
+            .expect("the block executes");
+            let owners = crate::execution::owner_tree::root(&batches).await.unwrap();
+            if let Some(expected) = owner_root {
+                assert_eq!(owners, expected);
+            }
+            owner_root = Some(owners);
+            let merkleized = batches.merkleize().await.expect("state merkleizes");
+            let validator_target = crate::execution::store::sync_target(&merkleized);
+            if let Some(expected) = &target {
+                assert_eq!(&validator_target, expected);
+            }
+            target = Some(validator_target);
+            let validator_root = merkleized.root();
+            match root {
+                None => root = Some(validator_root),
+                Some(agreed) => assert_eq!(
+                    validator_root, agreed,
+                    "every validator's own execution reaches the same state root",
+                ),
+            }
+            executed.push(merkleized);
+        }
+        let Some(root) = root else {
+            panic!("a devnet has at least one validator");
+        };
+
+        let block = HellasBlock::new(
+            Context {
+                round: Round::new(Epoch::zero(), View::new(tip.height)),
+                leader: self.fixture.leaders[0].clone(),
+                parent: (tip.head.context().round.view(), tip.head.digest()),
+            },
+            tip.head.digest(),
+            Height::new(tip.height),
+            timestamp,
+            root,
+            target.unwrap(),
+            fresh,
+        )
+        .with_owner_root(owner_root.unwrap());
+        let certificate = finalization(&self.fixture, &block);
+        // Marshal publishes certification before Stateful commits execution.
+        for (validator, executed) in self.validators.iter().zip(executed) {
+            validator
+                .indexer
+                .publish_proof(
+                    block.clone(),
+                    &crate::finality_proof::encode(&certificate.clone().encode(), &[]).unwrap(),
+                )
+                .await
+                .expect("a certified block is ingested");
+            validator.database.finalize(executed).await;
+            assert_eq!(
+                validator.index.apply_finalized(&block),
+                Ok(ApplyOutcome::Applied),
+            );
+        }
+        tip.head = block.clone();
+        *self.head.lock().unwrap() = block.clone();
+        for events in &self.activity {
+            let _ = events.send(crate::ConsensusActivity::Finalization {
+                proposal: crate::ProposalInfo {
+                    epoch: 0,
+                    view: tip.height,
+                    parent_view: tip.height - 1,
+                    parent_payload: block.parent(),
+                    payload: block.digest(),
+                },
+                signers: vec![],
+                certificate: certificate.encode().to_vec(),
+            });
+        }
+        for node in &self.full_nodes {
+            let mut progress = node.finalized();
+            tokio::time::timeout(crate::node::RECOVERY_TIMEOUT, async {
+                while progress.borrow_and_update().executed_height() < tip.height {
+                    progress.changed().await.unwrap();
+                }
+                node.wait_ready().await.unwrap();
+            })
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "full node at {:?} did not reach {}: {error}; {:?}",
+                    *node.finalized().borrow(),
+                    tip.height,
+                    node.peer_registry()
+                )
+            });
+            assert_eq!(
+                node.view()
+                    .unwrap()
+                    .client()
+                    .get_state_root()
+                    .await
+                    .unwrap(),
+                Some(root)
+            );
+        }
+        block
+    }
+}
+
+/// The stamp the block after `head` carries: never behind the local clock,
+/// so certified reads are as fresh as a live chain's, and at least one
+/// second after its parent, so a test reaches a block-time deadline by
+/// sealing rather than by waiting.
+fn next_timestamp(head: &HellasBlock) -> u64 {
+    let now = hellas_auth::authority::UnixMillis::now().map_or(0, |now| now.0);
+    now.max(head.timestamp().saturating_add(1_000))
 }
 
 async fn stop(

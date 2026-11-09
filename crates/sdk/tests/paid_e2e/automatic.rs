@@ -1427,6 +1427,9 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         },
     )
     .await;
+    // Paid parties refuse certified state that falls behind the local
+    // clock, so the chain certifies while a test seals nothing.
+    devnet.keep_certifying();
     devnet.seal().await;
     let trust_config = work_config(&devnet, root.path().join("paid"));
     let profile = &trust_config.chain;

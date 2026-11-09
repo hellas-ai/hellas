@@ -630,6 +630,40 @@ async fn sealing_while<T>(
     }
 }
 
+/// [`sealing_while`], except that once `query`'s channel has a pending
+/// close the next block is stamped at its response deadline. Each sealed
+/// block otherwise moves block time one second, so how long the window
+/// took would depend on how fast this host seals.
+async fn sealing_through_close<T>(
+    devnet: &mut Devnet,
+    query: hellas_chain::work_view::WorkChannelQuery,
+    work: impl std::future::Future<Output = T>,
+) -> T {
+    let source = hellas_chain::WorkBlocks::new(devnet.validator_light_client(0));
+    tokio::pin!(work);
+    loop {
+        tokio::select! {
+            output = &mut work => return output,
+            () = tokio::time::sleep(Duration::from_millis(100)) => {},
+        }
+        let mut deadline = 0;
+        if let Ok(Some(snapshot)) = source.work_channel_snapshot(query.clone()).await
+            && let hellas_kernel::PendingSlot::Present(pending) = snapshot.pending()
+        {
+            deadline = pending.response_deadline_ms();
+        }
+        let seal = devnet.seal_stamped(deadline);
+        tokio::pin!(seal);
+        tokio::select! {
+            output = &mut work => {
+                seal.await;
+                return output;
+            },
+            _ = &mut seal => {},
+        }
+    }
+}
+
 /// The coins `owner` holds at the tip, by value, as validator 0 and the
 /// first full node agree they are.
 async fn holdings(devnet: &Devnet, owner: SettlementKey) -> Vec<(CoinId, u64)> {
@@ -880,6 +914,9 @@ async fn paid_fixture(runtime: commonware_runtime::tokio::Context) -> PaidScenar
         },
     )
     .await;
+    // Paid parties refuse certified state that falls behind the local
+    // clock, so the chain certifies while a test seals nothing.
+    devnet.keep_certifying();
     let provider_node = devnet.full_node(0).clone();
 
     // Each owner delegates its allocation to its node's settlement key,
@@ -1256,7 +1293,7 @@ async fn paid_finish(case: PaidScenario) {
     let resumed_height = devnet.height();
     tokio::time::timeout(options.timeout.unwrap(), async {
         loop {
-            if session.with_state(|state| state.cursor().0).await.unwrap() == resumed_height {
+            if session.with_state(|state| state.cursor().0).await.unwrap() >= resumed_height {
                 break;
             }
             tokio::time::sleep(hellas_channel::work::SETUP_POLL).await;
@@ -1299,7 +1336,7 @@ async fn paid_finish(case: PaidScenario) {
     let old_cursor = resumed_height;
     Box::pin(advance_offline(&mut devnet, &relays)).await;
     let offline_tip = devnet.height();
-    assert_eq!(offline_tip - old_cursor, 3);
+    assert!(offline_tip - old_cursor >= 3);
     // Only the reopening client uses these listeners; the live provider keeps
     // polling its original source without contaminating the proof-read count.
     let mut stale_relays = remote::Relays::start_at(&devnet, 2, Duration::ZERO).await;
