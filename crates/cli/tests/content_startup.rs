@@ -90,14 +90,7 @@ async fn no_paid_serve_refuses_a_work_owned_upper_before_any_cleanup() {
         tokio::process::Command::new(env!("CARGO_BIN_EXE_hellas"))
             .arg("--home")
             .arg(root.path())
-            .args([
-                "--software-root",
-                "serve",
-                "--no-discovery",
-                "--port",
-                "0",
-                "--content-config",
-            ])
+            .args(["serve", "--no-discovery", "--port", "0", "--content-config"])
             .arg(config)
             .kill_on_drop(true)
             .output(),

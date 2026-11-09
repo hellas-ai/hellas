@@ -35,7 +35,7 @@ async fn an_expired_command_closes_the_endpoint_it_bound() {
     let identity = crate::identity::load_or_create(&root.path().join("identity")).unwrap();
     let cli = crate::Cli::try_parse_from(["hellas", "--faucet-account", "7", "serve"]).unwrap();
     let chain = hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet);
-    let owner = cli.owner.load(&chain).unwrap().unwrap();
+    let owner = cli.owner.load(&chain, root.path()).unwrap().unwrap();
     let context = Context::new(
         &identity,
         Some(&owner),
@@ -66,9 +66,10 @@ async fn paid_deadline_options_reach_the_signed_job_configuration() {
     let cli = crate::Cli::try_parse_from(["hellas", "--faucet-account", "7", "serve"]).unwrap();
     let owner = cli
         .owner
-        .load(&hellas_chain::genesis::ChainProfile::known(
-            hellas_chain::genesis::Chain::Devnet,
-        ))
+        .load(
+            &hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet),
+            root.path(),
+        )
         .unwrap()
         .unwrap();
     let location = StoreLocation::for_test(root.path());

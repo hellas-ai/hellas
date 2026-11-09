@@ -22,54 +22,42 @@ mod platform_hardening;
 mod tracing_config;
 
 fn validate_serve_assurance(
-    software_root: bool,
     assurance: hellas_rpc::Assurance,
-    root_kind: Option<hellas_rpc::RootKind>,
+    root_kind: hellas_rpc::RootKind,
 ) -> Result<(), String> {
     if assurance == hellas_rpc::Assurance::AppleAppAttest
-        && (software_root
-            || root_kind.is_some_and(|kind| kind != hellas_rpc::RootKind::SecureEnclave))
+        && root_kind != hellas_rpc::RootKind::SecureEnclave
     {
-        Err(
-            "Apple App Attest assurance requires a Secure Enclave root; \
-             --software-root cannot be used"
-                .to_owned(),
-        )
+        Err("Apple App Attest assurance requires a Secure Enclave root".to_owned())
     } else {
         Ok(())
     }
 }
 
-/// Providers and existing authority operations read their identity; requester
-/// commands create a local signing identity on first use.
-fn load_command_identity(
-    command: &Commands,
-    path: &Path,
-) -> anyhow::Result<identity::LocalIdentity> {
-    let grant_identity = matches!(
+/// Commands that act for the principal create its home key on first use.
+/// Job commands create it only when they pay or use a grant.
+fn acts_for_principal(command: &Commands) -> bool {
+    matches!(
         command,
-        Commands::Admin(_)
-            | Commands::Store(_)
+        Commands::Contact { .. }
+            | Commands::Offer { .. }
+            | Commands::Identity {
+                command: IdentityCommand::Init
+            }
+            | Commands::Admin(commands::admin::AdminArgs {
+                command: commands::admin::AdminCommand::BootstrapRemote { .. },
+                ..
+            })
             | Commands::Gateway { offer: Some(_), .. }
-            | Commands::Offer {
-                command: commands::contributions::OfferCommand::ImportBundle { .. },
+            | Commands::Gateway {
+                grant_pool_config: Some(_),
+                ..
             }
-    ) || local_gateway(command);
-    let read_only = grant_identity
-        || matches!(
-            command,
-            Commands::Identity {
-                command: IdentityCommand::ShowNodeId
-                    | IdentityCommand::ShowEnrollmentId
-                    | IdentityCommand::ShowHolder
-                    | IdentityCommand::ExportEnrollment { .. },
+            | Commands::Gateway {
+                paid_work_config: Some(_),
+                ..
             }
-        );
-    if read_only {
-        identity::load_existing(path)
-    } else {
-        identity::load_or_create(path)
-    }
+    )
 }
 
 #[derive(Args)]
@@ -126,10 +114,6 @@ struct Cli {
     #[arg(long, global = true, default_value = "crash")]
     durability: hellas_private::Durability,
 
-    /// Choose the software platform root when a command creates an identity.
-    #[arg(long = "software-root", global = true)]
-    software_root: bool,
-
     #[command(flatten)]
     owner: owner::OwnerArgs,
 
@@ -143,12 +127,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum IdentityCommand {
-    /// Create the local identity file if it does not exist
-    Init {
-        /// Create a fresh private software owner key alongside this device identity.
-        #[arg(long)]
-        passkey_out: Option<PathBuf>,
-    },
+    /// Create this home's device identity and principal key if they do not exist
+    Init,
     /// Print the node ID (hex public key) derived from the identity file
     ShowNodeId,
     /// Print the ContentId of the canonical enrollment bundle
@@ -431,79 +411,6 @@ enum Commands {
     },
 }
 
-fn validate_identity_options(command: &Commands, software_root: bool) -> Result<(), String> {
-    let identity_free = match command {
-        Commands::Admin(commands::admin::AdminArgs {
-            command: commands::admin::AdminCommand::InspectOffline { .. },
-            ..
-        }) => Some("admin inspect-offline"),
-        Commands::Trust(_) => Some("trust"),
-        #[cfg(unix)]
-        Commands::Machines(_) => Some("machines"),
-        Commands::Contact { .. } => Some("contact"),
-        Commands::Offer {
-            command: commands::contributions::OfferCommand::Import { .. },
-        } => Some("offer import"),
-        Commands::Store { .. } => Some("store"),
-        Commands::Serve {
-            check_config: true, ..
-        } => Some("serve --check-config"),
-        Commands::Chain { .. } => Some("chain"),
-        Commands::CodexAuth { .. } => Some("codex-auth"),
-        _ => None,
-    };
-    if let Some(name) = identity_free
-        && software_root
-    {
-        return Err(format!(
-            "--software-root cannot be used with `{name}`; that command does not use a Hellas identity"
-        ));
-    }
-
-    let reads_existing_identity = matches!(
-        command,
-        Commands::Gateway { offer: Some(_), .. }
-            | Commands::Gateway {
-                grant_pool_config: Some(_),
-                ..
-            }
-            | Commands::Offer {
-                command: commands::contributions::OfferCommand::ImportBundle { .. },
-            }
-            | Commands::Admin(_)
-            | Commands::Identity {
-                command: IdentityCommand::ShowNodeId
-                    | IdentityCommand::ShowEnrollmentId
-                    | IdentityCommand::ShowHolder
-                    | IdentityCommand::ExportEnrollment { .. },
-            }
-    ) || local_gateway(command);
-    if software_root && reads_existing_identity {
-        return Err(
-            "--software-root only selects the root when creating an identity; this command reads an existing identity"
-                .to_string(),
-        );
-    }
-    Ok(())
-}
-
-/// `gateway --local-grant`, which exists only with local compute.
-fn local_gateway(command: &Commands) -> bool {
-    #[cfg(feature = "compute")]
-    return matches!(
-        command,
-        Commands::Gateway {
-            local_grant: Some(_),
-            ..
-        }
-    );
-    #[cfg(not(feature = "compute"))]
-    return {
-        let _ = command;
-        false
-    };
-}
-
 fn main() {
     // SafeRuntime launches the current executable as a worker child. This
     // must run before Tokio creates worker threads and before clap, tracing,
@@ -565,16 +472,6 @@ async fn async_main() {
             std::process::exit(2);
         }
     };
-    if let Err(error) = validate_identity_options(&cli.command, cli.software_root) {
-        eprintln!("error: {error}");
-        std::process::exit(2);
-    }
-    if let Commands::Serve { assurance, .. } = &cli.command
-        && let Err(error) = validate_serve_assurance(cli.software_root, *assurance, None)
-    {
-        eprintln!("error: {error}");
-        std::process::exit(1);
-    }
     if matches!(&cli.command, Commands::Serve { .. })
         && let Err(err) = platform_hardening::harden_provider_process()
     {
@@ -657,8 +554,12 @@ async fn async_main() {
     let owner = match if persistent_owner {
         cli.owner.load_persistent(&home, &selected_chain)
     } else {
-        cli.owner.load(&selected_chain)
-    } {
+        cli.owner.load(&selected_chain, &home)
+    }
+    .and_then(|owner| match owner {
+        None if acts_for_principal(&cli.command) => owner::principal(&home).map(Some),
+        owner => Ok(owner),
+    }) {
         Ok(owner) => owner,
         Err(error) => {
             eprintln!("error: {error:#}");
@@ -807,9 +708,8 @@ async fn async_main() {
         command => command,
     };
 
-    // Before anything binds, and before any other startup work: a
-    // command that cannot have an identity has nothing further to do.
-    let local_identity = match load_command_identity(&command, &identity_path) {
+    // Before anything binds, and before any other startup work.
+    let local_identity = match identity::load_or_create(&identity_path) {
         Ok(identity) => identity,
         Err(err) => {
             eprintln!("error: {err:#}");
@@ -819,9 +719,8 @@ async fn async_main() {
     let secret_key = local_identity.transport_key.clone();
     if let Commands::Serve { assurance, .. } = &command
         && let Err(error) = validate_serve_assurance(
-            cli.software_root,
             *assurance,
-            Some(local_identity.enrollment.genesis.statement.root_kind),
+            local_identity.enrollment.genesis.statement.root_kind,
         )
     {
         eprintln!("error: {error}");
@@ -1394,11 +1293,7 @@ async fn async_main() {
             unreachable!("management commands handled before identity load")
         }
         Commands::Identity { command } => match command {
-            IdentityCommand::Init { passkey_out } => passkey_out
-                .as_deref()
-                .map(commands::identity::create_passkey)
-                .transpose()
-                .map(|_| ()),
+            IdentityCommand::Init => Ok(()),
             IdentityCommand::ShowNodeId => commands::identity::show_node_id(&secret_key),
             IdentityCommand::ShowEnrollmentId => {
                 commands::identity::show_enrollment_id(&local_identity.enrollment)

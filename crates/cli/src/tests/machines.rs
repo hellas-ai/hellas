@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn provisioning_uses_the_generic_client_side_commands_without_an_identity() {
+fn provisioning_uses_the_generic_client_side_commands() {
     for action in ["list", "create", "destroy"] {
         let mut args = vec![
             "hellas",
@@ -18,6 +18,6 @@ fn provisioning_uses_the_generic_client_side_commands_without_an_identity() {
             _ => {}
         }
         let cli = Cli::try_parse_from(args).unwrap();
-        validate_identity_options(&cli.command, false).unwrap();
+        assert!(!acts_for_principal(&cli.command));
     }
 }

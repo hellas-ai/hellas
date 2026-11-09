@@ -117,33 +117,9 @@ fn identity_init_has_an_explicit_dispatch_command() {
     assert!(matches!(
         cli.command,
         Commands::Identity {
-            command: IdentityCommand::Init { passkey_out: None },
+            command: IdentityCommand::Init,
         }
     ));
-}
-
-#[test]
-fn identity_free_commands_reject_software_root_but_allow_home() {
-    let cli = Cli::try_parse_from([
-        "hellas",
-        "--home",
-        "/state",
-        "offer",
-        "import",
-        "provider.offer",
-        "--name",
-        "provider",
-        "--software-root",
-    ])
-    .unwrap();
-    assert!(validate_identity_options(&cli.command, cli.software_root).is_err());
-}
-
-#[test]
-fn identity_queries_reject_a_root_selection_they_cannot_use() {
-    let cli =
-        Cli::try_parse_from(["hellas", "identity", "show-node-id", "--software-root"]).unwrap();
-    assert!(validate_identity_options(&cli.command, cli.software_root).is_err());
 }
 
 #[test]
@@ -257,21 +233,18 @@ fn admin_target_is_shared_and_requires_an_identity_pin() {
 }
 
 #[test]
-fn serve_rejects_software_root_with_apple_assurance() {
-    assert!(validate_serve_assurance(true, hellas_rpc::Assurance::AppleAppAttest, None).is_err());
+fn apple_assurance_requires_a_secure_enclave_root() {
     assert!(
         validate_serve_assurance(
-            false,
             hellas_rpc::Assurance::AppleAppAttest,
-            Some(hellas_rpc::RootKind::Software),
+            hellas_rpc::RootKind::Software,
         )
         .is_err()
     );
     assert!(
         validate_serve_assurance(
-            false,
             hellas_rpc::Assurance::AppleAppAttest,
-            Some(hellas_rpc::RootKind::SecureEnclave),
+            hellas_rpc::RootKind::SecureEnclave,
         )
         .is_ok()
     );
@@ -368,10 +341,7 @@ fn an_unreadable_settlement_identity_is_a_startup_failure() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("identity");
     std::fs::write(&path, b"not an identity").unwrap();
-    let paid =
-        Cli::try_parse_from(["hellas", "serve", "--paid-work-config", "/tmp/work.toml"]).unwrap();
-
-    let Err(error) = load_command_identity(&paid.command, &path) else {
+    let Err(error) = identity::load_or_create(&path) else {
         panic!("an identity file that is not one is not a key to settle with");
     };
 
@@ -474,7 +444,7 @@ fn serve_uses_bounded_fetch_defaults() {
 }
 
 #[test]
-fn offer_gateway_uses_its_private_resources_and_existing_identity() {
+fn offer_gateway_uses_its_private_resources() {
     let cli = Cli::try_parse_from([
         "hellas",
         "gateway",
@@ -488,11 +458,6 @@ fn offer_gateway_uses_its_private_resources_and_existing_identity() {
         "/gateway.json",
     ])
     .unwrap();
-    assert!(validate_identity_options(&cli.command, true).is_err());
-    let root = tempfile::tempdir().unwrap();
-    let path = root.path().join("missing-identity");
-    assert!(load_command_identity(&cli.command, &path).is_err());
-    assert!(!path.exists());
     let Commands::Gateway {
         grant_policy,
         work_profile,

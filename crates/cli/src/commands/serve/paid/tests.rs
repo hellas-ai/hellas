@@ -39,9 +39,10 @@ async fn fleet_paid_startup_requires_exact_owner_approval_without_owner_key() {
     let cli = crate::Cli::try_parse_from(["hellas", "serve", "--faucet-account", "7"]).unwrap();
     paid.owner = cli
         .owner
-        .load(&hellas_chain::genesis::ChainProfile::known(
-            hellas_chain::genesis::Chain::Devnet,
-        ))
+        .load(
+            &hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet),
+            std::path::Path::new("/"),
+        )
         .unwrap();
     let credential = paid
         .prepare(&config, &identity.enrollment, &identity.node_key)
@@ -165,9 +166,10 @@ async fn interrupted_bootstrap_reuses_prepared_owner_approval_credential_and_tls
     let cli = crate::Cli::try_parse_from(["hellas", "serve", "--faucet-account", "7"]).unwrap();
     let owner = cli
         .owner
-        .load(&hellas_chain::genesis::ChainProfile::known(
-            hellas_chain::genesis::Chain::Devnet,
-        ))
+        .load(
+            &hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet),
+            std::path::Path::new("/"),
+        )
         .unwrap()
         .unwrap();
     let example =
@@ -222,9 +224,10 @@ fn paid_fetch_admission_derives_the_configured_route_contract() {
     let cli = crate::Cli::try_parse_from(["hellas", "serve", "--faucet-account", "7"]).unwrap();
     let owner = cli
         .owner
-        .load(&hellas_chain::genesis::ChainProfile::known(
-            hellas_chain::genesis::Chain::Devnet,
-        ))
+        .load(
+            &hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet),
+            std::path::Path::new("/"),
+        )
         .unwrap()
         .unwrap();
     let example =

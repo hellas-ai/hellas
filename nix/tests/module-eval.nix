@@ -409,7 +409,7 @@ let
     extraArgs = [ "--text-model=${builtins.storeDir}/model.gguf" ];
   };
   harmlessExtraArgs = evalProvider {
-    extraArgs = [ "--software-root" ];
+    extraArgs = [ "--no-discovery" ];
   };
   unsupportedProviderApple = evalProvider {
     assurance = "apple-app-attest";

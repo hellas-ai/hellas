@@ -25,7 +25,7 @@ impl LocalCompute {
         let root = directory.path();
         hellas_private::restrict_directory(root).unwrap();
         let owner = Cli::new(root, "owner", AGENT_PASSKEY);
-        owner.run(&["--software-root", "identity", "init"]).await;
+        owner.run(&["identity", "init"]).await;
         let export = owner.output(&["identity", "export-enrollment"]).await;
         assert!(export.status.success());
         let enrollment = decode_enrollment(&export.stdout).unwrap();

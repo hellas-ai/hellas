@@ -42,7 +42,7 @@ async fn main() {
         );
         output.stdout
     };
-    run(&["--software-root", "identity", "init"]);
+    run(&["identity", "init"]);
     let enrollment = decode_enrollment(&run(&["identity", "export-enrollment"])).unwrap();
     let holder: CredentialHolder =
         serde_json::from_slice(&run(&["identity", "show-holder"])).unwrap();

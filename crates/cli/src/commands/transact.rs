@@ -215,7 +215,7 @@ pub struct Context {
     pub transport: iroh::SecretKey,
     pub settlement: Secp256k1Signer,
     pub producer: ProducerSigningKey,
-    owner: Option<hellas_kernel::SoftPasskey>,
+    owner: std::sync::OnceLock<hellas_kernel::SoftPasskey>,
     pub home: StoreLocation,
     pub chain: hellas_chain::chain_dir::ChainDir,
     /// Bound on first use; [`bounded`] closes them however the command ends,
@@ -235,7 +235,9 @@ impl Context {
             transport: identity.transport_key.clone(),
             settlement: crate::identity::settlement_signer(identity)?,
             producer: identity.node_key.clone(),
-            owner: owner.cloned(),
+            owner: owner
+                .cloned()
+                .map_or_else(std::sync::OnceLock::new, Into::into),
             home: home.clone(),
             chain: hellas_chain::chain_dir::ChainDir::open(home, chain)?,
             paid_endpoint: tokio::sync::OnceCell::new(),
@@ -243,11 +245,14 @@ impl Context {
         })
     }
 
-    /// Paid and granted work act for an owner; local work needs none.
+    /// Paid and granted work act for the principal, whose home key is
+    /// created on first use; local work needs none.
     fn owner(&self) -> super::CliResult<&hellas_kernel::SoftPasskey> {
-        self.owner
-            .as_ref()
-            .context("requester requires --passkey, --faucet or --faucet-account")
+        if let Some(owner) = self.owner.get() {
+            return Ok(owner);
+        }
+        let owner = crate::owner::principal(&self.home)?;
+        Ok(self.owner.get_or_init(|| owner))
     }
 
     async fn paid_endpoint(&self) -> super::CliResult<iroh::Endpoint> {

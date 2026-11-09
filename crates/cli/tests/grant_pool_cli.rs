@@ -17,13 +17,7 @@ fn gateway_checks_a_real_pool_before_startup() {
     let dir = tempfile::tempdir().unwrap();
     let binary = env!("CARGO_BIN_EXE_hellas");
     let init = Command::new(binary)
-        .args([
-            "--home",
-            dir.path().to_str().unwrap(),
-            "--software-root",
-            "identity",
-            "init",
-        ])
+        .args(["--home", dir.path().to_str().unwrap(), "identity", "init"])
         .output()
         .unwrap();
     assert!(

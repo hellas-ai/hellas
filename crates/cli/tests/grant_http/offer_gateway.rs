@@ -71,7 +71,7 @@ impl OfferHost {
         assert_eq!(provider.principal(), ROOT.principal());
         assert_eq!(client.principal(), FRIEND.principal());
         for cli in [&provider, &client] {
-            cli.run(&["--software-root", "identity", "init"]).await;
+            cli.run(&["identity", "init"]).await;
         }
         let exported = provider.output(&["identity", "export-enrollment"]).await;
         assert!(exported.status.success());
@@ -853,9 +853,7 @@ async fn a_restricted_administrator_can_share_and_the_recipient_can_import_renew
         .unwrap()
         .authority;
     let administrator = Cli::new(root, "sharing-admin", AGENT_PASSKEY);
-    administrator
-        .run(&["--software-root", "identity", "init"])
-        .await;
+    administrator.run(&["identity", "init"]).await;
     let authorization = GrantId([0x31; 16]);
     let now = auth::UnixMillis::now().unwrap();
     let machine = hellas_authority::node::machine_resource(authority);
@@ -1329,9 +1327,7 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
     );
     // Another device of the same principal cannot import the credential.
     let other_device = Cli::new(root, "client-laptop", FRIEND_PASSKEY);
-    other_device
-        .run(&["--software-root", "identity", "init"])
-        .await;
+    other_device.run(&["identity", "init"]).await;
     let wrong = other_device
         .output(&[
             "offer",

@@ -42,7 +42,7 @@
         if ${portablePackage}/bin/hellas serve --help | grep -F -- "--gpu-backend"; then exit 1; fi
         ${package}/bin/hellas identity --help | grep -F -- "show-enrollment-id"
 
-        ${package}/bin/hellas --home "$TMPDIR/hellas-home" --software-root \
+        ${package}/bin/hellas --home "$TMPDIR/hellas-home" \
           monitor --timeout-secs 1 >/dev/null 2>&1 || true
         ${package}/bin/hellas --home "$TMPDIR/hellas-home" identity show-node-id \
           | grep -E '^[0-9a-f]{64}$'

@@ -22,11 +22,11 @@ impl ManagedWorker {
         let root = directory.path();
         hellas_private::restrict_directory(root).unwrap();
         let owner = Cli::new(root, "owner", AGENT_PASSKEY);
-        owner.run(&["--software-root", "identity", "init"]).await;
+        owner.run(&["identity", "init"]).await;
         let state = root.join("worker");
         hellas_private::create_dir_all_durable(&state).unwrap();
         let worker = Cli::new(&state, "identity", ROOT_PASSKEY);
-        worker.run(&["--software-root", "identity", "init"]).await;
+        worker.run(&["identity", "init"]).await;
         let exported = worker.output(&["identity", "export-enrollment"]).await;
         assert!(exported.status.success());
         let provider = decode_enrollment(&exported.stdout).unwrap();
@@ -328,7 +328,7 @@ async fn normal_host_reconnects_through_its_original_enrollment() {
     let before = worker.control(&["status"]).await;
     assert_eq!(before["configuration"]["revision"], 1);
     let stranger = Cli::new(worker.root.path(), "stranger", STRANGER_PASSKEY);
-    stranger.run(&["--software-root", "identity", "init"]).await;
+    stranger.run(&["identity", "init"]).await;
     let refused = stranger
         .output(&[
             "admin",
