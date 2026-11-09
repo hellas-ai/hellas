@@ -1,10 +1,11 @@
 # HTTP APIs through Fetch
 
-`gateway --http-fetch-config FILE --paid-work-config POOL` exposes exact HTTP
-routes over paid HTTPS Fetch. Request and response bodies keep the upstream
-format, including SSE, tool calls and non-2xx errors. Every request uses a funded
-channel from the [paid pool](paid-gateway.md); missing payment configuration is a
-startup error. See [provider account and egress configuration](../crates/providers/HTTPS.md).
+`gateway --http-fetch-config FILE` exposes exact HTTP routes over HTTPS Fetch,
+paid with `--pay MAX --provider ENROLLMENT_ID@NODE_ID` or granted with
+`--access FILE`. Request and response bodies keep the upstream format,
+including SSE, tool calls and non-2xx errors. Every request runs as one Fetch
+job on the gateway's one provider, through the same `Executor` as the job
+commands. See [provider account and egress configuration](../crates/providers/HTTPS.md).
 
 The gateway's standard API paths can serve several accounts or provider nodes.
 It reads the requested model, finds backends configured to serve that model and
@@ -48,15 +49,15 @@ optional backend `max_in_flight` overrides the global per-account limit. Routes
 sharing a credential alias on the same provider share capacity and cooldown;
 duplicating that alias does not multiply its allowance.
 
-A backend's optional `provider` is an endpoint ID from the paid pool. It may be
-omitted only when the pool contains exactly one provider for the HTTP Fetch
-manifest. Addresses, funding, journals and enrollment/Apple trust pins belong in
-the pool. The provider must mount a paid Fetch channel for the gateway's transport
-and settlement identities and expose the configured service/method.
+A backend's optional `provider` is an endpoint ID; it may be omitted, and must
+then be the gateway's provider. Addresses, funding, journals and enrollment/Apple
+trust pins come from the gateway's `--pay`/`--provider` or `--access`, and
+`--trust-store`/`--trust-policy`. The provider must expose the configured
+service/method.
 
-The gateway bearer authorizes access to the gateway's payment identity. The
-router selects an account, then the paid client signs the exact Fetch request
-and proposes it on that provider's channel. The provider checks the funded edge,
+The gateway bearer authorizes access to the gateway's payment or grant
+identity. The router selects an account, then the client signs the exact Fetch
+request and proposes it on the provider's channel. The provider checks the funded edge,
 credit, deadlines, signature and Fetch policy before durably accepting work;
 only that accepted job can invoke the upstream. The credential's origin, path
 and method restrictions remain enforced by the provider. Every execution is authorized by Work.
@@ -74,10 +75,9 @@ acknowledgement. Each accepted valid terminal costs the channel's agreed fixed
 price, including HTTP error statuses. Already available prefixes share bounded
 wire frames, with a local observer-readiness check before each frame and individual
 signature checks for every event. Batching does not wait for more upstream data.
-Requests are not retried on another
-provider after account selection. The pool serializes work within each provider
-channel; concurrent requests assigned to that provider queue within its deadline, including requests for different
-accounts on that provider. Separate providers have independent channels.
+Requests are not retried after account selection. The gateway runs one
+request at a time: a channel journal, a funding wallet and a machine each have
+one owner. Concurrent requests queue, including requests for different accounts.
 
 Paths and methods match exactly; query parameters retain their order, repeats
 and percent encoding. Ordinary client headers, including idempotency keys and
@@ -97,21 +97,20 @@ combined with a provider credential; that restriction remains enforced by the
 provider. Private destinations also require its explicit egress opt-in.
 
 ```sh
-hellas --home ./gateway-home gateway \
-  --http-fetch-config ./http-gateway.json \
-  --paid-work-config /srv/hellas/paid-pool.json \
-  --port 8080 --gateway-profile ./gateway-profile.json
+hellas gateway --http-fetch-config ./http-gateway.json \
+  --pay 20 --provider ENROLLMENT_ID@NODE_ID --port 8080
 ```
 
-Provision the [HTTP authority profile](admin.md#http-gateway-authority) before startup.
-The client signs the request and verifies each response chunk before forwarding
+A loopback gateway keeps its own bearer in `<home>/gateway/bearer`; a remote
+one needs an explicitly provisioned
+[HTTP authority profile](admin.md#http-gateway-authority). The client signs the request and verifies each response chunk before forwarding
 it. Provider-owned credentials require public WebPKI roots. The gateway asks the
 provider for ephemeral retention and disables inference replay. Its own archive
 policy is independent of provider retention and upstream `store` fields.
 
 For Kimi Code, set `KIMI_MODEL_NAME` to an available model and use `--wrap kimi`;
 the wrapper supplies `KIMI_MODEL_BASE_URL` and `KIMI_MODEL_API_KEY`. A separately
-launched client can use the same variables and the credential from its provisioned HTTP authority.
+launched client can use the same variables and the bearer in `<home>/gateway/bearer`.
 Choose a context size that fits the byte limits below.
 
 ## Model selection and session affinity
@@ -202,24 +201,21 @@ attest those properties.
 
 ## Responses grants
 
-After importing an Offer and approving its provider trust policy, a sealed
-stateless Responses resource is served by the same SDK `grant_gateway::GrantServeOptions`
-composition as an embedded host:
+An access file whose resource seals one stateless Responses route serves
+`/v1/responses`:
 
 ```sh
-hellas gateway --offer ALIAS --grant-policy responses \
-  --trust-store ./trust --trust-policy PROVIDER \
-  --work-profile ./work-profile.json --gateway-profile ./gateway-profile.json \
-  --port 8080 --zdr
+hellas gateway --access friend.access \
+  --trust-store ./trust --trust-policy PROVIDER --port 8080 --zdr
 ```
 
-The Work profile authorizes the provider allowance; the gateway profile admits
-local HTTP callers. Requests use `/v1/responses`, authenticated by the scoped
-HTTP credential. The Offer determines the sealed route and environment. Ambiguous
-Offers require `--grant-policy`. With `--text-model` as well, `/v1/responses` is
-split by model: `--responses-model` names the models the Fetch answers to.
-Archive/ZDR, `--allow-remote`, `--responses-overrides` and `--wrap` use the
-shared gateway behavior. Shutdown drains accepted Work and closes its endpoint.
+Requests are authenticated by the gateway's bearer. The granted policy
+determines the sealed route and environment. With a text `--model` as well,
+`/v1/responses` is split by model: `--responses-model` names the models the
+Fetch answers to. Archive/ZDR, `--allow-remote`, `--responses-overrides` and
+`--wrap` use the shared gateway behavior. A granted HTTPS resource likewise
+presents its own routes without `--http-fetch-config`. Shutdown drains accepted
+Work and closes its endpoint.
 
 ## Limits and telemetry
 
@@ -232,8 +228,9 @@ Each wire frame remains bounded independently: Fetch completion authenticates
 all preceding prefixes without packing the full response back into one frame.
 
 The provider has a 20 minute total HTTP deadline and a 90 second response idle
-timeout. The pool's `timeout_secs` and on-chain block deadlines must also fit the
-expected execution time. Exceeding a stream limit closes it as incomplete.
+timeout. The gateway's on-chain block deadlines (`--acceptance-blocks`,
+`--terminal-blocks`, `--payment-blocks`) must also fit the expected execution
+time. Exceeding a stream limit closes it as incomplete.
 Individual upstream deliveries are forwarded promptly, split at 16 KiB.
 Before proposal, a disconnect cancels the request. After proposal, collection and
 payment continue independently of the HTTP reader. The bounded HTTP output queue
@@ -286,35 +283,3 @@ WebSockets must select their HTTP/SSE transport. Archive I/O remains on the
 response path, although its errors do not fail requests. These are contract
 differences from a general transparent HTTP proxy, even when inference and
 tool-call payloads are preserved exactly.
-
-## Static grant pools
-
-`gateway --grant-pool-config FILE --trust-store DIR` selects explicit resources
-from independently provisioned grant channels. The file contains aliases, not
-credentials, and has the following shape:
-
-```json
-{
-  "channels": [
-    {"offer": "first.chat", "work_profile": "first", "trust_policy": "first", "resources": ["RESOURCE_ID_1"]},
-    {"offer": "second.chat", "work_profile": "second", "trust_policy": "second", "resources": ["RESOURCE_ID_2"]}
-  ]
-}
-```
-
-Replace the placeholders with canonical resource IDs. Import Offers and access
-bundles through the existing private provisioning commands and approve each
-provider's trust policy independently. Credentials are bound to the importing
-principal and device; profiles imported before device-binding metadata was saved
-must be reimported from their access bundle for use in a pool. Run the same
-command with `--check-config` to validate saved aliases, trust and route
-compatibility without contacting providers or proposing work. Saved Offers can
-be expired locators; startup refreshes signed standing before accepting work.
-
-The pool opens one session per channel and keeps selected resources distinct.
-An explicit pool can distribute Compute among admitting resources by least
-pending work; once selected, a request keeps its channel and resource. HTTP
-Fetch uses the signed route and per-path model restrictions, when present.
-Changes to the configuration require a gateway restart. The executable
-[two-channel SDK example](../crates/sdk/tests/native_execution/pool.rs) shows
-constructing the typed pool and exercising independently budgeted providers.

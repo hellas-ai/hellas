@@ -18,15 +18,15 @@ The referenced private JSON file is maintained by your login tool and contains
 the provider API token. Explicit `secret_env` or the existing file refresh
 command may be used instead; there is no implicit environment fallback.
 
-Creation returns public resource metadata only. Bootstrap the resulting node
-through its normal HostControl using the invitation printed by `serve
---await-owner` in the provider's authenticated console. If creation cannot be
+Creation returns public resource metadata only. Claim the resulting node with
+`hellas pair` and the `hellas-invite:` line its `serve` prints in the provider's
+authenticated console. If creation cannot be
 confirmed, reconcile by the requested name before retrying; a failed response
 can still correspond to an allocated, billable resource.
 
-The ordinary image does not enable bootstrap by default. Its entrypoint is
-`serve --port 31145`; configure the provider template's additional arguments as
-`--await-owner` to opt in. Preserve the persistent home mount.
+The image's entrypoint is `serve --port 31145`. A node with no owner and no paid
+terms prints its invite and waits to be paired. Preserve the persistent home
+mount.
 
 RunPod does not expose inbound UDP ([port documentation](https://docs.runpod.io/pods/configuration/expose-ports)).
 Do not request `31145/udp` or substitute a TCP mapping into a QUIC invitation.
@@ -65,19 +65,18 @@ and its matching backend, including CUDA driver-library setup where needed. In R
 `dockerStartCmd`, pass only additional arguments, for example:
 
 ```json
-["--home", "/var/lib/hellas/.hellas", "--software-root",
- "--await-owner",
- "--grant-config", "/var/lib/hellas/resources.json",
- "--content-config", "/var/lib/hellas/content.toml"]
+["--home", "/var/lib/hellas/.hellas",
+ "--content", "/var/lib/hellas/models/whisper-tiny",
+ "--program", "PROGRAM_MANIFEST"]
 ```
 
-Prepare `resources.json`, a `[content]` declaration with lower directories and
-Jobs pins, and the weights on the persistent volume before using
-that command; a template does not create an allowance or download models.
-Use the [node configuration and bootstrap procedure](admin.md#explicit-offline-initialization-and-recovery),
-then issue/import access and run a job as in the
-[owner walkthrough](../README.md#own-a-worker-and-share-access). `admin share`
-requires a release containing that command on both client and worker.
+Put the converted weights on the persistent volume before using that command;
+`hellas program PATH` prints the manifest for `--program`. A template does not
+create an allowance or download models. Use `--grant-config` and
+`--content-config` instead for explicit resources and Jobs pins. Then pair,
+share and run a job as in the
+[sharing section](../README.md#2-share-your-gpu-with-a-friend). `hellas share`
+and `hellas pair` require a release containing them on both client and worker.
 The state filesystem must preserve private files owned by the daemon user
 (mode `0600` on Unix). If startup reports `file must be private`, inspect the
 reported path's owner and permissions on the actual mounted filesystem; do not
@@ -86,7 +85,7 @@ relax the check or advertise the worker as ready. RunPod's volume disk can be
 so verify its semantics rather than assuming it behaves like the container disk.
 Keep the identity and journal together on persistent storage across restarts.
 
-Keep the owner passkey on the client. An unowned worker's invitation expires
+Keep the owner's principal key on the client. An unowned worker's invite expires
 15 minutes after startup; obtain it promptly through the authenticated console.
 
 ## Provision through the CLI

@@ -1,28 +1,27 @@
 # Jobs
 
-To execute an existing job using an allowance, import its access bundle for
-the current principal and device, then select its imported offer:
+Every job command runs one job in one of three ways: under an access file
+someone shared with you (`--access FILE`), paid (`--pay MAX --provider
+ENROLLMENT_ID@NODE_ID`), or on this machine (`--local`, GPU builds only). To
+run an existing job folder under a grant:
 
 ```sh
-hellas --passkey owner.key offer import-bundle access.bundle --name shared
-hellas --passkey owner.key transact --job ./job \
-  --provider ENROLLMENT_ID@NODE_ID --offer shared.model --output ./result
+hellas transact --job ./job --access friend.access --output ./result
 ```
 
-Authenticate the provider enrollment and node ID independently before using
-them. The grant route checks that pin, the device-bound credential and the
-resource's invocation policy. It starts no chain client and spends no coins;
-the job folder's price is used only by paid execution and can be zero for a
-grant job. The offer's signed first policy selects the resource, and its
-`NAME.POLICY` alias locates the bound profile under `accesses/NAME`. Reusing
-the same offer and job returns its retained result without executing again. An unresolved attempt
-reports its recorded status instead of submitting new work. A new attempt
-path (`--attempt FILE`) is an explicit request to execute again and consume the allowance.
-`run`, `image`, `transcribe`, `text` and `fetch` accept `--offer NAME.POLICY`
-as the exclusive alternative to `--payment`; they save a zero-price job and use
-this same route.
-Grant channel journals share the imported offers' data directory with the
-gateway under `<home>/grants`; paid execution lives under `<home>/chains/<full consensus digest>/`.
+The access file is checked against this home's principal and device. The grant
+route checks the provider pin from its signed offer, the device-bound credential
+and the resource's invocation policy. It starts no chain client and spends no
+coins; the job folder's price is used only by paid execution and can be zero for
+a grant job. The offer's single policy selects the resource; `--resource ID`
+selects one when it has several. Reusing the same access file and job returns
+its retained result without executing again. An unresolved attempt reports its
+recorded status instead of submitting new work. A new attempt path (`--attempt
+FILE`) is an explicit request to execute again and consume the allowance.
+`run`, `image`, `transcribe`, `text` and `fetch` accept `--access FILE` as the
+alternative to `--pay`; they save a zero-price job and use this same route.
+Grant channel journals and attempts live under `<home>/grants`; paid execution
+lives under `<home>/chains/<full consensus digest>/`.
 Grant Compute uses ephemeral provider retention for job payloads. Compiled
 programs are cached independently of payload retention. A signed failed result
 makes the command fail on both first delivery and saved-result replay.
@@ -30,9 +29,9 @@ makes the command fail on both first delivery and saved-result replay.
 With the compute-enabled package (the NixOS module and the CUDA/HIP images;
 the portable release has no local compute), every Compute command also accepts
 `--local`: the job runs on this machine's executor under your own limits, with
-no chain, channel, grant or attempt record. A helper reads the model's weights
+no chain, channel, grant or attempt record. A helper serves the model's weights
 from its `--model` file or directory; `run` and `transact --job` read assets
-through `--content-config`. `--timeout` bounds it like any other job.
+through `--content PATH` or `--content-config`. `--timeout` bounds it like any other job.
 
 ```sh
 hellas transcribe --model ./whisper-tiny --audio speech.wav --local
@@ -54,12 +53,13 @@ new operation ranges, rebuilding the view if pruning overtakes its cursor.
 Signing keys and funding/channel recovery journals remain durable.
 
 ```sh
-hellas --faucet run --provider ENROLLMENT_ID@NODE_ID --source counter.hex --entry advance \
-  --arg u64:2 --arg u64:3 --returns u64 --payment 20 --save-job ./add
-hellas --faucet transact --job ./add --provider ENROLLMENT_ID@NODE_ID@127.0.0.1:9000 -o ./result
-hellas --faucet fetch https://example.com/data --provider ENROLLMENT_ID@NODE_ID --payment 20 \
+hellas faucet
+hellas run --provider ENROLLMENT_ID@NODE_ID --source counter.hex --entry advance \
+  --arg u64:2 --arg u64:3 --returns u64 --pay 20 --save-job ./add
+hellas transact --job ./add --provider ENROLLMENT_ID@NODE_ID@127.0.0.1:9000 -o ./result
+hellas fetch https://example.com/data --provider ENROLLMENT_ID@NODE_ID --pay 20 \
   --contract http --spki-sha256 LEAF_SPKI_SHA256 --save-job ./request -o ./response
-hellas --faucet transact --settle --provider ENROLLMENT_ID@NODE_ID
+hellas transact --settle --provider ENROLLMENT_ID@NODE_ID
 ```
 
 `--provider` takes the address `hellas serve` prints: the content ID of the
@@ -67,17 +67,19 @@ provider's enrollment bundle and the node ID it binds, optionally followed by
 `@IP:PORT`. Quotes, funding, payment and every reconnect refuse a provider that
 presents any other enrollment, before anything is signed or funded.
 
-`--faucet` only selects a key from the devnet genesis faucet allocation and
-retains it beside the identity; `--faucet-account N` selects one explicitly,
-and `--passkey FILE` uses your own owner key. Faucet keys are public
-development keys. The default chain is the shipped devnet. Select a compiled chain with
+Paid jobs act for the home's principal key, `<home>/principal.key`, created on
+first use; `--passkey FILE` points at a key held outside the home. `hellas
+faucet [--amount N]` pays it devnet coins from a random public faucet account
+and waits until the payment is final. The default chain is the shipped devnet. Select a compiled chain with
 `--chain devnet`, or pass one authenticated JSON profile with `--chain-config FILE`.
 The profile contains the exact `genesis_json` bytes as a JSON string, `trust`,
 and a nonempty `validators` URL list. `--timeout 90s` bounds the whole operation;
 without it the command waits until the job is done. `--home DIR` selects the directory for identity and requester state.
 
-The authenticated quote must admit the application's exact manifest and price.
-Those checks and the advertised input limits run before new channel funding.
+A helper asks for the provider's quote first, refuses a price above `--pay
+MAX`, and builds the job at exactly the quoted price. A saved `transact --job`
+keeps its own signed price, which must equal the quote. The authenticated quote
+must admit the application's exact manifest. Those checks and the advertised input limits run before new channel funding.
 Fetch's encoded-input size check uses the largest purchase-nonce encoding,
 reserving up to 32 bytes more than a particular purchase needs. One owner
 approval funds the quoted channel amount; later jobs reuse its balance.
@@ -87,6 +89,36 @@ verified finalized blocks. This path resumes an interrupted close without
 contacting the provider, reading live object proofs or requesting new funding.
 Missing, corrupt or mismatched journals stop settlement rather than being
 silently replaced.
+
+## What each application proves
+
+Execution identity is one canonical `ProgramManifest`: `(evaluator, adaptor,
+content-addressed application root)`. The two application identifiers are exact
+opaque strings. Hellas does not parse versions, negotiate compatibility, or
+consult a model or package registry.
+
+The application owns the meaning of its root. The two applications
+intentionally have different trust boundaries:
+
+| Application | Root and trusted computation | Outside that guarantee |
+| --- | --- | --- |
+| `hellas/catena-a621c8b54a7b`, `compute-0.0.1` | Exact Catena Hex sources, named content-addressed assets, inputs, the call plan (calls, optional step loop and stop rule) and declared outputs | Where sources and weights come from, provider GPU/backend choice, tokenizer, chat template, text decoding, and API presentation |
+| `hellas/fetch-0.0.2`, the contract's adaptor (`http-0.0.1`, `codex-responses-0.0.2` or `openai-responses-0.0.3`) | A strict stateless Responses field set; typed reconstruction of provider-shaped JSON; `stream=true` and upstream `store=false`; the exact official Codex or OpenAI HTTPS endpoint; no redirects; and SSE response projection | The truth, correctness, and availability of the adversarial upstream service; provider route label; credentials/auth-file location; and access policy |
+
+Fetch's purpose is to attest the exact transformation around a
+remote request, so structuring and destructuring are inside that application's
+trusted path rather than presentation performed outside it. This proves which
+checks and transformation ran, not that the remote service's claims are true.
+
+A platform-backed Assurance authenticates the Fetch application. The
+`ProducerSigned` mode authenticates only the producer key and signed transcript;
+it does not authenticate a running binary. The sealed Responses adaptor sends
+`store=false` upstream and accepts text and client-executed function tools.
+
+Work is the execution protocol for payment-funded channels and owner, principal
+and delegated grants, including gateways and sealed Fetch. Accepted
+paid inputs and results remain in the channel's recovery/evidence journal,
+independently of gateway archive settings.
 
 ## Results
 
@@ -109,8 +141,8 @@ the job and makes one call of `--entry`. `--arg` gives the call arguments in
 order: `bool:B`, `u16:N`, `u32:N`, `u64:N`, `f32:X`, `zeroed:BYTES` (a zeroed
 buffer) or `input:NAME`, where `--input FILE` supplies the bytes of input
 `NAME` (its file name). `--returns` gives each returned value's kind in order:
-`bool`, `u16`, `u32`, `u64`, `f32` or `buffer:MAX_BYTES`. `--payment` is the
-flat price A charges per job. The provider checks the arguments against the
+`bool`, `u16`, `u32`, `u64`, `f32` or `buffer:MAX_BYTES`. `--pay MAX` is the
+most you accept for the provider's flat per-job price. The provider checks the arguments against the
 program signature before calling it.
 
 Sources must be self-contained: include every stdlib definition the program
@@ -185,28 +217,32 @@ The result then also carries an `emitted` output with every emitted value.
 
 ## Image jobs
 
-Convert a local distilled Flux2 Klein 4B snapshot once:
+Convert the distilled Flux2 Klein 4B snapshot once, pinned to a 40-hex commit.
+The converter fetches the published files it reads at that commit:
 
 ```sh
-hellas convert-flux --checkpoint ./FLUX.2-klein-4B --output ./klein
+hellas convert-flux black-forest-labs/FLUX.2-klein-4B@COMMIT -o klein
 ```
 
 The converter validates the checkpoint and creates three ordinary provider
 assets (`text.bin`, `denoise.bin`, `vae.bin`), plus client metadata and a
 tokenizer. Text norms and VAE weights use F32; other weights use BF16, matching
-catena-models. Put the package directory in `[content] lower`, prepare it with
-`hellas store --content-config content.toml index`, then declare Jobs pins using
-the printed IDs and byte lengths. Start the provider with that `--content-config`
-file; see the [content store guide](../crates/store/README.md).
+catena-models. A provider serves the package with `serve --content klein`, or
+through Jobs pins in a `--content-config` file; see the
+[content store guide](../crates/store/README.md). An image program depends on
+each request's size and steps, so `hellas program` prints no manifest for it: a
+provider admits image jobs only through paid terms or grants that admit those
+exact programs, or that admit any program and are served with
+`--knowingly-unsafe`.
 The client needs the package's JSON files; it does not upload the weights.
 For 512×512 images, the provider must admit a 3 MiB output; allow 2 MiB of
 uploads for the program, token IDs and noise. Set its execution budget for
 the selected hardware and step count.
 
 ```sh
-hellas --faucet image --provider ENROLLMENT_ID@NODE_ID --model ./klein \
+hellas image --provider ENROLLMENT_ID@NODE_ID --model klein \
   --prompt 'a small red fox' --seed 42 --width 512 --height 512 --steps 4 \
-  --payment 20 -o fox.png
+  --pay 20 -o fox.png
 ```
 
 `image` saves the job before purchase, writes the PNG to `-o` (default
@@ -215,12 +251,12 @@ One job runs `flux.encode-text`, `flux.denoise` and `flux.decode-image`, passing
 conditioning and latents in slots. Tokenization and seeded ChaCha8 noise are
 client inputs; PNG encoding is client presentation of the signed RGB buffer.
 
-The gateway exposes the same package with `gateway --image-model ./klein`
-and a paid pool, `--offer`, or `--local-grant` as usual:
+The gateway exposes the same package with `gateway --model klein` and
+`--access`, `--pay` or `--local` as usual:
 
 ```sh
 curl http://127.0.0.1:8080/v1/images/generations \
-  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $(cat ~/.hellas/gateway/bearer)" -H 'Content-Type: application/json' \
   -d '{"model":"klein","prompt":"a small red fox","seed":42,"size":"512x512","steps":4}'
 ```
 
@@ -265,6 +301,20 @@ deliverable response limit. `--tls-root FILE` supplies a DER trust anchor;
 Apple-attested providers require the independent `--trust-store` and
 `--trust-policy` approval. Fetch additionally selects
 `--assurance apple-app-attest`; raw folders declare that assurance in `[fetch]`.
+
+### Sealed Fetch
+
+Fetch route names are operator-defined routing labels. The sealed destination
+selects the trusted adaptor, fixed official endpoint, no-redirect HTTP driver,
+and response projector as one unit. A configuration cannot supply a URL or
+claim a different adaptor identity.
+
+A provider route file contains a `routes` array. Each route has `service`,
+`method`, `destination` and optional `capabilities` (model and output limits).
+The former `callers` field is rejected; the mounted Work channel authorizes jobs.
+Use `serve --fetch-config FILE --paid-work-config FILE` to sell it.
+See [paid Work](../crates/channel/README.md) for channel configuration and
+[HTTPS Fetch](../crates/providers/HTTPS.md) for provider credentials and egress.
 
 ## Folder rules and retries
 

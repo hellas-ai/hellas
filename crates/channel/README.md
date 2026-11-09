@@ -53,10 +53,10 @@ journal as another kind fails.
 Use a [job folder](../../docs/jobs.md) to keep the caller input reusable:
 
 ```sh
-hellas --passkey owner.key transact --job ./job --provider ENROLLMENT_ID@NODE_ID -o ./result
-hellas --faucet fetch https://example.com/data --provider ENROLLMENT_ID@NODE_ID --payment 20 \
+hellas transact --job ./job --provider ENROLLMENT_ID@NODE_ID -o ./result
+hellas fetch https://example.com/data --provider ENROLLMENT_ID@NODE_ID --pay 20 \
   --contract http --spki-sha256 LEAF_SPKI_SHA256 --save-job ./request -o ./response
-hellas --passkey owner.key transact --settle --provider ENROLLMENT_ID@NODE_ID
+hellas transact --settle --provider ENROLLMENT_ID@NODE_ID
 ```
 
 The helper runs under the Fetch contract its caller names and calls the same

@@ -176,7 +176,7 @@ pub enum AdminCommand {
     /// Apply a typed JSON WorkControlCommand using the profile's selected grant.
     Work {
         command: PathBuf,
-        /// Export one selected offer in the format accepted by `offer import`.
+        /// Write the one selected signed offer to this file.
         #[arg(long)]
         offer_out: Option<PathBuf>,
     },
