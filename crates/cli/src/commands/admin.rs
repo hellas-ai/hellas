@@ -1,14 +1,48 @@
-//! Checked node administration. Online commands always use an explicit app profile.
-use std::path::PathBuf;
+//! Checked node administration through the profile of a paired node.
+use anyhow::Context as _;
+use std::path::{Path, PathBuf};
 mod node;
 mod owner_scope;
 pub(super) use node::{connect_local, connect_remote};
-pub use node::{inspect_offline, run};
+pub use node::{inspect_offline, pair, run};
 pub(crate) const CONTROL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Each paired node's profile is `<home>/nodes/NAME/profile.json`.
+fn paired_nodes(home: &Path) -> PathBuf {
+    home.join("nodes")
+}
+
+/// The profile of the only node this home has paired with.
+fn paired_profile(home: &Path) -> anyhow::Result<PathBuf> {
+    let directory = paired_nodes(home);
+    let mut profiles = Vec::new();
+    match std::fs::read_dir(&directory) {
+        Ok(entries) => {
+            for entry in entries {
+                let profile = entry?.path().join("profile.json");
+                if profile.try_exists()? {
+                    profiles.push(profile);
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", directory.display()));
+        }
+    }
+    match <[PathBuf; 1]>::try_from(profiles) {
+        Ok([profile]) => Ok(profile),
+        Err(profiles) if profiles.is_empty() => {
+            anyhow::bail!("no paired node: run `hellas pair INVITE` or pass --profile")
+        }
+        Err(_) => anyhow::bail!("several paired nodes: pass --profile"),
+    }
+}
 
 #[derive(clap::Args)]
 pub struct AdminArgs {
-    /// Private application credential and independently provisioned server trust.
+    /// Private application credential and independently provisioned server
+    /// trust (default: the only node paired with `hellas pair`).
     #[arg(long, global = true)]
     pub profile: Option<PathBuf>,
     /// Local node socket; defaults to this identity's control.sock.
@@ -156,22 +190,6 @@ pub enum AdminCommand {
         /// New private file for that bearer credential.
         #[arg(long, requires = "bearer_scope")]
         bearer_out: Option<PathBuf>,
-    },
-    /// Bootstrap a fresh node using the pairing document from its authenticated console.
-    BootstrapRemote {
-        #[arg(long)]
-        invitation: PathBuf,
-        #[arg(long, default_value = "00000000000000000000000000000000")]
-        root_grant: String,
-        /// Custom administrator scope; otherwise grant the pairing owner full administration.
-        #[arg(long, requires = "credential_scope")]
-        administrator: Option<PathBuf>,
-        /// Custom device scope paired with --administrator.
-        #[arg(long, requires = "administrator")]
-        credential_scope: Option<PathBuf>,
-        /// New private directory for the retained credential and remote profile.
-        #[arg(long)]
-        profile_out: PathBuf,
     },
     /// Replace lost administration offline; invalidate prior credentials and sessions.
     Recover {

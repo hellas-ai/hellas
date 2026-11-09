@@ -477,8 +477,7 @@ let
     lib.findFirst (
       assertion: lib.hasInfix "content.lower must be disjoint" assertion.message
     ) (throw "missing gateway content disjointness assertion") evaluation.config.assertions;
-  awaitOwnerHipProvider = evalProvider {
-    awaitOwner = true;
+  pairingHipProvider = evalProvider {
     gpuBackend = "hip";
   };
   cudaProvider = evalProvider {
@@ -1010,23 +1009,20 @@ in
     assert grantOnlyHipProvider.config.systemd.services.hellas.serviceConfig.LimitMEMLOCK == "infinity";
     assert lib.elem "/run/hellas/grant.json"
       grantOnlyHipProvider.config.systemd.services.hellas.unitConfig.RequiresMountsFor;
-    assert lib.hasInfix "--await-owner"
-      awaitOwnerHipProvider.config.systemd.services.hellas.serviceConfig.ExecStart;
     assert
-      !(lib.hasInfix "--paid-work-config" awaitOwnerHipProvider.config.systemd.services.hellas.serviceConfig.ExecStart);
+      !(lib.hasInfix "--paid-work-config" pairingHipProvider.config.systemd.services.hellas.serviceConfig.ExecStart);
     assert
-      !(lib.hasInfix "--grant-config" awaitOwnerHipProvider.config.systemd.services.hellas.serviceConfig.ExecStart);
-    assert awaitOwnerHipProvider.config.systemd.services.hellas.environment ? ROCM_PATH;
-    assert awaitOwnerHipProvider.config.systemd.services.hellas.path != [ ];
+      !(lib.hasInfix "--grant-config" pairingHipProvider.config.systemd.services.hellas.serviceConfig.ExecStart);
+    assert pairingHipProvider.config.systemd.services.hellas.environment ? ROCM_PATH;
+    assert pairingHipProvider.config.systemd.services.hellas.path != [ ];
     assert
-      awaitOwnerHipProvider.config.systemd.services.hellas.serviceConfig.SupplementaryGroups == [
+      pairingHipProvider.config.systemd.services.hellas.serviceConfig.SupplementaryGroups == [
         "render"
         "video"
       ];
     assert lib.elem "/dev/kfd rw"
-      awaitOwnerHipProvider.config.systemd.services.hellas.serviceConfig.DeviceAllow;
-    assert
-      awaitOwnerHipProvider.config.systemd.services.hellas.serviceConfig.LimitMEMLOCK == "infinity";
+      pairingHipProvider.config.systemd.services.hellas.serviceConfig.DeviceAllow;
+    assert pairingHipProvider.config.systemd.services.hellas.serviceConfig.LimitMEMLOCK == "infinity";
     assert !oversizedGpuSessionAssetBytes.success;
     assert !oversizedDefaultMaxTokens.success;
     assert !environmentPathEvaluation.success;

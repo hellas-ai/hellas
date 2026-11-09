@@ -184,7 +184,6 @@ impl PaidWork {
         mut provider: hellas_sdk::ProviderOptions<R>,
         grants: Option<hellas_sdk::grant_config::GrantConfig>,
         path: Option<PathBuf>,
-        transport: Option<iroh::Endpoint>,
     ) -> CliResult<hellas_sdk::node_control::host::HostHandle> {
         ensure!(
             provider.executor.assurance == Assurance::ProducerSigned,
@@ -223,7 +222,7 @@ impl PaidWork {
             provider,
             Some(grants),
             path,
-            transport,
+            None,
             self.chain.chain.home(),
         )
         .await?;

@@ -44,10 +44,7 @@ fn acts_for_principal(command: &Commands) -> bool {
             | Commands::Identity {
                 command: IdentityCommand::Init
             }
-            | Commands::Admin(commands::admin::AdminArgs {
-                command: commands::admin::AdminCommand::BootstrapRemote { .. },
-                ..
-            })
+            | Commands::Pair { .. }
             | Commands::Gateway { offer: Some(_), .. }
             | Commands::Gateway {
                 grant_pool_config: Some(_),
@@ -177,6 +174,14 @@ enum Commands {
         #[command(subcommand)]
         command: commands::contributions::OfferCommand,
     },
+    /// Become the owner of a fresh node with the invite its `serve` printed.
+    Pair {
+        /// The `hellas-invite:...` line, copied from the node's own console.
+        invite: String,
+        /// Name for the paired node in this home.
+        #[arg(long, default_value = "default")]
+        name: String,
+    },
     /// Administer node authority and settings.
     Admin(commands::admin::AdminArgs),
     /// Run the RPC server
@@ -198,21 +203,18 @@ enum Commands {
             default_value_t = hellas_rpc::DEFAULT_EXECUTION_QUEUE_CAPACITY
         )]
         queue_size: usize,
-        /// Paid terms (TOML). With an owner passkey, approve and fund them at
-        /// startup; without one, require the exact remotely approved policy
-        /// and stake already delegated by the owner.
-        #[arg(
-            long = "paid-work-config",
-            value_name = "FILE",
-            conflicts_with = "await_owner"
-        )]
+        /// Paid terms (TOML). With the principal key, approve and fund them
+        /// at startup; without one, require the exact remotely approved policy
+        /// and stake already delegated by the owner. Without paid terms, an
+        /// uninitialized node prints an invite and waits for `hellas pair`.
+        #[arg(long = "paid-work-config", value_name = "FILE")]
         work_config_file: Option<PathBuf>,
         /// Resources and listeners for an explicitly initialized authority store.
         #[arg(long = "grant-config")]
         grant_config_file: Option<PathBuf>,
         /// Admit this exact Compute program manifest (64-hex content ID) in the
         /// one shared `compute` resource; repeat for each program.
-        #[arg(long = "program", value_name = "MANIFEST", requires = "await_owner", conflicts_with = "grant_config_file")]
+        #[arg(long = "program", value_name = "MANIFEST", conflicts_with_all = ["grant_config_file", "work_config_file"])]
         programs: Vec<hellas_rpc::ContentId>,
         /// Serve a configuration that admits any Compute program (`mode =
         /// "any"` in paid terms, or `Any` in a grant resource); without it
@@ -220,9 +222,6 @@ enum Commands {
         /// an unknown author hands that author roughly root on this host.
         #[arg(long)]
         knowingly_unsafe: bool,
-        /// Wait for one owner pairing if the home provider authority is uninitialized.
-        #[arg(long)]
-        await_owner: bool,
         #[cfg(feature = "otel")]
         /// Prometheus metrics port (e.g. 9090)
         #[arg(long = "metrics-port")]
@@ -735,6 +734,10 @@ async fn async_main() {
             unreachable!("contact commands handled before identity load")
         }
         Commands::Admin(args) => commands::admin::run(args, &local_identity, passkey, &home).await,
+        Commands::Pair { invite, name } => {
+            let passkey = passkey.expect("pairing acts for the principal");
+            commands::admin::pair(&invite, &name, &local_identity, passkey, &home).await
+        }
         Commands::Store(args) => {
             commands::store::run(args, &home, Some(&local_identity), passkey).await
         }
@@ -749,7 +752,6 @@ async fn async_main() {
             grant_config_file,
             programs,
             knowingly_unsafe,
-            await_owner,
             #[cfg(feature = "otel")]
                 metrics_port: _,
             #[cfg(feature = "otel")]
@@ -778,7 +780,7 @@ async fn async_main() {
             {
                 Err(error) => Err(error),
                 Ok(paid) => {
-                    closing_endpoints(async |endpoints| {
+                    async {
                         // The key every settlement this node signs is signed
                         // with, taken from the identity loaded above and
                         // never made here.
@@ -818,42 +820,8 @@ async fn async_main() {
                              who can submit jobs roughly root on this host; pass \
                              --knowingly-unsafe to serve it anyway"
                         );
-
-                        let (grants, transport) = if await_owner {
-                            let (grants, transport) = commands::serve::bootstrap::prepare(
-                                &home,
-                                &local_identity,
-                                port,
-                                grants,
-                            )
-                            .await?;
-                            // The host closes it at shutdown; this covers every exit
-                            // before the host owns it.
-                            endpoints.extend(transport.clone());
-                            (Some(grants), transport)
-                        } else {
-                            (grants, None)
-                        };
-                        let fetch_config_file = match (fetch_config_file, await_owner) {
-                            (Some(path), _) => Some(path),
-                            (None, true) => {
-                                let path =
-                                    hellas_sdk::grant_config::GrantConfig::provider_dir(&home)
-                                        .join("fetch.json");
-                                if !path.try_exists()? {
-                                    hellas_private::write_atomically(
-                                        &path,
-                                        ".initializing",
-                                        br#"{"revision":0,"routes":[]}"#,
-                                    )?;
-                                }
-                                Some(path)
-                            }
-                            (None, false) => None,
-                        };
                         commands::serve::run(commands::serve::ServeOptions {
                             home: home.clone(),
-                            transport,
                             port,
                             discovery: !no_discovery,
                             queue_size,
@@ -873,7 +841,7 @@ async fn async_main() {
                             assurance,
                         })
                         .await
-                    })
+                    }
                     .await
                 }
             }

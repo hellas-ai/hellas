@@ -15,6 +15,7 @@ compute = ["hellas-executor/compute"]
 
 [dependencies]
 async-stream = { workspace = true }
+base64 = { workspace = true }
 futures = { workspace = true }
 futures-core = { workspace = true }
 hellas-attestation = { workspace = true, features = ["apple-app-attest"] }
@@ -73,7 +74,6 @@ zeroize = { version = "1.9" }
 
 [dev-dependencies]
 async-trait = "0.1"
-base64.workspace = true
 bytes.workspace = true
 catena-lang.workspace = true
 commonware-codec.workspace = true

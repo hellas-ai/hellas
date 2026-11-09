@@ -60,7 +60,6 @@ impl ManagedWorker {
         let mut node = worker.spawn(
             &[
                 "serve",
-                "--await-owner",
                 "--grant-config",
                 string(&resources),
                 "--fetch-config",
@@ -83,58 +82,8 @@ impl ManagedWorker {
             .unwrap()
             .port();
         let address = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)).to_string();
-        let invitation_file = root.join("invitation.json");
-        std::fs::write(&invitation_file, serde_json::to_vec(&invitation).unwrap()).unwrap();
-        let authority = auth::AuthorityId(hellas_auth::Digest::hash(b"normal host fixture"));
-        let now = auth::UnixMillis::now().unwrap();
-        let extra: Vec<_> = hellas_authority::operations::OPERATIONS
-            .iter()
-            .filter(|operation| {
-                !matches!(
-                    operation.scope,
-                    hellas_authority::operations::Scope::Allowance
-                )
-            })
-            .map(|operation| {
-                (
-                    operation.name,
-                    operation.permission(authority, None).unwrap().resource,
-                )
-            })
-            .collect();
-        let administrator = common_node::admin_spec(
-            authority,
-            owner.principal(),
-            &extra,
-            (now, auth::UnixMillis(now.0 + 3_600_000)),
-            (3_600_000, 8),
-            &[hellas_authority::grant_service::WORK_EXECUTE],
-        );
-        let administrator_file = root.join("administrator.json");
-        let scope_file = root.join("scope.json");
-        std::fs::write(
-            &administrator_file,
-            serde_json::to_vec(&administrator).unwrap(),
-        )
-        .unwrap();
-        let scope = administrator;
-        std::fs::write(&scope_file, serde_json::to_vec(&scope).unwrap()).unwrap();
-        let profile_dir = root.join("administration");
         let bootstrap = owner
-            .output(&[
-                "admin",
-                "bootstrap-remote",
-                "--invitation",
-                string(&invitation_file),
-                "--root-grant",
-                &GrantId([0; 16]).to_string(),
-                "--administrator",
-                string(&administrator_file),
-                "--credential-scope",
-                string(&scope_file),
-                "--profile-out",
-                string(&profile_dir),
-            ])
+            .output(&["pair", &invitation.encode().unwrap(), "--name", "worker"])
             .await;
         assert!(
             bootstrap.status.success(),
@@ -304,10 +253,7 @@ async fn invitation(node: &mut Process) -> Invitation {
     let deadline = tokio::time::Instant::now() + HANG_GUARD;
     loop {
         let log = std::fs::read_to_string(&node.log).unwrap();
-        if let Some(invitation) = log
-            .lines()
-            .find_map(|line| serde_json::from_str::<Invitation>(line).ok())
-        {
+        if let Some(invitation) = log.lines().find_map(|line| Invitation::decode(line).ok()) {
             return invitation;
         }
         assert!(

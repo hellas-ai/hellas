@@ -74,9 +74,8 @@ let
     writable: lib.all (content: !pathsOverlap writable content) providerContentPaths
   ) providerWriteRoots;
   providerCatenaConfigured = hellas.catenaConfigured cfg;
-  providerLocalExecutionEnabled =
-    hellas.catenaConfigured cfg
-    && (cfg.workConfigFile != null || cfg.grantConfigFile != null || cfg.awaitOwner);
+  # Every provider runs Compute: paid, or granted by the owner it pairs with.
+  providerLocalExecutionEnabled = hellas.catenaConfigured cfg;
   providerGpuConfigured = hellas.catenaPlatform pkgs && providerLocalExecutionEnabled;
   # The gateway runs the same native executor in process for --local-grant.
   gatewayGpuConfigured = hellas.catenaPlatform pkgs && gateway.localGrant != null;

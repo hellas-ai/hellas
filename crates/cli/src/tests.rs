@@ -619,7 +619,7 @@ fn serve_admits_configured_programs_and_acknowledges_any_only_from_configuration
         programs,
         knowingly_unsafe,
         ..
-    } = Cli::try_parse_from(["hellas", "serve", "--await-owner", "--program", &manifest])
+    } = Cli::try_parse_from(["hellas", "serve", "--program", &manifest])
         .unwrap()
         .command
     else {
@@ -629,30 +629,65 @@ fn serve_admits_configured_programs_and_acknowledges_any_only_from_configuration
     assert!(!knowingly_unsafe);
     // An acknowledgement for configuration that admits any program, never a mode.
     for args in [
-        vec!["hellas", "serve", "--knowingly-unsafe", "--grant-config", "g.json"],
-        vec!["hellas", "serve", "--knowingly-unsafe", "--paid-work-config", "p.toml"],
-    ] {
-        assert!(Cli::try_parse_from(&args).is_ok(), "{args:?}");
-    }
-    for args in [
-        vec!["hellas", "serve", "--program", &manifest],
         vec![
             "hellas",
             "serve",
-            "--await-owner",
-            "--program",
-            &manifest,
+            "--knowingly-unsafe",
             "--grant-config",
             "g.json",
         ],
         vec![
             "hellas",
             "serve",
-            "--await-owner",
-            "--program",
-            "not-a-hash",
+            "--knowingly-unsafe",
+            "--paid-work-config",
+            "p.toml",
         ],
+    ] {
+        assert!(Cli::try_parse_from(&args).is_ok(), "{args:?}");
+    }
+    for args in [
+        vec![
+            "hellas",
+            "serve",
+            "--program",
+            &manifest,
+            "--paid-work-config",
+            "p.toml",
+        ],
+        vec![
+            "hellas",
+            "serve",
+            "--program",
+            &manifest,
+            "--grant-config",
+            "g.json",
+        ],
+        vec!["hellas", "serve", "--program", "not-a-hash"],
+        vec!["hellas", "serve", "--await-owner"],
     ] {
         assert!(Cli::try_parse_from(&args).is_err(), "{args:?}");
     }
+}
+
+#[test]
+fn pair_takes_one_invite_and_an_optional_name() {
+    let Commands::Pair { invite, name } =
+        Cli::try_parse_from(["hellas", "pair", "hellas-invite:abc"])
+            .unwrap()
+            .command
+    else {
+        panic!("pair")
+    };
+    assert_eq!(
+        (invite.as_str(), name.as_str()),
+        ("hellas-invite:abc", "default")
+    );
+    assert!(acts_for_principal(
+        &Cli::try_parse_from(["hellas", "pair", "x", "--name", "gpu"])
+            .unwrap()
+            .command
+    ));
+    assert!(Cli::try_parse_from(["hellas", "pair"]).is_err());
+    assert!(Cli::try_parse_from(["hellas", "admin", "bootstrap-remote"]).is_err());
 }

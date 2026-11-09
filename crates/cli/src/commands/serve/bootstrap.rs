@@ -1,5 +1,4 @@
-//! Normal node startup with one explicit owner-pairing interval.
-use crate::identity::LocalIdentity;
+//! Normal node startup: an uninitialized node waits for its owner to pair.
 use anyhow::{Context, Result};
 use hellas_private::StoreLocation;
 use hellas_sdk::{
@@ -9,13 +8,14 @@ use hellas_sdk::{
 
 pub async fn prepare(
     home: &StoreLocation,
-    identity: &LocalIdentity,
+    transport_key: &iroh::SecretKey,
+    enrollment: &hellas_rpc::ProviderEnrollmentBundle,
     port: Option<u16>,
     configured: Option<GrantConfig>,
 ) -> Result<(GrantConfig, Option<iroh::Endpoint>)> {
     let root = GrantConfig::provider_dir(home);
     let mut config = configured.unwrap_or_else(|| GrantConfig::unconfigured(home));
-    // --await-owner is the explicit opt-in to credential-gated remote ingress.
+    // The owner administers the node through credential-gated remote ingress.
     // An existing allowlist remains a narrower operator-selected restriction.
     if !config.remote_control.enabled() {
         config.remote_control = RemoteControlAdmission::credential_gated();
@@ -24,7 +24,7 @@ pub async fn prepare(
     match hellas_authority::work_store::grant::NodeStore::open(
         &config.journal_root(),
         hellas_authority::model::grant::grant_network(),
-        Some(identity.enrollment.clone()),
+        Some(enrollment.clone()),
         now,
     )
     .await
@@ -47,41 +47,34 @@ pub async fn prepare(
         &tls.signing_key.serialize_der(),
     )?;
     let endpoint = hellas_sdk::node_control::host::bind_transport(
-        identity.transport_key.clone(),
+        transport_key.clone(),
         port,
         config.remote_control.clone(),
     )
     .await?;
-    hellas_wire::iroh::close_on_error(&endpoint, pair(&endpoint, &config, identity, &root, now))
-        .await?;
+    hellas_wire::iroh::close_on_error(&endpoint, pair(&endpoint, &config, enrollment, now)).await?;
     Ok((config, Some(endpoint)))
 }
 
 async fn pair(
     endpoint: &iroh::Endpoint,
     config: &GrantConfig,
-    identity: &LocalIdentity,
-    root: &std::path::Path,
+    enrollment: &hellas_rpc::ProviderEnrollmentBundle,
     now: hellas_auth::authority::UnixMillis,
 ) -> Result<()> {
     let invitation = bootstrap::Invitation::create(endpoint, now)?;
-    let invitation_path = root.join("invitation.json");
-    hellas_private::write_atomically(
-        &invitation_path,
-        ".pairing",
-        &serde_json::to_vec(&invitation)?,
-    )?;
-    eprintln!("Private pairing invitation: {}", invitation_path.display());
     // Pairing exists only for this process. A restart cannot reset the attempt
     // counter for an old secret: it generates an independent invitation instead.
-    eprintln!("Obtain this pairing document through the authenticated machine console:");
-    println!("{}", serde_json::to_string(&invitation)?);
+    eprintln!(
+        "Waiting for the owner. Copy the invite below from this console, never an untrusted channel, and run `hellas pair INVITE`:"
+    );
+    println!("{}", invitation.encode()?);
     let result = bootstrap::accept(
         endpoint,
         &invitation,
         &config.journal_root(),
         hellas_authority::model::grant::grant_network(),
-        Some(identity.enrollment.clone()),
+        Some(enrollment.clone()),
     )
     .await;
     result.context(

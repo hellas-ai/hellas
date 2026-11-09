@@ -199,7 +199,6 @@ rec {
     "--chain"
     "--chain-config"
     "--grant-config"
-    "--await-owner"
     "--knowingly-unsafe"
     "--passkey"
     "--metrics-port"
@@ -451,15 +450,6 @@ rec {
           --grant-config. Native Compute runs through grants without paid
           work, so this file enables the same content and GPU service setup as
           workConfigFile. Keep it outside the Nix store.
-        '';
-      };
-      awaitOwner = mkOption {
-        type = types.bool;
-        default = false;
-        example = true;
-        description = ''
-          Wait for one owner pairing when the grant journal is uninitialized,
-          storing authority state under the configured home/provider directory.
         '';
       };
       knowinglyUnsafe = lib.mkEnableOption ''
@@ -764,7 +754,6 @@ rec {
     ++ optArg "--chain" serve.chain
     ++ optArg "--chain-config" serve.chainConfig
     ++ optArg "--grant-config" serve.grantConfigFile
-    ++ lib.optional serve.awaitOwner "--await-owner"
     ++ lib.optional serve.knowinglyUnsafe "--knowingly-unsafe"
     ++ optArg "--passkey" serve.passkey
     ++ lib.optionals (otel.enable && serve.metricsPort != null) [

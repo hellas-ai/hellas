@@ -62,21 +62,6 @@ pub async fn run(
     passkey: Option<&dyn Authenticator>,
     home: &StoreLocation,
 ) -> Result<()> {
-    if matches!(args.command, AdminCommand::BootstrapRemote { .. }) {
-        ensure!(
-            args.profile.is_none()
-                && args.control_socket.is_none()
-                && args.node_enrollment.is_none()
-                && args.addresses.is_empty(),
-            "bootstrap uses the invitation's pin and addresses"
-        );
-        return bootstrap_remote(
-            args.command,
-            identity,
-            passkey.context("bootstrap requires --passkey")?,
-        )
-        .await;
-    }
     match &args.command {
         AdminCommand::Bootstrap { .. } | AdminCommand::Recover { .. } => {
             ensure!(
@@ -92,9 +77,12 @@ pub async fn run(
         _ => {}
     }
     let key = passkey.map_or(SessionKey::Node(&identity.node_key), SessionKey::Passkey);
-    let profile_path = args.profile.as_deref().context("--profile is required")?;
-    let pinned_node = profile::ClientProfile::remote_node(profile_path)?;
-    let profile = profile::ClientProfile::load(profile_path)?;
+    let profile_path = match args.profile {
+        Some(path) => path,
+        None => super::paired_profile(home)?,
+    };
+    let pinned_node = profile::ClientProfile::remote_node(&profile_path)?;
+    let profile = profile::ClientProfile::load(&profile_path)?;
     let remote = args
         .node_enrollment
         .map(|target| -> Result<iroh::EndpointId> {
@@ -585,31 +573,19 @@ async fn owner_approval(
     })
 }
 
-async fn bootstrap_remote(
-    command: AdminCommand,
+/// Claim a fresh node with the invite it printed, as its administrator with
+/// the default owner scope, and keep the profile as paired node `name`.
+pub async fn pair(
+    invite: &str,
+    name: &str,
     identity: &LocalIdentity,
     passkey: &dyn Authenticator,
+    home: &Path,
 ) -> Result<()> {
-    let AdminCommand::BootstrapRemote {
-        invitation,
-        root_grant,
-        administrator,
-        credential_scope,
-        profile_out,
-    } = command
-    else {
-        anyhow::bail!("remote bootstrap required")
-    };
-    let invitation: node_control::bootstrap::Invitation = read(&invitation)?;
-    let root: GrantId = root_grant.parse()?;
-    let (administrator, scope) = match (administrator, credential_scope) {
-        (Some(administrator), Some(scope)) => (read(&administrator)?, read(&scope)?),
-        (None, None) => {
-            let scope = super::owner_scope::administrator(passkey.public_key()?)?;
-            (scope.clone(), scope)
-        }
-        _ => anyhow::bail!("custom administrator and credential scope must be supplied together"),
-    };
+    let invitation = node_control::bootstrap::Invitation::decode(invite)?;
+    hellas_sdk::grant_store::validate_alias(name)?;
+    let root = GrantId([0; 16]);
+    let scope = super::owner_scope::administrator(passkey.public_key()?)?;
     let holder = hellas_auth::authority::NodeKey::from_public_key(identity.node_key.public_key())?;
     let approval = owner_approval(
         passkey,
@@ -617,13 +593,18 @@ async fn bootstrap_remote(
             root,
             target: Some(*invitation.node.as_bytes()),
         },
-        &administrator,
+        &scope,
         &scope,
         holder,
     )
     .await?;
     let (approval, secret) = approval.prepare(Some(*invitation.node.as_bytes()))?;
-    let profile = profile::install_remote(&profile_out, scope.authority, root, &secret)?;
+    let profile = profile::install_remote(
+        &super::paired_nodes(home).join(name),
+        scope.authority,
+        root,
+        &secret,
+    )?;
     profile::pin_remote(&profile, invitation.node)?;
     let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
         .secret_key(identity.transport_key.clone())
