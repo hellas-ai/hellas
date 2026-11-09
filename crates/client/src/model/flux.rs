@@ -7,7 +7,9 @@ use hellas_rpc::protocol::invocation::{Artifact, compute::*, output::InvocationO
 use hellas_store::content::{LocalStore, MemoryStore, Reservations, Scope};
 use rand_chacha::rand_core::SeedableRng;
 use rand_distr::{Distribution, StandardNormal};
+use serde::Deserialize;
 use std::{
+    collections::BTreeMap,
     fs::File,
     io::{BufWriter, Write},
     path::{Path, PathBuf},
@@ -19,6 +21,44 @@ pub const MAX_DIMENSION: usize = 512;
 pub const MAX_STEPS: usize = 50;
 pub const OUTPUT: &str = "image";
 const ASSETS: [&str; 3] = ["text", "denoise", "vae"];
+const SOURCES: [&str; 3] = [
+    "text_encoder/model.safetensors.index.json",
+    "transformer/diffusion_pytorch_model.safetensors",
+    "vae/diffusion_pytorch_model.safetensors",
+];
+/// The published snapshot files [`convert_flux`] reads, besides the text
+/// encoder shards its index names ([`text_shards`]).
+pub const CHECKPOINT: [&str; 9] = [
+    METADATA[0],
+    METADATA[1],
+    METADATA[2],
+    METADATA[3],
+    METADATA[4],
+    METADATA[5],
+    SOURCES[0],
+    SOURCES[1],
+    SOURCES[2],
+];
+
+/// The text encoder shard files the snapshot's index names.
+pub fn text_shards(checkpoint: &Path) -> Result<std::collections::BTreeSet<String>> {
+    #[derive(Deserialize)]
+    struct Index {
+        weight_map: BTreeMap<String, String>,
+    }
+    let index: Index = serde_json::from_reader(File::open(checkpoint.join(SOURCES[0]))?)?;
+    index
+        .weight_map
+        .into_values()
+        .map(|shard| {
+            ensure!(
+                !shard.is_empty() && !shard.contains(['/', '\\']) && shard != "." && shard != "..",
+                "invalid text encoder shard {shard:?}"
+            );
+            Ok(format!("text_encoder/{shard}"))
+        })
+        .collect()
+}
 const METADATA: [&str; 6] = [
     "model_index.json",
     "scheduler/scheduler_config.json",
@@ -137,11 +177,7 @@ pub fn convert_flux(checkpoint: &Path, destination: &Path) -> Result<Vec<NamedAs
         .prefix(".flux-")
         .tempdir_in(parent)?;
     let mut assets = Vec::new();
-    for ((name, tensors), source) in ASSETS.into_iter().zip(tensors).zip([
-        "text_encoder/model.safetensors.index.json",
-        "transformer/diffusion_pytorch_model.safetensors",
-        "vae/diffusion_pytorch_model.safetensors",
-    ]) {
+    for ((name, tensors), source) in ASSETS.into_iter().zip(tensors).zip(SOURCES) {
         let checkpoint = catena_models::weights::Weights::open(&checkpoint.join(source))?;
         let path = staging.path().join(format!("{name}.bin"));
         let mut file = BufWriter::new(File::create(&path)?);
@@ -151,7 +187,7 @@ pub fn convert_flux(checkpoint: &Path, destination: &Path) -> Result<Vec<NamedAs
         file.flush()?;
         file.get_ref().sync_all()?;
         drop(file);
-        let object = super::file_content(&path)?;
+        let object = hellas_store::content::file_content(&path)?;
         assets.push(NamedAsset {
             name: name.into(),
             object,

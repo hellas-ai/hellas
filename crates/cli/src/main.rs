@@ -364,22 +364,24 @@ enum Commands {
     Fetch(commands::transact::FetchArgs),
     /// Buy one call of a Catena program using the same job and payment path.
     Run(commands::transact::RunArgs),
-    /// Convert a local published Whisper checkpoint into a client model package.
+    /// Fetch a published Whisper checkpoint and convert it into a model
+    /// package, e.g. `openai/whisper-tiny@COMMIT`.
     ConvertWhisper {
-        #[arg(long, value_name = "DIR")]
-        checkpoint: PathBuf,
-        #[arg(long, value_name = "DIR")]
+        /// `ORG/NAME@COMMIT`, pinned to a 40-hex commit.
+        checkpoint: commands::convert::Checkpoint,
+        #[arg(short = 'o', long, value_name = "DIR")]
         output: PathBuf,
     },
     /// Transcribe one WAV with a client-rendered Whisper job.
     Transcribe(commands::transact::TranscribeArgs),
     /// Answer one prompt with a client-rendered Qwen3 text job.
     Text(commands::transact::TextArgs),
-    /// Convert a local distilled Flux2 Klein 4B snapshot into client metadata and provider assets.
+    /// Fetch a published distilled Flux2 Klein 4B snapshot and convert it
+    /// into client metadata and provider assets.
     ConvertFlux {
-        #[arg(long)]
-        checkpoint: PathBuf,
-        #[arg(short = 'o', long)]
+        /// `ORG/NAME@COMMIT`, pinned to a 40-hex commit.
+        checkpoint: commands::convert::Checkpoint,
+        #[arg(short = 'o', long, value_name = "DIR")]
         output: PathBuf,
     },
     /// Generate one PNG with a client-rendered Flux job.
@@ -620,43 +622,20 @@ async fn async_main() {
             return;
         }
         Commands::ConvertFlux { checkpoint, output } => {
-            let result = hellas_client::model::flux::convert_flux(&checkpoint, &output);
+            let result = commands::convert::flux(&checkpoint, &output);
             tracer_provider.shutdown();
-            match result {
-                Ok(assets) => {
-                    for asset in assets {
-                        println!(
-                            "{}: {} ({} bytes), {}",
-                            asset.name,
-                            asset.object.id(),
-                            asset.object.bytes(),
-                            output.join(format!("{}.bin", asset.name)).display()
-                        );
-                    }
-                }
-                Err(error) => {
-                    eprintln!("error: {error:#}");
-                    std::process::exit(1);
-                }
+            if let Err(error) = result {
+                eprintln!("error: {error:#}");
+                std::process::exit(1);
             }
             return;
         }
         Commands::ConvertWhisper { checkpoint, output } => {
-            let result = hellas_client::model::whisper::convert_whisper(&checkpoint, &output);
+            let result = commands::convert::whisper(&checkpoint, &output);
             tracer_provider.shutdown();
-            match result {
-                Ok(object) => println!(
-                    "weights: {} ({} bytes), {}",
-                    object.id(),
-                    object.bytes(),
-                    output
-                        .join(hellas_client::model::whisper::WEIGHTS_FILE)
-                        .display()
-                ),
-                Err(error) => {
-                    eprintln!("error: {error:#}");
-                    std::process::exit(1);
-                }
+            if let Err(error) = result {
+                eprintln!("error: {error:#}");
+                std::process::exit(1);
             }
             return;
         }

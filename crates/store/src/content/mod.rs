@@ -29,6 +29,65 @@ use hellas_rpc::ContentRef;
 use hellas_xet::Chunk;
 
 pub(crate) use disk::BadBacking;
+
+/// The content reference of one regular file, hashed in one pass; a file
+/// that changes while it is read is an error, never a wrong identity.
+pub fn file_content(path: &std::path::Path) -> std::io::Result<ContentRef> {
+    use std::io::{Error, ErrorKind, Read};
+    let mut file = hellas_private::open_regular_file(path)?;
+    let before = file.metadata()?;
+    let mut hasher = hellas_xet::XetFileHasher::new();
+    let mut buffer = vec![0; hellas_xet::MAX_CHUNK_SIZE];
+    let mut remaining = before.len();
+    let changed = || {
+        Error::new(
+            ErrorKind::InvalidData,
+            format!("{} changed while hashing", path.display()),
+        )
+    };
+    while remaining != 0 {
+        let wanted = remaining.min(buffer.len() as u64) as usize;
+        let read = file.read(&mut buffer[..wanted])?;
+        if read == 0 {
+            return Err(changed());
+        }
+        hasher.update(&buffer[..read]);
+        remaining -= read as u64;
+    }
+    if file.read(&mut [0])? != 0 {
+        return Err(changed());
+    }
+    #[cfg(unix)]
+    let identity = |metadata: &std::fs::Metadata| {
+        use std::os::unix::fs::MetadataExt;
+        (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        )
+    };
+    #[cfg(not(unix))]
+    let identity = |metadata: &std::fs::Metadata| {
+        (
+            metadata.len(),
+            metadata.modified().ok(),
+            metadata.created().ok(),
+        )
+    };
+    if identity(&before) != identity(&file.metadata()?)
+        || identity(&before) != identity(&std::fs::metadata(path)?)
+    {
+        return Err(changed());
+    }
+    Ok(ContentRef::new(
+        hellas_rpc::ContentId::from_bytes(hasher.finalize().into_bytes()),
+        before.len(),
+    ))
+}
 pub use disk::{DiskStore, IndexMode};
 pub use local::{JobContent, LocalStore, VerifiedReader};
 pub use memory::MemoryStore;

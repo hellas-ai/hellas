@@ -36,16 +36,19 @@ fn durability_is_global_and_defaults_to_crash() {
 
 #[test]
 fn image_cli_and_gateway_surfaces_are_available() {
-    let convert = Cli::try_parse_from([
-        "hellas",
-        "convert-flux",
-        "--checkpoint",
-        "snapshot",
-        "--output",
-        "klein",
-    ])
-    .unwrap();
-    assert!(matches!(convert.command, Commands::ConvertFlux { .. }));
+    let commit = "ab".repeat(20);
+    let snapshot = format!("org/klein@{commit}");
+    for command in ["convert-flux", "convert-whisper"] {
+        let convert = Cli::try_parse_from(["hellas", command, &snapshot, "-o", "out"]).unwrap();
+        assert!(matches!(
+            convert.command,
+            Commands::ConvertFlux { .. } | Commands::ConvertWhisper { .. }
+        ));
+        assert!(
+            Cli::try_parse_from(["hellas", command, "--checkpoint", "dir", "-o", "out"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["hellas", command, "org/klein@main", "-o", "out"]).is_err());
+    }
     let provider = format!("{}@{}", "11".repeat(32), "22".repeat(32));
     let image = Cli::try_parse_from([
         "hellas",

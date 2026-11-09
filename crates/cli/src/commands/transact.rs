@@ -673,16 +673,8 @@ impl Target {
                 opened,
             } => {
                 let mut native = native.take().context("local target is already open")?;
-                if let (Some(model), JobInput::Compute { environment, .. }) = (model, job.input()) {
-                    native.model = Some((
-                        std::path::absolute(model)?,
-                        environment
-                            .assets
-                            .iter()
-                            .map(|asset| asset.object)
-                            .collect(),
-                    ));
-                }
+                // The job reads its weights from the model it was rendered from.
+                native.content.extend(model.clone());
                 let (execution, reload) = crate::compute::local(
                     &context.home,
                     native,

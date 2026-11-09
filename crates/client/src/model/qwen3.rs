@@ -58,7 +58,7 @@ impl Qwen3 {
                     );
                     views.push((tensor.offset, tensor.bytes));
                 }
-                let object = super::file_content(&path)?;
+                let object = hellas_store::content::file_content(&path)?;
                 let model = catena::generated_model_source_for(&config)?;
                 let source = super::program::render(&model)?;
                 let raw = metacat::theory::RawTheorySet::from_text(&source)?;

@@ -71,7 +71,7 @@ pub fn validate_provider_config(
     home: &StoreLocation,
 ) -> CliResult<()> {
     if let Some(path) = content {
-        crate::content_configuration::ContentConfiguration::load(Some(path.into()), None, vec![])?;
+        crate::content_configuration::ContentConfiguration::load(Some(path.into()), vec![])?;
     }
     let routes = fetch
         .map(|path| load_fetch_config(path, home))
