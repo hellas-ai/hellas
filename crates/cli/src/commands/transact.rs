@@ -179,9 +179,9 @@ pub struct FetchArgs {
     url: String,
     #[command(flatten)]
     client: ClientArgs,
-    /// Flat price the provider charges; paid work only.
-    #[arg(long, conflicts_with = "access", value_parser = clap::value_parser!(u64).range(1..))]
-    payment: Option<u64>,
+    /// Pay the provider named by --provider its quoted price per job, at most MAX.
+    #[arg(long, value_name = "MAX", requires = "provider", conflicts_with = "access", value_parser = clap::value_parser!(u64).range(1..))]
+    pay: Option<u64>,
     #[arg(long, default_value = "producer-signed", value_parser = ["producer-signed", "apple-app-attest"])]
     assurance: String,
     #[arg(short = 'X', long, default_value = "GET")]
@@ -499,16 +499,17 @@ enum Target {
 }
 
 impl TargetArgs {
+    /// `pay` is the most a paid job may cost; free targets take 0.
     async fn resolve(
         self,
         client: &ClientArgs,
         context: &Context,
-        price: u64,
+        pay: u64,
         assurance: Assurance,
     ) -> super::CliResult<Target> {
         #[cfg(feature = "compute")]
         if self.local {
-            ensure!(price == 0, "local work is not paid; drop --payment");
+            ensure!(pay == 0, "local work is not paid; drop --pay");
             return Ok(Target::Local {
                 native: Some(self.native),
                 model: self.model,
@@ -519,12 +520,10 @@ impl TargetArgs {
         }
         let Some(access) = self.access.as_deref() else {
             ensure!(
-                price > 0,
-                "paid execution requires a positive job payment; select --access for grant work"
+                pay > 0,
+                "paid execution requires --pay MAX; select --access for grant work"
             );
-            return Ok(Target::Paid(
-                client.options(context, price, assurance).await?,
-            ));
+            return Ok(Target::Paid(client.options(context, pay, assurance).await?));
         };
         let principal = super::contributions::principal(context.owner()?)?;
         let holder = NodeKey::from_public_key(context.producer.public_key())?;
@@ -578,29 +577,32 @@ impl TargetArgs {
 }
 
 impl Target {
-    /// The invocation terms a job built against this target must satisfy.
-    async fn policy(
-        &self,
+    /// The terms a job built for this target must satisfy, if it has any,
+    /// and the price it charges: a paid provider quotes first, at most the
+    /// `--pay` ceiling, and the job is then built at exactly that price.
+    async fn quote(
+        &mut self,
         client: &ClientArgs,
         context: &Context,
-    ) -> super::CliResult<hellas_rpc::protocol::invocation::InvocationPolicy> {
+    ) -> super::CliResult<(
+        Option<hellas_rpc::protocol::invocation::InvocationPolicy>,
+        u64,
+    )> {
         Ok(match self {
             Target::Paid(options) => {
-                request_paid_quote(
+                let quote = request_paid_quote(
                     options,
                     &context.paid_endpoint().await?,
                     &context.settlement,
                     client.owner(context)?.principal(),
                 )
-                .await?
-                .policy
-                .invocation_policy
+                .await?;
+                options.expected_price = quote.policy.payment_policy.fixed_price;
+                (Some(quote.policy.invocation_policy), options.expected_price)
             }
-            Target::Grant { policy, .. } => policy.invocation_policy.clone(),
+            Target::Grant { policy, .. } => (Some(policy.invocation_policy.clone()), 0),
             #[cfg(feature = "compute")]
-            Target::Local { .. } => {
-                bail!("local execution runs Compute jobs; Fetch needs --provider or --access")
-            }
+            Target::Local { .. } => (None, 0),
         })
     }
 
@@ -727,8 +729,59 @@ fn select_policy(
     }
 }
 
-/// Every job command: resolve its target, run the job once through the
-/// executor, keep the signed evidence in `evidence`, then present it.
+/// Helper commands quote first: resolve the target, take its price (a paid
+/// provider's quote, at most `pay`), build the job at that price, save it
+/// (in `save`, or under the client state by digest) and run it once.
+/// `evidence` names where the signed evidence goes, given the job folder.
+#[allow(clippy::too_many_arguments)]
+async fn run_quoted(
+    client: &ClientArgs,
+    target: TargetArgs,
+    context: &Context,
+    pay: Option<u64>,
+    save: Option<PathBuf>,
+    build: impl AsyncFnOnce(u64) -> super::CliResult<Job>,
+    evidence: impl FnOnce(&Path) -> Option<PathBuf>,
+    present: impl FnOnce(&Job, &Completed, &str) -> super::CliResult<()> + Send,
+) -> super::CliResult<()> {
+    bounded(context, client.timeout, async |deadline| {
+        let mut target = within(
+            deadline,
+            target.resolve(client, context, pay.unwrap_or(0), Assurance::ProducerSigned),
+        )
+        .await?;
+        let result = async {
+            let (_, price) = within(deadline, target.quote(client, context)).await?;
+            let job = build(price).await?;
+            let directory = save.unwrap_or_else(|| {
+                client
+                    .root(context)
+                    .join("jobs")
+                    .join(job.digest().to_string())
+            });
+            job.save(&directory).await?;
+            eprintln!("job: {}", directory.display());
+            let evidence = evidence(&directory);
+            execute(
+                client,
+                context,
+                &mut target,
+                &job,
+                deadline,
+                evidence.as_deref(),
+                |completed, provider| present(&job, completed, provider),
+            )
+            .await
+        }
+        .await;
+        result.and(target.close().await)
+    })
+    .await
+}
+
+/// A saved job folder keeps its exact signed price: resolve its target, run
+/// it once through the executor, keep the signed evidence in `evidence`,
+/// then present it.
 async fn run_job(
     client: &ClientArgs,
     target: TargetArgs,
@@ -811,46 +864,57 @@ pub async fn run(args: TransactArgs, context: Context) -> super::CliResult<()> {
         .await;
     };
     let job = Job::load(job).await?;
+    let output = args.output.as_deref();
     run_job(
         &args.client,
         args.target,
         &context,
         &job,
-        args.output.as_deref(),
-        |completed, provider| {
-            if args.output.is_none() {
-                if is_https(&job) {
-                    use base64::{Engine as _, engine::general_purpose::STANDARD};
-                    println!(
-                        "output-0000 (base64): {}",
-                        STANDARD.encode(http_body(&job, completed)?)
-                    );
-                } else {
-                    println!("output: {}", serde_json::to_string(&completed.output)?);
-                }
-            }
-            println!("{}", wording(provider, &job, completed));
-            std::io::stdout().lock().flush()?;
-            Ok(())
-        },
+        output,
+        |completed, provider| present_job(&job, completed, provider, output),
     )
     .await
+}
+
+/// A job command's result: the output unless saved to a folder, then what
+/// was bought from whom.
+fn present_job(
+    job: &Job,
+    completed: &Completed,
+    provider: &str,
+    output: Option<&Path>,
+) -> super::CliResult<()> {
+    if output.is_none() {
+        if is_https(job) {
+            use base64::{Engine as _, engine::general_purpose::STANDARD};
+            println!(
+                "output-0000 (base64): {}",
+                STANDARD.encode(http_body(job, completed)?)
+            );
+        } else {
+            println!("output: {}", serde_json::to_string(&completed.output)?);
+        }
+    }
+    println!("{}", wording(provider, job, completed));
+    std::io::stdout().lock().flush()?;
+    Ok(())
 }
 
 pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
     let mut request = args.request()?;
     let contract = args.contract()?;
-    let payment = args.payment.unwrap_or(0);
     let assurance = args.assurance();
     let target = args.target;
     bounded(&context, args.client.timeout, async |deadline| {
         let mut target = within(
             deadline,
-            target.resolve(&args.client, &context, payment, assurance),
+            target.resolve(&args.client, &context, args.pay.unwrap_or(0), assurance),
         )
         .await?;
         let result = async {
-            let policy = within(deadline, target.policy(&args.client, &context)).await?;
+            let (policy, price) = within(deadline, target.quote(&args.client, &context)).await?;
+            let policy = policy
+                .context("local execution runs Compute jobs; Fetch needs --provider or --access")?;
             let admission = policy
                 .admissions
                 .iter()
@@ -878,7 +942,7 @@ pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
                     as u32;
             }
             let job = Job::fetch(
-                payment,
+                price,
                 contract.clone(),
                 service,
                 method,

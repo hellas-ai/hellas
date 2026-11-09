@@ -59,7 +59,7 @@ fn image_cli_and_gateway_surfaces_are_available() {
         "klein",
         "--prompt",
         "fox",
-        "--payment",
+        "--pay",
         "20",
         "--seed",
         "42",

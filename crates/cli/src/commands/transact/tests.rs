@@ -188,7 +188,7 @@ fn fetch_args(extra: &[&str]) -> FetchArgs {
         "https://example.test/path",
         "--provider",
         &id,
-        "--payment",
+        "--pay",
         "20",
     ];
     if !extra.contains(&"--max-response-bytes") {
@@ -219,7 +219,7 @@ fn provider_is_named_only_by_its_enrollment_and_node() {
                 "hellas",
                 "fetch",
                 "https://example.test",
-                "--payment",
+                "--pay",
                 "1",
                 "--contract",
                 "http",
@@ -302,7 +302,7 @@ fn fetch_runs_only_under_a_contract_the_buyer_names() {
         "https://example.test/path",
         "--provider",
         &id,
-        "--payment",
+        "--pay",
         "20",
     ])
     .err()
@@ -543,7 +543,7 @@ async fn run_writes_one_call_job_that_transact_loads_unchanged() {
         "u64",
         "--returns",
         "buffer:16",
-        "--payment",
+        "--pay",
         "20",
     ])
     .unwrap()
@@ -552,7 +552,7 @@ async fn run_writes_one_call_job_that_transact_loads_unchanged() {
         panic!("run");
     };
     assert!(args.client.timeout.is_none());
-    let job = args.job().await.unwrap();
+    let job = args.program.job(20).await.unwrap();
     let folder = root.path().join("job");
     job.save(&folder).await.unwrap();
     let loaded = Job::load(&folder).await.unwrap();
@@ -613,12 +613,13 @@ fn execution_helpers_choose_payment_or_an_imported_offer() {
             crate::Cli::try_parse_from(base.iter().copied().chain(flags.iter().copied()))
         };
         assert!(parse(&[]).is_err());
-        assert!(parse(&["--payment", "20"]).is_err());
-        assert!(parse(&["--payment", "20", "--provider", &provider]).is_ok());
-        assert!(parse(&["--payment", "0", "--provider", &provider]).is_err());
+        assert!(parse(&["--pay", "20"]).is_err());
+        assert!(parse(&["--pay", "20", "--provider", &provider]).is_ok());
+        assert!(parse(&["--pay", "0", "--provider", &provider]).is_err());
+        assert!(parse(&["--payment", "20", "--provider", &provider]).is_err());
         assert!(parse(&["--access", "box.access"]).is_ok());
         assert!(parse(&["--access", "box.access", "--provider", &provider]).is_ok());
-        assert!(parse(&["--payment", "20", "--access", "box.access"]).is_err());
+        assert!(parse(&["--pay", "20", "--access", "box.access"]).is_err());
         assert!(parse(&["--access", "box.access", "--buy-again"]).is_err());
         // Local execution exists only in the compute build.
         assert_eq!(parse(&["--local"]).is_ok(), cfg!(feature = "compute"));
@@ -638,7 +639,7 @@ fn paid_commands_require_a_provider_before_opening_chain_state() {
             "https://example.test",
             "--contract",
             "http",
-            "--payment",
+            "--pay",
             "20",
         ],
     ] {

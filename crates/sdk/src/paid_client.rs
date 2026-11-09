@@ -75,6 +75,8 @@ pub struct PaidWorkOptions {
     /// Independent approval an Apple provider requires; it must name
     /// `provider.enrollment`.
     pub apple_trust: Option<hellas_client::ProviderTrustAnchor>,
+    /// The most a job may cost. A quote above it is refused; a job's own
+    /// signed price must equal the price the provider quotes.
     pub expected_price: u64,
     pub acceptance_blocks: u64,
     pub terminal_blocks: u64,

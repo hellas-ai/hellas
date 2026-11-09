@@ -16,9 +16,9 @@ pub struct TextArgs {
     system: Option<String>,
     #[arg(long, default_value_t = 256, value_parser = clap::value_parser!(u64).range(1..))]
     max_tokens: u64,
-    /// Flat price the provider charges per job; paid work only.
-    #[arg(long, conflicts_with = "access", value_parser = clap::value_parser!(u64).range(1..))]
-    payment: Option<u64>,
+    /// Pay the provider named by --provider its quoted price per job, at most MAX.
+    #[arg(long, value_name = "MAX", requires = "provider", conflicts_with = "access", value_parser = clap::value_parser!(u64).range(1..))]
+    pay: Option<u64>,
     #[command(flatten)]
     target: TargetArgs,
     #[arg(short = 'o', long, value_name = "DIR")]
@@ -26,23 +26,27 @@ pub struct TextArgs {
 }
 
 pub async fn text(args: TextArgs, context: Context) -> super::super::CliResult<()> {
-    let (package, presentation, job) = prepare(&args).await?;
-    let directory = args
-        .client
-        .root(&context)
-        .join("jobs")
-        .join(job.digest().to_string());
-    job.save(&directory).await?;
-    eprintln!("job: {}", directory.display());
+    let (package, presentation, rendered) = prepare(&args).await?;
     let mut target = args.target;
     target.model = Some(args.model.clone());
-    run_job(
+    run_quoted(
         &args.client,
         target,
         &context,
-        &job,
-        args.output.as_deref(),
-        |completed, _| {
+        args.pay,
+        None,
+        async |price| {
+            Ok(Job::compute(
+                price,
+                rendered.environment,
+                rendered.plan,
+                rendered.inputs,
+                rendered.content,
+            )
+            .await?)
+        },
+        |_| args.output.clone(),
+        |_, completed, _| {
             let ModelResponse::Tokens(tokens) = package.decode(&completed.output)? else {
                 bail!("expected generated tokens");
             };
@@ -54,7 +58,13 @@ pub async fn text(args: TextArgs, context: Context) -> super::super::CliResult<(
     .await
 }
 
-async fn prepare(args: &TextArgs) -> anyhow::Result<(ModelPackage, TextPresentation, Job)> {
+async fn prepare(
+    args: &TextArgs,
+) -> anyhow::Result<(
+    ModelPackage,
+    TextPresentation,
+    hellas_client::model::ComputeJob,
+)> {
     let model = args.model.clone();
     let presentation = tokio::task::spawn_blocking(move || {
         TextPresentation::from_gguf(&model)
@@ -85,15 +95,7 @@ async fn prepare(args: &TextArgs) -> anyhow::Result<(ModelPackage, TextPresentat
             stops: &[],
         })
         .await?;
-    let job = Job::compute(
-        args.payment.unwrap_or(0),
-        rendered.environment,
-        rendered.plan,
-        rendered.inputs,
-        rendered.content,
-    )
-    .await?;
-    Ok((package, presentation, job))
+    Ok((package, presentation, rendered))
 }
 
 #[cfg(test)]
@@ -128,11 +130,8 @@ mod tests {
         };
         let (_, presentation, job) = prepare(&parse(&[])).await.unwrap();
         let (_, _, with_system) = prepare(&parse(&["--system", "be brief"])).await.unwrap();
-        assert_ne!(job.digest(), with_system.digest());
-        assert_eq!(job.price(), 0);
-        let JobInput::Compute { plan, inputs, .. } = job.input() else {
-            panic!("compute job")
-        };
+        assert_ne!(job.inputs, with_system.inputs);
+        let (plan, inputs) = (job.plan, job.inputs);
         assert_eq!(plan.step.as_ref().unwrap().stop.max_steps, 3);
         let prompt = presentation
             .encode_chat(&[ChatMessage {

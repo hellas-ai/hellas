@@ -14,9 +14,9 @@ pub struct TranscribeArgs {
     language: Option<String>,
     #[arg(long, default_value_t = 256)]
     max_tokens: usize,
-    /// Flat price the provider charges per job; paid work only.
-    #[arg(long, conflicts_with = "access", value_parser = clap::value_parser!(u64).range(1..))]
-    payment: Option<u64>,
+    /// Pay the provider named by --provider its quoted price per job, at most MAX.
+    #[arg(long, value_name = "MAX", requires = "provider", conflicts_with = "access", value_parser = clap::value_parser!(u64).range(1..))]
+    pay: Option<u64>,
     #[command(flatten)]
     target: TargetArgs,
     #[arg(short = 'o', long, value_name = "DIR")]
@@ -37,30 +37,26 @@ pub async fn transcribe(args: TranscribeArgs, context: Context) -> super::super:
             max_new_tokens: args.max_tokens,
         })
         .await?;
-    let job = Job::compute(
-        args.payment.unwrap_or(0),
-        rendered.environment,
-        rendered.plan,
-        rendered.inputs,
-        rendered.content,
-    )
-    .await?;
-    let directory = args
-        .client
-        .root(&context)
-        .join("jobs")
-        .join(job.digest().to_string());
-    job.save(&directory).await?;
-    eprintln!("job: {}", directory.display());
     let mut target = args.target;
     target.model = Some(args.model.clone());
-    run_job(
+    run_quoted(
         &args.client,
         target,
         &context,
-        &job,
-        args.output.as_deref(),
-        |completed, _| {
+        args.pay,
+        None,
+        async |price| {
+            Ok(Job::compute(
+                price,
+                rendered.environment,
+                rendered.plan,
+                rendered.inputs,
+                rendered.content,
+            )
+            .await?)
+        },
+        |_| args.output.clone(),
+        |_, completed, _| {
             let ModelResponse::Transcription(transcription) = package.decode(&completed.output)?
             else {
                 bail!("expected transcription");

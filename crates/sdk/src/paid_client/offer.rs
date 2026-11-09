@@ -198,10 +198,10 @@ pub(super) fn check_policy(
     if policy.network != args.config.network() {
         return Err(PaidClientError::InputMismatch("quoted network"));
     }
-    if policy.payment_policy.fixed_price != args.expected_price {
-        return Err(PaidClientError::PriceMismatch {
+    if policy.payment_policy.fixed_price > args.expected_price {
+        return Err(PaidClientError::PriceAbove {
             quoted: policy.payment_policy.fixed_price,
-            requested: args.expected_price,
+            maximum: args.expected_price,
         });
     }
     policy.invocation_policy.validate()?;
