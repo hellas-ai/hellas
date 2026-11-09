@@ -11,8 +11,7 @@ struct ManagedWorker {
     pin: String,
     address: String,
     profile: PathBuf,
-    work_profile: PathBuf,
-    trust_root: PathBuf,
+    access: PathBuf,
     gateway_profile: PathBuf,
     gateway_token: String,
 }
@@ -174,11 +173,13 @@ impl ManagedWorker {
         owner
             .run(&args.iter().map(String::as_str).collect::<Vec<_>>())
             .await;
-        owner
-            .run(&["offer", "import", string(&offer), "--name", "worker"])
-            .await;
+        let signed = hellas_authority::model::grant::records::SignedOffer::decode(
+            &std::fs::read(&offer).unwrap(),
+            hellas_auth::authority::UnixMillis(0),
+        )
+        .unwrap();
+        let access = access_file(&owner, &signed, &work_profile, &root.join("worker.access")).await;
         let (gateway_profile, gateway_token) = gateway_profile(root).await;
-        let trust_root = approve(root, "worker", provider.content_id());
         Self {
             root: directory,
             owner,
@@ -187,8 +188,7 @@ impl ManagedWorker {
             pin,
             address,
             profile,
-            work_profile,
-            trust_root,
+            access,
             gateway_profile,
             gateway_token,
         }
@@ -210,14 +210,8 @@ impl ManagedWorker {
         let mut gateway = self.owner.spawn(
             &[
                 "gateway",
-                "--trust-store",
-                string(&self.trust_root),
-                "--trust-policy",
-                "worker",
-                "--offer",
-                "worker",
-                "--work-profile",
-                string(&self.work_profile),
+                "--access",
+                string(&self.access),
                 "--port",
                 "0",
                 "--gateway-profile",

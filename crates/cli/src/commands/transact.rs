@@ -15,6 +15,7 @@ use hellas_sdk::{
     job::{Job, JobInput},
     paid_client::{PaidJournalKind, PaidWorkOptions, bind_paid_endpoint, request_paid_quote},
     transact::PaidAttemptPath,
+    {ExecutorGateway, GatewayTarget},
 };
 use std::{
     io::Write as _,
@@ -621,7 +622,7 @@ impl Target {
                         options: options.clone(),
                         endpoint: context.paid_endpoint().await?,
                         settlement_key: context.settlement.clone(),
-                        attempt: client.purchase(context, job, options, &owner)?,
+                        attempt: Some(client.purchase(context, job, options, &owner)?),
                         owner,
                         funding: Default::default(),
                         settle: client.settle,
@@ -662,33 +663,80 @@ impl Target {
                             context.grant_endpoint().await?,
                         ),
                         resource: policy.resource,
-                        attempt,
+                        attempt: Some(attempt),
                     }),
                     provider.to_string(),
                 )
             }
             #[cfg(feature = "compute")]
-            Target::Local {
-                native,
-                model,
-                timeout,
-                opened,
-            } => {
-                let mut native = native.take().context("local target is already open")?;
-                // The job reads its weights from the model it was rendered from.
-                native.content.extend(model.clone());
-                let (execution, reload) = crate::compute::local(
-                    &context.home,
-                    native,
-                    Arc::new(context.producer.clone()),
-                )
-                .await?;
-                *opened = Some((execution.content.clone(), reload));
+            Target::Local { timeout, .. } => {
                 let policy = hellas_sdk::execution::local::policy(job.input(), *timeout)?;
                 (
-                    Executor::Local(execution, policy),
+                    Executor::Local(self.open_local(context).await?, policy),
                     hex::encode(context.producer.public_key().bytes()),
                 )
+            }
+        })
+    }
+
+    /// This machine's executor, opened once; its content closes with the target.
+    #[cfg(feature = "compute")]
+    async fn open_local(
+        &mut self,
+        context: &Context,
+    ) -> super::CliResult<hellas_sdk::execution::local::LocalExecution> {
+        let Target::Local {
+            native,
+            model,
+            opened,
+            ..
+        } = self
+        else {
+            bail!("not a local target");
+        };
+        let mut native = native.take().context("local target is already open")?;
+        // The job reads its weights from the model it was rendered from.
+        native.content.extend(model.clone());
+        let (execution, reload) = crate::compute::local(
+            &context.home,
+            native,
+            Arc::new(context.producer.clone()),
+        )
+        .await?;
+        *opened = Some((execution.content.clone(), reload));
+        Ok(execution)
+    }
+
+    /// The gateway's target: every request runs as one untracked job here,
+    /// under `policy`, the terms [`Target::quote`] returned.
+    async fn gateway(
+        &mut self,
+        client: &ClientArgs,
+        context: &Context,
+        policy: Option<hellas_rpc::protocol::invocation::InvocationPolicy>,
+    ) -> super::CliResult<GatewayTarget> {
+        Ok(match self {
+            Target::Paid(options) => GatewayTarget::Paid {
+                options: options.clone(),
+                policy: policy.context("a paid provider quotes its terms")?,
+                endpoint: context.paid_endpoint().await?,
+                settlement_key: context.settlement.clone(),
+                owner: client.owner(context)?,
+            },
+            Target::Grant { options, policy, .. } => GatewayTarget::Grant {
+                options: options.clone(),
+                transport: hellas_sdk::grant_client::GrantTransport::Remote(
+                    context.grant_endpoint().await?,
+                ),
+                policy: policy.clone(),
+            },
+            #[cfg(feature = "compute")]
+            Target::Local { timeout, .. } => {
+                let timeout = *timeout;
+                GatewayTarget::Local {
+                    execution: self.open_local(context).await?,
+                    timeout,
+                }
             }
         })
     }
@@ -708,6 +756,49 @@ impl Target {
         }
         Ok(())
     }
+}
+
+/// `hellas gateway`'s execution flags: the job commands' own.
+#[derive(Debug, Args)]
+pub struct GatewayArgs {
+    #[command(flatten)]
+    client: ClientArgs,
+    /// Pay the provider named by --provider its quoted price per request, at most MAX.
+    #[arg(long, value_name = "MAX", requires = "provider", conflicts_with = "access", value_parser = clap::value_parser!(u64).range(1..))]
+    pay: Option<u64>,
+    #[command(flatten)]
+    target: TargetArgs,
+}
+
+/// Open the gateway's target as a job command opens its own and `serve`
+/// HTTP with it. The endpoints and content it opened close however it ends.
+pub async fn gateway(
+    args: GatewayArgs,
+    context: Context,
+    serve: impl AsyncFnOnce(Arc<ExecutorGateway>) -> super::CliResult<()>,
+) -> super::CliResult<()> {
+    let GatewayArgs { client, pay, target } = args;
+    ensure!(
+        !client.settle && !client.buy_again && target.attempt.is_none(),
+        "gateway requests are not tracked attempts: drop --settle, --buy-again and --attempt"
+    );
+    bounded(&context, None, async |_| {
+        let mut target = target
+            .resolve(&client, &context, pay.unwrap_or(0), Assurance::ProducerSigned)
+            .await?;
+        let result = async {
+            let (policy, _) = target.quote(&client, &context).await?;
+            let gateway = target.gateway(&client, &context, policy).await?;
+            serve(ExecutorGateway::new(
+                gateway,
+                Arc::new(context.producer.clone()),
+            ))
+            .await
+        }
+        .await;
+        result.and(target.close().await)
+    })
+    .await
 }
 
 fn select_policy(
@@ -841,6 +932,7 @@ async fn execute(
             &context.producer,
             deadline,
             stop,
+            Default::default(),
             Box::new(|completed| deliver(completed).map_err(Into::into)),
         )
         .await?;

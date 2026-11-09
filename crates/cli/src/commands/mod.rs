@@ -10,7 +10,6 @@ pub mod contributions;
 pub mod convert;
 pub mod faucet;
 
-pub mod grant_gateway;
 pub mod identity;
 pub mod monitor;
 pub mod rpc;

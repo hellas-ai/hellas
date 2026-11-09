@@ -98,11 +98,6 @@ pub fn client_journal_root(
 ) -> CliResult<StoreLocation> {
     Ok(home.child(data_root(home, identity)?).child("channels"))
 }
-/// Saved Offer terms may have expired; only use this as a signed locator.
-/// GrantSession obtains fresh authenticated standing before proposing a job.
-pub fn load_offer(home: &Path, identity: &PrincipalId, name: &str) -> CliResult<SignedOffer> {
-    Ok(hellas_sdk::grant_store::GrantStore::new(data_root(home, identity)?).load_offer(name)?)
-}
 
 #[cfg(test)]
 mod tests {

@@ -277,7 +277,6 @@ struct Provider {
     serving: tokio::task::JoinHandle<()>,
     admin: hellas_authority::grant_service::WorkAdministration,
     grants: hellas_authority::grant_service::GrantService,
-    grant_calls: Arc<std::sync::atomic::AtomicUsize>,
     compute: HostCompute,
     content: hellas_store::content::DiskStore,
 }
@@ -391,14 +390,12 @@ impl Provider {
         let authority =
             NodeCoordinator::new(store, Arc::new(|| UnixMillis::now().unwrap_or_default()));
         let key = Arc::new(ProducerSigningKey::from_secret_bytes([2; 32]).unwrap());
-        let grant_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let content = hellas_channel::test_support::channel::content_store(root).await;
         let grants = hellas_authority::grant_service::GrantService::from_node(
             authority.clone(),
             &enrollment,
             key.clone(),
             hellas_channel::test_support::backend::Backend {
-                calls: grant_calls.clone(),
                 signer: key.clone(),
                 finish: hellas_channel::test_support::backend::Completion::Immediate,
                 reply: hellas_channel::test_support::backend::Reply::events(
@@ -530,7 +527,6 @@ impl Provider {
             serving,
             admin,
             grants,
-            grant_calls,
             compute,
             content,
         }
@@ -2122,32 +2118,24 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
     })
 }
 
-/// Exercise paid and granted Compute on one endpoint, then dispatch HTTPS
-/// through that endpoint and a separately authorized second provider.
+/// Exercise granted Compute on the endpoint that also serves paid work.
 fn grant_composition<'a>(
     provider: &'a Provider,
     secret: &'a auth::CredentialSecret,
     root: &'a std::path::Path,
 ) -> futures::future::BoxFuture<'a, ()> {
     Box::pin(async move {
-        use base64::Engine as _;
-        use futures::StreamExt as _;
         use hellas_authority::model::grant::{
             budget::{Limit, Meter, Window},
             records::{Offer, SignedOffer},
         };
         use hellas_authority::test_support::{common_node, definition};
         use hellas_channel::test_support::principal;
-        use hellas_gateway::{WorkExecutionBackend, WorkFetchRequest};
         use hellas_sdk::grant_client::{GrantSessionOptions, GrantTransport, UnpinnedOffer};
-        use hellas_sdk::grant_gateway::{GrantPool, GrantPoolChannel, GrantPoolOptions};
         use hellas_sdk::node_control::profile::ClientProfile;
 
         let subject = principal(1).0;
-        let cli_binary = std::env::var_os("HELLAS_CLI_TEST_BINARY");
-        let data_root = root
-            .join("composition-cli-home/grants")
-            .join(format!("p256-{}", hex::encode(subject.as_bytes())));
+        let data_root = root.join("composition-grants");
         let policies = composition_policies();
         let mut definition = definition(auth::GrantId([71; 16]), subject);
         definition.policies = policies.clone();
@@ -2161,7 +2149,7 @@ fn grant_composition<'a>(
                 vec![Limit::new(
                     Meter::Requests,
                     Window::Total,
-                    if cli_binary.is_some() { 3 } else { 2 },
+                    2,
                 )],
                 2,
             )
@@ -2253,111 +2241,6 @@ fn grant_composition<'a>(
         session.shutdown().await.unwrap();
         drop(session);
 
-        let mut other = super::pool::provider_with_limit(
-            &root.join("composition-other"),
-            3,
-            None,
-            if cli_binary.is_some() { 2 } else { 1 },
-        )
-        .await;
-        other.options.journal_root = location;
-        if let Some(binary) = cli_binary.as_deref() {
-            super::cli_composition::run_gateway(binary, root, &options, &other, &data_root).await;
-        }
-        let second_before = other.calls.load(std::sync::atomic::Ordering::SeqCst);
-        let pool = GrantPool::open_pool(
-            GrantPoolOptions {
-                channels: vec![
-                    GrantPoolChannel {
-                        session: options,
-                        resources: vec![definition.policies[1].resource],
-                    },
-                    GrantPoolChannel {
-                        session: other.options.clone(),
-                        resources: vec![other.resource],
-                    },
-                ],
-            },
-            vec![
-                GrantTransport::Remote(transport),
-                GrantTransport::Local(other.service.clone()),
-            ],
-        )
-        .await
-        .unwrap();
-        let routes = pool.fetch_routes();
-        let first = routes
-            .iter()
-            .find(|route| route.provider == provider.endpoint.id())
-            .unwrap();
-        let second = routes
-            .iter()
-            .find(|route| route.provider == other.endpoint)
-            .unwrap();
-        let request =
-            |route: &hellas_gateway::FetchRoute,
-             policy: &hellas_authority::model::grant::records::GrantPolicy| {
-                let https = policy.https.as_ref().unwrap();
-                let body = hellas_rpc::http_fetch::HttpFetchRequest {
-                    url: format!("{}{}", https.origin, https.paths[0]),
-                    method: "POST".into(),
-                    headers: vec![],
-                    body_base64: base64::engine::general_purpose::STANDARD
-                        .encode(br#"{"model":"fixture"}"#),
-                    tls: https.tls.clone(),
-                    credential: https.credential.clone(),
-                    max_response_bytes: https.max_response_bytes,
-                };
-                WorkFetchRequest {
-                    provider: route.provider,
-                    resource: route.resource,
-                    channel: route.channel,
-                    service: "openai".into(),
-                    method: "responses".into(),
-                    body: serde_json::to_vec(&body).unwrap(),
-                }
-            };
-        let mut crossed = request(first, &definition.policies[1]);
-        crossed.channel = second.channel;
-        assert!(pool.fetch(crossed).is_err());
-        for (route, policy) in [
-            (first, &definition.policies[1]),
-            (second, &other.options.target.offer().grant.policies[0]),
-        ] {
-            let mut stream = pool.fetch(request(route, policy)).unwrap();
-            while let Some(event) = stream.next().await {
-                event.unwrap();
-            }
-        }
-        let mut denied = false;
-        for _ in 0..2 {
-            let mut stream = pool.fetch(request(first, &definition.policies[1])).unwrap();
-            match stream.next().await.unwrap() {
-                Err(_) => {
-                    denied = true;
-                    break;
-                }
-                Ok(_) => {
-                    while let Some(event) = stream.next().await {
-                        event.unwrap();
-                    }
-                }
-            }
-        }
-        assert!(denied, "the first provider's own budget is exhausted");
-        assert_eq!(
-            provider
-                .grant_calls
-                .load(std::sync::atomic::Ordering::SeqCst),
-            if cli_binary.is_some() { 3 } else { 2 }
-        );
-        assert_eq!(
-            other.calls.load(std::sync::atomic::Ordering::SeqCst),
-            second_before + 1,
-            "first-provider exhaustion must not execute on the second account"
-        );
-        pool.drain().await.unwrap();
-        other.service.drain().await.unwrap();
     })
 }
 

@@ -10,20 +10,12 @@ use super::*;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a HIP device and HELLAS_TEST_TEXT_MODEL; run manually on Strix"]
 async fn local_grant_serves_a_text_model_without_a_chain() {
-    use hellas_rpc::protocol::invocation::Limits;
     let model =
         PathBuf::from(std::env::var("HELLAS_TEST_TEXT_MODEL").expect("HELLAS_TEST_TEXT_MODEL"));
     let mut node = super::local_compute::LocalCompute::start(
         &model,
         "--text-model",
         &model,
-        Limits {
-            max_upload_bytes: 64 << 20,
-            max_output_bytes: 1 << 20,
-            max_steps: 256,
-            execution_timeout_ms: 600_000,
-        },
-        None,
         &[],
     )
     .await;

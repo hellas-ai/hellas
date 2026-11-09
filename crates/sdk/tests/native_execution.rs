@@ -24,14 +24,10 @@ fn catena_child() {
 mod automatic;
 #[path = "paid_e2e/budget.rs"]
 mod budget;
-#[path = "native_execution/cli_composition.rs"]
-mod cli_composition;
 #[path = "paid_e2e/gateway.rs"]
 mod gateway;
 #[path = "native_execution/grant.rs"]
 mod grant;
-#[path = "native_execution/pool.rs"]
-mod pool;
 #[path = "paid_e2e/remote.rs"]
 mod remote;
 #[path = "paid_e2e/settlement.rs"]
@@ -265,22 +261,6 @@ async fn check_other_enrollment_refused(
         .expect("channel with another enrollment")
         .to_string(),
     );
-    let gateway = elsewhere.clone();
-    let error = hellas_sdk::paid_gateway::PaidGateway::open(
-        hellas_sdk::paid_gateway::PaidGatewayOptions {
-            config: gateway.config.clone(),
-            content: gateway.content.clone(),
-            providers: vec![gateway_provider(&gateway)],
-            max_pending_requests: 1,
-        },
-        NodeIdentity::from_secret_bytes(iroh::SecretKey::generate().to_bytes(), [0x21; 32])
-            .unwrap(),
-        owner,
-    )
-    .await
-    .err()
-    .expect("pool with another enrollment");
-    refused(format!("{error:#}"));
     assert!(
         approvals.0.lock().unwrap().is_empty(),
         "another enrollment never reaches funding"
@@ -373,20 +353,6 @@ fn work_policy() -> InvocationPolicy {
 
 fn work_config(devnet: &Devnet, journal_root: std::path::PathBuf) -> WorkConfig {
     WorkConfig::from_chain_dir(devnet.chain_dir(&journal_root, 0)).unwrap()
-}
-
-fn gateway_provider(options: &PaidWorkOptions) -> hellas_sdk::paid_gateway::GatewayProviderOptions {
-    hellas_sdk::paid_gateway::GatewayProviderOptions {
-        provider: options.provider,
-        provider_addrs: options.provider_addrs.clone(),
-        apple_trust: options.apple_trust.clone(),
-        assurance: options.assurance,
-        expected_price: options.expected_price,
-        acceptance_blocks: options.acceptance_blocks,
-        terminal_blocks: options.terminal_blocks,
-        payment_blocks: options.payment_blocks,
-        timeout: options.timeout,
-    }
 }
 
 fn paid_policy() -> hellas_channel::model::paid_policy::PaidPolicy {
@@ -797,22 +763,38 @@ async fn check_gateway_quote(
     owner: Arc<hellas_sdk::client_owner::ClientOwner>,
 ) {
     use hellas_gateway::WorkExecutionBackend as _;
-    let args = options.clone();
-    let journal = args.config.chain.gateway(&args.provider.node.to_string());
-    let gateway = hellas_sdk::paid_gateway::PaidGateway::open(
-        hellas_sdk::paid_gateway::PaidGatewayOptions {
-            config: args.config.clone(),
-            content: args.content.clone(),
-            providers: vec![gateway_provider(&args)],
-            max_pending_requests: 1,
-        },
-        NodeIdentity::from_secret_bytes(iroh::SecretKey::generate().to_bytes(), [0x21; 32])
-            .unwrap(),
-        owner,
+    let endpoint = bind_paid_endpoint(iroh::SecretKey::generate()).await.unwrap();
+    let settlement = client_settlement();
+    let quote = hellas_sdk::paid_client::request_paid_quote(
+        options,
+        &endpoint,
+        &settlement,
+        owner.principal(),
     )
     .await
     .unwrap();
-    assert!(!journal.exists(), "gateway discovery only requests a quote");
+    let gateway = hellas_sdk::ExecutorGateway::new(
+        hellas_sdk::GatewayTarget::Paid {
+            options: options.clone(),
+            policy: quote.policy.invocation_policy,
+            endpoint,
+            settlement_key: settlement,
+            owner,
+        },
+        Arc::new(hellas_auth::ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap()),
+    );
+    let setups = async || {
+        hellas_channel::work_store::discover_setups(
+            &options.journal_root(),
+            options.config.network(),
+        )
+        .await
+        .unwrap()
+        .setups
+        .len()
+    };
+    let before = setups().await;
+
     assert!(
         gateway
             .fetch(hellas_gateway::WorkFetchRequest {
@@ -844,7 +826,7 @@ async fn check_gateway_quote(
         "gateway admits the whole request before requesting funding"
     );
     gateway.drain().await.unwrap();
-    assert!(!journal.exists());
+    assert_eq!(setups().await, before, "a refused request never funds a channel");
 }
 
 /// The provider earns exactly the price from the payment close, and its
@@ -1857,13 +1839,6 @@ async fn provider_close_offline(
 #[cfg(target_os = "linux")]
 #[test]
 fn unseen_program_pays_exactly_once() {
-    run(automatic::exercise);
-}
-
-#[test]
-#[ignore = "requires the CLI executable supplied by the CLI integration gate"]
-fn cli_paid_and_grant_two_provider_composition() {
-    assert!(std::env::var_os("HELLAS_CLI_TEST_BINARY").is_some());
     run(automatic::exercise);
 }
 

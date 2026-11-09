@@ -94,21 +94,10 @@ const TEST_REMOTE_TRUST_ARGS: &[&str] = &[
     "apple-app-attest",
 ];
 
-fn assert_test_remote_trust(remote_trust: &RemoteTrustArgs) {
-    assert_eq!(
-        remote_trust.trust_store.as_deref(),
-        Some(Path::new("/state/trust"))
-    );
-    assert_eq!(remote_trust.trust_policy.as_deref(), Some("provider"));
-    assert_eq!(
-        remote_trust.assurance,
-        hellas_rpc::Assurance::AppleAppAttest
-    );
-}
-
+/// A gateway under an access file, plus `args`.
 fn parse_gateway(args: &[&str]) -> Result<Cli, clap::Error> {
     Cli::try_parse_from(
-        ["hellas", "gateway"]
+        ["hellas", "gateway", "--access", "friend.access"]
             .into_iter()
             .chain(args.iter().copied()),
     )
@@ -184,19 +173,23 @@ fn serve_accepts_only_its_command_local_assurance() {
 }
 
 #[test]
-fn gateway_accepts_remote_trust_policy() {
-    let cli = parse_gateway(TEST_REMOTE_TRUST_ARGS).unwrap();
-    let Commands::Gateway { remote_trust, .. } = cli.command else {
-        panic!("gateway");
+fn gateway_takes_the_job_commands_targets() {
+    let provider = format!("{}@{}", "11".repeat(32), "22".repeat(32));
+    let gateway = |args: &[&str]| {
+        Cli::try_parse_from(["hellas", "gateway"].into_iter().chain(args.iter().copied()))
     };
-    assert_test_remote_trust(&remote_trust);
-}
-
-#[test]
-fn gateway_rejects_address_without_node_id() {
-    let result = parse_gateway(&["--address", "127.0.0.1:31145"]);
-
-    assert!(result.is_err());
+    assert!(gateway(&["--access", "friend.access"]).is_ok());
+    assert!(gateway(&["--pay", "20", "--provider", &provider]).is_ok());
+    assert_eq!(cfg!(feature = "compute"), gateway(&["--local"]).is_ok());
+    for refused in [
+        &[][..],
+        &["--pay", "20"][..],
+        &["--access", "friend.access", "--pay", "20", "--provider", &provider][..],
+        &["--offer", "lan"][..],
+        &["--paid-work-config", "pool.json", "--access", "friend.access"][..],
+    ] {
+        assert!(gateway(refused).is_err(), "{refused:?}");
+    }
 }
 
 #[test]
@@ -442,74 +435,6 @@ fn serve_uses_bounded_fetch_defaults() {
 }
 
 #[test]
-fn offer_gateway_uses_its_private_resources() {
-    let cli = Cli::try_parse_from([
-        "hellas",
-        "gateway",
-        "--offer",
-        "lan-model",
-        "--grant-policy",
-        "chat",
-        "--work-profile",
-        "/work.json",
-        "--gateway-profile",
-        "/gateway.json",
-    ])
-    .unwrap();
-    let Commands::Gateway {
-        grant_policy,
-        work_profile,
-        gateway_profile,
-        ..
-    } = &cli.command
-    else {
-        panic!("gateway")
-    };
-    assert_eq!(grant_policy.as_deref(), Some("chat"));
-    assert_eq!(work_profile.as_deref(), Some(Path::new("/work.json")));
-    assert_eq!(gateway_profile.as_deref(), Some(Path::new("/gateway.json")));
-    for args in [
-        vec!["--paid-work-config", "/pool.json"],
-        vec!["--local-grant", "00000000000000000000000000000000"],
-    ] {
-        let mut argv = vec!["hellas", "gateway", "--offer", "lan-model"];
-        argv.extend(args);
-        assert!(Cli::try_parse_from(argv).is_err());
-    }
-}
-
-#[test]
-fn offer_gateway_accepts_independent_apple_trust_policy() {
-    let cli = Cli::try_parse_from(
-        ["hellas", "gateway", "--offer", "provider"]
-            .into_iter()
-            .chain(TEST_REMOTE_TRUST_ARGS.iter().copied()),
-    )
-    .unwrap();
-    let Commands::Gateway { remote_trust, .. } = cli.command else {
-        panic!("gateway");
-    };
-    assert_test_remote_trust(&remote_trust);
-    for flag in [
-        "--provider",
-        "--apple-app-attest-app-id",
-        "--apple-app-attest-cdhashes",
-    ] {
-        assert!(
-            Cli::try_parse_from([
-                "hellas",
-                "gateway",
-                "--offer",
-                "provider",
-                flag,
-                "unapproved"
-            ])
-            .is_err()
-        );
-    }
-}
-
-#[test]
 #[cfg(feature = "otel")]
 fn metrics_address_defaults_to_loopback_and_accepts_an_explicit_ip() {
     for command in ["serve", "gateway"] {
@@ -541,7 +466,12 @@ fn metrics_address_defaults_to_loopback_and_accepts_an_explicit_ip() {
                 "::1",
             ),
         ] {
-            let cli = Cli::try_parse_from(args).unwrap();
+            let target = ["--access", "friend.access"];
+            let cli = Cli::try_parse_from(
+                args.into_iter()
+                    .chain(target.into_iter().filter(|_| command == "gateway")),
+            )
+            .unwrap();
             let (port, address) = match cli.command {
                 Commands::Serve {
                     metrics_port,
@@ -573,41 +503,6 @@ fn metrics_flags_require_the_otel_build() {
             assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
         }
     }
-}
-
-#[test]
-fn grant_pool_gateway_flags_enforce_source_exclusivity() {
-    let cli = parse_gateway(&[
-        "--grant-pool-config",
-        "pool.json",
-        "--trust-store",
-        "trust",
-        "--check-config",
-    ])
-    .unwrap();
-    assert!(matches!(
-        cli.command,
-        Commands::Gateway {
-            grant_pool_config: Some(_),
-            check_config: true,
-            ..
-        }
-    ));
-    for selector in [
-        "--offer",
-        "--local-grant",
-        "--paid-work-config",
-        "--work-profile",
-        "--grant-policy",
-        "--http-fetch-config",
-        "--trust-policy",
-    ] {
-        assert!(
-            parse_gateway(&["--grant-pool-config", "pool.json", selector, "other"]).is_err(),
-            "{selector}"
-        );
-    }
-    assert!(parse_gateway(&["--check-config"]).is_err());
 }
 
 #[test]

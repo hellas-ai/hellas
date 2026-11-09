@@ -2,30 +2,33 @@ use super::*;
 use futures::TryStreamExt as _;
 use hellas_gateway::{WorkEvent, WorkExecutionBackend as _};
 use hellas_sdk::paid_client::{SessionFundingOptions, SessionOpenMode};
-use hellas_sdk::paid_gateway::{PaidGateway, PaidGatewayOptions};
 
 #[test]
-fn gateway_waits_for_slow_funding_finality_within_the_request_deadline() {
+fn gateway_waits_for_slow_funding_finality() {
     run(|runtime| {
         Box::pin(async move {
             let mut case = paid_fixture(runtime).await;
             // The request deadline only has to outlast the connection
             // allowance; size it as a hang guard so load cannot expire it.
             case.options.timeout = Some(HANG_GUARD);
-            case.endpoint.close().await;
-            let gateway = PaidGateway::open(
-                PaidGatewayOptions {
-                    config: case.options.config.clone(),
-                    content: case.options.content.clone(),
-                    providers: vec![gateway_provider(&case.options)],
-                    max_pending_requests: 1,
-                },
-                NodeIdentity::from_secret_bytes(case.client_transport.to_bytes(), [0x21; 32])
-                    .unwrap(),
-                case.owner.clone(),
+            let quote = hellas_sdk::paid_client::request_paid_quote(
+                &case.options,
+                &case.endpoint,
+                &client_settlement(),
+                case.owner.principal(),
             )
             .await
             .unwrap();
+            let gateway = hellas_sdk::ExecutorGateway::new(
+                hellas_sdk::GatewayTarget::Paid {
+                    options: case.options.clone(),
+                    policy: quote.policy.invocation_policy,
+                    endpoint: case.endpoint.clone(),
+                    settlement_key: client_settlement(),
+                    owner: case.owner.clone(),
+                },
+                Arc::new(ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap()),
+            );
             let started = tokio::time::Instant::now();
             let request = gateway
                 .fetch(hellas_gateway::WorkFetchRequest {
@@ -65,10 +68,8 @@ fn gateway_waits_for_slow_funding_finality_within_the_request_deadline() {
                 let endpoint = bind_paid_endpoint(case.client_transport.clone())
                     .await
                     .unwrap();
-                let gateway_options = gateway_provider(&case.options)
-                    .with_config(case.options.config.clone(), case.options.content.clone());
                 let mut session = PaidWorkSession::open(
-                    gateway_options,
+                    case.options.clone(),
                     endpoint.clone(),
                     client_settlement(),
                     case.owner.clone(),
@@ -95,9 +96,8 @@ fn gateway_waits_for_slow_funding_finality_within_the_request_deadline() {
             case.devnet.shutdown().await;
             assert!(
                 stayed_pending,
-                "funding finality must outlive the connection allowance: {result:?}"
+                "the request waits for funding finality: {result:?}"
             );
-            // Completing at all proves it finished within the request deadline.
             assert!(elapsed > Duration::from_secs(10));
             let events =
                 result.expect("the same gateway request completes after funding finalizes");

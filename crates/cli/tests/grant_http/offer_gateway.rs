@@ -260,38 +260,17 @@ impl OfferHost {
     fn root(&self) -> &Path {
         self.directory.path()
     }
-    async fn approve_trust(&self) -> PathBuf {
-        let trust_root = self.root().join("caller-trust");
-        let trust_source = self.root().join("caller-policy.json");
-        std::fs::write(
-            &trust_source,
-            serde_json::to_vec(&hellas_sdk::trust_policy::TrustPolicy {
-                provider_genesis: self.signed_offer.offer().provider.content_id(),
-                assurance: hellas_rpc::Assurance::ProducerSigned,
-                apple: None,
-            })
-            .unwrap(),
+    async fn access(&self) -> PathBuf {
+        access_file(
+            &self.client,
+            &self.signed_offer,
+            &self.work_profile,
+            &self.root().join("friend.access"),
         )
-        .unwrap();
-        self.client
-            .run(&[
-                "trust",
-                "--store",
-                string(&trust_root),
-                "approve",
-                "lan",
-                "--expected-revision",
-                "0",
-                "--policy",
-                string(&trust_source),
-                "--reason",
-                "independent test provider approval",
-            ])
-            .await;
-        trust_root
+        .await
     }
     async fn gateway(&self) -> Gateway {
-        let trust_root = self.approve_trust().await;
+        let access = self.access().await;
         let (profile, token) = gateway_profile(self.root()).await;
         let mut process = self.client.spawn(
             &[
@@ -300,14 +279,8 @@ impl OfferHost {
                 "--metrics-port",
                 #[cfg(feature = "otel")]
                 "0",
-                "--offer",
-                "lan",
-                "--trust-store",
-                string(&trust_root),
-                "--trust-policy",
-                "lan",
-                "--work-profile",
-                string(&self.work_profile),
+                "--access",
+                string(&access),
                 "--port",
                 "0",
                 "--gateway-profile",
@@ -436,41 +409,6 @@ async fn remote_admin_uses_the_explicit_reader_profile() {
         panic!("allowance list")
     };
     assert_eq!(listed.len(), 1);
-    host.stop().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn gateway_requires_a_caller_approved_trust_policy() {
-    let host = OfferHost::start().await;
-    let trust_root = host.approve_trust().await;
-    let (gateway_profile, _) = gateway_profile(host.root()).await;
-    std::fs::remove_file(trust_root.join("lan.json")).unwrap();
-    let before = host.https.calls.load(Ordering::SeqCst);
-    let refused = host
-        .client
-        .output(&[
-            "gateway",
-            "--offer",
-            "lan",
-            "--work-profile",
-            string(&host.work_profile),
-            "--trust-store",
-            string(&trust_root),
-            "--trust-policy",
-            "lan",
-            "--gateway-profile",
-            string(&gateway_profile),
-            "--port",
-            "0",
-        ])
-        .await;
-    assert!(!refused.status.success());
-    let error = String::from_utf8_lossy(&refused.stderr);
-    assert_eq!(
-        error.trim(),
-        "error: No such file or directory (os error 2)"
-    );
-    assert_eq!(host.https.calls.load(Ordering::SeqCst), before);
     host.stop().await;
 }
 
@@ -732,20 +670,14 @@ async fn controlled_gateway_profile(root: &Path) -> (PathBuf, PathBuf) {
 async fn gateway_control_issues_and_revokes_live_credentials() {
     let host = OfferHost::start().await;
     let root = host.root();
-    let trust_root = host.approve_trust().await;
+    let access = host.access().await;
     let (gateway_profile, admin) = controlled_gateway_profile(root).await;
     let socket = root.join("ctl/control.sock");
     let mut process = host.client.spawn(
         &[
             "gateway",
-            "--offer",
-            "lan",
-            "--trust-store",
-            string(&trust_root),
-            "--trust-policy",
-            "lan",
-            "--work-profile",
-            string(&host.work_profile),
+            "--access",
+            string(&access),
             "--port",
             "0",
             "--gateway-profile",
@@ -1392,32 +1324,12 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
     changed_args[at + 1] = string(&changed_dir);
     assert!(!host.client.output(&changed_args).await.status.success());
     assert_eq!(host.https.calls.load(Ordering::SeqCst), 1);
-    let trust_root = host.approve_trust().await;
-    // The pool reads bundles from the principal's grant store.
-    hellas_sdk::grant_store::GrantStore::new(host.client.home.join("grants").join(format!(
-        "p256-{}",
-        hex::encode(host.client.principal().as_bytes())
-    )))
-    .import_bundle(&bundle, "shared", &host.client.principal(), &holder, false)
-    .unwrap();
-    let pool = root.join("grant-pool.json");
-    std::fs::write(
-        &pool,
-        serde_json::to_vec(&json!({"channels": [{
-            "offer": "shared.glm", "work_profile": "shared", "trust_policy": "lan",
-            "resources": [host.signed_offer.offer().grant.policies[0].resource.0.to_string()]
-        }]}))
-        .unwrap(),
-    )
-    .unwrap();
     let (gateway_profile, token) = gateway_profile(root).await;
     let mut gateway = host.client.spawn(
         &[
             "gateway",
-            "--grant-pool-config",
-            string(&pool),
-            "--trust-store",
-            string(&trust_root),
+            "--access",
+            string(&bundle),
             "--port",
             "0",
             "--gateway-profile",
@@ -1502,95 +1414,3 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
     assert_eq!(std::fs::read(retained_path).unwrap(), retained);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn pool_gateway_opens_two_independent_providers() {
-    use hellas_auth::authority::{CredentialHolder, UnixMillis};
-    use hellas_sdk::access_bundle::AccessBundle;
-    use hellas_sdk::node_control::profile::ClientProfile;
-    use hellas_sdk::trust_policy::{TrustPolicy, TrustPolicyStore};
-
-    let first = OfferHost::start().await;
-    let second = OfferHost::start_with_identity(None, None, Some(&first.client.identity)).await;
-    let root = first.root();
-    let CredentialHolder::Node(holder) = first.client.holder().await else {
-        panic!("expected node-bound client");
-    };
-    assert_eq!(first.client.holder().await, second.client.holder().await);
-    let trust_root = root.join("pool-trust");
-    let mut channels = Vec::new();
-    for (host, name) in [(&first, "first"), (&second, "second")] {
-        let profile = ClientProfile::load(&host.work_profile).unwrap();
-        let bundle = AccessBundle {
-            offers: vec![host.signed_offer.clone()],
-            authority: profile.authority,
-            authorization: profile.authorization,
-            subject: first.client.principal(),
-            holder,
-            credential: profile.credential,
-            expires: UnixMillis(UnixMillis::now().unwrap().0 + 600_000),
-            label: None,
-        };
-        let path = root.join(format!("{name}.access"));
-        bundle.save(&path).unwrap();
-        // The pool reads bundles from the principal's grant store.
-        hellas_sdk::grant_store::GrantStore::new(first.client.home.join("grants").join(format!(
-            "p256-{}",
-            hex::encode(first.client.principal().as_bytes())
-        )))
-        .import_bundle(&path, name, &first.client.principal(), &holder, false)
-        .unwrap();
-        TrustPolicyStore::new(&trust_root)
-            .approve(
-                name,
-                0,
-                TrustPolicy {
-                    provider_genesis: host.provider_enrollment.content_id(),
-                    assurance: hellas_rpc::Assurance::ProducerSigned,
-                    apple: None,
-                },
-                "independent provider approval".into(),
-            )
-            .unwrap();
-        channels.push(json!({
-            "offer": format!("{name}.glm"), "work_profile": name, "trust_policy": name,
-            "resources": [host.signed_offer.offer().grant.policies[0].resource.0.to_string()]
-        }));
-    }
-    let pool = root.join("two-provider-pool.json");
-    std::fs::write(
-        &pool,
-        serde_json::to_vec(&json!({"channels": channels})).unwrap(),
-    )
-    .unwrap();
-    let (profile, token) = gateway_profile(root).await;
-    let mut gateway = first.client.spawn(
-        &[
-            "gateway",
-            "--grant-pool-config",
-            string(&pool),
-            "--trust-store",
-            string(&trust_root),
-            "--port",
-            "0",
-            "--gateway-profile",
-            string(&profile),
-            "--zdr",
-        ],
-        "two-provider-gateway.log",
-    );
-    let address = gateway.wait_for("gateway listening on ").await;
-    let response = post(
-        &gateway_client(&token),
-        &format!("http://{address}/v1/chat/completions"),
-        json!({"messages":[]}),
-    )
-    .await;
-    assert_eq!(response.status(), reqwest::StatusCode::OK);
-    assert_eq!(
-        first.https.calls.load(Ordering::SeqCst) + second.https.calls.load(Ordering::SeqCst),
-        1
-    );
-    gateway.stop().await;
-    second.stop().await;
-    first.stop().await;
-}

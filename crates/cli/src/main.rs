@@ -4,10 +4,10 @@ use hellas_private::StoreLocation;
 #[macro_use]
 extern crate tracing;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 use iroh::EndpointId;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 mod compute;
 mod content_configuration;
 
@@ -47,50 +47,7 @@ fn acts_for_principal(command: &Commands) -> bool {
             }
             | Commands::Pair { .. }
             | Commands::Faucet { .. }
-            | Commands::Gateway { offer: Some(_), .. }
-            | Commands::Gateway {
-                grant_pool_config: Some(_),
-                ..
-            }
-            | Commands::Gateway {
-                paid_work_config: Some(_),
-                ..
-            }
     )
-}
-
-#[derive(Args)]
-struct RemoteTrustArgs {
-    /// Assurance required for remote execution.
-    #[arg(long, default_value = "producer-signed", value_parser = parse_assurance)]
-    assurance: hellas_rpc::Assurance,
-
-    /// Caller-owned native trust directory.
-    #[arg(long, conflicts_with = "paid_work_config")]
-    trust_store: Option<PathBuf>,
-    /// Previously approved local policy ID.
-    #[arg(long, requires = "trust_store", conflicts_with = "paid_work_config")]
-    trust_policy: Option<String>,
-}
-
-impl RemoteTrustArgs {
-    fn load(&self, home: &Path) -> anyhow::Result<hellas_client::ProviderTrustAnchor> {
-        let directory = self
-            .trust_store
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("--trust-store is required for grant execution"))?;
-        let id = self
-            .trust_policy
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("--trust-policy is required for grant execution"))?;
-        Ok(
-            hellas_sdk::trust_policy::TrustPolicyStore::new(directory).resolve(
-                id,
-                self.assurance,
-                identity::assertion_counters(home)?,
-            )?,
-        )
-    }
 }
 
 #[derive(Parser)]
@@ -274,29 +231,9 @@ enum Commands {
         /// Converted Flux2 Klein package served at /v1/images/generations.
         #[arg(long, value_name = "DIR")]
         image_model: Option<PathBuf>,
-        /// Content store, and with --local-grant the local GPU executor.
+        /// Where requests run: the job commands' --access, --pay or --local.
         #[command(flatten)]
-        native: compute::ServeArgs,
-        /// Run this node's own, already configured allowance's policies on
-        /// this machine: no chain, no remote provider and no ledger.
-        #[cfg(feature = "compute")]
-        #[arg(long, value_name = "ID", conflicts_with_all = ["offer", "paid_work_config", "grant_pool_config"])]
-        local_grant: Option<String>,
-        /// Use a private Offer previously verified by `offer import`.
-        #[arg(long, value_name = "ALIAS", conflicts_with_all = ["paid_work_config", "grant_pool_config"])]
-        offer: Option<String>,
-        /// Use an explicit list of private grant channels and resources.
-        #[arg(long, value_name = "FILE", conflicts_with_all = ["offer", "paid_work_config", "grant_policy", "work_profile", "http_fetch_config", "trust_policy"])]
-        grant_pool_config: Option<PathBuf>,
-        /// Check grant pool aliases, trust and saved terms without connecting.
-        #[arg(long, requires = "grant_pool_config")]
-        check_config: bool,
-        /// Select one resource when the Offer includes several matching policies.
-        #[arg(long)]
-        grant_policy: Option<String>,
-        /// Private application credential, authority and Work authorization grant.
-        #[arg(long, value_name = "FILE")]
-        work_profile: Option<PathBuf>,
+        execution: commands::transact::GatewayArgs,
         /// Serve exact HTTP routes through HTTPS Fetch. A grant with an HTTPS
         /// resource supplies its own routes.
         #[arg(long, value_name = "FILE")]
@@ -304,17 +241,12 @@ enum Commands {
         /// Disable payload archives and require ZDR for every HTTP request.
         #[arg(long)]
         zdr: bool,
-        /// Pay a pool of providers using durable on-chain funded work channels.
-        #[arg(long = "paid-work-config", value_name = "FILE")]
-        paid_work_config: Option<PathBuf>,
         /// Private profile selecting the local HTTP authority and scoped credential.
         #[arg(long = "gateway-profile", value_name = "FILE")]
         gateway_profile: Option<PathBuf>,
         /// Allow a non-loopback listener using the provisioned gateway authority.
         #[arg(long)]
         allow_remote: bool,
-        #[command(flatten)]
-        remote_trust: RemoteTrustArgs,
         /// Host interface to bind. Every request requires bearer authentication.
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
@@ -822,20 +754,11 @@ async fn async_main() {
             text_model,
             audio_model,
             image_model,
-            native,
-            #[cfg(feature = "compute")]
-            local_grant,
-            offer,
-            grant_pool_config,
-            check_config,
-            grant_policy,
-            work_profile,
+            execution,
             http_fetch_config,
             zdr,
-            paid_work_config,
             gateway_profile,
             allow_remote,
-            remote_trust,
             host,
             port,
             #[cfg(feature = "otel")]
@@ -847,288 +770,110 @@ async fn async_main() {
             responses_models,
             wrap,
             wrap_args,
-        } => closing_endpoints(async |endpoints| {
-            let assurance = remote_trust.assurance;
-            let pool_options = if let Some(path) = grant_pool_config.as_deref() {
-                let client = commands::contributions::require_principal(passkey)?;
-                let root = commands::contributions::data_root(&home, &client)?;
-                let trust_directory = remote_trust
-                    .trust_store
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("--trust-store is required for a grant pool"))?;
-                Some(commands::grant_gateway::load_pool(
-                    path,
-                    &home,
-                    &root,
-                    trust_directory,
-                    &local_identity,
-                    client,
-                    assurance,
-                )?)
-            } else {
-                None
-            };
-            if check_config {
-                let pool = pool_options
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("--check-config requires a grant pool"))?;
-                hellas_gateway::ResponsesFetch::from_routes(
-                    &pool.fetch_routes()?,
-                    responses_overrides.clone().unwrap_or_default(),
-                    responses_models.clone(),
-                )?;
-                println!("grant pool configuration is valid");
-                return Ok(());
-            }
-            let application = work_profile
-                .as_deref()
-                .map(hellas_sdk::node_control::profile::ClientProfile::load)
-                .transpose()?
-                .map(std::sync::Arc::new);
-            let work_application = || {
-                application
-                    .clone()
-                    .ok_or_else(|| anyhow::anyhow!("--work-profile is required for grant Work"))
-            };
-            #[cfg(feature = "compute")]
-            let local = match local_grant.as_deref() {
-                Some(grant) => {
-                    anyhow::ensure!(
-                        assurance == hellas_rpc::Assurance::ProducerSigned,
-                        "local Work requires producer-signed assurance"
-                    );
-                    Some(
-                        commands::grant_gateway::Local::open(
-                            &home,
-                            grant,
-                            grant_policy.as_deref(),
-                            native,
-                            &local_identity,
-                        )
-                        .await?,
-                    )
-                }
-                None => None,
-            };
-            #[cfg(feature = "compute")]
-            let local_work = local.as_ref().map(commands::grant_gateway::Local::work);
-            #[cfg(not(feature = "compute"))]
-            let local_work: Option<
-                std::sync::Arc<dyn hellas_gateway::WorkExecutionBackend>,
-            > = {
-                let _ = native;
-                None
-            };
-            let grant_source = if let Some(name) = offer.as_deref() {
-                let client = commands::contributions::require_principal(passkey)?;
-                let offer = commands::contributions::load_offer(&home, &client, name)?;
-                let target = hellas_sdk::grant_client::UnpinnedOffer::decode(
-                    &offer.encode()?,
-                    hellas_auth::authority::UnixMillis(0),
-                )?
-                .pin(&remote_trust.load(&home)?)?;
-                anyhow::ensure!(
-                    assurance == target.trust().required_assurance,
-                    "requested assurance differs from the pinned grant provider"
-                );
-                Some((
-                    commands::grant_gateway::session(
-                        &home,
-                        target,
-                        &local_identity,
-                        client,
-                        work_application()?,
-                    )?,
-                    hellas_sdk::grant_client::GrantTransport::Remote({
-                        let endpoint =
-                            hellas_sdk::grant_client::bind_endpoint(secret_key.clone()).await?;
-                        endpoints.push(endpoint.clone());
-                        endpoint
-                    }),
-                ))
-            } else {
-                None
-            };
-            anyhow::ensure!(
-                grant_policy.is_none() || grant_source.is_some() || local_work.is_some(),
-                "--grant-policy requires a remote or local allowance"
-            );
-            let hellas_sdk::node_control::profile::GatewayHost {
-                node,
-                access,
-                control,
-            } = hellas_sdk::node_control::profile::GatewayProfile::load(&home.child(
-                gateway_profile.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!("--gateway-profile is required to serve HTTP")
-                })?,
-            ))
-            .await?;
-            let http = http_fetch_config
-                .map(
-                    |path| -> anyhow::Result<hellas_gateway::HttpGatewayConfig> {
-                        let bytes = commands::read_bounded_regular_file(
-                            &path,
-                            "HTTP gateway config",
-                            4 << 20,
-                        )?;
-                        Ok(serde_json::from_slice(&bytes)?)
-                    },
-                )
-                .transpose()?;
-            let text = text_model.map(|model| hellas_gateway::TextOptions {
-                model_name: model
-                    .file_stem()
-                    .map_or_else(String::new, |stem| stem.to_string_lossy().into_owned()),
-                model,
-                default_max_tokens,
-            });
-            let mut models: Vec<_> = text
-                .into_iter()
-                .map(hellas_gateway::ModelOptions::Text)
-                .collect();
-            if let Some(model) = audio_model {
-                models.push(hellas_gateway::ModelOptions::Whisper(
-                    hellas_gateway::AudioOptions {
-                        model_name: model
-                            .file_name()
-                            .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
-                        model,
-                        default_max_tokens: default_max_tokens as usize,
-                    },
-                ));
-            }
-            if let Some(model) = image_model {
-                models.push(hellas_gateway::ModelOptions::Flux(
-                    hellas_gateway::ImageOptions {
-                        model_name: model
-                            .file_name()
-                            .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
-                        model,
-                    },
-                ));
-            }
-            let serve = hellas_sdk::GatewayServeOptions {
-                server: hellas_gateway::ServerOptions {
+        } => {
+            async {
+                let hellas_sdk::node_control::profile::GatewayHost {
+                    node,
                     access,
-                    archive: hellas_gateway::ArchiveOptions {
-                        directory: home.join("gateway-archive"),
-                        zdr,
-                    },
-                    allow_remote,
-                    host,
-                    port,
-                    wrap,
-                    wrap_args,
-                },
-                models,
-                http,
-                responses_overrides: responses_overrides.unwrap_or_default(),
-                responses_models,
-            };
-            #[cfg(feature = "otel")]
-            let metrics = metrics.map(|(address, bundle)| {
-                let bundle = match grant_source.as_ref().map(|(_, transport)| transport) {
-                    Some(hellas_sdk::grant_client::GrantTransport::Remote(endpoint)) => {
-                        let (_, receiver) = tokio::sync::watch::channel(Some(endpoint.clone()));
-                        bundle.with_iroh(receiver)
-                    }
-                    _ => bundle,
-                };
-                (address, bundle)
-            });
-            #[cfg(feature = "otel")]
-            if let Some((address, bundle)) = metrics {
-                metrics::spawn_metrics_server(address, bundle).await?;
-            }
-            let mut paid_content = None;
-            let gateway = if let Some(pool) = pool_options {
-                let endpoint = hellas_sdk::grant_client::bind_endpoint(secret_key.clone()).await?;
-                endpoints.push(endpoint.clone());
-                let transports = (0..pool.channels.len())
-                    .map(|_| hellas_sdk::grant_client::GrantTransport::Remote(endpoint.clone()))
+                    control,
+                } = hellas_sdk::node_control::profile::GatewayProfile::load(&home.child(
+                    gateway_profile.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!("--gateway-profile is required to serve HTTP")
+                    })?,
+                ))
+                .await?;
+                let http = http_fetch_config
+                    .map(
+                        |path| -> anyhow::Result<hellas_gateway::HttpGatewayConfig> {
+                            let bytes = commands::read_bounded_regular_file(
+                                &path,
+                                "HTTP gateway config",
+                                4 << 20,
+                            )?;
+                            Ok(serde_json::from_slice(&bytes)?)
+                        },
+                    )
+                    .transpose()?;
+                let text = text_model.map(|model| hellas_gateway::TextOptions {
+                    model_name: model
+                        .file_stem()
+                        .map_or_else(String::new, |stem| stem.to_string_lossy().into_owned()),
+                    model,
+                    default_max_tokens,
+                });
+                let mut models: Vec<_> = text
+                    .into_iter()
+                    .map(hellas_gateway::ModelOptions::Text)
                     .collect();
-                hellas_sdk::grant_gateway::GrantPoolServeOptions { serve, pool }
-                    .start(transports)
-                    .await?
-            } else if let Some((session, transport)) = grant_source {
-                hellas_sdk::grant_gateway::GrantServeOptions {
-                    serve,
-                    session,
-                    policy: grant_policy,
+                if let Some(model) = audio_model {
+                    models.push(hellas_gateway::ModelOptions::Whisper(
+                        hellas_gateway::AudioOptions {
+                            model_name: model
+                                .file_name()
+                                .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
+                            model,
+                            default_max_tokens: default_max_tokens as usize,
+                        },
+                    ));
                 }
-                .start(transport)
-                .await?
-            } else if let Some(path) = paid_work_config.as_ref() {
-                anyhow::ensure!(
-                    serve.http.is_some() || assurance == hellas_rpc::Assurance::ProducerSigned,
-                    "token-native paid work uses producer-signed assurance"
-                );
-                let config =
-                    hellas_sdk::work_config::WorkConfig::for_chain(selected_chain.clone(), &home)?;
-                let client_chain = config.chain.clone();
-                let content = hellas_store::content::DiskStore::open(
-                    StoreLocation::from_home(&path.with_extension("content"), home.durability()),
-                    vec![],
-                    hellas_store::content::IndexMode::Resume,
-                    None,
-                    hellas_store::content::Reservations::ram(
-                        hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
-                    ),
-                    false,
-                )
-                .await?;
-                let options = hellas_sdk::paid_gateway::load_pool_options(
-                    path,
-                    assurance,
-                    config,
-                    content.clone(),
+                if let Some(model) = image_model {
+                    models.push(hellas_gateway::ModelOptions::Flux(
+                        hellas_gateway::ImageOptions {
+                            model_name: model
+                                .file_name()
+                                .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
+                            model,
+                        },
+                    ));
+                }
+                #[cfg(feature = "otel")]
+                if let Some((address, bundle)) = metrics {
+                    metrics::spawn_metrics_server(address, bundle).await?;
+                }
+                let context = commands::transact::Context::new(
+                    &local_identity,
+                    owner.as_ref(),
+                    &home,
+                    &selected_chain,
                 )?;
-                paid_content = Some(content);
-                let passkey = owner
-                    .clone()
-                    .ok_or_else(|| anyhow::anyhow!("paid work acts for the principal"))?;
-                let payer = std::sync::Arc::new(hellas_sdk::client_owner::ClientOwner::new(
-                    std::sync::Arc::new(passkey),
-                    identity::settlement_signer(&local_identity)?.party_key(),
-                    &client_chain,
-                )?);
-                let paid = hellas_sdk::paid_gateway::PaidGateway::open(
-                    options,
-                    hellas_sdk::NodeIdentity::from_secret_bytes(
-                        secret_key.to_bytes(),
-                        local_identity.node_key.to_secret_bytes(),
-                    )?,
-                    payer,
-                )
-                .await?;
-                hellas_sdk::serve_gateway(paid, serve).await?
-            } else if let Some(work) = local_work {
-                hellas_sdk::serve_gateway(work, serve).await?
-            } else {
-                anyhow::bail!(
-                    "the gateway needs a work source: --local-grant, --offer or --paid-work-config"
-                );
-            };
-            let served = hellas_gateway::wait_for_shutdown(gateway)
-                .await
-                .map_err(anyhow::Error::from);
-            if let Some(content) = paid_content {
-                content.close().await;
+                let served = commands::transact::gateway(execution, context, async |work| {
+                    let http = match http {
+                        Some(http) => Some(http),
+                        None => work.target().http_config()?,
+                    };
+                    let serve = hellas_sdk::GatewayServeOptions {
+                        server: hellas_gateway::ServerOptions {
+                            access,
+                            archive: hellas_gateway::ArchiveOptions {
+                                directory: home.join("gateway-archive"),
+                                zdr,
+                            },
+                            allow_remote,
+                            host,
+                            port,
+                            wrap,
+                            wrap_args,
+                        },
+                        models,
+                        http,
+                        responses_overrides: responses_overrides.unwrap_or_default(),
+                        responses_models,
+                    };
+                    let gateway = hellas_sdk::serve_gateway(work, serve).await?;
+                    Ok(hellas_gateway::wait_for_shutdown(gateway).await?)
+                })
+                .await;
+                let stopped = match control {
+                    Some(control) => {
+                        served.and(control.shutdown().await.map_err(anyhow::Error::from))
+                    }
+                    None => served,
+                };
+                node.close().await;
+                stopped
             }
-            let stopped = match control {
-                Some(control) => served.and(control.shutdown().await.map_err(anyhow::Error::from)),
-                None => served,
-            };
-            // The local content store outlives the gateway that reads it.
-            #[cfg(feature = "compute")]
-            let stopped = match local {
-                Some(local) => stopped.and(local.shutdown().await),
-                None => stopped,
-            };
-            node.close().await;
-            stopped
-        })
-        .await,
+            .await
+        }
         Commands::Rpc {
             node_id,
             node_addrs,
@@ -1262,16 +1007,5 @@ async fn async_main() {
 mod parsers;
 #[cfg(test)]
 mod tests;
-
-/// Runs a command that binds remote endpoints into `endpoints`, then closes
-/// them however it ended. A host or gateway handed one has closed it already.
-async fn closing_endpoints<T>(command: impl AsyncFnOnce(&mut Vec<iroh::Endpoint>) -> T) -> T {
-    let mut endpoints = Vec::new();
-    let result = command(&mut endpoints).await;
-    for endpoint in endpoints {
-        endpoint.close().await;
-    }
-    result
-}
 
 use parsers::*;

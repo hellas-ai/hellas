@@ -136,11 +136,6 @@ let
       export HELLAS_CLI_TEST_BINARY
       cargo test ${s.sdk-integration} --test native_execution cli_settles_paid_channel_without_provider -- --ignored
       cargo test ${s.sdk-integration} --test native_execution cli_buys_a_paid_job_end_to_end -- --ignored
-      # The paid/grant composition case re-executes a Catena compile worker,
-      # whose process isolation is implemented only on Linux.
-      ${lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
-        cargo test ${s.sdk-integration} --test native_execution cli_paid_and_grant_two_provider_composition -- --ignored
-      ''}
       cargo test ${s.cli-otel-integration} --test grant_http metrics_scrape_observes_gateway_and_serve_work
     '' (cargoEnv rustToolchain);
     cloud = mkCargo "check-cloud" ''

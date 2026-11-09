@@ -4,7 +4,7 @@ use hellas_executor::{FetchProvider, FetchProviderFuture, PreparedFetchRequest};
 use hellas_private::StoreLocation;
 use hellas_rpc::{Assurance, RootProof};
 use hellas_sdk::{
-    GrantProviderOptions, grant_client::UnpinnedOffer, grant_gateway::GrantServeOptions,
+    GrantProviderOptions, grant_client::UnpinnedOffer,
 };
 use std::{
     num::NonZeroU64,
@@ -372,7 +372,6 @@ impl ShareFixtureBuilder {
                     responses_overrides: Default::default(),
                     responses_models: Vec::new(),
                 },
-                policy: None,
                 session: hellas_sdk::grant_client::GrantSessionOptions {
                     control_timeout: std::time::Duration::from_millis(
                         pinned.offer().grant.max_job_millis.get(),
@@ -691,6 +690,35 @@ struct ControlledGateway {
     control: TestControl,
     access: hellas_rpc::pb::host::GatewayAccess,
 }
+/// A grant gateway the host starts: each start binds its own endpoint.
+#[derive(Clone)]
+struct GrantServeOptions {
+    serve: hellas_sdk::GatewayServeOptions,
+    session: hellas_sdk::grant_client::GrantSessionOptions,
+}
+impl GrantServeOptions {
+    fn into_factory(self, key: iroh::SecretKey) -> hellas_sdk::node_control::host::GatewayFactory {
+        Arc::new(move |access| {
+            let (mut options, key) = (self.clone(), key.clone());
+            options.serve.server.access = access;
+            Box::pin(async move {
+                let endpoint = hellas_sdk::grant_client::bind_endpoint(key).await?;
+                let signer = options.session.signer.clone();
+                let target = hellas_sdk::GatewayTarget::Grant {
+                    policy: options.session.target.offer().grant.policies[0].clone(),
+                    options: options.session,
+                    transport: hellas_sdk::grant_client::GrantTransport::Remote(endpoint),
+                };
+                if options.serve.http.is_none() {
+                    options.serve.http = target.http_config()?;
+                }
+                let work = hellas_sdk::ExecutorGateway::new(target, signer);
+                Ok(hellas_sdk::serve_gateway(work, options.serve).await?)
+            })
+        })
+    }
+}
+
 async fn controlled_gateway(
     gateway: GrantServeOptions,
     key: iroh::SecretKey,

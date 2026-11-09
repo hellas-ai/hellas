@@ -112,11 +112,8 @@ impl Host {
             .await
             .unwrap()
     }
-    pub async fn responses_options(
-        &self,
-        addresses: Vec<String>,
-    ) -> crate::grant_gateway::GrantServeOptions {
-        crate::grant_gateway::GrantServeOptions {
+    pub async fn responses_options(&self, addresses: Vec<String>) -> GrantGateway {
+        GrantGateway {
             serve: crate::GatewayServeOptions {
                 server: hellas_gateway::ServerOptions {
                     access: self.gateway_access().await,
@@ -136,7 +133,6 @@ impl Host {
                 responses_models: Vec::new(),
             },
             session: self.options(addresses),
-            policy: None,
         }
     }
     /// The real provider dispatch loop, with a deterministic backend and pinned proof.
@@ -257,5 +253,35 @@ impl RemoteHost {
     pub async fn shutdown(self) {
         self.endpoint.close().await;
         self.task.await.unwrap();
+    }
+}
+
+/// A grant gateway the host starts: each start binds its own endpoint.
+#[derive(Clone)]
+pub struct GrantGateway {
+    pub serve: crate::GatewayServeOptions,
+    pub session: crate::grant_client::GrantSessionOptions,
+}
+impl GrantGateway {
+    /// The host supplies the access it validated; the configured access is replaced.
+    pub fn into_factory(self, key: iroh::SecretKey) -> crate::node_control::host::GatewayFactory {
+        std::sync::Arc::new(move |access| {
+            let (mut options, key) = (self.clone(), key.clone());
+            options.serve.server.access = access;
+            Box::pin(async move {
+                let endpoint = crate::grant_client::bind_endpoint(key).await?;
+                let signer = options.session.signer.clone();
+                let target = crate::GatewayTarget::Grant {
+                    policy: options.session.target.offer().grant.policies[0].clone(),
+                    options: options.session,
+                    transport: crate::grant_client::GrantTransport::Remote(endpoint),
+                };
+                if options.serve.http.is_none() {
+                    options.serve.http = target.http_config()?;
+                }
+                let work = crate::ExecutorGateway::new(target, signer);
+                Ok(crate::serve_gateway(work, options.serve).await?)
+            })
+        })
     }
 }
