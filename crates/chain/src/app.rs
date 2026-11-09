@@ -361,11 +361,13 @@ impl Application {
 fn kernel_context(
     network: NetworkId,
     height: Height,
+    block_time_ms: u64,
     previous_hash: Digest,
 ) -> hellas_kernel::Context {
     hellas_kernel::Context::with_fees(
         network,
         hellas_kernel::BlockHeight::new(height.get()),
+        block_time_ms,
         hellas_kernel::BlockHash::from_bytes(previous_hash.0),
         KERNEL_FEES,
     )
@@ -462,8 +464,11 @@ where
             }
             let block_height = Height::new(parent.height().get() + 1);
             let block_parent = parent.digest();
+            // Stamped before execution: the transactions are judged at the
+            // time the block will carry.
+            let timestamp = runtime.current().epoch_millis().max(parent.timestamp());
             let (batches, txs, _retained) = match execute_proposal(
-                kernel_context(self.network, block_height, block_parent),
+                kernel_context(self.network, block_height, timestamp, block_parent),
                 self.verifier.as_ref(),
                 candidates,
                 &self.genesis_allocations,
@@ -482,7 +487,6 @@ where
             let owner_root = crate::execution::owner_tree::root(&batches).await.ok()?;
             let merkleized = batches.merkleize().await.expect("UTXO merkleize failed");
 
-            let timestamp = runtime.current().epoch_millis().max(parent.timestamp());
             let block = HellasBlock::new(
                 consensus_context,
                 block_parent,
@@ -543,7 +547,12 @@ where
             #[cfg(feature = "indexer-api")]
             if let Some(index) = self.publication.as_ref().and_then(|p| p.index.as_ref()) {
                 let (batches, changes) = crate::execution::execute_all_observed(
-                    kernel_context(self.network, block.height(), block.parent()),
+                    kernel_context(
+                        self.network,
+                        block.height(),
+                        block.timestamp(),
+                        block.parent(),
+                    ),
                     self.verifier.as_ref(),
                     block.txs(),
                     &self.genesis_allocations,
@@ -645,6 +654,7 @@ where
                         kernel_context(
                             self.network,
                             Height::new(block.height().get() + 1),
+                            block.timestamp(),
                             block.digest(),
                         ),
                         self.verifier.as_ref(),
@@ -871,7 +881,7 @@ mod tests {
     #[test]
     fn kernel_context_binds_block_height_parent_hash_and_consensus_fees() {
         let parent = Digest::from([0x42; 32]);
-        let context = kernel_context(crate::domain::TEST_NETWORK, Height::new(17), parent);
+        let context = kernel_context(crate::domain::TEST_NETWORK, Height::new(17), 17_000, parent);
         assert_eq!(context.block_height(), hellas_kernel::BlockHeight::new(17));
         assert_eq!(
             context.previous_hash(),

@@ -101,9 +101,14 @@ where
 
     // Checked, not saturating: a deadline that wrapped would be a
     // response window already shut. This is what disables the work
-    // profile within one committed window of the height ceiling.
-    let record = PendingPaymentClose::from_accepted_start(context.network(), height, start)
-        .ok_or_else(|| reject(InvalidMoveReason::DeadlineOverflow))?;
+    // profile within one window of the block-time ceiling.
+    let record = PendingPaymentClose::from_accepted_start(
+        context.network(),
+        height,
+        context.block_time_ms(),
+        start,
+    )
+    .ok_or_else(|| reject(InvalidMoveReason::DeadlineOverflow))?;
 
     if let Some((certificate, _)) = start.certificate() {
         check_certificate(certificate, input, edge.terms()).map_err(reject)?;
@@ -204,7 +209,7 @@ where
     // Strictly below: a response landing exactly at the deadline is late,
     // which is what makes the adjudicated close's own guard the exact
     // complement of this one.
-    if context.block_height().get() >= record.response_deadline() {
+    if context.block_time_ms() >= record.response_deadline_ms() {
         return Err(reject(InvalidMoveReason::ResponseWindowClosed));
     }
 
@@ -321,7 +326,7 @@ pub(super) fn check_adjudicated<B: Batch>(
     // the exact complement of the response guard: at the deadline the
     // response is refused and the close is admitted, so there is no
     // height at which both or neither is legal.
-    if !record.responded() && context.block_height().get() < record.response_deadline() {
+    if !record.responded() && context.block_time_ms() < record.response_deadline_ms() {
         return Err(InvalidProofReason::ResponseWindowOpen);
     }
 

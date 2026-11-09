@@ -145,7 +145,7 @@ mod tests {
     fn genesis(private_key: &ed25519::PrivateKey) -> Genesis {
         Genesis {
             schema_version: GENESIS_SCHEMA_VERSION,
-            network_id: crate::genesis::HELLAS_DEVNET_2_ID.to_string(),
+            network_id: crate::genesis::HELLAS_DEVNET_3_ID.to_string(),
             validators: vec![GenesisValidator {
                 public_key: hex::encode(private_key.public_key().encode()),
                 label: "validator-a".to_string(),
@@ -196,7 +196,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             hex::encode(signature_bytes),
-            "e90d24cf563f999324b9d7c7e1552a193a81ae98298baf21eff4120ad4f686ac129e3075b63162da59489af44d84c62f54a33bb2508fbd0fcbee80a7389b8d09"
+            "0ad3692948f967636dbc8ee18414cb0aa1329f470ad3371105f411883decc1780b16bb763bc05032981443b5d1d02887f232aa36f2b7a39ceeb401fb205ba00b"
         );
         let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&public_key_bytes).unwrap();
         let signature = ed25519_dalek::Signature::from_bytes(&signature_bytes);

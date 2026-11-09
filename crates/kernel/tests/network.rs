@@ -41,6 +41,7 @@ const fn context(network: NetworkId) -> Context {
     Context::new(
         network,
         BlockHeight::new(1),
+        1_000,
         BlockHash::from_bytes([0; BlockHash::LENGTH]),
     )
 }

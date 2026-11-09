@@ -5,39 +5,32 @@
 //! asserted is what the second process may do — never what the first
 //! one meant to do.
 
-use hellas_channel::test_support::HANG_GUARD;
 use hellas_channel::test_support::channel::{client, network, provider};
 use hellas_private::StoreLocation;
 use hellas_rpc::protocol::invocation::InvocationPolicy;
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use hellas_channel::model::bundle::WorkChannelSetupBundleV2;
 use hellas_channel::model::setup::ProviderChannelPolicy;
 use hellas_channel::model::work::{PaidChannelPolicyV1, private_policy_commitment};
-use hellas_channel::work_close::{BlockSourceError, FinalizedBlocks, FinalizedWork, TxSink};
-use hellas_channel::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
+use hellas_channel::work_close::{BlockSourceError, TxSink};
 use hellas_channel::work_open::{
-    FinalizedSetup, SetupChannel, SetupDriveError, SetupProgress, SetupQuery, SetupStep, SetupView,
-    advance_setup,
+    FinalizedSetup, SetupProgress, SetupStep, advance_setup, setup_query,
 };
 use hellas_channel::work_store::journal::{Journal, JournalError, JournalId, JournalKind};
 use hellas_channel::work_store::setup::setup_key;
 use hellas_channel::work_store::{
     DiscoveredSetup, ObservedSetup, Role, SetupAbort, SetupDecision, SetupDiscoveryError, SetupEnd,
-    SetupFault, SetupRecord, SetupScan, SetupState, SetupStateError, SetupStore, WorkStoreError,
+    SetupFault, SetupRecord, SetupState, SetupStateError, SetupStore, WorkStoreError,
     discover_setups,
 };
 use hellas_kernel::{
     Auth, BlockHeight, CoinId, Decode as _, Edge, EdgeId, EdgeValues, Fees, Funding, Key,
     LeaseSlots, List, MAX_PARTY_INPUTS, Move, NetworkId, Parties, Party, PartyAuth, PartyKeys,
-    PaymentCloseStart, Payout, Proof, RegistryChunk, RegistryNamespace, RegistryRecordTag,
+    PaymentCloseStart, Payout, PendingSlot, RegistryChunk, RegistryNamespace, RegistryRecordTag,
     Secp256k1Verifier, Sig, Terms, TermsHash, Tx, WorkPaymentTerms, WorkStakeBondTerms,
 };
-use hellas_rpc::pb::work::{ExchangeSetupRequest, exchange_setup_response::Outcome};
-use hellas_rpc::services::work_setup::WorkSetupHandler;
 
 mod support;
 use support::temp;
@@ -63,10 +56,6 @@ fn coins(ids: &[u8]) -> List<CoinId, MAX_PARTY_INPUTS> {
         *slot = CoinId::from_bytes([*id; CoinId::LENGTH]);
     }
     List::take(slots, ids.len())
-}
-
-fn coin(id: u8) -> CoinId {
-    CoinId::from_bytes([id; CoinId::LENGTH])
 }
 
 fn empty_coins() -> List<CoinId, MAX_PARTY_INPUTS> {
@@ -106,7 +95,6 @@ fn payment_terms(bond_edge: EdgeId) -> WorkPaymentTerms {
         bond_edge,
         bond_terms(),
         private_policy_commitment(network(), &SALT, &channel_policy()),
-        hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
         hellas_kernel::MAX_START_VALIDITY_BLOCKS,
         2_049,
     )
@@ -128,7 +116,6 @@ fn provider_policy() -> ProviderChannelPolicy {
         channel_policy: channel_policy(),
         invocation_policy: work_policy(),
         expected_payment_values: EdgeValues::new(3_000, 200, Fees::ZERO),
-        min_omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
     }
 }
 
@@ -186,20 +173,8 @@ fn bundle_record(bundle: &WorkChannelSetupBundleV2) -> SetupRecord {
     }
 }
 
-fn scan() -> SetupScan {
-    SetupScan {
-        height: 7,
-        payload: [0x47; 32],
-    }
-}
-
-fn scan_record() -> SetupRecord {
-    let scan = scan();
-    SetupRecord::ScanArmed {
-        height: scan.height,
-        payload: scan.payload,
-    }
-}
+/// A height every fixture read is taken above.
+const FLOOR: u64 = 7;
 
 fn armed_record(bundle: &WorkChannelSetupBundleV2) -> SetupRecord {
     let payment_edge = bundle
@@ -236,7 +211,7 @@ fn same_block_contest() -> Tx {
         payment_edge(),
         Terms::work_payment(payment_terms(bond_edge())),
         Party::Maker,
-        (scan().height + 2, scan().height + 9),
+        (FLOOR + 2, FLOOR + 9),
         None,
         PartyAuth::signer(Sig::from_bytes([0_u8; Sig::LENGTH])),
     )))
@@ -278,34 +253,9 @@ async fn completed_store_at(location: &StoreLocation) -> SetupStore {
     let two = countersigned(one.clone());
     let three = completed(two.clone());
     for record in [
-        scan_record(),
         bundle_record(&one),
         bundle_record(&two),
         armed_record(&three),
-    ] {
-        if let Err(error) = store.commit(record, &verifier).await {
-            panic!("the fixture revision commits: {error}");
-        }
-    }
-    store
-}
-
-/// A client store that has durably retained the complete handshake.
-///
-/// The client arms its descriptor at revision 2 — after it has signed
-/// the payment Open and before the provider countersigns it — which is
-/// what makes revision 3 an import rather than a second arming.
-async fn client_completed_store(root: &std::path::Path) -> SetupStore {
-    let mut store = store(root, Role::Client).await;
-    let verifier = Secp256k1Verifier::new();
-    let one = proposed();
-    let two = countersigned(one.clone());
-    let three = completed(two.clone());
-    for record in [
-        bundle_record(&one),
-        scan_record(),
-        armed_record(&two),
-        bundle_record(&three),
     ] {
         if let Err(error) = store.commit(record, &verifier).await {
             panic!("the fixture revision commits: {error}");
@@ -478,119 +428,82 @@ impl Observed {
     }
 }
 
-/// One coherent finalized read of a channel whose bond is gone and
-/// whose payment edge is still live.
-///
-/// The state a permissionless bond Timeout leaves behind, and the state
-/// a close-only mount has to settle against. It counts its reads,
-/// because "the mount consults it" is half of what these tests are
-/// about.
-struct SurvivingPayment {
-    payment: Edge,
+/// One coherent certified read for the setup this journal holds,
+/// answering exactly the question the journal asks.
+fn read(
+    state: &SetupState,
     height: u64,
-    reads: std::sync::atomic::AtomicUsize,
-}
-
-impl SurvivingPayment {
-    fn at(height: u64, payment: Edge) -> Self {
-        Self {
-            payment,
-            height,
-            reads: std::sync::atomic::AtomicUsize::new(0),
-        }
-    }
-
-    fn reads(&self) -> usize {
-        self.reads.load(std::sync::atomic::Ordering::SeqCst)
-    }
-}
-
-impl SetupView for SurvivingPayment {
-    async fn finalized_setup(
-        &self,
-        _query: SetupQuery,
-    ) -> Result<Option<FinalizedSetup>, BlockSourceError> {
-        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(Some(FinalizedSetup {
-            height: self.height,
-            bond: None,
-            payment: Some(self.payment),
-            lease: LeaseSlots::Absent,
-            live_funding: BTreeSet::new(),
-        }))
+    bond: Option<Edge>,
+    payment: Option<Edge>,
+    lease: LeaseSlots,
+    live_funding: BTreeSet<CoinId>,
+) -> FinalizedSetup {
+    FinalizedSetup {
+        query: setup_query(state).expect("the setup names its payment edge"),
+        height,
+        payload: [height as u8; 32],
+        certified_at_ms: hellas_channel::test_support::channel::now_ms(),
+        bond,
+        payment,
+        lease,
+        pending: PendingSlot::Absent,
+        live_funding,
     }
 }
 
-/// One coherent finalized read of a channel whose bond, payment edge,
-/// and lease are all live: the state a completed setup is decided from,
-/// and the state its mount settles against.
-///
-/// It counts its reads for [`SurvivingPayment`]'s reason. A mount that
-/// never consults the edge settled against something else.
-struct LiveChannel {
-    payment: Edge,
-    height: u64,
-    reads: std::sync::atomic::AtomicUsize,
+/// A live, leased channel: the state a completed setup is decided from.
+fn live_channel(state: &SetupState, height: u64, payment: Edge) -> FinalizedSetup {
+    read(
+        state,
+        height,
+        Some(bond_object()),
+        Some(payment),
+        lease_over(bond_edge(), payment_edge()),
+        all_live(),
+    )
 }
 
-impl LiveChannel {
-    fn at(height: u64, payment: Edge) -> Self {
-        Self {
-            payment,
-            height,
-            reads: std::sync::atomic::AtomicUsize::new(0),
-        }
-    }
-
-    fn reads(&self) -> usize {
-        self.reads.load(std::sync::atomic::Ordering::SeqCst)
-    }
+/// A channel whose bond is gone and whose payment edge is still live.
+fn surviving_payment(state: &SetupState, height: u64, payment: Edge) -> FinalizedSetup {
+    read(
+        state,
+        height,
+        None,
+        Some(payment),
+        LeaseSlots::Absent,
+        BTreeSet::new(),
+    )
 }
 
-impl SetupView for LiveChannel {
-    async fn finalized_setup(
-        &self,
-        _query: SetupQuery,
-    ) -> Result<Option<FinalizedSetup>, BlockSourceError> {
-        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(Some(FinalizedSetup {
-            height: self.height,
-            bond: Some(bond_object()),
-            payment: Some(self.payment),
-            lease: lease_over(bond_edge(), payment_edge()),
-            live_funding: all_live(),
-        }))
-    }
-}
-
-/// Close-only recovery decides *what* to mount from journaled history
-/// and *what it settles* from one coherent read of the surviving edge.
-/// It hands nothing to consensus on either count.
+/// Mounting submits nothing.
 struct NoSink;
 
 impl TxSink for NoSink {
     async fn submit(&self, _tx: Tx) -> Result<hellas_rpc::SubmitTxOutcome, BlockSourceError> {
-        panic!("mounting a close-only channel submits nothing");
+        panic!("mounting a channel submits nothing");
     }
 }
 
-/// A finalized history a test writes down.
-struct Blocks {
-    blocks: Vec<FinalizedWork>,
-}
-
-impl FinalizedBlocks for Blocks {
-    async fn latest_height(&self) -> Result<Option<u64>, BlockSourceError> {
-        Ok(self.blocks.last().map(|block| block.height))
-    }
-
-    async fn block_at(&self, height: u64) -> Result<Option<FinalizedWork>, BlockSourceError> {
-        Ok(self
-            .blocks
-            .iter()
-            .find(|block| block.height == height)
-            .cloned())
-    }
+/// What a certified read at `height` showing the bond, the payment edge,
+/// or both live teaches this journal.
+fn seen(state: &SetupState, height: u64, bond: bool, payment: bool) -> SetupRecord {
+    let (bond_edge, payment_edge) = (bond_object(), payment_object());
+    let live = all_live();
+    SetupRecord::Observed(
+        state
+            .observe(&ObservedSetup {
+                height,
+                bond: bond.then_some(&bond_edge),
+                payment: payment.then_some(&payment_edge),
+                lease: if payment {
+                    lease_over(self::bond_edge(), self::payment_edge())
+                } else {
+                    LeaseSlots::Absent
+                },
+                live_funding: &live,
+            })
+            .expect("the read teaches the journal something"),
+    )
 }
 
 // ── The journal ───────────────────────────────────────────────────────
@@ -614,9 +527,6 @@ async fn a_retained_revision_is_re_exported_byte_for_byte() {
         {
             panic!("revision 1 commits: {error}");
         }
-        if let Err(error) = client_store.commit(scan_record(), &verifier).await {
-            panic!("the scan arm commits: {error}");
-        }
         if let Err(error) = client_store.commit(armed_record(&two), &verifier).await {
             panic!("revision 2 commits: {error}");
         }
@@ -628,49 +538,7 @@ async fn a_retained_revision_is_re_exported_byte_for_byte() {
         recovered.state().bundle_bytes(),
         Some(two.encode().as_slice())
     );
-    assert_eq!(recovered.len(), 3);
-}
-
-#[tokio::test]
-async fn applying_an_exportable_bundle_without_scan_arming_is_refused() {
-    let dir = temp();
-    let verifier = Secp256k1Verifier::new();
-    let mut provider_store = store(dir.path(), Role::Provider).await;
-    let error = provider_store
-        .commit(bundle_record(&proposed()), &verifier)
-        .await
-        .expect_err("revision 1 cannot become exportable before ScanArmed");
-    assert!(matches!(
-        error,
-        WorkStoreError::Setup(SetupStateError::WrongStage { .. })
-    ));
-    assert!(provider_store.state().bundle_bytes().is_none());
-}
-
-#[tokio::test]
-async fn a_second_distinct_scan_arm_is_refused() {
-    let dir = temp();
-    let verifier = Secp256k1Verifier::new();
-    let mut provider_store = store(dir.path(), Role::Provider).await;
-    provider_store
-        .commit(scan_record(), &verifier)
-        .await
-        .expect("the first arm commits");
-    let error = provider_store
-        .commit(
-            SetupRecord::ScanArmed {
-                height: scan().height + 1,
-                payload: [0x99; 32],
-            },
-            &verifier,
-        )
-        .await
-        .expect_err("a distinct scan floor cannot replace the held one");
-    assert!(matches!(
-        error,
-        WorkStoreError::Setup(SetupStateError::WrongStage { .. })
-    ));
-    assert_eq!(provider_store.state().scan_armed(), Some(scan()));
+    assert_eq!(recovered.len(), 2);
 }
 
 /// The three revisions go in order, and nothing else does.
@@ -701,7 +569,6 @@ async fn revisions_extend_and_never_rewind() {
 
     let mut ordered = store(dir.path(), Role::Provider).await;
     for record in [
-        scan_record(),
         bundle_record(&one),
         bundle_record(&two),
         armed_record(&three),
@@ -722,7 +589,7 @@ async fn revisions_extend_and_never_rewind() {
         "unexpected error: {error}"
     );
     assert_eq!(ordered.state().revision(), Some(3));
-    assert_eq!(ordered.len(), 4);
+    assert_eq!(ordered.len(), 3);
 }
 
 /// A revision whose signatures do not check never reaches the file —
@@ -891,7 +758,7 @@ async fn a_restart_finds_every_journal_its_root_holds() {
     // client, both under the one root.
     {
         let mut provider_store = store(dir.path(), Role::Provider).await;
-        for record in [scan_record(), bundle_record(&staked)] {
+        for record in [bundle_record(&staked)] {
             if let Err(error) = provider_store.commit(record, &verifier).await {
                 panic!("the provider's revision commits: {error}");
             }
@@ -1008,9 +875,9 @@ async fn a_journal_that_cannot_be_identified_is_reported_by_name() {
     let verifier = Secp256k1Verifier::new();
     let armed = proposed_over(other_bond_funding());
 
-    // A handshake that armed its immutable history floor and crashed
-    // before its first revision: the file is this endpoint's, and the
-    // bond it is keyed to is nowhere inside it.
+    // A handshake that recorded a read and crashed before its first
+    // revision: the file is this endpoint's, and the bond it is keyed to
+    // is nowhere inside it.
     {
         let location = StoreLocation::for_test(dir.path());
         let mut store = match SetupStore::open(
@@ -1025,9 +892,11 @@ async fn a_journal_that_cannot_be_identified_is_reported_by_name() {
             Ok(store) => store,
             Err(error) => panic!("the armed journal opens: {error}"),
         };
-        if let Err(error) = store.commit(scan_record(), &verifier).await {
-            panic!("the scan arm commits: {error}");
-        }
+        let read = seen(store.state(), FLOOR + 1, true, false);
+        store
+            .commit(read, &verifier)
+            .await
+            .expect("a read without a revision commits");
     }
     // And a file wearing a setup journal's name that is not one.
     let location = StoreLocation::for_test(dir.path());
@@ -1036,7 +905,7 @@ async fn a_journal_that_cannot_be_identified_is_reported_by_name() {
     // And one complete journal beside them.
     {
         let mut store = store(dir.path(), Role::Provider).await;
-        for record in [scan_record(), bundle_record(&proposed())] {
+        for record in [bundle_record(&proposed())] {
             if let Err(error) = store.commit(record, &verifier).await {
                 panic!("the revision commits: {error}");
             }
@@ -1330,7 +1199,7 @@ async fn a_client_never_submits_the_providers_transactions() {
     let mut client_store = store(dir.path(), Role::Client).await;
     let one = proposed();
     let two = countersigned(one.clone());
-    for record in [bundle_record(&one), scan_record(), armed_record(&two)] {
+    for record in [bundle_record(&one), armed_record(&two)] {
         if let Err(error) = client_store.commit(record, &verifier).await {
             panic!("the revision commits: {error}");
         }
@@ -1369,9 +1238,6 @@ async fn a_proposal_alone_decides_nothing() {
     let dir = temp();
     let verifier = Secp256k1Verifier::new();
     let mut journal = store(dir.path(), Role::Provider).await;
-    if let Err(error) = journal.commit(scan_record(), &verifier).await {
-        panic!("the scan arm commits: {error}");
-    }
     if let Err(error) = journal.commit(bundle_record(&proposed()), &verifier).await {
         panic!("revision 1 commits: {error}");
     }
@@ -1388,9 +1254,6 @@ async fn submission_markers_follow_the_transactions_they_are_about() {
     let dir = temp();
     let verifier = Secp256k1Verifier::new();
     let mut journal = store(dir.path(), Role::Provider).await;
-    if let Err(error) = journal.commit(scan_record(), &verifier).await {
-        panic!("the scan arm commits: {error}");
-    }
     if let Err(error) = journal.commit(bundle_record(&proposed()), &verifier).await {
         panic!("revision 1 commits: {error}");
     }
@@ -1450,7 +1313,6 @@ async fn submission_markers_follow_the_transactions_they_are_about() {
     let mut client_store = store(other.path(), Role::Client).await;
     for record in [
         bundle_record(&proposed()),
-        scan_record(),
         armed_record(&two),
         bundle_record(&three),
     ] {
@@ -1486,7 +1348,6 @@ async fn completion_records_the_channels_origin_and_is_terminal() {
                 payment_edge: EdgeId::from_bytes([0x66; EdgeId::LENGTH]),
                 origin_height: 44,
                 origin_payload: [0x01; 32],
-                origin_parent: [0x02; 32],
             },
             &verifier,
         )
@@ -1504,7 +1365,6 @@ async fn completion_records_the_channels_origin_and_is_terminal() {
         payment_edge: payment_edge(),
         origin_height: 44,
         origin_payload: [0x01; 32],
-        origin_parent: [0x02; 32],
     };
     if let Err(error) = journal.commit(complete.clone(), &verifier).await {
         panic!("completion commits: {error}");
@@ -1513,7 +1373,6 @@ async fn completion_records_the_channels_origin_and_is_terminal() {
         panic!("completion records an origin");
     };
     assert_eq!(origin.height, 44);
-    assert_eq!(origin.parent, [0x02; 32]);
     assert_eq!(journal.state().end(), Some(SetupEnd::Complete));
 
     // Recording it again is the same fact.
@@ -1558,7 +1417,6 @@ async fn a_different_completion_after_the_end_is_not_a_retry() {
         payment_edge: payment_edge(),
         origin_height: 44,
         origin_payload: [0x01; 32],
-        origin_parent: [0x02; 32],
     };
     if let Err(error) = journal.commit(complete.clone(), &verifier).await {
         panic!("completion commits: {error}");
@@ -1572,11 +1430,10 @@ async fn a_different_completion_after_the_end_is_not_a_retry() {
     assert_eq!(journal.len(), before);
 
     // Each field independently changes the completed origin.
-    for (payment_edge, origin_height, origin_payload, origin_parent) in [
-        (EdgeId::from_bytes([0x55; 32]), 44, [0x01; 32], [0x02; 32]),
-        (payment_edge(), 45, [0x01; 32], [0x02; 32]),
-        (payment_edge(), 44, [0x03; 32], [0x02; 32]),
-        (payment_edge(), 44, [0x01; 32], [0x04; 32]),
+    for (payment_edge, origin_height, origin_payload) in [
+        (EdgeId::from_bytes([0x55; 32]), 44, [0x01; 32]),
+        (payment_edge(), 45, [0x01; 32]),
+        (payment_edge(), 44, [0x03; 32]),
     ] {
         let error = journal
             .commit(
@@ -1584,7 +1441,6 @@ async fn a_different_completion_after_the_end_is_not_a_retry() {
                     payment_edge,
                     origin_height,
                     origin_payload,
-                    origin_parent,
                 },
                 &verifier,
             )
@@ -1606,7 +1462,6 @@ async fn a_different_completion_after_the_end_is_not_a_retry() {
     assert_eq!(origin.payment_edge, payment_edge());
     assert_eq!(origin.height, 44);
     assert_eq!(origin.payload, [0x01; 32]);
-    assert_eq!(origin.parent, [0x02; 32]);
 }
 
 /// An ended setup stays ended across a restart, and never resubmits.
@@ -1679,10 +1534,6 @@ async fn the_funding_coins_come_from_the_retained_transactions() {
 /// trailing byte are all refused.
 #[tokio::test]
 async fn the_record_codec_is_exact() {
-    let scan_arm = scan_record();
-    let scan_bytes = scan_arm.encode().unwrap();
-    assert_eq!(SetupRecord::decode(&scan_bytes), Ok(scan_arm));
-
     let armed = armed_record(&countersigned(proposed()));
     let armed_bytes = armed.encode().unwrap();
     assert_eq!(SetupRecord::decode(&armed_bytes), Ok(armed));
@@ -1695,11 +1546,10 @@ async fn the_record_codec_is_exact() {
         payment_edge: payment_edge(),
         origin_height: 44,
         origin_payload: [0x01; 32],
-        origin_parent: [0x02; 32],
     };
     let bytes = complete.encode().unwrap();
-    // tag || edge || height || payload || parent
-    assert_eq!(bytes.len(), 1 + 32 + 8 + 32 + 32);
+    // tag || edge || height || payload
+    assert_eq!(bytes.len(), 1 + 32 + 8 + 32);
     assert_eq!(SetupRecord::decode(&bytes), Ok(complete));
 
     let mut trailing = bytes.clone();
@@ -1715,68 +1565,10 @@ async fn the_record_codec_is_exact() {
     assert_eq!(SetupRecord::decode(&[9]), Err(SetupStateError::Malformed));
     assert_eq!(SetupRecord::decode(&[]), Err(SetupStateError::Malformed));
 
-    // The fields are in the order the encoder writes them: swapping the
-    // two 32-byte block digests is a different record, and only a
-    // reader that agrees with the layout can see it.
-    let Ok(SetupRecord::Complete {
-        origin_payload,
-        origin_parent,
-        ..
-    }) = SetupRecord::decode(&bytes)
-    else {
-        panic!("the record decodes");
-    };
-    assert_eq!(origin_payload, [0x01; 32]);
-    assert_eq!(origin_parent, [0x02; 32]);
-
     let dir = temp();
     let fixture = completed_store(dir.path()).await;
-    let history = SetupRecord::Observed(
-        fixture
-            .state()
-            .observe(&[FinalizedWork {
-                height: scan().height + 1,
-                parent: scan().payload,
-                payload: [0x48; 32],
-                txs: vec![
-                    completed(countersigned(proposed()))
-                        .payment_open()
-                        .expect("an executable payment Open"),
-                ],
-            }])
-            .expect("contiguous finalized observation"),
-    );
+    let history = seen(fixture.state(), FLOOR + 1, true, true);
     assert_eq!(SetupRecord::decode(&history.encode().unwrap()), Ok(history));
-}
-
-#[tokio::test]
-async fn setup_history_replay_checks_first_and_internal_links_atomically() {
-    let dir = temp();
-    let journal = completed_store(dir.path()).await;
-    let before = journal.len();
-    for broken in [0, 1] {
-        let mut blocks = vec![
-            FinalizedWork {
-                height: scan().height + 1,
-                parent: scan().payload,
-                payload: [0x48; 32],
-                txs: Vec::new(),
-            },
-            FinalizedWork {
-                height: scan().height + 2,
-                parent: [0x48; 32],
-                payload: [0x49; 32],
-                txs: Vec::new(),
-            },
-        ];
-        blocks[broken].parent = [0xff; 32];
-        assert_eq!(
-            journal.state().observe(&blocks),
-            Err(SetupStateError::Malformed)
-        );
-    }
-    assert_eq!(journal.len(), before);
-    assert_eq!(journal.state().scan_cursor(), Some(scan()));
 }
 
 /// Every signature-bearing setup export leaves enough state to recover the
@@ -1793,14 +1585,13 @@ async fn round4_exported_authorization_recovers() {
     let provider_one = temp();
     {
         let mut journal = store(provider_one.path(), Role::Provider).await;
-        for record in [scan_record(), bundle_record(&one)] {
+        for record in [bundle_record(&one)] {
             if let Err(error) = journal.commit(record, &verifier).await {
                 panic!("provider revision 1 arms before export: {error}");
             }
         }
     }
     let recovered_one = store(provider_one.path(), Role::Provider).await;
-    assert_eq!(recovered_one.state().scan_armed(), Some(scan()));
     assert_eq!(
         recovered_one.state().bundle_bytes(),
         Some(one.encode().as_slice())
@@ -1813,7 +1604,7 @@ async fn round4_exported_authorization_recovers() {
     let client_two = temp();
     {
         let mut journal = store(client_two.path(), Role::Client).await;
-        for record in [bundle_record(&one), scan_record(), armed_record(&two)] {
+        for record in [bundle_record(&one), armed_record(&two)] {
             if let Err(error) = journal.commit(record, &verifier).await {
                 panic!("client revision 2 arms before export: {error}");
             }
@@ -1831,7 +1622,6 @@ async fn round4_exported_authorization_recovers() {
     {
         let mut journal = store(provider_three.path(), Role::Provider).await;
         for record in [
-            scan_record(),
             bundle_record(&one),
             bundle_record(&two),
             armed_record(&three),
@@ -1883,36 +1673,9 @@ async fn round6_submitted_open_delays_end() {
         assert_eq!(journal.state().end(), None);
     }
 
-    let bond_open = journal
-        .state()
-        .bond_open()
-        .expect("the retained submitted Open");
-    if let Err(error) = journal
-        .commit(
-            SetupRecord::Observed(
-                journal
-                    .state()
-                    .observe(&[
-                        FinalizedWork {
-                            height: scan().height + 1,
-                            parent: scan().payload,
-                            payload: [0x48; 32],
-                            txs: Vec::new(),
-                        },
-                        FinalizedWork {
-                            height: scan().height + 2,
-                            parent: [0x48; 32],
-                            payload: [0x49; 32],
-                            txs: vec![bond_open],
-                        },
-                    ])
-                    .expect("contiguous finalized observation"),
-            ),
-            &verifier,
-        )
-        .await
-    {
-        panic!("contiguous history finalizes the retained Open: {error}");
+    let read = seen(journal.state(), FLOOR + 2, true, false);
+    if let Err(error) = journal.commit(read, &verifier).await {
+        panic!("a read showing the bond resolves the retained Open: {error}");
     }
     assert!(
         !journal.state().bond_submitted(),
@@ -1940,11 +1703,11 @@ async fn round6_submitted_open_delays_end() {
 /// in the fault the spent stake would otherwise be read as.
 ///
 /// The provider submits the bond and then the deterministic Timeout.
-/// While that Timeout is only submitted, the absent bond over a spent
-/// stake is its own reclaim in flight and no fault is decided. Once
-/// contiguous history holds the bond Open and the Close that spent it,
-/// the same read is a clean reclaim — the stake came back — and the end
-/// is `Abort(BondReclaimed)`, which a genuinely unexplained spend
+/// While no read has shown the bond, the absent bond over a spent stake
+/// is its own reclaim in flight and no fault is decided. Once a read has
+/// shown the bond live, its absence is a closed bond — and a bond's only
+/// exit is the Timeout that pays the stake back — so the end is
+/// `Abort(BondReclaimed)`, which a genuinely unexplained spend
 /// (`the_recovery_decision_covers_every_finalized_shape`) still is not.
 #[tokio::test]
 async fn a_finalized_bond_timeout_reclaims_the_stake_cleanly() {
@@ -1974,41 +1737,13 @@ async fn a_finalized_bond_timeout_reclaims_the_stake_cleanly() {
         "a submitted timeout waits for its finalized close",
     );
 
-    // History finalizes the bond Open and the deterministic Timeout Close
-    // that consumed it.
-    let bond_open = journal.state().bond_open().expect("the retained bond Open");
-    let bond_close = Tx::timeout_close(bond_edge(), &Terms::work_stake_bond(bond_terms()))
-        .expect("the bond has a deterministic timeout close");
-    if let Err(error) = journal
-        .commit(
-            SetupRecord::Observed(
-                journal
-                    .state()
-                    .observe(&[
-                        FinalizedWork {
-                            height: scan().height + 1,
-                            parent: scan().payload,
-                            payload: [0x51; 32],
-                            txs: vec![bond_open],
-                        },
-                        FinalizedWork {
-                            height: scan().height + 2,
-                            parent: [0x51; 32],
-                            payload: [0x52; 32],
-                            txs: vec![bond_close],
-                        },
-                    ])
-                    .expect("contiguous finalized observation"),
-            ),
-            &verifier,
-        )
-        .await
-    {
-        panic!("history finalizes the bond and its timeout close: {error}");
+    // A read shows the bond live.
+    let read = seen(journal.state(), FLOOR + 1, true, false);
+    if let Err(error) = journal.commit(read, &verifier).await {
+        panic!("a read showing the bond journals: {error}");
     }
 
-    // The absent bond over spent stake is now explained by this
-    // endpoint's own finalized reclaim.
+    // The absent bond over spent stake is now a closed bond.
     assert_eq!(
         spent_stake().decide(journal.state()),
         SetupDecision::Abort(SetupAbort::BondReclaimed),
@@ -2034,66 +1769,25 @@ async fn a_finalized_bond_timeout_reclaims_the_stake_cleanly() {
     );
 }
 
-#[tokio::test]
-async fn setup_completes_without_waiting_for_a_quiet_chain() {
-    struct AdvancingBlocks {
-        history: Blocks,
-        reads: AtomicUsize,
-    }
-    impl FinalizedBlocks for AdvancingBlocks {
-        async fn latest_height(&self) -> Result<Option<u64>, BlockSourceError> {
-            let offset = self.reads.fetch_add(1, Ordering::SeqCst) + 1;
-            Ok(Some(scan().height + offset as u64))
-        }
-
-        async fn block_at(&self, height: u64) -> Result<Option<FinalizedWork>, BlockSourceError> {
-            self.history.block_at(height).await
-        }
-    }
-
-    let dir = temp();
-    let mut journal = completed_store(dir.path()).await;
-    let content = hellas_channel::test_support::channel::content_store(dir.path()).await;
-    journal.set_content_store(content.clone());
-    let payment_open = completed(countersigned(proposed()))
-        .payment_open()
-        .expect("the signed payment Open");
-    let blocks = AdvancingBlocks {
-        history: Blocks {
-            blocks: vec![
-                FinalizedWork {
-                    height: scan().height + 1,
-                    parent: scan().payload,
-                    payload: [0xa1; 32],
-                    txs: vec![payment_open],
-                },
-                FinalizedWork {
-                    height: scan().height + 2,
-                    parent: [0xa1; 32],
-                    payload: [0xa2; 32],
-                    txs: vec![],
-                },
-            ],
-        },
-        reads: AtomicUsize::new(0),
+/// The client's contest that landed with, or before, the first read this
+/// provider took of the payment edge: it is the pending-close slot of that
+/// same read.
+fn contest_pending() -> PendingSlot {
+    let Tx::Move {
+        action: Move::StartPaymentClose(start),
+    } = same_block_contest()
+    else {
+        panic!("the fixture contest is a start");
     };
-    let view = LiveChannel::at(scan().height + 1, payment_object());
-    let advance = advance_setup(
-        &view,
-        &blocks,
-        &NoSink,
-        &mut journal,
-        &Secp256k1Verifier::new(),
+    PendingSlot::Present(
+        hellas_kernel::PendingPaymentClose::from_accepted_start(
+            network(),
+            FLOOR + 1,
+            hellas_channel::test_support::channel::now_ms(),
+            &start,
+        )
+        .expect("the fixture contest opens"),
     )
-    .await
-    .expect("a moving tip does not postpone the setup decision");
-    assert!(matches!(advance.progress, SetupProgress::Complete(_)));
-    assert!(advance.mounted.is_some());
-    assert_eq!(
-        blocks.reads.load(Ordering::SeqCst),
-        1,
-        "the origin is retained by the one finalized scan"
-    );
 }
 
 #[tokio::test]
@@ -2104,24 +1798,10 @@ async fn provider_setup_preserves_power_durability_when_mounting_the_channel() {
     let mut setup = completed_store_at(&location).await;
     let content = hellas_channel::test_support::channel::content_store(dir.path()).await;
     setup.set_content_store(content);
-    let blocks = Blocks {
-        blocks: vec![FinalizedWork {
-            height: scan().height + 1,
-            parent: scan().payload,
-            payload: [0xa1; 32],
-            txs: vec![completed(countersigned(proposed())).payment_open().unwrap()],
-        }],
-    };
-    let view = LiveChannel::at(scan().height + 1, payment_object());
-    let advance = advance_setup(
-        &view,
-        &blocks,
-        &NoSink,
-        &mut setup,
-        &Secp256k1Verifier::new(),
-    )
-    .await
-    .unwrap();
+    let read = live_channel(setup.state(), FLOOR + 1, payment_object());
+    let advance = advance_setup(&read, &NoSink, &mut setup, &Secp256k1Verifier::new())
+        .await
+        .unwrap();
     assert!(matches!(advance.progress, SetupProgress::Complete(_)));
     let mut channel = advance.mounted.expect("provider setup mounts its channel");
     assert_eq!(
@@ -2131,17 +1811,13 @@ async fn provider_setup_preserves_power_durability_when_mounting_the_channel() {
     );
 }
 
-/// A completed setup hands back the channel it mounted, opened at the
-/// origin it recorded and settled against the edge it read.
+/// A completed setup hands back the channel it mounted, starting at the
+/// first read that showed the payment edge live and leased, settled
+/// against the edge it read — and a contest already open at that read is
+/// on the channel handed back.
 ///
-/// The completion is where a caller would otherwise start re-deriving:
-/// it would take the origin, reach into `close_descriptor()`, pick a
-/// settlement, open a store, and replay history — four decisions the
-/// library already made. Two of them are visible here. The client funded
-/// 4,096 where the provider's configuration expected 1,200, and a close
-/// built on the expectation is one consensus refuses; and the contest
-/// ordered after the Open in the origin block is one only a replay of
-/// that block sees, because the mount's cursor already sits on it.
+/// The client funded 4,096 where the provider's configuration expected
+/// 1,200, and a close built on the expectation is one consensus refuses.
 #[tokio::test]
 async fn a_completed_setup_hands_back_the_channel_it_mounted() {
     let dir = temp();
@@ -2150,20 +1826,9 @@ async fn a_completed_setup_hands_back_the_channel_it_mounted() {
     let content = hellas_channel::test_support::channel::content_store(dir.path()).await;
     journal.set_content_store(content.clone());
 
-    let bundle = completed(countersigned(proposed()));
-    let payment_open = bundle.payment_open().expect("the executable payment Open");
-    let origin_payload = [0xa1; 32];
-    let blocks = Blocks {
-        blocks: vec![FinalizedWork {
-            height: scan().height + 1,
-            parent: scan().payload,
-            payload: origin_payload,
-            txs: vec![payment_open, same_block_contest()],
-        }],
-    };
-    let view = LiveChannel::at(scan().height + 1, overfunded_payment_object());
-
-    let advance = match advance_setup(&view, &blocks, &NoSink, &mut journal, &verifier).await {
+    let mut read = live_channel(journal.state(), FLOOR + 1, overfunded_payment_object());
+    read.pending = contest_pending();
+    let advance = match advance_setup(&read, &NoSink, &mut journal, &verifier).await {
         Ok(advance) => advance,
         Err(error) => panic!("a live leased pair completes: {error}"),
     };
@@ -2171,29 +1836,23 @@ async fn a_completed_setup_hands_back_the_channel_it_mounted() {
         panic!("a live leased pair completes: {:?}", advance.progress);
     };
     assert_eq!(
-        origin.height,
-        scan().height + 1,
-        "the origin is the block the payment Open landed in",
+        (origin.height, origin.payload),
+        (read.height, read.payload),
+        "the origin is this endpoint's first sighting of the payment edge",
     );
     assert_eq!(journal.state().end(), Some(SetupEnd::Complete));
+    assert_eq!(journal.state().observed_height(), Some(read.height));
 
     let mounted = advance
         .mounted
         .expect("completion hands back the channel it opened");
-    assert_eq!(
-        mounted.state().cursor(),
-        (origin.height, origin_payload),
-        "the channel was opened at the origin the completion recorded",
-    );
-    assert_eq!(
-        mounted.state().settlement().adjudicated_total(),
-        4_096,
-        "the mount settled against the edge the coherent read found",
-    );
+    assert_eq!(mounted.state().cursor(), (origin.height, origin.payload));
+    assert_eq!(mounted.state().certified_at_ms(), read.certified_at_ms);
+    assert_eq!(mounted.state().settlement().adjudicated_total(), 4_096);
     assert_eq!(mounted.state().settlement().capacity(), 2_047);
     assert!(
         mounted.state().close_opened().is_some(),
-        "and the origin block's own contest is journaled on the channel handed back",
+        "the contest open at the first sighting is journaled on the channel",
     );
     let expected = journal
         .state()
@@ -2201,22 +1860,11 @@ async fn a_completed_setup_hands_back_the_channel_it_mounted() {
         .expect("the armed close descriptor")
         .expected_settlement()
         .expect("the configured expectation settles");
-    assert_eq!(
-        expected.adjudicated_total(),
-        3_200,
-        "and the expectation a re-deriving caller would have reached is another number",
-    );
+    assert_eq!(expected.adjudicated_total(), 3_200);
 }
 
-/// A restart over a completed setup hands the channel back too, and it
-/// is the same channel.
-///
-/// A completed setup is terminal: the only branch a restarted process
-/// reaches it by is the journal shortcut, which decides nothing and
-/// records nothing. If that branch handed back only the origin, every
-/// restart would be the one place a caller had to mount for itself —
-/// and it would settle against the configured expectation, because the
-/// funded value is the one thing the setup journal does not hold.
+/// A restart over a completed setup hands the same channel back, settled
+/// against a fresh read of the edge.
 #[tokio::test]
 async fn a_restart_over_a_completed_setup_hands_back_the_same_channel() {
     let dir = temp();
@@ -2225,445 +1873,120 @@ async fn a_restart_over_a_completed_setup_hands_back_the_same_channel() {
     let content = hellas_channel::test_support::channel::content_store(dir.path()).await;
     journal.set_content_store(content.clone());
 
-    let bundle = completed(countersigned(proposed()));
-    let payment_open = bundle.payment_open().expect("the executable payment Open");
-    let origin_payload = [0xa2; 32];
-    let blocks = Blocks {
-        blocks: vec![FinalizedWork {
-            height: scan().height + 1,
-            parent: scan().payload,
-            payload: origin_payload,
-            txs: vec![payment_open, same_block_contest()],
-        }],
+    let mut read = live_channel(journal.state(), FLOOR + 1, overfunded_payment_object());
+    read.pending = contest_pending();
+    let advance = advance_setup(&read, &NoSink, &mut journal, &verifier)
+        .await
+        .expect("the setup completes");
+    let SetupProgress::Complete(origin) = advance.progress else {
+        panic!("the setup completes: {:?}", advance.progress);
     };
-    let view = LiveChannel::at(scan().height + 1, overfunded_payment_object());
-
-    let (origin, records) = loop {
-        match advance_setup(&view, &blocks, &NoSink, &mut journal, &verifier).await {
-            Ok(advance) => match advance.progress {
-                SetupProgress::HistoryAdvanced { .. } => continue,
-                SetupProgress::Complete(origin) => {
-                    let mounted = advance.mounted.expect("completion hands its channel back");
-                    break (origin, mounted.len());
-                }
-                other => panic!("the setup completes: {other:?}"),
-            },
-            Err(error) => panic!("the setup completes: {error}"),
-        }
-    };
-    // The mounted channel's journal is exclusive for as long as it
-    // lives, so the restart below is a restart of both files.
+    let records = advance
+        .mounted
+        .expect("completion hands its channel back")
+        .len();
     drop(journal);
 
     let mut restarted = store(dir.path(), Role::Provider).await;
     restarted.set_content_store(content.clone());
     assert_eq!(restarted.state().end(), Some(SetupEnd::Complete));
-    let before = view.reads();
-    let blocks = Blocks { blocks: Vec::new() }; // The origin has been pruned.
-    let advance = match advance_setup(&view, &blocks, &NoSink, &mut restarted, &verifier).await {
-        Ok(advance) => advance,
-        Err(error) => panic!("the restart answers from the journal: {error}"),
-    };
-    assert_eq!(
-        advance.progress,
-        SetupProgress::Complete(origin),
-        "the restart reaches the completion by the journal, not by a second scan",
-    );
+    let advance = advance_setup(&read, &NoSink, &mut restarted, &verifier)
+        .await
+        .expect("the restart answers from the journal");
+    assert_eq!(advance.progress, SetupProgress::Complete(origin));
     let mounted = advance
         .mounted
         .expect("the restart hands the channel back as well");
-    assert_eq!(
-        view.reads(),
-        before + 1,
-        "and it read the surviving edge to settle it",
-    );
-    assert_eq!(mounted.state().cursor(), (origin.height, origin_payload));
-    assert_eq!(
-        mounted.state().settlement().adjudicated_total(),
-        4_096,
-        "the restart settled at the funded edge, not at the configuration",
-    );
-    assert!(
-        mounted.state().close_opened().is_some(),
-        "the contest the first mount replayed is still on the channel it hands back",
-    );
+    assert_eq!(mounted.state().cursor(), (origin.height, origin.payload));
+    assert_eq!(mounted.state().settlement().adjudicated_total(), 4_096);
+    assert!(mounted.state().close_opened().is_some());
     assert_eq!(
         mounted.len(),
         records,
-        "and it reopened the first mount's journal rather than writing a second one",
+        "the same read again writes nothing to the channel journal",
     );
 }
 
-/// A setup is driven while its own `WorkSetup` ALPN is answered from the
-/// same journal, and the caller still mounts by receiving.
+/// A read answers the question it was asked, and a step refuses one that
+/// is not the journal's question now.
 ///
-/// The journal is exclusive — the assertion below is that a second
-/// `SetupStore::open` on this root is refused — so "drive it and serve
-/// it" is not two stores, it is one store borrowed twice. A step that
-/// held that borrow across its finalized read would be a provider that
-/// stops answering the handshake for as long as the chain is slow; the
-/// view here is stopped for the whole of the exchange, and the exchange
-/// is answered with the retained revision anyway.
-///
-/// What comes back is unchanged: `SetupAdvance::mounted` carries the
-/// channel this step opened, so a driver reachable from the service
-/// mounts by receiving exactly as a caller holding the store did.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_setup_is_driven_while_its_alpn_is_served_from_the_same_journal() {
+/// A revision the handshake commits while a read is in flight makes the
+/// payment Open executable, and its funding coins would read as absent —
+/// spent — in an answer that never asked about them. That answer decides
+/// nothing; so does one older than a read the journal already recorded.
+#[tokio::test]
+async fn a_step_refuses_a_read_of_another_question_or_an_older_state() {
     let dir = temp();
-    let mut journal = completed_store(dir.path()).await;
-    let content = hellas_channel::test_support::channel::content_store(dir.path()).await;
-    journal.set_content_store(content.clone());
-
-    // Why this has to go through the service at all: the journal is
-    // held, and a runner cannot open a second one to drive from.
-    let location = StoreLocation::for_test(dir.path());
-    match SetupStore::open(
-        &location,
-        network(),
-        bond_edge(),
-        Role::Provider,
-        &Secp256k1Verifier::new(),
-    )
-    .await
-    {
-        Err(WorkStoreError::Journal(JournalError::Locked { .. })) => {}
-        other => panic!("a second store over one root is refused: {other:?}"),
-    }
-
-    let three = completed(countersigned(proposed()));
-    let payment_open = three.payment_open().expect("the executable payment Open");
-    let origin_payload = [0xa3; 32];
-    let service = SetupService::new(SetupEndpoint::new(
-        journal,
-        provider(),
-        PaymentAdmission::Admits(Box::new(provider_policy())),
-    ));
-    let blocks = Arc::new(Blocks {
-        blocks: vec![FinalizedWork {
-            height: scan().height + 1,
-            parent: scan().payload,
-            payload: origin_payload,
-            txs: vec![payment_open, same_block_contest()],
-        }],
-    });
-    let released = Arc::new(AtomicBool::new(false));
-    let view = Arc::new(HeldChannel {
-        inner: LiveChannel::at(scan().height + 1, overfunded_payment_object()),
-        reached: AtomicUsize::new(0),
-        released: Arc::clone(&released),
-    });
-
-    // The completing step, stopped at its finalized read.
-    let driving = tokio::spawn({
-        let service = service.clone();
-        let view = Arc::clone(&view);
-        let blocks = Arc::clone(&blocks);
-        async move {
-            service
-                .advance_setup(view.as_ref(), blocks.as_ref(), &NoSink)
-                .await
-        }
-    });
-    let waited = tokio::time::timeout(HANG_GUARD, async {
-        while view.reached.load(Ordering::SeqCst) == 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await;
-    assert!(waited.is_ok(), "the driver reached the finalized read");
-
-    // The ALPN, answered from the same journal while that read waits.
-    let answering = tokio::spawn({
-        let service = service.clone();
-        async move { exchange(&service, Vec::new()).await }
-    });
-    let answered = tokio::time::timeout(HANG_GUARD, answering).await;
-    let Ok(Ok(offered)) = answered else {
-        panic!("the WorkSetup ALPN does not queue behind the drive: {answered:?}");
-    };
-    assert_eq!(
-        offered,
-        three.encode(),
-        "and it was answered with the revision the journal holds",
-    );
-    assert!(
-        !driving.is_finished(),
-        "the drive was still stopped at its finalized read while that was answered",
-    );
-
-    released.store(true, Ordering::SeqCst);
-    let Ok(Ok(advance)) = driving.await else {
-        panic!("the released drive completes the setup");
-    };
-    let SetupProgress::Complete(origin) = advance.progress else {
-        panic!(
-            "the released drive completes the setup: {:?}",
-            advance.progress
-        );
-    };
-    assert_eq!(origin.height, scan().height + 1);
-    let mounted = advance
-        .mounted
-        .expect("the driven completion hands back the channel it opened");
-    assert_eq!(
-        mounted.state().cursor(),
-        (origin.height, origin_payload),
-        "the channel was opened at the origin the completion recorded",
-    );
-    assert_eq!(
-        mounted.state().settlement().adjudicated_total(),
-        4_096,
-        "and settled against the edge the coherent read found",
-    );
-    assert!(
-        mounted.state().close_opened().is_some(),
-        "the origin block's own contest is journaled on the channel handed back",
-    );
-
-    // Cancellation releases both the driver slot and the journal guard.
-    let mut held = Box::pin(async {
-        let mut driver = service.drive().expect("the setup has a driver to take");
-        let _journal = driver.store().await.expect("the journal is reachable");
-        std::future::pending::<()>().await;
-    });
-    assert!(futures::poll!(held.as_mut()).is_pending());
-    assert!(
-        matches!(service.drive(), Err(SetupDriveError::Busy)),
-        "a second driver of one setup is turned away",
-    );
-    let mut queued = Box::pin(exchange(&service, Vec::new()));
-    assert!(futures::poll!(queued.as_mut()).is_pending());
-    drop(queued);
-    drop(held);
-    assert!(service.drive().is_ok(), "and the slot comes back");
-    assert_eq!(exchange(&service, Vec::new()).await, three.encode());
-
-    // Tokio's mutex does not poison itself; the setup guard must retain
-    // the old failure boundary for both the driver and the wire handler.
-    let panicked = tokio::spawn({
-        let service = service.clone();
-        async move {
-            let mut driver = service.drive().expect("the driver slot was released");
-            let _journal = driver.store().await.expect("the journal was released");
-            panic!("inject a panic while the setup journal is borrowed");
-        }
-    });
-    assert!(
-        panicked
-            .await
-            .expect_err("the injected panic unwinds")
-            .is_panic()
-    );
-    let mut driver = service.drive().expect("unwinding releases the driver slot");
-    assert!(matches!(driver.store().await, Err(SetupDriveError::Busy)));
-    let reply = service
-        .exchange_setup(
-            ExchangeSetupRequest {
-                bond_edge: bond_edge().as_bytes().to_vec(),
-                bundle: Vec::new(),
-            },
-            hellas_wire::TransportContext::default(),
-        )
-        .await
-        .expect("the poisoned service answers with a refusal");
-    let response: hellas_rpc::call::WithTrailer<_> = reply.into();
-    assert!(
-        matches!(response.response.outcome, Some(Outcome::Refused(refused))
-        if refused.code == hellas_channel::work::WorkRefusal::Unavailable.code() as i32)
-    );
-}
-
-/// A view that stops the driver where a real chain would, and counts
-/// that it got there.
-struct HeldChannel {
-    inner: LiveChannel,
-    reached: AtomicUsize,
-    released: Arc<AtomicBool>,
-}
-
-impl SetupView for HeldChannel {
-    async fn finalized_setup(
-        &self,
-        query: SetupQuery,
-    ) -> Result<Option<FinalizedSetup>, BlockSourceError> {
-        self.reached.fetch_add(1, Ordering::SeqCst);
-        while !self.released.load(Ordering::SeqCst) {
-            tokio::task::yield_now().await;
-        }
-        self.inner.finalized_setup(query).await
-    }
-}
-
-/// Offers one revision to a setup service through its own handler, and
-/// returns the revision it answers with.
-async fn exchange(service: &SetupService, bundle: Vec<u8>) -> Vec<u8> {
-    hellas_channel::test_support::channel::exchange_setup(service, bond_edge(), bundle).await
-}
-
-/// A payment leg learned while a finalized read is suspended changes the
-/// query. The driver must read that leg's funding before deciding to submit.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_setup_decides_from_the_revision_it_asked_the_chain_about() {
-    let dir = temp();
+    let verifier = Secp256k1Verifier::new();
+    let one = proposed();
     let mut journal = store(dir.path(), Role::Provider).await;
-    for record in [scan_record(), bundle_record(&proposed())] {
+    journal
+        .commit(bundle_record(&one), &verifier)
+        .await
+        .expect("revision 1 commits");
+    // The read is taken while revision 1 is all the journal holds...
+    let early = FinalizedSetup {
+        query: setup_query(journal.state()).expect("revision 1 names its bond"),
+        height: FLOOR + 1,
+        payload: [0x48; 32],
+        certified_at_ms: hellas_channel::test_support::channel::now_ms(),
+        bond: None,
+        payment: None,
+        lease: LeaseSlots::Absent,
+        pending: PendingSlot::Absent,
+        live_funding: without(PAYMENT_COIN),
+    };
+    // ...and revisions 2 and 3 land before it is answered.
+    for record in [
+        bundle_record(&countersigned(one.clone())),
+        armed_record(&completed(countersigned(one))),
+    ] {
         journal
-            .commit(record, &Secp256k1Verifier::new())
+            .commit(record, &verifier)
             .await
-            .unwrap();
+            .expect("revision commits");
     }
-    let three = completed(countersigned(proposed()));
-    let service = SetupService::new(SetupEndpoint::new(
-        journal,
-        provider(),
-        PaymentAdmission::Admits(Box::new(provider_policy())),
-    ));
-    // Nothing of this setup is on chain yet, so there is no history to
-    // catch up on and the step goes straight to its finalized read.
-    let blocks = Arc::new(Blocks { blocks: Vec::new() });
-    let released = Arc::new(AtomicBool::new(false));
-    let view = Arc::new(HeldFunding::holding(Arc::clone(&released)));
-    let sink = Arc::new(Mempool::default());
+    let sink = Mempool::default();
+    let advance = advance_setup(&early, &sink, &mut journal, &verifier)
+        .await
+        .expect("the step answers");
+    assert_eq!(advance.progress, SetupProgress::AwaitingFinalizedState);
+    assert!(sink.submitted().is_empty());
+    assert_eq!(journal.state().end(), None);
 
-    let driving = tokio::spawn({
-        let service = service.clone();
-        let view = Arc::clone(&view);
-        let blocks = Arc::clone(&blocks);
-        let sink = Arc::clone(&sink);
-        async move {
-            service
-                .advance_setup(view.as_ref(), blocks.as_ref(), sink.as_ref())
-                .await
-        }
-    });
-    let waited = tokio::time::timeout(HANG_GUARD, async {
-        while view.asked().is_empty() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await;
-    assert!(waited.is_ok(), "the driver reached its revision-1 read");
-
-    // Revision 3, journaled through the ALPN while that read waits.
-    let answering = tokio::spawn({
-        let service = service.clone();
-        async move { exchange(&service, countersigned(proposed()).encode()).await }
-    });
-    let answered = tokio::time::timeout(HANG_GUARD, answering).await;
-    let Ok(Ok(offered)) = answered else {
-        panic!("the WorkSetup ALPN does not queue behind the drive: {answered:?}");
-    };
-    assert_eq!(
-        offered,
-        three.encode(),
-        "the ALPN countersigned the payment and journaled revision 3",
+    // A read of the journal's own question decides.
+    let current = read(
+        journal.state(),
+        FLOOR + 2,
+        Some(bond_object()),
+        None,
+        LeaseSlots::Absent,
+        all_live(),
     );
-    assert!(
-        !driving.is_finished(),
-        "and it did that while the drive was still stopped at its revision-1 read",
-    );
-
-    released.store(true, Ordering::SeqCst);
-    let Ok(Ok(advance)) = driving.await else {
-        panic!("the released drive takes a step");
-    };
-    match advance.progress {
+    let advance = advance_setup(&current, &sink, &mut journal, &verifier)
+        .await
+        .expect("the step answers");
+    assert!(matches!(
+        advance.progress,
         SetupProgress::Submitted {
-            step: SetupStep::Bond,
+            step: SetupStep::Payment,
             ..
-        } => {}
-        SetupProgress::Aborted(abort) => {
-            panic!("the step ended the setup from a state it never observed: {abort:?}");
         }
-        SetupProgress::TimeoutBond | SetupProgress::BondTimeoutSubmitted { .. } => {
-            panic!("the step took the stake back from a state it never observed");
-        }
-        other => panic!("the step submits the bond it can now fund: {other:?}"),
-    }
-
-    let asked = view.asked();
-    assert_eq!(
-        asked.len(),
-        2,
-        "the revision-1 answer was discarded and the read taken again",
+    ));
+    // An older state than one already recorded decides nothing.
+    let older = read(
+        journal.state(),
+        FLOOR + 1,
+        None,
+        None,
+        LeaseSlots::Absent,
+        without(BOND_COIN),
     );
-    assert!(
-        !asked[0].funding.contains(&coin(PAYMENT_COIN)),
-        "the first read asked only about the executable bond's funding",
-    );
-    assert!(
-        asked[1].funding.contains(&coin(PAYMENT_COIN)),
-        "and the second asked about the newly learned payment funding",
-    );
-    assert_eq!(
-        sink.submitted().len(),
-        1,
-        "one bond Open was handed to consensus",
-    );
-
-    drop(service);
-    let recovered = store(dir.path(), Role::Provider).await;
-    assert_eq!(recovered.state().revision(), Some(3));
-    assert!(
-        recovered.state().end().is_none(),
-        "and the journal records no end at all: {:?}",
-        recovered.state().end(),
-    );
-}
-
-/// A finalized read that answers exactly the query it was asked, and
-/// stops the driver on the first one.
-///
-/// Every coin the query names is live, and nothing is spent for the
-/// whole of this test — so a `live_funding` short of a setup's funding
-/// can only be an answer to a query that did not ask about it.
-struct HeldFunding {
-    asked: std::sync::Mutex<Vec<SetupQuery>>,
-    released: Arc<AtomicBool>,
-}
-
-impl HeldFunding {
-    fn holding(released: Arc<AtomicBool>) -> Self {
-        Self {
-            asked: std::sync::Mutex::new(Vec::new()),
-            released,
-        }
-    }
-
-    fn asked(&self) -> Vec<SetupQuery> {
-        match self.asked.lock() {
-            Ok(asked) => asked.clone(),
-            Err(error) => panic!("the fixture view is not poisoned: {error}"),
-        }
-    }
-}
-
-impl SetupView for HeldFunding {
-    async fn finalized_setup(
-        &self,
-        query: SetupQuery,
-    ) -> Result<Option<FinalizedSetup>, BlockSourceError> {
-        let first = match self.asked.lock() {
-            Ok(mut asked) => {
-                asked.push(query.clone());
-                asked.len() == 1
-            }
-            Err(error) => panic!("the fixture view is not poisoned: {error}"),
-        };
-        if first {
-            while !self.released.load(Ordering::SeqCst) {
-                tokio::task::yield_now().await;
-            }
-        }
-        Ok(Some(FinalizedSetup {
-            height: 10,
-            bond: None,
-            payment: None,
-            lease: LeaseSlots::Absent,
-            live_funding: query.funding,
-        }))
-    }
+    let advance = advance_setup(&older, &sink, &mut journal, &verifier)
+        .await
+        .expect("the step answers");
+    assert_eq!(advance.progress, SetupProgress::AwaitingFinalizedState);
+    assert_eq!(journal.state().end(), None);
 }
 
 /// A sink that keeps what it was handed.
@@ -2691,164 +2014,8 @@ impl TxSink for Mempool {
     }
 }
 
-/// A close ordered after the payment Open in the origin block itself is
-/// seen when the channel is mounted, not lost with the block that opened
-/// it.
-///
-/// The origin block carries the payment Open and, after it, a client's
-/// `StartPaymentClose` on that very edge. A later block times the bond
-/// out, which is what puts this setup on the close-only recovery path.
-/// The mount opens with its cursor already on the origin block, so a
-/// same-block contest is exactly the one an inclusive-observe would drop
-/// — and the assertion is that the channel the caller is handed holds
-/// it, without the caller having replayed anything itself.
-#[tokio::test]
-async fn a_mount_replays_a_same_block_contest() {
-    let dir = temp();
-    let verifier = Secp256k1Verifier::new();
-    let mut journal = completed_store(dir.path()).await;
-    let content = hellas_channel::test_support::channel::content_store(dir.path()).await;
-    journal.set_content_store(content.clone());
-
-    let bundle = completed(countersigned(proposed()));
-    let payment_open = bundle.payment_open().expect("the executable payment Open");
-    let bond_close = Tx::timeout_close(bond_edge(), &Terms::work_stake_bond(bond_terms()))
-        .expect("the bond has a deterministic timeout close");
-
-    let origin_payload = [0x71; 32];
-    let blocks = Blocks {
-        blocks: vec![
-            FinalizedWork {
-                height: scan().height + 1,
-                parent: scan().payload,
-                payload: origin_payload,
-                txs: vec![payment_open, same_block_contest()],
-            },
-            FinalizedWork {
-                height: scan().height + 2,
-                parent: origin_payload,
-                payload: [0x72; 32],
-                txs: vec![bond_close],
-            },
-        ],
-    };
-
-    let view = SurvivingPayment::at(scan().height + 2, payment_object());
-    let advance = match advance_setup(&view, &blocks, &NoSink, &mut journal, &verifier).await {
-        Ok(advance) => advance,
-        Err(error) => panic!("a bond-timed-out payment mounts close-only: {error}"),
-    };
-    let SetupProgress::CloseOnly { origin, settled } = advance.progress else {
-        panic!(
-            "a bond-timed-out payment mounts close-only: {:?}",
-            advance.progress
-        );
-    };
-    assert!(!settled, "the payment edge is contested, not closed");
-    assert_eq!(
-        origin.height,
-        scan().height + 1,
-        "the origin is the payment Open block"
-    );
-
-    // The channel handed back holds the contest: the Start ordered after
-    // the Open in the origin block was replayed, not dropped with the
-    // block the cursor already sat on. Nothing here re-derived it.
-    let mounted = advance
-        .mounted
-        .expect("a close-only mount hands back the channel it opened");
-    assert!(
-        mounted.state().close_opened().is_some(),
-        "the same-block contest is journaled on the mounted channel",
-    );
-}
-
-/// A client's contiguous history crosses the bond Timeout that anyone
-/// could have sent, and its cursor keeps moving.
-///
-/// A leased bond may be permissionlessly timed out at its horizon while
-/// the payment edge survives, so every client will eventually fetch a
-/// block carrying that Close. A batch is applied whole, and a client may
-/// not record bond Close evidence — so a batch that carried it would be
-/// refused, and refused again on every retry, with the cursor stuck
-/// below the block it landed in for good. The Close is left out and the
-/// header is not.
-#[tokio::test]
-async fn a_client_history_crosses_a_permissionless_bond_timeout() {
-    let dir = temp();
-    let verifier = Secp256k1Verifier::new();
-    let mut journal = client_completed_store(dir.path()).await;
-    let content = hellas_channel::test_support::channel::content_store(dir.path()).await;
-    journal.set_content_store(content.clone());
-
-    let bundle = completed(countersigned(proposed()));
-    let payment_open = bundle.payment_open().expect("the executable payment Open");
-    let bond_close = Tx::timeout_close(bond_edge(), &Terms::work_stake_bond(bond_terms()))
-        .expect("the bond has a deterministic timeout close");
-
-    let origin_payload = [0x81; 32];
-    let timeout_payload = [0x82; 32];
-    let blocks = Blocks {
-        blocks: vec![
-            FinalizedWork {
-                height: scan().height + 1,
-                parent: scan().payload,
-                payload: origin_payload,
-                txs: vec![payment_open],
-            },
-            FinalizedWork {
-                height: scan().height + 2,
-                parent: origin_payload,
-                payload: timeout_payload,
-                txs: vec![bond_close],
-            },
-        ],
-    };
-    let view = SurvivingPayment::at(scan().height + 2, payment_object());
-
-    let advance = advance_setup(&view, &blocks, &NoSink, &mut journal, &verifier).await;
-    assert_eq!(
-        journal.state().scan_cursor().map(|scan| scan.height),
-        Some(scan().height + 2),
-        "the cursor moved past the block the bond died in",
-    );
-    assert_eq!(
-        journal.state().scan_cursor().map(|scan| scan.payload),
-        Some(timeout_payload)
-    );
-    assert!(
-        !journal.state().close_only_recovery(),
-        "client does not record the provider's bond reclaim"
-    );
-
-    // The client is not stuck: the surviving payment edge mounts, and
-    // its origin is the block its own Open landed in.
-    match advance {
-        Ok(advance) => match advance.progress {
-            SetupProgress::CloseOnly { origin, settled } => {
-                assert!(!settled, "the payment edge outlived the bond");
-                assert_eq!(origin.height, scan().height + 1);
-                assert!(
-                    advance.mounted.is_some(),
-                    "and the client is handed the channel it mounted",
-                );
-            }
-            other => panic!("the client mounts the surviving payment edge: {other:?}"),
-        },
-        Err(error) => panic!("the client mounts the surviving payment edge: {error}"),
-    }
-}
-
-/// A payment edge that outlived its bond settles at what it holds, not
-/// at what the provider's configuration expected it to hold.
-///
-/// An edge's id is a hash over its funding coins and its terms, never
-/// over what those coins are worth, so the client that names them
-/// decides the value and an overfunded edge is this same channel. The
-/// mount therefore has to read the edge, and it has to read it before it
-/// fixes the number every close it builds must distribute: 4,096 is what
-/// consensus will make an adjudicated close hand out, and 1,200 — the
-/// configured expectation — is a close consensus refuses.
+/// A payment edge that outlived its bond mounts close-only and settles at
+/// what it holds, not at what the configuration expected it to hold.
 #[tokio::test]
 async fn an_overfunded_close_only_channel_settles_at_the_edge_it_holds() {
     let dir = temp();
@@ -2857,32 +2024,8 @@ async fn an_overfunded_close_only_channel_settles_at_the_edge_it_holds() {
     let content = hellas_channel::test_support::channel::content_store(dir.path()).await;
     journal.set_content_store(content.clone());
 
-    let bundle = completed(countersigned(proposed()));
-    let payment_open = bundle.payment_open().expect("the executable payment Open");
-    let bond_close = Tx::timeout_close(bond_edge(), &Terms::work_stake_bond(bond_terms()))
-        .expect("the bond has a deterministic timeout close");
-
-    let origin_payload = [0x91; 32];
-    let blocks = Blocks {
-        blocks: vec![
-            FinalizedWork {
-                height: scan().height + 1,
-                parent: scan().payload,
-                payload: origin_payload,
-                txs: vec![payment_open],
-            },
-            FinalizedWork {
-                height: scan().height + 2,
-                parent: origin_payload,
-                payload: [0x92; 32],
-                txs: vec![bond_close],
-            },
-        ],
-    };
-    let view = SurvivingPayment::at(scan().height + 2, overfunded_payment_object());
-
-    // The first mount, on the journal-only route: it still reads.
-    let advance = match advance_setup(&view, &blocks, &NoSink, &mut journal, &verifier).await {
+    let read = surviving_payment(journal.state(), FLOOR + 2, overfunded_payment_object());
+    let advance = match advance_setup(&read, &NoSink, &mut journal, &verifier).await {
         Ok(advance) => advance,
         Err(error) => panic!("a bond-timed-out payment mounts close-only: {error}"),
     };
@@ -2892,76 +2035,27 @@ async fn an_overfunded_close_only_channel_settles_at_the_edge_it_holds() {
             advance.progress
         );
     };
-    assert!(journal.state().close_only_recovery());
     assert!(!settled, "the payment edge outlived the bond");
-    assert_eq!(
-        view.reads(),
-        1,
-        "the mount settled against a coherent read of the edge",
-    );
-
-    // And what it settled against is the number consensus will make an
-    // adjudicated close hand out, on the channel the caller was handed
-    // rather than on one the caller built for itself.
+    assert_eq!(origin.height, FLOOR + 2);
     let mounted = advance
         .mounted
         .expect("a close-only mount hands back the channel it opened");
     assert_eq!(mounted.state().settlement().adjudicated_total(), 4_096);
     assert_eq!(mounted.state().settlement().capacity(), 2_047);
-    // The channel journal is held for as long as that store lives, so
-    // the restart below is a restart of both files.
     drop(mounted);
-
-    // The restart: the same journal reopened over its own files takes
-    // the same step to the same answer.
     drop(journal);
+
+    // The restart reaches the recorded origin and settles again from the read.
     let mut restarted = store(dir.path(), Role::Provider).await;
     restarted.set_content_store(content.clone());
-    match advance_setup(&view, &blocks, &NoSink, &mut restarted, &verifier).await {
-        Ok(advance) => match advance.progress {
-            SetupProgress::CloseOnly {
-                origin: again,
-                settled,
-            } => {
-                assert!(!settled);
-                assert_eq!(again, origin, "the restart mounts the same channel");
-                let mounted = advance
-                    .mounted
-                    .expect("the restart is handed the channel too");
-                assert_eq!(
-                    mounted.state().settlement().adjudicated_total(),
-                    4_096,
-                    "and it settles at the funded edge, not at the configuration",
-                );
-            }
-            other => panic!("the restart mounts close-only: {other:?}"),
-        },
-        Err(error) => panic!("the restart mounts close-only: {error}"),
-    }
-    assert_eq!(view.reads(), 2, "and it read the edge again to do it");
-
-    // And what both mounts settled against is what an adjudicated close
-    // has to distribute. The expectation is not: a close built on it
-    // would hand out 1,200 from an edge holding 4,096, and consensus
-    // takes a close whose outputs sum to exactly what the edge
-    // distributes or none at all.
-    let descriptor = restarted
-        .state()
-        .close_descriptor()
-        .expect("the armed close descriptor");
-    let funded = descriptor
-        .funded_settlement(&overfunded_payment_object())
-        .expect("the surviving edge settles");
-    let expected = descriptor
-        .expected_settlement()
-        .expect("the configured expectation settles");
-    assert_eq!(funded.adjudicated_total(), 4_096);
-    assert_eq!(funded.capacity(), 2_047);
-    assert_eq!(
-        expected.adjudicated_total(),
-        3_200,
-        "the expectation is a different close from the one this edge can pay",
-    );
+    let advance = advance_setup(&read, &NoSink, &mut restarted, &verifier)
+        .await
+        .expect("the restart mounts");
+    assert_eq!(advance.progress, SetupProgress::Complete(origin));
+    let mounted = advance
+        .mounted
+        .expect("the restart is handed the channel too");
+    assert_eq!(mounted.state().settlement().adjudicated_total(), 4_096);
 }
 
 /// Every ending this handshake can reach survives the journal, under
@@ -3039,9 +2133,6 @@ async fn replay_checks_the_signatures_again() {
         else {
             panic!("the journal opens");
         };
-        if let Err(error) = credulous.commit(scan_record(), &AcceptAll).await {
-            panic!("the scan arm commits: {error}");
-        }
         if let Err(error) = credulous.commit(bundle_record(&forged), &AcceptAll).await {
             panic!("a credulous verifier accepts it: {error}");
         }
@@ -3091,17 +2182,6 @@ async fn in_flight_store(root: &std::path::Path) -> SetupStore {
         SetupRecord::BondSubmitted,
         SetupRecord::PaymentSubmitted,
         SetupRecord::BondTimeoutSubmitted,
-        SetupRecord::Observed(
-            store
-                .state()
-                .observe(&[FinalizedWork {
-                    height: scan().height + 1,
-                    parent: scan().payload,
-                    payload: [0x48; 32],
-                    txs: Vec::new(),
-                }])
-                .expect("contiguous finalized observation"),
-        ),
     ] {
         if let Err(error) = store.commit(record, &verifier).await {
             panic!("the in-flight fixture commits: {error}");
@@ -3117,46 +2197,9 @@ async fn in_flight_store(root: &std::path::Path) -> SetupStore {
 async fn settled_store(root: &std::path::Path) -> SetupStore {
     let verifier = Secp256k1Verifier::new();
     let mut store = completed_store(root).await;
-    let three = completed(countersigned(proposed()));
-    let (Some(bond_open), Some(payment_open)) = (three.bond_open(), three.payment_open()) else {
-        panic!("an executable revision holds both Opens");
-    };
-    // A work-payment edge commits no timeout payout, so the two closes
-    // are built the same way rather than one of each: what the journal
-    // reads off a close is its input edge, and nothing else.
-    let bond = Terms::work_stake_bond(bond_terms());
-    let Some(outputs) = bond.timeout_outputs().cloned() else {
-        panic!("a bond commits its timeout payout");
-    };
-    let close_of =
-        |edge: EdgeId| Tx::close(edge, Proof::timeout(bond.clone(), None), outputs.clone());
-    let blocks = vec![
-        FinalizedWork {
-            height: scan().height + 1,
-            parent: scan().payload,
-            payload: [0x48; 32],
-            txs: vec![bond_open],
-        },
-        FinalizedWork {
-            height: scan().height + 2,
-            parent: [0x48; 32],
-            payload: [0x49; 32],
-            txs: vec![payment_open],
-        },
-        FinalizedWork {
-            height: scan().height + 3,
-            parent: [0x49; 32],
-            payload: [0x4a; 32],
-            txs: vec![close_of(bond_edge()), close_of(payment_edge())],
-        },
-    ];
+    let seen_live = seen(store.state(), FLOOR + 3, true, true);
     for record in [
-        SetupRecord::Observed(
-            store
-                .state()
-                .observe(&blocks)
-                .expect("contiguous finalized observation"),
-        ),
+        seen_live,
         SetupRecord::Ended {
             outcome: SetupEnd::Aborted(SetupAbort::BondReclaimed),
         },
@@ -3225,15 +2268,12 @@ async fn a_checkpoint_replays_to_what_the_frames_replayed_to() {
     assert!(in_flight.payment_submitted());
     assert_eq!(in_flight.revision(), Some(3));
     assert!(in_flight.close_descriptor().is_some());
-    assert!(in_flight.scan_armed().is_some());
-    assert_ne!(in_flight.scan_cursor(), in_flight.scan_armed());
     assert_eq!(in_flight.end(), None);
 
     let settled = temp();
     let settled = settled_store(settled.path()).await;
     let settled = settled.state();
-    assert!(settled.origin().is_some());
-    assert!(settled.close_only_recovery());
+    assert_eq!(settled.observed_height(), Some(FLOOR + 3));
     assert!(!settled.submitted_open_unresolved());
     assert_eq!(
         settled.end(),
@@ -3286,85 +2326,23 @@ fn payment_policy() -> hellas_channel::model::work::JobPaymentPolicyV2 {
     }
 }
 
+/// A spend nothing this journal saw explains is a fault on the first read
+/// that shows it: an edge that opened and closed while unwatched leaves
+/// no state to tell it from a theft, and recovering it is an operator's.
 #[tokio::test]
-async fn finalized_observations_keep_setup_checkpoints_bounded_and_refuse_stale_replay() {
-    let dir = temp();
-    let verifier = Secp256k1Verifier::new();
-    let mut journal = completed_store(dir.path()).await;
-    let initial_size = journal.state().checkpoint().unwrap().len();
-    for _ in 0..20 {
-        let mut cursor = journal.state().scan_cursor().unwrap();
-        let blocks: Vec<_> = (0..256)
-            .map(|_| {
-                let height = cursor.height + 1;
-                let mut payload = [0; 32];
-                payload[..8].copy_from_slice(&height.to_be_bytes());
-                let block = FinalizedWork {
-                    height,
-                    parent: cursor.payload,
-                    payload,
-                    txs: vec![],
-                };
-                cursor = SetupScan { height, payload };
-                block
-            })
-            .collect();
-        let observed = journal.state().observe(&blocks).unwrap();
-        let record = SetupRecord::Observed(observed);
-        assert!(record.encode().unwrap().len() < 256);
-        journal.commit(record.clone(), &verifier).await.unwrap();
-        let before = journal.state().clone();
-        assert!(journal.commit(record, &verifier).await.is_err());
-        assert_eq!(journal.state(), &before);
-        assert_eq!(journal.state().checkpoint().unwrap().len(), initial_size);
-    }
-    let expected = journal.state().clone();
-    journal.rotate().await.unwrap();
-    drop(journal);
-    assert_eq!(store(dir.path(), Role::Provider).await.state(), &expected);
-}
-
-#[tokio::test]
-async fn a_terminal_decision_waits_for_the_block_explaining_spent_funding() {
-    struct Spent;
-    impl SetupView for Spent {
-        async fn finalized_setup(
-            &self,
-            _: SetupQuery,
-        ) -> Result<Option<FinalizedSetup>, BlockSourceError> {
-            Ok(Some(FinalizedSetup {
-                height: scan().height + 1,
-                bond: None,
-                payment: None,
-                lease: LeaseSlots::Absent,
-                live_funding: without(BOND_COIN),
-            }))
-        }
-    }
+async fn an_unexplained_spend_faults_on_the_read_that_shows_it() {
     let directory = temp();
     let mut journal = completed_store(directory.path()).await;
     let verifier = Secp256k1Verifier::new();
-    let advance = advance_setup(
-        &Spent,
-        &Blocks { blocks: vec![] },
-        &NoSink,
-        &mut journal,
-        &verifier,
-    )
-    .await
-    .unwrap();
-    assert_eq!(advance.progress, SetupProgress::AwaitingFinalizedState);
-    assert_eq!(journal.state().end(), None);
-    // Once the matching height was scanned, an unexplained spend is terminal.
-    let blocks = Blocks {
-        blocks: vec![FinalizedWork {
-            height: scan().height + 1,
-            parent: scan().payload,
-            payload: [0xce; 32],
-            txs: vec![],
-        }],
-    };
-    let advance = advance_setup(&Spent, &blocks, &NoSink, &mut journal, &verifier)
+    let spent = read(
+        journal.state(),
+        FLOOR + 1,
+        None,
+        None,
+        LeaseSlots::Absent,
+        without(BOND_COIN),
+    );
+    let advance = advance_setup(&spent, &NoSink, &mut journal, &verifier)
         .await
         .unwrap();
     assert_eq!(

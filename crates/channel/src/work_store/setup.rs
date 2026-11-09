@@ -199,28 +199,15 @@ pub struct ObservedSetup<'a> {
     pub live_funding: &'a BTreeSet<CoinId>,
 }
 
-/// The immutable finalized observation floor retained before an executable
-/// authorization can leave an endpoint.
+/// What one certified read showed this setup, at the facts its decisions
+/// keep: the edges this endpoint has seen live. Only
+/// `SetupState::observe` can construct it, and it is journaled only when
+/// it teaches the journal something.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SetupScan {
-    /// Finalized height already observed when the setup was armed.
-    pub height: u64,
-    /// Payload digest at `height`; the first history block must name it as
-    /// parent.
-    pub payload: [u8; 32],
-}
-
-/// A bounded observation of finalized blocks. Only `SetupState::observe` can
-/// construct it; journals retain the cursor and outcomes, never transactions.
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SetupObservation {
-    from: SetupScan,
-    through: SetupScan,
-    bond_finalized: bool,
-    payment_finalized: bool,
-    bond_closed: bool,
-    payment_closed: bool,
-    origin: Option<SetupOrigin>,
+    height: u64,
+    bond_live: bool,
+    payment_live: bool,
 }
 
 /// One durable step of the handshake.
@@ -233,7 +220,6 @@ pub enum SetupRecord {
     /// The original offer and authenticated peer, durable with revision one.
     Offer {
         peer: [u8; 32],
-        floor: Option<SetupScan>,
         offer: Box<crate::model::offer::SignedPaidOffer>,
     },
     /// One revision of the handshake, written before the signature it
@@ -241,14 +227,6 @@ pub enum SetupRecord {
     Bundle {
         /// The revision's exact canonical bytes.
         bundle: Vec<u8>,
-    },
-    /// The immutable observation floor, written once before revision 1 (the
-    /// provider) or revision 2 (the client) can be exported.
-    ScanArmed {
-        /// Finalized height already observed.
-        height: u64,
-        /// Payload digest at `height`.
-        payload: [u8; 32],
     },
     /// An executable revision and everything close-only recovery needs,
     /// committed together before that revision is returned to the peer.
@@ -258,7 +236,8 @@ pub enum SetupRecord {
         /// The admitted descriptor recovered without operator configuration.
         close_descriptor: Box<CloseDescriptor>,
     },
-    /// The cursor and outcomes of a contiguous finalized scan.
+    /// A certified read showed an edge live that this journal had not
+    /// seen live.
     Observed(SetupObservation),
     /// The provider is about to submit the deterministic bond Timeout.
     BondTimeoutSubmitted,
@@ -266,17 +245,14 @@ pub enum SetupRecord {
     BondSubmitted,
     /// The retained payment Open is about to be broadcast.
     PaymentSubmitted,
-    /// Both edges and the lease are finalized, at this block.
+    /// The payment edge was first seen live, by proof, at this block.
     Complete {
         /// The payment edge the retained bundle derives.
         payment_edge: EdgeId,
-        /// Height of the block carrying the accepted payment Open.
+        /// Height of the certified read that first showed the edge.
         origin_height: u64,
         /// Payload digest of that block.
         origin_payload: [u8; 32],
-        /// Payload digest of that block's parent, which is the watcher
-        /// cursor immediately before the channel existed.
-        origin_parent: [u8; 32],
     },
     /// Setup ended without a channel.
     Ended {
@@ -291,7 +267,6 @@ mod tag {
     pub(super) const PAYMENT_SUBMITTED: u8 = 2;
     pub(super) const COMPLETE: u8 = 3;
     pub(super) const ENDED: u8 = 4;
-    pub(super) const SCAN_ARMED: u8 = 5;
     pub(super) const ARMED_BUNDLE: u8 = 6;
     pub(super) const OBSERVED: u8 = 7;
     pub(super) const BOND_TIMEOUT_SUBMITTED: u8 = 8;
@@ -336,17 +311,20 @@ const fn end_from_code(code: u8) -> Option<SetupEnd> {
     })
 }
 
-/// Where the channel this journal opens is finalized.
+/// Where this endpoint first saw the channel it opens.
+///
+/// Recorded locally, by each party for itself: the certified read that
+/// first showed the payment edge live and leased. It is the channel
+/// journal's starting cursor and nothing else, so two parties may record
+/// different heights for the same channel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SetupOrigin {
     /// The payment edge the handshake produced.
     pub payment_edge: EdgeId,
-    /// Height of the block carrying the accepted payment Open.
+    /// Height of the read that first showed it.
     pub height: u64,
     /// Payload digest of that block.
     pub payload: [u8; 32],
-    /// Payload digest of its parent: the watcher's starting cursor.
-    pub parent: [u8; 32],
 }
 
 /// Everything the handshake has durably reached.
@@ -358,15 +336,12 @@ pub struct SetupState {
     role: Role,
     bundle: Option<WorkChannelSetupBundleV2>,
     bundle_bytes: Vec<u8>,
-    scan_armed: Option<SetupScan>,
     close_descriptor: Option<CloseDescriptor>,
     unresolved_bond_open: bool,
     unresolved_payment_open: bool,
-    scan_cursor: Option<SetupScan>,
+    observed_height: Option<u64>,
     bond_finalized: bool,
     payment_finalized: bool,
-    bond_closed: bool,
-    payment_closed: bool,
     bond_timeout_submitted: bool,
     origin: Option<SetupOrigin>,
     end: Option<SetupEnd>,

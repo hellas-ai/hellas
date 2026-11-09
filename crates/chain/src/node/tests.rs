@@ -161,6 +161,7 @@ impl Fixture {
             hellas_kernel::Context::with_fees(
                 crate::domain::network_id(self.config.genesis()).unwrap(),
                 hellas_kernel::BlockHeight::new(height),
+                height * 1_000,
                 hellas_kernel::BlockHash::from_bytes(self.head.digest().0),
                 domain::KERNEL_FEES,
             ),
@@ -1437,7 +1438,7 @@ fn full_node_derives_h0_from_the_selected_custom_genesis() {
 fn nonindexed_full_node_refuses_an_expiring_threshold_key() {
     use commonware_cryptography::{Hasher as _, Sha256};
     let mut genesis: hellas_genesis::Genesis =
-        serde_json::from_str(hellas_genesis::HELLAS_DEVNET_2_JSON).unwrap();
+        serde_json::from_str(hellas_genesis::HELLAS_DEVNET_3_JSON).unwrap();
     genesis.network_id = "custom-node-rotating-1".into();
     let genesis_json = serde_json::to_string(&genesis).unwrap();
     let mut trust = hellas_genesis::ChainProfile::known(hellas_genesis::Chain::Devnet)

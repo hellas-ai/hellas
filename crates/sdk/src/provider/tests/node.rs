@@ -4,10 +4,8 @@ use hellas_channel::test_support::channel::{
     client, provider, provider_producer, signer, work_policy,
 };
 use hellas_channel::work::WorkBackend;
-use hellas_channel::work_close::FinalizedBlocks;
 use hellas_channel::work_close::TxSink;
 use hellas_channel::work_handshake::{PaymentAdmission, SetupEndpoint};
-use hellas_channel::work_open::SetupView;
 use hellas_channel::work_store::{ChannelStore, JobPhase, Role, SetupStore};
 use hellas_executor::FetchRouteRegistry;
 use hellas_kernel::{EdgeId, NetworkId, PartyKeys, Secp256k1Signer, Secp256k1Verifier};
@@ -40,18 +38,16 @@ use hellas_channel::model::work::{
     payment_binding_digest, private_policy_commitment, result_digest, signing_hash, work_id,
 };
 use hellas_channel::work::{BackendFault, WorkRefusal};
-use hellas_channel::work_close::{BlockSourceError, FinalizedWork};
+use hellas_channel::work_close::BlockSourceError;
 use hellas_channel::work_handshake::{apply_setup_exchange, prepare_setup_exchange};
-use hellas_channel::work_open::{FinalizedSetup, SetupQuery};
 use hellas_channel::work_store::{
-    Channel, ChannelRecord, SetupEnd, SetupOrigin, SetupRecord, SetupScan, TerminalOutcome,
+    Channel, ChannelRecord, SetupEnd, SetupOrigin, SetupRecord, TerminalOutcome,
 };
 use hellas_kernel::{
     Auth, BlockHeight, BufferWriter, CoinId, Decode as _, Edge, EdgeValues, Encode as _, Fees,
-    Funding, LeaseSlots, List, MAX_PARTY_INPUTS, MAX_START_VALIDITY_BLOCKS,
-    MIN_OMIT_RESPONSE_BLOCKS, Move, Parties, Party, Payout, PendingPaymentClose, Proof,
-    RegistryChunk, RegistryNamespace, RegistryRecordTag, StartId, Terms, Tx, WorkPaymentSettlement,
-    WorkPaymentTerms, WorkStakeBondTerms, Writer as _,
+    Funding, LeaseSlots, List, MAX_PARTY_INPUTS, MAX_START_VALIDITY_BLOCKS, Move, Parties, Party,
+    Payout, PendingPaymentClose, Proof, RegistryChunk, RegistryNamespace, RegistryRecordTag,
+    StartId, Terms, Tx, WorkPaymentSettlement, WorkPaymentTerms, WorkStakeBondTerms, Writer as _,
 };
 use hellas_rpc::call::WithTrailer;
 use hellas_rpc::protocol::invocation::PreparedInvocation;
@@ -485,8 +481,6 @@ async fn two_vouched_peers_receive_their_distinct_configured_offers() {
         WorkRunnerConfig {
             chain: crate::test_support::chain_dir(dir.path(), network()),
 
-            poll: Duration::from_millis(1),
-            max_observation_age: HANG_GUARD,
             settlement_key: provider(),
         },
         MountedWork::default(),
@@ -615,9 +609,6 @@ async fn discover_two_route_runner(
     let runner = match WorkRunner::discover(
         WorkRunnerConfig {
             chain: crate::test_support::chain_dir(root, network()),
-
-            poll: Duration::from_millis(1),
-            max_observation_age: HANG_GUARD,
             settlement_key: provider(),
         },
         work_mount.clone(),
@@ -704,7 +695,7 @@ async fn completion_clears_and_mounts_only_the_completing_route() {
     second
         .seed_provider_offer(dir.path(), admits(), second_route_peer())
         .await;
-    let source = Chain::routed([first.bond_edge()], [first.ready_snapshot(ORIGIN, None)]);
+    let source = Chain::routed([first.ready_snapshot(ORIGIN, None)]);
     let work_mount = MountedWork::default();
     let content = hellas_channel::test_support::channel::content_store(dir.path()).await;
     let setup_mount = MountedSetup::with_content_store(content.clone());
@@ -803,13 +794,10 @@ async fn requests_use_local_observation_and_one_contested_route_does_not_disable
     let second = OfferFixture::second();
     first.write_completed_setup(dir.path()).await;
     second.write_completed_setup(dir.path()).await;
-    let source = Chain::routed(
-        [first.bond_edge(), second.bond_edge()],
-        [
-            first.ready_snapshot(ORIGIN, None),
-            second.ready_snapshot(ORIGIN, None),
-        ],
-    );
+    let source = Chain::routed([
+        first.ready_snapshot(ORIGIN, None),
+        second.ready_snapshot(ORIGIN, None),
+    ]);
     let work_mount = MountedWork::default();
     let content = hellas_channel::test_support::channel::content_store(dir.path()).await;
     let setup_mount = MountedSetup::with_content_store(content.clone());
@@ -935,6 +923,58 @@ async fn requests_use_local_observation_and_one_contested_route_does_not_disable
     );
 }
 
+/// A source whose submissions never answer, over the fixture chain's reads.
+#[derive(Clone)]
+struct UnansweredSubmissions(Chain);
+
+impl FinalizedWorkView for UnansweredSubmissions {
+    async fn work_channel_snapshot(
+        &self,
+        query: WorkChannelQuery,
+    ) -> Result<Option<hellas_chain::Verified<WorkChannelSnapshot>>, QueryError> {
+        self.0.work_channel_snapshot(query).await
+    }
+}
+
+impl TxSink for UnansweredSubmissions {
+    async fn submit(&self, _tx: Tx) -> Result<SubmitTxOutcome, BlockSourceError> {
+        std::future::pending().await
+    }
+}
+
+/// One loop drives every journal, so a submission the chain never answers
+/// must not stall it: the step gives up at the certified-age bound and the
+/// tick reports a failed source, which the loop answers by redialling.
+#[tokio::test]
+async fn an_unanswered_submission_fails_the_source_instead_of_stalling_the_clock() {
+    let dir = temp();
+    let first = OfferFixture::first();
+    let second = OfferFixture::second();
+    first.write_completed_setup(dir.path()).await;
+    second.write_completed_setup(dir.path()).await;
+    write_contested_channel(dir.path()).await;
+    let source = UnansweredSubmissions(Chain::routed([
+        first.channel_snapshot(RESPONSE_HEIGHT, None, Some(pending_contest(false))),
+        second.channel_snapshot(
+            second.bond_terms().timeout.get(),
+            Some(second.live_bond()),
+            None,
+        ),
+    ]));
+    let work_mount = MountedWork::default();
+    let content = hellas_channel::test_support::channel::content_store(dir.path()).await;
+    let setup_mount = MountedSetup::with_content_store(content.clone());
+    let mut runner =
+        discover_two_route_runner(dir.path(), &work_mount, &setup_mount, &content).await;
+
+    // The clock jumps over the bound once the step is only waiting on it.
+    tokio::time::pause();
+    assert!(
+        !runner.tick(&source).await,
+        "an unanswered submission is a failed source"
+    );
+}
+
 /// Connections are irrelevant to close duty. With neither peer dialled,
 /// one tick still advances every owned journal and submits both unrelated
 /// permissionless closes that their coherent snapshots make due.
@@ -946,17 +986,14 @@ async fn one_tick_drives_every_owned_journal_without_connected_clients() {
     first.write_completed_setup(dir.path()).await;
     second.write_completed_setup(dir.path()).await;
     let start_id = write_contested_channel(dir.path()).await;
-    let source = Chain::routed(
-        [first.bond_edge(), second.bond_edge()],
-        [
-            first.channel_snapshot(ORIGIN, None, Some(pending_contest(true))),
-            second.channel_snapshot(
-                second.bond_terms().timeout.get(),
-                Some(second.live_bond()),
-                None,
-            ),
-        ],
-    );
+    let source = Chain::routed([
+        first.channel_snapshot(RESPONSE_HEIGHT, None, Some(pending_contest(false))),
+        second.channel_snapshot(
+            second.bond_terms().timeout.get(),
+            Some(second.live_bond()),
+            None,
+        ),
+    ]);
     let work_mount = MountedWork::default();
     let content = hellas_channel::test_support::channel::content_store(dir.path()).await;
     let setup_mount = MountedSetup::with_content_store(content.clone());
@@ -967,6 +1004,11 @@ async fn one_tick_drives_every_owned_journal_without_connected_clients() {
         runner.tick(&source).await,
         "the one source answers both clocks"
     );
+    source.set_snapshot(first.channel_snapshot(
+        RESPONSE_HEIGHT + 1,
+        None,
+        Some(pending_contest(true)),
+    ));
     source.set_snapshot(second.channel_snapshot(second.bond_terms().timeout.get(), None, None));
     assert!(
         runner.tick(&source).await,
@@ -1010,7 +1052,10 @@ async fn one_tick_drives_every_owned_journal_without_connected_clients() {
             )
         })
         .count();
-    assert_eq!(responses, 1, "A's retained response is resubmitted");
+    assert_eq!(
+        responses, 1,
+        "A's answer is sent until a read shows it landed"
+    );
     assert_eq!(adjudications, 1, "A's adjudication is submitted");
     assert_eq!(timeouts, 1, "B's bond timeout is submitted");
     assert_eq!(
@@ -1084,15 +1129,24 @@ const PAYMENT_RESERVE: u64 = 200;
 /// The finalized block this channel's payment Open landed in, and so
 /// the cursor every mount of it starts at.
 const ORIGIN: u64 = 44;
-/// The finalized block that opened the fixture contest.
+/// The certified block that opened the fixture contest.
 const CONTEST_HEIGHT: u64 = ORIGIN + 1;
-/// Height at which the fixture contest's response window shuts. Above
-/// the origin, which is what makes the answer below a timely one.
-const RESPONSE_DEADLINE: u64 = CONTEST_HEIGHT + MIN_OMIT_RESPONSE_BLOCKS;
-/// The finalized block that accepted the fixture contest response.
+/// A certified read after the contest opened.
 const RESPONSE_HEIGHT: u64 = CONTEST_HEIGHT + 1;
-/// The immutable history floor both journals are armed at.
+/// The certified height the node-chain fixture starts at.
 const FLOOR: u64 = 7;
+
+/// The block time the fixture contest was accepted at: this process's
+/// first ask, so every read the tests take is inside its window.
+fn contest_time_ms() -> u64 {
+    static TIME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *TIME.get_or_init(hellas_channel::test_support::channel::now_ms)
+}
+
+/// Block time at which the fixture contest's response window shuts.
+fn response_deadline_ms() -> u64 {
+    contest_time_ms() + hellas_kernel::RESPONSE_WINDOW_MS
+}
 
 fn network() -> NetworkId {
     let Some(network) = NetworkId::new("hellas-devnet-1") else {
@@ -1182,7 +1236,6 @@ fn payment_terms() -> WorkPaymentTerms {
         bond_edge(),
         bond_terms(),
         private_policy_commitment(network(), &SALT, &channel_policy()),
-        MIN_OMIT_RESPONSE_BLOCKS,
         MAX_START_VALIDITY_BLOCKS,
         OMISSION_BOND,
     )
@@ -1196,7 +1249,6 @@ fn provider_policy() -> ProviderChannelPolicy {
         channel_policy: channel_policy(),
         invocation_policy: work_policy(),
         expected_payment_values: EdgeValues::new(PAYMENT_VALUE, PAYMENT_RESERVE, Fees::ZERO),
-        min_omit_response_blocks: MIN_OMIT_RESPONSE_BLOCKS,
     }
 }
 
@@ -1222,10 +1274,6 @@ fn recorded_offer(
     .unwrap();
     SetupRecord::Offer {
         peer: peer.into_bytes(),
-        floor: Some(SetupScan {
-            height: FLOOR,
-            payload: payload_at(FLOOR),
-        }),
         offer: Box::new(offer),
     }
 }
@@ -1250,36 +1298,6 @@ fn proposed() -> WorkChannelSetupBundleV2 {
     ) {
         Ok(bundle) => bundle,
         Err(error) => panic!("the fixture bond proposes: {error}"),
-    }
-}
-
-fn countersigned(bundle: WorkChannelSetupBundleV2) -> WorkChannelSetupBundleV2 {
-    let bond_hash = bundle.bond_open_hash();
-    let payment_hash = Tx::open_hash(
-        network(),
-        &payment_funding(),
-        &Terms::work_payment(payment_terms()),
-    );
-    match bundle.countersign_bond_and_propose_payment(
-        hellas_kernel::PartyAuth::signer(Auth::native(client().sign(bond_hash))),
-        payment_funding(),
-        payment_terms(),
-        hellas_kernel::PartyAuth::signer(Auth::native(client().sign(payment_hash))),
-    ) {
-        Ok(bundle) => bundle,
-        Err(error) => panic!("the fixture payment proposes: {error}"),
-    }
-}
-
-fn completed(bundle: WorkChannelSetupBundleV2) -> WorkChannelSetupBundleV2 {
-    let Some(hash) = bundle.payment_open_hash() else {
-        panic!("a proposed payment has an open hash");
-    };
-    match bundle.countersign_payment(hellas_kernel::PartyAuth::signer(Auth::native(
-        provider().sign(hash),
-    ))) {
-        Ok(bundle) => bundle,
-        Err(error) => panic!("the fixture payment countersigns: {error}"),
     }
 }
 
@@ -1321,7 +1339,6 @@ fn origin() -> SetupOrigin {
         payment_edge: payment_edge(),
         height: ORIGIN,
         payload: payload_at(ORIGIN),
-        parent: payload_at(ORIGIN - 1),
     }
 }
 
@@ -1599,32 +1616,25 @@ async fn write_contested_channel(root: &Path) -> StartId {
         ChannelRecord::CloseOpened {
             start_id,
             opener: Party::Maker,
-            response_deadline: RESPONSE_DEADLINE,
+            response_deadline_ms: response_deadline_ms(),
             claimed: 0,
         },
     )
     .await;
-    let pending =
-        PendingPaymentClose::from_accepted_start(network(), CONTEST_HEIGHT, &contest_start())
-            .expect("the fixture contest start creates pending state");
-    commit(
-        &mut store,
-        ChannelRecord::CloseHistoryAdvanced {
-            parent: payload_at(ORIGIN),
-            history: hellas_channel::work_store::CloseHistory {
-                height: CONTEST_HEIGHT,
-                payload: payload_at(CONTEST_HEIGHT),
-                pending,
-            },
-        },
+    let pending = PendingPaymentClose::from_accepted_start(
+        network(),
+        CONTEST_HEIGHT,
+        contest_time_ms(),
+        &contest_start(),
     )
-    .await;
+    .expect("the fixture contest start creates pending state");
     commit(
         &mut store,
-        ChannelRecord::CursorAdvanced {
+        ChannelRecord::Anchored {
             height: CONTEST_HEIGHT,
-            parent: payload_at(ORIGIN),
             payload: payload_at(CONTEST_HEIGHT),
+            certified_at_ms: contest_time_ms(),
+            pending: Some(pending),
         },
     )
     .await;
@@ -1651,29 +1661,6 @@ fn contest_start_id() -> StartId {
     )
 }
 
-fn contest_response() -> hellas_kernel::PaymentCloseResponse {
-    let channel = descriptor().channel().clone();
-    let job = authorization();
-    let result = hellas_channel::job::paid_terminal_result(
-        &channel,
-        &job,
-        &work_policy(),
-        &bundle(),
-        &answer_transcript(),
-    )
-    .expect("the fixture result derives");
-    let (certificate, _) =
-        next_payment(&channel, &job, &result, 0, settlement()).expect("the fixture payment builds");
-    let sig = client().sign(certificate.digest(network()));
-    hellas_channel::work_close::close_response(
-        &channel,
-        contest_start_id(),
-        (certificate, sig),
-        &provider(),
-    )
-    .expect("the fixture close response builds")
-}
-
 /// The coherent finalized view the clock asks this fixture chain for.
 fn channel_snapshot(
     height: u64,
@@ -1692,8 +1679,9 @@ fn channel_snapshot(
             state_root: hellas_chain::domain::Digest::from([0xd0; 32]),
             finalization: Vec::new(),
         },
+        hellas_channel::test_support::channel::now_ms(),
         bond,
-        None,
+        Some(live_payment()),
         [None, None],
         pending,
         BTreeSet::new(),
@@ -1711,7 +1699,7 @@ fn pending_contest(responded: bool) -> RegistryChunk {
     value.extend_from_slice(payment_edge().as_bytes());
     value.push(Party::Maker.tag());
     value.extend_from_slice(&contest_start_id().to_bytes());
-    value.extend_from_slice(&RESPONSE_DEADLINE.to_be_bytes());
+    value.extend_from_slice(&response_deadline_ms().to_be_bytes());
     value.extend_from_slice(&0_u64.to_be_bytes());
     let final_cumulative = if responded {
         payment_policy().fixed_price
@@ -1826,6 +1814,7 @@ fn ready_channel_snapshot(height: u64, pending: Option<RegistryChunk>) -> WorkCh
             state_root: hellas_chain::domain::Digest::from([0xd1; 32]),
             finalization: Vec::new(),
         },
+        hellas_channel::test_support::channel::now_ms(),
         Some(live_bond()),
         Some(live_payment()),
         live_lease_slots(),
@@ -1836,9 +1825,8 @@ fn ready_channel_snapshot(height: u64, pending: Option<RegistryChunk>) -> WorkCh
 
 // ── The chain a test writes down ──────────────────────────────────
 
-/// One finalized source written down by a test: the coherent reads it answers
-/// with, the blocks those reads describe, and a sink that keeps what it was
-/// handed. It has no routing opinion — queries select by their signed channel
+/// One certified source written down by a test: the coherent read it answers
+/// for each channel, and a sink that keeps what it was handed. It has no routing opinion — queries select by their signed channel
 /// identity — so one channel and several are the same fixture.
 #[derive(Clone)]
 struct Chain(Arc<Mutex<ChainState>>);
@@ -1853,50 +1841,45 @@ struct BlockedRead {
 struct ChainState {
     /// Everything a driver submitted, in the order it did.
     submitted: Vec<Tx>,
-    /// Completed setups whose payment Open the origin block carries.
-    completed_setups: Vec<EdgeId>,
-    /// One coherent finalized read per channel.
+    /// One coherent certified read per channel.
     snapshots: Vec<WorkChannelSnapshot>,
+    /// How many blocks the chain has finalized past each channel's written
+    /// read, and when the latest was stamped. Like a live chain, a block
+    /// half the certified-age bound old is followed by another.
+    stamps: std::collections::BTreeMap<(EdgeId, u64), (u64, u64)>,
     /// Snapshot reads so far, for tests that assert no validator I/O.
     snapshot_reads: usize,
     /// One read to hold until the test releases it.
     next_read: Option<BlockedRead>,
-    /// One permit added as `latest_height` is entered.
+    /// One permit added as a read is entered.
     entered: Arc<Semaphore>,
-    /// One permit the test adds to let `latest_height` out again.
+    /// One permit the test adds to let a read out again.
     release: Arc<Semaphore>,
-    /// Whether `latest_height` waits at all.
+    /// Whether every read waits for the test.
     slow: bool,
 }
 
 impl Chain {
     /// The default fixture channel, with a tip that never moves.
     fn single() -> Self {
-        Self::build([bond_edge()], [channel_snapshot(ORIGIN, None, None)], false)
+        Self::build([ready_channel_snapshot(ORIGIN, None)], false)
     }
 
-    /// The same, with a block read that waits until the test releases it.
+    /// The same, with a read that waits until the test releases it.
     fn slow() -> Self {
-        Self::build([bond_edge()], [channel_snapshot(ORIGIN, None, None)], true)
+        Self::build([ready_channel_snapshot(ORIGIN, None)], true)
     }
 
     /// Independent coherent snapshots for several configured channels.
-    fn routed(
-        completed_setups: impl IntoIterator<Item = EdgeId>,
-        snapshots: impl IntoIterator<Item = WorkChannelSnapshot>,
-    ) -> Self {
-        Self::build(completed_setups, snapshots, false)
+    fn routed(snapshots: impl IntoIterator<Item = WorkChannelSnapshot>) -> Self {
+        Self::build(snapshots, false)
     }
 
-    fn build(
-        completed_setups: impl IntoIterator<Item = EdgeId>,
-        snapshots: impl IntoIterator<Item = WorkChannelSnapshot>,
-        slow: bool,
-    ) -> Self {
+    fn build(snapshots: impl IntoIterator<Item = WorkChannelSnapshot>, slow: bool) -> Self {
         Self(Arc::new(Mutex::new(ChainState {
             submitted: Vec::new(),
-            completed_setups: completed_setups.into_iter().collect(),
             snapshots: snapshots.into_iter().collect(),
+            stamps: std::collections::BTreeMap::new(),
             snapshot_reads: 0,
             next_read: None,
             entered: Arc::new(Semaphore::new(0)),
@@ -1923,7 +1906,7 @@ impl Chain {
         if let Some(existing) = held
             .snapshots
             .iter_mut()
-            .find(|existing| existing.query() == &query)
+            .find(|existing| same_channel(existing.query(), &query))
         {
             *existing = snapshot;
         } else {
@@ -1940,7 +1923,7 @@ impl Chain {
         self.held().next_read = Some(read);
     }
 
-    /// Waits until a caller is inside the block read.
+    /// Waits until a caller is inside a held read.
     async fn wait_for_read(&self) {
         let entered = self.held().entered.clone();
         match entered.acquire().await {
@@ -1954,43 +1937,56 @@ impl Chain {
     }
 }
 
-/// The payment Open the origin block carries for a completed setup.
-fn payment_open_for(bond: EdgeId) -> Option<Tx> {
-    if bond == bond_edge() {
-        return completed(countersigned(proposed())).payment_open();
-    }
-    [OfferFixture::first(), OfferFixture::second()]
-        .into_iter()
-        .find(|route| route.bond_edge() == bond)
-        .and_then(|route| {
-            route
-                .completed(route.countersigned(route.proposed()))
-                .payment_open()
-        })
+/// Whether two queries name the same channel, whatever coins they ask about.
+fn same_channel(held: &WorkChannelQuery, asked: &WorkChannelQuery) -> bool {
+    held.bond_edge == asked.bond_edge && held.payment_edge == asked.payment_edge
 }
 
-impl SetupView for Chain {
-    async fn finalized_setup(
-        &self,
-        query: SetupQuery,
-    ) -> Result<Option<FinalizedSetup>, BlockSourceError> {
-        if !self.held().completed_setups.contains(&query.bond_edge) {
-            return Err(BlockSourceError::new(
-                "the fixture source was asked for an unconfigured setup",
-            ));
-        }
-        // Both edges consumed and no funding left live. A completed setup reads
-        // its edge only to price the settlement, and an absent one is what makes
-        // the mount fall back to the descriptor's expectation — the same one this
-        // fixture's journal was written under.
-        Ok(Some(FinalizedSetup {
+/// The chain as an offer nobody has answered sees it: nothing opened, and
+/// every coin it was asked about still live.
+fn unanswered_offer(query: WorkChannelQuery) -> WorkChannelSnapshot {
+    let live = query.funding.clone();
+    WorkChannelSnapshot::new(
+        query,
+        LatestBlock {
             height: ORIGIN,
-            bond: None,
-            payment: None,
-            lease: LeaseSlots::Absent,
-            live_funding: BTreeSet::new(),
-        }))
-    }
+            payload: hellas_chain::domain::Digest::from(payload_at(ORIGIN)),
+            state_root: hellas_chain::domain::Digest::from([0xd4; 32]),
+            finalization: Vec::new(),
+        },
+        hellas_channel::test_support::channel::now_ms(),
+        None,
+        None,
+        [None, None],
+        None,
+        live,
+    )
+}
+
+/// `snapshot` as the answer to `query`: the same objects, `later` blocks on,
+/// stamped `certified_at_ms`, with every coin it was asked about spent.
+fn answering(
+    snapshot: &WorkChannelSnapshot,
+    query: WorkChannelQuery,
+    later: u64,
+    certified_at_ms: u64,
+) -> WorkChannelSnapshot {
+    let height = snapshot.block().height + later;
+    let block = LatestBlock {
+        height,
+        payload: hellas_chain::domain::Digest::from(payload_at(height)),
+        ..snapshot.block().clone()
+    };
+    WorkChannelSnapshot::new(
+        query,
+        block,
+        certified_at_ms,
+        snapshot.bond().copied(),
+        snapshot.payment().copied(),
+        *snapshot.lease_slots(),
+        snapshot.pending_slot(),
+        BTreeSet::new(),
+    )
 }
 
 impl FinalizedWorkView for Chain {
@@ -2018,22 +2014,6 @@ impl FinalizedWorkView for Chain {
             entered.add_permits(1);
             release.acquire().await.unwrap().forget();
         }
-        self.held()
-            .snapshots
-            .iter()
-            .find(|snapshot| snapshot.query() == &query)
-            .cloned()
-            .map(|snapshot| Some(hellas_chain::Verified::assume_for_tests(snapshot)))
-            .ok_or_else(|| {
-                QueryError::StateUnavailable(
-                    "the fixture source was asked for another channel".to_string(),
-                )
-            })
-    }
-}
-
-impl FinalizedBlocks for Chain {
-    async fn latest_height(&self) -> Result<Option<u64>, BlockSourceError> {
         let (slow, entered, release) = {
             let held = self.held();
             (held.slow, held.entered.clone(), held.release.clone())
@@ -2045,35 +2025,30 @@ impl FinalizedBlocks for Chain {
                 Err(error) => panic!("the fixture chain is open: {error}"),
             }
         }
-        let responded = self.held().snapshots.iter().any(|snapshot| {
-            matches!(
-                snapshot.observed_channel().pending,
-                hellas_kernel::PendingSlot::Present(pending) if pending.responded()
-            )
-        });
-        Ok(Some(if responded { RESPONSE_HEIGHT } else { ORIGIN }))
-    }
-
-    async fn block_at(&self, height: u64) -> Result<Option<FinalizedWork>, BlockSourceError> {
-        let txs = match height {
-            ORIGIN => self
-                .held()
-                .completed_setups
-                .iter()
-                .filter_map(|bond| payment_open_for(*bond))
-                .collect(),
-            CONTEST_HEIGHT => vec![Tx::move_action(Move::StartPaymentClose(contest_start()))],
-            RESPONSE_HEIGHT => vec![Tx::move_action(Move::RespondPaymentClose(
-                contest_response(),
-            ))],
-            _ => return Ok(None),
+        let mut held = self.held();
+        let found = held
+            .snapshots
+            .iter()
+            .find(|snapshot| same_channel(snapshot.query(), &query))
+            .cloned();
+        let answer = match found {
+            Some(snapshot) => {
+                let now = hellas_channel::test_support::channel::now_ms();
+                let half_age =
+                    u64::try_from(hellas_channel::work::MAX_CERTIFIED_AGE.as_millis()).unwrap() / 2;
+                let (later, stamp) = held
+                    .stamps
+                    .entry((query.bond_edge, snapshot.block().height))
+                    .or_insert((0, now));
+                if now.saturating_sub(*stamp) > half_age {
+                    *later += 1;
+                    *stamp = now;
+                }
+                answering(&snapshot, query, *later, *stamp)
+            }
+            None => unanswered_offer(query),
         };
-        Ok(Some(FinalizedWork {
-            height,
-            parent: payload_at(height - 1),
-            payload: payload_at(height),
-            txs,
-        }))
+        Ok(Some(hellas_chain::Verified::assume_for_tests(answer)))
     }
 }
 
@@ -2084,17 +2059,23 @@ impl TxSink for Chain {
     }
 }
 
-/// The injectable finalized source used by the ALPN proof. It starts
-/// at the scan floor, finalizes each setup Open handed to its sink in
-/// the next block, and exposes the resulting channel through the same
-/// coherent snapshot interface production uses.
+/// The injectable certified source used by the ALPN proof. It starts at
+/// the floor, includes each setup Open handed to its sink in the next
+/// block, and answers every query from the resulting channel state through
+/// the same coherent snapshot production reads.
 #[derive(Clone)]
 struct NodeChain(Arc<Mutex<NodeChainState>>);
 
 struct NodeChainState {
-    setup: FinalizedSetup,
-    snapshot: WorkChannelSnapshot,
-    blocks: Vec<FinalizedWork>,
+    height: u64,
+    /// The timestamp the block at `height` carries.
+    stamped_at: u64,
+    bond: Option<Edge>,
+    payment: Option<Edge>,
+    lease_slots: [Option<RegistryChunk>; 2],
+    pending: Option<RegistryChunk>,
+    live_funding: BTreeSet<CoinId>,
+    opens: usize,
     submitted: Vec<Tx>,
 }
 
@@ -2107,100 +2088,36 @@ impl NodeChain {
         .into_iter()
         .collect();
         Self(Arc::new(Mutex::new(NodeChainState {
-            setup: FinalizedSetup {
-                height: FLOOR,
-                bond: None,
-                payment: None,
-                lease: LeaseSlots::Absent,
-                live_funding,
-            },
-            snapshot: WorkChannelSnapshot::new(
-                WorkChannelQuery {
-                    bond_edge: bond_edge(),
-                    payment_edge: Some(payment_edge()),
-                    funding: BTreeSet::new(),
-                },
-                LatestBlock {
-                    height: FLOOR,
-                    payload: hellas_chain::domain::Digest::from(payload_at(FLOOR)),
-                    state_root: hellas_chain::domain::Digest::from([0xd1; 32]),
-                    finalization: Vec::new(),
-                },
-                None,
-                None,
-                [None, None],
-                None,
-                BTreeSet::new(),
-            ),
-            blocks: Vec::new(),
+            height: FLOOR,
+            stamped_at: hellas_channel::test_support::channel::now_ms(),
+            bond: None,
+            payment: None,
+            lease_slots: [None, None],
+            pending: None,
+            live_funding,
+            opens: 0,
             submitted: Vec::new(),
         })))
     }
 
-    fn latest(&self) -> u64 {
+    fn held(&self) -> std::sync::MutexGuard<'_, NodeChainState> {
         match self.0.lock() {
-            Ok(held) => held.blocks.last().map_or(FLOOR, |block| block.height),
+            Ok(held) => held,
             Err(error) => panic!("the node-chain fixture is reachable: {error}"),
         }
     }
 
     fn submitted(&self) -> Vec<Tx> {
-        match self.0.lock() {
-            Ok(held) => held.submitted.clone(),
-            Err(error) => panic!("the node-chain fixture is reachable: {error}"),
-        }
+        self.held().submitted.clone()
     }
 
-    /// Exposes a pending client contest one finalized height after
-    /// mount. The otherwise empty block is deliberate: it proves that
-    /// cursor catch-up alone cannot substitute for the coherent state
-    /// predicate, without letting the raw journal's own close refusal
-    /// mask a stale-readiness mutation.
+    /// Opens a pending client contest one certified height after mount.
     fn open_contest(&self) -> u64 {
-        let current = self.latest();
-        let height = current + 1;
-        let block = FinalizedWork {
-            height,
-            parent: payload_at(current),
-            payload: payload_at(height),
-            txs: Vec::new(),
-        };
-        match self.0.lock() {
-            Ok(mut held) => {
-                held.blocks.push(block);
-                held.snapshot = ready_channel_snapshot(height, Some(pending_contest(false)));
-            }
-            Err(error) => panic!("the node-chain fixture is reachable: {error}"),
-        }
-        height
-    }
-}
-
-impl SetupView for NodeChain {
-    async fn finalized_setup(
-        &self,
-        query: SetupQuery,
-    ) -> Result<Option<FinalizedSetup>, BlockSourceError> {
-        let expected_funding = [
-            CoinId::from_bytes([0xa1; CoinId::LENGTH]),
-            CoinId::from_bytes([0xb1; CoinId::LENGTH]),
-        ]
-        .into_iter()
-        .collect();
-        if query.bond_edge != bond_edge()
-            || query.payment_edge != Some(payment_edge())
-            || query.funding != expected_funding
-        {
-            return Err(BlockSourceError::new(
-                "the fixture was asked for another setup",
-            ));
-        }
-        match self.0.lock() {
-            Ok(held) => Ok(Some(held.setup.clone())),
-            Err(error) => Err(BlockSourceError::new(format!(
-                "the node-chain setup lock failed: {error}",
-            ))),
-        }
+        let mut held = self.held();
+        held.height += 1;
+        held.stamped_at = hellas_channel::test_support::channel::now_ms();
+        held.pending = Some(pending_contest(false));
+        held.height
     }
 }
 
@@ -2209,36 +2126,34 @@ impl FinalizedWorkView for NodeChain {
         &self,
         query: WorkChannelQuery,
     ) -> Result<Option<hellas_chain::Verified<WorkChannelSnapshot>>, QueryError> {
-        match self.0.lock() {
-            Ok(held) if held.snapshot.query() == &query => Ok(Some(
-                hellas_chain::Verified::assume_for_tests(held.snapshot.clone()),
-            )),
-            Ok(_) => Err(QueryError::StateUnavailable(
+        if query.bond_edge != bond_edge() || query.payment_edge != Some(payment_edge()) {
+            return Err(QueryError::StateUnavailable(
                 "the fixture was asked for another work channel".to_string(),
-            )),
-            Err(error) => Err(QueryError::StateUnavailable(format!(
-                "the node-chain snapshot lock failed: {error}",
-            ))),
+            ));
         }
-    }
-}
-
-impl FinalizedBlocks for NodeChain {
-    async fn latest_height(&self) -> Result<Option<u64>, BlockSourceError> {
-        Ok(Some(self.latest()))
-    }
-
-    async fn block_at(&self, height: u64) -> Result<Option<FinalizedWork>, BlockSourceError> {
-        match self.0.lock() {
-            Ok(held) => Ok(held
-                .blocks
-                .iter()
-                .find(|block| block.height == height)
-                .cloned()),
-            Err(error) => Err(BlockSourceError::new(format!(
-                "the node-chain block lock failed: {error}",
-            ))),
-        }
+        let held = self.held();
+        let live_funding = query
+            .funding
+            .intersection(&held.live_funding)
+            .copied()
+            .collect();
+        Ok(Some(hellas_chain::Verified::assume_for_tests(
+            WorkChannelSnapshot::new(
+                query,
+                LatestBlock {
+                    height: held.height,
+                    payload: hellas_chain::domain::Digest::from(payload_at(held.height)),
+                    state_root: hellas_chain::domain::Digest::from([0xd1; 32]),
+                    finalization: Vec::new(),
+                },
+                held.stamped_at,
+                held.bond,
+                held.payment,
+                held.lease_slots,
+                held.pending,
+                live_funding,
+            ),
+        )))
     }
 }
 
@@ -2249,52 +2164,27 @@ impl TxSink for NodeChain {
             .lock()
             .map_err(|error| BlockSourceError::new(format!("the sink lock failed: {error}")))?;
         held.submitted.push(tx.clone());
-        let open_number = held
-            .blocks
-            .iter()
-            .flat_map(|block| &block.txs)
-            .filter(|tx| matches!(tx, Tx::Open { .. }))
-            .count();
         if !matches!(tx, Tx::Open { .. }) {
             return Ok(SubmitTxOutcome::Enqueued);
         }
-        let height = held
-            .blocks
-            .last()
-            .map_or(FLOOR + 1, |block| block.height + 1);
-        held.blocks.push(FinalizedWork {
-            height,
-            parent: payload_at(height - 1),
-            payload: payload_at(height),
-            txs: vec![tx],
-        });
-        match open_number {
-            0 => {
-                held.setup = FinalizedSetup {
-                    height,
-                    bond: Some(live_bond()),
-                    payment: None,
-                    lease: LeaseSlots::Absent,
-                    live_funding: [CoinId::from_bytes([0xb1; CoinId::LENGTH])]
-                        .into_iter()
-                        .collect(),
-                };
-            }
+        held.height += 1;
+        held.stamped_at = hellas_channel::test_support::channel::now_ms();
+        held.opens += 1;
+        match held.opens {
             1 => {
-                let lease = hellas_kernel::parse_bond_lease(live_lease_slots(), bond_edge());
-                held.setup = FinalizedSetup {
-                    height,
-                    bond: Some(live_bond()),
-                    payment: Some(live_payment()),
-                    lease,
-                    live_funding: BTreeSet::new(),
-                };
-                held.snapshot = ready_channel_snapshot(height, None);
+                held.bond = Some(live_bond());
+                held.live_funding = [CoinId::from_bytes([0xb1; CoinId::LENGTH])]
+                    .into_iter()
+                    .collect();
+            }
+            2 => {
+                held.payment = Some(live_payment());
+                held.lease_slots = live_lease_slots();
+                held.live_funding = BTreeSet::new();
             }
             other => {
                 return Err(BlockSourceError::new(format!(
-                    "the fixture received unexpected setup Open {}",
-                    other + 1,
+                    "the fixture received unexpected setup Open {other}",
                 )));
             }
         }
@@ -2309,9 +2199,6 @@ async fn runner(root: &Path, _policy: ProviderChannelPolicy, mount: &MountedWork
     let runner = match WorkRunner::discover(
         WorkRunnerConfig {
             chain: crate::test_support::chain_dir(root, network()),
-
-            poll: Duration::from_millis(1),
-            max_observation_age: HANG_GUARD,
             settlement_key: provider(),
         },
         mount.clone(),
@@ -2441,7 +2328,6 @@ impl OfferFixture {
             self.bond_edge(),
             self.bond_terms(),
             private_policy_commitment(network(), &SALT, &channel_policy()),
-            MIN_OMIT_RESPONSE_BLOCKS,
             MAX_START_VALIDITY_BLOCKS,
             OMISSION_BOND,
         )
@@ -2539,10 +2425,6 @@ impl OfferFixture {
         let three = self.completed(two.clone());
         let close_descriptor = self.descriptor();
         for record in [
-            SetupRecord::ScanArmed {
-                height: FLOOR,
-                payload: payload_at(FLOOR),
-            },
             recorded_offer(one.clone(), peer, self.payment_funding(), provider_policy()),
             SetupRecord::Bundle {
                 bundle: two.encode(),
@@ -2555,7 +2437,6 @@ impl OfferFixture {
                 payment_edge: self.payment_edge(),
                 origin_height: ORIGIN,
                 origin_payload: payload_at(ORIGIN),
-                origin_parent: payload_at(ORIGIN - 1),
             },
         ] {
             if let Err(error) = store.commit(record, &verifier).await {
@@ -2578,21 +2459,14 @@ impl OfferFixture {
         let one = self.proposed();
         let two = self.countersigned(one.clone());
         let three = self.completed(two.clone());
-        let mut offer = recorded_offer(
+        let offer = recorded_offer(
             one,
             first_route_peer(),
             self.payment_funding(),
             provider_policy(),
         );
-        if let SetupRecord::Offer { floor, .. } = &mut offer {
-            *floor = None;
-        }
         for record in [
             offer,
-            SetupRecord::ScanArmed {
-                height: FLOOR,
-                payload: payload_at(FLOOR),
-            },
             SetupRecord::ArmedBundle {
                 bundle: two.encode(),
                 close_descriptor: Box::new(self.descriptor()),
@@ -2604,7 +2478,6 @@ impl OfferFixture {
                 payment_edge: self.payment_edge(),
                 origin_height: ORIGIN,
                 origin_payload: payload_at(ORIGIN),
-                origin_parent: payload_at(ORIGIN - 1),
             },
         ] {
             store.commit(record, &verifier).await.unwrap();
@@ -2735,8 +2608,9 @@ impl OfferFixture {
                 state_root: hellas_chain::domain::Digest::from([0xd2; 32]),
                 finalization: Vec::new(),
             },
+            hellas_channel::test_support::channel::now_ms(),
             bond,
-            None,
+            Some(self.live_payment()),
             [None, None],
             pending,
             BTreeSet::new(),
@@ -2765,6 +2639,7 @@ impl OfferFixture {
                 state_root: hellas_chain::domain::Digest::from([0xd3; 32]),
                 finalization: Vec::new(),
             },
+            hellas_channel::test_support::channel::now_ms(),
             Some(self.live_bond()),
             Some(payment),
             self.live_lease_slots(),
@@ -2864,8 +2739,6 @@ impl RunningPaidNode {
             WorkRunnerConfig {
                 chain: crate::test_support::chain_dir(root, network()),
 
-                poll: Duration::from_millis(1),
-                max_observation_age: HANG_GUARD,
                 settlement_key: provider(),
             },
             work_mount.clone(),
@@ -3286,15 +3159,6 @@ async fn run_advertised_paid_exchange(
         panic!("WorkSetup round 1 imports the driven provider offer: {error}");
     }
     if let Err(error) = caller
-        .arm_scan(SetupScan {
-            height: FLOOR,
-            payload: payload_at(FLOOR),
-        })
-        .await
-    {
-        panic!("the client arms the same finalized floor: {error}");
-    }
-    if let Err(error) = caller
         .propose_payment(payment_funding(), payment_terms())
         .await
     {
@@ -3420,6 +3284,10 @@ async fn a_restart_with_an_open_contest_is_answered_on_the_clock() {
     let mount = MountedWork::default();
     let mut runner = runner(dir.path(), provider_policy(), &mount).await;
     let chain = Chain::single();
+    chain.set_snapshot(ready_channel_snapshot(
+        RESPONSE_HEIGHT,
+        Some(pending_contest(false)),
+    ));
 
     let recovered = mount
         .service(
@@ -3443,13 +3311,14 @@ async fn a_restart_with_an_open_contest_is_answered_on_the_clock() {
     else {
         panic!("the tick that answered the contest mounted its channel")
     };
-    let cursor = match service.with_state(|state| state.cursor().0).await {
-        Ok(cursor) => cursor,
+    let read_at = match service.with_state(|state| state.certified_at_ms()).await {
+        Ok(read_at) => read_at,
         Err(error) => panic!("the mounted channel is readable: {error}"),
     };
     assert!(
-        cursor < RESPONSE_DEADLINE,
-        "the answer was submitted at {cursor}, past the deadline {RESPONSE_DEADLINE}",
+        read_at < response_deadline_ms(),
+        "the answer was submitted at block time {read_at}, past the deadline {}",
+        response_deadline_ms(),
     );
     let responded = match service.with_state(|state| state.close_responded()).await {
         Ok(responded) => responded,
@@ -3470,7 +3339,10 @@ async fn the_paid_work_clock_submits_adjudication_when_consensus_makes_it_due_an
     let mount = MountedWork::default();
     let mut runner = runner(dir.path(), provider_policy(), &mount).await;
     let chain = Chain::single();
-    chain.set_snapshot(channel_snapshot(ORIGIN, None, Some(pending_contest(false))));
+    chain.set_snapshot(ready_channel_snapshot(
+        RESPONSE_HEIGHT,
+        Some(pending_contest(false)),
+    ));
 
     assert!(runner.tick(&chain).await, "the first coherent read answers");
     assert_eq!(
@@ -3506,7 +3378,10 @@ async fn the_paid_work_clock_submits_adjudication_when_consensus_makes_it_due_an
         "a local CloseResponded is not consensus response evidence",
     );
 
-    chain.set_snapshot(channel_snapshot(ORIGIN, None, Some(pending_contest(true))));
+    chain.set_snapshot(ready_channel_snapshot(
+        RESPONSE_HEIGHT + 1,
+        Some(pending_contest(true)),
+    ));
     assert!(runner.tick(&chain).await, "the responded read answers");
     assert_eq!(
         adjudicated_payment_closes(&chain),
@@ -3786,7 +3661,10 @@ fn the_clock_resumes_an_accepted_job_after_restart() {
             "delivery never reruns the model"
         );
 
-        chain.set_snapshot(ready_channel_snapshot(ORIGIN, Some(pending_contest(false))));
+        chain.set_snapshot(ready_channel_snapshot(
+            ORIGIN + 1,
+            Some(pending_contest(false)),
+        ));
         assert!(restarted.tick(&chain).await);
         let mut stream = handler
             .stream_result(request, context)
@@ -3800,7 +3678,14 @@ fn the_clock_resumes_an_accepted_job_after_restart() {
         else {
             panic!("cached readiness must not release data after a finalized contest");
         };
-        assert_eq!(refusal.code, WorkRefusalCode::Unavailable as i32);
+        // The contest is the cutoff: the job rests at its expired terminal,
+        // or the revoked observer refuses first. Either way nothing leaves.
+        assert!(
+            refusal.code == WorkRefusalCode::Unavailable as i32
+                || refusal.code == WorkRefusalCode::Declined as i32,
+            "{}",
+            refusal.reason
+        );
         assert!(stream.next().await.is_none());
     });
 }
@@ -3880,7 +3765,10 @@ async fn open_result_stream_stops(shutdown: bool) {
         );
         mount.clear_all().await.unwrap();
     } else {
-        chain.set_snapshot(ready_channel_snapshot(ORIGIN, Some(pending_contest(false))));
+        chain.set_snapshot(ready_channel_snapshot(
+            ORIGIN + 1,
+            Some(pending_contest(false)),
+        ));
         assert!(runner.tick(&chain).await);
     }
     backend.finish();
@@ -3888,14 +3776,17 @@ async fn open_result_stream_stops(shutdown: bool) {
         .await
         .unwrap()
         .expect("the open stream terminates with a refusal");
+    let shown = format!("{next:?}");
     assert!(
         match next {
             Err(status) => status.code == hellas_wire::WireCode::Unavailable,
             Ok(event) => matches!(event.outcome,
             Some(hellas_rpc::pb::work::work_stream_event::Outcome::Refused(refusal))
-                if refusal.code == WorkRefusalCode::NotReady as i32 || refusal.code == WorkRefusalCode::Unavailable as i32),
+                if refusal.code == WorkRefusalCode::NotReady as i32
+                    || refusal.code == WorkRefusalCode::Unavailable as i32
+                    || refusal.code == WorkRefusalCode::Declined as i32),
         },
-        "no payload is released after the observer revokes readiness"
+        "no payload is released after the observer revokes readiness: {shown}"
     );
     assert!(stream.next().await.is_none());
 }
@@ -4004,6 +3895,10 @@ async fn a_clean_shutdown_leaves_a_replayable_journal() {
             .content_store()
     };
     let chain = Chain::single();
+    chain.set_snapshot(ready_channel_snapshot(
+        RESPONSE_HEIGHT,
+        Some(pending_contest(false)),
+    ));
     let (stop, stopped) = oneshot::channel();
     let task = {
         let chain = chain.clone();
@@ -4075,20 +3970,20 @@ async fn a_clean_shutdown_leaves_a_replayable_journal() {
     );
 }
 
+/// One poll reads every channel in one batch, so a read the source holds
+/// stalls them all — for at most the certified-age bound, after which the
+/// read is abandoned, the source redialled, and every channel advances.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_blocked_channel_observer_does_not_stop_other_channels_or_shutdown() {
+async fn a_held_read_is_abandoned_at_the_age_bound_and_every_channel_advances() {
     let dir = temp();
     let first = OfferFixture::first();
     let second = OfferFixture::second();
     first.write_completed_setup(dir.path()).await;
     second.write_completed_setup(dir.path()).await;
-    let source = Chain::routed(
-        [first.bond_edge(), second.bond_edge()],
-        [
-            first.ready_snapshot(ORIGIN, None),
-            second.ready_snapshot(ORIGIN, None),
-        ],
-    );
+    let source = Chain::routed([
+        first.ready_snapshot(ORIGIN, None),
+        second.ready_snapshot(ORIGIN, None),
+    ]);
     let entered = Arc::new(Semaphore::new(0));
     let release = Arc::new(Semaphore::new(0));
     source.block_next_read(BlockedRead {
@@ -4131,7 +4026,7 @@ async fn a_blocked_channel_observer_does_not_stop_other_channels_or_shutdown() {
         }
     })
     .await
-    .expect("the second channel advances while the first source is blocked");
+    .expect("the second channel advances once the held read is abandoned");
     let response =
         accept_mounted_route(&mount, second_route_peer(), second.signed_accept_request()).await;
     assert!(matches!(
@@ -4186,13 +4081,10 @@ async fn one_peer_routes_distinct_channels_without_crossing_journals() {
     let content = hellas_channel::test_support::channel::content_store(root.path()).await;
     let setup = MountedSetup::with_content_store(content.clone());
     let mut runner = discover_two_route_runner(root.path(), &original, &setup, &content).await;
-    let source = Chain::routed(
-        [first.bond_edge(), second.bond_edge()],
-        [
-            first.ready_snapshot(ORIGIN, None),
-            second.ready_snapshot(ORIGIN, None),
-        ],
-    );
+    let source = Chain::routed([
+        first.ready_snapshot(ORIGIN, None),
+        second.ready_snapshot(ORIGIN, None),
+    ]);
     assert!(runner.tick(&source).await);
     let a = original
         .service(
@@ -4869,8 +4761,6 @@ async fn offline_startup_restores_retained_pins_and_output_before_the_global_bar
     let mut runner = WorkRunner::discover(
         WorkRunnerConfig {
             chain: crate::test_support::chain_dir(root.path(), network()),
-            poll: Duration::from_millis(1),
-            max_observation_age: HANG_GUARD,
             settlement_key: provider(),
         },
         mounted.clone(),
@@ -4900,33 +4790,10 @@ async fn offline_startup_restores_retained_pins_and_output_before_the_global_bar
         "restore the exact remaining reservation before collection"
     );
     let snapshot = offer.ready_snapshot_payment(ORIGIN, None, payment);
-    assert!(
-        !service
-            .with_state(|state| state.origin_observed())
-            .await
-            .unwrap()
-    );
-    let invalid = Chain::routed([], [snapshot.clone()]);
-    assert!(
-        !runner.tick(&invalid).await,
-        "a coherent tip without the actual opening transaction cannot authorize the handoff"
-    );
-    assert!(
-        !service
-            .with_state(|state| state.origin_observed())
-            .await
-            .unwrap()
-    );
     assert!(service.readiness().await.is_err());
-    let source = Chain::routed([offer.bond_edge()], [snapshot]);
+    let source = Chain::routed([snapshot]);
     assert!(runner.tick(&source).await);
     assert!(service.readiness().await.is_ok());
-    assert!(
-        service
-            .with_state(|state| state.origin_observed())
-            .await
-            .unwrap()
-    );
     assert_eq!(
         service
             .with_state(|state| state.settlement())
@@ -4966,8 +4833,6 @@ async fn offline_startup_restores_retained_pins_and_output_before_the_global_bar
     let duplicate_result = WorkRunner::discover(
         WorkRunnerConfig {
             chain: crate::test_support::chain_dir(root.path(), network()),
-            poll: Duration::from_millis(1),
-            max_observation_age: HANG_GUARD,
             settlement_key: provider(),
         },
         MountedWork::default(),
@@ -4994,8 +4859,6 @@ async fn offline_startup_restores_retained_pins_and_output_before_the_global_bar
     let recovered = WorkRunner::discover(
         WorkRunnerConfig {
             chain: crate::test_support::chain_dir(root.path(), network()),
-            poll: Duration::from_millis(1),
-            max_observation_age: HANG_GUARD,
             settlement_key: provider(),
         },
         MountedWork::default(),
@@ -5168,7 +5031,6 @@ async fn offline_client_roots_restore_all_half_signed_obligations_before_collect
             payment_edge: orphan.payment_edge(),
             height: ORIGIN,
             payload: payload_at(ORIGIN),
-            parent: payload_at(ORIGIN - 1),
         },
         node.clone(),
         &verifier,

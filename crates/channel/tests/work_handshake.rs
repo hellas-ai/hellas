@@ -20,7 +20,7 @@ use hellas_channel::work_handshake::{
     PaymentAdmission, SetupEndpoint, SetupExchangeError, SetupService, apply_setup_exchange,
     prepare_setup_exchange, send_setup_exchange,
 };
-use hellas_channel::work_store::{Role, SetupScan, SetupStore};
+use hellas_channel::work_store::{Role, SetupStore};
 use hellas_kernel::{
     BlockHeight, CoinId, EdgeId, EdgeValues, Fees, Funding, List, MAX_PARTY_INPUTS, Parties,
     PartyKeys, Payout, Secp256k1Signer, Secp256k1Verifier, SigVerifier as _, Terms, Tx,
@@ -61,15 +61,6 @@ const SALT: [u8; 32] = [0x5a; 32];
 const OMISSION_BOND: u64 = 601;
 const PAYMENT_VALUE: u64 = 1_000;
 const PAYMENT_RESERVE: u64 = 200;
-/// The window the provider measured its own response probability over,
-/// and the one the fixture's terms admit.
-///
-/// Above the kernel's floor by enough that a test can propose a
-/// *shorter* window and still be proposing terms the kernel itself
-/// would accept — so what refuses it is the provider's measurement and
-/// not a consensus rule standing in front of it.
-const WINDOW: u64 = hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS + 4;
-
 /// A third key with no role in these terms.
 fn stranger() -> Secp256k1Signer {
     signer(0x23)
@@ -115,7 +106,6 @@ fn payment_terms(bond_edge: EdgeId) -> WorkPaymentTerms {
         bond_edge,
         bond_terms(),
         private_policy_commitment(network(), &SALT, &channel_policy()),
-        WINDOW,
         hellas_kernel::MAX_START_VALIDITY_BLOCKS,
         OMISSION_BOND,
     )
@@ -146,7 +136,6 @@ fn provider_policy() -> ProviderChannelPolicy {
             PAYMENT_RESERVE,
             Fees::new(0, 0, 0, 0),
         ),
-        min_omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
     }
 }
 
@@ -156,19 +145,6 @@ fn admits() -> PaymentAdmission {
 
 fn proposes() -> PaymentAdmission {
     PaymentAdmission::Proposes(Box::new(provider_policy()))
-}
-
-fn scan() -> SetupScan {
-    SetupScan {
-        height: 7,
-        payload: [0x47; 32],
-    }
-}
-
-async fn arm(endpoint: &mut SetupEndpoint) {
-    if let Err(error) = endpoint.arm_scan(scan()).await {
-        panic!("the fixture arms its immutable history floor: {error}");
-    }
 }
 
 fn bond_edge() -> EdgeId {
@@ -203,7 +179,6 @@ async fn endpoint(
 /// in.
 async fn proposing_provider(root: &std::path::Path) -> SetupEndpoint {
     let mut endpoint = endpoint(root, Role::Provider, provider(), admits()).await;
-    arm(&mut endpoint).await;
     if let Err(error) = endpoint
         .propose_bond(network(), bond_funding(), bond_terms())
         .await
@@ -211,30 +186,6 @@ async fn proposing_provider(root: &std::path::Path) -> SetupEndpoint {
         panic!("the fixture provider proposes its bond: {error}");
     }
     endpoint
-}
-
-#[tokio::test]
-async fn no_export_path_can_return_unjournaled_revision_bytes() {
-    let root = tempfile::tempdir().expect("a temp dir");
-    let mut provider_endpoint = endpoint(root.path(), Role::Provider, provider(), admits()).await;
-    let error = provider_endpoint
-        .propose_bond(network(), bond_funding(), bond_terms())
-        .await
-        .expect_err("the export path cannot sign past a missing ScanArmed");
-    assert!(matches!(error, SetupExchangeError::Store(_)));
-    assert!(
-        provider_endpoint.state().bundle_bytes().is_none(),
-        "no bytes exist for a caller to export when the durable guard refuses",
-    );
-    drop(provider_endpoint);
-    assert!(
-        reopen(root.path(), Role::Provider)
-            .await
-            .state()
-            .bundle_bytes()
-            .is_none(),
-        "the refusal is also the recovered state",
-    );
 }
 
 // ── An in-memory pipe pair, so the wire is a real wire ────────────────
@@ -301,7 +252,6 @@ async fn two_endpoints_that_have_never_met_open_a_channel() {
     if let Err(error) = exchange_setup(dialer.clone(), &mut caller).await {
         panic!("the first exchange completes: {error}");
     }
-    arm(&mut caller).await;
     assert_eq!(
         caller.state().revision(),
         Some(1),
@@ -422,7 +372,6 @@ async fn a_provider_does_not_countersign_terms_its_own_policy_refuses() {
         if let Err(error) = exchange_setup(dialer.clone(), &mut caller).await {
             panic!("the first exchange completes: {error}");
         }
-        arm(&mut caller).await;
         if let Err(error) = caller.propose_payment(payment_funding(), terms).await {
             panic!("the client is free to propose {what}: {error}");
         }
@@ -478,7 +427,6 @@ async fn a_provider_does_not_countersign_terms_its_own_policy_refuses() {
 async fn a_proposing_endpoint_declines_to_countersign_admissible_terms() {
     let root = tempfile::tempdir().expect("a temp dir");
     let mut proposer = endpoint(root.path(), Role::Provider, provider(), proposes()).await;
-    arm(&mut proposer).await;
     if let Err(error) = proposer
         .propose_bond(network(), bond_funding(), bond_terms())
         .await
@@ -495,7 +443,6 @@ async fn a_proposing_endpoint_declines_to_countersign_admissible_terms() {
     if let Err(error) = exchange_setup(dialer.clone(), &mut caller).await {
         panic!("the first exchange completes: {error}");
     }
-    arm(&mut caller).await;
     if let Err(error) = caller
         .propose_payment(payment_funding(), payment_terms(bond_edge()))
         .await
@@ -670,7 +617,7 @@ async fn a_replay_is_answered_the_same_and_writes_nothing() {
     let provider = reopen(provider_root.path(), Role::Provider).await;
     assert_eq!(
         provider.len(),
-        4,
+        3,
         "the journal holds one record per revision and nothing for the replay",
     );
     assert_eq!(provider.state().bundle_bytes(), Some(first.as_slice()));
@@ -729,7 +676,6 @@ async fn a_stranger_cannot_make_the_provider_countersign() {
     if let Err(error) = exchange_setup(dialer.clone(), &mut interloper).await {
         panic!("the proposal is public: {error}");
     }
-    arm(&mut interloper).await;
     assert_eq!(interloper.state().revision(), Some(1));
 
     // And cannot journal a revision 2 over it, because its own store
@@ -842,7 +788,7 @@ async fn refused_by_a_proposing_provider(bundle: Vec<u8>) -> (ExchangeSetupRespo
     );
     assert_eq!(
         provider.len(),
-        2,
+        1,
         "and wrote nothing for the revision it refused",
     );
     let reason = match response.outcome.as_ref() {
@@ -926,7 +872,6 @@ async fn complete(dialer: &MuxTransport, caller: &mut SetupEndpoint) {
     if let Err(error) = exchange_setup(dialer.clone(), caller).await {
         panic!("the first exchange completes: {error}");
     }
-    arm(caller).await;
     if let Err(error) = caller
         .propose_payment(payment_funding(), payment_terms(bond_edge()))
         .await

@@ -5,7 +5,6 @@ use std::path::Path;
 
 pub mod admin;
 pub mod chain;
-pub mod chain_node;
 pub(crate) mod codex_auth;
 pub mod contributions;
 

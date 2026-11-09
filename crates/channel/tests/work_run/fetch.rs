@@ -450,8 +450,9 @@ async fn paid_fetch_larger_than_a_wire_frame_streams_and_pays_without_disk_paylo
         .await
         .unwrap();
     let (transport, server) = transport::transport_pair();
+    let served = service.clone();
     let serving = tokio::spawn(async move {
-        let handler = WorkServer(service);
+        let handler = WorkServer(served);
         while let Ok(Some(inbound)) = server.accept().await {
             let _ = Dispatcher::<MuxTransport>::dispatch(&handler, inbound).await;
         }
@@ -481,6 +482,9 @@ async fn paid_fetch_larger_than_a_wire_frame_streams_and_pays_without_disk_paylo
         .await
         .unwrap();
     assert!(delivered.transcript.len() > hellas_wire::frame::MAX_FRAME_BYTES);
+    // The stream outlives one certified age; pay from a fresh read.
+    let fresh = ready_of(descriptor_with(profile.clone()), CURSOR + 1);
+    hellas_channel::test_support::channel::refresh(&client, &service, &fresh, CURSOR + 1).await;
     assert_eq!(
         admit_payment(&WorkClientImpl::new(transport), &mut client, id)
             .await

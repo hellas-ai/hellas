@@ -5,7 +5,6 @@
 //! crates without making a CLI binary their library boundary.
 
 pub use hellas_attestation::{AttestationError, Attester, Binding, RootProver};
-pub use hellas_chain::node::{Config as ChainNodeConfig, FullNode};
 pub use hellas_rpc as rpc;
 pub use hellas_wire as wire;
 

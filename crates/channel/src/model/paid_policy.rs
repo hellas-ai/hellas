@@ -1,10 +1,7 @@
 //! Owner-approved terms for automatic paid-channel offers.
 use super::{setup::ProviderChannelPolicy, work::*};
 use hellas_auth::authority::Revision;
-use hellas_kernel::{
-    EdgeValues, Fees, MAX_OMIT_RESPONSE_BLOCKS, MIN_OMIT_RESPONSE_BLOCKS, NetworkId,
-    work_payment_settlement,
-};
+use hellas_kernel::{EdgeValues, Fees, NetworkId, work_payment_settlement};
 use hellas_rpc::protocol::invocation::InvocationPolicy;
 use serde::{Deserialize, Serialize};
 
@@ -16,7 +13,6 @@ pub struct PaidPolicy {
     pub payment_policy: JobPaymentPolicyV2,
     #[serde(with = "edge_values")]
     pub expected_payment_values: EdgeValues,
-    pub min_omit_response_blocks: u64,
     #[serde(default = "default_jobs_per_channel")]
     pub jobs_per_channel: u64,
     pub offers: OfferPolicy,
@@ -71,8 +67,6 @@ impl PaidPolicy {
         }
         if self.channel_policy.compute_credit_limit < self.payment_policy.fixed_price
             || self.channel_policy.delivery_credit_limit < self.payment_policy.fixed_price
-            || !(MIN_OMIT_RESPONSE_BLOCKS..=MAX_OMIT_RESPONSE_BLOCKS)
-                .contains(&self.min_omit_response_blocks)
             || self.offers.max_stake_per_client == 0
             || self.offers.max_open_offers == 0
             || !(1..=1_000_000).contains(&self.offers.bond_lifetime_blocks)
@@ -94,7 +88,6 @@ impl StoredPaidPolicy {
             invocation_policy: self.policy.invocation_policy.clone(),
             payment_policy: self.policy.payment_policy,
             expected_payment_values: self.policy.expected_payment_values,
-            min_omit_response_blocks: self.policy.min_omit_response_blocks,
         }
     }
 }

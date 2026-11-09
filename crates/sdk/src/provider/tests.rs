@@ -33,10 +33,9 @@ impl RootProver for UnusedRoot {
 }
 
 #[tokio::test]
-async fn paid_provider_advertises_work_and_chain_services() {
+async fn paid_provider_advertises_work_services_and_serves_no_chain_sync() {
     tokio::time::timeout(Duration::from_secs(30), async {
-        let mut fixture = crate::test_support::PaidFixture::new();
-        let node = fixture.node().await;
+        let fixture = crate::test_support::PaidFixture::new();
         let identity = NodeIdentity::from_secret_bytes([4; 32], [2; 32]).unwrap();
         let (enrollment, _) = crate::test_support::enrollment(identity.transport_key().public());
         let mut routes = FetchRouteRegistry::new();
@@ -75,9 +74,7 @@ async fn paid_provider_advertises_work_and_chain_services() {
                 routes,
                 fetch_max_in_flight: 1,
                 fetch_queue_capacity: 1,
-                paid_work: Some(
-                    crate::PaidProviderOptions::new(fixture.config, node.clone()).unwrap(),
-                ),
+                paid_work: Some(crate::PaidProviderOptions::new(fixture.config)),
                 grants: Some(crate::GrantProviderOptions {
                     configuration: Default::default(),
                     max_job_millis: std::num::NonZeroU64::new(5000).unwrap(),
@@ -116,8 +113,17 @@ async fn paid_provider_advertises_work_and_chain_services() {
                 .await
                 .is_err()
         );
+        // A paid provider is no chain peer: it reads its channels by proof.
+        assert!(
+            client
+                .connect(
+                    addr.clone(),
+                    hellas_rpc::services::chain_sync::ChainSync::ALPN.as_bytes()
+                )
+                .await
+                .is_err()
+        );
         for alpn in [
-            hellas_rpc::services::chain_sync::ChainSync::ALPN,
             hellas_rpc::services::node::Node::ALPN,
             hellas_rpc::services::work::Work::ALPN,
             hellas_rpc::services::work_setup::WorkSetup::ALPN,
@@ -127,7 +133,6 @@ async fn paid_provider_advertises_work_and_chain_services() {
         }
         client.close().await;
         provider.shutdown().await.unwrap();
-        node.shutdown().await.unwrap();
     })
     .await
     .expect("paid provider protocol negotiation completes");
@@ -314,7 +319,6 @@ fn work_and_content_are_advertised_with_the_configured_control_services() {
         [
             Node::ALPN.as_bytes(),
             Content::ALPN.as_bytes(),
-            hellas_rpc::services::chain_sync::ChainSync::ALPN.as_bytes(),
             WorkSetup::ALPN.as_bytes(),
             Work::ALPN.as_bytes()
         ]

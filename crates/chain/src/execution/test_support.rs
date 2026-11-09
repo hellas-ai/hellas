@@ -85,6 +85,18 @@ pub(crate) fn index_block(
     txs: Vec<Transaction>,
 ) -> HellasBlock {
     let height = parent.height().get() + 1;
+    index_block_at(parent, state_root, txs, height * 1_000)
+}
+
+/// [`index_block`], stamped at `timestamp` rather than one second per
+/// height.
+pub(crate) fn index_block_at(
+    parent: &HellasBlock,
+    state_root: commonware_cryptography::sha256::Digest,
+    txs: Vec<Transaction>,
+    timestamp: u64,
+) -> HellasBlock {
+    let height = parent.height().get() + 1;
     let sync_target = UtxoSyncTarget::new(
         state_root,
         non_empty_range!(
@@ -100,7 +112,7 @@ pub(crate) fn index_block(
         },
         parent.digest(),
         Height::new(height),
-        height,
+        timestamp,
         state_root,
         sync_target,
         txs,

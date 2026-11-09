@@ -10,7 +10,6 @@
 use hellas_channel::test_support::HANG_GUARD;
 use hellas_private::StoreLocation;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use support::temp;
 
 use hellas_auth::Digest;
@@ -31,9 +30,7 @@ use hellas_channel::work::{
     ClientChannel as _, ClientEndpoint, ClientService, CloseEndpoint, EndpointError, JobProposal,
     ProposeError, ProviderEndpoint, WorkRefusal, WorkService, propose_work,
 };
-use hellas_channel::work_close::{
-    BlockSourceError, CatchUpError, CloseChannel as _, FinalizedBlocks, FinalizedWork,
-};
+use hellas_channel::work_close::CloseChannel as _;
 use hellas_channel::work_store::{
     Channel, ChannelRecord, ChannelStore, JobPhase, JobState, Role, SetupOrigin, TerminalOutcome,
 };
@@ -628,459 +625,6 @@ async fn one_channel_has_one_cursor_driver_whatever_a_second_caller_names() {
         service.drive().is_ok(),
         "the authority comes back when the driver goes",
     );
-}
-
-/// A block source that stops inside `block_at` until it is released.
-///
-/// The wait is the whole fixture. Every claim below is about what a
-/// second caller can do while a driver is in there, and a driver that
-/// held this channel's journal across the wait would be holding the
-/// request path's own lock.
-struct HeldChain {
-    blocks: Vec<FinalizedWork>,
-    fetches: Arc<AtomicUsize>,
-    released: Arc<AtomicBool>,
-}
-
-impl HeldChain {
-    fn over(heights: std::ops::RangeInclusive<u64>, released: &Arc<AtomicBool>) -> Arc<Self> {
-        Arc::new(Self {
-            blocks: heights
-                .map(|height| FinalizedWork {
-                    height,
-                    parent: payload_at(height - 1),
-                    payload: payload_at(height),
-                    txs: Vec::new(),
-                })
-                .collect(),
-            fetches: Arc::new(AtomicUsize::new(0)),
-            released: Arc::clone(released),
-        })
-    }
-}
-
-impl FinalizedBlocks for HeldChain {
-    async fn latest_height(&self) -> Result<Option<u64>, BlockSourceError> {
-        Ok(self.blocks.last().map(|block| block.height))
-    }
-
-    async fn block_at(&self, height: u64) -> Result<Option<FinalizedWork>, BlockSourceError> {
-        self.fetches.fetch_add(1, Ordering::SeqCst);
-        while !self.released.load(Ordering::SeqCst) {
-            tokio::task::yield_now().await;
-        }
-        Ok(self
-            .blocks
-            .iter()
-            .find(|block| block.height == height)
-            .cloned())
-    }
-}
-
-/// Waits until `count` reaches `wanted`, or gives up rather than hang.
-async fn reaches(count: &AtomicUsize, wanted: usize) {
-    let waited = tokio::time::timeout(HANG_GUARD, async {
-        while count.load(Ordering::SeqCst) < wanted {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await;
-    assert!(waited.is_ok(), "the driver reached the chain wait");
-}
-
-/// One job's cursor has one driver, whatever else is running.
-///
-/// Both drivers here are service calls, because after this slice there
-/// is no other kind: the endpoint is not handed out, so a second driver
-/// cannot be built out of a raw borrow. The refused one reads no block
-/// at all, which is what stops two drivers copying one duty out of the
-/// same block.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn one_job_has_one_cursor_driver_while_a_drive_is_in_flight() {
-    let root = temp();
-    let service = WorkService::new(provider_endpoint(root.path()).await);
-    let id = Digest::from_bytes([0x55; 32]);
-    let released = Arc::new(AtomicBool::new(false));
-    let chain = HeldChain::over((CURSOR + 1)..=(CURSOR + 3), &released);
-    let fetches = Arc::clone(&chain.fetches);
-
-    let driving = tokio::spawn({
-        let service = service.clone();
-        let chain = Arc::clone(&chain);
-        async move { service.catch_up_job(chain.as_ref(), id).await }
-    });
-    reaches(&fetches, 1).await;
-
-    // The second driver of the same job, while the first is stopped at
-    // the chain. Bounded, because the failure this is about is a second
-    // driver that joins the drive instead of being turned away, and that
-    // one would never return.
-    let second = tokio::time::timeout(HANG_GUARD, service.catch_up_job(chain.as_ref(), id)).await;
-    let Ok(second) = second else {
-        panic!("a second driver of one job is turned away, not admitted to the drive");
-    };
-    assert!(
-        matches!(second, Err(CatchUpError::Busy)),
-        "a second driver of one job is turned away: {second:?}",
-    );
-    assert_eq!(
-        fetches.load(Ordering::SeqCst),
-        1,
-        "and it read no block of its own",
-    );
-
-    released.store(true, Ordering::SeqCst);
-    let Ok(Ok(height)) = driving.await else {
-        panic!("the one driver finishes its range");
-    };
-    assert_eq!(height, CURSOR + 3);
-    assert_eq!(
-        fetches.load(Ordering::SeqCst),
-        3,
-        "each block in the range was fetched exactly once",
-    );
-    assert_eq!(
-        service
-            .with_state(|state| state.cursor().0)
-            .await
-            .expect("the endpoint is reachable"),
-        CURSOR + 3,
-    );
-}
-
-/// A second driver naming a *different* job is refused too, and reads
-/// nothing.
-///
-/// This is the forged key. A guard keyed on what the caller says is not
-/// a guard: the second call names a digest of its own, gets a slot of
-/// its own, and drives the one cursor its counterpart is driving —
-/// fetching every block a second time and treating the first driver's
-/// applies as its own redundant re-reads. The authority is the
-/// channel's, so the name it is asked for buys nothing.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_second_driver_naming_another_job_is_refused_and_reads_nothing() {
-    let root = temp();
-    let service = WorkService::new(provider_endpoint(root.path()).await);
-    let released = Arc::new(AtomicBool::new(false));
-    let chain = HeldChain::over((CURSOR + 1)..=(CURSOR + 3), &released);
-    let fetches = Arc::clone(&chain.fetches);
-
-    let driving = tokio::spawn({
-        let service = service.clone();
-        let chain = Arc::clone(&chain);
-        async move {
-            service
-                .catch_up_job(chain.as_ref(), Digest::from_bytes([0x55; 32]))
-                .await
-        }
-    });
-    reaches(&fetches, 1).await;
-
-    let second = tokio::time::timeout(
-        HANG_GUARD,
-        service.catch_up_job(chain.as_ref(), Digest::from_bytes([0x56; 32])),
-    )
-    .await;
-    let Ok(second) = second else {
-        panic!("a driver naming another job is turned away, not admitted to the drive");
-    };
-    assert!(
-        matches!(second, Err(CatchUpError::Busy)),
-        "a different name does not buy a second drive of one channel: {second:?}",
-    );
-    assert_eq!(
-        fetches.load(Ordering::SeqCst),
-        1,
-        "and it read no block of its own",
-    );
-
-    released.store(true, Ordering::SeqCst);
-    let Ok(Ok(height)) = driving.await else {
-        panic!("the one driver finishes its range");
-    };
-    assert_eq!(height, CURSOR + 3);
-    assert_eq!(
-        fetches.load(Ordering::SeqCst),
-        3,
-        "each block in the range was fetched exactly once, not twice",
-    );
-}
-
-/// A job id is checked against the journal, not taken on trust.
-///
-/// Nothing else is driving here, so `Busy` is not what refuses this: the
-/// channel holds an accepted job, the driver names another, and a
-/// cursor advanced for a job this journal has never heard of would be
-/// this channel's cursor moved by a stranger.
-#[tokio::test]
-async fn a_driver_naming_a_job_this_channel_does_not_hold_is_refused() {
-    let open = Arc::new(AtomicBool::new(true));
-
-    // Before acceptance there is no job to contradict, which is the
-    // phase boundary's own case: the digest is the proposal's, and this
-    // journal learns it from the acceptance this read precedes.
-    let fresh_root = temp();
-    let fresh = WorkService::new(provider_endpoint(fresh_root.path()).await);
-    let unread = HeldChain::over((CURSOR + 1)..=(CURSOR + 3), &open);
-    let ahead = fresh
-        .catch_up_job(unread.as_ref(), Digest::from_bytes([0x55; 32]))
-        .await;
-    assert!(
-        matches!(ahead, Ok(height) if height == CURSOR + 3),
-        "a channel holding no job contradicts no name: {ahead:?}",
-    );
-
-    let root = temp();
-    let service = WorkService::new(provider_endpoint(root.path()).await);
-    accepted_signature(&accept_uploaded_service(&service, &signed_request(1, 1)).await);
-    let chain = HeldChain::over((CURSOR + 1)..=(CURSOR + 3), &open);
-    let fetches = Arc::clone(&chain.fetches);
-    let stranger = service
-        .catch_up_job(chain.as_ref(), Digest::from_bytes([0x56; 32]))
-        .await;
-    assert!(
-        matches!(stranger, Err(CatchUpError::OtherJob)),
-        "the journal's job is what says whose drive this is: {stranger:?}",
-    );
-    assert_eq!(
-        fetches.load(Ordering::SeqCst),
-        0,
-        "and the refused driver asked the source for nothing",
-    );
-    assert_eq!(
-        service
-            .with_state(|state| state.cursor().0)
-            .await
-            .expect("the endpoint is reachable"),
-        CURSOR,
-        "so the cursor is where it was",
-    );
-}
-
-/// A channel whose one job has ended still knows whose drive this is.
-///
-/// Ending a job clears the *open* job and writes this channel's one
-/// permanent terminal, which keeps the real `work_id`. A check that
-/// consulted only the open job would therefore find nothing to
-/// contradict on every channel that ever finished anything, and the
-/// exception meant for "no job yet" would become "no job right now" —
-/// any digest a caller offered would drive the cursor.
-///
-/// All five outcomes rest at the same terminal; the three below are the
-/// ones reachable from this fixture's phase without a signed result.
-#[tokio::test]
-async fn a_driver_naming_another_job_is_refused_after_this_channel_s_job_ended() {
-    let open = Arc::new(AtomicBool::new(true));
-    for outcome in [
-        TerminalOutcome::Failed { code: 1 },
-        TerminalOutcome::Expired {
-            deadline: deadlines().payment,
-            height: CURSOR,
-            payload: payload_at(CURSOR),
-        },
-        TerminalOutcome::Indeterminate,
-    ] {
-        let name = format!("{outcome:?}");
-        let root = temp();
-        let (service, held) = terminated_provider(root.path(), outcome).await;
-        let chain = HeldChain::over((CURSOR + 1)..=(CURSOR + 3), &open);
-        let fetches = Arc::clone(&chain.fetches);
-
-        let stranger = service
-            .catch_up_job(chain.as_ref(), Digest::from_bytes([0x56; 32]))
-            .await;
-        assert!(
-            matches!(stranger, Err(CatchUpError::OtherJob)),
-            "{name}: the terminal names the job as durably as the open one did: {stranger:?}",
-        );
-        assert_eq!(
-            fetches.load(Ordering::SeqCst),
-            0,
-            "{name}: and the refused driver asked the source for nothing",
-        );
-        assert_eq!(
-            service
-                .with_state(|state| state.cursor().0)
-                .await
-                .expect("the endpoint is reachable"),
-            CURSOR,
-            "{name}: so the cursor is where it was",
-        );
-
-        // Non-vacuous: the job this channel really ran still drives.
-        let owner = service.catch_up_job(chain.as_ref(), held).await;
-        assert!(
-            matches!(owner, Ok(height) if height == CURSOR + 3),
-            "{name}: the job the terminal names is not locked out by it: {owner:?}",
-        );
-    }
-}
-
-/// A reopened provider whose one job has ended at `outcome`, with the
-/// `work_id` that terminal holds.
-///
-/// Journaled the way the endpoint journals it — the proposal, then the
-/// terminating record — and reopened, so what the driver reads is what
-/// a restart would replay rather than what one run happened to hold.
-async fn terminated_provider(
-    root: &std::path::Path,
-    outcome: TerminalOutcome,
-) -> (WorkService, Digest) {
-    let authorization = authorization(1, 1);
-    let held = work_id(ready().channel(), &authorization);
-    let client_signature = client().sign(signing_hash(held));
-    let verifier = Secp256k1Verifier::new();
-    let mut store = store_at_cursor(root, Role::Provider).await;
-    for record in [
-        ChannelRecord::JobProposed {
-            authorization,
-            client_signature,
-            prepared_input: bundle_bytes(1).into(),
-
-            retained_tree: None,
-        },
-        ChannelRecord::JobTerminated {
-            work_id: held,
-            outcome,
-        },
-    ] {
-        if let Err(error) = store.commit(record, &verifier).await {
-            panic!("the fixture reaches its terminal: {error}");
-        }
-    }
-    store.content_store().close().await;
-    drop(store);
-
-    let service = WorkService::new(provider_endpoint(root).await);
-    let ended = service
-        .with_state(|state| state.jobs().next().is_none() && state.terminals().next().is_some())
-        .await
-        .expect("the endpoint is reachable");
-    assert!(
-        ended,
-        "the fixture's job is over and its terminal is on disk"
-    );
-    (service, held)
-}
-
-/// An inbound proposal is answered while a cursor drive waits on a slow
-/// chain.
-///
-/// The drive is mid-flight and stopped at the source for the whole of
-/// the request, and the request is answered — co-signature journaled and
-/// all — without waiting for it. That is the watcher/runner isolation
-/// rule as a test: a driver holds no borrow across a chain wait, so the
-/// request path never queues behind one.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_proposal_is_answered_while_a_drive_waits_on_the_chain() {
-    let root = temp();
-    let service = WorkService::new(provider_endpoint(root.path()).await);
-    let id = Digest::from_bytes([0x55; 32]);
-    let released = Arc::new(AtomicBool::new(false));
-    let chain = HeldChain::over((CURSOR + 1)..=(CURSOR + 3), &released);
-    let fetches = Arc::clone(&chain.fetches);
-
-    let driving = tokio::spawn({
-        let service = service.clone();
-        let chain = Arc::clone(&chain);
-        async move { service.catch_up_job(chain.as_ref(), id).await }
-    });
-    reaches(&fetches, 1).await;
-
-    let answering = tokio::spawn({
-        let service = service.clone();
-        async move { accept_uploaded_service(&service, &signed_request(1, 1)).await }
-    });
-    let answered = tokio::time::timeout(HANG_GUARD, answering).await;
-    let Ok(Ok(response)) = answered else {
-        panic!("the request path does not queue behind the drive: {answered:?}");
-    };
-    accepted_signature(&response);
-    assert!(
-        !driving.is_finished(),
-        "the drive was still stopped at the chain while that was answered",
-    );
-
-    released.store(true, Ordering::SeqCst);
-    assert!(driving.await.is_ok(), "and it finishes afterwards");
-}
-
-/// The same, for the drive that owns a sink as well as a source.
-///
-/// A close drive commits, submits and records a hand-off, so it is the
-/// one that would be tempting to run under a single held borrow — and a
-/// held borrow here is a provider that stops answering proposals every
-/// time the chain is slow. It takes the endpoint per apply and per
-/// record and across neither wait, so the request is answered with its
-/// co-signature while the drive is stopped at the block source.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_proposal_is_answered_while_a_close_drive_waits_on_the_chain() {
-    let root = temp();
-    let service = WorkService::new(provider_endpoint(root.path()).await);
-    let released = Arc::new(AtomicBool::new(false));
-    let chain = HeldChain::over((CURSOR + 1)..=(CURSOR + 3), &released);
-    let fetches = Arc::clone(&chain.fetches);
-    let sink = Arc::new(NoSink::default());
-
-    let driving = tokio::spawn({
-        let service = service.clone();
-        let chain = Arc::clone(&chain);
-        let sink = Arc::clone(&sink);
-        async move { service.advance_close(chain.as_ref(), sink.as_ref()).await }
-    });
-    reaches(&fetches, 1).await;
-
-    let answering = tokio::spawn({
-        let service = service.clone();
-        async move { accept_uploaded_service(&service, &signed_request(1, 1)).await }
-    });
-    let answered = tokio::time::timeout(HANG_GUARD, answering).await;
-    let Ok(Ok(response)) = answered else {
-        panic!("the request path does not queue behind the close drive: {answered:?}");
-    };
-    accepted_signature(&response);
-    assert!(
-        !driving.is_finished(),
-        "the drive was still stopped at the chain while that was answered",
-    );
-
-    released.store(true, Ordering::SeqCst);
-    let Ok(Ok(progress)) = driving.await else {
-        panic!("the close drive finishes its range");
-    };
-    assert_eq!(
-        progress,
-        hellas_channel::work_close::CloseProgress::Nothing,
-        "this channel has no contest and no retained start, so nothing was sent",
-    );
-    assert_eq!(
-        sink.taken.load(Ordering::SeqCst),
-        0,
-        "and the sink was never asked to take anything",
-    );
-    assert_eq!(
-        service
-            .with_state(|state| state.cursor().0)
-            .await
-            .expect("the endpoint is reachable"),
-        CURSOR + 3,
-    );
-}
-
-/// A sink that counts what it was asked to take, and takes it.
-#[derive(Debug, Default)]
-struct NoSink {
-    taken: AtomicUsize,
-}
-
-impl hellas_channel::work_close::TxSink for NoSink {
-    async fn submit(
-        &self,
-        _tx: hellas_kernel::Tx,
-    ) -> Result<hellas_rpc::SubmitTxOutcome, BlockSourceError> {
-        self.taken.fetch_add(1, Ordering::SeqCst);
-        Ok(hellas_rpc::SubmitTxOutcome::Enqueued)
-    }
 }
 
 #[test]
@@ -2620,66 +2164,13 @@ async fn the_wire_carries_the_authorization_the_signature_covers() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn client_observer_does_not_hold_the_journal_during_chain_io() {
-    let root = temp();
-    let mut service = ClientService::new(raw_client_endpoint(root.path()).await);
-    service
-        .observer()
-        .observe_ready(
-            ready(),
-            hellas_channel::work::ObservationTime::now(),
-            std::time::Duration::from_secs(30),
-        )
-        .await
-        .unwrap();
-    let released = Arc::new(AtomicBool::new(false));
-    let source = HeldChain::over(CURSOR + 1..=CURSOR + 1, &released);
-    let observer = service.observer();
-    let held_source = source.clone();
-    let driving =
-        tokio::spawn(async move { observer.drive().unwrap().catch_up(&*held_source).await });
-    reaches(&source.fetches, 1).await;
-    assert!(matches!(
-        service.observer().drive(),
-        Err(EndpointError::CatchingUp)
-    ));
-    // The provider exchange can sign and journal while the observer waits.
-    let request = service
-        .propose(
-            &proposal(1),
-            &hellas_channel::test_support::channel::program_content().await,
-        )
-        .await
-        .unwrap();
-    assert!(!request.client_signature.is_empty());
-    assert_eq!(
-        service
-            .with_state(|state| state.proposal_nonce_high_water())
-            .await
-            .unwrap(),
-        1
-    );
-    released.store(true, Ordering::SeqCst);
-    assert_eq!(driving.await.unwrap().unwrap(), CURSOR + 1);
-    assert!(service.observer().drive().is_ok());
-}
-
 #[tokio::test]
 async fn shared_client_can_follow_blocks_while_waiting_for_provider_acceptance() {
     use hellas_channel::work::ClientService;
     let client_root = temp();
     let provider_root = temp();
     let mut client = ClientService::new(raw_client_endpoint(client_root.path()).await);
-    client
-        .observer()
-        .observe_ready(
-            ready(),
-            hellas_channel::work::ObservationTime::now(),
-            std::time::Duration::from_secs(30),
-        )
-        .await
-        .unwrap();
+    client.observer().observe_ready(ready()).await.unwrap();
     let observer = client.observer();
     let (client_transport, server_transport) = transport_pair();
     let request = tokio::spawn(async move {
@@ -2704,15 +2195,19 @@ async fn shared_client_can_follow_blocks_while_waiting_for_provider_acceptance()
     })
     .await
     .unwrap();
+    let (bond, payment) = (
+        hellas_channel::test_support::channel::bond_object(),
+        hellas_channel::test_support::channel::payment_object(),
+    );
     observer
         .drive()
         .unwrap()
-        .observe_finalized(&FinalizedWork {
-            height: CURSOR + 1,
-            parent: payload_at(CURSOR),
-            payload: payload_at(CURSOR + 1),
-            txs: Vec::new(),
-        })
+        .observe(&hellas_channel::test_support::channel::observed_at(
+            CURSOR + 1,
+            &bond,
+            &payment,
+            hellas_kernel::PendingSlot::Absent,
+        ))
         .await
         .unwrap();
     let serving = serve(
@@ -2728,11 +2223,26 @@ async fn shared_client_can_follow_blocks_while_waiting_for_provider_acceptance()
 }
 
 #[tokio::test]
-async fn managed_observers_start_closed_and_old_tips_cannot_renew_expired_readiness() {
+async fn managed_observers_start_closed_and_stale_certified_reads_cannot_admit() {
     let client_root = temp();
     let provider_root = temp();
-    let mut client = ClientService::new(raw_client_endpoint(client_root.path()).await);
-    let provider = WorkService::new(provider_endpoint(provider_root.path()).await);
+    // Journals that have read nothing yet.
+    let mut client = ClientService::new(
+        ClientEndpoint::new(
+            ready(),
+            store(client_root.path(), Role::Client).await,
+            client(),
+        )
+        .unwrap(),
+    );
+    let provider = WorkService::new(
+        ProviderEndpoint::new(
+            ready(),
+            store(provider_root.path(), Role::Provider).await,
+            provider(),
+        )
+        .unwrap(),
+    );
     provider.require_observer().await.unwrap();
     assert!(matches!(
         client.readiness().await,
@@ -2742,34 +2252,67 @@ async fn managed_observers_start_closed_and_old_tips_cannot_renew_expired_readin
         refusal_code(&accept_uploaded_service(&provider, &signed_request(1, 1)).await),
         WorkRefusalCode::NotReady
     );
-    for max_age in [
-        std::time::Duration::ZERO,
-        std::time::Duration::from_secs(30),
-    ] {
-        let started = hellas_channel::work::ObservationTime::now();
+    // A read older than the certified-age bound is applied, but cannot
+    // admit work on either side.
+    let stale = hellas_channel::test_support::channel::now_ms()
+        - u64::try_from(hellas_channel::work::MAX_CERTIFIED_AGE.as_millis()).unwrap()
+        - 1;
+    let (bond, payment) = (
+        hellas_channel::test_support::channel::bond_object(),
+        hellas_channel::test_support::channel::payment_object(),
+    );
+    let mut observed = hellas_channel::test_support::channel::observed_at(
+        CURSOR,
+        &bond,
+        &payment,
+        hellas_kernel::PendingSlot::Absent,
+    );
+    observed.certified_at_ms = stale;
+    client
+        .observer()
+        .drive()
+        .unwrap()
+        .observe(&observed)
+        .await
+        .unwrap();
+    provider
+        .advance_close(&observed, &hellas_channel::test_support::channel::NullSink)
+        .await
+        .unwrap();
+    assert_eq!(
+        client.observer().observe_ready(ready()).await,
+        Err(EndpointError::ObservationStale)
+    );
+    assert_eq!(
+        provider.observe_ready(ready()).await,
+        Err(EndpointError::ObservationStale)
+    );
+    assert!(matches!(
         client
-            .observer()
-            .observe_ready(ready(), started, max_age)
-            .await
-            .unwrap();
-        provider
-            .observe_ready(ready(), started, max_age)
-            .await
-            .unwrap();
-        assert!(matches!(
-            client
-                .propose(
-                    &proposal(1),
-                    &hellas_channel::test_support::channel::program_content().await
-                )
-                .await,
-            Err(ProposeError::Endpoint(EndpointError::ObservationStale))
-        ));
-        assert_eq!(
-            refusal_code(&accept_uploaded_service(&provider, &signed_request(1, 1)).await),
-            WorkRefusalCode::NotReady
-        );
-    }
+            .propose(
+                &proposal(1),
+                &hellas_channel::test_support::channel::program_content().await
+            )
+            .await,
+        Err(ProposeError::Endpoint(EndpointError::ObservationStale))
+    ));
+    assert_eq!(
+        refusal_code(&accept_uploaded_service(&provider, &signed_request(1, 1)).await),
+        WorkRefusalCode::NotReady
+    );
+    // A fresh read restores admission.
+    observed.height = CURSOR + 1;
+    observed.payload = payload_at(CURSOR + 1);
+    observed.certified_at_ms = hellas_channel::test_support::channel::now_ms();
+    client
+        .observer()
+        .drive()
+        .unwrap()
+        .observe(&observed)
+        .await
+        .unwrap();
+    client.observer().observe_ready(ready()).await.unwrap();
+    assert!(client.readiness().await.is_ok());
     assert_eq!(
         client
             .with_state(|state| state.proposal_nonce_high_water())

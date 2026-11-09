@@ -281,13 +281,16 @@ impl ClientArgs {
             &context.chain,
         )?))
     }
+    /// The attempt `owner` keeps for `job` at this provider. Takes the
+    /// owner rather than opening it: the funding wallet is one exclusive
+    /// lock, and the job's executor already holds it.
     fn purchase(
         &self,
         context: &Context,
         job: &Job,
         options: &PaidWorkOptions,
+        owner: &hellas_sdk::client_owner::ClientOwner,
     ) -> super::CliResult<ExecutionAttempt> {
-        let owner = self.owner(context)?;
         let path = PaidAttemptPath::new(
             &context.chain,
             options.provider,
@@ -602,18 +605,21 @@ impl Target {
         job: &Job,
     ) -> super::CliResult<(Executor, String)> {
         Ok(match self {
-            Target::Paid(options) => (
-                Executor::Paid(PaidExecution {
-                    options: options.clone(),
-                    endpoint: context.paid_endpoint().await?,
-                    settlement_key: context.settlement.clone(),
-                    owner: client.owner(context)?,
-                    funding: Default::default(),
-                    attempt: client.purchase(context, job, options)?,
-                    settle: client.settle,
-                }),
-                options.provider.to_string(),
-            ),
+            Target::Paid(options) => {
+                let owner = client.owner(context)?;
+                (
+                    Executor::Paid(PaidExecution {
+                        options: options.clone(),
+                        endpoint: context.paid_endpoint().await?,
+                        settlement_key: context.settlement.clone(),
+                        attempt: client.purchase(context, job, options, &owner)?,
+                        owner,
+                        funding: Default::default(),
+                        settle: client.settle,
+                    }),
+                    options.provider.to_string(),
+                )
+            }
             Target::Grant {
                 options,
                 policy,

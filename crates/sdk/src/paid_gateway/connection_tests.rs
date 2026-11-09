@@ -191,8 +191,6 @@ fn an_unresponsive_paid_quote_yields_to_the_next_provider_within_the_connection_
                     .unwrap(),
                 )
                 .unwrap(),
-                poll: Duration::from_millis(20),
-                max_observation_age: Duration::from_secs(30),
             };
             pool.owner = Arc::new(
                 crate::client_owner::ClientOwner::new(

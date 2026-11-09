@@ -15,15 +15,15 @@ pub mod setup;
 use hellas_kernel::Cursor;
 
 pub use channel::{
-    Channel, ChannelRecord, ChannelStateError, ChannelStore, CloseHistory, CloseSettlement,
-    FinalizedHeight, Funding, JobBook, JobPhase, JobState, JobTerminal, OpenContest,
-    PaidCertificate, PaymentFunding, RespondedContest, TerminalOutcome,
+    Channel, ChannelRecord, ChannelStateError, ChannelStore, CloseSettlement, FinalizedHeight,
+    Funding, JobBook, JobPhase, JobState, JobTerminal, OpenContest, PaidCertificate,
+    PaymentFunding, RespondedContest, TerminalOutcome,
 };
 pub use journal::{JournalError, Role};
 pub use setup::{
     DiscoveredSetup, ObservedSetup, SetupAbort, SetupDecision, SetupDiscovery, SetupDiscoveryError,
-    SetupEnd, SetupFault, SetupObservation, SetupOrigin, SetupRecord, SetupScan, SetupState,
-    SetupStateError, SetupStore, UnidentifiedSetup, discover_setups,
+    SetupEnd, SetupFault, SetupObservation, SetupOrigin, SetupRecord, SetupState, SetupStateError,
+    SetupStore, UnidentifiedSetup, discover_setups,
 };
 
 /// Why a durable step could not be taken.

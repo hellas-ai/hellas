@@ -33,7 +33,7 @@ use hellas_rpc::{
     scheme_id,
 };
 const NETWORK: &str = "hellas-devnet-1";
-const OTHER_NETWORK: &str = "hellas-devnet-22";
+const OTHER_NETWORK: &str = "hellas-devnet-32";
 const SALT: [u8; 32] = [0x5a; 32];
 const NONCE: [u8; 32] = [7; 32];
 const PROPOSAL_NONCE: u64 = 0x0102_0304_0506_0708;
@@ -110,7 +110,6 @@ fn payment_terms() -> WorkPaymentTerms {
             &SALT,
             &channel_policy(),
         ),
-        omit_response_blocks: 32,
         start_validity_blocks: 16,
         omission_bond: 100,
     }
@@ -341,14 +340,14 @@ fn golden_fetch_invocation_digests_are_pinned() {
         ("result", result_digest(&channel(), &r).to_string()),
     ];
     let expected = [
-        "ee04b6bee03ee2e0a874b44f0061da24f31cab970afc2a0aeee2ec889d3e5e7d",
-        "3e6ce25bf54e270b3b4a27710fdd524fe170a1afd6378577bfb14a4d3531fe86",
+        "19b8658a5210e07bc6ed3810f6cae5ae6a84d30051273f77ee4e2c1fd530d706",
+        "a39ec00175ae64810be2217c986931f237df26fc714b68852693db2dc7a6026b",
         "49de467ef4334be374b748326d015ed07fb439b7b8f16df04f8b9a3a41100198",
-        "060368615e68c89ca8fd87b604ec09eee7c5bc79de7a5da90082b153a027f71c",
+        "582345acd2f5eceaa869fe9d53efed068ca1ac16b047ff73c8337528e444ab51",
         "bccf5d4dd97b81660d9c0296f4039922ae875fa067a21b0e6940b5fccc679297",
         "413bc901a9367bc949f5d53dfbe151e10aa0d9b7da9d748436496b576bc4c368",
         "6e223dd82ad6548d1fa38373aaec2b6dc9baf3e856b1910f17e8c776ddcec1f0",
-        "96fd9d2c35f6117d49e7af395150c689506841e93229c6c811b99b0c5a1d1a29",
+        "1a1dd4e1623ac3befe2b542a87728edae9d810a9cd7bf951071133bb7d223eb5",
     ];
     assert_eq!(
         values.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>(),

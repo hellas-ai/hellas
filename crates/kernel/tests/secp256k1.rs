@@ -30,6 +30,7 @@ const TIMEOUT: BlockHeight = BlockHeight::new(2);
 const CONTEXT: Context = Context::new(
     support::NETWORK,
     BlockHeight::new(1),
+    1_000,
     BlockHash::from_bytes([0; BlockHash::LENGTH]),
 );
 

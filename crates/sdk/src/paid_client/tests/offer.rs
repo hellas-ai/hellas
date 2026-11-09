@@ -1,7 +1,6 @@
 use super::*;
 use crate::test_support::{PaidFixture, enrollment, signer};
 use hellas_channel::model::offer::{PaidOffer, SignedPaidOffer};
-use hellas_channel::work::ObservationTime;
 use hellas_private::StoreLocation;
 use hellas_rpc::services::work::{Work, WorkServer};
 use hellas_wire::Dispatcher;
@@ -246,11 +245,7 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
         let client = ClientService::new(hellas_channel::work::ClientEndpoint::new(fixture.ready.clone(), client_store, crate::test_support::signer(1)).unwrap());
         client
             .observer()
-            .observe_ready(
-                fixture.ready.clone(),
-                ObservationTime::now(),
-                Duration::from_secs(60),
-            )
+            .observe_ready(fixture.ready.clone())
             .await
             .unwrap();
         let mut session = PaidWorkSession {
@@ -300,7 +295,7 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
         let store = fixture.store(Role::Client).await;
         args.content = store.content_store();
         let client = ClientService::new(ClientEndpoint::recover(store, signer(1)).unwrap());
-        client.observer().observe_ready(fixture.ready.clone(), ObservationTime::now(), Duration::from_secs(60)).await.unwrap();
+        client.observer().observe_ready(fixture.ready.clone()).await.unwrap();
         let mut session = PaidWorkSession { args, descriptor, policy, dialer, client, observer: None, needs_recovery: true };
         let job = crate::job::Job::fetch(crate::test_support::PRICE, hellas_channel::test_support::test_responses_contract(), "openai".into(), "responses".into(), crate::test_support::BODY.to_vec(), Assurance::ProducerSigned).unwrap();
         // The acceptance is reported once, before any output, and names the

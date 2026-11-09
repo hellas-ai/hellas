@@ -1,11 +1,11 @@
 use hellas_authority::model::grant::records::decode_contact_card;
-use hellas_chain::genesis::{Chain, ChainProfile, FaucetAccount, HELLAS_DEVNET_2_FAUCET_JSON};
+use hellas_chain::genesis::{Chain, ChainProfile, FaucetAccount, HELLAS_DEVNET_3_FAUCET_JSON};
 use sha2::Digest as _;
 use std::process::Command;
 
 #[test]
 fn faucet_flags_sign_as_the_announced_account_without_creating_a_node() {
-    let accounts: Vec<FaucetAccount> = serde_json::from_str(HELLAS_DEVNET_2_FAUCET_JSON).unwrap();
+    let accounts: Vec<FaucetAccount> = serde_json::from_str(HELLAS_DEVNET_3_FAUCET_JSON).unwrap();
     for selection in [vec!["--faucet"], vec!["--faucet-account", "7"]] {
         let home = tempfile::tempdir().unwrap();
         let output = Command::new(env!("CARGO_BIN_EXE_hellas"))
@@ -54,7 +54,7 @@ fn faucet_rejects_another_authenticated_chain_before_identity_side_effects() {
     let mut trust = known.trust().clone();
     trust.network_id = "custom-faucet-test".into();
     let mut genesis: serde_json::Value =
-        serde_json::from_str(hellas_chain::genesis::HELLAS_DEVNET_2_JSON).unwrap();
+        serde_json::from_str(hellas_chain::genesis::HELLAS_DEVNET_3_JSON).unwrap();
     genesis["network_id"] = serde_json::json!("custom-faucet-test");
     let genesis_json = serde_json::to_string(&genesis).unwrap();
     trust.genesis_sha256 = hex::encode(sha2::Sha256::digest(genesis_json.as_bytes()));

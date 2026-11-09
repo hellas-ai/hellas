@@ -135,7 +135,6 @@ fn payment_of(mutate: impl FnOnce(&mut WorkPaymentTerms)) -> Terms {
         bond_edge: payment_bond_edge(),
         bond_terms: payment_bond(),
         private_policy_commitment: [4; 32],
-        omit_response_blocks: 64,
         start_validity_blocks: 8,
         omission_bond: 2,
     };
@@ -317,16 +316,6 @@ fn work_payment_open_rejects_a_bond_it_does_not_match() {
             InvalidOpenReason::WorkStakeReturnRouting,
         ),
         (
-            payment_of(|payment| payment.omit_response_blocks = 0),
-            InvalidOpenReason::WorkResponseWindowOutOfRange,
-        ),
-        (
-            payment_of(|payment| {
-                payment.omit_response_blocks = hellas_kernel::MAX_OMIT_RESPONSE_BLOCKS + 1;
-            }),
-            InvalidOpenReason::WorkResponseWindowOutOfRange,
-        ),
-        (
             payment_of(|payment| payment.start_validity_blocks = 0),
             InvalidOpenReason::WorkStartValidityOutOfRange,
         ),
@@ -375,8 +364,9 @@ const PAYMENT_VALUE: u64 = 10;
 const OMISSION_BOND: u64 = 2;
 /// Largest certificate this channel may admit.
 const PAYMENT_CAPACITY: u64 = PAYMENT_VALUE - OMISSION_BOND;
-/// Response window `payment_of` commits.
-const RESPONSE_WINDOW: u64 = 64;
+/// Blocks the response window spans: fixtures stamp each block one
+/// second after the last (`at`).
+const RESPONSE_WINDOW: u64 = hellas_kernel::RESPONSE_WINDOW_MS / 1_000;
 /// Height every fixture opens and starts at.
 const START_HEIGHT: u64 = 1;
 /// Height the response window shuts at.
@@ -388,6 +378,7 @@ const fn at(height: u64) -> Context {
     Context::new(
         support::NETWORK,
         BlockHeight::new(height),
+        height * 1_000,
         BlockHash::from_bytes([0; BlockHash::LENGTH]),
     )
 }
@@ -704,7 +695,7 @@ fn a_provider_start_settles_its_certificate_once_the_window_closes() {
     assert!(!record.responded());
     assert!(!record.penalty_due());
     assert_eq!(record.penalty_amount(), OMISSION_BOND);
-    assert_eq!(record.response_deadline(), RESPONSE_DEADLINE);
+    assert_eq!(record.response_deadline_ms(), RESPONSE_DEADLINE * 1_000);
 
     let close = adjudicated_tx(&record, 5);
     let (provider, client) = apply_payment_close(&mut state, at(RESPONSE_DEADLINE), &close);
@@ -2309,36 +2300,43 @@ fn work_open_and_bond_timeout_costs_are_the_assigned_vectors() {
     );
 }
 
-/// The response window has a derived floor, not a chosen one: below it
-/// the provider has no measured opportunity to observe the start and get
-/// an answer included, so the omission theorem the channel is priced on
-/// does not hold and consensus refuses the open.
+/// The window is block time, not blocks: however many blocks land, a
+/// response is on time while its block is stamped before the deadline,
+/// and an adjudicated close waits for a block stamped at or after it.
 #[test]
-fn a_payment_open_refuses_a_window_below_the_derived_floor() {
-    let floor = hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS;
-    let too_short = payment_of(|payment| payment.omit_response_blocks = floor - 1);
-    let funding = payment_funding();
-    let output = Tx::edge_id_of(&funding, &too_short);
-    let mut state = funded_state_for(&work_open());
-    let store = *state.store();
-
+fn the_response_window_is_measured_in_block_time() {
+    let mut state = open_payment_state();
+    apply_move(&mut state, CONTEXT, &start_tx(Party::Maker, Some(5)));
+    let Some(record) = pending_record(&state) else {
+        panic!("the start wrote a contest");
+    };
+    let deadline = record.response_deadline_ms();
     assert_eq!(
-        state.apply(CONTEXT, &FAKE_VERIFIER, &open_tx(funding, too_short)),
-        Err(ApplyError::InvalidOpen {
-            output,
-            reason: InvalidOpenReason::WorkResponseWindowOutOfRange,
-        }),
+        deadline,
+        CONTEXT.block_time_ms() + hellas_kernel::RESPONSE_WINDOW_MS
     );
-    assert_eq!(*state.store(), store);
-
-    // Exactly at the floor is admitted, so the bound is the floor and
-    // not something above it.
-    let exact = payment_of(|payment| payment.omit_response_blocks = floor);
-    let funding = payment_funding();
-    let edge = Tx::edge_id_of(&funding, &exact);
-    let open = open_tx(funding, exact);
-    let mut state = bonded_state_for(edge);
-    apply_payment_open(&mut state, &open);
+    // A thousand blocks later, one millisecond early: still open.
+    let height = START_HEIGHT + 1_000;
+    let early = Context::new(
+        support::NETWORK,
+        BlockHeight::new(height),
+        deadline - 1,
+        BlockHash::from_bytes([0; BlockHash::LENGTH]),
+    );
+    assert_close_rejected(
+        &mut state,
+        early,
+        &adjudicated_tx(&record, 5),
+        InvalidProofReason::ResponseWindowOpen,
+    );
+    // The very next block, stamped at the deadline: admitted.
+    let shut = Context::new(
+        support::NETWORK,
+        BlockHeight::new(height + 1),
+        deadline,
+        BlockHash::from_bytes([0; BlockHash::LENGTH]),
+    );
+    apply_payment_close(&mut state, shut, &adjudicated_tx(&record, 5));
 }
 
 /// A channel whose omission bond swallows everything a close
@@ -2396,24 +2394,23 @@ fn the_payment_exits_stay_open_past_the_admission_horizon() {
     assert_eq!(provider, Some((TAKER, 6)));
 }
 
-/// A start within one committed window of the height ceiling would wrap
-/// its own deadline into the past. The work profile is disabled there
-/// rather than opening a contest that is already over.
+/// A start within one window of the block-time ceiling would wrap its
+/// own deadline into the past. The work profile is disabled there rather
+/// than opening a contest that is already over.
 #[test]
-fn a_start_too_close_to_the_height_ceiling_is_refused() {
+fn a_start_too_close_to_the_time_ceiling_is_refused() {
     let mut state = open_payment_state();
-    let height = u64::MAX - RESPONSE_WINDOW + 1;
-    let start = Tx::move_action(Move::StartPaymentClose(start_body(
-        Party::Taker,
-        (height, height),
-        None,
-        TAKER,
-    )));
+    let late = Context::new(
+        support::NETWORK,
+        BlockHeight::new(START_HEIGHT),
+        u64::MAX - hellas_kernel::RESPONSE_WINDOW_MS + 1,
+        BlockHash::from_bytes([0; BlockHash::LENGTH]),
+    );
 
     assert_start_rejected(
         &mut state,
-        at(height),
-        &start,
+        late,
+        &start_tx(Party::Taker, None),
         InvalidMoveReason::DeadlineOverflow,
     );
 }
@@ -3073,6 +3070,7 @@ fn nonzero_fees_separate_the_two_routes_and_the_capacity_they_imply() {
     let priced = Context::with_fees(
         support::NETWORK,
         BlockHeight::new(1),
+        1_000,
         BlockHash::from_bytes([0; BlockHash::LENGTH]),
         FEES,
     );
@@ -3122,6 +3120,7 @@ fn nonzero_fees_separate_the_two_routes_and_the_capacity_they_imply() {
         Context::with_fees(
             support::NETWORK,
             BlockHeight::new(RESPONSE_DEADLINE),
+            RESPONSE_DEADLINE * 1_000,
             BlockHash::from_bytes([0; BlockHash::LENGTH]),
             FEES,
         ),
@@ -3146,6 +3145,7 @@ fn a_certificate_one_unit_over_the_reported_capacity_is_refused() {
     let priced = Context::with_fees(
         support::NETWORK,
         BlockHeight::new(1),
+        1_000,
         BlockHash::from_bytes([0; BlockHash::LENGTH]),
         FEES,
     );

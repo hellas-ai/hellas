@@ -22,7 +22,6 @@ hellas-auth = { workspace = true }
 hellas-authority = { workspace = true }
 hellas-chain = { workspace = true, default-features = false, features = [
     "chain-dir",
-    "full-node",
     "proof-verify",
     "work-watcher",
 ] }

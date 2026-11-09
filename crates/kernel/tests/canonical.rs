@@ -654,7 +654,6 @@ const fn widest_work_payment() -> WorkPaymentTerms {
         bond_edge: EdgeId::from_bytes([0x54; EdgeId::LENGTH]),
         bond_terms: bond,
         private_policy_commitment: [0x55; 32],
-        omit_response_blocks: 4096,
         start_validity_blocks: 64,
         omission_bond: 11,
     }
@@ -680,9 +679,11 @@ fn owned_terms_and_transaction_maxima_are_pinned() {
 /// signer and an optional payout delegate (67 to 100 bytes a side), each
 /// payout an optional delegate, and each party witness an authority
 /// byte inside its own envelope. The widest transaction is still the
-/// open, now carrying two maximal `WebAuthn` party witnesses.
-const TERMS_MAX: usize = 630;
-const TX_MAX: usize = 5_291;
+/// open, now carrying two maximal `WebAuthn` party witnesses. Both fell by
+/// eight bytes when the response window left the payment terms for the
+/// kernel's one block-time constant.
+const TERMS_MAX: usize = 622;
+const TX_MAX: usize = 5_283;
 
 /// `Terms::decode` recomputes the terms commitment, and a work payment
 /// recomputes its embedded bond's commitment too. `SingleChunkHasher`
@@ -834,7 +835,7 @@ fn payment_close_pending_record_bytes_are_pinned() {
         record.start_id(),
         StartId::from_bytes([0x33; StartId::LENGTH]),
     );
-    assert_eq!(record.response_deadline(), 907);
+    assert_eq!(record.response_deadline_ms(), 907);
     assert_eq!(record.start_cumulative(), 4_242);
     assert_eq!(record.final_cumulative(), 4_243);
     assert!(record.responded());
@@ -869,11 +870,11 @@ fn payment_close_wire_widths_are_pinned() {
     )));
     // Each native party witness is 70 bytes: its envelope, the
     // authority byte, and the 67-byte native `Auth`.
-    assert_eq!(present.encoded_size(), 898);
+    assert_eq!(present.encoded_size(), 890);
     // The maximum carries two maximal `WebAuthn` witnesses instead.
-    assert_eq!(PaymentCloseStart::MAX_ENCODED_SIZE, 5_142);
+    assert_eq!(PaymentCloseStart::MAX_ENCODED_SIZE, 5_134);
     // Absence encodes neither conditional field: 75 + 70 bytes shorter.
-    assert_eq!(golden_start(None).encoded_size(), 898 - 75 - 70);
+    assert_eq!(golden_start(None).encoded_size(), 890 - 75 - 70);
 
     let response = golden_response();
     assert_eq!(response.encoded_size(), 283);
@@ -883,7 +884,7 @@ fn payment_close_wire_widths_are_pinned() {
     // byte, and nothing else: the action's own tag is what selects it.
     let start_tx = Tx::move_action(Move::StartPaymentClose(present));
     let response_tx = Tx::move_action(Move::RespondPaymentClose(response));
-    assert_eq!(start_tx.encoded_size(), 901);
+    assert_eq!(start_tx.encoded_size(), 893);
     assert_eq!(response_tx.encoded_size(), 286);
 
     let freeze = Proof::freeze(
@@ -979,14 +980,14 @@ fn an_unassigned_move_tag_is_rejected() {
 /// changed domain is a consensus break rather than a refactor.
 #[test]
 fn payment_close_digests_are_pinned() {
-    const EARNED: &str = "58e07a6b410528c13bf7bee08ad6479013aec69c93decfa4198d4637ce1f86cf";
-    const NO_EARNED: &str = "a03d8875c77877f17b9a53a42dcd382d5bc7872ed5850bdc658b45be951cf420";
-    const SETTLEMENT: &str = "615cab1d79ed09aae8800fc5693254584d457d086274c6b5a3e151eccec77177";
-    const START: &str = "d73a97a117c9f7995b87461baa84b5bab7e4f029b3cf3649a2362449941216e2";
-    const START_ID: &str = "bc7bb08d13ccc5898f8b02935ebf60052f32e9f35456f400fd18845310081fa8";
-    const RESPONSE: &str = "b8e34b3c4e176af4b4d1ce34388aa2006120e4e2c6d1a90c957b4a548f30d679";
-    const FREEZE: &str = "d9884b2aeb703634ddd5037ba31a5f8cf0661e99517572f2782cb4d592fe46a9";
-    const CONTEST: &str = "d652c76ef2744235d5bc4dbd43f0e0e8a86ee3b74f017edfdf343b5eb697e122";
+    const EARNED: &str = "55d200306df44a2d5d5f5ff5c720d079fafff6f200331f970b83dacc1c902dd3";
+    const NO_EARNED: &str = "e96cd5aae6d70014bc1e9c77bc319226c64dea6ceef0c8b96486e45dcd2d1e2b";
+    const SETTLEMENT: &str = "0129dce9afc030cdaac9c4a56de17cdccd87ca4374a866e4890d1d1736021c39";
+    const START: &str = "b5120d380975898b78a59986551903344dc15c44721ef1685e8e723f92a09aee";
+    const START_ID: &str = "c75e30d022f0c2f802ce42549f6c9be4fd598a6fc359ad32be1d1902ad217697";
+    const RESPONSE: &str = "cac40ee3a396923c00fc96e0bdc8d35945015ab28f5e4c2da6422ba84f13e689";
+    const FREEZE: &str = "4be31fb5fdee2aa895d88e5563883c93acf30ff6998e7da7df744d6fdabc4658";
+    const CONTEST: &str = "66e0d1ffa4aa15fa8b7874cfad29b25f419c48d51a0df58ce0019fb2378bf1e5";
 
     let edge = golden_edge();
     let terms = golden_terms_hash();
@@ -1264,7 +1265,7 @@ fn work_terms_hashes_are_pinned() {
     let payment = widest_work_payment();
     assert_hex(
         &Terms::work_payment(payment.clone()).hash().to_bytes(),
-        "a027be73e947101d97c4c1bbc542aabf05f007b4da3c5d51f8299ba1344d8a07",
+        "a4cb8181e77829d51bf6275bbdeacd413eb0d182f6ae10c756c5b04908176f17",
     );
     assert_hex(
         &payment.bond_terms_hash().to_bytes(),

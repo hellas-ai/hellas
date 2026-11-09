@@ -3,7 +3,7 @@
 use super::*;
 
 /// Borrows a client endpoint for local state and journal operations.
-/// Release the guard before waiting on a transport or finalized history.
+/// Release the guard before waiting on a transport or a chain read.
 pub trait ClientChannel: Send {
     /// # Errors
     /// [`EndpointError::Poisoned`] after a panic while holding the endpoint.
@@ -13,10 +13,10 @@ pub trait ClientChannel: Send {
         Output = Result<impl DerefMut<Target = ClientEndpoint> + Send, EndpointError>,
     > + Send;
 
-    /// Advance verified history without holding shared request authority over I/O.
-    fn catch_up<S: FinalizedBlocks + Sync + ?Sized>(
+    /// Applies one certified read under the channel's driver.
+    fn observe(
         &mut self,
-        source: &S,
+        observed: &ObservedChannel<'_>,
     ) -> impl core::future::Future<Output = Result<u64, CatchUpError>> + Send;
 }
 
@@ -25,11 +25,8 @@ impl ClientChannel for ClientEndpoint {
         Ok(self)
     }
 
-    async fn catch_up<S: FinalizedBlocks + Sync + ?Sized>(
-        &mut self,
-        source: &S,
-    ) -> Result<u64, CatchUpError> {
-        ClientEndpoint::catch_up(self, source).await
+    async fn observe(&mut self, observed: &ObservedChannel<'_>) -> Result<u64, CatchUpError> {
+        Ok(ClientEndpoint::observe(self, observed).await?.cursor().0)
     }
 }
 
@@ -166,24 +163,27 @@ impl ClientObserver {
         Ok(read(self.endpoint().await?.state()))
     }
 
-    /// Publishes a coherent snapshot only after its history has been applied.
-    pub async fn observe_ready(
-        &self,
-        ready: ReadyChannel,
-        started: ObservationTime,
-        max_age: std::time::Duration,
-    ) -> Result<(), EndpointError> {
+    /// Publishes readiness decided from the read the journal's cursor
+    /// holds, as fresh as that read's certified block time.
+    ///
+    /// # Errors
+    ///
+    /// [`EndpointError::CatchingUp`] when the decision is newer than the
+    /// cursor, [`EndpointError::ObservationStale`] when the cursor's read
+    /// is too old, and the binding errors.
+    pub async fn observe_ready(&self, ready: ReadyChannel) -> Result<(), EndpointError> {
         let mut endpoint = self.endpoint().await?;
         bind(&ready, &endpoint.store, &endpoint.signer, Role::Client)?;
         if ready.check_caught_up(endpoint.state().cursor().0).is_err() {
             return Err(EndpointError::CatchingUp);
         }
         let height = ready.finalized_height();
+        let certified_at_ms = endpoint.state().certified_at_ms();
         endpoint
             .observation
             .as_mut()
             .ok_or(EndpointError::NotAdmitting)?
-            .confirm(height, started, max_age);
+            .confirm(height, certified_at_ms)?;
         endpoint.ready = Some(ready);
         Ok(())
     }
@@ -213,7 +213,7 @@ impl ClientObserver {
         Ok(())
     }
 
-    /// Takes exclusive authority to drive finalized history, not requests.
+    /// Takes exclusive authority to drive certified reads, not requests.
     pub fn drive(&self) -> Result<ClientDriver<'_>, EndpointError> {
         self.driving
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -229,14 +229,11 @@ impl ClientChannel for ClientService {
         self.observer.endpoint().await
     }
 
-    async fn catch_up<S: FinalizedBlocks + Sync + ?Sized>(
-        &mut self,
-        source: &S,
-    ) -> Result<u64, CatchUpError> {
+    async fn observe(&mut self, observed: &ObservedChannel<'_>) -> Result<u64, CatchUpError> {
         self.observer
             .drive()
             .map_err(|_| CatchUpError::Busy)?
-            .catch_up(source)
+            .observe(observed)
             .await
     }
 }
@@ -264,51 +261,23 @@ impl CloseChannel for ClientDriver<'_> {
 }
 
 impl ClientDriver<'_> {
-    /// Applies a verified block under the same lock used by payments.
-    pub async fn observe_finalized(&mut self, block: &FinalizedWork) -> Result<(), CatchUpError> {
-        observe(&mut *self.store().await?, block, &Secp256k1Verifier::new()).await?;
-        Ok(())
-    }
-
-    /// Fetches missing blocks without borrowing the journal across network I/O.
-    pub async fn catch_up<S: FinalizedBlocks + ?Sized>(
-        &mut self,
-        source: &S,
-    ) -> Result<u64, CatchUpError> {
-        let Some(latest) = source.latest_height().await? else {
-            return Ok(self.store().await?.state().cursor().0);
-        };
-        self.catch_up_to(source, latest).await
-    }
-
-    /// Applies a fixed snapshot's history without querying a moving chain tip.
-    pub async fn catch_up_to<S: FinalizedBlocks + ?Sized>(
-        &mut self,
-        source: &S,
-        latest: u64,
-    ) -> Result<u64, CatchUpError> {
-        let next = self.store().await?.state().cursor().0.saturating_add(1);
-        for height in next..=latest {
-            let block = source
-                .block_at(height)
-                .await?
-                .ok_or(CatchUpError::Missing { height })?;
-            self.observe_finalized(&block).await?;
-        }
-        Ok(self.store().await?.state().cursor().0)
+    /// Applies one certified read under the same lock used by payments.
+    pub async fn observe(&mut self, observed: &ObservedChannel<'_>) -> Result<u64, CatchUpError> {
+        let mut store = self.store().await?;
+        observe(&mut store, observed, &Secp256k1Verifier::new()).await?;
+        Ok(store.state().cursor().0)
     }
 
     /// Drives a retained close without blocking ordinary state access.
-    pub async fn advance_close<S, T>(
+    pub async fn advance_close<T>(
         &mut self,
-        source: &S,
+        observed: &ObservedChannel<'_>,
         sink: &T,
     ) -> Result<CloseProgress, CatchUpError>
     where
-        S: FinalizedBlocks + ?Sized,
         T: TxSink + ?Sized,
     {
-        advance_close(source, sink, self, &Secp256k1Verifier::new()).await
+        advance_close(observed, sink, self, &Secp256k1Verifier::new()).await
     }
 }
 
@@ -373,15 +342,7 @@ mod proposal_tests {
         let service = ClientService::new(
             ClientEndpoint::new(ready.clone(), store, fixture::client()).unwrap(),
         );
-        service
-            .observer()
-            .observe_ready(
-                ready,
-                ObservationTime::now(),
-                std::time::Duration::from_secs(30),
-            )
-            .await
-            .unwrap();
+        service.observer().observe_ready(ready).await.unwrap();
         (service, content, capacity)
     }
 

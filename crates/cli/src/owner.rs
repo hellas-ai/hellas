@@ -114,7 +114,7 @@ mod tests {
     fn every_selected_faucet_passkey_controls_its_genesis_allocation() {
         let chain = ChainProfile::known(Chain::Devnet);
         let genesis: hellas_chain::genesis::Genesis =
-            serde_json::from_str(hellas_chain::genesis::HELLAS_DEVNET_2_JSON).unwrap();
+            serde_json::from_str(hellas_chain::genesis::HELLAS_DEVNET_3_JSON).unwrap();
         for index in 0..100 {
             let options = OwnerArgs {
                 faucet_account: Some(index),

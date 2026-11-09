@@ -3,12 +3,10 @@ use hellas_private::StoreLocation;
 use std::path::PathBuf;
 
 type Result<T, E = ProvisionError> = std::result::Result<T, E>;
-use hellas_chain::WorkBlocks;
-use hellas_chain::domain::MAX_EDGE_LIFETIME_BLOCKS;
+use hellas_chain::client::RemoteLightClient;
 use hellas_channel::model::bundle::WorkChannelSetupBundleV2;
 use hellas_channel::model::setup::ProviderChannelPolicy;
-use hellas_channel::work_close::FinalizedBlocks;
-use hellas_channel::work_store::{Role, SetupScan, SetupStore};
+use hellas_channel::work_store::{Role, SetupStore};
 use hellas_channel::work_store::{SetupRecord, SetupState};
 use hellas_kernel::{
     BlockHeight, Funding, List, MAX_EDGE_OUTPUTS, Parties, PartyKeys, Payout, Terms, Tx,
@@ -25,10 +23,46 @@ use hellas_rpc::pb::work::{
 };
 use std::collections::BTreeSet;
 
+/// The chain an offer allocator reads: dialled when first needed and kept
+/// while it answers.
+pub(super) struct OfferChain {
+    config: crate::work_config::WorkConfig,
+    client: tokio::sync::Mutex<Option<RemoteLightClient>>,
+}
+
+impl OfferChain {
+    pub(super) fn new(config: crate::work_config::WorkConfig) -> Self {
+        Self {
+            config,
+            client: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    async fn client(&self) -> Result<RemoteLightClient, hellas_chain::QueryError> {
+        let mut held = self.client.lock().await;
+        if let Some(client) = held.as_ref() {
+            return Ok(client.clone());
+        }
+        let client = crate::client_chain::connect_at(
+            &self.config,
+            hellas_channel::work::MAX_CERTIFIED_AGE,
+            0,
+        )
+        .await?;
+        *held = Some(client.clone());
+        Ok(client)
+    }
+
+    /// Drops a client whose read failed, so the next offer dials afresh.
+    async fn forget(&self) {
+        self.client.lock().await.take();
+    }
+}
+
 pub(super) struct OfferAllocator {
     pub needs_restart: std::sync::atomic::AtomicBool,
     pub config: WorkRunnerConfig,
-    pub node: FullNode,
+    pub chain: OfferChain,
     pub authority: hellas_authority::node::NodeCoordinator,
     pub provider: hellas_rpc::ProviderEnrollmentBundle,
     pub addresses: Vec<String>,
@@ -70,6 +104,9 @@ impl AutomaticOffers {
                             // Once accepted, finish durable allocation even if the
                             // RPC caller disconnects. Only this worker allocates.
                             let result = Box::pin(allocator.request(request, context, &allocator.mount)).await;
+                            if result.is_err() {
+                                allocator.chain.forget().await;
+                            }
                             let _ = reply.send(result);
                         }
                         None => break,
@@ -246,8 +283,7 @@ impl OfferAllocator {
         if coins.is_empty() && registry.is_empty() {
             return quote(&policy, current.policy.offers.omission_bond);
         }
-        let view = self.node.view().map_err(unavailable)?;
-        let chain = view.client();
+        let chain = self.chain.client().await.map_err(unavailable)?;
         let tip = chain
             .get_latest_block()
             .await
@@ -405,7 +441,6 @@ impl OfferAllocator {
                 timeout_payout: stake_value,
                 max_job_price: current.policy.payment_policy.fixed_price,
             },
-            &self.node,
             &self.authority,
             &held,
             &self.needs_restart,
@@ -470,22 +505,14 @@ struct ProvisionOptions {
 /// Sign and journal an offer under an existing provider identity.
 async fn provision_offer(
     options: ProvisionOptions,
-    node: &hellas_chain::node::FullNode,
     authority: &hellas_authority::node::NodeCoordinator,
     held: &[SetupState],
     write_started: &std::sync::atomic::AtomicBool,
 ) -> Result<Provisioned> {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     authority.check_provider(&options.provider).await?;
     let candidate = BondCandidate::plan(&options, authority.owner().await?)?;
     let offer = Offer::plan(&options, candidate, held)?;
-    let view = tokio::time::timeout_at(deadline, node.wait_ready())
-        .await
-        .map_err(|_| ProvisionError::NoFinalizedBlock)??;
-    let floor = floor_of(&WorkBlocks::new(view.client()))
-        .await?
-        .ok_or(ProvisionError::NoFinalizedBlock)?;
-    offer.journal(floor, write_started).await
+    offer.journal(write_started).await
 }
 
 /// One offer as the disk holds it, read back after it was written.
@@ -494,8 +521,6 @@ struct Provisioned {
     /// The bond this journal is keyed to, which is what discovery names
     /// it by.
     bond_edge: EdgeId,
-    /// The floor its history starts above, as retained.
-    floor: SetupScan,
     offer: hellas_channel::model::offer::SignedPaidOffer,
 }
 
@@ -609,21 +634,7 @@ impl Offer {
 
     /// Journals revision 1, and returns only once a fresh open of the
     /// journal replays it.
-    async fn journal(
-        self,
-        floor: SetupScan,
-        write_started: &std::sync::atomic::AtomicBool,
-    ) -> Result<Provisioned> {
-        let timeout = self.candidate.bond_terms.timeout.get();
-        if timeout <= floor.height {
-            return Err(ProvisionError::ExpiredBond {
-                timeout,
-                height: floor.height,
-            });
-        }
-        if timeout - floor.height > MAX_EDGE_LIFETIME_BLOCKS {
-            return Err(ProvisionError::BondLifetime);
-        }
+    async fn journal(self, write_started: &std::sync::atomic::AtomicBool) -> Result<Provisioned> {
         let Self {
             candidate,
             policy,
@@ -668,7 +679,6 @@ impl Offer {
                 .commit(
                     SetupRecord::Offer {
                         peer,
-                        floor: Some(floor),
                         offer: Box::new(offer),
                     },
                     &Secp256k1Verifier::new(),
@@ -682,22 +692,17 @@ impl Offer {
         // Reopen with the same replay and signature checks used at startup.
         let reopened = open_provider_journal(&journal_root, network, bond_edge).await?;
         let state = reopened.into_state().await;
-        let (Some(1), Some(floor)) = (state.revision(), state.scan_armed()) else {
+        if state.revision() != Some(1) {
             return Err(ProvisionError::JournalReplay {
                 root: journal_root.into_path_buf(),
                 revision: state.revision(),
-                floor: state.scan_armed().map(|scan| scan.height),
             });
-        };
+        }
         let offer = state
             .offer()
             .map(|(_, offer)| offer.clone())
             .ok_or(ProvisionError::MissingProposal(bond_edge))?;
-        Ok(Provisioned {
-            bond_edge,
-            floor,
-            offer,
-        })
+        Ok(Provisioned { bond_edge, offer })
     }
 }
 
@@ -751,24 +756,6 @@ fn funding_coins(funding: &Funding) -> BTreeSet<CoinId> {
         .collect()
 }
 
-/// Returns the finalized tip and its payload, or `None` before the first block.
-/// Both values must come from the same block to start a contiguous history.
-async fn floor_of<B>(blocks: &B) -> Result<Option<SetupScan>>
-where
-    B: FinalizedBlocks + ?Sized,
-{
-    let Some(height) = blocks.latest_height().await? else {
-        return Ok(None);
-    };
-    let Some(block) = blocks.block_at(height).await? else {
-        return Ok(None);
-    };
-    Ok(Some(SetupScan {
-        height: block.height,
-        payload: block.payload,
-    }))
-}
-
 /// Reads the coins one provider stakes.
 fn staked(ids: &[CoinId]) -> Result<List<CoinId, MAX_PARTY_INPUTS>> {
     if ids.is_empty() || ids.len() > MAX_PARTY_INPUTS {
@@ -791,10 +778,6 @@ enum ProvisionError {
     Authority(#[from] hellas_authority::work_store::grant::NodeStoreError),
     #[error(transparent)]
     Offer(#[from] hellas_channel::model::offer::PaidOfferError),
-    #[error("bond timeout {timeout} must be after finalized height {height}")]
-    ExpiredBond { timeout: u64, height: u64 },
-    #[error("bond timeout exceeds the chain maximum lifetime")]
-    BondLifetime,
     #[error("stake requires between 1 and at most 4 coins, found {0}")]
     StakeCount(usize),
     #[error("duplicate stake coin {}", hex::encode(.0.to_bytes()))]
@@ -805,19 +788,13 @@ enum ProvisionError {
     BondCollision(EdgeId),
     #[error("candidate stake coin {} is reserved by bond {}", hex::encode(coin.to_bytes()), hex::encode(bond.to_bytes()))]
     ReservedCoin { coin: CoinId, bond: EdgeId },
-    #[error("journal under {} replays as revision {revision:?} over floor {floor:?}, not the armed proposal", root.display())]
-    JournalReplay {
-        root: PathBuf,
-        revision: Option<u8>,
-        floor: Option<u64>,
-    },
+    #[error("journal under {} replays as revision {revision:?}, not the offered proposal", root.display())]
+    JournalReplay { root: PathBuf, revision: Option<u8> },
     #[error("work journal under {}: {source}", root.display())]
     Journal {
         root: PathBuf,
         source: hellas_channel::work_store::WorkStoreError,
     },
-    #[error("the local node is not ready with a finalized block to floor this offer at")]
-    NoFinalizedBlock,
     #[error(transparent)]
     Setup(#[from] hellas_channel::work_handshake::SetupExchangeError),
     #[error(transparent)]

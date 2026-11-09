@@ -23,6 +23,7 @@ where
         hellas_kernel::Context::with_fees(
             network,
             hellas_kernel::BlockHeight::new(block.height().get()),
+            block.timestamp(),
             hellas_kernel::BlockHash::from_bytes(block.parent().0),
             crate::domain::KERNEL_FEES,
         ),

@@ -1041,7 +1041,7 @@ pub struct PendingPaymentClose {
     payment_edge: EdgeId,
     opener_role: Party,
     start_id: StartId,
-    response_deadline: u64,
+    response_deadline_ms: u64,
     start_cumulative: u64,
     final_cumulative: u64,
     responded: bool,
@@ -1064,6 +1064,7 @@ impl PendingPaymentClose {
     pub fn from_accepted_start(
         network: NetworkId,
         height: u64,
+        block_time_ms: u64,
         start: &PaymentCloseStart,
     ) -> Option<Self> {
         let crate::TermsProfile::WorkPayment(payment) = start.terms().profile() else {
@@ -1073,7 +1074,7 @@ impl PendingPaymentClose {
             start.payment_edge(),
             start.opener_role(),
             start_id(start.digest(network), height),
-            height.checked_add(payment.omit_response_blocks)?,
+            block_time_ms.checked_add(crate::consts::RESPONSE_WINDOW_MS)?,
             (
                 start
                     .certificate()
@@ -1119,7 +1120,7 @@ impl PendingPaymentClose {
         payment_edge: EdgeId,
         opener_role: Party,
         start_id: StartId,
-        response_deadline: u64,
+        response_deadline_ms: u64,
         claim: (u64, u64),
         owner_signed: bool,
     ) -> Self {
@@ -1132,7 +1133,7 @@ impl PendingPaymentClose {
             payment_edge,
             opener_role,
             start_id,
-            response_deadline,
+            response_deadline_ms,
             start_cumulative: claimed,
             final_cumulative: claimed,
             responded: false,
@@ -1160,10 +1161,11 @@ impl PendingPaymentClose {
         self.start_id
     }
 
-    /// Returns the height at which the response window shuts.
+    /// Returns the block time, in milliseconds, at which the response
+    /// window shuts.
     #[must_use]
-    pub const fn response_deadline(&self) -> u64 {
-        self.response_deadline
+    pub const fn response_deadline_ms(&self) -> u64 {
+        self.response_deadline_ms
     }
 
     /// Returns the amount the opener claimed.
@@ -1424,7 +1426,7 @@ fn adjudicated_preimage<W: Writer + ?Sized>(
     payment_edge.encode_to(writer);
     payment_terms_hash.encode_to(writer);
     record.start_id.encode_to(writer);
-    record.response_deadline.encode_to(writer);
+    record.response_deadline_ms.encode_to(writer);
     record.start_cumulative.encode_to(writer);
     record.final_cumulative.encode_to(writer);
     flag(record.penalty_due).encode_to(writer);
@@ -1541,7 +1543,7 @@ impl Encode for PendingPaymentClose {
         self.payment_edge.encode_to(writer);
         self.opener_role.encode_to(writer);
         self.start_id.encode_to(writer);
-        self.response_deadline.encode_to(writer);
+        self.response_deadline_ms.encode_to(writer);
         self.start_cumulative.encode_to(writer);
         self.final_cumulative.encode_to(writer);
         flag(self.responded).encode_to(writer);
@@ -1562,7 +1564,7 @@ impl Decode for PendingPaymentClose {
         let payment_edge = decode_field(buf, &mut consumed)?;
         let opener_role = decode_field(buf, &mut consumed)?;
         let start_id = decode_field(buf, &mut consumed)?;
-        let response_deadline = decode_field(buf, &mut consumed)?;
+        let response_deadline_ms = decode_field(buf, &mut consumed)?;
         let start_cumulative = decode_field(buf, &mut consumed)?;
         let final_cumulative = decode_field(buf, &mut consumed)?;
         let responded = decode_flag(buf, &mut consumed, "PendingPaymentClose.responded")?;
@@ -1577,7 +1579,7 @@ impl Decode for PendingPaymentClose {
                 payment_edge,
                 opener_role,
                 start_id,
-                response_deadline,
+                response_deadline_ms,
                 start_cumulative,
                 final_cumulative,
                 responded,
@@ -1803,7 +1805,7 @@ mod tests {
         let mut other_start = base;
         other_start.start_id = StartId::from_bytes([0x99; StartId::LENGTH]);
         let mut other_deadline = base;
-        other_deadline.response_deadline = base.response_deadline + 1;
+        other_deadline.response_deadline_ms = base.response_deadline_ms + 1;
         let mut other_claim = base;
         other_claim.start_cumulative = base.start_cumulative + 1;
         let mut other_final = base;
@@ -1820,7 +1822,7 @@ mod tests {
         assert_all_distinct(&[
             ("base", commitment_of(&base)),
             ("start_id", commitment_of(&other_start)),
-            ("response_deadline", commitment_of(&other_deadline)),
+            ("response_deadline_ms", commitment_of(&other_deadline)),
             ("start_cumulative", commitment_of(&other_claim)),
             ("final_cumulative", commitment_of(&other_final)),
             ("penalty_due", commitment_of(&other_due)),

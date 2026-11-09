@@ -90,6 +90,7 @@ fn load_apply_replay_round_trip() {
     let ctx = hellas_kernel::Context::new(
         crate::domain::TEST_NETWORK,
         hellas_kernel::BlockHeight::new(1),
+        1_000,
         hellas_kernel::BlockHash::from_bytes([0; hellas_kernel::BlockHash::LENGTH]),
     );
     state

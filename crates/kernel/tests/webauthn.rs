@@ -20,6 +20,7 @@ use support::{FixedStore, coin_id, list, state};
 const CONTEXT: Context = Context::new(
     support::NETWORK,
     BlockHeight::new(1),
+    1_000,
     BlockHash::from_bytes([0; BlockHash::LENGTH]),
 );
 const TIMEOUT: BlockHeight = BlockHeight::new(2);

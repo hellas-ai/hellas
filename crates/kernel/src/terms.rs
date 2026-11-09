@@ -145,9 +145,6 @@ pub struct WorkPaymentTerms {
     /// Salted commitment to the bilateral risk and credit policy. The
     /// body stays private until a game reveals it.
     pub private_policy_commitment: [u8; HASH_LENGTH],
-    /// Blocks the client has to answer a provider's close start before
-    /// the provider's stated amount is taken as uncontested.
-    pub omit_response_blocks: u64,
     /// Blocks a signed close start stays valid for inclusion.
     pub start_validity_blocks: u64,
     /// Amount the client forfeits to the provider when a close reveals
@@ -452,20 +449,19 @@ impl Encode for WorkPaymentTerms {
     const MAX_ENCODED_SIZE: usize = EdgeId::MAX_ENCODED_SIZE
         + WORK_STAKE_BOND_WITNESS_MAX_SIZE
         + HASH_LENGTH
-        + 3 * u64::MAX_ENCODED_SIZE;
+        + 2 * u64::MAX_ENCODED_SIZE;
 
     fn encoded_size(&self) -> usize {
         EdgeId::MAX_ENCODED_SIZE
             + work_stake_bond_witness_size(&self.bond_terms)
             + HASH_LENGTH
-            + 3 * u64::MAX_ENCODED_SIZE
+            + 2 * u64::MAX_ENCODED_SIZE
     }
 
     fn encode_to<W: Writer + ?Sized>(&self, writer: &mut W) {
         self.bond_edge.encode_to(writer);
         encode_work_stake_bond_witness(writer, &self.bond_terms);
         self.private_policy_commitment.encode_to(writer);
-        self.omit_response_blocks.encode_to(writer);
         self.start_validity_blocks.encode_to(writer);
         self.omission_bond.encode_to(writer);
     }
@@ -482,7 +478,6 @@ impl Decode for WorkPaymentTerms {
         let (bond_terms, witness_size) = decode_work_stake_bond_witness(rest)?;
         consumed += witness_size;
         let private_policy_commitment = decode_field(buf, &mut consumed)?;
-        let omit_response_blocks = decode_field(buf, &mut consumed)?;
         let start_validity_blocks = decode_field(buf, &mut consumed)?;
         let omission_bond = decode_field(buf, &mut consumed)?;
         Ok((
@@ -490,7 +485,6 @@ impl Decode for WorkPaymentTerms {
                 bond_edge,
                 bond_terms,
                 private_policy_commitment,
-                omit_response_blocks,
                 start_validity_blocks,
                 omission_bond,
             },
@@ -623,7 +617,6 @@ mod tests {
             bond_edge: EdgeId::from_bytes([5; EdgeId::LENGTH]),
             bond_terms: sample_work_bond(),
             private_policy_commitment: [6; HASH_LENGTH],
-            omit_response_blocks: 64,
             start_validity_blocks: 8,
             omission_bond: 3,
         }

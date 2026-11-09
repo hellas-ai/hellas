@@ -758,19 +758,18 @@ async fn durable_expiry_before_cleanup_releases_unaccepted_payloads_on_reopen() 
         )
         .await
         .unwrap();
-    for height in CURSOR + 1..=expired {
-        journal
-            .append(
-                &ChannelRecord::CursorAdvanced {
-                    height,
-                    parent: payload_at(height - 1),
-                    payload: payload_at(height),
-                }
-                .encode(),
-            )
-            .await
-            .unwrap();
-    }
+    journal
+        .append(
+            &ChannelRecord::Anchored {
+                height: expired,
+                payload: payload_at(expired),
+                certified_at_ms: hellas_channel::test_support::channel::now_ms(),
+                pending: None,
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
     journal.close().await;
     drop(journal);
     // The durable expiry exists without ChannelStore having performed cleanup.
@@ -953,18 +952,12 @@ async fn paid_upload_termination_cancels_a_blocked_ack_and_releases_its_ram() {
                     service.prepare_close().await.unwrap();
                 }
                 "deadline" => {
-                    let mut driver = service.drive().unwrap();
-                    for height in CURSOR + 1..=deadlines().acceptance + 1 {
-                        driver
-                            .observe_finalized(&hellas_channel::work_close::FinalizedWork {
-                                height,
-                                parent: payload_at(height - 1),
-                                payload: payload_at(height),
-                                txs: vec![],
-                            })
-                            .await
-                            .unwrap();
-                    }
+                    hellas_channel::test_support::channel::observe_service(
+                        &service,
+                        deadlines().acceptance + 1,
+                        hellas_kernel::PendingSlot::Absent,
+                    )
+                    .await;
                 }
                 _ => unreachable!(),
             }

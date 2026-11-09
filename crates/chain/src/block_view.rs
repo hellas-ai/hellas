@@ -150,6 +150,13 @@ impl FinalizedBlockView {
         self.snapshot.payload
     }
 
+    /// Returns the timestamp this block carries, in milliseconds. It is
+    /// covered by the payload digest the certificate names.
+    #[must_use]
+    pub fn timestamp(&self) -> u64 {
+        self.block.timestamp()
+    }
+
     /// Returns the payload digest of this block's parent.
     ///
     /// A cursor is contiguous only if each block names the previous

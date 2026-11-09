@@ -4,7 +4,7 @@
 The included native origin follows the chain archive and listens only on loopback.
 
 Provision a `hellas_genesis::TrustDocument` independently of the RPC peer. It has
-`schema_version: 1`, `network_id: "hellas-devnet-2"`, the SHA-256 of the exact
+`schema_version: 1`, `network_id: "hellas-devnet-3"`, the SHA-256 of the exact
 genesis JSON bytes, and a nonempty contiguous epoch schedule. Each epoch supplies
 an ID, a height range, and the 96-character compressed BLS MinPk threshold
 identity. Schedules start at height zero, have no gaps or overlaps, and use
@@ -105,8 +105,8 @@ The node executes finalized blocks through the validator kernel and checks
 state and owner roots before publishing the read index. The complete block
 archive is retained by default; `--chain-archive-blocks N` exposes the last N
 executed blocks and reclaims older storage in sections. Fresh nodes replay from
-genesis and require sources retaining the missing history. Paid consumers read
-this same local state. Grant-only processes do not start a chain node.
+genesis and require sources retaining the missing history. Paid providers and
+buyers do not start a chain node: they read their channels by proof.
 
 `/api/v1/blocks/{latest|height|payload}/proof` and
 `/api/v1/transactions/{digest}/proof` return `ProofBundle`. Proof routes default

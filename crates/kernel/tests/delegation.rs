@@ -50,12 +50,14 @@ const K_COIN: CoinId = coin_id(0x44);
 const VALUE: u64 = 100;
 const HORIZON: BlockHeight = BlockHeight::new(1_000);
 const OMISSION_BOND: u64 = 2;
-const RESPONSE_WINDOW: u64 = 64;
+/// Blocks the response window spans: `at` stamps one block per second.
+const RESPONSE_WINDOW: u64 = hellas_kernel::RESPONSE_WINDOW_MS / 1_000;
 
 const fn at(height: u64) -> Context {
     Context::new(
         NETWORK,
         BlockHeight::new(height),
+        height * 1_000,
         BlockHash::from_bytes([0; BlockHash::LENGTH]),
     )
 }
@@ -190,7 +192,6 @@ fn payment_terms(bond_edge: EdgeId, bond: WorkStakeBondTerms) -> Terms {
         bond_edge,
         bond_terms: bond,
         private_policy_commitment: [7; 32],
-        omit_response_blocks: RESPONSE_WINDOW,
         start_validity_blocks: 8,
         omission_bond: OMISSION_BOND,
     })

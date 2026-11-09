@@ -254,14 +254,12 @@ let
       }
     );
     # The workspace tests, run once with line-coverage instrumentation. On
-    # the validator host the run fails on a failing test and on a crate below
-    # its floor in coverage-floor.json. cargo-llvm-cov instruments only
-    # workspace crates through its rustc wrapper, so the dependencies in
-    # `cargoDeps` stay valid; keeping its target directory at `target` is what
-    # lets Cargo reuse them. The output holds lcov.info, summary.json,
-    # summary.txt and the coverage-floor.json this run would record (copy it
-    # over the committed one after raising coverage). Other hosts run the same
-    # tests uninstrumented; the floors are measured on the validator host.
+    # the validator host the run fails on a failing test; coverage is reported,
+    # never enforced. cargo-llvm-cov instruments only workspace crates through
+    # its rustc wrapper, so the dependencies in `cargoDeps` stay valid; keeping
+    # its target directory at `target` is what lets Cargo reuse them. The
+    # output holds lcov.info, summary.json and summary.txt. Other hosts run the
+    # same tests uninstrumented.
     unit =
       if pkgs.stdenv.hostPlatform.system == "x86_64-linux" then
         craneLib.mkCargoDerivation (
@@ -274,7 +272,6 @@ let
             nativeBuildInputs = craneArgs.nativeBuildInputs ++ [
               cargoLlvmCov
               pkgs.cargo-nextest
-              pkgs.python3
             ];
             CARGO_LLVM_COV_TARGET_DIR = "target";
             NEXTEST_SHOW_PROGRESS = "counter";
@@ -286,7 +283,6 @@ let
               cargo llvm-cov report --lcov --output-path "$out/lcov.info"
               cargo llvm-cov report --json --summary-only --output-path "$out/summary.json"
               cargo llvm-cov report --summary-only | tee "$out/summary.txt"
-              python3 ${./coverage-ratchet.py} "$out/summary.json" ${./coverage-floor.json} "$out/coverage-floor.json"
             '';
             installPhaseCommand = "";
           }

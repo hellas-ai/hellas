@@ -68,10 +68,9 @@
 //! # What the provider will sign it over
 //!
 //! That *is* decided here, and it is the one judgement this module
-//! makes. Revision 2 is the client's, and four of the fields in it are
+//! makes. Revision 2 is the client's, and three of the fields in it are
 //! the client's free choice: `private_policy_commitment`,
-//! `omission_bond`, `omit_response_blocks`, and
-//! `start_validity_blocks`. A provider that countersigned whatever
+//! `omission_bond`, and `start_validity_blocks`. A provider that countersigned whatever
 //! arrived would be staking on terms it had never checked.
 //!
 //! So [`PaymentAdmission`] carries the provider's own configuration and
@@ -103,11 +102,12 @@ use hellas_wire::{StreamTransport, TransportContext, WireStatus};
 use crate::model::bundle::{SetupBundleError, WorkChannelSetupBundleV2};
 use crate::model::setup::{CloseDescriptor, ProviderChannelPolicy, WorkChannelDescriptor};
 use crate::work::{Refusal, WorkRefusal};
-use crate::work_close::{FinalizedBlocks, TxSink};
-use crate::work_open::{SetupAdvance, SetupChannel, SetupDriveError, SetupView, advance_setup};
-use crate::work_store::{
-    SetupRecord, SetupScan, SetupState, SetupStateError, SetupStore, WorkStoreError,
+use crate::work_close::TxSink;
+use crate::work_open::{
+    FinalizedSetup, SetupAdvance, SetupChannel, SetupDriveError, SetupQuery, advance_setup,
+    setup_query,
 };
+use crate::work_store::{SetupRecord, SetupState, SetupStateError, SetupStore, WorkStoreError};
 use hellas_rpc::pb::work::{
     ExchangeSetupRequest, ExchangeSetupResponse, SetupAdvanced, WorkRefused,
     exchange_setup_response::Outcome,
@@ -239,26 +239,6 @@ impl SetupEndpoint {
     #[must_use]
     pub const fn state(&self) -> &SetupState {
         self.store.state()
-    }
-
-    /// Fsyncs this endpoint's immutable history floor at the only role/stage
-    /// where it is legal.
-    ///
-    /// A provider calls this before building revision 1. A client calls it
-    /// after importing revision 1 and before building revision 2. The setup
-    /// store refuses every other stage and writes an identical retry zero
-    /// times, so each journal contains exactly one scan arm.
-    pub async fn arm_scan(&mut self, scan: SetupScan) -> Result<&SetupState, SetupExchangeError> {
-        Ok(self
-            .store
-            .commit(
-                SetupRecord::ScanArmed {
-                    height: scan.height,
-                    payload: scan.payload,
-                },
-                &Secp256k1Verifier::new(),
-            )
-            .await?)
     }
 
     /// Signs the bond this endpoint will stake, and journals it before
@@ -400,7 +380,6 @@ impl SetupEndpoint {
             .commit(
                 SetupRecord::Offer {
                     peer,
-                    floor: None,
                     offer: Box::new(offer),
                 },
                 &Secp256k1Verifier::new(),
@@ -639,7 +618,7 @@ impl SetupChannel for SetupDriver<'_> {
 }
 
 impl SetupDriver<'_> {
-    /// Takes one step without holding the journal across chain or network waits.
+    /// Takes one step without holding the journal across a sink wait.
     ///
     /// The step is [`advance_setup`]'s and no other: what is different
     /// here is only where the borrow begins and ends, so a setup can be
@@ -651,18 +630,15 @@ impl SetupDriver<'_> {
     ///
     /// [`SetupDriveError::Busy`] when the journal cannot be reached, and
     /// whatever [`advance_setup`] raises otherwise.
-    pub async fn advance<W, B, T>(
+    pub async fn advance<T>(
         &mut self,
-        view: &W,
-        blocks: &B,
+        read: &FinalizedSetup,
         sink: &T,
     ) -> Result<SetupAdvance, SetupDriveError>
     where
-        W: SetupView + ?Sized,
-        B: FinalizedBlocks + ?Sized,
         T: TxSink + ?Sized,
     {
-        advance_setup(view, blocks, sink, self, &Secp256k1Verifier::new()).await
+        advance_setup(read, sink, self, &Secp256k1Verifier::new()).await
     }
 }
 
@@ -675,6 +651,12 @@ impl SetupService {
     /// Read retained setup facts through the same writer used by dispatch and driving.
     pub async fn state(&self) -> Result<SetupState, SetupDriveError> {
         Ok(self.store().await?.state().clone())
+    }
+
+    /// What a read for this setup's next step must ask, once it names a
+    /// payment edge.
+    pub async fn query(&self) -> Result<Option<SetupQuery>, SetupDriveError> {
+        Ok(setup_query(self.store().await?.state()))
     }
     /// Wraps one setup endpoint as a dispatchable service.
     #[must_use]
@@ -709,18 +691,15 @@ impl SetupService {
     ///
     /// [`SetupDriveError::Busy`] while another driver owns this setup,
     /// and whatever [`SetupDriver::advance`] raises otherwise.
-    pub async fn advance_setup<W, B, T>(
+    pub async fn advance_setup<T>(
         &self,
-        view: &W,
-        blocks: &B,
+        read: &FinalizedSetup,
         sink: &T,
     ) -> Result<SetupAdvance, SetupDriveError>
     where
-        W: SetupView + ?Sized,
-        B: FinalizedBlocks + ?Sized,
         T: TxSink + ?Sized,
     {
-        self.drive()?.advance(view, blocks, sink).await
+        self.drive()?.advance(read, sink).await
     }
 
     async fn store(&self) -> Result<SetupGuard<'_>, SetupDriveError> {

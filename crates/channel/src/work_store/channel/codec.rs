@@ -53,21 +53,22 @@ impl ChannelRecord {
     fn encode_inner(&self, metadata_only: bool) -> Vec<u8> {
         let mut out = Vec::new();
         match self {
-            Self::OriginObserved => out.push(tag::ORIGIN_OBSERVED),
             Self::ProposalExchange { work_id, pending } => {
                 out.push(tag::PROPOSAL_EXCHANGE);
                 out.extend_from_slice(work_id.as_bytes());
                 out.push(u8::from(*pending));
             }
-            Self::CursorAdvanced {
+            Self::Anchored {
                 height,
-                parent,
                 payload,
+                certified_at_ms,
+                pending,
             } => {
-                out.push(tag::CURSOR);
+                out.push(tag::ANCHORED);
                 put_u64(&mut out, *height);
-                out.extend_from_slice(parent);
                 out.extend_from_slice(payload);
+                put_u64(&mut out, *certified_at_ms);
+                put_option(&mut out, pending.as_ref(), put_pending);
             }
             Self::JobProposed {
                 authorization,
@@ -140,21 +141,16 @@ impl ChannelRecord {
                 // length.
                 out.extend_from_slice(&encode_kernel(start.as_ref()));
             }
-            Self::CloseHistoryAdvanced { parent, history } => {
-                out.push(tag::CLOSE_HISTORY);
-                out.extend_from_slice(parent);
-                put_close_history(&mut out, history);
-            }
             Self::CloseOpened {
                 start_id,
                 opener,
-                response_deadline,
+                response_deadline_ms,
                 claimed,
             } => {
                 out.push(tag::CLOSE_OPENED);
                 out.extend_from_slice(&start_id.to_bytes());
                 out.push(party_code(*opener));
-                put_u64(&mut out, *response_deadline);
+                put_u64(&mut out, *response_deadline_ms);
                 put_u64(&mut out, *claimed);
             }
             Self::CloseResponded {
@@ -165,15 +161,10 @@ impl ChannelRecord {
                 out.extend_from_slice(&start_id.to_bytes());
                 out.extend_from_slice(response_digest.as_bytes());
             }
-            Self::CloseSettled {
-                height,
-                payload,
-                provider_payout,
-            } => {
+            Self::CloseSettled { height, payload } => {
                 out.push(tag::CLOSE_SETTLED);
                 put_u64(&mut out, *height);
                 out.extend_from_slice(payload);
-                put_u64(&mut out, *provider_payout);
             }
         }
         out
@@ -193,11 +184,11 @@ impl ChannelRecord {
                 work_id: digest(&mut cursor)?,
                 pending: crate::work_store::take_bool(&mut cursor, ChannelStateError::Malformed)?,
             },
-            tag::ORIGIN_OBSERVED => Self::OriginObserved,
-            tag::CURSOR => Self::CursorAdvanced {
+            tag::ANCHORED => Self::Anchored {
                 height: cursor.u64().ok_or(ChannelStateError::Malformed)?,
-                parent: cursor.array::<32>().ok_or(ChannelStateError::Malformed)?,
                 payload: cursor.array::<32>().ok_or(ChannelStateError::Malformed)?,
+                certified_at_ms: cursor.u64().ok_or(ChannelStateError::Malformed)?,
+                pending: take_option(&mut cursor, ChannelStateError::Malformed, take_pending)?,
             },
             tag::PROPOSED => Self::JobProposed {
                 authorization: private_record(&mut cursor)?,
@@ -245,10 +236,6 @@ impl ChannelRecord {
             tag::CLOSE_PREPARED => Self::ClosePrepared {
                 start: Box::new(decode_kernel(cursor.rest())?),
             },
-            tag::CLOSE_HISTORY => Self::CloseHistoryAdvanced {
-                parent: cursor.array::<32>().ok_or(ChannelStateError::Malformed)?,
-                history: take_close_history(&mut cursor)?,
-            },
             tag::CLOSE_OPENED => Self::CloseOpened {
                 start_id: StartId::from_bytes(
                     cursor
@@ -256,7 +243,7 @@ impl ChannelRecord {
                         .ok_or(ChannelStateError::Malformed)?,
                 ),
                 opener: party(cursor.byte().ok_or(ChannelStateError::Malformed)?)?,
-                response_deadline: cursor.u64().ok_or(ChannelStateError::Malformed)?,
+                response_deadline_ms: cursor.u64().ok_or(ChannelStateError::Malformed)?,
                 claimed: cursor.u64().ok_or(ChannelStateError::Malformed)?,
             },
             tag::CLOSE_RESPONDED => Self::CloseResponded {
@@ -274,7 +261,6 @@ impl ChannelRecord {
             tag::CLOSE_SETTLED => Self::CloseSettled {
                 height: cursor.u64().ok_or(ChannelStateError::Malformed)?,
                 payload: cursor.array::<32>().ok_or(ChannelStateError::Malformed)?,
-                provider_payout: cursor.u64().ok_or(ChannelStateError::Malformed)?,
             },
             _ => return Err(ChannelStateError::Malformed),
         };
@@ -466,10 +452,10 @@ impl Channel<PaymentFunding> {
                     channel,
                     settlement,
                     cursor,
-                    origin_observed,
+                    certified_at_ms,
+                    pending,
                     close_prepared,
                     close_opened,
-                    close_history,
                     close_responded,
                     close_settled,
                     retained_roots,
@@ -532,9 +518,9 @@ impl Channel<PaymentFunding> {
             put_outcome(&mut out, outcome);
         }
         put_u64(&mut out, *proposal_nonce_high_water);
-        out.push(u8::from(*origin_observed));
         put_u64(&mut out, cursor.0);
         out.extend_from_slice(&cursor.1);
+        put_u64(&mut out, *certified_at_ms);
         put_u64(&mut out, indeterminate.len() as u64);
         for work_id in indeterminate.iter() {
             out.extend_from_slice(work_id.as_bytes());
@@ -545,7 +531,7 @@ impl Channel<PaymentFunding> {
         put_option(&mut out, close_opened.as_ref(), |out, contest| {
             out.extend_from_slice(&contest.start_id.to_bytes());
             out.push(party_code(contest.opener));
-            put_u64(out, contest.response_deadline);
+            put_u64(out, contest.response_deadline_ms);
             put_u64(out, contest.claimed);
         });
         put_option(&mut out, close_responded.as_ref(), |out, answer| {
@@ -555,12 +541,11 @@ impl Channel<PaymentFunding> {
         put_option(&mut out, close_settled.as_ref(), |out, settlement| {
             put_u64(out, settlement.height);
             out.extend_from_slice(&settlement.payload);
-            put_u64(out, settlement.provider_payout);
         });
         put_option(&mut out, pending_proposal.as_ref(), |out, id| {
             out.extend_from_slice(id.as_bytes())
         });
-        put_option(&mut out, close_history.as_ref(), put_close_history);
+        put_option(&mut out, pending.as_ref(), put_pending);
         put_u64(&mut out, retained_roots.len() as u64);
         for (work, root) in retained_roots {
             out.extend_from_slice(work.as_bytes());
@@ -674,12 +659,11 @@ impl Channel<PaymentFunding> {
             }
         }
         let proposal_nonce_high_water = cursor.u64().ok_or(ChannelStateError::Malformed)?;
-        let origin_observed =
-            crate::work_store::take_bool(&mut cursor, ChannelStateError::Malformed)?;
         let finalized_cursor = (
             cursor.u64().ok_or(ChannelStateError::Malformed)?,
             cursor.array::<32>().ok_or(ChannelStateError::Malformed)?,
         );
+        let certified_at_ms = cursor.u64().ok_or(ChannelStateError::Malformed)?;
         let indeterminate = {
             let count = cursor.u64().ok_or(ChannelStateError::Malformed)?;
             let mut held = BTreeSet::new();
@@ -702,7 +686,7 @@ impl Channel<PaymentFunding> {
                         .ok_or(ChannelStateError::Malformed)?,
                 ),
                 opener: party(cursor.byte().ok_or(ChannelStateError::Malformed)?)?,
-                response_deadline: cursor.u64().ok_or(ChannelStateError::Malformed)?,
+                response_deadline_ms: cursor.u64().ok_or(ChannelStateError::Malformed)?,
                 claimed: cursor.u64().ok_or(ChannelStateError::Malformed)?,
             })
         })?;
@@ -724,15 +708,10 @@ impl Channel<PaymentFunding> {
             Ok(CloseSettlement {
                 height: cursor.u64().ok_or(ChannelStateError::Malformed)?,
                 payload: cursor.array::<32>().ok_or(ChannelStateError::Malformed)?,
-                provider_payout: cursor.u64().ok_or(ChannelStateError::Malformed)?,
             })
         })?;
         let pending_proposal = take_option(&mut cursor, ChannelStateError::Malformed, digest)?;
-        let close_history = take_option(
-            &mut cursor,
-            ChannelStateError::Malformed,
-            take_close_history,
-        )?;
+        let pending = take_option(&mut cursor, ChannelStateError::Malformed, take_pending)?;
         let count = cursor.u64().ok_or(ChannelStateError::Malformed)?;
         let mut retained_roots = BTreeMap::new();
         let mut previous = None;
@@ -752,10 +731,10 @@ impl Channel<PaymentFunding> {
                 channel,
                 settlement,
                 cursor: finalized_cursor,
-                origin_observed,
+                certified_at_ms,
+                pending,
                 close_prepared,
                 close_opened,
-                close_history,
                 close_responded,
                 close_settled,
                 retained_roots,
@@ -778,18 +757,12 @@ impl Channel<PaymentFunding> {
     }
 }
 
-fn put_close_history(out: &mut Vec<u8>, history: &CloseHistory) {
-    put_u64(out, history.height);
-    out.extend_from_slice(&history.payload);
-    put_bytes(out, &encode_kernel(&history.pending));
+fn put_pending(out: &mut Vec<u8>, pending: &PendingPaymentClose) {
+    put_bytes(out, &encode_kernel(pending));
 }
 
-fn take_close_history(cursor: &mut Cursor<'_>) -> Result<CloseHistory, ChannelStateError> {
-    Ok(CloseHistory {
-        height: cursor.u64().ok_or(ChannelStateError::Malformed)?,
-        payload: cursor.array::<32>().ok_or(ChannelStateError::Malformed)?,
-        pending: decode_kernel(take_bytes(cursor, ChannelStateError::Malformed)?)?,
-    })
+fn take_pending(cursor: &mut Cursor<'_>) -> Result<PendingPaymentClose, ChannelStateError> {
+    decode_kernel(take_bytes(cursor, ChannelStateError::Malformed)?)
 }
 
 fn put_content(out: &mut Vec<u8>, object: &ContentRef) {

@@ -142,12 +142,14 @@ fn close_accepts_when_current_fee_exceeds_open_reserve() {
     let cheap = Context::with_fees(
         crate::support::NETWORK,
         BlockHeight::new(1),
+        1_000,
         BlockHash::from_bytes([0; BlockHash::LENGTH]),
         Fees::new(0, 0, 1, 0),
     );
     let expensive = Context::with_fees(
         crate::support::NETWORK,
         TIMEOUT,
+        TIMEOUT.get() * 1_000,
         BlockHash::from_bytes([0; BlockHash::LENGTH]),
         Fees::new(0, 0, 3, 0),
     );
@@ -205,6 +207,7 @@ fn close_surplus_uses_selected_close_kind() {
     let proof_priced = Context::with_fees(
         crate::support::NETWORK,
         BlockHeight::new(1),
+        1_000,
         BlockHash::from_bytes([0; BlockHash::LENGTH]),
         Fees::new(0, 0, 1, 0),
     );

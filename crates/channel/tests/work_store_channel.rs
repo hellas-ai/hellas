@@ -72,7 +72,6 @@ fn terms_for(policy: PaidChannelPolicyV1) -> WorkPaymentTerms {
         EdgeId::from_bytes([0xb0; 32]),
         bond_terms(),
         private_policy_commitment(network(), &SALT, &policy),
-        hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
         8,
         OMISSION_BOND,
     )
@@ -138,7 +137,6 @@ fn origin_of(channel: &PaidChannel) -> SetupOrigin {
         payment_edge: channel.payment_edge(),
         height: RECEIPT_HEIGHT - 1,
         payload: payload_at(RECEIPT_HEIGHT - 1),
-        parent: payload_at(RECEIPT_HEIGHT - 2),
     }
 }
 
@@ -368,20 +366,21 @@ async fn client_sequence(channel: &PaidChannel, job: &Job) -> Vec<ChannelRecord>
 /// A finalized height inside every fixture job's terminal deadline.
 const RECEIPT_HEIGHT: u64 = 150;
 
+/// One certified read of the live, uncontested fixture channel at
+/// `height`, stamped one second per height.
 fn cursor_at(height: u64) -> ChannelRecord {
-    ChannelRecord::CursorAdvanced {
+    ChannelRecord::Anchored {
         height,
-        parent: payload_at(height.saturating_sub(1)),
         payload: payload_at(height),
+        certified_at_ms: height * 1_000,
+        pending: None,
     }
 }
 
-/// Moves one store's cursor to `height`, one block at a time.
+/// Moves one store's cursor to `height` with one read.
 async fn advance(store: &mut ChannelStore, height: u64) {
-    let mut next = store.state().cursor().0.saturating_add(1);
-    while next <= height {
-        commit_all(store, &[cursor_at(next)]).await;
-        next += 1;
+    if store.state().cursor().0 < height || store.state().certified_at_ms() == 0 {
+        commit_all(store, &[cursor_at(height)]).await;
     }
 }
 
@@ -979,7 +978,6 @@ async fn a_store_opens_anchored_at_the_channels_origin() {
             payment_edge: EdgeId::from_bytes([0x5e; 32]),
             height: RECEIPT_HEIGHT - 1,
             payload: payload_at(RECEIPT_HEIGHT - 1),
-            parent: payload_at(RECEIPT_HEIGHT - 2),
         },
         store.content_store(),
         &Secp256k1Verifier::new(),
@@ -1813,16 +1811,14 @@ async fn role_scoped_steps_belong_to_one_role() {
     }
 }
 
-/// The finalized cursor moves to the next block, or it does not move.
+/// The certified cursor moves forward to any later read, and never back.
 ///
-/// Two rules, varied one at a time against the same held block. A
-/// height that is not the next one is a block this endpoint never read;
-/// a parent that is not the held payload is a block from a history it
-/// never read. Either would let a watcher report progress it has not
-/// made, and every deadline in this crate is measured against that
-/// progress.
+/// A read is a fact about the chain's state at its block, so nothing
+/// between the cursor and it is replayed; a read behind the cursor, or
+/// another block at the cursor's own height, is refused before it can
+/// say anything.
 #[tokio::test]
-async fn the_cursor_only_moves_to_the_contiguous_next_block() {
+async fn the_cursor_only_moves_forward_to_a_certified_read() {
     let dir = temp();
     let verifier = Secp256k1Verifier::new();
     let mut store = open(dir.path(), Role::Provider).await;
@@ -1830,62 +1826,90 @@ async fn the_cursor_only_moves_to_the_contiguous_next_block() {
     commit_all(&mut store, &[cursor_at(anchor + 1)]).await;
     assert_eq!(store.state().cursor(), (anchor + 1, payload_at(anchor + 1)));
 
-    // Every height but the next one, with the parent left correct. The
-    // repeated height carries a different payload, so it is a second
-    // block at the held height rather than the retry answered below.
-    for height in [anchor + 1, anchor, 0, anchor + 3, anchor + 20] {
-        let error = commit_with_content(
-            &mut store,
-            ChannelRecord::CursorAdvanced {
-                height,
-                parent: payload_at(anchor + 1),
-                payload: [0x99; 32],
-            },
-            &verifier,
-        )
-        .await
-        .expect_err("only the next height moves the cursor");
+    for height in [anchor, 0] {
+        let error = commit_with_content(&mut store, cursor_at(height), &verifier)
+            .await
+            .expect_err("a read behind the cursor is refused");
         assert!(
             matches!(
                 error,
-                WorkStoreError::Channel(ChannelStateError::CursorNotNext {
-                    held,
-                    actual,
-                }) if held == anchor + 1 && actual == height
+                WorkStoreError::Channel(ChannelStateError::CursorBehind { held, actual })
+                    if held == anchor + 1 && actual == height
             ),
             "unexpected error at {height}: {error}"
         );
     }
-
-    // The next height, and the only thing varied is the parent.
     let error = commit_with_content(
         &mut store,
-        ChannelRecord::CursorAdvanced {
-            height: anchor + 2,
-            parent: payload_at(anchor),
-            payload: payload_at(anchor + 2),
+        ChannelRecord::Anchored {
+            height: anchor + 1,
+            payload: [0x99; 32],
+            certified_at_ms: (anchor + 1) * 1_000,
+            pending: None,
         },
         &verifier,
     )
     .await
-    .expect_err("a block from another history does not extend this one");
+    .expect_err("another block at the held height is refused");
     assert!(
         matches!(
             error,
             WorkStoreError::Channel(ChannelStateError::CursorNotContiguous { height })
-                if height == anchor + 2
+                if height == anchor + 1
         ),
         "unexpected error: {error}"
     );
 
-    // The same two fields, correct: the cursor moves by exactly one.
-    commit_all(&mut store, &[cursor_at(anchor + 2)]).await;
-    assert_eq!(store.state().cursor(), (anchor + 2, payload_at(anchor + 2)));
+    // Any later read moves the cursor, however far.
+    commit_all(&mut store, &[cursor_at(anchor + 1_000)]).await;
+    assert_eq!(
+        store.state().cursor(),
+        (anchor + 1_000, payload_at(anchor + 1_000))
+    );
+    assert_eq!(store.state().certified_at_ms(), (anchor + 1_000) * 1_000);
 
-    // The same block again is the same fact.
+    // The same read again is the same fact.
     let before = store.len();
-    commit_all(&mut store, &[cursor_at(anchor + 2)]).await;
+    commit_all(&mut store, &[cursor_at(anchor + 1_000)]).await;
     assert_eq!(store.len(), before);
+
+    // A slot with no journaled contest is refused: the contest is
+    // committed before the read that carries it.
+    let error = commit_with_content(
+        &mut store,
+        ChannelRecord::Anchored {
+            height: anchor + 1_001,
+            payload: payload_at(anchor + 1_001),
+            certified_at_ms: (anchor + 1_001) * 1_000,
+            pending: Some(pending_record(&channel())),
+        },
+        &verifier,
+    )
+    .await
+    .expect_err("a contest the journal has not recorded");
+    assert!(matches!(
+        error,
+        WorkStoreError::Channel(ChannelStateError::Malformed)
+    ));
+}
+
+/// A pending-close record for the fixture channel, opened by the client.
+fn pending_record(channel: &PaidChannel) -> hellas_kernel::PendingPaymentClose {
+    let start = hellas_channel::work_close::close_start(
+        channel,
+        Party::Maker,
+        RECEIPT_HEIGHT,
+        None,
+        &fixture::client(),
+    )
+    .expect("the fixture start signs");
+    hellas_kernel::PendingPaymentClose::from_accepted_start(
+        channel.network(),
+        RECEIPT_HEIGHT + 1,
+        (RECEIPT_HEIGHT + 1) * 1_000,
+        &start,
+    )
+    .expect("the fixture contest opens")
 }
 
 /// Two processes over one channel: the second fails before it can act.
@@ -1933,21 +1957,30 @@ fn the_record_codec_is_exact_and_ordered() {
     let channel = channel();
     let job = job_at(&channel, 1, 0);
 
-    let cursor = ChannelRecord::CursorAdvanced {
+    let cursor = ChannelRecord::Anchored {
         height: 0x0102_0304_0506_0708,
-        parent: [0xaa; 32],
         payload: [0xab; 32],
+        certified_at_ms: 0x1112_1314_1516_1718,
+        pending: None,
     };
     let bytes = cursor.encode();
-    // tag || height || parent || payload — the height first and
-    // big-endian, and the two digests in that order. A round trip would
-    // pass with them transposed; these bytes do not.
+    // tag || height || payload || certified time || no slot — the two
+    // big-endian `u64`s around one digest. A round trip would pass with
+    // them transposed; these bytes do not.
     let mut expected = vec![0_u8];
     expected.extend_from_slice(&0x0102_0304_0506_0708_u64.to_be_bytes());
-    expected.extend_from_slice(&[0xaa; 32]);
     expected.extend_from_slice(&[0xab; 32]);
+    expected.extend_from_slice(&0x1112_1314_1516_1718_u64.to_be_bytes());
+    expected.push(0);
     assert_eq!(bytes, expected);
     assert_eq!(ChannelRecord::decode(&bytes), Ok(cursor));
+    let with_slot = ChannelRecord::Anchored {
+        height: 7,
+        payload: [0xab; 32],
+        certified_at_ms: 8,
+        pending: Some(pending_record(&channel)),
+    };
+    assert_eq!(ChannelRecord::decode(&with_slot.encode()), Ok(with_slot));
 
     let start = hellas_kernel::PaymentCloseStart::new(
         channel.payment_edge(),
@@ -1979,7 +2012,7 @@ fn the_record_codec_is_exact_and_ordered() {
     let opened = ChannelRecord::CloseOpened {
         start_id: hellas_kernel::StartId::from_bytes([0xcd; 32]),
         opener: Party::Maker,
-        response_deadline: 0x3132_3334_3536_3738,
+        response_deadline_ms: 0x3132_3334_3536_3738,
         claimed: 0x4142_4344_4546_4748,
     };
     let bytes = opened.encode();
@@ -1994,7 +2027,7 @@ fn the_record_codec_is_exact_and_ordered() {
     let opened = ChannelRecord::CloseOpened {
         start_id: hellas_kernel::StartId::from_bytes([0xcd; 32]),
         opener: Party::Taker,
-        response_deadline: 0,
+        response_deadline_ms: 0,
         claimed: 0,
     };
     let bytes = opened.encode();
@@ -2045,16 +2078,12 @@ fn the_record_codec_is_exact_and_ordered() {
     let settled = ChannelRecord::CloseSettled {
         height: 0x1112_1314_1516_1718,
         payload: [0xef; 32],
-        provider_payout: 0x2122_2324_2526_2728,
     };
     let bytes = settled.encode();
-    // tag || height || payload || provider payout. Two big-endian
-    // `u64`s around one digest: a round trip would pass with them
-    // exchanged, and these bytes would not.
+    // tag || height || payload.
     let mut expected = vec![10_u8];
     expected.extend_from_slice(&0x1112_1314_1516_1718_u64.to_be_bytes());
     expected.extend_from_slice(&[0xef; 32]);
-    expected.extend_from_slice(&0x2122_2324_2526_2728_u64.to_be_bytes());
     assert_eq!(bytes, expected);
     assert_eq!(ChannelRecord::decode(&bytes), Ok(settled));
 
@@ -2767,7 +2796,7 @@ async fn one_contest_admits_one_answer() {
         &[ChannelRecord::CloseOpened {
             start_id,
             opener: Party::Maker,
-            response_deadline: RECEIPT_HEIGHT + 16,
+            response_deadline_ms: (RECEIPT_HEIGHT + 16) * 1_000,
             claimed: 0,
         }],
     )
@@ -2866,7 +2895,7 @@ async fn one_contest_admits_one_answer() {
             &[ChannelRecord::CloseOpened {
                 start_id,
                 opener,
-                response_deadline: RECEIPT_HEIGHT + 16,
+                response_deadline_ms: (RECEIPT_HEIGHT + 16) * 1_000,
                 claimed,
             }],
         )
@@ -2903,7 +2932,7 @@ async fn one_contest_admits_one_answer() {
         &[ChannelRecord::CloseOpened {
             start_id,
             opener: Party::Maker,
-            response_deadline: RECEIPT_HEIGHT + 16,
+            response_deadline_ms: (RECEIPT_HEIGHT + 16) * 1_000,
             claimed: 0,
         }],
     )
@@ -2989,7 +3018,7 @@ async fn closed_store(root: &std::path::Path) -> ChannelStore {
             ChannelRecord::CloseOpened {
                 start_id,
                 opener: Party::Maker,
-                response_deadline: RECEIPT_HEIGHT + 16,
+                response_deadline_ms: (RECEIPT_HEIGHT + 16) * 1_000,
                 claimed: 0,
             },
             ChannelRecord::CloseResponded {
@@ -3003,7 +3032,6 @@ async fn closed_store(root: &std::path::Path) -> ChannelStore {
             ChannelRecord::CloseSettled {
                 height: RECEIPT_HEIGHT + 20,
                 payload: payload_at(RECEIPT_HEIGHT + 20),
-                provider_payout: PRICE,
             },
         ],
     )

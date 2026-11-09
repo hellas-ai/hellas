@@ -1,0 +1,444 @@
+{
+  "schema_version": 1,
+  "network_id": "hellas-devnet-3",
+  "validators": [
+    {
+      "public_key": "ae3a9bc6eb721b7b8a34d23aa0d5b1623e89bc6f092815ea13b92f79a39c7d38",
+      "label": "validator-0"
+    },
+    {
+      "public_key": "80c02edc00c6b43231858aa5dd6c1911d7e489e470218da82193a470dfce50cf",
+      "label": "validator-1"
+    },
+    {
+      "public_key": "8e1ea87cdb41614693298cb65ebfa8c3e6d09dc9f358321d8e533a8813e75bc4",
+      "label": "validator-2"
+    },
+    {
+      "public_key": "f9e83545c23f527cadf1aa3063d21962eb33a4ae4d54ade6af7448e1fd5b8719",
+      "label": "validator-3"
+    },
+    {
+      "public_key": "2f52436ff3b44d61fe5bad64c5ba346720cc55303fa04e01ad3f3ed599abd029",
+      "label": "validator-4"
+    },
+    {
+      "public_key": "9a28e6f9a4f3fd261ac8d76188347cd5d78fa57985f336be3a0b4a82d854f0da",
+      "label": "validator-5"
+    }
+  ],
+  "allocations": [
+    {
+      "address": "21tzoXVq7aGx61bNRTPDVn9hJhszdDA4CPcp9LYZL8ffT",
+      "balance": 1000000
+    },
+    {
+      "address": "236h7pukvqi6u8ADu53erbWyLYXNyNEuB9BRNMXtVKUfZ",
+      "balance": 1000000
+    },
+    {
+      "address": "25uDmUCQcwYUHHyXthtEspGB2KVTmbys8vTSqAMXKNqRV",
+      "balance": 1000000
+    },
+    {
+      "address": "2BnrDwXpfc6t5JimoPFJctDCuAWyJVNpzcmcAs6nT8XQ7",
+      "balance": 931145
+    },
+    {
+      "address": "25eaT7GtWzh6FcSucEJKyaWBAv5L9znK6xCCL32kcqtLR",
+      "balance": 931145
+    },
+    {
+      "address": "sESb2nRQPGyDYacSwi9Naz7LumwEfaqA5mzhnTodQUTy",
+      "balance": 931145
+    },
+    {
+      "address": "21LdTvvaA5Ac85hC7SEb5mn3DTKDUDfQyapZcUGbP8P8S",
+      "balance": 931145
+    },
+    {
+      "address": "ikiA7Y38GYyog7k2jjtUr5AvpXvVmaz3uyPGSpT2uWBj",
+      "balance": 931145
+    },
+    {
+      "address": "koa8ZeeZ5gFMdyY94PSybAG9tPSmheUv9aUtTkfFGhWa",
+      "balance": 931145
+    },
+    {
+      "address": "c621b6GSft1ZRYzGLQJANGmMTcETSoL7S3i17zvFb2iZ",
+      "balance": 931145
+    },
+    {
+      "address": "y66uSSyVKYtQGhSmsKQFHArYVPndXuWg1FsywQqdvgkL",
+      "balance": 931145
+    },
+    {
+      "address": "dwsJ353hUAPtiNThfTxDnVuEFjq8wJtBFTsADMRAXn5t",
+      "balance": 931145
+    },
+    {
+      "address": "25JDR1zMvFxv9fMdCnuzCDsQjrJmTeQdwbNvGzp49wmn7",
+      "balance": 931145
+    },
+    {
+      "address": "qhN5SebtvLtMTwCoF5YRiLYfXuPR1ezyMnPmf3w9ceiu",
+      "balance": 931145
+    },
+    {
+      "address": "sfrEjeHq4vjBgjuHAskpCisdmSB3FVNouPscj4zUPi3s",
+      "balance": 931145
+    },
+    {
+      "address": "sLZcqPTNGVcqUvN4RKQEEZMmD9JZrbGgfYQ68MezvZi4",
+      "balance": 931145
+    },
+    {
+      "address": "29JVitJRPor5sgvqv9gi4tBkQodKDLGTEfPBkk2deiY5r",
+      "balance": 931145
+    },
+    {
+      "address": "2569QSaHL8qkkRHPE8NbCGzxUFjMMY8sfUDWbCa5eFZm6",
+      "balance": 931145
+    },
+    {
+      "address": "sLCRmZY3poZ8J4pvDKfs45eUoeavZs4SLMg1625dijAj",
+      "balance": 931145
+    },
+    {
+      "address": "2AwkqZXRtvmN3r4pcYnoB29NTuEaJuQWakfcUPpQqfiZ9",
+      "balance": 931145
+    },
+    {
+      "address": "25kqBrndwhHQrHd8PREbgZHcuf8DEe5bctHY641BQ4Wy5",
+      "balance": 931145
+    },
+    {
+      "address": "29BYtTnH3J32BaE4Wh8GDfwgaqL4fc1w4R7uuQwfhtsCV",
+      "balance": 931145
+    },
+    {
+      "address": "jzdTyn97JandLqrLyNoqNyVZnPQ5iQfPsceYD8rBBaqQ",
+      "balance": 931145
+    },
+    {
+      "address": "iNpar1SKbkJmnneXsX9MYmRSTR6NgTGXD9o8e64Jx88B",
+      "balance": 931145
+    },
+    {
+      "address": "qCRMbg3SM3WZV73PZQpawnxZv4sBHwSqTbi5ukaCy1SV",
+      "balance": 931145
+    },
+    {
+      "address": "wRpjqcM1iUE2R32j1RVqeyYj5YB6NzzWX5zfWhpb4ftm",
+      "balance": 931145
+    },
+    {
+      "address": "hyzxWYx6UJTud1zvTuheRd8wTNK8wG7kwbEEnC6wrx8D",
+      "balance": 931145
+    },
+    {
+      "address": "24QD8jK9Lw9XzvaX5uLZhcZLQQfNBezsdd9ZaVEmM1RBf",
+      "balance": 931145
+    },
+    {
+      "address": "u4JMqqWifYHLqWnhScWJZYtwS3C91vdb3seJsaEx6JjD",
+      "balance": 931145
+    },
+    {
+      "address": "29Sq3b487EfA1vuKuayMeewWBAHzuTRBEq8GN1uhZzbPS",
+      "balance": 931145
+    },
+    {
+      "address": "tEpgfNuDShBBB28xuQp7bUoJgExLp8y1KHBLws3nEhw6",
+      "balance": 931145
+    },
+    {
+      "address": "sEfWDYSNCbDAnmm42KebZJmL1puvvG6fPX9i4HvN7bhf",
+      "balance": 931145
+    },
+    {
+      "address": "zqJvDXW3NPta6Xq76dHpoSJxmDCXFv2PBbvgM9djtZ9j",
+      "balance": 931145
+    },
+    {
+      "address": "razsCLCHLE4BEHicxisarRDH8yYuRUsi63TYBtWJhkr7",
+      "balance": 931145
+    },
+    {
+      "address": "22uuCcqNnz727DeUhxm1DcNascdHTmRouXUYaqbWsieko",
+      "balance": 931145
+    },
+    {
+      "address": "e4rZ7MGx5ehwP5uJSw2TjnEzyp9ForbPeuFjNjAbdTP9",
+      "balance": 931145
+    },
+    {
+      "address": "2AKqVk7NGcHLQusYfLq9n1psjf4XMCVUu6wsao45taM8U",
+      "balance": 931145
+    },
+    {
+      "address": "e3efj8q1VG5huHayjTr7zexAcypfBeHDvAsjzUMYkBaf",
+      "balance": 931145
+    },
+    {
+      "address": "hTr5TumE5eSCXW9dwCDErNnn6kcPFfrDAkE8kVFv6N2P",
+      "balance": 931145
+    },
+    {
+      "address": "hEXiefgBqtSGV6UDNPnpzUFmep8jXyEDXDDhiaANGTpt",
+      "balance": 931145
+    },
+    {
+      "address": "w2fESZxTGm9qhuxxKoVBjJLMxo85mmNSTEEGivSFYCQc",
+      "balance": 931145
+    },
+    {
+      "address": "zi2RdvAkxYpiGxA6ZLFPQH54Bp61ZiPAkBQyD9YQ33bX",
+      "balance": 931145
+    },
+    {
+      "address": "uMLQTpfbA7sqWUbSWk4Z7b53L9cTnp3jVCXoC9B1ESPR",
+      "balance": 931145
+    },
+    {
+      "address": "iGYKgReeoZ8PEEkGoRpdi13gkyrmd3ToYjvtcJWdYFB7",
+      "balance": 931145
+    },
+    {
+      "address": "rYGi7mBH15fQCzSTAbhZGSEMfp3NvoUDgjaSxJyTmCH1",
+      "balance": 931145
+    },
+    {
+      "address": "22JwCM2yFVSq4zAuMPFaYPu7VYb2RQZHNNu1n4yS1pFiR",
+      "balance": 931145
+    },
+    {
+      "address": "22qFy3vUr273W5qwnLeZz9kPLqzy9tMntHD3xKNMkckrb",
+      "balance": 931145
+    },
+    {
+      "address": "pWJi8bxi79hSEiXCwiEiXPPiFSZFzanXufHGzYebbs8B",
+      "balance": 931145
+    },
+    {
+      "address": "y6PQFdDGPBn5PaA3UrnbDd9DuWBzhHtFjZQLExgjprx7",
+      "balance": 931145
+    },
+    {
+      "address": "zh7zZdtrNRqHJaiWb9JLHNbi6PqM8GLHsFnYo8aYGKaq",
+      "balance": 931145
+    },
+    {
+      "address": "24combZsj2PLF2hvqcHbkZwv3DmHCxP64hrWE1q8v8LmH",
+      "balance": 931145
+    },
+    {
+      "address": "23BYgr5LCQopwMiRz6vGD9HiV3d3xFcwNEKb1easj2Rtu",
+      "balance": 931145
+    },
+    {
+      "address": "cVHcQwGhXBSUr89yHzF1qDd1s5esrUD7qoEdNVkHd2aN",
+      "balance": 931145
+    },
+    {
+      "address": "xQ9yEjqUupD5EUkzRC1rHEYNvsbsFE3NabbboeQqcxMF",
+      "balance": 931145
+    },
+    {
+      "address": "28d3ZThoY5zSsS2ovgbcSmPtUxYrW9ya6YTv2nfSDDZse",
+      "balance": 931145
+    },
+    {
+      "address": "23THKbm1ZazvCWDSX9bXpZ8x3pMJXfBDe5YFS5X7XS6z5",
+      "balance": 931145
+    },
+    {
+      "address": "mJqJhynNZnEfEuW3qncVEi4w8VnW7HMPdLXYF5dufzxh",
+      "balance": 931145
+    },
+    {
+      "address": "trRBcN62cHH7DTzNNhYNmZJKgCSaGhUSiz662pS9m2Jf",
+      "balance": 931145
+    },
+    {
+      "address": "zsWkJtfdK3mxcmnqLDuwCRtFPFpSxk1oYAwVt6LeC1Vi",
+      "balance": 931145
+    },
+    {
+      "address": "tx5xtJPbLv8HjCujuweTcL6NYhxgFuJmktvKnrRjQrGo",
+      "balance": 931145
+    },
+    {
+      "address": "2ApyVNSNLyKRQXjG8brYraHZtwPmCSAYus3BwTtAG2kFN",
+      "balance": 931145
+    },
+    {
+      "address": "zk5qcgPK65n5RAsvXMxB32CGFy3bAcbfxGf3CsW5xGs5",
+      "balance": 931145
+    },
+    {
+      "address": "ekYMzKR1kZndZAjFqBvwJ764s2fRvinWYei3FuGFoFwA",
+      "balance": 931145
+    },
+    {
+      "address": "22vqTTXPFqBs3BmLiMDau1zGszisHC21Zrk8sb9cLcVVG",
+      "balance": 931145
+    },
+    {
+      "address": "eHAYWSgobDWoy1hkw2Ge4ebV39hzw5uw4obk1YZLT4Ny",
+      "balance": 931145
+    },
+    {
+      "address": "h2cNS79RT5mX5nxV43yCghaukgHPcRb7NCrv8YA6N4QF",
+      "balance": 931145
+    },
+    {
+      "address": "sxCBHW5E2ogxn7BhoYqdWVg4Px9Thahfd1CQrwHXiCH2",
+      "balance": 931145
+    },
+    {
+      "address": "zPy6PN6Jg1Xzfq1i17jbHcwfvKRBDfEAwnqXradokq4j",
+      "balance": 931145
+    },
+    {
+      "address": "cPxxHG2hcNkksVKoHdeccc165PEgLcAxcKrpkEQUqSov",
+      "balance": 931145
+    },
+    {
+      "address": "nqUbXrzAzVegW1aeYreuNCqm1ZtdP4x72zHHVpJqDsRg",
+      "balance": 931145
+    },
+    {
+      "address": "ypL8G9L5k4w5ht7j4VSsKGBsZxYyRFqLZMT5JGooqCZW",
+      "balance": 931145
+    },
+    {
+      "address": "22HAx5Qrv9a3uTqRpxih4ospLB1MhYw3BK7KxMoqLJF2L",
+      "balance": 931145
+    },
+    {
+      "address": "z6JRuw41QMqwnxEeiuGr4erwfif4ShjgPAVMZG8w1GLX",
+      "balance": 931145
+    },
+    {
+      "address": "znrct7SDjNPEoDPBVC6DRxBjm8VCx8oTo6u9SXKvTLVs",
+      "balance": 931145
+    },
+    {
+      "address": "zLubHKusQhhkKsBsabMAqQdoTxB4A3RwjB98VWA4WoPa",
+      "balance": 931145
+    },
+    {
+      "address": "nWV8Db3Rtp7VYAqSJePmf6JjSZaD9mptFmREbQECXLUc",
+      "balance": 931145
+    },
+    {
+      "address": "nk7t4MXmoSZdVyrgGCkPKG6kUcCcQxXTZqmjBqqG3aAh",
+      "balance": 931145
+    },
+    {
+      "address": "28f4MXMJnTfG9quwK1qAeXEm9LSFXoRDrYjmGixLkeQMd",
+      "balance": 931145
+    },
+    {
+      "address": "23hKjWqjmzoterBmhRWS2ZXgLk6mZBcQNvgBMzuFeNEDL",
+      "balance": 931145
+    },
+    {
+      "address": "24z2XvrJFa2PzaDy5UkHKHdRtMHMbZ3vrSEHnPbrVTDeP",
+      "balance": 931145
+    },
+    {
+      "address": "wRwoDbUxygvT1pTEnzBheQbyQK7ZGQhiypZfB5YCcd45",
+      "balance": 931145
+    },
+    {
+      "address": "sNdgg4vEVFb9PGw8a3sunH77rrvV1smQe4fN3icrnTAa",
+      "balance": 931145
+    },
+    {
+      "address": "25MnhW6K2DNZWwd35prsyzewACyhRjTgKaWgv73TbHULj",
+      "balance": 931145
+    },
+    {
+      "address": "28sMWP6DV5J8Pcv4ndyrkwQzEYeWrSpEsEcfH5EZmNFr3",
+      "balance": 931145
+    },
+    {
+      "address": "uBSsRo4NGWon6cKDymXVANii69Sz1PJNx77QB7uK5cdy",
+      "balance": 931145
+    },
+    {
+      "address": "kijs5LsrGJPFmJoXGPSrrJEnWGZxqzFnvy5f2te88Rcr",
+      "balance": 931145
+    },
+    {
+      "address": "v1yAxryrtywweenY5r4nJvMxX7VURokKSfFVZYudDQWb",
+      "balance": 931145
+    },
+    {
+      "address": "nc8541ZjPiq2CYr1Fs2uXnGay2bNoKV6rjfpmbYu7CqT",
+      "balance": 931145
+    },
+    {
+      "address": "29chh1zc6Tcehx1aaPbUtaNoJk1KTtVXoWyyZUkgLKjir",
+      "balance": 931145
+    },
+    {
+      "address": "wChfzcxfp8omLQnaqZBxnYfqHTtD3BwvdRxTdRhAdRa6",
+      "balance": 931145
+    },
+    {
+      "address": "qkRBkTPSeYBqaGnXt6fB1yn6EsaA2DTpKE9AgVq61ENa",
+      "balance": 931145
+    },
+    {
+      "address": "252Rahgm31NCdZfd57QNrTWX1Qdb4S59LTKik39aREkJf",
+      "balance": 931145
+    },
+    {
+      "address": "y5J3CC582eTsS2mn7E1xSiL8jPfo5uG6f16EKUctH5s2",
+      "balance": 931145
+    },
+    {
+      "address": "ieJLGvvwd9ixxgiWsRZ4PWDDPSd6es4AdUqFatF5cDiK",
+      "balance": 931145
+    },
+    {
+      "address": "doTqAEUtJfhaPCmAwTbSAxBsFtevSxFHLN8sxPUtQ9bn",
+      "balance": 931145
+    },
+    {
+      "address": "k3LH8yZJbYRdvtT1CLWPF3WHUxAyJjde6JXX7FmxFuJU",
+      "balance": 931145
+    },
+    {
+      "address": "upKZicVoqbK8zGdvKvKfJ2Z9YRK8VGRV9pWM9iHzEE6M",
+      "balance": 931145
+    },
+    {
+      "address": "27UA6kiKSP6kRGY1ac3BJQN73aLTaXBejqHEtLgvz7EHz",
+      "balance": 931145
+    },
+    {
+      "address": "bizt5Di4h5d42qkHM4knY3tffhiX9j6XTNHjqR5cPsHS",
+      "balance": 931145
+    },
+    {
+      "address": "svmBL82ofayxoDS6arSgNUYXkCmMAisKFfuQSt2Srrjy",
+      "balance": 931145
+    },
+    {
+      "address": "vXmaC15wFhLSrzKyfFUSWJDQeWR9gnDtEUZhdFkqQj9F",
+      "balance": 931145
+    },
+    {
+      "address": "2B71pQ7vJGCSZrEL8xFDj7x5weHZZB6zYgxKmJo388yTS",
+      "balance": 931145
+    },
+    {
+      "address": "hNTxZrRn6csHdSEg3x14C8nxAhXzGHFx3ekqEF62Mf1s",
+      "balance": 931145
+    }
+  ]
+}

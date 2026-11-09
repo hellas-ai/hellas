@@ -488,16 +488,6 @@ fn check_work_payment_terms(payment: &WorkPaymentTerms) -> Result<(), InvalidOpe
     // is the bond's timeout, so there is no second spelling to disagree
     // with. What remains is the bond's own policy and this body's.
     check_work_bond_policy(&payment.bond_terms)?;
-    // The floor is derived, not chosen: below it the provider has no
-    // measured opportunity to observe the start, sign an answer, and get
-    // it included, so the omission theorem the channel is priced on does
-    // not hold. Consensus refuses the channel rather than opening one
-    // whose safety argument it knows to be false.
-    if payment.omit_response_blocks < crate::consts::MIN_OMIT_RESPONSE_BLOCKS
-        || payment.omit_response_blocks > crate::consts::MAX_OMIT_RESPONSE_BLOCKS
-    {
-        return Err(InvalidOpenReason::WorkResponseWindowOutOfRange);
-    }
     if payment.start_validity_blocks == 0
         || payment.start_validity_blocks > crate::consts::MAX_START_VALIDITY_BLOCKS
     {

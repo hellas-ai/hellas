@@ -146,6 +146,9 @@ impl<T> std::ops::Deref for Verified<T> {
 pub struct ObjectSnapshot {
     pub network: hellas_kernel::NetworkId,
     pub block: LatestBlock,
+    /// The certified block's own timestamp, in milliseconds. Zero for an
+    /// unproven read, which is never fresh.
+    pub certified_at_ms: u64,
     pub objects: std::collections::BTreeMap<ObjectId, Object>,
     pub holdings: Option<Holdings>,
 }

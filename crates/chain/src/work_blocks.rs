@@ -1,83 +1,41 @@
-//! Handing finalized blocks to a paid endpoint's watcher.
+//! One light client, as a paid endpoint's chain.
 //!
-//! # Why an adapter and not a blanket impl
-//!
-//! The watcher's block source is `hellas_channel::work_close::FinalizedBlocks`
-//! and a light client is `crate::LightClient`. Both are foreign to each
-//! other, so nothing can implement the first for every one of the
-//! second; [`WorkBlocks`] is the one type that owns that pairing. It
-//! adds no policy — every decision it could make is made by
-//! [`FinalizedBlockView::decode`] above it or by the journal below it.
-//!
-//! # What crosses
-//!
-//! One block, checked. `decode` is what turns a bag of bytes beside a
-//! finalization certificate into a block: it hashes the bytes against
-//! the payload the certificate names, decodes them with the validator's
-//! own codec, and checks the height and state root. Only then are the
-//! transactions in it facts.
-//!
-//! They cross in consensus order, and the non-kernel ones are dropped
-//! rather than reordered. That is not a projection the watcher has to
-//! trust: a transfer or a merge cannot open a contest or close an edge,
-//! so the relative order of everything that *can* is exactly the
-//! validator's.
-//!
-//! # And one way back
-//!
-//! The same pairing carries a transaction *out*. An endpoint that could
-//! read blocks and not submit would sign a start it had no way to hand
-//! to anyone, so the sink is here rather than in a second adapter — one
-//! light client, one channel, one direction each way.
-//!
-//! # And the state behind the blocks
-//!
-//! A setup driver needs a third thing: one coherent read of the two
-//! edges, the bond's lease, and the liveness of the coins its retained
-//! Opens spend. That is [`FinalizedWorkView`], and it is on the same
-//! light client, so it is on the same adapter rather than a second one
-//! a caller could pair with a different chain. What crosses is
-//! [`FinalizedSetup`], which is `hellas_rpc`'s owned shape of the same
-//! answer; the coherence it carries is the snapshot's, and
-//! `WorkChannelSnapshot::finalized_setup` is what refuses to produce
-//! one from a snapshot that asked about other coins.
+//! A paid endpoint needs two things from a chain and no more: one
+//! coherent, proof-checked read of its channels' objects at a certified
+//! block ([`FinalizedWorkView`]), and somewhere to hand a transaction
+//! ([`TxSink`]). [`WorkBlocks`] is the one type that pairs them over a
+//! light client, so the read and the submission cannot be pointed at two
+//! different chains, and it refuses any read older than what the
+//! journal it serves already holds.
 
 use hellas_channel::work::WorkService;
 use hellas_channel::work_close::{
-    BlockSourceError, CatchUpError, CloseError, CloseProgress, FinalizedBlocks, FinalizedWork,
-    TxSink,
+    BlockSourceError, CatchUpError, CloseError, CloseProgress, TxSink,
 };
-use hellas_channel::work_open::{FinalizedSetup, SetupQuery, SetupView};
 use hellas_kernel::{Terms, Tx};
 
 use crate::SubmitTxOutcome;
-use crate::block_view::FinalizedBlockView;
-use crate::domain::{Digest, Transaction};
-use crate::light_client::{FinalizedBlockQuery, LightClient, QueryError};
+use crate::domain::Transaction;
+use crate::light_client::{LightClient, QueryError};
 use crate::work_view::{FinalizedWorkView, WorkChannelQuery, WorkChannelSnapshot};
 
-/// One light client, as a paid endpoint's block source.
+/// One light client, as a paid endpoint's chain.
 ///
-/// The client must authenticate each finalized historical block on the same
-/// pinned consensus chain. Use a local validating node or a remote client with
-/// an independently authenticated consensus verifier; this adapter does not
-/// turn an unverified remote connection into trusted finality evidence.
+/// The client must authenticate each read on the same pinned consensus
+/// chain: a remote client with an independently authenticated consensus
+/// verifier, or a validating node's own. This adapter does not turn an
+/// unverified remote connection into trusted evidence.
 #[derive(Clone, Debug)]
 pub struct WorkBlocks<C> {
     client: C,
-    read_retry: Option<(std::time::Duration, std::time::Duration)>,
     min_height: u64,
 }
 
 /// What one production clock step did for a mounted paid channel.
 #[derive(Debug)]
 pub struct PaidWorkClockAdvance {
-    /// The verified snapshot already read for settlement, reusable by admission.
-    pub snapshot: Option<crate::light_client::Verified<WorkChannelSnapshot>>,
-    /// The shared start, response, and final adjudication drive that ran first.
+    /// The shared start, response, and final adjudication drive.
     pub close: CloseProgress,
-    /// Submission outcome for a due adjudicated payment close.
-    pub adjudication: Option<SubmitTxOutcome>,
     /// Submission outcome for a due completed-bond timeout.
     pub bond_timeout: Option<SubmitTxOutcome>,
 }
@@ -88,9 +46,6 @@ pub enum PaidWorkClockError {
     /// The journaled close drive failed.
     #[error("the journaled close drive failed: {0}")]
     CloseDrive(#[source] CatchUpError),
-    /// The coherent finalized channel read failed.
-    #[error("the coherent finalized channel read failed: {0}")]
-    Snapshot(#[source] QueryError),
     /// The endpoint could not derive the close consensus permits.
     #[error("the mounted endpoint could not derive its close: {0}")]
     Decision(#[source] CloseError),
@@ -108,30 +63,18 @@ impl PaidWorkClockError {
     pub const fn source_failed(&self) -> bool {
         matches!(
             self,
-            Self::CloseDrive(CatchUpError::Source(_)) | Self::Snapshot(_) | Self::Submission(_)
+            Self::CloseDrive(CatchUpError::Source(_)) | Self::Submission(_)
         )
     }
 }
 
 impl<C: LightClient> WorkBlocks<C> {
-    /// Reads finalized blocks for a watcher through `client`.
+    /// Reads and submits for a paid endpoint through `client`.
     pub const fn new(client: C) -> Self {
         Self {
             client,
-            read_retry: None,
             min_height: 0,
         }
-    }
-
-    /// Waits for transiently unavailable setup reads without retrying transactions.
-    #[must_use]
-    pub const fn with_read_retry(
-        mut self,
-        poll: std::time::Duration,
-        timeout: std::time::Duration,
-    ) -> Self {
-        self.read_retry = Some((poll, timeout));
-        self
     }
 
     /// A persisted journal must never interpret absence at an earlier root.
@@ -141,178 +84,70 @@ impl<C: LightClient> WorkBlocks<C> {
         self
     }
 
-    async fn read<T, F, Fut>(&self, mut read: F) -> Result<T, QueryError>
-    where
-        F: FnMut() -> Fut,
-        Fut: std::future::Future<Output = Result<T, QueryError>>,
-    {
-        let Some((poll, timeout)) = self.read_retry else {
-            return read().await;
-        };
-        let deadline = tokio::time::Instant::now() + timeout;
-        let mut last_reason = "chain read did not answer".to_owned();
-        loop {
-            let result = tokio::time::timeout_at(deadline, read())
-                .await
-                .map_err(|_| QueryError::ReadUnavailableTimeout {
-                    timeout,
-                    reason: last_reason.clone(),
-                })?;
-            match result {
-                Err(QueryError::StateUnavailable(reason)) => {
-                    last_reason.clone_from(&reason);
-                    if tokio::time::Instant::now() >= deadline {
-                        return Err(QueryError::ReadUnavailableTimeout { timeout, reason });
-                    }
-                    tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + poll))
-                        .await;
-                }
-                result => return result,
-            }
-        }
+    /// Returns the light client this adapter reads and submits through.
+    pub const fn client(&self) -> &C {
+        &self.client
     }
 }
 
 impl From<QueryError> for BlockSourceError {
     fn from(error: QueryError) -> Self {
-        match error {
-            QueryError::ReadUnavailableTimeout { timeout, reason } => {
-                Self::ReadUnavailableTimeout { timeout, reason }
-            }
-            error => Self::new(error.to_string()),
-        }
+        Self::new(error.to_string())
     }
 }
 
-/// Advances one mounted paid channel on the production clock.
+/// Advances one mounted paid channel on the production clock, from one
+/// certified read of it.
 ///
-/// The journaled close drive runs first. The endpoint is then borrowed
-/// synchronously only long enough to copy the two edge ids and embedded
-/// bond terms. Payment adjudication belongs to the shared close driver and
-/// requires only finalized history, just as it does for an offline client's
-/// recovery. A coherent finalized object snapshot is still needed for the
-/// separate bond timeout after payment closure or at the bond horizon.
+/// The journaled close drive runs first: it applies the read and serves
+/// the contest, adjudication or retained start it shows. The bond then
+/// comes back by its Timeout once the payment edge is closed or the bond
+/// horizon has passed.
 ///
 /// # Errors
 ///
-/// Returns the failed journal drive, snapshot, decision, or submission.
-/// A retained work-bond shape without a timeout payout is also refused.
-pub async fn advance_paid_work_clock<S>(
+/// Returns the failed journal drive, decision, or submission. A retained
+/// work-bond shape without a timeout payout is also refused.
+pub async fn advance_paid_work_clock<T>(
     service: &WorkService,
-    source: &S,
+    snapshot: &WorkChannelSnapshot,
+    sink: &T,
 ) -> Result<PaidWorkClockAdvance, PaidWorkClockError>
 where
-    S: FinalizedBlocks + FinalizedWorkView + TxSink + Sync,
+    T: TxSink + ?Sized + Sync,
 {
     let close = service
-        .advance_close(source, source)
+        .advance_close(&snapshot.observed_channel(), sink)
         .await
         .map_err(PaidWorkClockError::CloseDrive)?;
-    let adjudication = match close {
-        CloseProgress::AdjudicationSubmitted { outcome, .. } => Some(outcome),
-        _ => None,
-    };
-
-    let (query, bond_terms, settled_height) = service
+    let (bond_edge, bond_terms, settled) = service
         .with_state(|state| {
-            let channel = state.channel();
-            let payment_terms = channel.payment_terms();
+            let payment_terms = state.channel().payment_terms();
             (
-                WorkChannelQuery {
-                    bond_edge: payment_terms.bond_edge,
-                    payment_edge: Some(channel.payment_edge()),
-                    funding: Default::default(),
-                },
+                payment_terms.bond_edge,
                 Terms::work_stake_bond(payment_terms.bond_terms.clone()),
-                state.close_settled().map(|settled| settled.height),
+                state.close_settled().is_some(),
             )
         })
         .await
         .map_err(|error| PaidWorkClockError::Decision(CloseError::Endpoint(error)))?;
-    let bond_edge = query.bond_edge;
-    let Some(snapshot) = source
-        .work_channel_snapshot(query)
-        .await
-        .map_err(PaidWorkClockError::Snapshot)?
-    else {
-        return Ok(PaidWorkClockAdvance {
-            snapshot: None,
-            close,
-            adjudication,
-            bond_timeout: None,
-        });
-    };
-
-    // The journal's finalized close and a snapshot at least that new jointly
-    // prove the lease no longer protects a live payment edge.
-    let payment_closed = settled_height.is_some_and(|height| snapshot.block().height >= height)
-        && snapshot.payment().is_none();
     let bond_timeout = if snapshot.bond().is_some()
-        && (payment_closed || snapshot.block().height >= bond_terms.timeout().get())
+        && (settled || snapshot.block().height >= bond_terms.timeout().get())
     {
         let tx = Tx::timeout_close(bond_edge, &bond_terms)
             .ok_or(PaidWorkClockError::TimeoutUnavailable)?;
         Some(
-            source
-                .submit(tx)
+            sink.submit(tx)
                 .await
                 .map_err(PaidWorkClockError::Submission)?,
         )
     } else {
         None
     };
-
     Ok(PaidWorkClockAdvance {
-        snapshot: Some(snapshot),
         close,
-        adjudication,
         bond_timeout,
     })
-}
-
-/// Returns a payload digest as the 32 bytes a journal records.
-///
-/// Copied field by field rather than by a fallible conversion because
-/// the two widths are the same width: a Sha256 digest is 32 bytes, and
-/// this is only ever called on one. There is no shorter-digest case to
-/// report, so there is no error here to swallow.
-fn bytes(digest: &Digest) -> [u8; 32] {
-    let mut out = [0_u8; 32];
-    let source: &[u8] = digest;
-    for (slot, byte) in out.iter_mut().zip(source) {
-        *slot = *byte;
-    }
-    out
-}
-
-impl<C: LightClient + FinalizedWorkView> SetupView for WorkBlocks<C> {
-    async fn finalized_setup(
-        &self,
-        query: SetupQuery,
-    ) -> Result<Option<FinalizedSetup>, BlockSourceError> {
-        let funding = query.funding;
-        let Some(snapshot) = self
-            .work_channel_snapshot(WorkChannelQuery {
-                bond_edge: query.bond_edge,
-                payment_edge: query.payment_edge,
-                funding: funding.clone(),
-            })
-            .await
-            .map_err(BlockSourceError::from)?
-        else {
-            return Ok(None);
-        };
-        // The snapshot answers for the coins its own query named, and
-        // the query above is the one built from `funding`. A `None`
-        // here is a light client that answered a different question —
-        // reported as a source failure, because a decision taken on it
-        // would read another transaction's survivors as this one's.
-        snapshot.finalized_setup(&funding).map(Some).ok_or_else(|| {
-            BlockSourceError::new(
-                "the work channel snapshot answers for other funding coins than were asked for",
-            )
-        })
-    }
 }
 
 impl<C: LightClient + FinalizedWorkView> FinalizedWorkView for WorkBlocks<C> {
@@ -320,17 +155,14 @@ impl<C: LightClient + FinalizedWorkView> FinalizedWorkView for WorkBlocks<C> {
         &self,
         query: WorkChannelQuery,
     ) -> Result<Option<crate::light_client::Verified<WorkChannelSnapshot>>, QueryError> {
-        self.read(|| async {
-            let snapshot = self.client.work_channel_snapshot(query.clone()).await?;
-            if snapshot.as_ref().map_or(0, |value| value.block().height) < self.min_height {
-                return Err(QueryError::StateUnavailable(format!(
-                    "chain is behind persisted journal height {}",
-                    self.min_height
-                )));
-            }
-            Ok(snapshot)
-        })
-        .await
+        let snapshot = self.client.work_channel_snapshot(query).await?;
+        if snapshot.as_ref().map_or(0, |value| value.block().height) < self.min_height {
+            return Err(QueryError::StateUnavailable(format!(
+                "chain is behind persisted journal height {}",
+                self.min_height
+            )));
+        }
+        Ok(snapshot)
     }
 }
 
@@ -340,66 +172,6 @@ impl<C: LightClient> TxSink for WorkBlocks<C> {
             .submit_tx(Transaction::Kernel(tx))
             .await
             .map_err(|error| BlockSourceError::new(error.to_string()))
-    }
-}
-
-impl<C: LightClient> FinalizedBlocks for WorkBlocks<C> {
-    async fn latest_height(&self) -> Result<Option<u64>, BlockSourceError> {
-        Ok(self
-            .read(|| async {
-                // A journal floor must stay within the state this source can prove.
-                let latest = self
-                    .client
-                    .get_applied_finalized_block(FinalizedBlockQuery::Latest)
-                    .await?
-                    .map(|block| block.snapshot);
-                if latest.as_ref().map_or(0, |value| value.height) < self.min_height {
-                    return Err(QueryError::StateUnavailable(format!(
-                        "chain is behind persisted journal height {}",
-                        self.min_height
-                    )));
-                }
-                Ok(latest)
-            })
-            .await
-            .map_err(BlockSourceError::from)?
-            .map(|block| block.height))
-    }
-
-    async fn block_at(&self, height: u64) -> Result<Option<FinalizedWork>, BlockSourceError> {
-        let Some(finalized) = self
-            .read(|| {
-                self.client
-                    .get_finalized_block(FinalizedBlockQuery::Height(height))
-            })
-            .await
-            .map_err(BlockSourceError::from)?
-        else {
-            return Ok(None);
-        };
-        let view = FinalizedBlockView::decode(&finalized)
-            .map_err(|error| BlockSourceError::new(error.to_string()))?;
-        // The height a caller asked for, against the height the block
-        // itself carries. `decode` has already tied the block to its own
-        // snapshot; this is what ties that snapshot to the question.
-        if view.height() != height {
-            return Err(BlockSourceError::new(format!(
-                "asked for finalized block {height} and was given {}",
-                view.height(),
-            )));
-        }
-        Ok(Some(FinalizedWork {
-            height,
-            parent: bytes(&view.parent()),
-            payload: bytes(&view.payload()),
-            txs: view
-                .txs()
-                .iter()
-                .map(|tx| match tx {
-                    Transaction::Kernel(kernel) => kernel.clone(),
-                })
-                .collect(),
-        }))
     }
 }
 
@@ -441,9 +213,11 @@ mod tests {
     use hellas_channel::test_support::channel::work_policy;
     use hellas_channel::work_close::{BlockSourceError, adjudicated_close, close_start};
     use hellas_channel::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
-    use hellas_channel::work_open::{SetupAdvance, SetupProgress, SetupStep, advance_setup};
+    use hellas_channel::work_open::{
+        FinalizedSetup, SetupProgress, SetupStep, advance_setup, setup_query,
+    };
     use hellas_channel::work_store::{
-        Role, SetupAbort, SetupEnd, SetupOrigin, SetupRecord, SetupScan, SetupStateError,
+        Role, SetupAbort, SetupEnd, SetupFault, SetupOrigin, SetupRecord, SetupStateError,
         SetupStore, WorkStoreError,
     };
 
@@ -471,10 +245,6 @@ mod tests {
     const OMISSION_BOND: u64 = 51;
     const HORIZON: u64 = 500;
     const SALT: [u8; 32] = [0x5a; 32];
-    /// The window the provider measured its response probability over,
-    /// and the one the terms admit.
-    const WINDOW: u64 = hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS + 4;
-
     fn signer(byte: u8) -> Secp256k1Signer {
         match Secp256k1Signer::from_secret_scalar([byte; 32]) {
             Ok(signer) => signer,
@@ -549,7 +319,6 @@ mod tests {
             channel_policy: channel_policy(),
             invocation_policy: work_policy(),
             expected_payment_values: expected_values(),
-            min_omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
         }
     }
 
@@ -558,7 +327,6 @@ mod tests {
             bond_edge(),
             bond_terms(),
             private_policy_commitment(TEST_NETWORK, &SALT, &channel_policy()),
-            WINDOW,
             hellas_kernel::MAX_START_VALIDITY_BLOCKS,
             OMISSION_BOND,
         )
@@ -677,6 +445,7 @@ mod tests {
                 KernelContext::with_fees(
                     TEST_NETWORK,
                     BlockHeight::new(self.height),
+                    self.height * 1_000,
                     BlockHash::from_bytes([0; BlockHash::LENGTH]),
                     KERNEL_FEES,
                 ),
@@ -697,7 +466,7 @@ mod tests {
                 },
                 self.head.digest(),
                 Height::new(self.height),
-                self.height,
+                self.height * 1_000,
                 root,
                 crate::execution::store::sync_target(&merkleized),
                 fresh,
@@ -728,7 +497,6 @@ mod tests {
         provider_root: &std::path::Path,
         client_root: &std::path::Path,
         payment_funding: Funding,
-        scan: SetupScan,
         content: (
             &hellas_store::content::DiskStore,
             &hellas_store::content::DiskStore,
@@ -739,10 +507,6 @@ mod tests {
             provider(),
             PaymentAdmission::Admits(Box::new(provider_policy())),
         );
-        proposer
-            .arm_scan(scan)
-            .await
-            .expect("the provider arms its scan");
         if let Err(error) = proposer
             .propose_bond(TEST_NETWORK, bond_funding(), bond_terms())
             .await
@@ -760,7 +524,6 @@ mod tests {
             &service,
             &mut caller,
             bond_edge(),
-            scan,
             payment_funding,
             payment_terms(),
         )
@@ -794,13 +557,6 @@ mod tests {
         store
     }
 
-    fn scan_at(block: &HellasBlock) -> SetupScan {
-        SetupScan {
-            height: commonware_consensus::Heightable::height(block).get(),
-            payload: block.digest().into(),
-        }
-    }
-
     /// A handshake, two Opens, two finalized blocks, and two journals
     /// that agree on where the channel began.
     ///
@@ -829,14 +585,11 @@ mod tests {
             let blocks = WorkBlocks::new(chain.light_client());
             let verifier = Secp256k1Verifier::new();
 
-            // The finalized block is the observation floor durably armed
-            // before either executable Open can leave the handshake.
-            let floor = chain.seal().await;
+            chain.seal().await;
             shake_hands(
                 provider_root.path(),
                 client_root.path(),
                 payment_funding,
-                scan_at(&floor),
                 (&provider_content, &client_content),
             )
             .await;
@@ -849,7 +602,7 @@ mod tests {
             let mut client_store =
                 open_store(client_root.path(), Role::Client, &client_content).await;
             assert_eq!(
-                step(&blocks, &blocks, &mut client_store).await,
+                step(&blocks, &mut client_store).await,
                 SetupProgress::AwaitingCounterparty,
             );
             assert!(chain.mempool.test_transactions().await.is_empty());
@@ -858,14 +611,8 @@ mod tests {
             // The sink refuses. The marker must already be durable, and
             // it must be durable *on the disk* rather than in the state
             // this process is holding.
-            let refused = advance_setup(
-                &blocks,
-                &blocks,
-                &RefusingSink,
-                &mut provider_store,
-                &verifier,
-            )
-            .await;
+            let read = read(&blocks, &provider_store).await;
+            let refused = advance_setup(&read, &RefusingSink, &mut provider_store, &verifier).await;
             assert!(
                 refused.is_err(),
                 "a sink that refuses is an error, got {refused:?}",
@@ -883,7 +630,7 @@ mod tests {
             // again: the journal holds one bundle and the transaction
             // comes out of it.
             assert_eq!(
-                step(&blocks, &blocks, &mut provider_store).await,
+                step(&blocks, &mut provider_store).await,
                 SetupProgress::Submitted {
                     step: SetupStep::Bond,
                     outcome: SubmitTxOutcome::Enqueued,
@@ -893,7 +640,7 @@ mod tests {
             assert_eq!(bond_block.txs().len(), 1, "one bond open, not two");
 
             assert_eq!(
-                step(&blocks, &blocks, &mut provider_store).await,
+                step(&blocks, &mut provider_store).await,
                 SetupProgress::Submitted {
                     step: SetupStep::Payment,
                     outcome: SubmitTxOutcome::Enqueued,
@@ -901,9 +648,8 @@ mod tests {
             );
             let origin_block = chain.seal().await;
             // Both edges are live and the bond is leased to this payment
-            // channel, so the driver records where that happened.
-            let SetupProgress::Complete(origin) = step(&blocks, &blocks, &mut provider_store).await
-            else {
+            // channel, so the driver records the read that first showed it.
+            let SetupProgress::Complete(origin) = step(&blocks, &mut provider_store).await else {
                 panic!("the provider completes its setup");
             };
             assert_eq!(
@@ -912,18 +658,18 @@ mod tests {
                     payment_edge,
                     height: commonware_consensus::Heightable::height(&origin_block).get(),
                     payload: origin_block.digest().into(),
-                    parent: bond_block.digest().into(),
                 },
-                "the origin is the block that carried the payment open, and its parent",
+                "the origin is the first certified read that shows the payment edge",
             );
+            let _ = bond_block;
 
-            // The client's own journal, driven by the same function,
-            // reaches the same origin. It submits nothing: every step
-            // above was the provider's.
+            // The client's own journal, driven by the same function and
+            // reading at the same block, records the same first sighting.
+            // It submits nothing: every step above was the provider's.
             let mut client_store =
                 open_store(client_root.path(), Role::Client, &client_content).await;
             assert_eq!(
-                step(&blocks, &blocks, &mut client_store).await,
+                step(&blocks, &mut client_store).await,
                 SetupProgress::Complete(origin),
             );
 
@@ -1000,8 +746,11 @@ mod tests {
 
     /// Revision 3 is a portable authorization, not merely a getter: after
     /// the exporting provider crashes, the counterparty can land both Opens
-    /// and permissionlessly retire the leased bond, and the provider still
-    /// mounts the surviving payment edge from journal history alone.
+    /// and run a whole contest to its close. The restarted provider never
+    /// saw the payment edge, and its read shows a bond still leased to a
+    /// payment edge that is gone. Nothing it reads now says what that
+    /// channel paid, so the setup stops for manual reconciliation rather
+    /// than guess; the stake stays reclaimable by the bond's Timeout.
     #[test]
     fn round4_exported_authorization_recovers() {
         run_qmdb(|runtime| async move {
@@ -1012,12 +761,11 @@ mod tests {
             let payment_funding = Funding::new(one_coin(client_coin()), no_coins());
             let mut chain = Chain::start(runtime, "work_setup_journal_recovery").await;
             let blocks = WorkBlocks::new(chain.light_client());
-            let floor = chain.seal().await;
+            chain.seal().await;
             shake_hands(
                 provider_root.path(),
                 client_root.path(),
                 payment_funding,
-                scan_at(&floor),
                 (&provider_content, &client_content),
             )
             .await;
@@ -1077,7 +825,7 @@ mod tests {
             let PendingSlot::Present(pending) = snapshot.pending() else {
                 panic!("the real Start created a pending close");
             };
-            while chain.height < pending.response_deadline() {
+            while chain.height * 1_000 < pending.response_deadline_ms() {
                 chain.seal().await;
             }
             let close = adjudicated_close(
@@ -1100,10 +848,10 @@ mod tests {
 
             let mut restarted =
                 open_store(provider_root.path(), Role::Provider, &provider_content).await;
-            let mounted = step(&blocks, &blocks, &mut restarted).await;
-            assert!(
-                matches!(mounted, SetupProgress::CloseOnly { settled: true, .. }),
-                "journal-only recovery mounts CloseOnly: {mounted:?}",
+            assert_eq!(
+                step(&blocks, &mut restarted).await,
+                SetupProgress::Faulted(SetupFault::UnexplainedState),
+                "a channel that opened and closed unwatched is reconciled by hand",
             );
             chain.shutdown().await;
         });
@@ -1119,12 +867,11 @@ mod tests {
             let payment_funding = Funding::new(one_coin(client_coin()), no_coins());
             let mut chain = Chain::start(runtime, "work_setup_open_obligation").await;
             let blocks = WorkBlocks::new(chain.light_client());
-            let floor = chain.seal().await;
+            chain.seal().await;
             shake_hands(
                 provider_root.path(),
                 client_root.path(),
                 payment_funding,
-                scan_at(&floor),
                 (&provider_content, &client_content),
             )
             .await;
@@ -1134,14 +881,9 @@ mod tests {
                 let mut provider_store =
                     open_store(provider_root.path(), Role::Provider, &provider_content).await;
                 let retained = provider_store.state().bond_open().expect("retained Open");
-                let refused = advance_setup(
-                    &blocks,
-                    &blocks,
-                    &RefusingSink,
-                    &mut provider_store,
-                    &verifier,
-                )
-                .await;
+                let read = read(&blocks, &provider_store).await;
+                let refused =
+                    advance_setup(&read, &RefusingSink, &mut provider_store, &verifier).await;
                 assert!(refused.is_err(), "the marker survives the failed broadcast");
                 retained
             };
@@ -1170,16 +912,17 @@ mod tests {
 
             let mut restarted =
                 open_store(provider_root.path(), Role::Provider, &provider_content).await;
-            advance_setup(&blocks, &blocks, &blocks, &mut restarted, &verifier)
+            let current = read(&blocks, &restarted).await;
+            advance_setup(&current, &blocks, &mut restarted, &verifier)
                 .await
-                .expect("the finalized Open is applied before the next setup decision");
+                .expect("the read showing the Open is recorded before the next setup decision");
             assert!(
                 !restarted.state().bond_submitted(),
                 "the finalized Open discharges the journal obligation",
             );
             assert!(
                 restarted.state().payment_submitted(),
-                "after catching up, the driver immediately submits the payment Open",
+                "on the same read, the driver submits the payment Open",
             );
             assert!(matches!(
                 restarted
@@ -1218,12 +961,11 @@ mod tests {
             );
             let mut chain = Chain::start(runtime, "work_setup_unfunded").await;
             let blocks = WorkBlocks::new(chain.light_client());
-            let floor = chain.seal().await;
+            chain.seal().await;
             shake_hands(
                 provider_root.path(),
                 client_root.path(),
                 payment_funding,
-                scan_at(&floor),
                 (&provider_content, &client_content),
             )
             .await;
@@ -1231,7 +973,7 @@ mod tests {
             let mut provider_store =
                 open_store(provider_root.path(), Role::Provider, &provider_content).await;
             assert_eq!(
-                step(&blocks, &blocks, &mut provider_store).await,
+                step(&blocks, &mut provider_store).await,
                 SetupProgress::Aborted(SetupAbort::PaymentFundingSpent),
             );
             assert!(
@@ -1278,12 +1020,11 @@ mod tests {
             );
             let mut chain = Chain::start(runtime, "work_setup_stranded").await;
             let blocks = WorkBlocks::new(chain.light_client());
-            let floor = chain.seal().await;
+            chain.seal().await;
             shake_hands(
                 provider_root.path(),
                 client_root.path(),
                 payment_funding,
-                scan_at(&floor),
                 (&provider_content, &client_content),
             )
             .await;
@@ -1303,7 +1044,7 @@ mod tests {
             assert_eq!(bond_block.txs().len(), 1);
 
             assert_eq!(
-                step(&blocks, &blocks, &mut provider_store).await,
+                step(&blocks, &mut provider_store).await,
                 SetupProgress::BondTimeoutSubmitted {
                     outcome: SubmitTxOutcome::Enqueued,
                 },
@@ -1329,24 +1070,34 @@ mod tests {
     /// releases its journal: these tests assert about what the setup
     /// recorded, and `a_completed_setup_hands_back_the_channel_it_mounted`
     /// asserts about what was handed back.
-    async fn step<C>(
-        view: &WorkBlocks<C>,
-        blocks: &WorkBlocks<C>,
-        store: &mut SetupStore,
-    ) -> SetupProgress
+    async fn step<C>(blocks: &WorkBlocks<C>, store: &mut SetupStore) -> SetupProgress
     where
         C: LightClient + FinalizedWorkView,
     {
-        loop {
-            match advance_setup(view, blocks, view, store, &Secp256k1Verifier::new()).await {
-                Ok(SetupAdvance {
-                    progress: SetupProgress::HistoryAdvanced { .. },
-                    ..
-                }) => continue,
-                Ok(advance) => return advance.progress,
-                Err(error) => panic!("the driver takes a step: {error}"),
-            }
+        let current = read(blocks, store).await;
+        match advance_setup(&current, blocks, store, &Secp256k1Verifier::new()).await {
+            Ok(advance) => advance.progress,
+            Err(error) => panic!("the driver takes a step: {error}"),
         }
+    }
+
+    /// One certified read of what this setup journal asks now.
+    async fn read<C>(blocks: &WorkBlocks<C>, store: &SetupStore) -> FinalizedSetup
+    where
+        C: LightClient + FinalizedWorkView,
+    {
+        let query = setup_query(store.state()).expect("the handshake names a payment edge");
+        blocks
+            .work_channel_snapshot(WorkChannelQuery {
+                bond_edge: query.bond_edge,
+                payment_edge: query.payment_edge,
+                funding: query.funding.clone(),
+            })
+            .await
+            .expect("the setup state reads")
+            .expect("certified state exists")
+            .finalized_setup(&query)
+            .expect("the read answers the setup's query")
     }
 
     fn payment_policy() -> hellas_channel::model::work::JobPaymentPolicyV2 {

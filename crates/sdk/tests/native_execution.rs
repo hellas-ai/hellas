@@ -403,7 +403,6 @@ fn paid_policy() -> hellas_channel::model::paid_policy::PaidPolicy {
             oracle_grace_blocks: 6,
         },
         expected_payment_values: EdgeValues::new(CLIENT_FUNDING, 0, Fees::ZERO),
-        min_omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
         jobs_per_channel: 10,
         offers: hellas_channel::model::paid_policy::OfferPolicy {
             max_stake_per_client: PROVIDER_STAKE,
@@ -418,7 +417,6 @@ fn paid_policy() -> hellas_channel::model::paid_policy::PaidPolicy {
 async fn start_provider(
     root: &std::path::Path,
     config: WorkConfig,
-    node: hellas_sdk::FullNode,
     identity: &NodeIdentity,
 ) -> (
     hellas_sdk::ProviderHandle,
@@ -444,7 +442,7 @@ async fn start_provider(
             routes,
             fetch_max_in_flight: 1,
             fetch_queue_capacity: 1,
-            paid_work: Some(PaidProviderOptions::new(config, node).unwrap()),
+            paid_work: Some(PaidProviderOptions::new(config)),
         }
         .prepare()
         .await
@@ -832,7 +830,9 @@ struct PaidScenario<S = PaidWorkSession> {
     identity: NodeIdentity,
     root: tempfile::TempDir,
     devnet: Devnet,
-    provider_node: hellas_sdk::FullNode,
+    /// The devnet's own executing node, which tests read the chain through;
+    /// the provider itself reads by proof.
+    provider_node: hellas_chain::node::FullNode,
     provider: hellas_sdk::ProviderHandle,
     provider_content: hellas_store::content::DiskStore,
     relays: remote::Relays,
@@ -919,13 +919,8 @@ async fn paid_fixture(runtime: commonware_runtime::tokio::Context) -> PaidScenar
     drop(store);
     let config = work_config(&devnet, root.path().join("provider-journal"));
     let relays = remote::Relays::start(&devnet).await;
-    let (provider, _, provider_content) = start_provider(
-        root.path(),
-        config.clone(),
-        provider_node.clone(),
-        &identity,
-    )
-    .await;
+    let (provider, _, provider_content) =
+        start_provider(root.path(), config.clone(), &identity).await;
     let authority = provider.administration().unwrap().node();
     let caller = hellas_authority::test_support::session(&authority, &secret).await;
     let command = || hellas_authority::model::grant::admin::WorkControlCommand::SetPaidPolicy {
@@ -1219,7 +1214,7 @@ async fn paid_finish(case: PaidScenario) {
         identity,
         root,
         mut devnet,
-        provider_node,
+        provider_node: _,
         provider,
         provider_content,
         mut relays,
@@ -1264,7 +1259,7 @@ async fn paid_finish(case: PaidScenario) {
             if session.with_state(|state| state.cursor().0).await.unwrap() == resumed_height {
                 break;
             }
-            tokio::time::sleep(options.config.poll()).await;
+            tokio::time::sleep(hellas_channel::work::SETUP_POLL).await;
         }
     })
     .await
@@ -1284,7 +1279,7 @@ async fn paid_finish(case: PaidScenario) {
     provider.shutdown().await.unwrap();
     provider_content.close().await;
     let (provider, upstream, provider_content) =
-        start_provider(root.path(), provider_config, provider_node, &identity).await;
+        start_provider(root.path(), provider_config, &identity).await;
     assert_eq!(
         provider
             .administration()
@@ -1760,7 +1755,7 @@ async fn provider_close_offline(
         PRICE,
         "A can settle only B's certified cumulative while B is absent"
     );
-    devnet.seal_through(pending.response_deadline()).await;
+    devnet.seal_past(pending.response_deadline_ms()).await;
     let node = devnet.full_node(0).clone();
     sealing_while(devnet, Duration::from_millis(100), async {
         let mut finalized = node.finalized();
@@ -1833,60 +1828,6 @@ fn unseen_program_pays_exactly_once() {
 fn cli_paid_and_grant_two_provider_composition() {
     assert!(std::env::var_os("HELLAS_CLI_TEST_BINARY").is_some());
     run(automatic::exercise);
-}
-
-#[test]
-fn setup_reads_wait_for_the_required_height() {
-    use hellas_chain::WorkBlocks;
-    use hellas_channel::work_close::FinalizedBlocks as _;
-    use hellas_channel::work_open::{SetupQuery, SetupView as _};
-
-    run(|runtime| async move {
-        let mut devnet = Devnet::start(
-            runtime,
-            DevnetConfig {
-                name: "sdk_setup_reads",
-                owners: vec![CLIENT_OWNER],
-                full_nodes: 1,
-            },
-        )
-        .await;
-        devnet.seal().await;
-        let node = devnet.full_node(0).clone();
-        let client = node.view().unwrap().client();
-        let timeout = hellas_chain::node::RECOVERY_TIMEOUT;
-        let poll = work_config(&devnet, std::path::PathBuf::new()).poll();
-        let source = WorkBlocks::new(client.clone()).with_read_retry(poll, timeout);
-        let query = SetupQuery {
-            bond_edge: hellas_kernel::EdgeId::from_bytes([0; 32]),
-            payment_edge: Some(hellas_kernel::EdgeId::from_bytes([1; 32])),
-            funding: Default::default(),
-        };
-        let next = devnet.height() + 1;
-        let source = source.with_min_height(next);
-        let read = source.finalized_setup(query.clone());
-        tokio::pin!(read);
-        assert!(tokio::time::timeout(poll, &mut read).await.is_err());
-        let (snapshot, block) = tokio::join!(read, devnet.seal());
-        assert_eq!(snapshot.unwrap().unwrap().height, next);
-        assert_eq!(source.latest_height().await.unwrap(), Some(next));
-        assert_eq!(
-            source.block_at(next).await.unwrap().unwrap().payload,
-            hellas_chain::FinalizedBlockView::decode(
-                &client
-                    .get_finalized_block(hellas_chain::FinalizedBlockQuery::Height(next))
-                    .await
-                    .unwrap()
-                    .unwrap()
-            )
-            .unwrap()
-            .payload()
-            .0
-        );
-        drop(block);
-        assert_eq!(node.status().executed_height(), next);
-        devnet.shutdown().await;
-    });
 }
 
 #[test]

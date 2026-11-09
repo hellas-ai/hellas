@@ -29,15 +29,16 @@
 //! proof in every model here would still hold, and would still be about
 //! a chain whose witnesses another chain could spend.
 //!
+//! # Block time
+//!
+//! [`Context::block_time_ms`] is the timestamp the block itself carries,
+//! which consensus has already bounded: never before its parent's, and
+//! never more than [`crate::MAX_BLOCK_TIME_LEAD_MS`] past a verifier's
+//! clock. One rule reads it — the close response deadline — because
+//! that is the one settlement semantic racing a remote watcher's clock.
+//!
 //! # Deliberately absent
 //!
-//! - **Wall-clock timestamp.** A BFT-safe block timestamp is its own
-//!   subtle problem (median-of-validators? leader-asserts-then-bounded?
-//!   tolerated drift?), and adding one to [`Context`] commits the kernel
-//!   to one set of safety arguments before consensus integration has
-//!   pinned them down. [`BlockHeight`] is sufficient for every current
-//!   proof shape; revisit only when a settlement semantic genuinely
-//!   needs wall-clock time, not block-relative time.
 //! - **Validator set.** The kernel never checks "is this signer in the
 //!   active set?" — that knowledge lives in whichever
 //!   [`crate::SigVerifier`] implementations
@@ -288,6 +289,7 @@ impl Decode for BlockHeight {
 pub struct Context {
     network: NetworkId,
     block_height: BlockHeight,
+    block_time_ms: u64,
     previous_hash: BlockHash,
     fees: Fees,
 }
@@ -303,9 +305,16 @@ impl Context {
     pub const fn new(
         network: NetworkId,
         block_height: BlockHeight,
+        block_time_ms: u64,
         previous_hash: BlockHash,
     ) -> Self {
-        Self::with_fees(network, block_height, previous_hash, Fees::ZERO)
+        Self::with_fees(
+            network,
+            block_height,
+            block_time_ms,
+            previous_hash,
+            Fees::ZERO,
+        )
     }
 
     /// Creates an operation context with an explicit fee schedule.
@@ -313,12 +322,14 @@ impl Context {
     pub const fn with_fees(
         network: NetworkId,
         block_height: BlockHeight,
+        block_time_ms: u64,
         previous_hash: BlockHash,
         fees: Fees,
     ) -> Self {
         Self {
             network,
             block_height,
+            block_time_ms,
             previous_hash,
             fees,
         }
@@ -335,6 +346,12 @@ impl Context {
     #[must_use]
     pub const fn block_height(self) -> BlockHeight {
         self.block_height
+    }
+
+    /// Returns the block's own timestamp, in milliseconds.
+    #[must_use]
+    pub const fn block_time_ms(self) -> u64 {
+        self.block_time_ms
     }
 
     /// Returns the previous finalized block hash.

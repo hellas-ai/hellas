@@ -187,16 +187,20 @@ impl LocalLightClient {
                 "owner index and application state are not synchronized".to_string(),
             ));
         }
-        if self
+        // The next block is stamped no earlier than this one, so a response
+        // already late at this block's time is late at inclusion too.
+        let Some(finalized) = self
             .chain_indexer
-            .get_finalization(cursor.payload)
+            .get_finalized_block(FinalizedBlockQuery::Payload(cursor.payload))
             .await?
-            .is_none()
-        {
+        else {
             return Err(QueryError::StateUnavailable(
                 "owner index cursor finalization is unavailable".to_string(),
             ));
-        }
+        };
+        let cursor_time_ms = crate::block_view::FinalizedBlockView::decode(&finalized)
+            .map_err(|error| QueryError::StateUnavailable(error.to_string()))?
+            .timestamp();
         let Some(admission_height) = cursor.height.checked_add(1) else {
             return Err(QueryError::StateUnavailable(
                 "finalized height has no successor for response admission".to_string(),
@@ -205,6 +209,7 @@ impl LocalLightClient {
         let context = KernelContext::with_fees(
             network,
             BlockHeight::new(admission_height),
+            cursor_time_ms,
             BlockHash::from_bytes(cursor.payload.0),
             crate::domain::KERNEL_FEES,
         );
@@ -511,17 +516,27 @@ async fn lookup<'a>(
 }
 
 impl Lookup<'_> {
-    async fn snapshot(&self, chain_indexer: &ChainIndexer) -> Result<LatestBlock, QueryError> {
-        let finalization = chain_indexer
-            .get_finalization(self.cursor.payload)
+    /// The block the lookup was read at, and that block's timestamp.
+    async fn snapshot(
+        &self,
+        chain_indexer: &ChainIndexer,
+    ) -> Result<(LatestBlock, u64), QueryError> {
+        let finalized = chain_indexer
+            .get_finalized_block(FinalizedBlockQuery::Payload(self.cursor.payload))
             .await?
             .ok_or_else(|| QueryError::StateUnavailable("finalization is unavailable".into()))?;
-        Ok(LatestBlock {
-            height: self.cursor.height,
-            payload: self.cursor.payload,
-            state_root: self.reader.root(),
-            finalization,
-        })
+        let timestamp = crate::block_view::FinalizedBlockView::decode(&finalized)
+            .map_err(|error| QueryError::StateUnavailable(error.to_string()))?
+            .timestamp();
+        Ok((
+            LatestBlock {
+                height: self.cursor.height,
+                payload: self.cursor.payload,
+                state_root: self.reader.root(),
+                finalization: finalized.snapshot.finalization,
+            },
+            timestamp,
+        ))
     }
 
     fn holdings(&self) -> Option<Holdings> {
@@ -551,11 +566,12 @@ async fn read_objects(
     else {
         return Ok(None);
     };
-    let block = found.snapshot(chain_indexer).await?;
+    let (block, certified_at_ms) = found.snapshot(chain_indexer).await?;
     let holdings = found.holdings();
     Ok(Some(Verified::new(ObjectSnapshot {
         network,
         block,
+        certified_at_ms,
         objects: found
             .objects
             .into_iter()
@@ -730,7 +746,7 @@ impl LightClient for LocalLightClient {
         let Some(found) = self.lookup_request(request).await? else {
             return Ok(hellas_rpc::pb::chain::GetObjectsResponse::default());
         };
-        let snapshot = found.snapshot(&self.chain_indexer).await?;
+        let (snapshot, _) = found.snapshot(&self.chain_indexer).await?;
         Ok(hellas_rpc::pb::chain::GetObjectsResponse {
             snapshot: Some(crate::server::latest_block_to_proto(snapshot)),
             objects: found

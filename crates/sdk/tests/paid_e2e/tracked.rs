@@ -329,13 +329,13 @@ fn executor_retries_unspent_attempts_replays_and_bounds_settlement() {
             let completed = sealing_while(
                 &mut case.devnet,
                 Duration::from_millis(100),
-                executor(attempt, None, false).run(
+                Box::pin(executor(attempt, None, false).run(
                     &job,
                     &signer,
                     None,
                     stop_on(std::future::pending()),
                     deliver(),
-                ),
+                )),
             )
             .await
             .unwrap();
@@ -638,7 +638,6 @@ fn tracked_recovery_requires_attempt_and_request_bindings() {
             let (provider, upstream, provider_content) = start_provider(
                 case.root.path(),
                 work_config(&case.devnet, case.root.path().join("provider-journal")),
-                case.provider_node.clone(),
                 &case.identity,
             )
             .await;
@@ -1047,7 +1046,6 @@ fn reused_nonce_scenario(
         let (provider, upstream, provider_content) = start_provider(
             case.root.path(),
             work_config(&case.devnet, case.root.path().join("provider-journal")),
-            case.provider_node.clone(),
             &case.identity,
         )
         .await;

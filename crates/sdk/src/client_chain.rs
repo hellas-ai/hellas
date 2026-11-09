@@ -110,6 +110,9 @@ pub async fn connect_at(
         if !transient && let Some(error) = invalid_source {
             return Err(invalid(error));
         }
-        tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + config.poll)).await;
+        tokio::time::sleep_until(
+            deadline.min(tokio::time::Instant::now() + hellas_channel::work::SETUP_POLL),
+        )
+        .await;
     }
 }

@@ -1,6 +1,6 @@
 use super::*;
 use crate::test_support::{BODY, PRICE, PaidFixture, signer};
-use hellas_channel::work::{BackendFault, ObservationTime, WorkBackend, run_accepted_work};
+use hellas_channel::work::{BackendFault, WorkBackend, run_accepted_work};
 use hellas_channel::work_close::CloseChannel as _;
 use hellas_rpc::fetch::{encode_fetch_event_payload, encode_fetch_terminal_payload};
 use hellas_rpc::output::{OutputEvent, StopReason, TextChannel};
@@ -247,11 +247,7 @@ async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
             let client = ClientService::new(ClientEndpoint::recover(store, signer(1)).unwrap());
             client
                 .observer()
-                .observe_ready(
-                    fixture.ready.clone(),
-                    ObservationTime::now(),
-                    Duration::from_secs(60),
-                )
+                .observe_ready(fixture.ready.clone())
                 .await
                 .unwrap();
             let endpoint = bind_paid_endpoint(SecretKey::from_bytes(&[5; 32]))

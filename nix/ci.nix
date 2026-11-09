@@ -134,7 +134,8 @@ let
       cargo build ${s.cli} --bin hellas
       HELLAS_CLI_TEST_BINARY="$(realpath "''${CARGO_TARGET_DIR:-target}/debug/hellas")"
       export HELLAS_CLI_TEST_BINARY
-      cargo test ${s.sdk-integration} --test native_execution cli_settles_paid_channel_without_provider_or_object_proofs -- --ignored
+      cargo test ${s.sdk-integration} --test native_execution cli_settles_paid_channel_without_provider -- --ignored
+      cargo test ${s.sdk-integration} --test native_execution cli_buys_a_paid_job_end_to_end -- --ignored
       # The paid/grant composition case re-executes a Catena compile worker,
       # whose process isolation is implemented only on Linux.
       ${lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''

@@ -29,11 +29,13 @@ const TIMEOUT: BlockHeight = BlockHeight::new(2);
 const TIMEOUT_CONTEXT: Context = Context::new(
     support::NETWORK,
     TIMEOUT,
+    TIMEOUT.get() * 1_000,
     BlockHash::from_bytes([0; BlockHash::LENGTH]),
 );
 const CONTEXT: Context = Context::new(
     support::NETWORK,
     BlockHeight::new(1),
+    1_000,
     BlockHash::from_bytes([0; BlockHash::LENGTH]),
 );
 

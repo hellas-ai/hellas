@@ -23,7 +23,7 @@ pub use settlement::{
 type Result<T, E = PaidClientError> = std::result::Result<T, E>;
 use crate::client_owner::ClientOwner;
 use crate::work_link::WorkLink as ProviderDialer;
-use futures::StreamExt as _;
+use hellas_chain::LightClient as _;
 use hellas_chain::client::RemoteLightClient;
 use hellas_chain::{FinalizedWorkView as _, WorkBlocks, WorkChannelQuery};
 use hellas_channel::model::setup::{ProviderChannelPolicy, WorkChannelDescriptor};
@@ -32,13 +32,12 @@ use hellas_channel::work::{
     ClientChannel as _, ClientEndpoint, ClientObserver, ClientService, JobProposal, propose_work,
     resume_work_proposal,
 };
-use hellas_channel::work_close::FinalizedBlocks as _;
 use hellas_channel::work_handshake::{
     PaymentAdmission, SetupEndpoint, SetupService, apply_setup_exchange, prepare_setup_exchange,
     send_setup_exchange,
 };
 use hellas_channel::work_open::{SetupAdvance, SetupProgress};
-use hellas_channel::work_store::{Role, SetupScan, SetupStore};
+use hellas_channel::work_store::{Role, SetupStore};
 use hellas_client::work::payment::pay_for_result;
 use hellas_kernel::{
     EdgeId, Funding, MAX_START_VALIDITY_BLOCKS, Secp256k1Signer, Secp256k1Verifier,
@@ -132,8 +131,8 @@ impl SessionFundingOptions {
 
 /// Chain reads keep their recovery bound even when the caller sets none.
 pub(crate) fn read_timeout(timeout: Option<Duration>) -> Duration {
-    timeout.map_or(hellas_chain::node::RECOVERY_TIMEOUT, |timeout| {
-        timeout.min(hellas_chain::node::RECOVERY_TIMEOUT)
+    timeout.map_or(hellas_channel::work::MAX_CERTIFIED_AGE, |timeout| {
+        timeout.min(hellas_channel::work::MAX_CERTIFIED_AGE)
     })
 }
 
@@ -262,27 +261,19 @@ impl Drop for PaidWorkSession {
 async fn observe_client(
     client: &ClientObserver,
     descriptor: &WorkChannelDescriptor,
-    config: &WorkConfig,
     remote: &RemoteLightClient,
     floor: u64,
 ) -> Result<()> {
     let chain = WorkBlocks::new(remote.clone()).with_min_height(floor);
-    let started = hellas_channel::work::ObservationTime::now();
     let span = hellas_rpc::request_span!(target: "hellas_request", parent: None, "paid.channel.observe", hellas.channel.role = "client");
     tokio::time::timeout(
-        config.max_observation_age,
+        hellas_channel::work::MAX_CERTIFIED_AGE,
         async {
-            let mut driver = client.drive()?;
-            driver.advance_close(&chain, &chain).await?;
-            let ready = ready_channel(descriptor, &chain).await?;
-            if ready
-                .check_caught_up(client.with_state(|state| state.cursor().0).await?)
-                .is_err()
-            {
-                driver.catch_up_to(&chain, ready.finalized_height()).await?;
-            }
+            let snapshot = settlement::channel_read(&chain, descriptor.channel()).await?;
+            let observed = snapshot.observed_channel();
+            client.drive()?.advance_close(&observed, &chain).await?;
             client
-                .observe_ready(ready, started, config.max_observation_age)
+                .observe_ready(descriptor.check_ready(&observed)?)
                 .await?;
             Ok::<_, PaidClientError>(())
         }
@@ -302,10 +293,6 @@ fn spawn_observer(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut source_config = config.clone();
-        let mut finalized = tokio::time::timeout(config.poll, remote.subscribe_finalized())
-            .await
-            .ok()
-            .and_then(|result| result.ok());
         loop {
             if client
                 .with_state(|state| state.close_settled().is_some())
@@ -318,15 +305,13 @@ fn spawn_observer(
                 let _ = client.suspend().await;
                 break;
             };
-            let result = observe_client(&client, &descriptor, &config, &remote, floor).await;
-            if let Err(error) = result {
+            if let Err(error) = observe_client(&client, &descriptor, &remote, floor).await {
                 let _ = client.suspend().await;
                 tracing::debug!(%error, "paid client observation unavailable");
-                finalized = None;
                 source_config.chain.rotate_validators();
                 match crate::client_chain::connect_at(
                     &source_config,
-                    config.max_observation_age,
+                    hellas_channel::work::MAX_CERTIFIED_AGE,
                     floor,
                 )
                 .await
@@ -334,35 +319,14 @@ fn spawn_observer(
                     Ok(next) => remote = next,
                     Err(error) => {
                         tracing::debug!(%error, "waiting for a verified remote chain source");
-                        #[expect(
-                            clippy::disallowed_methods,
-                            reason = "inventory class B: remote source recovery"
-                        )]
-                        tokio::time::sleep(config.poll).await;
-                        continue;
                     }
                 }
             }
             #[expect(
                 clippy::disallowed_methods,
-                reason = "inventory class B/C: finalized/freshness; rollout 2/3"
+                reason = "inventory class B/C: the certified-read poll the response window is sized for"
             )]
-            if let Some(stream) = &mut finalized {
-                tokio::select! {
-                    item = stream.next() => if !matches!(item, Some(Ok(_))) { finalized = None; },
-                    _ = tokio::time::sleep(config.poll) => {},
-                }
-            } else {
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "inventory class B: remote subscription retry"
-                )]
-                tokio::time::sleep(config.poll).await;
-                finalized = tokio::time::timeout(config.poll, remote.subscribe_finalized())
-                    .await
-                    .ok()
-                    .and_then(|result| result.ok());
-            }
+            tokio::time::sleep(hellas_channel::work::POLL).await;
         }
     })
 }
@@ -498,9 +462,7 @@ impl PaidWorkSession {
             offer::RetainedSetups::discover(&journal_root, config.network(), args.provider).await?;
         let floor = setups.floor();
         let remote = crate::client_chain::connect_at(config, read_timeout, floor).await?;
-        let chain = WorkBlocks::new(remote.clone())
-            .with_read_retry(config.poll, read_timeout)
-            .with_min_height(floor);
+        let chain = WorkBlocks::new(remote.clone()).with_min_height(floor);
         let retained = setups.select(&chain).await?;
         let reconnect = retained.is_some();
         let (mut store, signed) = match retained {
@@ -527,7 +489,7 @@ impl PaidWorkSession {
                     &remote,
                     quote,
                     crate::client_owner::FundingControls {
-                        poll: args.config.poll,
+                        poll: hellas_channel::work::SETUP_POLL,
                         timeout: read_timeout,
                         approval: funding.approval.as_deref(),
                         before_sign: intent.before_open.take(),
@@ -602,9 +564,6 @@ impl PaidWorkSession {
             })
             .await?;
         }
-        if setup.state().scan_armed().is_none() {
-            setup.arm_scan(finalized_floor(&chain).await?).await?;
-        }
         if setup.state().revision() == Some(1) {
             let terms = payment_terms(config, &policy, &bundle, omission_bond);
             propose_client_payment(
@@ -619,7 +578,7 @@ impl PaidWorkSession {
             check_client_party(&bundle, owner.principal(), &settlement_key)?;
         }
         if setup.state().revision() == Some(2) {
-            exchange_setup(&dialer, &mut setup, config.poll, args.timeout).await?;
+            exchange_setup(&dialer, &mut setup, args.timeout).await?;
         }
         if setup.state().revision() != Some(3) {
             return Err(PaidClientError::MissingState(
@@ -628,7 +587,7 @@ impl PaidWorkSession {
         }
 
         let setup_service = SetupService::new(setup);
-        let result = drive_setup(&setup_service, &policy, &chain, config.poll).await;
+        let result = drive_setup(&setup_service, &policy, &chain).await;
         setup_service.close().await;
         let (mounted, descriptor) = result?;
         // A completed setup journal stops at the height that finished the
@@ -642,32 +601,24 @@ impl PaidWorkSession {
         // regressed below state it already proved, is reselected like one that is
         // merely behind, rather than retried until the open deadline.
         let channel_floor = mounted.state().cursor().0;
-        let tip = WorkBlocks::new(remote.clone()).latest_height().await;
-        let (mut remote, chain) = if !matches!(tip, Ok(Some(height)) if height >= channel_floor) {
+        let tip = remote.get_latest_block().await;
+        let (mut remote, chain) = if !matches!(&tip, Ok(Some(block)) if block.height >= channel_floor)
+        {
             let remote =
                 crate::client_chain::connect_at(config, read_timeout, channel_floor).await?;
-            let chain = WorkBlocks::new(remote.clone())
-                .with_read_retry(config.poll, read_timeout)
-                .with_min_height(channel_floor);
+            let chain = WorkBlocks::new(remote.clone()).with_min_height(channel_floor);
             (remote, chain)
         } else {
             (remote, chain.with_min_height(channel_floor))
         };
-        let started = hellas_channel::work::ObservationTime::now();
-        let ready = match ready_channel(&descriptor, &chain).await {
-            Ok(ready) => Some(ready),
-            Err(PaidClientError::WorkSetup(_)) => None,
-            Err(error) => return Err(error),
-        };
+        let snapshot = settlement::channel_read(&chain, descriptor.channel()).await?;
+        let ready = descriptor.check_ready(&snapshot.observed_channel()).ok();
         let initially_ready = ready.is_some();
         let mut endpoint = ClientEndpoint::recover(mounted, settlement_key)?;
-        endpoint.catch_up(&chain).await?;
+        endpoint.observe(&snapshot.observed_channel()).await?;
         let client = ClientService::new(endpoint);
         if let Some(ready) = ready {
-            client
-                .observer()
-                .observe_ready(ready, started, config.max_observation_age)
-                .await?;
+            client.observer().observe_ready(ready).await?;
         }
         if initially_ready {
             // Keep initial observation in the opening future. Cancellation must
@@ -679,13 +630,13 @@ impl PaidWorkSession {
                 {
                     let floor = client.with_state(|state| state.cursor().0).await?;
                     if let Err(error) = observe_client(
-                        &client.observer(), &descriptor, config, &remote, floor,
+                        &client.observer(), &descriptor, &remote, floor,
                     ).await {
                         client.observer().suspend().await?;
                         tracing::debug!(%error, "paid client observation unavailable");
                         source_config.chain.rotate_validators();
                         match crate::client_chain::connect_at(
-                            &source_config, config.max_observation_age, floor,
+                            &source_config, hellas_channel::work::MAX_CERTIFIED_AGE, floor,
                         ).await {
                             Ok(next) => remote = next,
                             Err(error) => tracing::debug!(%error, "waiting for a verified remote chain source"),
@@ -696,7 +647,7 @@ impl PaidWorkSession {
                             clippy::disallowed_methods,
                             reason = "inventory class A: channel readiness; rollout 2"
                         )]
-                        tokio::time::sleep(config.poll).await;
+                        tokio::time::sleep(hellas_channel::work::SETUP_POLL).await;
                     }
                 }
                 Ok(())
@@ -764,7 +715,7 @@ impl PaidWorkSession {
             &self.dialer,
             &mut self.client,
             work,
-            self.args.config.poll,
+            hellas_channel::work::SETUP_POLL,
             self.args.timeout,
         )
         .await?;
@@ -839,7 +790,6 @@ impl PaidWorkSession {
             needs_recovery,
             ..
         } = self;
-        let config = &args.config;
         if let Some(prepared) = prepared.as_ref() {
             check_request(
                 policy,
@@ -857,7 +807,14 @@ impl PaidWorkSession {
         {
             // A lost acknowledgement never requires fresh admission: these
             // exact certificate bytes are already durable on the client.
-            pay_when_ready(dialer, client, work_id, args.config.poll, args.timeout).await?;
+            pay_when_ready(
+                dialer,
+                client,
+                work_id,
+                hellas_channel::work::SETUP_POLL,
+                args.timeout,
+            )
+            .await?;
         }
         if client.with_state(|state| state.is_closing()).await? {
             return if prepared.is_none() {
@@ -966,8 +923,14 @@ impl PaidWorkSession {
                         continue;
                     }
                     RecoveredJob::Delivered(work_id) => {
-                        pay_when_ready(dialer, client, work_id, args.config.poll, args.timeout)
-                            .await?;
+                        pay_when_ready(
+                            dialer,
+                            client,
+                            work_id,
+                            hellas_channel::work::SETUP_POLL,
+                            args.timeout,
+                        )
+                        .await?;
                         continue;
                     }
                     RecoveredJob::Unrecoverable(work_id) => {
@@ -1020,7 +983,7 @@ impl PaidWorkSession {
                     dialer,
                     client,
                     &ready,
-                    config.poll,
+                    hellas_channel::work::SETUP_POLL,
                     None,
                     None,
                     JobLookup::Retained(work_id),
@@ -1065,7 +1028,7 @@ impl PaidWorkSession {
                     dialer,
                     client,
                     &ready,
-                    config.poll,
+                    hellas_channel::work::SETUP_POLL,
                     progress.as_ref(),
                     accepted.as_ref(),
                     if recover {
@@ -1130,7 +1093,7 @@ async fn propose_when_ready(
     proposed: Option<&AtomicBool>,
 ) -> Result<hellas_auth::Digest> {
     let deadline = args.timeout.map(|timeout| Instant::now() + timeout);
-    let mut delay = args.config.poll.max(Duration::from_secs(1));
+    let mut delay = hellas_channel::work::SETUP_POLL.max(Duration::from_secs(1));
     loop {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(PaidClientError::Timeout {
@@ -1392,7 +1355,14 @@ async fn execute_paid_job(
         .await?
         .verified(work_id, &proposal.prepared_input)
         .await?;
-    let credited = pay_when_ready(dialer, client, work_id, args.config.poll, args.timeout).await?;
+    let credited = pay_when_ready(
+        dialer,
+        client,
+        work_id,
+        hellas_channel::work::SETUP_POLL,
+        args.timeout,
+    )
+    .await?;
     if let Some(purchase) = purchase {
         purchase.paid(work_id)?;
     }
@@ -1453,7 +1423,6 @@ fn payment_terms(
             &policy.policy_salt,
             &policy.channel_policy,
         ),
-        omit_response_blocks: policy.min_omit_response_blocks,
         start_validity_blocks: MAX_START_VALIDITY_BLOCKS,
         omission_bond,
     }
@@ -1463,13 +1432,31 @@ async fn drive_setup(
     setup: &SetupService,
     policy: &ProviderChannelPolicy,
     chain: &WorkBlocks<RemoteLightClient>,
-    poll: Duration,
 ) -> Result<(
     hellas_channel::work_store::ChannelStore,
     WorkChannelDescriptor,
 )> {
     loop {
-        let SetupAdvance { progress, mounted } = setup.advance_setup(chain, chain, chain).await?;
+        let query = setup
+            .query()
+            .await?
+            .ok_or(PaidClientError::MissingState("setup names no payment edge"))?;
+        let snapshot = chain
+            .work_channel_snapshot(WorkChannelQuery {
+                bond_edge: query.bond_edge,
+                payment_edge: query.payment_edge,
+                funding: query.funding.clone(),
+            })
+            .await?
+            .ok_or(PaidClientError::MissingState(
+                "no certified setup state is available",
+            ))?;
+        let read = snapshot
+            .finalized_setup(&query)
+            .ok_or(PaidClientError::MissingState(
+                "setup read answers another query",
+            ))?;
+        let SetupAdvance { progress, mounted } = setup.advance_setup(&read, chain).await?;
         if let Some(store) = mounted {
             let channel = store.state().channel();
             let descriptor =
@@ -1482,32 +1469,11 @@ async fn drive_setup(
             | SetupProgress::TimeoutBond) => return Err(PaidClientError::SetupEnded(end)),
             #[expect(
                 clippy::disallowed_methods,
-                reason = "inventory class B: setup finalization; rollout 3"
+                reason = "inventory class B: setup inclusion; rollout 3"
             )]
-            _ => tokio::time::sleep(poll).await,
+            _ => tokio::time::sleep(hellas_channel::work::SETUP_POLL).await,
         }
     }
-}
-
-async fn ready_channel(
-    descriptor: &WorkChannelDescriptor,
-    chain: &WorkBlocks<RemoteLightClient>,
-) -> Result<hellas_channel::model::setup::ReadyChannel> {
-    let query = WorkChannelQuery {
-        bond_edge: descriptor.bond_edge(),
-        payment_edge: Some(descriptor.channel().payment_edge()),
-        funding: Default::default(),
-    };
-    let snapshot =
-        chain
-            .work_channel_snapshot(query)
-            .await?
-            .ok_or(PaidClientError::MissingState(
-                "no finalized channel snapshot is available",
-            ))?;
-    descriptor
-        .check_ready(&snapshot.observed_channel())
-        .map_err(PaidClientError::from)
 }
 
 pub fn deadlines(
@@ -1552,7 +1518,6 @@ pub async fn bind_paid_endpoint(secret_key: SecretKey) -> Result<Endpoint> {
 async fn exchange_setup(
     dialer: &ProviderDialer,
     setup: &mut SetupEndpoint,
-    poll: Duration,
     timeout: Option<Duration>,
 ) -> Result<()> {
     let request = prepare_setup_exchange(setup);
@@ -1567,31 +1532,14 @@ async fn exchange_setup(
                 Err(hellas_channel::work_handshake::SetupExchangeError::Refused {
                     refusal,
                     ..
-                }) if refusal.is_retryable() => tokio::time::sleep(poll).await,
+                }) if refusal.is_retryable() => {
+                    tokio::time::sleep(hellas_channel::work::SETUP_POLL).await;
+                }
                 result => return Ok(result?),
             }
         }
     })
     .await
-}
-
-async fn finalized_floor(chain: &WorkBlocks<RemoteLightClient>) -> Result<SetupScan> {
-    let height = chain
-        .latest_height()
-        .await?
-        .ok_or(PaidClientError::MissingState(
-            "remote chain has no finalized blocks",
-        ))?;
-    let block = chain
-        .block_at(height)
-        .await?
-        .ok_or(PaidClientError::MissingState(
-            "remote archive did not return its finalized tip",
-        ))?;
-    Ok(SetupScan {
-        height,
-        payload: block.payload,
-    })
 }
 
 #[cfg(test)]

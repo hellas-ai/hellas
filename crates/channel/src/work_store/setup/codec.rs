@@ -16,7 +16,7 @@ impl SetupRecord {
     /// Whether this step takes on an obligation rather than discharging
     /// one.
     ///
-    /// The scan floor and the two revisions are where a handshake
+    /// The offer and the two revisions are where a handshake
     /// commits itself, so they are what stops when the journal cannot
     /// rotate. Everything below them follows a revision this endpoint
     /// has already exported — the submissions it authorised, the history
@@ -26,10 +26,7 @@ impl SetupRecord {
     pub(super) const fn is_new_work(&self) -> bool {
         matches!(
             self,
-            Self::Bundle { .. }
-                | Self::ArmedBundle { .. }
-                | Self::ScanArmed { .. }
-                | Self::Offer { .. }
+            Self::Bundle { .. } | Self::ArmedBundle { .. } | Self::Offer { .. }
         )
     }
 
@@ -37,10 +34,9 @@ impl SetupRecord {
     pub fn encode(&self) -> Result<Vec<u8>, SetupStateError> {
         let mut out = Vec::new();
         match self {
-            Self::Offer { peer, floor, offer } => {
+            Self::Offer { peer, offer } => {
                 out.push(tag::OFFER);
                 out.extend_from_slice(peer);
-                put_option(&mut out, floor.as_ref(), put_scan);
                 out.extend_from_slice(&offer.encode().map_err(|_| SetupStateError::Malformed)?);
             }
             Self::Bundle { bundle } => {
@@ -49,11 +45,6 @@ impl SetupRecord {
                 // frame already carries this record's length, and a
                 // second length here could disagree with it.
                 out.extend_from_slice(bundle);
-            }
-            Self::ScanArmed { height, payload } => {
-                out.push(tag::SCAN_ARMED);
-                put_u64(&mut out, *height);
-                out.extend_from_slice(payload);
             }
             Self::ArmedBundle {
                 bundle,
@@ -66,15 +57,11 @@ impl SetupRecord {
             }
             Self::Observed(observed) => {
                 out.push(tag::OBSERVED);
-                put_scan(&mut out, &observed.from);
-                put_scan(&mut out, &observed.through);
+                put_u64(&mut out, observed.height);
                 out.extend_from_slice(&[
-                    u8::from(observed.bond_finalized),
-                    u8::from(observed.payment_finalized),
-                    u8::from(observed.bond_closed),
-                    u8::from(observed.payment_closed),
+                    u8::from(observed.bond_live),
+                    u8::from(observed.payment_live),
                 ]);
-                put_option(&mut out, observed.origin.as_ref(), put_origin);
             }
             Self::BondTimeoutSubmitted => out.push(tag::BOND_TIMEOUT_SUBMITTED),
             Self::BondSubmitted => out.push(tag::BOND_SUBMITTED),
@@ -83,13 +70,11 @@ impl SetupRecord {
                 payment_edge,
                 origin_height,
                 origin_payload,
-                origin_parent,
             } => {
                 out.push(tag::COMPLETE);
                 out.extend_from_slice(&payment_edge.to_bytes());
                 put_u64(&mut out, *origin_height);
                 out.extend_from_slice(origin_payload);
-                out.extend_from_slice(origin_parent);
             }
             Self::Ended { outcome } => {
                 out.push(tag::ENDED);
@@ -110,7 +95,6 @@ impl SetupRecord {
         let record = match cursor.byte().ok_or(SetupStateError::Malformed)? {
             tag::OFFER => Self::Offer {
                 peer: cursor.array().ok_or(SetupStateError::Malformed)?,
-                floor: take_option(&mut cursor, SetupStateError::Malformed, take_scan)?,
                 offer: Box::new(
                     crate::model::offer::SignedPaidOffer::decode(cursor.rest())
                         .map_err(|_| SetupStateError::Malformed)?,
@@ -118,10 +102,6 @@ impl SetupRecord {
             },
             tag::BUNDLE => Self::Bundle {
                 bundle: cursor.rest().to_vec(),
-            },
-            tag::SCAN_ARMED => Self::ScanArmed {
-                height: cursor.u64().ok_or(SetupStateError::Malformed)?,
-                payload: cursor.array::<32>().ok_or(SetupStateError::Malformed)?,
             },
             tag::ARMED_BUNDLE => {
                 let bundle_len = usize::try_from(cursor.u64().ok_or(SetupStateError::Malformed)?)
@@ -138,13 +118,9 @@ impl SetupRecord {
                 }
             }
             tag::OBSERVED => Self::Observed(SetupObservation {
-                from: take_scan(&mut cursor)?,
-                through: take_scan(&mut cursor)?,
-                bond_finalized: take_bool(&mut cursor, SetupStateError::Malformed)?,
-                payment_finalized: take_bool(&mut cursor, SetupStateError::Malformed)?,
-                bond_closed: take_bool(&mut cursor, SetupStateError::Malformed)?,
-                payment_closed: take_bool(&mut cursor, SetupStateError::Malformed)?,
-                origin: take_option(&mut cursor, SetupStateError::Malformed, take_origin)?,
+                height: cursor.u64().ok_or(SetupStateError::Malformed)?,
+                bond_live: take_bool(&mut cursor, SetupStateError::Malformed)?,
+                payment_live: take_bool(&mut cursor, SetupStateError::Malformed)?,
             }),
             tag::BOND_TIMEOUT_SUBMITTED => Self::BondTimeoutSubmitted,
             tag::BOND_SUBMITTED => Self::BondSubmitted,
@@ -155,7 +131,6 @@ impl SetupRecord {
                 ),
                 origin_height: cursor.u64().ok_or(SetupStateError::Malformed)?,
                 origin_payload: cursor.array::<32>().ok_or(SetupStateError::Malformed)?,
-                origin_parent: cursor.array::<32>().ok_or(SetupStateError::Malformed)?,
             },
             tag::ENDED => Self::Ended {
                 outcome: end_from_code(cursor.byte().ok_or(SetupStateError::Malformed)?)
@@ -175,24 +150,10 @@ fn put_origin(out: &mut Vec<u8>, origin: &SetupOrigin) {
     out.extend_from_slice(&origin.payment_edge.to_bytes());
     put_u64(out, origin.height);
     out.extend_from_slice(&origin.payload);
-    out.extend_from_slice(&origin.parent);
 }
 fn take_origin(cursor: &mut Cursor<'_>) -> Result<SetupOrigin, SetupStateError> {
     Ok(SetupOrigin {
         payment_edge: EdgeId::from_bytes(cursor.array::<32>().ok_or(SetupStateError::Malformed)?),
-        height: cursor.u64().ok_or(SetupStateError::Malformed)?,
-        payload: cursor.array::<32>().ok_or(SetupStateError::Malformed)?,
-        parent: cursor.array::<32>().ok_or(SetupStateError::Malformed)?,
-    })
-}
-
-pub(super) fn put_scan(out: &mut Vec<u8>, scan: &SetupScan) {
-    put_u64(out, scan.height);
-    out.extend_from_slice(&scan.payload);
-}
-
-pub(super) fn take_scan(cursor: &mut Cursor<'_>) -> Result<SetupScan, SetupStateError> {
-    Ok(SetupScan {
         height: cursor.u64().ok_or(SetupStateError::Malformed)?,
         payload: cursor.array::<32>().ok_or(SetupStateError::Malformed)?,
     })
@@ -237,8 +198,8 @@ pub(super) fn describes_bundle(
 }
 
 impl SetupState {
-    /// Encodes the signed handshake, observation cursor and outcomes. Its
-    /// size is independent of chain length; blocks live in the node archive.
+    /// Encodes the signed handshake, what reads have shown and the
+    /// outcomes. Its size is independent of chain length.
     pub fn checkpoint(&self) -> Result<Vec<u8>, SetupStateError> {
         let Self {
             offer,
@@ -247,15 +208,12 @@ impl SetupState {
             role,
             bundle,
             bundle_bytes,
-            scan_armed,
             close_descriptor,
             unresolved_bond_open,
             unresolved_payment_open,
-            scan_cursor,
+            observed_height,
             bond_finalized,
             payment_finalized,
-            bond_closed,
-            payment_closed,
             bond_timeout_submitted,
             origin,
             end,
@@ -271,18 +229,17 @@ impl SetupState {
         put_option(&mut out, bundle.as_ref(), |out, _| {
             put_bytes(out, bundle_bytes);
         });
-        put_option(&mut out, scan_armed.as_ref(), put_scan);
         let close_bytes = close_descriptor.as_ref().map(|d| d.encode()).transpose()?;
         put_option(&mut out, close_bytes.as_ref(), |out, bytes| {
             put_bytes(out, bytes);
         });
         out.push(u8::from(*unresolved_bond_open));
         out.push(u8::from(*unresolved_payment_open));
-        put_option(&mut out, scan_cursor.as_ref(), put_scan);
+        put_option(&mut out, observed_height.as_ref(), |out, height| {
+            put_u64(out, *height);
+        });
         out.push(u8::from(*bond_finalized));
         out.push(u8::from(*payment_finalized));
-        out.push(u8::from(*bond_closed));
-        out.push(u8::from(*payment_closed));
         out.push(u8::from(*bond_timeout_submitted));
         put_option(&mut out, origin.as_ref(), put_origin);
         put_option(&mut out, end.as_ref(), |out, end| {
@@ -330,7 +287,6 @@ impl SetupState {
             .as_deref()
             .map(WorkChannelSetupBundleV2::decode)
             .transpose()?;
-        let scan_armed = take_option(&mut cursor, SetupStateError::Malformed, take_scan)?;
         let close_descriptor = take_option(&mut cursor, SetupStateError::Malformed, |cursor| {
             Ok(CloseDescriptor::decode(take_bytes(
                 cursor,
@@ -339,22 +295,21 @@ impl SetupState {
         })?;
         let unresolved_bond_open = take_bool(&mut cursor, SetupStateError::Malformed)?;
         let unresolved_payment_open = take_bool(&mut cursor, SetupStateError::Malformed)?;
-        let scan_cursor = take_option(&mut cursor, SetupStateError::Malformed, take_scan)?;
+        let observed_height = take_option(&mut cursor, SetupStateError::Malformed, |cursor| {
+            cursor.u64().ok_or(SetupStateError::Malformed)
+        })?;
         let state = Self {
             network,
             bond_edge,
             role,
             bundle,
             bundle_bytes: bundle_bytes.unwrap_or_default(),
-            scan_armed,
             close_descriptor,
             unresolved_bond_open,
             unresolved_payment_open,
-            scan_cursor,
+            observed_height,
             bond_finalized: take_bool(&mut cursor, SetupStateError::Malformed)?,
             payment_finalized: take_bool(&mut cursor, SetupStateError::Malformed)?,
-            bond_closed: take_bool(&mut cursor, SetupStateError::Malformed)?,
-            payment_closed: take_bool(&mut cursor, SetupStateError::Malformed)?,
             bond_timeout_submitted: take_bool(&mut cursor, SetupStateError::Malformed)?,
             origin: take_option(&mut cursor, SetupStateError::Malformed, take_origin)?,
             end: take_option(&mut cursor, SetupStateError::Malformed, |cursor| {

@@ -269,8 +269,6 @@ pub enum InvalidOpenReason {
     /// A work-payment open carries no maker funding. The client's
     /// owner is proved by the coins that fund the channel.
     WorkPaymentMakerUnfunded,
-    /// Work-payment terms commit a zero or over-long response window.
-    WorkResponseWindowOutOfRange,
     /// Work-payment terms commit a zero or over-long start validity
     /// window.
     WorkStartValidityOutOfRange,

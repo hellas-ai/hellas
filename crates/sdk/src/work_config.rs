@@ -1,7 +1,6 @@
 //! Process-owned paid chain configuration.
 use hellas_private::StoreLocation;
 use std::path::Path;
-use std::time::Duration;
 mod error;
 #[cfg(test)]
 mod tests;
@@ -10,41 +9,21 @@ type Result<T> = std::result::Result<T, WorkConfigError>;
 use hellas_chain::chain_dir::ChainDir;
 use hellas_chain::genesis::{ChainProfile, CustomChainFile};
 
-/// One process chain and its transport, journal and observation settings.
+/// One process chain and where its journals live. How often channels are
+/// read and how old a read may be are the channel crate's, derived from
+/// the kernel's response window, not settings.
 #[derive(Clone, Debug)]
 pub struct WorkConfig {
     pub chain: ChainDir,
-    pub(crate) poll: Duration,
-    pub(crate) max_observation_age: Duration,
 }
 
 impl WorkConfig {
-    pub fn poll(&self) -> Duration {
-        self.poll
-    }
-
-    pub fn max_observation_age(&self) -> Duration {
-        self.max_observation_age
-    }
-
-    /// Shorten readiness freshness so integration tests can expire observation.
-    #[cfg(feature = "integration-tests")]
-    #[doc(hidden)]
-    pub fn with_max_observation_age(mut self, max_observation_age: Duration) -> Self {
-        self.max_observation_age = max_observation_age;
-        self
-    }
     pub fn for_chain(chain: ChainProfile, root: &StoreLocation) -> Result<Self> {
         Self::from_chain_dir(ChainDir::open(root, &chain)?)
     }
 
     pub fn from_chain_dir(chain: ChainDir) -> Result<Self> {
-        Self {
-            chain,
-            poll: Duration::from_millis(500),
-            max_observation_age: hellas_chain::node::RECOVERY_TIMEOUT,
-        }
-        .validate()
+        Self { chain }.validate()
     }
 
     pub fn network(&self) -> hellas_kernel::NetworkId {
@@ -59,30 +38,6 @@ impl WorkConfig {
             }
         })?;
         Ok(self)
-    }
-
-    pub fn node_config(
-        &self,
-        archive_blocks: Option<std::num::NonZeroU64>,
-    ) -> Result<hellas_chain::node::Config> {
-        hellas_chain::node::Config::for_profile(self.chain.clone(), Vec::new(), archive_blocks)
-            .map_err(|_| WorkConfigError::Invalid {
-                field: "chain",
-                reason: "selected trust schedule cannot run a static full node",
-            })
-    }
-
-    pub fn check_node(&self, node: &hellas_chain::node::FullNode) -> Result<()> {
-        let actual = node.config().chain();
-        if self.chain.consensus_digest() != actual.consensus_digest()
-            || self.chain.trust() != actual.trust()
-        {
-            return Err(WorkConfigError::Invalid {
-                field: "chain",
-                reason: "paid configuration differs from the process's chain node",
-            });
-        }
-        Ok(())
     }
 }
 

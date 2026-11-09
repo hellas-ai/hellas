@@ -19,15 +19,15 @@ pub(super) struct Source {
     observation_gate: Arc<std::sync::Mutex<Option<ObservationGate>>>,
 }
 
-// Latest object reads carry their own block, so the retained opener reads
-// applied Latest only for the mounted floor, catch-up, then initial observation.
+// A retained opener takes one proof read to select its channel, one for its
+// completed setup, then one for the channel's initial observation; the gate
+// holds every read from the third on.
 #[derive(Clone)]
 struct ObservationGate {
     reads: Arc<AtomicUsize>,
     first_blocked: Arc<AtomicUsize>,
     entered: Arc<tokio::sync::Semaphore>,
     release: Arc<tokio::sync::Semaphore>,
-    delay: Duration,
 }
 
 macro_rules! forward {
@@ -75,25 +75,6 @@ impl hellas_chain::LightClient for Source {
         &self,
         query: FinalizedBlockQuery,
     ) -> Result<Option<FinalizedBlock>, QueryError> {
-        let gate = self.observation_gate.lock().unwrap().clone();
-        if query == FinalizedBlockQuery::Latest
-            && let Some(gate) = gate
-        {
-            let read = gate.reads.fetch_add(1, Ordering::SeqCst) + 1;
-            if read == 2 {
-                tokio::time::sleep(gate.delay).await;
-            }
-            if read >= 3 {
-                let _ = gate.first_blocked.compare_exchange(
-                    0,
-                    read,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                );
-                gate.entered.add_permits(1);
-                let _ = gate.release.acquire().await;
-            }
-        }
         if self.tips_unavailable.load(Ordering::SeqCst) {
             self.tip_refusals.add_permits(1);
             return Err(QueryError::Remote("injected RPC Unavailable".into()));
@@ -117,6 +98,20 @@ impl hellas_chain::LightClient for Source {
         request: hellas_rpc::pb::chain::GetObjectProofsRequest,
     ) -> Result<hellas_rpc::pb::chain::GetObjectProofsResponse, QueryError> {
         self.attempts.fetch_add(1, Ordering::SeqCst);
+        let gate = self.observation_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            let read = gate.reads.fetch_add(1, Ordering::SeqCst) + 1;
+            if read >= 3 {
+                let _ = gate.first_blocked.compare_exchange(
+                    0,
+                    read,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+                gate.entered.add_permits(1);
+                let _ = gate.release.acquire().await;
+            }
+        }
         if self.unavailable.load(Ordering::SeqCst) {
             return Err(QueryError::StateUnavailable(
                 "injected transient proof read".into(),
@@ -520,30 +515,27 @@ pub(super) async fn proofs(runtime: commonware_runtime::tokio::Context) {
     );
     foreign.shutdown().await;
     assert!(FinalizedBlockView::decode(&latest).is_ok());
-    use hellas_channel::work_open::SetupView as _;
-    let query = hellas_channel::work_open::SetupQuery {
+    let query = hellas_chain::work_view::WorkChannelQuery {
         bond_edge: hellas_kernel::EdgeId::from_bytes([0; 32]),
         payment_edge: None,
         funding: Default::default(),
     };
     let unfloored = hellas_chain::WorkBlocks::new(client.clone())
-        .finalized_setup(query.clone())
+        .work_channel_snapshot(query.clone())
         .await
         .unwrap()
         .unwrap();
     assert_eq!(
-        unfloored.height, latest.snapshot.height,
+        unfloored.block().height,
+        latest.snapshot.height,
         "the live certified root really proves absence before applying the journal floor"
     );
-    let floor = hellas_chain::WorkBlocks::new(client.clone())
+    let behind = hellas_chain::WorkBlocks::new(client.clone())
         .with_min_height(latest.snapshot.height + 1)
-        .with_read_retry(Duration::from_millis(10), Duration::from_secs(2));
-    let behind = floor.finalized_setup(query).await;
+        .work_channel_snapshot(query)
+        .await;
     assert!(
-        matches!(
-            behind,
-            Err(hellas_channel::work_close::BlockSourceError::ReadUnavailableTimeout { .. })
-        ),
+        matches!(behind, Err(QueryError::StateUnavailable(_))),
         "a valid state below persisted progress cannot establish channel absence"
     );
     // One hanging relay must not discard an already verified healthy answer.
@@ -651,7 +643,7 @@ pub(super) async fn opening_cancellation_releases_the_mounted_client_journal(
     let height = case.devnet.height();
     tokio::time::timeout(HANG_GUARD, async {
         while session.with_state(|state| state.cursor().0).await.unwrap() < height {
-            tokio::time::sleep(case.options.config.poll()).await;
+            tokio::time::sleep(hellas_channel::work::SETUP_POLL).await;
         }
     })
     .await
@@ -663,16 +655,13 @@ pub(super) async fn opening_cancellation_releases_the_mounted_client_journal(
     session.shutdown().await;
     drop(session);
     case.relays.source.replay.store(height, Ordering::SeqCst);
-    for expires in [false, true] {
-        let mut options = case.options.clone();
-        let poll = options.config.poll();
-        options.config = options.config.with_max_observation_age(poll * 2);
+    {
+        let options = case.options.clone();
         let gate = ObservationGate {
             reads: Arc::new(AtomicUsize::new(0)),
             first_blocked: Arc::new(AtomicUsize::new(0)),
             entered: Arc::new(tokio::sync::Semaphore::new(0)),
             release: Arc::new(tokio::sync::Semaphore::new(0)),
-            delay: options.config.max_observation_age() + options.config.poll(),
         };
         *case.relays.source.observation_gate.lock().unwrap() = Some(gate.clone());
         let mut opening = Box::pin(PaidWorkSession::open(
@@ -692,7 +681,7 @@ pub(super) async fn opening_cancellation_releases_the_mounted_client_journal(
         assert_eq!(
             gate.first_blocked.load(Ordering::SeqCst),
             3,
-            "the controlled third applied read is initial observation"
+            "the read after the mount is the channel's initial observation"
         );
         assert!(matches!(
             ChannelStore::recover(
@@ -705,21 +694,7 @@ pub(super) async fn opening_cancellation_releases_the_mounted_client_journal(
             .await,
             Err(WorkStoreError::Journal(JournalError::Locked { .. }))
         ));
-        if expires {
-            let error = opening
-                .await
-                .err()
-                .expect("the configured opening deadline expires");
-            assert!(
-                matches!(
-                    error,
-                    hellas_sdk::paid_client::PaidClientError::Timeout { .. }
-                ),
-                "{error}"
-            );
-        } else {
-            drop(opening);
-        }
+        drop(opening);
         let mut recovered = ChannelStore::recover(
             &case.options.journal_root(),
             descriptor.channel().clone(),

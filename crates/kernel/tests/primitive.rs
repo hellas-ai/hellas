@@ -67,6 +67,7 @@ fn context_prices_resource_costs() {
     let context = Context::with_fees(
         NETWORK,
         BlockHeight::new(7),
+        7_000,
         BlockHash::from_bytes(block_hash_bytes),
         fees,
     );

@@ -1182,7 +1182,13 @@ async fn recovery_defers_an_empty_header_but_refuses_records_without_the_initial
     .await
     .unwrap();
     journal
-        .append(&ChannelRecord::OriginObserved.encode())
+        .append(
+            &ChannelRecord::CloseSettled {
+                height: 1,
+                payload: [0; 32],
+            }
+            .encode(),
+        )
         .await
         .unwrap();
     journal.close().await;

@@ -383,6 +383,7 @@ mod tests {
             Ok(Some(hellas_chain::Verified::assume_for_tests(
                 hellas_chain::ObjectSnapshot {
                     network: self.network,
+                    certified_at_ms: 0,
                     block: hellas_chain::LatestBlock {
                         height: page + 1,
                         payload: hellas_chain::domain::Digest::from([page as u8; 32]),
@@ -410,6 +411,7 @@ mod tests {
             Ok(Some(hellas_chain::Verified::assume_for_tests(
                 hellas_chain::ObjectSnapshot {
                     network: self.network,
+                    certified_at_ms: 0,
                     block: hellas_chain::LatestBlock {
                         height: page + 2,
                         payload: hellas_chain::domain::Digest::from([(page + 1) as u8; 32]),

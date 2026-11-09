@@ -22,8 +22,8 @@ pub struct CollectedResult {
 /// What one ordinary attempt to collect a job's answer found.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CollectResultOutcome {
-    /// The authenticated answer arrived and the client caught up to a
-    /// finalized height from which it can still safely pay.
+    /// The authenticated answer arrived, and the client's certified cursor
+    /// is still inside the job's payment window.
     Collected(CollectedResult),
     /// The provider cannot answer yet. Retrying does not create a
     /// second delivery or payment.
@@ -39,15 +39,13 @@ pub enum CollectResultError {
     /// The delivery did not complete, or was refused permanently.
     #[error(transparent)]
     Deliver(#[from] DeliverError),
-    /// The post-answer finalized-height barrier could not be made.
-    #[error("the post-answer catch-up failed: {0}")]
-    CatchUp(#[from] hellas_channel::work_close::CatchUpError),
-    /// Catch-up crossed the job's last safe payment height.
+    /// The client's certified cursor is past the job's last safe payment
+    /// height.
     #[error(
-        "the result became stale at finalized height {height}; payment deadline was {deadline}"
+        "the result became stale at certified height {height}; payment deadline was {deadline}"
     )]
     Stale {
-        /// Finalized height reached after delivery.
+        /// Certified height the client's journal holds after delivery.
         height: u64,
         /// Payment deadline both parties authorized.
         deadline: u64,
@@ -59,21 +57,20 @@ pub enum CollectResultError {
 ///
 /// The delivery path verifies the provider signature, rebuilds the
 /// result from the signed transcript, and journals it before returning.
-/// This function then catches the client up to the finalized tip and
-/// refuses a result whose payment window elapsed meanwhile. A caller may
+/// This function then refuses a result whose payment window the client's
+/// own certified cursor has already passed; the channel's observer keeps
+/// that cursor current. A caller may
 /// pass the returned result directly to [`payment::pay_for_result`], after it passes the invocation result checks.
-pub async fn collect_result<T, C>(
+pub async fn collect_result<T>(
     transport: T,
     endpoint: &mut impl ClientChannel,
     ready: &ReadyChannel,
-    source: &C,
     work_id: hellas_auth::Digest,
 ) -> Result<CollectResultOutcome, CollectResultError>
 where
     T: StreamTransport + Sync,
     T::Error: std::error::Error + Send + Sync + 'static,
     T::Stream: 'static,
-    C: hellas_channel::work_close::FinalizedBlocks + Sync + ?Sized,
 {
     let delivery = match fetch_result_stream(transport, endpoint, ready, work_id, |_| Ok(())).await
     {
@@ -84,16 +81,16 @@ where
         Err(error) => return Err(error.into()),
     };
 
-    let deadline = endpoint
-        .client()
-        .await
-        .map_err(DeliverError::from)?
-        .state()
-        .job_by_id(work_id)
-        .ok_or(DeliverError::NoSuchJob)?
-        .authorization()
-        .payment_deadline;
-    let height = endpoint.catch_up(source).await?;
+    let (deadline, height) = {
+        let client = endpoint.client().await.map_err(DeliverError::from)?;
+        let state = client.state();
+        let deadline = state
+            .job_by_id(work_id)
+            .ok_or(DeliverError::NoSuchJob)?
+            .authorization()
+            .payment_deadline;
+        (deadline, state.cursor().0)
+    };
     if height > deadline {
         return Err(CollectResultError::Stale { height, deadline });
     }

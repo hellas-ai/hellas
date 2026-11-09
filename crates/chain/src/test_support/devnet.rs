@@ -78,7 +78,7 @@ impl GenesisOwner {
     /// Panics if `index` is not in 0..100.
     pub fn faucet(index: u8) -> Self {
         let accounts: Vec<crate::genesis::FaucetAccount> =
-            serde_json::from_str(crate::genesis::HELLAS_DEVNET_2_FAUCET_JSON)
+            serde_json::from_str(crate::genesis::HELLAS_DEVNET_3_FAUCET_JSON)
                 .expect("the shipped faucet list parses");
         let account = accounts
             .into_iter()
@@ -570,6 +570,11 @@ impl Devnet {
             .client()
     }
 
+    /// The last sealed block.
+    pub const fn head(&self) -> &HellasBlock {
+        &self.head
+    }
+
     /// The height of the last sealed block.
     pub fn height(&self) -> u64 {
         self.height
@@ -602,6 +607,7 @@ impl Devnet {
             }
             self.included.extend(proposed);
             self.height += 1;
+            let timestamp = self.next_timestamp();
 
             let mut root = None;
             let mut owner_root = None;
@@ -613,6 +619,7 @@ impl Devnet {
                     KernelContext::with_fees(
                         TEST_NETWORK,
                         BlockHeight::new(self.height),
+                        timestamp,
                         BlockHash::from_bytes(self.head.digest().0),
                         KERNEL_FEES,
                     ),
@@ -656,7 +663,7 @@ impl Devnet {
                 },
                 self.head.digest(),
                 Height::new(self.height),
-                self.height,
+                timestamp,
                 root,
                 target.unwrap(),
                 fresh,
@@ -746,6 +753,23 @@ impl Devnet {
         while self.height < height {
             self.seal().await;
         }
+    }
+
+    /// Seals until the head is stamped at or after `block_time_ms`: the
+    /// way a test reaches a close deadline, which is block time.
+    pub async fn seal_past(&mut self, block_time_ms: u64) {
+        while self.head.timestamp() < block_time_ms {
+            self.seal().await;
+        }
+    }
+
+    /// The stamp the next block carries: never behind the local clock, so
+    /// certified reads are as fresh as a live chain's, and at least one
+    /// second after its parent, so a test reaches a block-time deadline by
+    /// sealing rather than by waiting.
+    fn next_timestamp(&self) -> u64 {
+        let now = hellas_auth::authority::UnixMillis::now().map_or(0, |now| now.0);
+        now.max(self.head.timestamp().saturating_add(1_000))
     }
 
     /// The coins among `candidates` that `owner` holds at the finalized

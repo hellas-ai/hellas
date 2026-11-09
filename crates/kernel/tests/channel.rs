@@ -42,18 +42,21 @@ use hellas_kernel::{
 const FEE_CONTEXT: Context = Context::with_fees(
     support::NETWORK,
     BlockHeight::new(1),
+    1_000,
     BlockHash::from_bytes([0; BlockHash::LENGTH]),
     Fees::new(3, 0, 0, 0),
 );
 const RESOURCE_CONTEXT: Context = Context::with_fees(
     support::NETWORK,
     BlockHeight::new(1),
+    1_000,
     BlockHash::from_bytes([0; BlockHash::LENGTH]),
     Fees::new(1, 3, 0, 3),
 );
 const RESOURCE_TIMEOUT_CONTEXT: Context = Context::with_fees(
     support::NETWORK,
     TIMEOUT,
+    TIMEOUT.get() * 1_000,
     BlockHash::from_bytes([0; BlockHash::LENGTH]),
     Fees::new(1, 3, 0, 3),
 );

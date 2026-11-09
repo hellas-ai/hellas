@@ -136,6 +136,7 @@ impl TrustedReader {
         Ok(Some(ObjectSnapshot {
             network: self.network,
             block: latest_block_from_proto(snapshot)?,
+            certified_at_ms: 0,
             objects,
             holdings,
         }))

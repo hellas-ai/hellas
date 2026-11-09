@@ -102,7 +102,7 @@ mod tests {
     };
     use commonware_cryptography::{Hasher as _, Sha256};
     use commonware_runtime::{Runner as _, deterministic};
-    use hellas_genesis::{HELLAS_DEVNET_2_ID, HELLAS_DEVNET_2_JSON, TrustEpoch};
+    use hellas_genesis::{HELLAS_DEVNET_3_ID, HELLAS_DEVNET_3_JSON, TrustEpoch};
 
     #[test]
     fn proof_verifier_accepts_rotated_threshold_keys_only_at_the_scheduled_height() {
@@ -110,19 +110,19 @@ mod tests {
             let first = crate::execution::test_support::consensus_fixture_in(
                 501,
                 4,
-                hellas_kernel::NetworkId::new(HELLAS_DEVNET_2_ID).unwrap(),
-                crate::genesis_digest(&serde_json::from_str(HELLAS_DEVNET_2_JSON).unwrap()),
+                hellas_kernel::NetworkId::new(HELLAS_DEVNET_3_ID).unwrap(),
+                crate::genesis_digest(&serde_json::from_str(HELLAS_DEVNET_3_JSON).unwrap()),
             );
             let second = crate::execution::test_support::consensus_fixture_in(
                 601,
                 4,
-                hellas_kernel::NetworkId::new(HELLAS_DEVNET_2_ID).unwrap(),
-                crate::genesis_digest(&serde_json::from_str(HELLAS_DEVNET_2_JSON).unwrap()),
+                hellas_kernel::NetworkId::new(HELLAS_DEVNET_3_ID).unwrap(),
+                crate::genesis_digest(&serde_json::from_str(HELLAS_DEVNET_3_JSON).unwrap()),
             );
             let trust = TrustDocument {
                 schema_version: 1,
-                network_id: HELLAS_DEVNET_2_ID.into(),
-                genesis_sha256: hex::encode(Sha256::hash(HELLAS_DEVNET_2_JSON.as_bytes())),
+                network_id: HELLAS_DEVNET_3_ID.into(),
+                genesis_sha256: hex::encode(Sha256::hash(HELLAS_DEVNET_3_JSON.as_bytes())),
                 epochs: vec![
                     TrustEpoch {
                         epoch: 0,
@@ -139,7 +139,7 @@ mod tests {
                 ],
             };
             let schedule =
-                TrustedEpochs::with_genesis(trust.clone(), HELLAS_DEVNET_2_JSON.as_bytes())
+                TrustedEpochs::with_genesis(trust.clone(), HELLAS_DEVNET_3_JSON.as_bytes())
                     .unwrap();
             assert_eq!(schedule.first(Epoch::new(1)), Some(Height::new(2)));
             assert_eq!(schedule.last(Epoch::zero()), Some(Height::new(1)));
@@ -162,7 +162,7 @@ mod tests {
             );
             let verifier = crate::proof_verify::ProofVerifier::with_genesis(
                 trust,
-                HELLAS_DEVNET_2_JSON.as_bytes(),
+                HELLAS_DEVNET_3_JSON.as_bytes(),
             )
             .unwrap();
             let check = |block: &HellasBlock, committee| {
