@@ -136,6 +136,13 @@ pub(crate) fn read_timeout(timeout: Option<Duration>) -> Duration {
     })
 }
 
+/// How long owner funding may wait for its transaction to finalize. That
+/// spans blocks, not one read, so the caller's deadline bounds it; without
+/// one it keeps the read bound.
+pub(crate) fn funding_timeout(timeout: Option<Duration>) -> Duration {
+    timeout.unwrap_or(hellas_channel::work::MAX_CERTIFIED_AGE)
+}
+
 /// Bounds `work` by the caller's timeout; without one it waits until done.
 async fn within<T>(
     timeout: Option<Duration>,
@@ -490,7 +497,7 @@ impl PaidWorkSession {
                     quote,
                     crate::client_owner::FundingControls {
                         poll: hellas_channel::work::SETUP_POLL,
-                        timeout: read_timeout,
+                        timeout: funding_timeout(args.timeout),
                         approval: funding.approval.as_deref(),
                         before_sign: intent.before_open.take(),
                     },
