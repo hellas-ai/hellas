@@ -91,6 +91,17 @@ impl ModelPackage {
             },
         })
     }
+    /// The program manifest every job this model renders runs, which a
+    /// provider admits with `serve --program`. An image program depends on
+    /// each request's size and steps, so an image model has none.
+    pub fn program(&self) -> Result<hellas_rpc::ContentId> {
+        let environment = match &self.family {
+            Family::Whisper(model) => model.environment(),
+            Family::Qwen3(model) => model.environment(),
+            Family::Flux(_) => bail!("an image program depends on each request's size and steps"),
+        };
+        Ok(environment.manifest()?.content_id())
+    }
     pub fn is_image(&self) -> bool {
         matches!(self.family, Family::Flux(_))
     }

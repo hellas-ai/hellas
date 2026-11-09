@@ -296,6 +296,12 @@ enum Commands {
         #[arg(short = 'o', long, value_name = "DIR")]
         output: PathBuf,
     },
+    /// Print the program manifest a model's jobs run, which `serve
+    /// --program` admits: a Qwen GGUF or a converted Whisper package.
+    Program {
+        #[arg(value_name = "PATH")]
+        model: PathBuf,
+    },
     /// Transcribe one WAV with a client-rendered Whisper job.
     Transcribe(commands::transact::TranscribeArgs),
     /// Answer one prompt with a client-rendered Qwen3 text job.
@@ -532,6 +538,18 @@ async fn async_main() {
         }
         Commands::ConvertFlux { checkpoint, output } => {
             let result = commands::convert::flux(&checkpoint, &output);
+            tracer_provider.shutdown();
+            if let Err(error) = result {
+                eprintln!("error: {error:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        Commands::Program { model } => {
+            let result = hellas_client::model::ModelPackage::open(&model)
+                .await
+                .and_then(|package| package.program())
+                .map(|program| println!("{program}"));
             tracer_provider.shutdown();
             if let Err(error) = result {
                 eprintln!("error: {error:#}");
@@ -961,8 +979,10 @@ async fn async_main() {
             }
             .await
         }
-        Commands::ConvertWhisper { .. } | Commands::ConvertFlux { .. } => {
-            unreachable!("conversion handled before identity load")
+        Commands::ConvertWhisper { .. }
+        | Commands::ConvertFlux { .. }
+        | Commands::Program { .. } => {
+            unreachable!("model commands handled before identity load")
         }
         Commands::Trust(args) => commands::trust::run(args),
         Commands::Chain { .. } | Commands::Faucet { .. } => {

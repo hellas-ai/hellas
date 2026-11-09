@@ -98,6 +98,9 @@ impl Qwen3 {
         })
     }
 
+    pub(super) fn environment(&self) -> &Environment {
+        &self.environment
+    }
     /// Stops are the caller's ids plus the GGUF end-of-sequence id.
     pub fn render_job(
         &self,

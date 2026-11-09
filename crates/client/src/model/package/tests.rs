@@ -36,6 +36,32 @@ async fn canonical_qwen3_job_bytes_are_stable() {
     );
 }
 
+/// `hellas program` prints what `serve --program` admits: it must be the
+/// manifest of every job the model renders, whatever the request.
+#[tokio::test]
+async fn program_is_the_manifest_every_rendered_job_runs() {
+    let qwen = ModelPackage::open(&fixture()).await.unwrap();
+    for (prompt, max_new) in [(&[2, 1][..], 2), (&[1][..], 1)] {
+        let job = qwen.text_job(prompt, max_new, &[0]).await.unwrap();
+        let manifest = job.environment.manifest().unwrap().content_id();
+        assert_eq!(qwen.program().unwrap(), manifest);
+    }
+    let whisper = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/model/whisper/mini");
+    let whisper = ModelPackage::open(&whisper).await.unwrap();
+    for (language, max_new_tokens) in [(Some("en"), 4), (None, 2)] {
+        let job = whisper
+            .render_job(&ModelRequest::Transcription {
+                samples: &[0.; 400],
+                language,
+                max_new_tokens,
+            })
+            .await
+            .unwrap();
+        let manifest = job.environment.manifest().unwrap().content_id();
+        assert_eq!(whisper.program().unwrap(), manifest);
+    }
+}
+
 #[tokio::test]
 async fn tiny_gguf_renders_the_complete_qwen3_step_job() {
     let package = ModelPackage::open(&fixture()).await.unwrap();
