@@ -36,9 +36,10 @@ pub(super) async fn channel_read(
 /// retained start while it can still land and signs a replacement once it
 /// cannot, and a fresh start is handed to the chain as soon as it is signed:
 /// its inclusion window is counted in blocks from the read it was signed at.
-/// A source that fails is replaced by the next configured validator.
-/// [`POLL`](hellas_channel::work::POLL) is the only pacing: this loop has no
-/// deadline. Returns the source that observed the close.
+/// A source that fails is replaced by the next configured validator, which
+/// is first read at its next block. Each step waits for the next finalized
+/// block; this loop has no deadline. Returns the source that observed the
+/// close.
 pub(super) async fn settle_close<C>(
     client: &mut C,
     config: &WorkConfig,
@@ -48,37 +49,48 @@ where
     C: ClientChannel + Send,
 {
     let mut source_config = config.clone();
-    let mut chain = None;
+    let mut source = None;
+    let mut replaced = false;
     loop {
-        if chain.is_none() {
+        let Some((chain, blocks)) = source.as_mut() else {
             let floor = client.client().await?.state().cursor().0;
-            match crate::client_chain::connect_at(&source_config, timeout, floor).await {
-                Ok(remote) => chain = Some(WorkBlocks::new(remote).with_min_height(floor)),
+            let connected =
+                match crate::client_chain::connect_at(&source_config, timeout, floor).await {
+                    // Every validator answered for another chain: no rotation helps.
+                    Err(error @ hellas_chain::QueryError::Remote(_)) => return Err(error.into()),
+                    Ok(remote) => remote
+                        .finalized_blocks()
+                        .await
+                        .map(|blocks| (remote, blocks)),
+                    Err(error) => Err(error),
+                };
+            match connected {
+                Ok((remote, mut blocks)) => {
+                    if !replaced || blocks.next().await.is_ok() {
+                        source = Some((WorkBlocks::new(remote).with_min_height(floor), blocks));
+                    }
+                }
                 Err(error) => {
                     tracing::debug!(%error, "paid settlement is waiting for a chain source");
                     source_config.chain.rotate_validators();
                 }
             }
-        }
-        if let Some(source) = chain.as_ref() {
-            match close_step(client, source).await {
-                Ok(true) => return Ok(chain.expect("the source that settled")),
-                Ok(false) => {}
-                Err(
-                    PaidClientError::Query(_)
-                    | PaidClientError::CatchUp(hellas_channel::work_close::CatchUpError::Source(_)),
-                ) => {
-                    chain = None;
-                    source_config.chain.rotate_validators();
-                }
-                Err(error) => return Err(error),
+            continue;
+        };
+        match close_step(client, chain).await {
+            Ok(true) => return Ok(source.expect("the source that settled").0),
+            Ok(false) if blocks.next().await.is_ok() => continue,
+            Ok(false)
+            | Err(
+                PaidClientError::Query(_)
+                | PaidClientError::CatchUp(hellas_channel::work_close::CatchUpError::Source(_)),
+            ) => {
+                source = None;
+                replaced = true;
+                source_config.chain.rotate_validators();
             }
+            Err(error) => return Err(error),
         }
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "inventory class B: certified close; rollout 3"
-        )]
-        tokio::time::sleep(hellas_channel::work::POLL).await;
     }
 }
 

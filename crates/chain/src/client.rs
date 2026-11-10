@@ -15,10 +15,53 @@ mod objects;
 
 pub use objects::TrustedReader;
 
+/// The WebSocket carrier to one endpoint. Servers close idle and long-lived
+/// connections; the next call after a close opens a fresh one, so a close is
+/// never a failed request.
+struct Connection {
+    address: String,
+    transport: std::sync::Mutex<MuxTransport>,
+}
+
+impl Connection {
+    async fn open(address: String) -> Result<Self, QueryError> {
+        let transport = connect_transport(&address).await?;
+        Ok(Self {
+            address,
+            transport: std::sync::Mutex::new(transport),
+        })
+    }
+
+    fn current(&self) -> MuxTransport {
+        self.transport
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// A client on the live carrier, reconnecting if the server closed it.
+    async fn client(&self) -> Result<LightClientClientImpl<MuxTransport>, QueryError> {
+        let current = self.current();
+        if !current.is_closed() {
+            return Ok(LightClientClientImpl::new(current));
+        }
+        let fresh = connect_transport(&self.address).await?;
+        let mut transport = self
+            .transport
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A concurrent call may have replaced it first; keep the live one.
+        if transport.is_closed() {
+            *transport = fresh;
+        }
+        Ok(LightClientClientImpl::new(transport.clone()))
+    }
+}
+
 /// Wire-backed light client that connects to a remote validator or relay.
 #[derive(Clone)]
 pub struct RemoteLightClient {
-    client: LightClientClientImpl<MuxTransport>,
+    connection: std::sync::Arc<Connection>,
     finalized_height: std::sync::Arc<std::sync::atomic::AtomicU64>,
     applied_progress: std::sync::Arc<std::sync::atomic::AtomicU64>,
     proof_verifier: std::sync::Arc<crate::proof_verify::ProofVerifier>,
@@ -29,26 +72,23 @@ impl RemoteLightClient {
         self.proof_verifier.network()
     }
 
-    /// Notifications only wake the caller; subsequent reads verify their data.
-    pub async fn subscribe_finalized(
+    /// Follows finalized blocks from now on. Take it before the read whose
+    /// change the caller waits for, so no block in between is missed.
+    pub async fn finalized_blocks(&self) -> Result<FinalizedBlocks, QueryError> {
+        Ok(FinalizedBlocks {
+            stream: Some(self.subscribe_finalized().await?),
+            client: self.clone(),
+        })
+    }
+
+    async fn subscribe_finalized(
         &self,
     ) -> Result<StreamingCall<GetFinalizedBlockResponse>, QueryError> {
-        self.rpc_client()
+        self.rpc()
+            .await?
             .subscribe_finalized(GetLatestBlockRequest {})
             .await
             .map_err(QueryError::from)
-    }
-
-    pub fn new(
-        transport: MuxTransport,
-        proof_verifier: std::sync::Arc<crate::proof_verify::ProofVerifier>,
-    ) -> Self {
-        Self {
-            client: LightClientClientImpl::new(transport),
-            finalized_height: Default::default(),
-            applied_progress: Default::default(),
-            proof_verifier,
-        }
     }
 
     /// Connect to a WebSocket endpoint.
@@ -56,8 +96,12 @@ impl RemoteLightClient {
         addr: impl Into<String>,
         proof_verifier: std::sync::Arc<crate::proof_verify::ProofVerifier>,
     ) -> Result<Self, QueryError> {
-        let addr = addr.into();
-        Ok(Self::new(connect_transport(&addr).await?, proof_verifier))
+        Ok(Self {
+            connection: std::sync::Arc::new(Connection::open(addr.into()).await?),
+            finalized_height: Default::default(),
+            applied_progress: Default::default(),
+            proof_verifier,
+        })
     }
 
     /// Subscribe to the consensus activity stream.
@@ -65,7 +109,8 @@ impl RemoteLightClient {
         &self,
         urgent_events: Vec<ActivityEventKind>,
     ) -> Result<StreamingCall<ActivityEvent>, QueryError> {
-        self.client
+        self.rpc()
+            .await?
             .subscribe_activity(SubscribeActivityRequest {
                 urgent_events: urgent_events.into_iter().map(|k| k as i32).collect(),
             })
@@ -75,10 +120,47 @@ impl RemoteLightClient {
 
     /// Fetch transport/version metadata from the connected validator path.
     pub async fn get_relay_info(&self) -> Result<GetRelayInfoResponse, QueryError> {
-        self.client
+        self.rpc()
+            .await?
             .get_relay_info(GetRelayInfoRequest {})
             .await
             .map_err(QueryError::from)
+    }
+}
+
+/// Wakes once per finalized block. A wake carries no data: the caller
+/// re-reads, with proofs, after each one.
+pub struct FinalizedBlocks {
+    client: RemoteLightClient,
+    stream: Option<StreamingCall<GetFinalizedBlockResponse>>,
+}
+
+impl FinalizedBlocks {
+    /// Completes when a block has finalized since the last call.
+    ///
+    /// The server ends a subscription when its connection closes or a block
+    /// read fails; that is resubscribed, over a fresh connection if needed,
+    /// and also wakes, since blocks may have passed meanwhile. A refused
+    /// subscription is an error.
+    pub async fn next(&mut self) -> Result<(), QueryError> {
+        use futures_util::StreamExt as _;
+        if let Some(stream) = &mut self.stream {
+            match stream.next().await {
+                Some(Ok(_)) => return Ok(()),
+                Some(Err(status)) => {
+                    self.stream = None;
+                    return Err(status.into());
+                }
+                None => {}
+            }
+        }
+        if let Some(Err(status)) = self.stream.take().map(StreamingCall::finish)
+            && status.code == hellas_wire::WireCode::ResourceExhausted
+        {
+            return Err(status.into());
+        }
+        self.stream = Some(self.client.subscribe_finalized().await?);
+        Ok(())
     }
 }
 
@@ -154,8 +236,14 @@ async fn connect_transport(addr: &str) -> Result<MuxTransport, QueryError> {
 }
 
 impl RemoteLightClient {
-    fn rpc_client(&self) -> &LightClientClientImpl<MuxTransport> {
-        &self.client
+    async fn rpc(&self) -> Result<LightClientClientImpl<MuxTransport>, QueryError> {
+        self.connection.client().await
+    }
+
+    /// Completes once the current carrier has ended.
+    #[cfg(all(test, feature = "validator"))]
+    pub(crate) async fn carrier_closed(&self) {
+        self.connection.current().closed().await;
     }
 }
 
@@ -165,7 +253,8 @@ impl LightClient for RemoteLightClient {
         &self,
         request: GetObjectProofsRequest,
     ) -> Result<GetObjectProofsResponse, QueryError> {
-        self.rpc_client()
+        self.rpc()
+            .await?
             .get_object_proofs(request)
             .await
             .map_err(QueryError::from)
@@ -181,9 +270,14 @@ impl LightClient for RemoteLightClient {
     async fn get_holdings(
         &self,
         owner: SettlementKey,
-        after: Option<ObjectId>,
+        after: Option<crate::domain::ObjectKey>,
     ) -> Result<Option<Verified<ObjectSnapshot>>, QueryError> {
-        Box::pin(objects::read(self, Vec::new(), Some((owner, after)))).await
+        Box::pin(objects::read(
+            self,
+            Vec::new(),
+            Some((owner, after.map(crate::domain::ObjectKey::id))),
+        ))
+        .await
     }
 
     fn get_state_root(&self) -> impl Future<Output = Result<Option<Digest>, QueryError>> + Send {
@@ -196,29 +290,15 @@ impl LightClient for RemoteLightClient {
         }
     }
 
-    fn get_proof(
-        &self,
-        object_id: ObjectId,
-    ) -> impl Future<Output = Result<Option<Vec<u8>>, QueryError>> + Send {
-        let client = self.rpc_client().clone();
-        async move {
-            let response = client
-                .get_proof(GetProofRequest {
-                    object_id: object_id.to_vec(),
-                })
-                .await
-                .map_err(QueryError::from)?;
-            Ok(response.proof)
-        }
-    }
-
     fn get_finalization(
         &self,
         payload: Digest,
     ) -> impl Future<Output = Result<Option<Vec<u8>>, QueryError>> + Send {
-        let client = self.rpc_client().clone();
+        let this = self.clone();
         async move {
-            let response = client
+            let response = this
+                .rpc()
+                .await?
                 .get_finalization(GetFinalizationRequest {
                     payload: payload.to_vec(),
                 })
@@ -232,9 +312,10 @@ impl LightClient for RemoteLightClient {
         &self,
     ) -> impl Future<Output = Result<Option<LatestBlock>, QueryError>> + Send {
         let progress = self.finalized_height.clone();
-        let client = self.rpc_client().clone();
+        let this = self.clone();
         let verifier = self.proof_verifier.clone();
         async move {
+            let client = this.rpc().await?;
             let response = client
                 .get_latest_block(GetLatestBlockRequest {})
                 .await
@@ -253,10 +334,12 @@ impl LightClient for RemoteLightClient {
         query: FinalizedBlockQuery,
     ) -> impl Future<Output = Result<Option<FinalizedBlock>, QueryError>> + Send {
         let progress = self.finalized_height.clone();
-        let client = self.rpc_client().clone();
+        let this = self.clone();
         let verifier = self.proof_verifier.clone();
         async move {
-            let response = client
+            let response = this
+                .rpc()
+                .await?
                 .get_finalized_block(finalized_block_query_to_proto(query))
                 .await
                 .map_err(QueryError::from)?;
@@ -280,10 +363,11 @@ impl LightClient for RemoteLightClient {
         query: FinalizedBlockQuery,
     ) -> impl Future<Output = Result<Option<FinalizedBlock>, QueryError>> + Send {
         let state = self.clone();
-        let client = self.rpc_client().clone();
         let verifier = self.proof_verifier.clone();
         async move {
-            let response = client
+            let response = state
+                .rpc()
+                .await?
                 .get_applied_finalized_block(finalized_block_query_to_proto(query))
                 .await
                 .map_err(QueryError::from)?;
@@ -304,7 +388,7 @@ impl LightClient for RemoteLightClient {
         &self,
         tx: Transaction,
     ) -> impl Future<Output = Result<DomainSubmitTxOutcome, QueryError>> + Send {
-        let client = self.rpc_client().clone();
+        let this = self.clone();
         // Boxed: a transaction and its RPC call are large, and every chain
         // caller would otherwise compose them inline in its own future.
         Box::pin(async move {
@@ -324,7 +408,10 @@ impl LightClient for RemoteLightClient {
                 })
             );
             let called = Timing::start();
-            let outcome = submit_over(&client, tx).await;
+            let outcome = match this.rpc().await {
+                Ok(client) => submit_over(&client, tx).await,
+                Err(error) => Err(error),
+            };
             if let Some(ms) = called.ms() {
                 tracing::event!(
                     name: "rpc_ms",
@@ -340,9 +427,11 @@ impl LightClient for RemoteLightClient {
     }
 
     fn get_validators(&self) -> impl Future<Output = Result<Vec<String>, QueryError>> + Send {
-        let client = self.rpc_client().clone();
+        let this = self.clone();
         async move {
-            let resp = client
+            let resp = this
+                .rpc()
+                .await?
                 .get_validators(GetValidatorsRequest {})
                 .await
                 .map_err(QueryError::from)?;
@@ -351,9 +440,11 @@ impl LightClient for RemoteLightClient {
     }
 
     fn get_consensus_info(&self) -> impl Future<Output = Result<ConsensusInfo, QueryError>> + Send {
-        let client = self.rpc_client().clone();
+        let this = self.clone();
         async move {
-            let resp = client
+            let resp = this
+                .rpc()
+                .await?
                 .get_consensus_info(GetConsensusInfoRequest {})
                 .await
                 .map_err(QueryError::from)?;

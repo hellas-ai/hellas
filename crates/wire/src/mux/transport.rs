@@ -163,6 +163,18 @@ impl MuxTransport {
     }
 }
 
+impl MuxTransport {
+    /// Whether the carrier has ended. A closed transport opens no streams.
+    pub fn is_closed(&self) -> bool {
+        self.cmd_tx.is_closed()
+    }
+
+    /// Completes once the carrier has ended.
+    pub async fn closed(&self) {
+        self.cmd_tx.closed().await;
+    }
+}
+
 impl StreamTransport for MuxTransport {
     type Stream = MuxStream;
     type Error = MuxTransportError;

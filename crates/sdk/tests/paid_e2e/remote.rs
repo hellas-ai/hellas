@@ -1,6 +1,6 @@
 //! Untrusted WebSocket transport around the harness's real finalized state.
 use super::*;
-use hellas_chain::domain::{ObjectId, Transaction};
+use hellas_chain::domain::Transaction;
 use hellas_chain::{ConsensusInfo, FinalizedBlock, FinalizedBlockQuery, LatestBlock, QueryError};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
@@ -37,7 +37,6 @@ macro_rules! forward {
 }
 impl hellas_chain::LightClient for Source {
     forward!(get_state_root() -> Option<hellas_chain::domain::Digest>);
-    forward!(get_proof(object_id: ObjectId) -> Option<Vec<u8>>);
     forward!(get_finalization(payload: hellas_chain::domain::Digest) -> Option<Vec<u8>>);
     forward!(submit_tx(tx: Transaction) -> hellas_chain::SubmitTxOutcome);
     forward!(get_validators() -> Vec<String>);
@@ -165,8 +164,8 @@ impl Relays {
         for _ in 0..6 {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             urls.push(format!("ws://{}", listener.local_addr().unwrap()));
-            let (activity, _) = tokio::sync::broadcast::channel(16);
-            let service = hellas_chain::LightClientRpc::new(source.clone(), activity);
+            let service =
+                hellas_chain::LightClientRpc::new(source.clone(), devnet.validator_activity(0));
             let source = source.clone();
             let disconnect = disconnect.clone();
             let mut stop = disconnect.subscribe();

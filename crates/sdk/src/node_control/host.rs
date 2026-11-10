@@ -919,9 +919,6 @@ fn transport_alpns() -> Vec<Vec<u8>> {
         hellas_rpc::services::work_setup::WorkSetup::ALPN
             .as_bytes()
             .to_vec(),
-        hellas_rpc::services::chain_sync::ChainSync::ALPN
-            .as_bytes()
-            .to_vec(),
         HostControl::ALPN.as_bytes().to_vec(),
     ]
 }

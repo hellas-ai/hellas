@@ -141,7 +141,7 @@ impl<T> std::ops::Deref for Verified<T> {
 
 /// Current objects at one finalized root. Missing keys are absent. An owner
 /// read also lists one page of the owner's holdings, whose objects are in
-/// `objects`.
+/// the snapshot. Objects are read only by typed key.
 #[derive(Debug, Clone)]
 pub struct ObjectSnapshot {
     pub network: hellas_kernel::NetworkId,
@@ -149,27 +149,79 @@ pub struct ObjectSnapshot {
     /// The certified block's own timestamp, in milliseconds. Zero for an
     /// unproven read, which is never fresh.
     pub certified_at_ms: u64,
-    pub objects: std::collections::BTreeMap<ObjectId, Object>,
-    pub holdings: Option<Holdings>,
+    objects: std::collections::BTreeMap<ObjectId, Object>,
+    holdings: Option<Holdings>,
 }
 
 /// One page of an owner's holdings in owner-tree order. `next` is the last
 /// listed key while more follow, and continues the listing at a later root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Holdings {
-    pub keys: Vec<ObjectId>,
-    pub next: Option<ObjectId>,
+    pub keys: Vec<ObjectKey>,
+    pub next: Option<ObjectKey>,
 }
 
-impl Holdings {
-    pub(crate) fn new(keys: Vec<ObjectId>, offset: u64, count: u64) -> Self {
-        let more = offset.saturating_add(keys.len() as u64) < count;
-        let next = more.then(|| keys.last().copied()).flatten();
-        Self { keys, next }
+/// The typed key of a stored object, or `None` for owner-tree records.
+fn typed_key(id: ObjectId, object: &Object) -> Option<ObjectKey> {
+    match object {
+        Object::Coin(_) => Some(ObjectKey::Coin(hellas_kernel::CoinId::from_bytes(id.0))),
+        Object::Edge(_) => Some(ObjectKey::Edge(hellas_kernel::EdgeId::from_bytes(id.0))),
+        Object::RegistryChunk(_) => Some(ObjectKey::RegistryChunk(
+            hellas_kernel::RegistryChunkId::from_bytes(id.0),
+        )),
+        Object::OwnerData(_) => None,
     }
 }
 
 impl ObjectSnapshot {
+    pub fn new(
+        network: hellas_kernel::NetworkId,
+        block: LatestBlock,
+        certified_at_ms: u64,
+        objects: std::collections::BTreeMap<ObjectId, Object>,
+    ) -> Self {
+        Self {
+            network,
+            block,
+            certified_at_ms,
+            objects,
+            holdings: None,
+        }
+    }
+
+    /// Lists the owner page `listed`, at `offset` of the owner's `count`
+    /// holdings. Each listed id must name a coin or edge in the snapshot.
+    pub fn with_holdings(
+        mut self,
+        listed: Vec<ObjectId>,
+        offset: u64,
+        count: u64,
+    ) -> Result<Self, QueryError> {
+        let more = offset.saturating_add(listed.len() as u64) < count;
+        let keys = listed
+            .into_iter()
+            .map(|id| {
+                self.objects
+                    .get(&id)
+                    .and_then(|object| typed_key(id, object))
+                    .ok_or_else(|| QueryError::Remote("listed holding has no object".into()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let next = more.then(|| keys.last().copied()).flatten();
+        self.holdings = Some(Holdings { keys, next });
+        Ok(self)
+    }
+
+    /// The owner page, for an owner read.
+    pub fn holdings(&self) -> Option<&Holdings> {
+        self.holdings.as_ref()
+    }
+
+    /// Where the owner listing continues, while more holdings follow.
+    pub fn next_holdings(&self) -> Option<ObjectKey> {
+        self.holdings.as_ref().and_then(|holdings| holdings.next)
+    }
+
     /// The object at `key`, as the kind `key` names. Kernel derivations are
     /// domain separated per kind, but ids also cross boundaries as bytes, so
     /// an id rebuilt as the wrong kind finds another kind's object: that is
@@ -218,38 +270,42 @@ impl ObjectSnapshot {
         })
     }
 
-    fn listed(&self) -> impl Iterator<Item = (ObjectId, &Object)> {
+    fn listed(&self) -> impl Iterator<Item = (ObjectKey, &Object)> {
         self.holdings
             .iter()
             .flat_map(|holdings| holdings.keys.iter())
-            .filter_map(|key| self.objects.get(key).map(|object| (*key, object)))
+            .filter_map(|key| self.objects.get(&key.id()).map(|object| (*key, object)))
     }
 
     /// Listed coins whose owner is `owner`.
-    pub fn owned_coins(&self, owner: SettlementKey) -> Vec<(ObjectId, Coin)> {
+    pub fn owned_coins(&self, owner: SettlementKey) -> Vec<(hellas_kernel::CoinId, Coin)> {
         self.listed()
-            .filter_map(|(key, object)| match object {
-                Object::Coin(coin) if coin.owner == owner => Some((key, *coin)),
+            .filter_map(|(key, object)| match (key, object) {
+                (ObjectKey::Coin(id), Object::Coin(coin)) if coin.owner == owner => {
+                    Some((id, *coin))
+                }
                 _ => None,
             })
             .collect()
     }
 
     /// Listed coins delegated to `delegate`: spendable funding, not its balance.
-    pub fn delegated_coins(&self, delegate: SettlementKey) -> Vec<(ObjectId, Coin)> {
+    pub fn delegated_coins(&self, delegate: SettlementKey) -> Vec<(hellas_kernel::CoinId, Coin)> {
         self.listed()
-            .filter_map(|(key, object)| match object {
-                Object::Coin(coin) if coin.delegate == Some(delegate) => Some((key, *coin)),
+            .filter_map(|(key, object)| match (key, object) {
+                (ObjectKey::Coin(id), Object::Coin(coin)) if coin.delegate == Some(delegate) => {
+                    Some((id, *coin))
+                }
                 _ => None,
             })
             .collect()
     }
 
     /// Listed edges.
-    pub fn edges(&self) -> Vec<(ObjectId, EdgeState)> {
+    pub fn edges(&self) -> Vec<(hellas_kernel::EdgeId, EdgeState)> {
         self.listed()
-            .filter_map(|(key, object)| match object {
-                Object::Edge(edge) => Some((key, EdgeState::from(*edge))),
+            .filter_map(|(key, object)| match (key, object) {
+                (ObjectKey::Edge(id), Object::Edge(edge)) => Some((id, EdgeState::from(*edge))),
                 _ => None,
             })
             .collect()
@@ -415,7 +471,7 @@ pub trait LightClient: Clone + Send + Sync + 'static {
     fn get_holdings(
         &self,
         _owner: SettlementKey,
-        _after: Option<ObjectId>,
+        _after: Option<ObjectKey>,
     ) -> impl Future<Output = Result<Option<Verified<ObjectSnapshot>>, QueryError>> + Send {
         async {
             Err(QueryError::StateUnavailable(
@@ -425,11 +481,6 @@ pub trait LightClient: Clone + Send + Sync + 'static {
     }
 
     fn get_state_root(&self) -> impl Future<Output = Result<Option<Digest>, QueryError>> + Send;
-
-    fn get_proof(
-        &self,
-        object_id: ObjectId,
-    ) -> impl Future<Output = Result<Option<Vec<u8>>, QueryError>> + Send;
 
     fn get_finalization(
         &self,

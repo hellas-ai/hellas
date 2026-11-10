@@ -530,7 +530,6 @@ impl PaidWorkSession {
                     &remote,
                     quote,
                     crate::client_owner::FundingControls {
-                        poll: hellas_channel::work::SETUP_POLL,
                         timeout: funding_timeout(args.timeout),
                         approval: funding.approval.as_deref(),
                         before_sign: intent.before_open.take(),
@@ -671,29 +670,43 @@ impl PaidWorkSession {
             // release this journal before a caller can immediately reopen it.
             let mut source_config = config.clone();
             within(args.timeout, "initial channel observation", async {
+                // Readiness changes only with a read of a newer block, so a
+                // read that leaves the channel unready waits for one.
+                let mut blocks = remote.finalized_blocks().await.ok();
                 while client.readiness().await.is_err()
                     && !client.with_state(|state| state.is_closing()).await?
                 {
                     let floor = client.with_state(|state| state.cursor().0).await?;
-                    if let Err(error) = observe_client(
-                        &client.observer(), &descriptor, &remote, floor,
-                    ).await {
+                    let step: Result<()> = match blocks.as_mut() {
+                        Some(blocks) => async {
+                            observe_client(&client.observer(), &descriptor, &remote, floor).await?;
+                            if client.readiness().await.is_err() {
+                                blocks.next().await?;
+                            }
+                            Ok(())
+                        }.await,
+                        None => Err(PaidClientError::MissingState("finalized block subscription")),
+                    };
+                    if let Err(error) = step {
                         client.observer().suspend().await?;
                         tracing::debug!(%error, "paid client observation unavailable");
                         source_config.chain.rotate_validators();
                         match crate::client_chain::connect_at(
                             &source_config, hellas_channel::work::MAX_CERTIFIED_AGE, floor,
                         ).await {
-                            Ok(next) => remote = next,
+                            // A new source is read from its next block on, which also
+                            // paces a source whose reads keep failing.
+                            Ok(next) => {
+                                blocks = next.finalized_blocks().await.ok();
+                                if let Some(waiting) = blocks.as_mut()
+                                    && waiting.next().await.is_err()
+                                {
+                                    blocks = None;
+                                }
+                                remote = next;
+                            }
                             Err(error) => tracing::debug!(%error, "waiting for a verified remote chain source"),
                         }
-                    }
-                    if client.readiness().await.is_err() {
-                        #[expect(
-                            clippy::disallowed_methods,
-                            reason = "inventory class A: channel readiness; rollout 2"
-                        )]
-                        tokio::time::sleep(hellas_channel::work::SETUP_POLL).await;
                     }
                 }
                 Ok(())
@@ -1487,6 +1500,7 @@ async fn drive_setup(
     hellas_channel::work_store::ChannelStore,
     WorkChannelDescriptor,
 )> {
+    let mut blocks = chain.client().finalized_blocks().await?;
     loop {
         let query = setup
             .query()
@@ -1518,11 +1532,7 @@ async fn drive_setup(
             end @ (SetupProgress::Aborted(_)
             | SetupProgress::Faulted(_)
             | SetupProgress::TimeoutBond) => return Err(PaidClientError::SetupEnded(end)),
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "inventory class B: setup inclusion; rollout 3"
-            )]
-            _ => tokio::time::sleep(hellas_channel::work::SETUP_POLL).await,
+            _ => blocks.next().await?,
         }
     }
 }

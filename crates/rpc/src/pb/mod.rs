@@ -250,10 +250,11 @@ mod id_pins {
             GetAppliedFinalizedBlock, GetObjectProofs, GetObjects, GetStateRoot, LightClient,
             SubmitWorkResponse, SubscribeFinalized,
         };
-        // Adding GetObjects rotates the service digest. SERVICE_ID is never
-        // sent: a call opens by METHOD_ID alone, and every existing method
-        // keeps its id, so 0x6a5a_dd5a peers interoperate.
-        assert_eq!(<LightClient as ServiceMarker>::SERVICE_ID, 0x34db_04b6);
+        // Removing GetProof, which no node answered, rotates the service
+        // digest. SERVICE_ID is never sent: a call opens by METHOD_ID alone,
+        // and every remaining method keeps its id, so 0x34db_04b6 peers
+        // interoperate.
+        assert_eq!(<LightClient as ServiceMarker>::SERVICE_ID, 0x3199_ff16);
         assert_eq!(
             <GetAppliedFinalizedBlock as MethodMarker>::METHOD_ID,
             0x6d407974

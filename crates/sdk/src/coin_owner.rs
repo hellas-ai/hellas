@@ -206,7 +206,6 @@ impl OwnerReshape {
                 page.owned_coins(owner.into())
                     .into_iter()
                     .filter_map(|(id, coin)| {
-                        let id = CoinId::from_bytes(id.into());
                         (!reserved.contains(&id)
                             && coin.value > 0
                             && (coin.delegate.is_none() || coin.delegate == Some(delegate.into())))
@@ -226,7 +225,7 @@ impl OwnerReshape {
             {
                 break;
             }
-            after = page.holdings.as_ref().and_then(|holdings| holdings.next);
+            after = page.next_holdings();
             if after.is_none() {
                 break;
             }
@@ -368,35 +367,31 @@ mod tests {
         async fn get_holdings(
             &self,
             owner: hellas_chain::domain::SettlementKey,
-            after: Option<hellas_chain::domain::ObjectId>,
+            after: Option<hellas_chain::domain::ObjectKey>,
         ) -> Result<
             Option<hellas_chain::Verified<hellas_chain::ObjectSnapshot>>,
             hellas_chain::QueryError,
         > {
             assert_eq!(owner, self.owner);
-            let start = after.map_or(1, |id| id.0[0] as usize + 1);
+            let start = after.map_or(1, |key| key.id().0[0] as usize + 1);
             let end = (start + 32).min(130);
             let page = self.pages.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
             let keys: Vec<_> = (start..end)
                 .map(|index| hellas_chain::domain::ObjectId::from([index as u8; 32]))
                 .collect();
-            Ok(Some(hellas_chain::Verified::assume_for_tests(
-                hellas_chain::ObjectSnapshot {
-                    network: self.network,
-                    certified_at_ms: 0,
-                    block: hellas_chain::LatestBlock {
-                        height: page + 1,
-                        payload: hellas_chain::domain::Digest::from([page as u8; 32]),
-                        state_root: hellas_chain::domain::Digest::from([page as u8; 32]),
-                        finalization: Vec::new(),
-                    },
-                    objects: keys.iter().map(|id| (*id, self.coin(*id))).collect(),
-                    holdings: Some(hellas_chain::Holdings {
-                        next: (end < 130).then(|| keys[keys.len() - 1]),
-                        keys,
-                    }),
+            let snapshot = hellas_chain::ObjectSnapshot::new(
+                self.network,
+                hellas_chain::LatestBlock {
+                    height: page + 1,
+                    payload: hellas_chain::domain::Digest::from([page as u8; 32]),
+                    state_root: hellas_chain::domain::Digest::from([page as u8; 32]),
+                    finalization: Vec::new(),
                 },
-            )))
+                0,
+                keys.iter().map(|id| (*id, self.coin(*id))).collect(),
+            )
+            .with_holdings(keys, start as u64 - 1, 129)?;
+            Ok(Some(hellas_chain::Verified::assume_for_tests(snapshot)))
         }
 
         async fn get_objects(
@@ -409,33 +404,25 @@ mod tests {
             self.reads.lock().unwrap().push(keys.clone());
             let page = self.pages.load(std::sync::atomic::Ordering::SeqCst);
             Ok(Some(hellas_chain::Verified::assume_for_tests(
-                hellas_chain::ObjectSnapshot {
-                    network: self.network,
-                    certified_at_ms: 0,
-                    block: hellas_chain::LatestBlock {
+                hellas_chain::ObjectSnapshot::new(
+                    self.network,
+                    hellas_chain::LatestBlock {
                         height: page + 2,
                         payload: hellas_chain::domain::Digest::from([(page + 1) as u8; 32]),
                         state_root: hellas_chain::domain::Digest::from([(page + 1) as u8; 32]),
                         finalization: Vec::new(),
                     },
-                    objects: keys
-                        .into_iter()
+                    0,
+                    keys.into_iter()
                         .map(|key| (key.id(), self.coin(key.id())))
                         .collect(),
-                    holdings: None,
-                },
+                ),
             )))
         }
 
         async fn get_state_root(
             &self,
         ) -> Result<Option<hellas_chain::domain::Digest>, hellas_chain::QueryError> {
-            unreachable!()
-        }
-        async fn get_proof(
-            &self,
-            _: hellas_chain::domain::ObjectId,
-        ) -> Result<Option<Vec<u8>>, hellas_chain::QueryError> {
             unreachable!()
         }
         async fn get_finalization(

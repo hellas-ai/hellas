@@ -94,7 +94,6 @@ pub(crate) type FundingBinding<'a> =
     Box<dyn FnOnce() -> Result<(), crate::transact::PurchaseError> + Send + 'a>;
 
 pub(crate) struct FundingControls<'a> {
-    pub poll: Duration,
     pub timeout: Duration,
     pub approval: Option<&'a dyn crate::paid_client::FundingApproval>,
     /// Runs after application reservation, before owner signing or replay submission.
@@ -121,7 +120,6 @@ impl ClientOwner {
     ) -> Result<Funding, ClientOwnerError> {
         let network = self.chain.network();
         let FundingControls {
-            poll,
             timeout,
             approval,
             mut before_sign,
@@ -160,7 +158,6 @@ impl ClientOwner {
                 network,
                 &reshape,
                 (record.floor_height, record.floor_payload),
-                poll,
             )
             .await
         })
@@ -353,7 +350,6 @@ impl ClientOwner {
         chain: &RemoteLightClient,
         provider: iroh::EndpointId,
         need: u64,
-        poll: Duration,
         timeout: Duration,
     ) -> Result<Funding, ClientOwnerError> {
         self.fund_with_approval(
@@ -361,7 +357,6 @@ impl ClientOwner {
             provider,
             need,
             FundingControls {
-                poll,
                 timeout,
                 approval: None,
                 before_sign: None,
@@ -389,7 +384,6 @@ impl ClientOwner {
     ) -> Result<Funding, ClientOwnerError> {
         let network = self.chain.network();
         let FundingControls {
-            poll,
             timeout,
             approval,
             mut before_sign,
@@ -491,7 +485,6 @@ impl ClientOwner {
                                 network,
                                 &reshape,
                                 (record.floor_height, record.floor_payload),
-                                poll,
                             )
                             .await
                         {
@@ -511,25 +504,24 @@ impl ClientOwner {
                     reserved.insert(coin);
                 }
             }
-            let plan = loop {
-                match OwnerReshape::split_avoiding(
-                    chain,
-                    network,
-                    self.owner,
-                    need,
-                    self.delegate,
-                    &reserved,
-                )
-                .await
-                {
-                    #[expect(
-                        clippy::disallowed_methods,
-                        reason = "inventory class B: remote readiness; rollout 3"
-                    )]
-                    Err(CoinOwnerError::Query(
-                        QueryError::StateUnavailable(_) | QueryError::ChannelClosed,
-                    )) => tokio::time::sleep(poll).await,
-                    result => break result?,
+            let plan = {
+                let mut blocks = chain.finalized_blocks().await?;
+                loop {
+                    match OwnerReshape::split_avoiding(
+                        chain,
+                        network,
+                        self.owner,
+                        need,
+                        self.delegate,
+                        &reserved,
+                    )
+                    .await
+                    {
+                        Err(CoinOwnerError::Query(
+                            QueryError::StateUnavailable(_) | QueryError::ChannelClosed,
+                        )) => blocks.next().await?,
+                        result => break result?,
+                    }
                 }
             };
             let floor = plan
@@ -577,7 +569,7 @@ impl ClientOwner {
                 self.write(&archive, &record)?;
             }
             self.write(&path, &record)?;
-            let result = self.finish(chain, network, &reshape, floor, poll).await;
+            let result = self.finish(chain, network, &reshape, floor).await;
             if matches!(result, Err(ClientOwnerError::InputsSpent)) {
                 for (found, mut record, _) in self.records()? {
                     if found == path {
@@ -598,10 +590,10 @@ impl ClientOwner {
         network: NetworkId,
         reshape: &Reshape,
         floor: (u64, [u8; 32]),
-        poll: Duration,
     ) -> Result<Funding, ClientOwnerError> {
         let coin = Reshape::output_ids(network, reshape.inputs(), reshape.outputs()).as_slice()[0];
         let mut submitted = false;
+        let mut blocks = chain.finalized_blocks().await?;
         loop {
             let keys = std::iter::once(coin)
                 .chain(reshape.inputs().iter().copied())
@@ -609,11 +601,7 @@ impl ClientOwner {
                 .collect();
             let snapshot = match chain.get_objects(keys).await {
                 Err(QueryError::StateUnavailable(_) | QueryError::ChannelClosed) => {
-                    #[expect(
-                        clippy::disallowed_methods,
-                        reason = "inventory class B: remote readiness; rollout 3"
-                    )]
-                    tokio::time::sleep(poll).await;
+                    blocks.next().await?;
                     continue;
                 }
                 result => result?.ok_or(CoinOwnerError::NoSnapshot)?,
@@ -622,11 +610,7 @@ impl ClientOwner {
                 return Err(CoinOwnerError::Network.into());
             }
             if snapshot.block.height < floor.0 {
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "inventory class B: finalized floor; rollout 3"
-                )]
-                tokio::time::sleep(poll).await;
+                blocks.next().await?;
                 continue;
             }
             if snapshot.block.height == floor.0 && snapshot.block.payload != floor.1.into() {
@@ -661,11 +645,7 @@ impl ClientOwner {
                 }
                 submitted = true;
             }
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "inventory class B: finalized reshape; rollout 3"
-            )]
-            tokio::time::sleep(poll).await;
+            blocks.next().await?;
         }
     }
 }

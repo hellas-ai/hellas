@@ -14,7 +14,7 @@ use crate::{
     execution::store::{UtxoDatabase, UtxoDb},
     indexer::ChainIndexer,
     light_client::{
-        ConsensusInfo, FinalizedBlock, FinalizedBlockQuery, Holdings, LatestBlock, LightClient,
+        ConsensusInfo, FinalizedBlock, FinalizedBlockQuery, LatestBlock, LightClient,
         ObjectSnapshot, QueryError, Verified,
     },
     owner_index::{OwnerCursor, OwnerIndex},
@@ -538,17 +538,6 @@ impl Lookup<'_> {
             timestamp,
         ))
     }
-
-    fn holdings(&self) -> Option<Holdings> {
-        self.page.as_ref().map(|page| {
-            let keys = page
-                .holdings
-                .iter()
-                .map(|holding| ObjectId::from(holding.object_id))
-                .collect();
-            Holdings::new(keys, page.offset, page.summary().count)
-        })
-    }
 }
 
 /// This node's own read: it executed the state, so the snapshot is verified
@@ -567,18 +556,28 @@ async fn read_objects(
         return Ok(None);
     };
     let (block, certified_at_ms) = found.snapshot(chain_indexer).await?;
-    let holdings = found.holdings();
-    Ok(Some(Verified::new(ObjectSnapshot {
+    let snapshot = ObjectSnapshot::new(
         network,
         block,
         certified_at_ms,
-        objects: found
+        found
             .objects
             .into_iter()
             .filter_map(|(key, object)| object.map(|object| (key, object)))
             .collect(),
-        holdings,
-    })))
+    );
+    let Some(page) = found.page else {
+        return Ok(Some(Verified::new(snapshot)));
+    };
+    let listed = page
+        .holdings
+        .iter()
+        .map(|holding| ObjectId::from(holding.object_id))
+        .collect();
+    let snapshot = snapshot
+        .with_holdings(listed, page.offset, page.summary().count)
+        .map_err(|error| QueryError::StateUnavailable(format!("owner page: {error}")))?;
+    Ok(Some(Verified::new(snapshot)))
 }
 
 /// Reads every object of one work channel under one database snapshot.
@@ -788,7 +787,7 @@ impl LightClient for LocalLightClient {
     async fn get_holdings(
         &self,
         owner: SettlementKey,
-        after: Option<ObjectId>,
+        after: Option<crate::domain::ObjectKey>,
     ) -> Result<Option<Verified<ObjectSnapshot>>, QueryError> {
         self.require_ready()?;
         read_objects(
@@ -797,7 +796,7 @@ impl LightClient for LocalLightClient {
             &self.chain_indexer,
             self.network()?,
             Default::default(),
-            Some((owner, after)),
+            Some((owner, after.map(crate::domain::ObjectKey::id))),
         )
         .await
     }
@@ -805,13 +804,6 @@ impl LightClient for LocalLightClient {
     async fn get_state_root(&self) -> Result<Option<Digest>, QueryError> {
         self.require_ready()?;
         Ok(Some(self.databases.read().await.root()))
-    }
-
-    async fn get_proof(&self, object_id: ObjectId) -> Result<Option<Vec<u8>>, QueryError> {
-        let _ = object_id;
-        Err(QueryError::StateUnavailable(
-            "key proofs are not available".to_string(),
-        ))
     }
 
     async fn get_finalization(&self, payload: Digest) -> Result<Option<Vec<u8>>, QueryError> {

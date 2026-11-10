@@ -16,6 +16,13 @@ fn coin_key(id: ObjectId) -> crate::domain::ObjectKey {
     crate::domain::ObjectKey::Coin(hellas_kernel::CoinId::from_bytes(id.0))
 }
 
+fn has_coin(snapshot: &crate::ObjectSnapshot, id: ObjectId) -> bool {
+    snapshot
+        .coin(hellas_kernel::CoinId::from_bytes(id.0))
+        .unwrap()
+        .is_some()
+}
+
 mod adversarial;
 
 #[derive(Default)]
@@ -112,7 +119,6 @@ impl LightClient for ObservedClient {
 
     forward! {
         get_state_root() -> Option<Digest>;
-        get_proof(object_id: ObjectId) -> Option<Vec<u8>>;
         get_plain_objects(request: GetObjectProofsRequest) -> hellas_rpc::pb::chain::GetObjectsResponse;
         get_finalization(payload: Digest) -> Option<Vec<u8>>;
         get_latest_block() -> Option<LatestBlock>;
@@ -360,7 +366,7 @@ fn empty_current_database_absence_is_verified_by_hellas() {
                 None,
             )
             .unwrap();
-        assert!(verified.objects.is_empty());
+        assert!(!has_coin(&verified, missing));
         let mut invalid = response;
         invalid.proofs[0].proof[0] ^= 1;
         assert!(
@@ -389,7 +395,7 @@ async fn pages(remote: &RemoteLightClient, owner: SettlementKey) -> Vec<crate::O
             .unwrap()
             .unwrap()
             .into_inner();
-        after = page.holdings.as_ref().unwrap().next;
+        after = page.next_holdings();
         pages.push(page);
         if after.is_none() {
             return pages;
@@ -397,10 +403,10 @@ async fn pages(remote: &RemoteLightClient, owner: SettlementKey) -> Vec<crate::O
     }
 }
 
-fn values(coins: Vec<(ObjectId, crate::domain::Coin)>) -> Vec<(ObjectId, u64)> {
+fn values(coins: Vec<(hellas_kernel::CoinId, crate::domain::Coin)>) -> Vec<(ObjectId, u64)> {
     coins
         .into_iter()
-        .map(|(id, coin)| (id, coin.value))
+        .map(|(id, coin)| (ObjectId::from(id.to_bytes()), coin.value))
         .collect()
 }
 
@@ -451,7 +457,7 @@ fn owner_cursor_pages_remain_complete_while_every_page_has_a_new_finalized_root(
                 assert_eq!(*value, 100);
                 assert!(ids.insert(*id), "cursor repeated an owner holding");
             }
-            after = page.holdings.as_ref().unwrap().next;
+            after = page.next_holdings();
             if index < 4 {
                 assert!(after.is_some());
                 let (next, batch) = prepare(
@@ -491,8 +497,8 @@ fn current_proofs_bind_inclusion_absence_and_requested_root() {
             .unwrap()
             .unwrap();
         assert_eq!(first.block.payload, fixture.applied.digest());
-        assert!(first.objects.contains_key(&fixture.old_coin));
-        assert!(!first.objects.contains_key(&fixture.new_coin));
+        assert!(has_coin(&first, fixture.old_coin));
+        assert!(!has_coin(&first, fixture.new_coin));
         let request = fixture.operations.lock().unwrap().requests[0].clone();
         assert_eq!(request.object_ids.len(), 2);
         assert!(request.payload.is_none());
@@ -527,8 +533,8 @@ fn current_proofs_bind_inclusion_absence_and_requested_root() {
             .unwrap()
             .unwrap();
         assert_eq!(second.block.payload, fixture.archived.digest());
-        assert!(!second.objects.contains_key(&fixture.old_coin));
-        assert!(second.objects.contains_key(&fixture.new_coin));
+        assert!(!has_coin(&second, fixture.old_coin));
+        assert!(has_coin(&second, fixture.new_coin));
         fixture.operations.lock().unwrap().replay_old = true;
         assert!(
             matches!(
@@ -576,16 +582,15 @@ fn old_current_proof_cannot_authenticate_a_new_root() {
     run_qmdb(|runtime| async move {
         let mut fixture = fixture(runtime).await;
         let key = fixture.old_coin;
-        assert!(
-            fixture
+        assert!(has_coin(
+            &fixture
                 .remote
                 .get_objects(vec![coin_key(key)])
                 .await
                 .unwrap()
-                .unwrap()
-                .objects
-                .contains_key(&key)
-        );
+                .unwrap(),
+            key
+        ));
         fixture
             .database
             .finalize(fixture.pending.take().unwrap())
@@ -600,16 +605,15 @@ fn old_current_proof_cannot_authenticate_a_new_root() {
             "old proof cannot authenticate new root"
         );
         fixture.operations.lock().unwrap().corrupt = 0;
-        assert!(
-            !fixture
+        assert!(!has_coin(
+            &fixture
                 .remote
                 .get_objects(vec![coin_key(key)])
                 .await
                 .unwrap()
-                .unwrap()
-                .objects
-                .contains_key(&key)
-        );
+                .unwrap(),
+            key
+        ));
         fixture.stop().await;
     });
 }
@@ -730,8 +734,10 @@ fn trusted_reads_answer_the_proven_read_without_proofs() {
             .unwrap();
         let plain = fixture.trusted.get_objects(keys).await.unwrap().unwrap();
         assert_eq!(plain.block, proven.block);
-        assert_eq!(plain.objects, proven.objects);
-        assert!(plain.holdings.is_none());
+        for key in [fixture.old_coin, fixture.new_coin] {
+            assert_eq!(has_coin(&plain, key), has_coin(&proven, key));
+        }
+        assert!(plain.holdings().is_none());
 
         let proven = fixture
             .remote
@@ -745,13 +751,13 @@ fn trusted_reads_answer_the_proven_read_without_proofs() {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(plain.holdings, proven.holdings);
+        assert_eq!(plain.holdings(), proven.holdings());
         assert_eq!(plain.owned_coins(fixture.owner).len(), 32);
         assert_eq!(
             plain.owned_coins(fixture.owner),
             proven.owned_coins(fixture.owner)
         );
-        let after = plain.holdings.as_ref().unwrap().next;
+        let after = plain.next_holdings();
         let rest = fixture
             .trusted
             .get_holdings(fixture.owner, after)
@@ -759,7 +765,7 @@ fn trusted_reads_answer_the_proven_read_without_proofs() {
             .unwrap()
             .unwrap();
         assert_eq!(rest.owned_coins(fixture.owner).len(), 1);
-        assert_eq!(rest.holdings.as_ref().unwrap().next, None);
+        assert_eq!(rest.next_holdings(), None);
         fixture.stop().await;
     });
 }

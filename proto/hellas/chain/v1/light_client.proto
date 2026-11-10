@@ -28,7 +28,6 @@ service LightClient {
   rpc GetObjectProofs(GetObjectProofsRequest) returns (GetObjectProofsResponse);
   rpc SubscribeFinalized(GetLatestBlockRequest) returns (stream GetFinalizedBlockResponse);
   rpc GetStateRoot(GetStateRootRequest) returns (GetStateRootResponse);
-  rpc GetProof(GetProofRequest) returns (GetProofResponse);
   rpc GetFinalization(GetFinalizationRequest) returns (GetFinalizationResponse);
   rpc GetLatestBlock(GetLatestBlockRequest) returns (GetLatestBlockResponse);
   rpc GetFinalizedBlock(GetFinalizedBlockRequest) returns (GetFinalizedBlockResponse);
@@ -131,13 +130,6 @@ message OwnerPageProof {
 message GetStateRootRequest {}
 message GetStateRootResponse {
   optional bytes state_root = 1;
-}
-
-message GetProofRequest {
-  bytes object_id = 1;
-}
-message GetProofResponse {
-  optional bytes proof = 1;
 }
 
 message GetFinalizationRequest {

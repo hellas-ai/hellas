@@ -157,15 +157,6 @@ impl FullNode {
             .owner_proof(&self.0.core.database, owner, offset, limit, payload)
             .await
     }
-    /// Serve the finalized chain subset on a host's authenticated iroh
-    /// connection. Streams and reads share the connection concurrently.
-    pub async fn serve_chain(&self, transport: Arc<IrohTransport>) {
-        dispatch(
-            transport,
-            Admission(ChainSyncServer(self.clone()), self.0.manager.clone()),
-        )
-        .await;
-    }
     pub fn config(&self) -> &Config {
         &self.0.config
     }
@@ -180,18 +171,6 @@ impl FullNode {
     }
     pub fn peer_ids(&self) -> Vec<iroh::EndpointId> {
         self.0.network.ids()
-    }
-    /// Capabilities for the host's endpoint when it also mounts this ChainSync handler.
-    pub fn discovery(
-        &self,
-        id: iroh::EndpointId,
-        service_alpns: Vec<String>,
-    ) -> impl NodeHandler + Clone + 'static {
-        NodeService {
-            id,
-            service_alpns,
-            network: self.0.network.clone(),
-        }
     }
     pub async fn shutdown(self) -> Result<(), Error> {
         self.0.core.readiness.halt("chain node shutdown");
@@ -320,7 +299,8 @@ impl ChainSyncHandler for SyncService {
     }
 }
 
-// External dispatchers retain the node lease for the complete RPC/stream lifetime.
+// Tests read a node through the public ChainSync subset; the lease lives for the whole call.
+#[cfg(test)]
 #[allow(refining_impl_trait)]
 impl ChainSyncHandler for FullNode {
     async fn get_latest_block(

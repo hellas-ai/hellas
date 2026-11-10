@@ -926,7 +926,7 @@ mod tests {
                     Some((owner, None)),
                 )
                 .unwrap();
-            assert_eq!(verified_objects.holdings.as_ref().unwrap().keys.len(), 1);
+            assert_eq!(verified_objects.holdings().unwrap().keys.len(), 1);
             for pin in [None, Some(latest.payload.as_str())] {
                 let query = pin.map_or(String::new(), |pin| format!("?payload={pin}"));
                 let response = app

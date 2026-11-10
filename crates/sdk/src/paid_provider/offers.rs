@@ -396,14 +396,13 @@ impl OfferAllocator {
                 .delegated_coins(delegate)
                 .into_iter()
                 .find_map(|(id, coin)| {
-                    let id = CoinId::from_bytes(id.0);
                     (!reserved.contains(&id)
                         && coin.owner == Key::from_bytes(*owner.as_bytes()).into()
                         && coin.value > 0
                         && coin.value <= current.policy.offers.max_stake_per_client)
                         .then_some((id, coin.value))
                 });
-            after = page.holdings.as_ref().and_then(|holdings| holdings.next);
+            after = page.next_holdings();
             if found.is_some() || after.is_none() {
                 break found;
             }

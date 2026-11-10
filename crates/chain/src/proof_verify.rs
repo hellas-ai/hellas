@@ -380,23 +380,23 @@ impl ProofVerifier {
                     .iter()
                     .map(|holding| ObjectId::from(holding.object_id))
                     .collect();
-                Some(crate::light_client::Holdings::new(
-                    keys,
-                    page.offset,
-                    summary.count,
-                ))
+                Some((keys, page.offset, summary.count))
             }
             None => None,
         };
-        Ok(crate::light_client::Verified::new(
-            crate::light_client::ObjectSnapshot {
-                network: self.network(),
-                block: verified.view.snapshot().clone(),
-                certified_at_ms: verified.view.timestamp(),
-                objects,
-                holdings,
-            },
-        ))
+        let snapshot = crate::light_client::ObjectSnapshot::new(
+            self.network(),
+            verified.view.snapshot().clone(),
+            verified.view.timestamp(),
+            objects,
+        );
+        let snapshot = match holdings {
+            Some((keys, offset, count)) => snapshot
+                .with_holdings(keys, offset, count)
+                .map_err(|_| VerificationError::InvalidProof)?,
+            None => snapshot,
+        };
+        Ok(crate::light_client::Verified::new(snapshot))
     }
 }
 

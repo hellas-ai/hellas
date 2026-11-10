@@ -126,13 +126,12 @@ async fn owned_coins(
     let mut coins = Vec::new();
     let mut after = None;
     while let Some(page) = client.get_holdings(owner, after).await? {
-        for (id, coin) in page.owned_coins(owner) {
-            coins.push((
-                CoinId::from_bytes(<[u8; 32]>::try_from(id.as_ref())?),
-                coin.value,
-            ));
-        }
-        after = page.holdings.as_ref().and_then(|page| page.next);
+        coins.extend(
+            page.owned_coins(owner)
+                .into_iter()
+                .map(|(id, coin)| (id, coin.value)),
+        );
+        after = page.next_holdings();
         if after.is_none() {
             break;
         }

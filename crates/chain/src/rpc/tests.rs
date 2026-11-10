@@ -1199,7 +1199,7 @@ fn finalized_reads_inside_the_commit_before_publish_window_use_the_committed_blo
             .into_iter()
             .map(|(id, coin)| (id, coin.value))
             .collect();
-        assert_eq!(coins, vec![(ids[0], 100)]);
+        assert_eq!(coins, vec![(CoinId::from_bytes(ids[0].0), 100)]);
         assert_eq!(snapshot.unwrap().unwrap().block().payload, next.digest());
 
         // State that is not the next finalized block is refused at once, rather

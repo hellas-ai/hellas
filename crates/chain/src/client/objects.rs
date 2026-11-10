@@ -1,6 +1,5 @@
 use super::*;
 use crate::domain::{Object, ObjectKey};
-use crate::light_client::Holdings;
 use commonware_codec::DecodeExt as _;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -35,7 +34,8 @@ pub(super) async fn read(
 ) -> Result<Option<Verified<ObjectSnapshot>>, QueryError> {
     let keys = key_set(keys)?;
     let response = client
-        .rpc_client()
+        .rpc()
+        .await?
         .get_object_proofs(request(&keys, owner))
         .await
         .map_err(QueryError::from)?;
@@ -62,7 +62,7 @@ pub(super) async fn read(
 /// [`RemoteLightClient`].
 #[derive(Clone)]
 pub struct TrustedReader {
-    client: LightClientClientImpl<MuxTransport>,
+    connection: std::sync::Arc<Connection>,
     network: hellas_kernel::NetworkId,
 }
 
@@ -72,9 +72,8 @@ impl TrustedReader {
         addr: impl Into<String>,
         network: hellas_kernel::NetworkId,
     ) -> Result<Self, QueryError> {
-        let transport = connect_transport(&addr.into()).await?;
         Ok(Self {
-            client: LightClientClientImpl::new(transport),
+            connection: std::sync::Arc::new(Connection::open(addr.into()).await?),
             network,
         })
     }
@@ -89,9 +88,10 @@ impl TrustedReader {
     pub async fn get_holdings(
         &self,
         owner: SettlementKey,
-        after: Option<ObjectId>,
+        after: Option<ObjectKey>,
     ) -> Result<Option<ObjectSnapshot>, QueryError> {
-        self.read(BTreeSet::new(), Some((owner, after))).await
+        self.read(BTreeSet::new(), Some((owner, after.map(ObjectKey::id))))
+            .await
     }
 
     async fn read(
@@ -100,7 +100,9 @@ impl TrustedReader {
         owner: OwnerCursor,
     ) -> Result<Option<ObjectSnapshot>, QueryError> {
         let response = self
-            .client
+            .connection
+            .client()
+            .await?
             .get_objects(request(&keys, owner))
             .await
             .map_err(QueryError::from)?;
@@ -120,25 +122,18 @@ impl TrustedReader {
                 );
             }
         }
-        let holdings = response
-            .owner_page
-            .map(|page| {
-                let keys = page
-                    .holdings
-                    .iter()
-                    .map(|key| <[u8; 32]>::try_from(key.as_slice()).map(ObjectId::from))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|_| invalid("holding"))?;
-                let count = page.summary.ok_or_else(|| invalid("owner summary"))?.count;
-                Ok::<_, QueryError>(Holdings::new(keys, page.offset, count))
-            })
-            .transpose()?;
-        Ok(Some(ObjectSnapshot {
-            network: self.network,
-            block: latest_block_from_proto(snapshot)?,
-            certified_at_ms: 0,
-            objects,
-            holdings,
-        }))
+        let snapshot =
+            ObjectSnapshot::new(self.network, latest_block_from_proto(snapshot)?, 0, objects);
+        let Some(page) = response.owner_page else {
+            return Ok(Some(snapshot));
+        };
+        let keys = page
+            .holdings
+            .iter()
+            .map(|key| <[u8; 32]>::try_from(key.as_slice()).map(ObjectId::from))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| invalid("holding"))?;
+        let count = page.summary.ok_or_else(|| invalid("owner summary"))?.count;
+        snapshot.with_holdings(keys, page.offset, count).map(Some)
     }
 }
