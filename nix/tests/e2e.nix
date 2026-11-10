@@ -278,6 +278,22 @@ in
           "test \"$(cat /sys/fs/cgroup/system.slice/hellas.service/memory.swap.max)\" = 0"
       )
 
+      # This run's journal; each start of an unowned node prints a new invite.
+      run_log = (
+          "journalctl -o cat _SYSTEMD_INVOCATION_ID="
+          "$(systemctl show -p InvocationID --value hellas.service)"
+      )
+      # A node without an owner waits for one, and a signal ends the wait promptly.
+      machine.wait_until_succeeds(f"{run_log} | grep -q '^hellas-invite:'", timeout=60)
+      machine.succeed("timeout 30 systemctl stop hellas.service")
+
+      # Its owner pairs it with the invite; an owned node starts serving.
+      machine.succeed("systemctl start hellas.service")
+      machine.wait_until_succeeds(f"{run_log} | grep -q '^hellas-invite:'", timeout=60)
+      invite = machine.succeed(f"{run_log} | grep -m1 '^hellas-invite:'").strip()
+      machine.succeed(f"hellas --home /tmp/hellas-owner pair {invite}")
+      machine.wait_until_succeeds(f"{run_log} | grep -q 'RPC server running.'", timeout=60)
+
       # Keep the discovery subscriber alive before the provider advertises.
       machine.succeed("systemctl stop hellas.service")
       machine.succeed("systemctl start hellas-monitor.service")
