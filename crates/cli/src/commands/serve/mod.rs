@@ -160,6 +160,7 @@ pub async fn run(mut options: ServeOptions) -> CliResult<()> {
     };
     // Install signal handlers before publishing a ready local control socket.
     let shutdown = shutdown_signal().context("failed to listen for shutdown signal")?;
+    tokio::pin!(shutdown);
     let node_id = options.secret_key.public();
     let address = hellas_sdk::client::ProviderAddress::of(options.open_identity.enrollment())?;
     anyhow::ensure!(
@@ -186,15 +187,23 @@ pub async fn run(mut options: ServeOptions) -> CliResult<()> {
                 .await?
         }
         // Everything local is checked: wait for the owner if the node has none.
+        // A signal ends the wait; the next start prints a new invite.
         None => {
-            let (grants, transport) = bootstrap::prepare(
-                &options.home,
-                &provider.secret_key,
-                provider.open_identity.enrollment(),
-                options.port,
-                options.grants,
-            )
-            .await?;
+            let prepared = tokio::select! {
+                prepared = bootstrap::prepare(
+                    &options.home,
+                    &provider.secret_key,
+                    provider.open_identity.enrollment(),
+                    options.port,
+                    options.grants,
+                ) => prepared,
+                signal = &mut shutdown => {
+                    println!("Shutting down...");
+                    content.close().await;
+                    return signal.context("failed to listen for shutdown signal");
+                }
+            };
+            let (grants, transport) = prepared?;
             let started = configuration::start_host(
                 provider,
                 Some(grants),
@@ -237,7 +246,7 @@ pub async fn run(mut options: ServeOptions) -> CliResult<()> {
     eprintln!("Explorer:     {add_url}");
 
     println!("RPC server running. Press Ctrl+C to stop.");
-    shutdown.await?;
+    (&mut shutdown).await?;
 
     println!("Shutting down...");
     // Return failures through the CLI so its telemetry guard still flushes.
