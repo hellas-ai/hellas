@@ -1284,9 +1284,12 @@ impl Channel<PaymentFunding> {
             });
         }
 
-        // Compute credit is the provider's exposure and only the
-        // provider's: the client is the party that would default on it.
-        // Every active job contributes to the reserved total before co-signing.
+        // Funded capacity binds both parties: a job beyond it is one no
+        // payment can carry. Compute credit is the provider's exposure and
+        // only the provider's: the client is the party that would default
+        // on it. Every open job holds its price against both until its
+        // terminal, so concurrent jobs cannot over-commit either.
+        self.check_capacity(authorization.price)?;
         if self.role == Role::Provider {
             self.check_compute_limit(authorization.price)?;
         }
@@ -1712,48 +1715,63 @@ impl Channel<PaymentFunding> {
         Ok(Applied::Changed)
     }
 
+    /// Reserves this job's price against the payment edge's funded
+    /// capacity. A payment moves an open job's reservation into the
+    /// credited total; an expiry releases it.
+    fn check_capacity(&self, price: u64) -> Result<(), ChannelStateError> {
+        let reserved = self.reserved(|_| true);
+        let used = self.ledger.credited_cumulative();
+        reserve(
+            "capacity",
+            used,
+            reserved,
+            price,
+            self.funding.settlement.capacity(),
+        )
+    }
+
     /// Reserves this job's price against the channel's outstanding compute credit.
     fn check_compute_limit(&self, price: u64) -> Result<(), ChannelStateError> {
         let limit = self.funding.channel.channel_policy().compute_credit_limit;
-        let reserved = self
-            .book
-            .jobs
-            .values()
-            .map(|job| job.authorization.price)
-            .fold(0_u64, u64::saturating_add);
-        if reserved.saturating_add(price) > limit {
-            return Err(ChannelStateError::OverCredit {
-                ledger: "compute",
-                used: 0,
-                reserved,
-                price,
-                limit,
-            });
-        }
-        Ok(())
+        reserve("compute", 0, self.reserved(|_| true), price, limit)
     }
 
     /// Checks the one job's price against the delivery limit.
     fn check_delivery_limit(&self, price: u64) -> Result<(), ChannelStateError> {
         let limit = self.funding.channel.channel_policy().delivery_credit_limit;
-        let reserved = self
-            .book
+        let reserved = self.reserved(|job| job.phase.delivered());
+        reserve("delivery", 0, reserved, price, limit)
+    }
+
+    /// The summed price of the open jobs `held` selects.
+    fn reserved(&self, held: impl Fn(&JobState) -> bool) -> u64 {
+        self.book
             .jobs
             .values()
-            .filter(|job| job.phase.delivered())
+            .filter(|job| held(job))
             .map(|job| job.authorization.price)
-            .fold(0_u64, u64::saturating_add);
-        if reserved.saturating_add(price) > limit {
-            return Err(ChannelStateError::OverCredit {
-                ledger: "delivery",
-                used: 0,
-                reserved,
-                price,
-                limit,
-            });
-        }
-        Ok(())
+            .fold(0_u64, u64::saturating_add)
     }
+}
+
+/// Refuses `price` when it would take `used` plus `reserved` past `limit`.
+fn reserve(
+    ledger: &'static str,
+    used: u64,
+    reserved: u64,
+    price: u64,
+    limit: u64,
+) -> Result<(), ChannelStateError> {
+    if used.saturating_add(reserved).saturating_add(price) > limit {
+        return Err(ChannelStateError::OverCredit {
+            ledger,
+            used,
+            reserved,
+            price,
+            limit,
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]

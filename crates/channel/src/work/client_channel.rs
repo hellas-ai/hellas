@@ -57,6 +57,7 @@ impl ClientService {
             observer: ClientObserver {
                 endpoint: Arc::new(EndpointLock::new(endpoint)),
                 driving: Arc::new(AtomicBool::new(false)),
+                changed: Arc::new(tokio::sync::watch::Sender::new(())),
             },
         }
     }
@@ -145,6 +146,9 @@ impl ClientService {
 pub struct ClientObserver {
     endpoint: Arc<EndpointLock<ClientEndpoint>>,
     driving: Arc<AtomicBool>,
+    /// Marks every change to readiness: a confirmation, a suspension, or a
+    /// certified read applied by the driver.
+    changed: Arc<tokio::sync::watch::Sender<()>>,
 }
 
 impl ClientObserver {
@@ -185,6 +189,7 @@ impl ClientObserver {
             .ok_or(EndpointError::NotAdmitting)?
             .confirm(height, certified_at_ms)?;
         endpoint.ready = Some(ready);
+        self.changed.send_replace(());
         Ok(())
     }
 
@@ -203,15 +208,36 @@ impl ClientObserver {
     /// Returns local readiness; never contacts a validator.
     pub async fn readiness(&self) -> Result<ReadyChannel, EndpointError> {
         let endpoint = self.endpoint().await?;
+        // A closing channel never admits again, however fresh its read.
+        if endpoint.state().is_closing() {
+            return Err(EndpointError::NotAdmitting);
+        }
         endpoint
             .observation
             .as_ref()
             .ok_or(EndpointError::NotAdmitting)?
             .check()?;
-        if endpoint.state().is_closing() {
-            return Err(EndpointError::NotAdmitting);
-        }
         endpoint.ready.clone().ok_or(EndpointError::NotAdmitting)
+    }
+
+    /// Readiness from a confirmation that has not lapsed. A lapsed one waits
+    /// for the observer's next change; every other refusal is final.
+    ///
+    /// # Errors
+    ///
+    /// The refusals of [`Self::readiness`] other than
+    /// [`EndpointError::ObservationStale`].
+    pub async fn fresh_readiness(&self) -> Result<ReadyChannel, EndpointError> {
+        let mut changed = self.changed.subscribe();
+        loop {
+            match self.readiness().await {
+                Err(EndpointError::ObservationStale) => {
+                    // The sender lives as long as `self`.
+                    let _ = changed.changed().await;
+                }
+                ready => return ready,
+            }
+        }
     }
 
     /// Stops new signatures while the observer reconnects or shuts down.
@@ -222,6 +248,7 @@ impl ClientObserver {
             .as_mut()
             .ok_or(EndpointError::NotAdmitting)?
             .suspend();
+        self.changed.send_replace(());
         Ok(())
     }
 
@@ -277,7 +304,10 @@ impl ClientDriver<'_> {
     pub async fn observe(&mut self, observed: &ObservedChannel<'_>) -> Result<u64, CatchUpError> {
         let mut store = self.store().await?;
         observe(&mut store, observed, &Secp256k1Verifier::new()).await?;
-        Ok(store.state().cursor().0)
+        let cursor = store.state().cursor().0;
+        drop(store);
+        self.service.changed.send_replace(());
+        Ok(cursor)
     }
 
     /// Drives a retained close without blocking ordinary state access.
@@ -300,6 +330,16 @@ mod proposal_tests {
     use hellas_store::content::{ContentStore as _, *};
 
     async fn service(root: &std::path::Path) -> (ClientService, DiskStore, u64) {
+        let (service, content, capacity) = unobserved_service(root).await;
+        service
+            .observer()
+            .observe_ready(fixture::ready())
+            .await
+            .unwrap();
+        (service, content, capacity)
+    }
+
+    async fn unobserved_service(root: &std::path::Path) -> (ClientService, DiskStore, u64) {
         let ready = fixture::ready();
         let input = fixture::bundle(1);
         let bytes = input.canonical_bytes().unwrap();
@@ -354,8 +394,22 @@ mod proposal_tests {
         let service = ClientService::new(
             ClientEndpoint::new(ready.clone(), store, fixture::client()).unwrap(),
         );
-        service.observer().observe_ready(ready).await.unwrap();
         (service, content, capacity)
+    }
+
+    #[tokio::test]
+    async fn a_lapsed_confirmation_waits_for_the_observers_next_one() {
+        let root = tempfile::tempdir().unwrap();
+        let (service, _content, _) = unobserved_service(root.path()).await;
+        let observer = service.observer();
+        let waiting = tokio::spawn({
+            let observer = observer.clone();
+            async move { observer.fresh_readiness().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        observer.observe_ready(fixture::ready()).await.unwrap();
+        assert_eq!(waiting.await.unwrap(), Ok(fixture::ready()));
     }
 
     #[tokio::test]

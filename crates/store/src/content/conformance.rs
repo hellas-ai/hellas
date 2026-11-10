@@ -8,9 +8,10 @@ use hellas_auth::Digest;
 use hellas_rpc::{
     ContentRef,
     services::content::{Content, ContentServer},
+    services::resolve::{ResolveClientImpl, ResolveMethod, ResolveServer},
 };
 use hellas_wire::{
-    Dispatcher, ServiceMarker, StreamTransport, TransportContext,
+    Dispatcher, MethodMarker as _, ServiceMarker, StreamTransport, TransportContext,
     clock::DefaultClock,
     mux::{MessagePipe, MuxConfig, MuxTransport, Role},
 };
@@ -31,7 +32,8 @@ impl MessagePipe for Pipe {
         Ok(self.1.recv().await)
     }
 }
-fn mux<S: ContentStore + 'static>(store: Arc<S>, scope: Scope) -> MuxTransport {
+/// The RPC adapter over disk, routing Resolve beside Content as the host does.
+fn mux(store: Arc<DiskStore>, scope: Scope) -> MuxTransport {
     let (a_tx, a_rx) = tokio::sync::mpsc::unbounded_channel();
     let (b_tx, b_rx) = tokio::sync::mpsc::unbounded_channel();
     let client = MuxTransport::spawn::<8, _, _>(
@@ -53,11 +55,11 @@ fn mux<S: ContentStore + 'static>(store: Arc<S>, scope: Scope) -> MuxTransport {
         while let Ok(Some(inbound)) = server.accept().await {
             let service = service.clone();
             tokio::spawn(async move {
-                let _ = <ContentServer<ContentService<S>> as Dispatcher<MuxTransport>>::dispatch(
-                    &ContentServer(service),
-                    inbound,
-                )
-                .await;
+                let _ = if inbound.method_id == ResolveMethod::METHOD_ID {
+                    Dispatcher::<MuxTransport>::dispatch(&ResolveServer(service), inbound).await
+                } else {
+                    Dispatcher::<MuxTransport>::dispatch(&ContentServer(service), inbound).await
+                };
             });
         }
     });
@@ -945,4 +947,131 @@ async fn rpc_disk() {
         remotes: Mutex::new(vec![]),
     })
     .await;
+}
+
+/// A remote owner resolves an HF repo and acquires its weights over its
+/// content connection; a job then reads them through its Work scope, and
+/// once the pins are removed the content is collected.
+#[tokio::test]
+async fn a_remote_owner_resolves_and_acquires_an_hf_repo_a_job_then_reads() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = DiskStore::open(
+        hellas_private::StoreLocation::for_test(root.path()),
+        vec![],
+        IndexMode::Resume,
+        None,
+        Reservations::ram(32 << 20),
+        false,
+    )
+    .await
+    .unwrap();
+    store.finish_recovery().await.unwrap();
+    let sha = "a".repeat(40);
+    let weights = ContentRef::for_bytes(b"weights");
+    let xorb = hellas_xet::XetHash::ZERO;
+    let frame = framed(b"weights");
+    let listing = serde_json::json!([
+        {"type":"file","path":"tokenizer.json","size":2},
+        {"type":"file","path":"weights.bin","size":7,"xetHash":weights.id().to_string()},
+    ])
+    .to_string()
+    .into_bytes();
+    let tree_path = format!("/api/models/org/repo/tree/{sha}?recursive=true");
+    let tokenizer_path = format!("/org/repo/resolve/{sha}/tokenizer.json");
+    let (base, serving) = hub(|base| {
+        vec![
+            // Resolve: the revision, the listing, and the git-stored small file.
+            ("/api/models/org/repo/revision/main".into(), 200, serde_json::json!({"sha":sha}).to_string().into_bytes()),
+            (tree_path.clone(), 200, listing.clone()),
+            (tokenizer_path.clone(), 200, b"{}".to_vec()),
+            // Acquire: the same tree, then the Xet weights.
+            (tree_path, 200, listing),
+            (tokenizer_path, 200, b"{}".to_vec()),
+            (format!("/api/models/org/repo/xet-read-token/{sha}"), 200, format!("{{\"accessToken\":\"t\",\"casUrl\":\"{base}\"}}").into_bytes()),
+            (format!("/v2/reconstructions/{}", weights.id()), 200, serde_json::json!({"terms":[{"hash":xorb.to_string(),"range":{"start":0,"end":1},"unpacked_length":7}],"xorbs":{xorb.to_string():[{"url":format!("{base}/xorb"),"ranges":[{"chunks":{"start":0,"end":1},"bytes":{"start":0,"end":frame.len()-1}}]}]}}).to_string().into_bytes()),
+            ("/xorb".into(), 206, frame),
+        ]
+    });
+    store.core.hf_hub = Some(base);
+    let transport = mux(Arc::new(store.clone()), Scope::Owner);
+    let owner = RemoteStore::new(transport.clone(), store.core.pool.clone());
+
+    let reply = ResolveClientImpl::new(transport)
+        .resolve(hellas_rpc::pb::resolve::ResolveRequest {
+            uri: "hf://org/repo".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(reply.commit_sha, sha);
+    let tree = reply.tree.unwrap();
+    let tree = ContentRef::new(
+        hellas_rpc::ContentId::from_slice(&tree.id).unwrap(),
+        tree.bytes,
+    );
+    // Resolve learns the tree but never fetches the weights.
+    assert!(matches!(
+        owner
+            .stat(
+                &Scope::Owner,
+                &at(&format!("hf/org/repo@{sha}"), "weights.bin")
+            )
+            .await,
+        Err(Error::Missing)
+    ));
+    let acquired = owner
+        .acquire(
+            &Scope::Owner,
+            Source::HfXet {
+                repo: crate::hf::Repo {
+                    id: "org/repo".into(),
+                    kind: crate::hf::RepoKind::Model,
+                    revision: sha.clone(),
+                },
+                commit: sha.clone(),
+                path: None,
+            },
+            Some(tree),
+            pin("models/org/repo", PinPolicy::Jobs),
+        )
+        .await
+        .unwrap();
+    serving.join().unwrap();
+    assert_eq!(acquired.object, tree);
+
+    // A job whose closure names the weights reads them from the node.
+    let job = JobContent::new(
+        &store,
+        JobId {
+            channel: Digest::from_bytes([7; 32]),
+            id: Digest::from_bytes([8; 32]),
+        },
+        vec![weights],
+        0,
+    )
+    .await
+    .unwrap();
+    let content = LocalStore::Job(job.clone());
+    let reader = content
+        .open_verified(job.scope(), weights, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reader.read_all(weights, &content.ram_pool()).await.unwrap(),
+        &b"weights"[..]
+    );
+    job.end().await.unwrap();
+
+    remove(&owner, "models/org/repo").await;
+    remove(&owner, &format!("hf/org/repo@{sha}")).await;
+    assert!(owner.collect(&Scope::Owner).await.unwrap().objects > 0);
+    assert!(
+        !root
+            .path()
+            .join("objects")
+            .join(weights.id().to_string())
+            .exists()
+    );
+    owner.finish_uploads().await.unwrap();
+    store.close().await;
 }
