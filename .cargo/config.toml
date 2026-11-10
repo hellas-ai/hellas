@@ -1,0 +1,5 @@
+# GNU ld's peak memory gets large test binaries OOM-killed on small builders.
+# Linux links with lld everywhere (Rust itself defaults to lld on x86_64 only);
+# the Nix builds and dev shells put it on PATH.
+[target.'cfg(target_os = "linux")']
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]

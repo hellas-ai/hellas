@@ -38,13 +38,13 @@ jobs:
             exit 1
           fi
       # Not derivations: deny needs the advisory database, the others inspect
-      # the dependency graph or one narrow feature set.
+      # the dependency graph or one narrow feature set or target.
       - name: Dependency lints
         env:
           CARGO_INCREMENTAL: "0"
           CARGO_PROFILE_DEV_DEBUG: "0"
         run: |
-          for check in cargo-sources deny channel-dependencies provider-dependencies xet-no-alloc; do
+          for check in cargo-sources deny channel-dependencies provider-dependencies xet-no-alloc wasm-chain wasm-rpc wasm-xet; do
             nix run --accept-flake-config ".#check-$check"
           done
 
