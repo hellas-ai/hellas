@@ -145,6 +145,31 @@ pub(crate) fn funding_timeout(timeout: Option<Duration>) -> Duration {
     timeout.unwrap_or(hellas_channel::work::MAX_CERTIFIED_AGE)
 }
 
+/// The channel's readiness from a confirmed read that has not lapsed. The
+/// observer renews it from the chain; a job that arrives while the last
+/// confirmation has lapsed waits for the next one, as session open does,
+/// within the caller's deadline. Every other refusal is final.
+async fn fresh_readiness(
+    client: &ClientService,
+    timeout: Option<Duration>,
+) -> Result<hellas_channel::model::setup::ReadyChannel> {
+    within(timeout, "channel readiness", async {
+        loop {
+            match client.readiness().await {
+                Err(hellas_channel::work::EndpointError::ObservationStale) => {
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "inventory class A: channel readiness"
+                    )]
+                    tokio::time::sleep(hellas_channel::work::SETUP_POLL).await;
+                }
+                ready => return ready.map_err(Into::into),
+            }
+        }
+    })
+    .await
+}
+
 /// Bounds `work` by the caller's timeout; without one it waits until done.
 async fn within<T>(
     timeout: Option<Duration>,
@@ -331,11 +356,18 @@ fn spawn_observer(
                     }
                 }
             }
+            // Read again before the last confirmation lapses. A read of an
+            // aged block leaves less than the age bound, and waiting a whole
+            // POLL after it would refuse new money while fresher blocks exist.
+            let left = client.freshness().await.unwrap_or_default();
+            let next = hellas_channel::work::POLL
+                .min(left / 2)
+                .max(hellas_channel::work::SETUP_POLL);
             #[expect(
                 clippy::disallowed_methods,
                 reason = "inventory class B/C: the certified-read poll the response window is sized for"
             )]
-            tokio::time::sleep(hellas_channel::work::POLL).await;
+            tokio::time::sleep(next).await;
         }
     })
 }
@@ -837,7 +869,7 @@ impl PaidWorkSession {
                 Err(hellas_channel::work::EndpointError::NotAdmitting.into())
             };
         }
-        let ready = client.readiness().await?;
+        let ready = fresh_readiness(client, args.timeout).await?;
         if recover && *needs_recovery {
             enum RecoveredJob {
                 /// The result was delivered, verified and committed before the
@@ -1034,7 +1066,7 @@ impl PaidWorkSession {
         }
         let result = match prepared {
             Some(prepared) => {
-                let ready = client.readiness().await?;
+                let ready = fresh_readiness(client, args.timeout).await?;
                 execute_paid_job(
                     args,
                     prepared,
@@ -1128,6 +1160,11 @@ async fn propose_when_ready(
             Ok(work_id) => return Ok(work_id),
             Err(hellas_channel::work::ProposeError::Refused { refusal, .. })
                 if refusal.is_retryable() => {}
+            // A confirmation that lapsed while this proposal waited is renewed
+            // by the observer; it is not an answer to the job either.
+            Err(hellas_channel::work::ProposeError::Endpoint(
+                hellas_channel::work::EndpointError::ObservationStale,
+            )) => {}
             // Finalized setup can reach the client before the provider's clock
             // mounts Work. Upload has no structured NotReady response; the
             // retained half-signed proposal makes this retry the same purchase.

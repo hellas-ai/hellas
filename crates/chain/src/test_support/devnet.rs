@@ -748,6 +748,9 @@ impl Devnet {
         owner: SettlementKey,
         candidates: impl IntoIterator<Item = CoinId>,
     ) -> Vec<(CoinId, Coin)> {
+        // The projection and the executed reads must name one block, so no
+        // heartbeat seal may land between them.
+        let _tip = self.sealer.tip.lock().await;
         let Some(held) = self
             .light_client(node)
             .get_holdings(owner, None)
@@ -842,33 +845,52 @@ impl Sealer {
         tip.height += 1;
         let timestamp = next_timestamp(&tip.head).max(not_before);
 
+        // The stamp is fixed before execution and the block is readable only
+        // after it, so a block is born as old as its execution. Each
+        // validator executes on its own task, so that age is one execution,
+        // not six in a row.
+        let parent = BlockHash::from_bytes(tip.head.digest().0);
+        let height = tip.height;
+        let executions: Vec<_> = self
+            .validators
+            .iter()
+            .map(|validator| {
+                let database = validator.database.clone();
+                let fresh = fresh.clone();
+                let allocations = self.allocations.clone();
+                tokio::spawn(async move {
+                    let batches = database.new_batches().await;
+                    let batches = execute_all(
+                        KernelContext::with_fees(
+                            TEST_NETWORK,
+                            BlockHeight::new(height),
+                            timestamp,
+                            parent,
+                            KERNEL_FEES,
+                        ),
+                        &ChainVerifier::new(),
+                        &fresh,
+                        &allocations,
+                        batches,
+                    )
+                    .await
+                    .expect("the block executes");
+                    let owners = crate::execution::owner_tree::root(&batches).await.unwrap();
+                    let merkleized = batches.merkleize().await.expect("state merkleizes");
+                    (owners, merkleized)
+                })
+            })
+            .collect();
         let mut root = None;
         let mut owner_root = None;
         let mut target = None;
         let mut executed = Vec::with_capacity(self.validators.len());
-        for validator in &self.validators {
-            let batches = validator.database.new_batches().await;
-            let batches = execute_all(
-                KernelContext::with_fees(
-                    TEST_NETWORK,
-                    BlockHeight::new(tip.height),
-                    timestamp,
-                    BlockHash::from_bytes(tip.head.digest().0),
-                    KERNEL_FEES,
-                ),
-                &ChainVerifier::new(),
-                &fresh,
-                &self.allocations,
-                batches,
-            )
-            .await
-            .expect("the block executes");
-            let owners = crate::execution::owner_tree::root(&batches).await.unwrap();
+        for execution in executions {
+            let (owners, merkleized) = execution.await.expect("a validator's execution task");
             if let Some(expected) = owner_root {
                 assert_eq!(owners, expected);
             }
             owner_root = Some(owners);
-            let merkleized = batches.merkleize().await.expect("state merkleizes");
             let validator_target = crate::execution::store::sync_target(&merkleized);
             if let Some(expected) = &target {
                 assert_eq!(&validator_target, expected);
@@ -996,6 +1018,12 @@ async fn stop(
 
 impl Drop for Devnet {
     fn drop(&mut self) {
+        // A test that unwinds skips shutdown(); the heartbeat must not seal
+        // into validators that are being stopped. Nothing reads the chain
+        // after this, so a seal cut short leaves nothing behind.
+        if let Some((_, task)) = self.heartbeat.take() {
+            task.abort();
+        }
         let validators = std::mem::take(&mut self.validators);
         let Some(runtime) = self.runtime_guard.take() else {
             return;
