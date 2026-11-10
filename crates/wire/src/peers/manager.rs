@@ -5,6 +5,7 @@ use std::time::Duration;
 use web_time::Instant;
 
 use thiserror::Error;
+use tokio::sync::watch;
 
 use super::admission::{Outcome, Permit, RequestKind};
 use super::{
@@ -26,6 +27,7 @@ use super::{
 #[derive(Clone, Debug)]
 pub struct PeerManager {
     registry: Arc<Mutex<PeerRegistry>>,
+    changed: watch::Sender<()>,
     base: Instant,
 }
 
@@ -43,6 +45,7 @@ impl PeerManager {
     pub fn with_config(config: PeerRegistryConfig) -> Self {
         Self {
             registry: Arc::new(Mutex::new(PeerRegistry::with_config(config))),
+            changed: watch::Sender::new(()),
             base: Instant::now(),
         }
     }
@@ -54,6 +57,19 @@ impl PeerManager {
     /// for admission/EMA/eviction are produced by this method.
     pub fn now_ms(&self) -> u64 {
         u64::try_from(Instant::now().duration_since(self.base).as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Wakes after every registry write that can change which peers are
+    /// disclosed: discovery, service and last-seen observations, blocks and
+    /// forgets. Request-slot release (in-flight and health accounting) does not.
+    pub fn subscribe(&self) -> watch::Receiver<()> {
+        self.changed.subscribe()
+    }
+
+    fn write<R>(&self, write: impl FnOnce(&mut PeerRegistry) -> R) -> Result<R, PeerManagerError> {
+        let result = write(&mut *self.lock()?);
+        self.changed.send_replace(());
+        Ok(result)
     }
 
     pub fn snapshot(&self) -> Result<PeerRegistry, PeerManagerError> {
@@ -93,7 +109,7 @@ impl PeerManager {
 
     fn apply(&self, peer: PeerId, event: PeerEvent) -> Result<PeerChange, PeerManagerError> {
         let now = self.now_ms();
-        Ok(self.lock()?.apply(now, peer, event))
+        self.write(|registry| registry.apply(now, peer, event))
     }
 
     pub fn observe_discovered_peer(
@@ -119,9 +135,9 @@ impl PeerManager {
         transport_security: TransportSecurity,
     ) -> Result<ServiceObservation, PeerManagerError> {
         let now = self.now_ms();
-        Ok(self
-            .lock()?
-            .observe_discovered_service(now, peer, source, service, transport_security))
+        self.write(|registry| {
+            registry.observe_discovered_service(now, peer, source, service, transport_security)
+        })
     }
 
     pub fn observe_discovered_service<S: RpcService>(
@@ -146,7 +162,7 @@ impl PeerManager {
         rtt_ms: Option<f64>,
     ) -> Result<PeerChange, PeerManagerError> {
         let now = self.now_ms();
-        Ok(self.lock()?.observe_inbound_request(now, peer, rtt_ms)?)
+        Ok(self.write(|registry| registry.observe_inbound_request(now, peer, rtt_ms))??)
     }
 
     pub fn forget_peer(&self, peer: PeerId) -> Result<PeerChange, PeerManagerError> {
@@ -199,17 +215,17 @@ impl PeerManager {
         observation: RpcObservation,
     ) -> Result<RpcPermitGuard, PeerManagerError> {
         let now = self.now_ms();
-        let mut registry = self.lock()?;
-        registry.apply(
-            now,
-            peer,
-            PeerEvent::Discovered {
-                source: observation.source,
-                transport_security: observation.initial_security,
-            },
-        );
-        let permit = registry.try_acquire(now, peer, kind)?;
-        drop(registry);
+        let permit = self.write(|registry| {
+            registry.apply(
+                now,
+                peer,
+                PeerEvent::Discovered {
+                    source: observation.source,
+                    transport_security: observation.initial_security,
+                },
+            );
+            registry.try_acquire(now, peer, kind)
+        })??;
 
         Ok(RpcPermitGuard {
             manager: self.clone(),
@@ -383,28 +399,27 @@ impl RpcPermitGuard {
             return;
         };
         let now = self.manager.now_ms();
-        let Ok(mut registry) = self.manager.lock() else {
-            return;
-        };
         // Completion notifications go via `apply_completion` so a peer
         // forgotten mid-RPC stays tombstoned — the subsequent `release`
         // must be free to purge the entry. Plain `apply` would revive.
-        registry.apply_completion(
-            now,
-            permit.peer(),
-            PeerEvent::Discovered {
-                source: self.observation.source,
-                transport_security: self.observation.completion_security,
-            },
-        );
-        registry.apply_completion(
-            now,
-            permit.peer(),
-            PeerEvent::ServiceObserved {
-                service: permit.kind().service,
-                transport_security: self.observation.completion_security,
-            },
-        );
+        let _ = self.manager.write(|registry| {
+            registry.apply_completion(
+                now,
+                permit.peer(),
+                PeerEvent::Discovered {
+                    source: self.observation.source,
+                    transport_security: self.observation.completion_security,
+                },
+            );
+            registry.apply_completion(
+                now,
+                permit.peer(),
+                PeerEvent::ServiceObserved {
+                    service: permit.kind().service,
+                    transport_security: self.observation.completion_security,
+                },
+            );
+        });
     }
 
     fn release(&mut self, outcome: Outcome) {

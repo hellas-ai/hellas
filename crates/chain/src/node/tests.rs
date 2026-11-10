@@ -348,8 +348,11 @@ fn full_nodes_exchange_executed_state_without_a_validator() {
             &config.chain,
         )
         .unwrap();
-        config.peers = vec![seed.endpoint_addr()];
+        config.peers = Vec::new();
         let a = FullNode::start(config).await.unwrap();
+        // `a` learns its only peer after its live feed started, so the peer
+        // registry's change signal, not a startup read, starts the feeder.
+        a.0.network.seed(seed.endpoint_addr());
         a.wait_ready().await.unwrap();
         apply(&seed, block2.clone()).await.unwrap();
         a.finalized()

@@ -23,7 +23,7 @@ pub(super) struct Lease {
     pub(super) core: Arc<Core>,
     pub(super) manager: PeerManager,
     config: Config,
-    network: Network,
+    pub(super) network: Network,
     endpoint: iroh::Endpoint,
     thread: StdMutex<Option<std::thread::JoinHandle<()>>>,
     runtime: Arc<RuntimeGuard>,

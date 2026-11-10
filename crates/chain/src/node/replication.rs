@@ -271,22 +271,26 @@ impl Network {
     pub(super) async fn feed(&self, input: super::input::FinalizedInput) {
         let mut tasks = FuturesUnordered::new();
         let mut running = std::collections::BTreeSet::new();
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "inventory class A: peer membership; rollout 5"
-        )]
-        let mut discovery = tokio::time::interval(Duration::from_secs(1));
+        // Registry writes wake this loop. A peer whose quarantine expired
+        // returns with its next discovery observation.
+        let mut changes = self.manager().subscribe();
         loop {
-            tokio::select! {
-                _ = discovery.tick() => {
-                    for id in self.ids() {
-                        if running.len() >= MAX_PEERS { break; }
-                        if running.insert(id) {
-                            let (network, input) = (self.clone(), input.clone());
-                            tasks.push(async move { network.feed_peer(id, input).await; id });
-                        }
-                    }
+            changes.mark_unchanged();
+            for id in self.ids() {
+                if running.len() >= MAX_PEERS {
+                    break;
                 }
+                if running.insert(id) {
+                    let (network, input) = (self.clone(), input.clone());
+                    tasks.push(async move {
+                        network.feed_peer(id, input).await;
+                        id
+                    });
+                }
+            }
+            tokio::select! {
+                // The directory owns the sender, so the channel stays open.
+                _ = changes.changed() => {}
                 Some(id) = tasks.next(), if !tasks.is_empty() => { running.remove(&id); }
             }
         }

@@ -151,3 +151,45 @@ fn dropping_armed_permit_panics_in_debug() {
     // Dropping without release should fire the debug tripwire.
     drop(permit);
 }
+
+#[test]
+fn disclosure_writes_signal_subscribers_and_slot_release_does_not() {
+    let manager = PeerManager::with_config(config());
+    let mut changes = manager.subscribe();
+    let mut signalled = || {
+        let changed = changes.has_changed().expect("manager owns the sender");
+        changes.mark_unchanged();
+        changed
+    };
+    assert!(!signalled());
+    manager
+        .observe_discovered_service::<Node>(
+            peer(1),
+            DiscoverySource::Manual,
+            TransportSecurity::Untrusted,
+        )
+        .expect("registry should be writable");
+    assert!(signalled());
+    let kind = RequestKind::for_method::<crate::peers::test_markers::GetNodeInfo>();
+    let observation = RpcObservation::authenticated_transport("iroh");
+    let permit = manager
+        .acquire_rpc(peer(2), kind, observation)
+        .expect("request should be admitted");
+    assert!(signalled());
+    drop(permit);
+    assert!(!signalled(), "a cancelled request only releases its slot");
+    let mut permit = manager
+        .acquire_rpc(peer(2), kind, observation)
+        .expect("request should be admitted");
+    assert!(signalled());
+    permit.finish_ok();
+    assert!(signalled(), "completion observes the service");
+    manager
+        .block_peer(peer(1), Duration::from_secs(1))
+        .expect("registry should be writable");
+    assert!(signalled());
+    manager
+        .observe_inbound_request(peer(3), None)
+        .expect("registry should be writable");
+    assert!(signalled());
+}

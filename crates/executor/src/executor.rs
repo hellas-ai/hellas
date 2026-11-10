@@ -5,8 +5,6 @@ use crate::catena;
 use crate::{ExecutorError, FetchCall, FetchRoute, FetchRouteRegistry, ProjectedFetch};
 use futures_util::StreamExt;
 use hellas_auth::ProducerSigningKey;
-#[cfg(feature = "compute")]
-use hellas_channel::work::admission::{CancelOnFailure, Cancellation};
 use hellas_channel::work::{
     Admitted, BackendFault, PaidProgress, WorkBackend,
     admission::{AdmissionError, CapacityDomain, RunningWork, WorkPermit},
@@ -222,14 +220,7 @@ impl ExecutorHandle {
             #[cfg(feature = "compute")]
             CapacityDomain::Gpu => {
                 let cancel = catena::Cancellation::default();
-                let signal = cancel.clone();
-                let stopped = Cancellation::new();
-                let dropped = stopped.clone();
-                let _cancel_on_drop =
-                    CancelOnFailure(vec![Cancellation::with_cleanup(move || {
-                        signal.cancel();
-                        dropped.cancel();
-                    })]);
+                let _cancel_on_drop = cancel.drop_guard();
                 let executor = self.inner.clone();
                 let physical = running.clone();
                 let control = cancel.clone();
@@ -241,17 +232,11 @@ impl ExecutorHandle {
                                 .map_err(|error| error.to_string())
                         };
                         tokio::pin!(opening);
-                        let expiry = async {
-                            match physical.deadline() {
-                                Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
-                                None => std::future::pending().await,
-                            }
-                        };
+                        // The caller below cancels on admission cancellation or
+                        // deadline, and the drop guard if the caller goes away.
                         tokio::select! {
                             result = &mut opening => result,
-                            () = physical.cancelled() => { control.cancel(); opening.await },
-                            () = stopped.cancelled() => { control.cancel(); opening.await },
-                            () = expiry => { control.cancel(); opening.await },
+                            () = control.cancelled() => opening.await,
                         }
                     };
                     // The owned task retains admission and the GPU slot through

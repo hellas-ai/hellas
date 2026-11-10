@@ -4,12 +4,8 @@ use catena_lang::{
 };
 use hellas_rpc::{ContentId, ContentRef};
 use hellas_store::content::VerifiedReader;
-use std::{
-    collections::BTreeMap,
-    io::Read,
-    sync::{Arc, Mutex},
-    time::{Duration, Instant},
-};
+use std::{collections::BTreeMap, io::Read, sync::Arc, time::Instant};
+use tokio::sync::Mutex;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -74,24 +70,9 @@ impl Assets {
         cancel: &super::Cancellation,
         deadline: Option<Instant>,
     ) -> Result<Arc<Resident>> {
-        let mut state = loop {
-            if cancel.is_cancelled() || deadline.is_some_and(|end| Instant::now() >= end) {
-                return Err("asset pin timed out or cancelled".into());
-            }
-            match self.state.try_lock() {
-                Ok(state) => break state,
-                Err(std::sync::TryLockError::Poisoned(_)) => {
-                    return Err("resident cache poisoned".into());
-                }
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "inventory class A: cache mutex; rollout 4"
-                )]
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    std::thread::sleep(Duration::from_millis(2))
-                }
-            }
-        };
+        let mut state = cancel
+            .block_on(deadline, self.state.lock())
+            .ok_or("asset pin timed out or cancelled")?;
         state.clock += 1;
         let clock = state.clock;
         if let Some((resident, used)) = state.entries.get_mut(&object.id()) {
@@ -177,6 +158,7 @@ pub fn upload(bytes: &[u8], dialect: GpuDialect) -> Result<MemOwn> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     fn reader(bytes: &[u8]) -> VerifiedReader {
         VerifiedReader::Memory(std::io::Cursor::new(bytes.to_vec().into()))
     }
@@ -239,7 +221,7 @@ mod tests {
     #[test]
     fn resident_pin_lock_wait_obeys_cancellation_and_deadline() {
         let assets = Assets::new(0, GpuDialect::Hip);
-        let _held = assets.state.lock().unwrap();
+        let held = assets.state.try_lock().unwrap();
         let object = ContentRef::for_bytes(b"not accessed");
         for cancelled in [false, true] {
             let cancel = super::super::Cancellation::default();
@@ -261,5 +243,24 @@ mod tests {
                     .contains("timed out or cancelled")
             );
         }
+        let pin = |cancel: super::super::Cancellation| {
+            let result = assets.pin_for_job(reader(b"not accessed"), object, &cancel, None);
+            result.err().unwrap().to_string()
+        };
+        std::thread::scope(|scope| {
+            // With the lock held throughout, only cancellation ends this wait.
+            let cancel = super::super::Cancellation::default();
+            let waiter = scope.spawn({
+                let cancel = cancel.clone();
+                move || pin(cancel)
+            });
+            cancel.cancel();
+            assert!(waiter.join().unwrap().contains("timed out or cancelled"));
+            // Releasing the lock wakes a waiter with no deadline; it then
+            // reaches the capacity check.
+            let waiter = scope.spawn(move || pin(Default::default()));
+            drop(held);
+            assert!(waiter.join().unwrap().contains("exceeds resident capacity"));
+        });
     }
 }
