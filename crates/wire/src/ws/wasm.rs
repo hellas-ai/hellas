@@ -59,11 +59,18 @@ impl MessagePipe for WsPipe {
 }
 
 /// Connect to `url` (wss:// or ws://) and return a `MuxTransport`
-/// ready for outbound RPCs. The mux driver is `spawn_local`'ed on
-/// the wasm task queue.
+/// ready for outbound RPCs. The handshake and the mux driver run as
+/// `spawn_local` tasks on the wasm task queue, so the returned future is
+/// `Send` even though `ws_stream_wasm`'s connect future is not.
 pub async fn connect(url: &str) -> Result<MuxTransport, WsError> {
-    let (_meta, stream) = WsMeta::connect(url, None)
+    let (reply, connected) = futures::channel::oneshot::channel();
+    let url = url.to_owned();
+    wasm_bindgen_futures::spawn_local(async move {
+        let _ = reply.send(WsMeta::connect(url, None).await);
+    });
+    let (_meta, stream) = connected
         .await
+        .map_err(|e| WsError::Connect(e.to_string()))?
         .map_err(|e| WsError::Connect(e.to_string()))?;
     let pipe = WsPipe::new(stream);
     Ok(MuxTransport::spawn_with::<WASM_MUX_N, _, _, _>(
