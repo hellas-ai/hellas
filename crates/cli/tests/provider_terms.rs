@@ -126,3 +126,43 @@ fn serve_refuses_terms_admitting_any_program_without_the_acknowledgement() {
     assert!(stderr.contains("--knowingly-unsafe"), "{stderr}");
     assert!(stderr.contains("roughly root on this host"), "{stderr}");
 }
+
+/// A text request that names no token budget gets the command's default:
+/// 256 for `hellas text`, 128 for the gateway. The example paid terms and a
+/// plain `serve --program` grant must both admit it.
+#[tokio::test]
+async fn example_terms_and_the_generic_grant_admit_a_default_text_budget() {
+    use hellas_client::model::{ModelPackage, ModelRequest};
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../client/src/model/package/mini-qwen3.gguf");
+    let mut job = ModelPackage::open(&fixture)
+        .await
+        .unwrap()
+        .render_job(&ModelRequest::Text {
+            prompt_ids: &[1],
+            max_new: 1,
+            stops: &[],
+        })
+        .await
+        .unwrap();
+    // One step per new token; the fixture's context is shorter than 256.
+    let stop = &mut job.plan.step.as_mut().unwrap().stop;
+    assert_eq!(stop.max_steps, 1);
+    stop.max_steps = 256;
+    let example: toml::Value =
+        toml::from_str(include_str!("../../../docs/examples/faucet-provider.toml")).unwrap();
+    let paid: hellas_rpc::protocol::invocation::Limits =
+        example["limits"].clone().try_into().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let grant = hellas_sdk::grant_config::GrantConfig::compute(
+        &hellas_private::StoreLocation::for_test(root.path()),
+        hellas_rpc::protocol::invocation::ComputePrograms::Any {},
+    )
+    .unwrap();
+    for limits in [
+        paid,
+        grant.configuration.resources()[0].invocation_policy.limits,
+    ] {
+        job.plan.validate_bounds(&limits).unwrap();
+    }
+}
