@@ -73,11 +73,11 @@ fn image_cli_and_gateway_surfaces_are_available() {
     .unwrap();
     assert!(matches!(image.command, Commands::Image(_)));
     let gateway = parse_gateway(&["--model", "klein", "--model", "qwen.gguf"]).unwrap();
-    let Commands::Gateway { models, .. } = gateway.command else {
+    let Commands::Gateway { execution, .. } = gateway.command else {
         panic!("gateway")
     };
     assert_eq!(
-        models,
+        execution.models,
         [
             std::path::Path::new("klein"),
             std::path::Path::new("qwen.gguf")

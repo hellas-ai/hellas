@@ -216,13 +216,8 @@ enum Commands {
     /// `gateway/bearer` there, so a web page cannot spend what it runs on;
     /// --gateway-profile selects an explicitly provisioned one instead.
     Gateway {
-        /// A model the routes render jobs from, named after its file or
-        /// directory: a Qwen GGUF serves the text routes, a converted Whisper
-        /// package /v1/audio/transcriptions and a converted Flux package
-        /// /v1/images/generations. Providers must hold the same weights.
-        #[arg(long = "model", value_name = "PATH")]
-        models: Vec<PathBuf>,
-        /// Where requests run: the job commands' --access, --pay or --local.
+        /// The models the routes render jobs from, and where requests run:
+        /// the job commands' --access, --pay or --local.
         #[command(flatten)]
         execution: commands::transact::GatewayArgs,
         /// Serve exact HTTP routes through HTTPS Fetch. A grant with an HTTPS
@@ -759,7 +754,6 @@ async fn async_main() {
             }
         }
         Commands::Gateway {
-            models,
             execution,
             http_fetch_config,
             zdr,
@@ -825,9 +819,12 @@ async fn async_main() {
                         },
                     )
                     .transpose()?;
-                let models = models
-                    .into_iter()
-                    .map(|model| hellas_gateway::ModelOptions::at(model, default_max_tokens))
+                let models = execution
+                    .models
+                    .iter()
+                    .map(|model| {
+                        hellas_gateway::ModelOptions::at(model.clone(), default_max_tokens)
+                    })
                     .collect();
                 let context = commands::transact::Context::new(
                     &local_identity,

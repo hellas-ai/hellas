@@ -1754,7 +1754,25 @@ pub async fn run_admitted<B: WorkBackend>(
         content,
         admission,
     );
-    backend.execute_stream(input, progress).await
+    execute(backend, input, progress).await
+}
+
+/// Run admitted `input` on `backend`. However the backend reports its
+/// events, `progress` sees only the signed output prefix: a terminal or
+/// failure reaches the caller once, in the returned transcript.
+async fn execute<B: WorkBackend>(
+    backend: &B,
+    input: Admitted<PreparedInvocation>,
+    progress: PaidProgress,
+) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
+    use hellas_rpc::protocol::invocation::output::{FAILURE, TERMINAL};
+    let prefix: PaidProgress = Arc::new(move |event| {
+        if matches!(event.event().body().kind(), TERMINAL | FAILURE) {
+            return Ok(());
+        }
+        progress(event)
+    });
+    backend.execute_stream(input, prefix).await
 }
 
 /// What [`ProviderEndpoint::begin_run`] found, and what may be done next.
@@ -1906,7 +1924,7 @@ where
     let progress: PaidProgress =
         Arc::new(move |event| progress_service.publish_progress(work_id, &facts, event));
 
-    let transcript = match backend.execute_stream(input, progress).await {
+    let transcript = match execute(backend, input, progress).await {
         Ok(transcript) => transcript,
         Err(fault) => return Err(end_failed(service, work_id, RunError::Backend(fault)).await),
     };

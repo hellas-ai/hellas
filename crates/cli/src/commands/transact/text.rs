@@ -28,7 +28,7 @@ pub struct TextArgs {
 pub async fn text(args: TextArgs, context: Context) -> super::super::CliResult<()> {
     let (package, presentation, rendered) = prepare(&args).await?;
     let mut target = args.target;
-    target.model = Some(args.model.clone());
+    target.models = vec![args.model.clone()];
     run_quoted(
         &args.client,
         target,

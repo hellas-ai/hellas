@@ -39,7 +39,7 @@ pub async fn image(args: ImageArgs, context: Context) -> super::super::CliResult
     let package = ModelPackage::open(&args.model).await?;
     let rendered = package.render_job(&ModelRequest::Image(request)).await?;
     let mut target = args.target;
-    target.model = Some(args.model.clone());
+    target.models = vec![args.model.clone()];
     run_quoted(
         &args.client,
         target,

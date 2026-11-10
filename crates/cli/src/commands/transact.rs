@@ -169,10 +169,10 @@ pub(super) struct TargetArgs {
     #[cfg(feature = "compute")]
     #[command(flatten)]
     native: crate::compute::ServeArgs,
-    /// The model file or package a helper rendered its job from; local
-    /// execution reads the job's weights from it.
+    /// The model files or packages a helper or the gateway renders jobs
+    /// from; local execution reads the jobs' weights from them.
     #[arg(skip)]
-    pub(super) model: Option<PathBuf>,
+    pub(super) models: Vec<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -490,7 +490,7 @@ enum Target {
     #[cfg(feature = "compute")]
     Local {
         native: Option<crate::compute::ServeArgs>,
-        model: Option<PathBuf>,
+        models: Vec<PathBuf>,
         timeout: Duration,
         opened: Option<(
             hellas_store::content::DiskStore,
@@ -513,7 +513,7 @@ impl TargetArgs {
             ensure!(pay == 0, "local work is not paid; drop --pay");
             return Ok(Target::Local {
                 native: Some(self.native),
-                model: self.model,
+                models: self.models,
                 // Bounded by the command deadline; the evaluator needs a limit.
                 timeout: client.timeout.unwrap_or(Duration::from_secs(86_400)),
                 opened: None,
@@ -687,7 +687,7 @@ impl Target {
     ) -> super::CliResult<hellas_sdk::execution::local::LocalExecution> {
         let Target::Local {
             native,
-            model,
+            models,
             opened,
             ..
         } = self
@@ -695,8 +695,8 @@ impl Target {
             bail!("not a local target");
         };
         let mut native = native.take().context("local target is already open")?;
-        // The job reads its weights from the model it was rendered from.
-        native.content.extend(model.clone());
+        // Jobs read their weights from the models they were rendered from.
+        native.content.extend(models.iter().cloned());
         let (execution, reload) =
             crate::compute::local(&context.home, native, Arc::new(context.producer.clone()))
                 .await?;
@@ -757,9 +757,15 @@ impl Target {
     }
 }
 
-/// `hellas gateway`'s execution flags: the job commands' own.
+/// `hellas gateway`'s models, and its execution flags: the job commands' own.
 #[derive(Debug, Args)]
 pub struct GatewayArgs {
+    /// A model the routes render jobs from, named after its file or
+    /// directory: a Qwen GGUF serves the text routes, a converted Whisper
+    /// package /v1/audio/transcriptions and a converted Flux package
+    /// /v1/images/generations. Providers must hold the same weights.
+    #[arg(long = "model", value_name = "PATH")]
+    pub(crate) models: Vec<PathBuf>,
     #[command(flatten)]
     client: ClientArgs,
     /// Pay the provider named by --provider its quoted price per request, at most MAX.
@@ -777,10 +783,12 @@ pub async fn gateway(
     serve: impl AsyncFnOnce(Arc<ExecutorGateway>) -> super::CliResult<()>,
 ) -> super::CliResult<()> {
     let GatewayArgs {
+        models,
         client,
         pay,
-        target,
+        mut target,
     } = args;
+    target.models = models;
     ensure!(
         !client.settle && !client.buy_again && target.attempt.is_none(),
         "gateway requests are not tracked attempts: drop --settle, --buy-again and --attempt"
