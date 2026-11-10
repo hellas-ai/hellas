@@ -15,8 +15,8 @@ use {
     std::{
         io::Write,
         process::{Command, Stdio},
-        time::Duration,
     },
+    tokio::sync::{Mutex, oneshot},
 };
 
 // Decision 23's killable compile child, specified in plan-v4 §§2.2/2.5.
@@ -83,17 +83,7 @@ pub fn compile_cancellable(
     cancel: &Cancellation,
     dialect: GpuDialect,
 ) -> Result<RuntimeModule> {
-    use std::sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    };
-    static CACHE_BUSY: AtomicBool = AtomicBool::new(false);
-    struct CacheGuard;
-    impl Drop for CacheGuard {
-        fn drop(&mut self) {
-            CACHE_BUSY.store(false, Ordering::Release);
-        }
-    }
+    static CACHE: Mutex<()> = Mutex::const_new(());
     let check_cancelled = || -> Result<()> {
         if cancel.is_cancelled() {
             return Err("Catena frontend compile cancelled".into());
@@ -118,22 +108,13 @@ pub fn compile_cancellable(
     // ModuleCache takes a blocking OS file lock. One bounded background operation
     // keeps a lock held by another process from blocking the executor or creating
     // an unbounded number of abandoned threads.
-    while CACHE_BUSY
-        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
-        check_cancelled()?;
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "inventory class A: compile contention; rollout 4"
-        )]
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    let guard = CacheGuard;
+    let guard = cancel
+        .block_on(None, CACHE.lock())
+        .ok_or("Catena frontend compile cancelled")?;
     let sources = sources.to_vec();
     let executable = executable.to_owned();
     check_cancelled()?;
-    let (send, receive) = mpsc::sync_channel(1);
+    let (send, receive) = oneshot::channel();
     let child_cancel = cancel.clone();
     std::thread::spawn(move || {
         let _guard = guard;
@@ -147,19 +128,11 @@ pub fn compile_cancellable(
             .map_err(|error| error.to_string());
         let _ = send.send(result);
     });
-    loop {
-        check_cancelled()?;
-        match receive.recv_timeout(Duration::from_millis(2)) {
-            Ok(result) => {
-                check_cancelled()?;
-                return result.map_err(Into::into);
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(_) => {
-                check_cancelled()?;
-                return Err("Catena cache operation failed".into());
-            }
-        }
+    let result = cancel.block_on(None, receive);
+    check_cancelled()?;
+    match result {
+        Some(Ok(result)) => result.map_err(Into::into),
+        _ => Err("Catena cache operation failed".into()),
     }
 }
 

@@ -14,6 +14,7 @@ use std::{
     thread,
     time::Duration,
 };
+use tokio::sync::oneshot;
 
 #[cfg(target_os = "linux")]
 use std::{collections::BTreeSet, fs, io};
@@ -71,12 +72,14 @@ enum SpawnRequest {
     New {
         cancel: Cancellation,
         dialect: GpuDialect,
-        reply: mpsc::Sender<SpawnReply>,
+        reply: oneshot::Sender<SpawnReply>,
     },
 }
 
-fn start_spawner() -> mpsc::SyncSender<SpawnRequest> {
-    let (send, receive) = mpsc::sync_channel(0);
+fn start_spawner() -> mpsc::Sender<SpawnRequest> {
+    // Requests queue behind the running spawn; a request cancelled while
+    // queued is refused by `spawn_child` before it starts a child.
+    let (send, receive) = mpsc::channel();
     // Linux PDEATHSIG follows the creating thread. This process-lifetime thread
     // owns every spawn, even when the job requesting it runs on a short-lived thread.
     thread::spawn(move || {
@@ -116,8 +119,8 @@ impl SpawnError {
     }
 }
 
-fn spawner() -> &'static mpsc::SyncSender<SpawnRequest> {
-    static SPAWNER: OnceLock<mpsc::SyncSender<SpawnRequest>> = OnceLock::new();
+fn spawner() -> &'static mpsc::Sender<SpawnRequest> {
+    static SPAWNER: OnceLock<mpsc::Sender<SpawnRequest>> = OnceLock::new();
     SPAWNER.get_or_init(start_spawner)
 }
 fn spawn(
@@ -127,51 +130,31 @@ fn spawn(
     spawn_on(spawner(), cancel, dialect)
 }
 fn spawn_on(
-    spawner: &mpsc::SyncSender<SpawnRequest>,
+    spawner: &mpsc::Sender<SpawnRequest>,
     cancel: Cancellation,
     dialect: GpuDialect,
 ) -> std::result::Result<(SafeRuntime, i32), SpawnError> {
-    let (reply, receive) = mpsc::channel();
-    let mut request = SpawnRequest::New {
+    if cancel.is_cancelled() {
+        return Err(SpawnError::Cancelled);
+    }
+    let (reply, receive) = oneshot::channel();
+    let request = SpawnRequest::New {
         cancel: cancel.clone(),
         dialect,
         reply,
     };
-    loop {
-        if cancel.is_cancelled() {
-            return Err(SpawnError::Cancelled);
-        }
-        match spawner.try_send(request) {
-            Ok(()) => break,
-            Err(mpsc::TrySendError::Full(queued)) => {
-                request = queued;
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "inventory class A: spawn queue; rollout 4"
-                )]
-                thread::sleep(Duration::from_millis(2));
-            }
-            Err(_) => return Err(SpawnError::Unavailable),
-        }
+    spawner.send(request).map_err(|_| SpawnError::Unavailable)?;
+    let result = cancel.block_on(None, receive);
+    // Cleanup may produce an EOF error at the same time as cancellation.
+    // Classify the caller's cancellation before that transport consequence.
+    if cancel.is_cancelled() {
+        return Err(SpawnError::Cancelled);
     }
-    loop {
-        if cancel.is_cancelled() {
-            return Err(SpawnError::Cancelled);
-        }
-        match receive.recv_timeout(Duration::from_millis(2)) {
-            Ok(result) => {
-                // Cleanup may produce an EOF error at the same time as cancellation.
-                // Classify the caller's cancellation before that transport consequence.
-                if cancel.is_cancelled() {
-                    return Err(SpawnError::Cancelled);
-                }
-                return result
-                    .map(Spawned::into_parts)
-                    .map_err(SpawnError::Initialization);
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(_) => return Err(SpawnError::Unavailable),
-        }
+    match result {
+        Some(Ok(result)) => result
+            .map(Spawned::into_parts)
+            .map_err(SpawnError::Initialization),
+        _ => Err(SpawnError::Unavailable),
     }
 }
 
@@ -477,22 +460,14 @@ impl Device for Lease {
     }
 
     fn call(&mut self, entry: &str, args: Vec<Value<'_>>) -> Result<Vec<Value<'static>>> {
-        if !self.loaded
-            || self.failed
-            || self.cancel.is_cancelled()
-            || self.watchdog.as_ref().is_some_and(Watchdog::fired)
-        {
+        if !self.loaded || self.failed || self.cancel.is_cancelled() {
             self.failed = true;
             return Err("worker lease is not executable".into());
         }
         let worker = self.worker.as_ref().unwrap();
         match worker.artifacts[&self.key].exec_values(entry, args) {
-            Ok(values)
-                if !self.cancel.is_cancelled()
-                    && !self.watchdog.as_ref().is_some_and(Watchdog::fired) =>
-            {
-                Ok(values)
-            }
+            // The watchdog cancels before it kills, so cancellation covers its firing.
+            Ok(values) if !self.cancel.is_cancelled() => Ok(values),
             Ok(_) => {
                 self.failed = true;
                 kill_group(worker.pid);
@@ -536,4 +511,29 @@ fn unsupported_runtime_does_not_launch_a_child() {
         result.err().unwrap().to_string(),
         "Catena process isolation requires Linux"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancellation_ends_a_spawn_wait_and_a_lost_spawner_is_unavailable() {
+        let (spawner, requests) = mpsc::channel();
+        let cancel = Cancellation::default();
+        let canceller = thread::spawn({
+            let cancel = cancel.clone();
+            move || {
+                // Hold the request unanswered: only cancellation can end the wait.
+                let SpawnRequest::New { reply, .. } = requests.recv().unwrap();
+                cancel.cancel();
+                (requests, reply)
+            }
+        });
+        let result = spawn_on(&spawner, cancel, GpuDialect::Hip);
+        assert!(matches!(result, Err(SpawnError::Cancelled)));
+        drop(canceller.join().unwrap());
+        let result = spawn_on(&spawner, Cancellation::default(), GpuDialect::Hip);
+        assert!(matches!(result, Err(SpawnError::Unavailable)));
+    }
 }

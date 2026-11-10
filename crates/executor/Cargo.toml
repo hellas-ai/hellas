@@ -47,6 +47,7 @@ tempfile = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
+tokio-util.workspace = true
 tracing = { workspace = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 uuid = { version = "1", features = ["v4"] }
