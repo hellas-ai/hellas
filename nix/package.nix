@@ -46,6 +46,7 @@ let
   buildSrc = lib.fileset.toSource {
     root = ../.;
     fileset = lib.fileset.unions [
+      ../.cargo/config.toml
       ../Cargo.toml
       ../Cargo.lock
       ../clippy.toml
