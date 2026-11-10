@@ -94,14 +94,14 @@ pub enum ChannelStateError {
         /// The terminal the job already reached.
         outcome: &'static str,
     },
-    /// A credit limit would have been exceeded.
-    #[error("{ledger} credit: {used} lost plus {reserved} reserved plus {price} exceeds {limit}")]
+    /// A credit limit or the funded capacity would have been exceeded.
+    #[error("{ledger} limit: {used} used plus {reserved} reserved plus {price} exceeds {limit}")]
     OverCredit {
         /// Which limit.
         ledger: &'static str,
-        /// Unrecovered loss against this counterparty.
+        /// Already spent against it: capacity credited to payments.
         used: u64,
-        /// Reserved against the job in flight.
+        /// Reserved against the open jobs.
         reserved: u64,
         /// Price this job would add.
         price: u64,

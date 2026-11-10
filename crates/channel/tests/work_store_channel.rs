@@ -108,13 +108,22 @@ async fn open(root: &std::path::Path, role: Role) -> ChannelStore {
 }
 
 async fn open_on(root: &std::path::Path, channel: PaidChannel, role: Role) -> ChannelStore {
+    open_funded(root, channel, settlement(), role).await
+}
+
+async fn open_funded(
+    root: &std::path::Path,
+    channel: PaidChannel,
+    settlement: WorkPaymentSettlement,
+    role: Role,
+) -> ChannelStore {
     let content = hellas_channel::test_support::channel::content_store(root).await;
     let origin = origin_of(&channel);
     let location = StoreLocation::for_test(root);
     let store = match ChannelStore::open(
         &location,
         channel,
-        settlement(),
+        settlement,
         role,
         origin,
         content.clone(),
@@ -1456,6 +1465,71 @@ async fn compute_credit_bounds_what_may_be_co_signed() {
     if let Err(error) = commit_with_content(&mut store, job.proposed(), &verifier).await {
         panic!("a job within the compute limit co-signs: {error}");
     }
+}
+
+/// Every open job holds its price against the funded capacity from the
+/// moment it is proposed, so two jobs cannot together promise more than
+/// the edge can pay. Expiry releases the hold; payment moves it into the
+/// credited total, where it stays.
+#[tokio::test]
+async fn open_jobs_reserve_funded_capacity_until_their_terminal() {
+    let verifier = Secp256k1Verifier::new();
+    let Some(funded) = work_payment_settlement(
+        EdgeValues::new(PRICE + PRICE / 2 + OMISSION_BOND, 0, Fees::ZERO),
+        OMISSION_BOND,
+    ) else {
+        panic!("a funded edge prices both exits");
+    };
+    let capacity = funded.capacity();
+    assert_eq!(capacity, PRICE + PRICE / 2, "room for one job, not two");
+    let over = |used, reserved| {
+        move |error: &WorkStoreError| {
+            matches!(
+                error,
+                WorkStoreError::Channel(ChannelStateError::OverCredit {
+                    ledger: "capacity",
+                    used: u,
+                    reserved: r,
+                    price: PRICE,
+                    limit,
+                }) if *u == used && *r == reserved && *limit == capacity
+            )
+        }
+    };
+
+    let dir = temp();
+    let channel = channel();
+    let mut store = open_funded(dir.path(), channel.clone(), funded, Role::Provider).await;
+    let first = job_at(&channel, 1, 0);
+    commit_all(&mut store, &[first.proposed()]).await;
+    let second = job_at(&channel, 2, 0);
+    let error = commit_with_content(&mut store, second.proposed(), &verifier)
+        .await
+        .expect_err("two open jobs exceed the funded capacity");
+    assert!(over(0, PRICE)(&error), "unexpected error: {error}");
+
+    // The first job expires unpaid: its hold is released.
+    commit_all(
+        &mut store,
+        &[ChannelRecord::JobTerminated {
+            work_id: first.work_id,
+            outcome: TerminalOutcome::Expired {
+                deadline: first.authorization.acceptance_deadline,
+                height: first.authorization.acceptance_deadline + 1,
+                payload: payload_at(first.authorization.acceptance_deadline + 1),
+            },
+        }],
+    )
+    .await;
+    commit_all(&mut store, &provider_sequence(&channel, &second).await).await;
+    assert_eq!(store.state().ledger().credited_cumulative(), PRICE);
+
+    // The paid job's price stays spent.
+    let third = job_at(&channel, 3, PRICE);
+    let error = commit_with_content(&mut store, third.proposed(), &verifier)
+        .await
+        .expect_err("credited capacity is not released by payment");
+    assert!(over(PRICE, 0)(&error), "unexpected error: {error}");
 }
 
 /// The one job's price is checked against the delivery limit before the

@@ -145,27 +145,14 @@ pub(crate) fn funding_timeout(timeout: Option<Duration>) -> Duration {
     timeout.unwrap_or(hellas_channel::work::MAX_CERTIFIED_AGE)
 }
 
-/// The channel's readiness from a confirmed read that has not lapsed. The
-/// observer renews it from the chain; a job that arrives while the last
-/// confirmation has lapsed waits for the next one, as session open does,
-/// within the caller's deadline. Every other refusal is final.
+/// The channel's readiness from a confirmation that has not lapsed, within
+/// the caller's deadline. See [`ClientObserver::fresh_readiness`].
 async fn fresh_readiness(
     client: &ClientService,
     timeout: Option<Duration>,
 ) -> Result<hellas_channel::model::setup::ReadyChannel> {
     within(timeout, "channel readiness", async {
-        loop {
-            match client.readiness().await {
-                Err(hellas_channel::work::EndpointError::ObservationStale) => {
-                    #[expect(
-                        clippy::disallowed_methods,
-                        reason = "inventory class A: channel readiness"
-                    )]
-                    tokio::time::sleep(hellas_channel::work::SETUP_POLL).await;
-                }
-                ready => return ready.map_err(Into::into),
-            }
-        }
+        Ok(client.observer().fresh_readiness().await?)
     })
     .await
 }
