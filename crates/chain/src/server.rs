@@ -10,7 +10,7 @@ use hellas_rpc::pb::{
     chain::{
         self as pb, ActivityEvent, FinalizationEvent, FinalizedBlock as ProtoFinalizedBlock,
         FinalizedSnapshot, GetConsensusInfoResponse, GetFinalizationResponse,
-        GetFinalizedBlockResponse, GetLatestBlockResponse, GetProofResponse, GetRelayInfoResponse,
+        GetFinalizedBlockResponse, GetLatestBlockResponse, GetRelayInfoResponse,
         GetStateRootResponse, GetValidatorsResponse, NotarizationEvent, NotarizeEvent,
         NullificationEvent, NullifyEvent, SubmitTxOutcome as ProtoSubmitTxOutcome,
         SubmitTxResponse, SubmitWorkResponseRequest, activity_event, submit_tx_request,
@@ -344,21 +344,6 @@ where
             Ok(GetStateRootResponse {
                 state_root: state_root.map(|root| root.to_vec()),
             })
-        }
-    }
-
-    fn get_proof(
-        &self,
-        request: pb::GetProofRequest,
-    ) -> impl Future<Output = Result<GetProofResponse, WireStatus>> + Send {
-        let client = self.client.clone();
-        async move {
-            let object_id = digest_from_bytes(request.object_id, "object_id")?;
-            let proof = client
-                .get_proof(object_id)
-                .await
-                .map_err(WireStatus::from)?;
-            Ok(GetProofResponse { proof })
         }
     }
 

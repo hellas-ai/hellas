@@ -12,7 +12,6 @@ use hellas_rpc::protocol::invocation::{
 };
 use hellas_sdk::node_control::profile;
 use std::path::Path;
-use std::time::Duration;
 use {
     hellas_authority::authenticator::Authenticator, hellas_authority::authenticator::kernel_auth,
     hellas_authority::grant_service::WorkAdministration,
@@ -316,7 +315,7 @@ impl PaidWork {
             }) {
                 return Ok(());
             }
-            let Some(next) = page.holdings.as_ref().and_then(|page| page.next) else {
+            let Some(next) = page.next_holdings() else {
                 break;
             };
             after = Some(next);
@@ -594,6 +593,7 @@ impl PaidWork {
                 64 * 1024,
             )?)?
         } else {
+            let mut blocks = client.finalized_blocks().await?;
             let input = 'search: loop {
                 let mut after = None;
                 while let Some(page) = client.get_holdings(owner.into(), after).await? {
@@ -608,18 +608,13 @@ impl PaidWork {
                     if let Some((id, _)) = selected {
                         break 'search id;
                     }
-                    let Some(next) = page.holdings.as_ref().and_then(|page| page.next) else {
+                    let Some(next) = page.next_holdings() else {
                         break;
                     };
                     after = Some(next);
                 }
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "inventory class B: certified coin search; rollout 3"
-                )]
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                blocks.next().await?;
             };
-            let input = CoinId::from_bytes(input.0);
             let plan = hellas_sdk::coin_owner::OwnerReshape::prepare(
                 client,
                 network,
@@ -677,6 +672,7 @@ impl PaidWork {
             .map(|id| hellas_chain::domain::ObjectKey::Coin(*id))
             .collect();
         let mut submitted = false;
+        let mut blocks = client.finalized_blocks().await?;
         loop {
             let read = client
                 .get_objects(keys.clone())
@@ -705,11 +701,7 @@ impl PaidWork {
                 client.submit_tx(tx.clone()).await?;
                 submitted = true;
             }
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "inventory class B: certified delegation; rollout 3"
-            )]
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            blocks.next().await?;
         }
     }
 }

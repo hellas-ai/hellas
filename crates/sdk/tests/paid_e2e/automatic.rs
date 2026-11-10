@@ -1724,7 +1724,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
             devnet.network(),
             ROOT,
             &keys[0],
-            &[CoinId::from_bytes(stake.0)],
+            &[stake],
             None,
         )
         .await

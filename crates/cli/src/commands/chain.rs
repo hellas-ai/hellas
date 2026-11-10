@@ -467,7 +467,7 @@ impl ObjectReader {
             {
                 anyhow::bail!("owner state changed during the listing; retry");
             }
-            after = page.holdings.as_ref().and_then(|holdings| holdings.next);
+            after = page.next_holdings();
             pages.push(page);
             if after.is_none() {
                 return Ok(pages);
@@ -614,8 +614,8 @@ async fn run_object_query(reader: ObjectReader, query: QueryCommand) -> CliResul
             };
             print_snapshot(&first.block);
             for page in &pages {
-                for (object_id, coin) in page.owned_coins(owner) {
-                    println!("{} {}", hex::encode(object_id), coin.value);
+                for (id, coin) in page.owned_coins(owner) {
+                    println!("{} {}", hex::encode(id.to_bytes()), coin.value);
                 }
             }
         }
@@ -628,8 +628,13 @@ async fn run_object_query(reader: ObjectReader, query: QueryCommand) -> CliResul
             };
             print_snapshot(&first.block);
             for page in &pages {
-                for (object_id, edge) in page.edges() {
-                    println!("{} {} {}", hex::encode(object_id), edge.maker, edge.taker);
+                for (id, edge) in page.edges() {
+                    println!(
+                        "{} {} {}",
+                        hex::encode(id.to_bytes()),
+                        edge.maker,
+                        edge.taker
+                    );
                 }
             }
         }
@@ -786,35 +791,32 @@ async fn get_live_edge(
     client: &RemoteLightClient,
     edge_id: EdgeId,
 ) -> CliResult<hellas_chain::EdgeState> {
-    const SNAPSHOT_RETRIES: usize = 40;
-    const SNAPSHOT_RETRY_DELAY: Duration = Duration::from_millis(250);
+    const INDEX_WAIT: Duration = Duration::from_secs(10);
 
-    for attempt in 0..SNAPSHOT_RETRIES {
-        let latest = client
-            .get_latest_block()
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("chain has no finalized block"))?;
-        match client.get_objects(vec![ObjectKey::Edge(edge_id)]).await {
-            // The close is decided at state at least as new as the latest
-            // finalized block seen above.
-            Ok(Some(snapshot)) if snapshot.block.height >= latest.height => {
-                return snapshot
-                    .edge(edge_id)?
-                    .map(hellas_chain::EdgeState::from)
-                    .ok_or_else(|| anyhow::anyhow!("edge does not exist"));
+    let mut blocks = client.finalized_blocks().await?;
+    let read = async {
+        loop {
+            let latest = client
+                .get_latest_block()
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("chain has no finalized block"))?;
+            match client.get_objects(vec![ObjectKey::Edge(edge_id)]).await {
+                // The close is decided at state at least as new as the latest
+                // finalized block seen above.
+                Ok(Some(snapshot)) if snapshot.block.height >= latest.height => {
+                    return snapshot
+                        .edge(edge_id)?
+                        .map(hellas_chain::EdgeState::from)
+                        .ok_or_else(|| anyhow::anyhow!("edge does not exist"));
+                }
+                Ok(_) | Err(QueryError::StateUnavailable(_)) => blocks.next().await?,
+                Err(error) => return Err(error.into()),
             }
-            Ok(_) | Err(QueryError::StateUnavailable(_)) => {}
-            Err(error) => return Err(error.into()),
         }
-        if attempt + 1 < SNAPSHOT_RETRIES {
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "inventory class B: remote index; rollout 3"
-            )]
-            tokio::time::sleep(SNAPSHOT_RETRY_DELAY).await;
-        }
-    }
-    Err(anyhow::anyhow!("edge state is not indexed yet"))
+    };
+    tokio::time::timeout(INDEX_WAIT, read)
+        .await
+        .map_err(|_| anyhow::anyhow!("edge state is not indexed yet"))?
 }
 
 fn load_mutual_signer(

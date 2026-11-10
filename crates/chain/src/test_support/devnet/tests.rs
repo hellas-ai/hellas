@@ -251,7 +251,7 @@ fn a_remote_light_client_verifies_the_block_a_full_node_finalized() {
                     .into_iter()
                     .map(|(id, coin)| (id, coin.value))
                     .collect::<Vec<_>>(),
-                vec![(coin_object_id(delegated), owner.balance)],
+                vec![(delegated, owner.balance)],
                 "{url}",
             );
 

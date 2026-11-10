@@ -562,6 +562,15 @@ impl Devnet {
 
     /// The light client validator `validator` serves at its URL, read in
     /// process.
+    /// The consensus activity `validator` publishes; a light-client server
+    /// built on [`Self::validator_light_client`] streams it to subscribers.
+    pub fn validator_activity(
+        &self,
+        validator: usize,
+    ) -> tokio::sync::broadcast::Sender<crate::ConsensusActivity> {
+        self.sealer.activity[validator].clone()
+    }
+
     pub fn validator_light_client(&self, validator: usize) -> LocalLightClient {
         let validator = &self.validators[validator];
         LocalLightClient::new(
@@ -760,16 +769,14 @@ impl Devnet {
             panic!("the owner index has a finalized cursor");
         };
         assert!(
-            held.holdings
-                .as_ref()
-                .is_some_and(|page| page.next.is_none()),
+            held.holdings().is_some_and(|page| page.next.is_none()),
             "a devnet owner fits one holdings page"
         );
         let projected_root = held.block.state_root;
         let mut projected = held
             .owned_coins(owner)
             .into_iter()
-            .map(|(id, coin)| (CoinId::from_bytes(id.into()), coin.value))
+            .map(|(id, coin)| (id, coin.value))
             .collect::<Vec<_>>();
         projected.sort_by_key(|(id, value)| (*value, *id));
 

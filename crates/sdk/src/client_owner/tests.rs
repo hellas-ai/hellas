@@ -181,7 +181,6 @@ fn durable_funding_retries_one_signature_and_reserves_other_providers() {
                         provider(3),
                         200,
                         FundingControls {
-                            poll: Duration::from_millis(10),
                             timeout: FUNDING_DEADLINE,
                             approval: Some(&Deny),
                             before_sign: None,
@@ -199,7 +198,6 @@ fn durable_funding_retries_one_signature_and_reserves_other_providers() {
                     provider(3),
                     200,
                     FundingControls {
-                        poll: Duration::from_millis(10),
                         timeout: FUNDING_DEADLINE,
                         approval: Some(&gate),
                         before_sign: None,
@@ -220,7 +218,6 @@ fn durable_funding_retries_one_signature_and_reserves_other_providers() {
                     provider(3),
                     200,
                     FundingControls {
-                        poll: Duration::from_millis(10),
                         timeout: FUNDING_DEADLINE,
                         approval: Some(&gate),
                         before_sign: None,
@@ -271,7 +268,6 @@ fn durable_funding_retries_one_signature_and_reserves_other_providers() {
                     provider(3),
                     200,
                     FundingControls {
-                        poll: Duration::from_millis(10),
                         timeout: FUNDING_DEADLINE,
                         approval: Some(&gate),
                         before_sign: None,
@@ -301,7 +297,6 @@ fn durable_funding_retries_one_signature_and_reserves_other_providers() {
                     provider(3),
                     [7; 16],
                     FundingControls {
-                        poll: Duration::from_millis(10),
                         timeout: FUNDING_DEADLINE,
                         approval: Some(&gate),
                         before_sign: None,
@@ -319,7 +314,6 @@ fn durable_funding_retries_one_signature_and_reserves_other_providers() {
                     provider(3),
                     200,
                     FundingControls {
-                        poll: Duration::from_millis(10),
                         timeout: FUNDING_DEADLINE,
                         approval: Some(&gate),
                         before_sign: None,
@@ -330,7 +324,6 @@ fn durable_funding_retries_one_signature_and_reserves_other_providers() {
                     provider(3),
                     200,
                     FundingControls {
-                        poll: Duration::from_millis(10),
                         timeout: FUNDING_DEADLINE,
                         approval: Some(&gate),
                         before_sign: None,
@@ -344,20 +337,8 @@ fn durable_funding_retries_one_signature_and_reserves_other_providers() {
             assert_eq!(approval.count.load(Ordering::SeqCst), 2);
             let (second, third) = sealing(&mut devnet, async {
                 tokio::join!(
-                    owner.fund(
-                        &chain,
-                        provider(4),
-                        200,
-                        Duration::from_millis(10),
-                        FUNDING_DEADLINE
-                    ),
-                    owner.fund(
-                        &chain,
-                        provider(5),
-                        200,
-                        Duration::from_millis(10),
-                        FUNDING_DEADLINE
-                    )
+                    owner.fund(&chain, provider(4), 200, FUNDING_DEADLINE),
+                    owner.fund(&chain, provider(5), 200, FUNDING_DEADLINE)
                 )
             })
             .await;
@@ -428,13 +409,7 @@ fn competing_owner_spend_releases_conflicted_inputs_for_another_provider() {
             let approval = Arc::new(Approval::new());
             approval.pause.store(true, Ordering::SeqCst);
             let owner = ClientOwner::new(approval.clone(), delegate(), &state).unwrap();
-            let funding = owner.fund(
-                &chain,
-                provider(3),
-                300,
-                Duration::from_millis(10),
-                FUNDING_DEADLINE,
-            );
+            let funding = owner.fund(&chain, provider(3), 300, FUNDING_DEADLINE);
             tokio::pin!(funding);
             tokio::select! { result = &mut funding => panic!("approval was not held: {result:?}"), () = approval.entered.notified() => {} }
             let competing = OwnerReshape::prepare(
@@ -477,36 +452,27 @@ fn competing_owner_spend_releases_conflicted_inputs_for_another_provider() {
             );
             let other = sealing(
                 &mut devnet,
-                owner.fund(
-                    &chain,
-                    provider(4),
-                    100,
-                    Duration::from_millis(10),
-                    FUNDING_DEADLINE,
-                ),
+                owner.fund(&chain, provider(4), 100, FUNDING_DEADLINE),
             )
             .await
             .unwrap();
             assert_eq!(approval.count.load(Ordering::SeqCst), 2);
+            let found = chain
+                .get_objects(other.maker().iter().copied().map(ObjectKey::Coin).collect())
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(
-                chain
-                    .get_objects(other.maker().iter().copied().map(ObjectKey::Coin).collect())
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .objects
-                    .len(),
+                other
+                    .maker()
+                    .iter()
+                    .filter(|id| found.coin(**id).unwrap().is_some())
+                    .count(),
                 1
             );
             let retry = sealing(
                 &mut devnet,
-                owner.fund(
-                    &chain,
-                    provider(3),
-                    100,
-                    Duration::from_millis(10),
-                    FUNDING_DEADLINE,
-                ),
+                owner.fund(&chain, provider(3), 100, FUNDING_DEADLINE),
             )
             .await
             .unwrap();

@@ -1,5 +1,4 @@
 use super::*;
-use crate::domain::ObjectId;
 use crate::{Mempool, light_client::QueryError};
 use bytes::Bytes;
 use hellas_channel::test_support::HANG_GUARD;
@@ -44,10 +43,6 @@ struct MempoolClient {
 
 impl LightClientApi for MempoolClient {
     async fn get_state_root(&self) -> Result<Option<Digest>, QueryError> {
-        panic!("unused test method")
-    }
-
-    async fn get_proof(&self, _object_id: ObjectId) -> Result<Option<Vec<u8>>, QueryError> {
         panic!("unused test method")
     }
 
@@ -524,6 +519,52 @@ async fn activity_stream_does_not_block_unary_requests() {
     server.abort();
 }
 
+/// The server closes a connection that opens no call for `IDLE_TIMEOUT`,
+/// quiet subscriptions included. The client's next call reconnects instead
+/// of failing on the closed carrier.
+#[cfg(feature = "client")]
+#[tokio::test]
+async fn a_call_after_the_server_idle_close_succeeds_on_a_fresh_connection() {
+    use crate::{LightClient as _, client::RemoteLightClient};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let (activity_tx, _activity_rx) = broadcast::channel(8);
+    let server = spawn_light_client_server(
+        addr,
+        MempoolClient::default(),
+        activity_tx,
+        LightClientRpcState::default(),
+    )
+    .await
+    .unwrap();
+    let client = RemoteLightClient::connect(format!("ws://{addr}"), test_proof_verifier())
+        .await
+        .unwrap();
+    assert_eq!(client.get_validators().await.unwrap(), ["validator-a"]);
+    // A quiet subscription does not keep the connection open.
+    let mut blocks = client.finalized_blocks().await.unwrap();
+
+    // Only the idle deadline is virtual; the sockets stay real.
+    tokio::time::pause();
+    tokio::time::advance(IDLE_TIMEOUT).await;
+    client.carrier_closed().await;
+    tokio::time::resume();
+
+    let validators = tokio::time::timeout(HANG_GUARD, client.get_validators())
+        .await
+        .expect("the call must not hang on the closed connection")
+        .expect("the call must reconnect after the server closed the idle connection");
+    assert_eq!(validators, ["validator-a"]);
+    // The ended subscription resubscribes on the fresh connection.
+    tokio::time::timeout(HANG_GUARD, blocks.next())
+        .await
+        .expect("an ended subscription wakes its follower")
+        .expect("the follower resubscribes");
+    server.abort();
+}
+
 #[test]
 fn activity_event_contains_validator_observation_timestamp() {
     let before = unix_time_ms();
@@ -555,13 +596,21 @@ async fn one_validator_submission_is_one_rpc_sample() {
     use hellas_rpc::observe::Samples;
     use tracing::instrument::WithSubscriber as _;
 
-    let (client_transport, server_transport) = transport_pair();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
     let (activity_tx, _activity_rx) = broadcast::channel(1);
-    let server = tokio::spawn(serve_light_client_transport(
-        server_transport,
-        LightClientRpc::new(MempoolClient::default(), activity_tx),
-    ));
-    let client = RemoteLightClient::new(client_transport, test_proof_verifier());
+    let server = spawn_light_client_server(
+        addr,
+        MempoolClient::default(),
+        activity_tx,
+        LightClientRpcState::default(),
+    )
+    .await
+    .unwrap();
+    let client = RemoteLightClient::connect(format!("ws://{addr}"), test_proof_verifier())
+        .await
+        .unwrap();
     let samples = std::sync::Arc::new(Samples::new());
 
     let tx = Transaction::Kernel(valid_open_tx().expect("general transaction fixture"));

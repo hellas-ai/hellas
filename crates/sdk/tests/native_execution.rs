@@ -656,16 +656,11 @@ async fn wait_for_holdings(
             finalized.borrow_and_update();
             match chain.get_holdings(owner, None).await {
                 Ok(Some(listing)) => {
-                    assert!(
-                        listing
-                            .holdings
-                            .as_ref()
-                            .is_some_and(|page| page.next.is_none())
-                    );
+                    assert!(listing.holdings().is_some_and(|page| page.next.is_none()));
                     let coins: Vec<_> = listing
                         .owned_coins(owner)
                         .into_iter()
-                        .map(|(id, coin)| (CoinId::from_bytes(id.0), coin.value))
+                        .map(|(id, coin)| (id, coin.value))
                         .collect();
                     if ready(&coins) {
                         break;
@@ -1189,9 +1184,21 @@ async fn paid_setup(
         devnet.shutdown().await;
         return None;
     }
+    // An unavailable source is read again at each new block, so the chain
+    // keeps finalizing meanwhile, as a live one does.
+    let retried = async {
+        while relays
+            .source
+            .attempts
+            .load(std::sync::atomic::Ordering::SeqCst)
+            < attempts + 2
+        {
+            tokio::task::yield_now().await;
+        }
+    };
     tokio::select! {
         result = &mut open => panic!("setup ended before its proof read: {}", result.err().map_or_else(|| "unexpected success".into(), |error| error.to_string())),
-        () = async { while relays.source.attempts.load(std::sync::atomic::Ordering::SeqCst) < attempts + 2 { tokio::task::yield_now().await; } } => {},
+        () = sealing_while(&mut devnet, Duration::from_millis(100), retried) => {},
     }
     assert!(
         approvals.0.lock().unwrap().is_empty(),
