@@ -53,6 +53,13 @@ pub struct PaidWork {
     policy: PaidPolicy,
 }
 
+impl PaidWork {
+    /// Whether these terms admit Compute programs nobody configured.
+    pub fn admits_any_program(&self) -> bool {
+        self.policy.invocation_policy.admits_any_program()
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Bootstrap {
@@ -177,7 +184,6 @@ impl PaidWork {
         mut provider: hellas_sdk::ProviderOptions<R>,
         grants: Option<hellas_sdk::grant_config::GrantConfig>,
         path: Option<PathBuf>,
-        transport: Option<iroh::Endpoint>,
     ) -> CliResult<hellas_sdk::node_control::host::HostHandle> {
         ensure!(
             provider.executor.assurance == Assurance::ProducerSigned,
@@ -216,7 +222,7 @@ impl PaidWork {
             provider,
             Some(grants),
             path,
-            transport,
+            None,
             self.chain.chain.home(),
         )
         .await?;

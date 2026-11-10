@@ -15,6 +15,8 @@ const MAX_BOOTSTRAP_BYTES: usize = 64 * 1024;
 const MAX_PAIRING_ATTEMPTS: usize = 8;
 const MAX_HANDSHAKES: usize = 16;
 pub const PAIRING_LIFETIME: Duration = Duration::from_secs(15 * 60);
+/// The one line a node prints and its owner pastes into `hellas pair`.
+const INVITE_PREFIX: &str = "hellas-invite:";
 
 /// Public pin and one-use pairing material. Obtain this whole document through
 /// the provider's authenticated console, never through an untrusted lookup.
@@ -35,6 +37,30 @@ struct Request {
 }
 
 impl Invitation {
+    /// `hellas-invite:` followed by the base64url JSON invitation.
+    pub fn encode(&self) -> serde_json::Result<String> {
+        use base64::Engine as _;
+        let json = serde_json::to_vec(self)?;
+        Ok(format!(
+            "{INVITE_PREFIX}{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json)
+        ))
+    }
+
+    pub fn decode(text: &str) -> std::io::Result<Self> {
+        use base64::Engine as _;
+        let invalid =
+            || std::io::Error::new(std::io::ErrorKind::InvalidData, "not a hellas invite");
+        let encoded = text
+            .trim()
+            .strip_prefix(INVITE_PREFIX)
+            .ok_or_else(invalid)?;
+        let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(|_| invalid())?;
+        serde_json::from_slice(&json).map_err(|_| invalid())
+    }
+
     pub fn create(endpoint: &iroh::Endpoint, now: UnixMillis) -> Result<Self, WireStatus> {
         use rand::Rng;
         let mut pairing = [0; 32];
@@ -224,6 +250,25 @@ mod tests {
     use super::*;
     use hellas_private::StoreLocation;
     use {hellas_authority::test_support::common_node, hellas_channel::test_support::actors::ROOT};
+
+    #[test]
+    fn an_invite_is_one_line_that_round_trips_and_nothing_else_decodes() {
+        let invitation = Invitation {
+            node: iroh::SecretKey::from([7; 32]).public(),
+            addresses: vec!["192.0.2.1:4433".parse().unwrap()],
+            pairing: [9; 32],
+            expires: UnixMillis(1),
+        };
+        let line = invitation.encode().unwrap();
+        assert!(line.starts_with(INVITE_PREFIX) && !line.contains(char::is_whitespace));
+        let decoded = Invitation::decode(&format!("{line}\n")).unwrap();
+        assert_eq!(decoded.node, invitation.node);
+        assert_eq!(decoded.addresses, invitation.addresses);
+        assert_eq!(decoded.pairing, invitation.pairing);
+        assert_eq!(decoded.expires, invitation.expires);
+        assert!(Invitation::decode(&line[INVITE_PREFIX.len()..]).is_err());
+        assert!(Invitation::decode("hellas-invite:!!").is_err());
+    }
 
     #[test]
     fn provider_runtime_dials_tls_relay_with_default_stack() {

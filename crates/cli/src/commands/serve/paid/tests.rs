@@ -1,5 +1,4 @@
 use super::*;
-use clap::Parser as _;
 use hellas_private::StoreLocation;
 
 #[tokio::test]
@@ -36,13 +35,7 @@ async fn fleet_paid_startup_requires_exact_owner_approval_without_owner_key() {
     );
     assert!(!paid.root.join("bootstrap.json").exists());
 
-    let cli = crate::Cli::try_parse_from(["hellas", "serve", "--faucet-account", "7"]).unwrap();
-    paid.owner = cli
-        .owner
-        .load(&hellas_chain::genesis::ChainProfile::known(
-            hellas_chain::genesis::Chain::Devnet,
-        ))
-        .unwrap();
+    paid.owner = Some(hellas_kernel::SoftPasskey::from_secret_scalar([7; 32]).unwrap());
     let credential = paid
         .prepare(&config, &identity.enrollment, &identity.node_key)
         .await
@@ -162,14 +155,7 @@ fn power_durability_reaches_paid_chain_journals() {
 async fn interrupted_bootstrap_reuses_prepared_owner_approval_credential_and_tls() {
     let root = tempfile::tempdir().unwrap();
     let identity = crate::identity::load_or_create(&root.path().join("identity")).unwrap();
-    let cli = crate::Cli::try_parse_from(["hellas", "serve", "--faucet-account", "7"]).unwrap();
-    let owner = cli
-        .owner
-        .load(&hellas_chain::genesis::ChainProfile::known(
-            hellas_chain::genesis::Chain::Devnet,
-        ))
-        .unwrap()
-        .unwrap();
+    let owner = hellas_kernel::SoftPasskey::from_secret_scalar([7; 32]).unwrap();
     let example =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples/faucet-provider.toml");
     let location = StoreLocation::for_test(&root.path().join("provider"));
@@ -215,104 +201,11 @@ async fn interrupted_bootstrap_reuses_prepared_owner_approval_credential_and_tls
     assert_eq!(std::fs::read(config.control_private_key()).unwrap(), key);
 }
 
-#[tokio::test]
-async fn faucet_upload_terms_admit_a_fresh_whisper_program_and_features() {
-    use hellas_client::model::{ModelPackage, ModelRequest};
-    use hellas_store::content::{
-        ContentStore as _, DiskStore, IndexMode, JobId, PinName, PinPolicy, PinValue, Reservations,
-        Scope, Target,
-    };
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../client/src/model/whisper/mini");
-    let model = ModelPackage::open(&fixture).await.unwrap();
-    let job = model
-        .render_job(&ModelRequest::Transcription {
-            samples: &[0.; 400],
-            language: Some("en"),
-            max_new_tokens: 4,
-        })
-        .await
-        .unwrap();
-    let example: toml::Value = toml::from_str(include_str!(
-        "../../../../../../docs/examples/faucet-provider.toml"
-    ))
-    .unwrap();
-    let limits: hellas_rpc::protocol::invocation::Limits =
-        example["limits"].clone().try_into().unwrap();
-    let inputs = job
-        .inputs
-        .iter()
-        .map(|a| {
-            (
-                a.name.clone(),
-                hellas_rpc::ContentRef::for_bytes(a.bytes.as_bytes()),
-            )
-        })
-        .collect();
-    let root = tempfile::tempdir().unwrap();
-    let node = DiskStore::open(
-        StoreLocation::for_test(&root.path().join("content")),
-        vec![fixture],
-        IndexMode::Resume,
-        None,
-        Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
-        false,
-    )
-    .await
-    .unwrap();
-    node.finish_recovery().await.unwrap();
-    for asset in &job.environment.assets {
-        node.set_pin(
-            &Scope::Owner,
-            &PinName::new(format!("config/{}", asset.name)).unwrap(),
-            None,
-            Some(PinValue {
-                target: Target::Object(asset.object),
-                policy: PinPolicy::Jobs,
-                expires: None,
-            }),
-        )
-        .await
-        .unwrap();
-    }
-    let mut closure = vec![hellas_rpc::ContentRef::for_bytes(
-        &job.environment.canonical_bytes().unwrap(),
-    )];
-    closure.extend(job.environment.sources.iter().copied());
-    closure.extend(job.environment.assets.iter().map(|asset| asset.object));
-    let inputs: std::collections::BTreeMap<_, _> = inputs;
-    closure.extend(inputs.values().copied());
-    hellas_executor::catena::validate::preflight(&job.environment, &inputs, &job.plan, &limits)
-        .unwrap();
-    let id = JobId {
-        channel: hellas_auth::Digest::hash(b"faucet channel"),
-        id: hellas_auth::Digest::hash(b"faucet job"),
-    };
-    // The real reservation charges fresh program/root/features, while a
-    // readable Jobs pin supplies provider-held weights without charging uploads.
-    let scope = node
-        .open_work(id, closure.clone(), limits.max_upload_bytes)
-        .await
-        .unwrap();
-    node.end_work(&scope).await.unwrap();
-    assert!(matches!(
-        node.open_work(id, closure, 1 << 20).await,
-        Err(hellas_store::content::Error::Capacity)
-    ));
-    node.close().await;
-}
-
 #[test]
 fn paid_fetch_admission_derives_the_configured_route_contract() {
     use hellas_executor::FetchAdaptorFactory as _;
     let root = tempfile::tempdir().unwrap();
-    let cli = crate::Cli::try_parse_from(["hellas", "serve", "--faucet-account", "7"]).unwrap();
-    let owner = cli
-        .owner
-        .load(&hellas_chain::genesis::ChainProfile::known(
-            hellas_chain::genesis::Chain::Devnet,
-        ))
-        .unwrap()
-        .unwrap();
+    let owner = hellas_kernel::SoftPasskey::from_secret_scalar([7; 32]).unwrap();
     let example =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples/faucet-provider.toml");
     let mut terms: toml::Value =

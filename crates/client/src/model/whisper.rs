@@ -22,6 +22,8 @@ use std::{
 pub const WEIGHTS_FILE: &str = "weights.bf16";
 pub const OUTPUT: &str = "transcription";
 const METADATA: [&str; 3] = ["config.json", "generation_config.json", "tokenizer.json"];
+/// The published checkpoint files [`convert_whisper`] reads.
+pub const CHECKPOINT: [&str; 4] = [METADATA[0], METADATA[1], METADATA[2], "model.safetensors"];
 
 #[derive(Deserialize)]
 struct Generation {
@@ -169,7 +171,7 @@ pub fn convert_whisper(checkpoint: &Path, destination: &Path) -> Result<ContentR
     for name in METADATA {
         std::fs::copy(checkpoint.join(name), staging.path().join(name))?;
     }
-    let object = super::file_content(&path)?;
+    let object = hellas_store::content::file_content(&path)?;
     std::fs::rename(staging.path(), destination)?;
     Ok(object)
 }
@@ -196,7 +198,7 @@ impl Whisper {
             tokio::task::spawn_blocking(move || -> Result<_> {
                 let (config, generation, tokenizer) = metadata(&dir)?;
                 let views = views(&config)?;
-                let object = super::file_content(&dir.join(WEIGHTS_FILE))?;
+                let object = hellas_store::content::file_content(&dir.join(WEIGHTS_FILE))?;
                 let (offset, bytes) = views.last().context("model has no weights")?;
                 ensure!(
                     object.bytes() == offset + bytes,
@@ -229,6 +231,9 @@ impl Whisper {
             content,
             views,
         })
+    }
+    pub(super) fn environment(&self) -> &Environment {
+        &self.environment
     }
     pub fn transcription_capacity(&self) -> usize {
         self.config.max_target_positions - 4

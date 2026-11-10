@@ -1,8 +1,6 @@
-//! Shared owner, grant and gateway for the manual model comparisons.
+//! A local gateway for the manual model comparisons.
 use super::*;
-use hellas_authority::model::grant::{grant_network, owner_grant_id, records::*};
 use hellas_private::StoreLocation;
-use hellas_rpc::protocol::invocation::{Admission, InvocationPolicy, Limits, compute};
 
 pub(super) struct LocalCompute {
     pub gateway: Process,
@@ -13,101 +11,22 @@ pub(super) struct LocalCompute {
 }
 
 impl LocalCompute {
-    pub async fn start(
-        model: &Path,
-        model_flag: &str,
-        content: &Path,
-        limits: Limits,
-        job_millis: Option<std::num::NonZeroU64>,
-        extra: &[&str],
-    ) -> Self {
+    pub async fn start(model: &Path, content: &Path, extra: &[&str]) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         hellas_private::restrict_directory(root).unwrap();
         let owner = Cli::new(root, "owner", AGENT_PASSKEY);
-        owner.run(&["--software-root", "identity", "init"]).await;
-        let export = owner.output(&["identity", "export-enrollment"]).await;
-        assert!(export.status.success());
-        let enrollment = decode_enrollment(&export.stdout).unwrap();
-        let principal = owner.principal();
-        let journal = owner.home.join("provider");
-        let (store, secret) = common_node::bootstrap_node_with_credential(
-            &journal,
-            grant_network(),
-            Some(enrollment.clone()),
-            hellas_auth::authority::UnixMillis::now().unwrap_or_default(),
-        )
-        .await
-        .unwrap();
-        let policy = GrantPolicy {
-            name: "local".into(),
-            invocation_policy: InvocationPolicy {
-                admissions: vec![Admission::Compute {
-                    evaluator: compute::EVALUATOR.into(),
-                    programs: hellas_rpc::protocol::invocation::ComputePrograms::Any {},
-                }],
-                limits,
-            },
-            https: None,
-            responses: None,
-            ..hellas_authority::test_support::policy()
+        owner.run(&["identity", "init"]).await;
+        let hellas_auth::authority::CredentialHolder::Node(holder) = owner.holder().await else {
+            panic!("a device key")
         };
-        let allowance = owner_grant_id(grant_network(), enrollment.content_id(), principal);
-        // Read this fixture identity's node key to provision its own service.
-        let identity_bytes = std::fs::read(&owner.identity).unwrap();
-        let mut decoder = hellas_rpc::DagCborDecoder::new(&identity_bytes);
-        decoder.array(6, "identity").unwrap();
-        decoder
-            .tag("hellas.provider.identity.persistence.v3")
-            .unwrap();
-        assert_eq!(decoder.u64("version").unwrap(), 3);
-        decoder.array(2, "root").unwrap();
-        assert_eq!(decoder.u64("root kind").unwrap(), 0);
-        let _: [u8; 32] = decoder.fixed_bytes("root key").unwrap();
-        let signer = hellas_auth::ProducerSigningKey::from_secret_bytes(
-            decoder.fixed_bytes("node key").unwrap(),
-        )
-        .unwrap();
-        let mut definition = common_node::allowance(allowance, principal, vec![policy]);
-        if let Some(millis) = job_millis {
-            definition.max_job_millis = millis;
-        }
-        let store = common_node::provision(
-            &journal,
-            store,
-            &secret,
-            signer,
-            (1, vec![]),
-            definition,
-            (vec![], 256),
-        )
-        .await;
-        let node = hellas_authority::node::NodeCoordinator::new(
-            store,
-            Arc::new(|| hellas_auth::authority::UnixMillis::now().unwrap_or_default()),
-        );
-        let credential =
-            execution_credential(&node, &secret, principal, allowance, owner.holder().await).await;
-        let authority = hellas_authority::test_support::session(&node, &secret)
-            .await
-            .authority();
-        let work_profile = work_profile(root, authority, &credential);
-        drop(node);
+        let journal = owner.home.join("provider");
         let (gateway_profile, gateway_token) = gateway_profile(root).await;
-        let trust_root = approve(root, "local", enrollment.content_id());
         let configuration = prepare_content(root, &journal, content);
-        let allowance = hex::encode(allowance.0);
         let mut args = vec![
             "gateway",
-            "--trust-store",
-            string(&trust_root),
-            "--trust-policy",
-            "local",
-            "--local-grant",
-            &allowance,
-            "--work-profile",
-            string(&work_profile),
-            model_flag,
+            "--local",
+            "--model",
             string(model),
             "--content-config",
             string(&configuration),
@@ -135,8 +54,7 @@ impl LocalCompute {
             )
             .build()
             .unwrap();
-        let provider =
-            hellas_auth::PublicKey::Secp256k1(grant_producer(&enrollment).unwrap().to_bytes());
+        let provider = holder.public_key();
         Self {
             gateway,
             http,

@@ -136,11 +136,6 @@ let
       export HELLAS_CLI_TEST_BINARY
       cargo test ${s.sdk-integration} --test native_execution cli_settles_paid_channel_without_provider -- --ignored
       cargo test ${s.sdk-integration} --test native_execution cli_buys_a_paid_job_end_to_end -- --ignored
-      # The paid/grant composition case re-executes a Catena compile worker,
-      # whose process isolation is implemented only on Linux.
-      ${lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
-        cargo test ${s.sdk-integration} --test native_execution cli_paid_and_grant_two_provider_composition -- --ignored
-      ''}
       cargo test ${s.cli-otel-integration} --test grant_http metrics_scrape_observes_gateway_and_serve_work
     '' (cargoEnv rustToolchain);
     cloud = mkCargo "check-cloud" ''
@@ -181,6 +176,37 @@ let
           exit 1
         fi
       done
+    '' (cargoEnv rustToolchain ++ [ pkgs.gnugrep ]);
+    # The keyhole: providers run generic compute and know no models. Provider
+    # crates must not reach client model code, and the provider half of the
+    # CLI and SDK must not name it. Client model code stays client-side.
+    provider-dependencies = mkCargo "check-provider-dependencies" ''
+      for package in hellas-executor hellas-authority hellas-providers hellas-rpc hellas-channel hellas-admission hellas-store hellas-chain hellas-kernel; do
+        dependencies="$(cargo tree --locked --edges normal,build --prefix none -p "$package")"
+        if grep -Eq '^(hellas-client|hellas-gateway|hellas-presentation|catena-models|tokenizers|hound|png|safetensors) v' <<< "$dependencies"; then
+          printf '%s\n' "$dependencies"
+          echo "client model code reached provider crate $package" >&2
+          exit 1
+        fi
+      done
+      provider_paths=(
+        crates/cli/src/commands/serve
+        crates/cli/src/compute.rs
+        crates/cli/src/content_configuration.rs
+        crates/sdk/src/provider
+        crates/sdk/src/provider.rs
+        crates/sdk/src/paid_provider
+        crates/sdk/src/paid_provider.rs
+        crates/sdk/src/grant_provider.rs
+      )
+      existing=()
+      for path in "''${provider_paths[@]}"; do
+        if [[ -e "$path" ]]; then existing+=("$path"); fi
+      done
+      if grep -rnE 'hellas_client::model|ModelPackage|ModelRequest|catena_models' "''${existing[@]}"; then
+        echo "provider code names client model code" >&2
+        exit 1
+      fi
     '' (cargoEnv rustToolchain ++ [ pkgs.gnugrep ]);
     # RPC owns the generated Work/WorkSetup interfaces and their wire-id pins;
     # Channel and authority own the canonical records and durable orchestration.
@@ -339,6 +365,7 @@ let
     "statix"
     "nixfmt"
     "channel-dependencies"
+    "provider-dependencies"
     "xet-no-alloc"
   ];
   lintChecks = lib.filterAttrs (name: _: builtins.elem name lintNames) checks;

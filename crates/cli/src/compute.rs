@@ -9,8 +9,10 @@ pub(crate) struct ServeArgs {
     /// Node content configuration containing [content].
     #[arg(long, value_name = "FILE")]
     pub(crate) content_config: Option<PathBuf>,
-    #[arg(skip)]
-    pub(crate) model: Option<crate::content_configuration::Model>,
+    /// Serve the file at PATH, or every file in the directory at PATH (such
+    /// as a converted model package), to jobs that name it; repeat for each.
+    #[arg(long = "content", value_name = "PATH")]
+    pub(crate) content: Vec<PathBuf>,
     #[cfg(feature = "compute")]
     #[command(flatten)]
     pub(crate) gpu: GpuArgs,
@@ -45,7 +47,7 @@ impl ServeArgs {
         }
         #[cfg(not(feature = "compute"))]
         let _ = executor;
-        crate::content_configuration::ContentConfiguration::load(self.content_config, self.model)
+        crate::content_configuration::ContentConfiguration::load(self.content_config, self.content)
     }
 }
 

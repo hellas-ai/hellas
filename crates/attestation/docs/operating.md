@@ -30,24 +30,21 @@ Attestation only works on a genuine, locked-down Apple machine.
 
 ## Requester
 
-Use the paid HTTPS Fetch gateway. Each pool entry selects a named `trust_policy`
-from the caller's native private `trust_store`. Approve the enrollment, Apple app ID,
-CDHashes and exact manifest IDs through the separate `hellas trust ... approve`
-operation using independently reviewed release metadata. Offers cannot replace these
-pins. See the
-[paid gateway guide](../../../docs/paid-gateway.md) for funding and pool fields,
-and [HTTP routing](../../../docs/http-gateway.md) for exact route configuration.
+Buy an Apple-attested HTTPS Fetch with `hellas fetch`. `--trust-policy` selects
+a named policy from the caller's private `--trust-store`. Approve the enrollment,
+Apple app ID, CDHashes and exact manifest IDs through the separate `hellas trust
+... approve` operation using independently reviewed release metadata. Offers
+cannot replace these pins. See the
+[paid work guide](../../../docs/paid-gateway.md) for funding.
 
 ```sh
-hellas gateway \
-  --assurance apple-app-attest \
-  --paid-work-config /srv/hellas/pool.json \
-  --http-fetch-config /srv/hellas/http-routes.json \
-  --zdr
+hellas fetch https://api.example.com/v1/models --contract http \
+  --assurance apple-app-attest --trust-store ./trust --trust-policy provider-a \
+  --pay 20 --provider ENROLLMENT_ID@NODE_ID
 ```
 
-`--zdr` disables gateway payload archives and requires a ZDR policy for every
-HTTP request. Paid Fetch journals contain accounting metadata, never request
+`hellas gateway` runs producer-signed work only; it has no Apple assurance
+option. Paid Fetch journals contain accounting metadata, never request
 or response bodies. These storage rules do not establish an upstream API's
 retention policy. Native token Work remains producer-signed; Apple assurance
 here is the paid Fetch path. Owner and principal routes use grant-funded Work with the same provider authentication.

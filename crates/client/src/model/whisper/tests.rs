@@ -52,6 +52,41 @@ fn checkpoint(dir: &Path) {
     .unwrap();
 }
 
+/// A provider and its users convert the same pinned checkpoint separately; a
+/// job names the provider's weights by content ID. So the package must be a
+/// pure function of the checkpoint bytes: identical across runs and
+/// directories, and pinned here so every machine and architecture must
+/// produce the same identity.
+#[test]
+fn conversion_is_a_pure_function_of_the_pinned_checkpoint() {
+    let root = tempfile::tempdir().unwrap();
+    let checkpoint_dir = root.path().join("checkpoint");
+    checkpoint(&checkpoint_dir);
+    let packages = [root.path().join("one"), root.path().join("elsewhere/two")];
+    std::fs::create_dir(root.path().join("elsewhere")).unwrap();
+    let objects: Vec<_> = packages
+        .iter()
+        .map(|package| convert_whisper(&checkpoint_dir, package).unwrap())
+        .collect();
+    assert_eq!(objects[0], objects[1]);
+    assert_eq!(
+        objects[0].id().to_string(),
+        "0bb00e1c571b43ce6a2392e06ccf76423c4391e34a972d7c701bd7c69e71b506",
+        "the converted weights' identity changed"
+    );
+    for name in CHECKPOINT
+        .iter()
+        .filter(|name| METADATA.contains(name))
+        .chain([&WEIGHTS_FILE])
+    {
+        assert_eq!(
+            std::fs::read(packages[0].join(name)).unwrap(),
+            std::fs::read(packages[1].join(name)).unwrap(),
+            "{name}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn converted_asset_and_program_are_stable_and_ship_with_every_job() {
     let root = tempfile::tempdir().unwrap();

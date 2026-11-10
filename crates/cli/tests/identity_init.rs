@@ -1,7 +1,7 @@
 use std::process::Command;
 
 #[test]
-fn initialize_identity_and_owner_key_with_bare_filenames() {
+fn identity_init_creates_the_device_identity_and_principal_key_in_a_relative_home() {
     let directory = tempfile::tempdir().unwrap();
     let run = |arguments: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_hellas"))
@@ -10,29 +10,15 @@ fn initialize_identity_and_owner_key_with_bare_filenames() {
             .output()
             .unwrap()
     };
-    let output = run(&[
-        "--home",
-        ".",
-        "--software-root",
-        "identity",
-        "init",
-        "--passkey-out",
-        "owner.passkey",
-    ]);
+    let output = run(&["--home", ".", "identity", "init"]);
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(directory.path().join("identity").is_file());
-    let key = std::fs::read(directory.path().join("owner.passkey")).unwrap();
+    let key = std::fs::read(directory.path().join("principal.key")).unwrap();
     hellas_kernel::SoftPasskey::from_secret_scalar(key.try_into().unwrap()).unwrap();
-    let output = run(&["--home", ".", "identity", "show-holder"]);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
 }
 
 #[test]
@@ -50,7 +36,7 @@ fn home_flag_overrides_environment_and_os_home() {
             .output()
             .unwrap()
     };
-    let output = run(&["--software-root", "identity", "init"]);
+    let output = run(&["identity", "init"]);
     assert!(
         output.status.success(),
         "{}",
@@ -64,7 +50,7 @@ fn home_flag_overrides_environment_and_os_home() {
         .env("HELLAS_HOME", &from_env)
         .arg("--home")
         .arg(&explicit)
-        .args(["--software-root", "identity", "init"])
+        .args(["identity", "init"])
         .output()
         .unwrap();
     assert!(
@@ -77,7 +63,7 @@ fn home_flag_overrides_environment_and_os_home() {
     let output = Command::new(env!("CARGO_BIN_EXE_hellas"))
         .env("HOME", &from_home)
         .env_remove("HELLAS_HOME")
-        .args(["--software-root", "identity", "init"])
+        .args(["identity", "init"])
         .output()
         .unwrap();
     assert!(

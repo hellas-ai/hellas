@@ -21,7 +21,7 @@ use hellas_rpc::{
 use hellas_sdk::node_control::{self, profile};
 mod share;
 use hellas_wire::{ServiceMarker, StreamTransport};
-use share::{ShareRequest, share};
+use share::ShareRequest;
 use std::{path::Path, time::Duration};
 
 fn read<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
@@ -62,21 +62,6 @@ pub async fn run(
     passkey: Option<&dyn Authenticator>,
     home: &StoreLocation,
 ) -> Result<()> {
-    if matches!(args.command, AdminCommand::BootstrapRemote { .. }) {
-        ensure!(
-            args.profile.is_none()
-                && args.control_socket.is_none()
-                && args.node_enrollment.is_none()
-                && args.addresses.is_empty(),
-            "bootstrap uses the invitation's pin and addresses"
-        );
-        return bootstrap_remote(
-            args.command,
-            identity,
-            passkey.context("bootstrap requires --passkey")?,
-        )
-        .await;
-    }
     match &args.command {
         AdminCommand::Bootstrap { .. } | AdminCommand::Recover { .. } => {
             ensure!(
@@ -91,10 +76,83 @@ pub async fn run(
         }
         _ => {}
     }
+    connected(
+        Connection {
+            profile: args.profile,
+            control_socket: args.control_socket,
+            node_enrollment: args.node_enrollment,
+            addresses: args.addresses,
+        },
+        Operation::Admin(args.command),
+        identity,
+        passkey,
+        home,
+    )
+    .await
+}
+
+/// Share with the contact on the paired node: one access file, bound to the
+/// contact's device.
+pub async fn share(
+    args: super::ShareArgs,
+    identity: &LocalIdentity,
+    passkey: Option<&dyn Authenticator>,
+    home: &StoreLocation,
+) -> Result<()> {
+    let contact = hellas_sdk::contact::Contact::decode(&args.to)?;
+    let request = ShareRequest {
+        contact: contact.card,
+        holder: contact.holder,
+        resource: args.resource,
+        limits: args.limits,
+        max_job: args.max_job,
+        expires: args.expires,
+        label: args.label,
+        out: args.out,
+    };
+    connected(
+        Connection {
+            profile: args.profile,
+            control_socket: args.control_socket,
+            node_enrollment: None,
+            addresses: vec![],
+        },
+        Operation::Share(request),
+        identity,
+        passkey,
+        home,
+    )
+    .await
+}
+
+struct Connection {
+    profile: Option<std::path::PathBuf>,
+    control_socket: Option<std::path::PathBuf>,
+    node_enrollment: Option<String>,
+    addresses: Vec<std::net::SocketAddr>,
+}
+
+enum Operation {
+    Admin(AdminCommand),
+    Share(ShareRequest),
+}
+
+async fn connected(
+    args: Connection,
+    operation: Operation,
+    identity: &LocalIdentity,
+    passkey: Option<&dyn Authenticator>,
+    home: &StoreLocation,
+) -> Result<()> {
     let key = passkey.map_or(SessionKey::Node(&identity.node_key), SessionKey::Passkey);
-    let profile_path = args.profile.as_deref().context("--profile is required")?;
-    let pinned_node = profile::ClientProfile::remote_node(profile_path)?;
-    let profile = profile::ClientProfile::load(profile_path)?;
+    let profile_path = match args.profile {
+        Some(path) => path,
+        None => super::paired_profile(home)?,
+    };
+    let (pinned_node, mut addresses) = profile::ClientProfile::remote_node(&profile_path)?
+        .map_or((None, vec![]), |(node, addresses)| (Some(node), addresses));
+    addresses.extend(args.addresses);
+    let profile = profile::ClientProfile::load(&profile_path)?;
     let remote = args
         .node_enrollment
         .map(|target| -> Result<iroh::EndpointId> {
@@ -121,9 +179,9 @@ pub async fn run(
     );
     if let Some(node) = remote {
         let (endpoint, client, challenge) =
-            connect_remote(identity, node, args.addresses, &profile, key).await?;
+            connect_remote(identity, node, addresses, &profile, key).await?;
         let result = command(
-            args.command,
+            operation,
             client,
             profile.authorization,
             challenge.generation,
@@ -134,7 +192,7 @@ pub async fn run(
     } else {
         let authorization = profile.authorization;
         let (client, challenge) = connect_local(profile, args.control_socket, home, key).await?;
-        command(args.command, client, authorization, challenge.generation).await
+        command(operation, client, authorization, challenge.generation).await
     }
 }
 
@@ -202,7 +260,7 @@ pub(in crate::commands) async fn connect_local(
 }
 
 async fn command<T>(
-    command: AdminCommand,
+    operation: Operation,
     client: HostControlClientImpl<T>,
     authorization: GrantId,
     generation: u64,
@@ -211,6 +269,12 @@ where
     T: StreamTransport + Send + Sync,
     T::Stream: Send + 'static,
 {
+    let command = match operation {
+        Operation::Share(request) => {
+            return share::share(&client, authorization, generation, request).await;
+        }
+        Operation::Admin(command) => command,
+    };
     match command {
         AdminCommand::Inspect { command } => {
             let query: hellas_auth::authority::InspectionQuery = read(&command)?;
@@ -305,33 +369,6 @@ where
                     "authority": hex::encode(scope.authority.0.as_bytes()),
                 })
             );
-        }
-        AdminCommand::Share {
-            contact,
-            holder,
-            resource,
-            limits,
-            max_job,
-            expires,
-            label,
-            out,
-        } => {
-            let request = ShareRequest {
-                contact: hellas_authority::model::grant::records::decode_contact_card(
-                    &hellas_private::read_bounded_regular_file(
-                        &contact,
-                        hellas_authority::model::grant::records::MAX_CONTACT_CARD_BYTES,
-                    )?,
-                )?,
-                holder: read(&holder)?,
-                resource,
-                limits,
-                max_job,
-                expires,
-                label,
-                out,
-            };
-            share(&client, authorization, generation, request).await?;
         }
         AdminCommand::RevokeCredential {
             credential_id,
@@ -585,31 +622,115 @@ async fn owner_approval(
     })
 }
 
-async fn bootstrap_remote(
-    command: AdminCommand,
+/// The loopback gateway's own HTTP authority in `directory`, created on first
+/// use and owned by the home principal. Its one bearer credential may only
+/// invoke the gateway; the profile is written last, so a profile names a
+/// complete authority.
+pub async fn gateway_profile(
+    directory: &Path,
+    home: &StoreLocation,
     identity: &LocalIdentity,
     passkey: &dyn Authenticator,
+) -> Result<std::path::PathBuf> {
+    let profile = directory.join("profile.json");
+    if profile.try_exists()? {
+        return Ok(profile);
+    }
+    hellas_private::create_dir_all_durable(directory)?;
+    hellas_private::restrict_directory(directory)?;
+    let journal = directory.join("authority");
+    ensure!(
+        !journal.try_exists()?,
+        "{} holds an authority without its profile; remove the directory to create a new one",
+        directory.display()
+    );
+    let administrator = super::owner_scope::administrator(passkey.public_key()?)?;
+    let authority = administrator.authority;
+    let root = GrantId([0; 16]);
+    let holder = hellas_auth::authority::NodeKey::from_public_key(identity.node_key.public_key())?;
+    let approval = owner_approval(
+        passkey,
+        Ownership::Bootstrap { root, target: None },
+        &administrator,
+        &administrator,
+        holder,
+    )
+    .await?;
+    let now = hellas_auth::authority::UnixMillis::now()?;
+    let (store, secret) = NodeStore::bootstrap(
+        &home.child(&journal),
+        hellas_authority::model::grant::grant_network(),
+        root,
+        approval,
+        None,
+        now,
+    )
+    .await?;
+    let node = hellas_authority::node::NodeCoordinator::new(
+        store,
+        std::sync::Arc::new(|| hellas_auth::authority::UnixMillis::now().unwrap_or_default()),
+    );
+    let issued = async {
+        let caller = node
+            .authenticate_session(&secret, SessionKey::Passkey(passkey))
+            .await?;
+        let invoke =
+            hellas_authority::operations::Operation::named(hellas_authority::node::GATEWAY_INVOKE)
+                .context("gateway.invoke is a known operation")?
+                .permission(authority, None)?;
+        let scope = GrantSpec {
+            authority,
+            subject: administrator.subject,
+            permissions: [invoke].into(),
+            issuance: None,
+            delegation_depth: 0,
+            not_before: now,
+            expires: administrator.expires,
+        };
+        let (credential, bearer) =
+            Credential::prepare(scope, CredentialHolder::Bearer, caller.generation())?;
+        let path = directory.join("credential");
+        profile::save_credential(credential_output(&path)?, &path, &bearer)?;
+        node.issue_credential(&caller, root, credential).await?;
+        anyhow::Ok(())
+    }
+    .await;
+    node.close().await;
+    issued?;
+    hellas_private::write_atomically(
+        &profile,
+        ".writing",
+        &serde_json::to_vec(&serde_json::json!({
+            "journal": "authority",
+            "authority": authority,
+            "authorization": root,
+            "credential": "credential",
+        }))?,
+    )?;
+    Ok(profile)
+}
+
+/// Claim a fresh node with the invite it printed, as its administrator with
+/// the default owner scope, and keep the profile as paired node `name`.
+pub async fn pair(
+    invite: &str,
+    name: &str,
+    identity: &LocalIdentity,
+    passkey: &dyn Authenticator,
+    home: &Path,
 ) -> Result<()> {
-    let AdminCommand::BootstrapRemote {
-        invitation,
-        root_grant,
-        administrator,
-        credential_scope,
-        profile_out,
-    } = command
-    else {
-        anyhow::bail!("remote bootstrap required")
-    };
-    let invitation: node_control::bootstrap::Invitation = read(&invitation)?;
-    let root: GrantId = root_grant.parse()?;
-    let (administrator, scope) = match (administrator, credential_scope) {
-        (Some(administrator), Some(scope)) => (read(&administrator)?, read(&scope)?),
-        (None, None) => {
-            let scope = super::owner_scope::administrator(passkey.public_key()?)?;
-            (scope.clone(), scope)
-        }
-        _ => anyhow::bail!("custom administrator and credential scope must be supplied together"),
-    };
+    let invitation = node_control::bootstrap::Invitation::decode(invite)?;
+    ensure!(
+        !name.is_empty()
+            && name.len() <= 64
+            && name.as_bytes()[0].is_ascii_alphanumeric()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte)),
+        "a node name is 1..64 ASCII letters, digits, dots, underscores or hyphens, starting with a letter or digit"
+    );
+    let root = GrantId([0; 16]);
+    let scope = super::owner_scope::administrator(passkey.public_key()?)?;
     let holder = hellas_auth::authority::NodeKey::from_public_key(identity.node_key.public_key())?;
     let approval = owner_approval(
         passkey,
@@ -617,14 +738,19 @@ async fn bootstrap_remote(
             root,
             target: Some(*invitation.node.as_bytes()),
         },
-        &administrator,
+        &scope,
         &scope,
         holder,
     )
     .await?;
     let (approval, secret) = approval.prepare(Some(*invitation.node.as_bytes()))?;
-    let profile = profile::install_remote(&profile_out, scope.authority, root, &secret)?;
-    profile::pin_remote(&profile, invitation.node)?;
+    let profile = profile::install_remote(
+        &super::paired_nodes(home).join(name),
+        scope.authority,
+        root,
+        &secret,
+    )?;
+    profile::pin_remote(&profile, invitation.node, &invitation.addresses)?;
     let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
         .secret_key(identity.transport_key.clone())
         .bind()

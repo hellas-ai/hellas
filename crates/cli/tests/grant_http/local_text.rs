@@ -1,5 +1,5 @@
-//! Manual Strix check: `gateway --local-grant` serves a real Qwen3 GGUF from
-//! this machine's own allowance, with no chain and no remote provider.
+//! Manual check: `gateway --local` serves a real Qwen3 GGUF on this machine,
+//! with no chain and no remote provider.
 //!
 //! ```sh
 //! nix develop .#rocm -c env HELLAS_TEST_TEXT_MODEL=/path/Qwen3-0.6B-BF16.gguf \
@@ -9,24 +9,10 @@ use super::*;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a HIP device and HELLAS_TEST_TEXT_MODEL; run manually on Strix"]
-async fn local_grant_serves_a_text_model_without_a_chain() {
-    use hellas_rpc::protocol::invocation::Limits;
+async fn local_gateway_serves_a_text_model_without_a_chain() {
     let model =
         PathBuf::from(std::env::var("HELLAS_TEST_TEXT_MODEL").expect("HELLAS_TEST_TEXT_MODEL"));
-    let mut node = super::local_compute::LocalCompute::start(
-        &model,
-        "--text-model",
-        &model,
-        Limits {
-            max_upload_bytes: 64 << 20,
-            max_output_bytes: 1 << 20,
-            max_steps: 256,
-            execution_timeout_ms: 600_000,
-        },
-        None,
-        &[],
-    )
-    .await;
+    let mut node = super::local_compute::LocalCompute::start(&model, &model, &[]).await;
     let http = &node.http;
     let address = &node.address;
     let url = format!("http://{address}/v1/completions");

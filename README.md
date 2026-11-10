@@ -1,583 +1,145 @@
 # Hellas
 
-Hellas commits exact work, runs it locally or over an adversarial network, and
-binds the result into a signed transcript. Execution identity is one canonical
-`ProgramManifest`:
-
-```text
-(evaluator, adaptor, content-addressed application root)
-```
-
-The two application identifiers are exact opaque strings. Hellas does not
-parse versions, negotiate compatibility, or consult a model/package registry.
-
-## Execution boundary
-
-The application owns the meaning of its root. The two applications
-intentionally have different trust boundaries:
-
-| Application | Root and trusted computation | Outside that guarantee |
-| --- | --- | --- |
-| `hellas/catena-a621c8b54a7b`, `compute-0.0.1` | Exact Catena Hex sources, named content-addressed assets, inputs, the call plan (calls, optional step loop and stop rule) and declared outputs | Where sources and weights come from, provider GPU/backend choice, tokenizer, chat template, text decoding, and API presentation |
-| `hellas/fetch-0.0.2`, the contract's adaptor (`http-0.0.1`, `codex-responses-0.0.2` or `openai-responses-0.0.3`) | A strict stateless Responses field set; typed reconstruction of provider-shaped JSON; `stream=true` and upstream `store=false`; the exact official Codex or OpenAI HTTPS endpoint; no redirects; and SSE response projection | The truth, correctness, and availability of the adversarial upstream service; provider route label; credentials/auth-file location; and access policy |
-
-Fetch's purpose is to attest the exact transformation around a
-remote request, so structuring and destructuring are inside that application's
-trusted path rather than presentation performed outside it. This proves which
-checks and transformation ran, not that the remote service's claims are true.
-
-A platform-backed Assurance authenticates the Fetch application. The
-`ProducerSigned` mode authenticates only the producer key and signed transcript;
-it does not authenticate a running binary. The sealed Responses adaptor sends
-`store=false` upstream and accepts text and client-executed function tools.
-
-Work is the execution protocol for payment-funded channels and owner, principal
-and delegated grants, including `gateway --offer` and sealed Fetch. Accepted
-paid inputs and results remain in the channel's recovery/evidence journal,
-independently of gateway archive settings.
-
-## Quickstart: sell and buy one job
-
-Person A sells GPU compute on the devnet with a GPU build (`.#cli` or
-the `hip`/`cuda` image below):
-
-```sh
-hellas --faucet serve --paid-work-config docs/examples/faucet-provider.toml
-```
-
-`--faucet` only selects a key from the devnet genesis faucet allocation. These
-are public development keys; the selected account is retained beside the
-identity, and `--faucet-account N` picks one. It sets no price or limits. Paid
-work is sold only with `--paid-work-config FILE`: at startup the selected owner
-approves exactly that file's terms and delegates the stake its offers bond.
-The default chain is the compiled Devnet profile. `--chain devnet` selects it
-explicitly; `--chain-config FILE` selects an independently authenticated custom
-chain for the whole process. Each gateway pool also uses one selected chain.
-The example charges 20 per job, ten jobs per channel, and stops execution after
-90 seconds. `serve` prints A's provider address, `ENROLLMENT_ID@NODE_ID`: the
-content ID of A's enrollment and the node it binds. B learns it from A out of
-band and every paid connection must present exactly that enrollment.
-
-Person B runs no node. Given a self-contained Catena program `counter.hex`
-whose `advance` entry adds two `u64` values, one command builds a job, pays A
-and prints the result; a second closes the channel. The source must include
-any stdlib definitions it uses; the provider compiles exactly the supplied
-sources.
-
-```sh
-hellas --faucet run --provider ENROLLMENT_ID@NODE_ID --source counter.hex --entry advance \
-  --arg u64:2 --arg u64:3 --returns u64 --payment 20
-hellas --faucet transact --settle --provider ENROLLMENT_ID@NODE_ID
-```
-
-B's key approves funding once per channel: A's jobs per channel times its
-price, plus reserve and fees. Later jobs reuse the open channel; `--settle`
-closes it and returns the unspent part. Before paying, B checks that the result
-is signed by A and matches this job. Hellas does not re-run the job, so this
-shows who answered, not that the answer is correct.
-
-`run` writes a job folder and transacts it exactly as `hellas transact
---job DIR`, the raw command for any application. `hellas fetch URL` does
-the same for a paid HTTPS request. See [jobs](docs/jobs.md) for the folder
-format, multi-step jobs and Fetch.
-
-A compiles the Catena sources for its visible GPU and runs each job in a
-separate worker process group. That isolation is crash/timeout containment,
-not a sandbox: it does not confine what the program can reach, and there is no
-memory metering. A job over A's upload limit is refused before it runs; a job
-that exceeds the execution limit is killed with its worker and is not paid.
-Compilation has no time limit. Sources and weights a job names by content ID
-must be available to A through declared Jobs pins in its content configuration.
-Local model directories and existing HuggingFace caches are read-only lower
-layers; acquired objects live in the upper, which defaults to `<home>/store`
-(`--home` or `HELLAS_HOME` selects home). Pass the same file to
-`hellas serve --content-config content.toml` and local index preparation:
-
-```toml
-[content]
-upper = "/var/lib/hellas/content-store"
-lower = ["/srv/hellas/content"]
-index = "require"
-```
-
-Run `hellas store --content-config content.toml index` as the service user
-before startup. It prints each content ID and exact byte length; use those in
-`[content.pins."config/NAME"]` declarations with `expect` and `bytes`. Declared
-pins default to `Jobs`. Require mode refuses missing or stale index records
-without hashing. `index = "resume"` permits changed identities to be verified
-again; `store index --recheck` forces verification. The private derived index
-lives in the upper, and model files stay in place. See the
-[content store guide](crates/store/README.md) for declarations, acquisition and
-Owner commands.
-
-Indexed provider content is an immutable local-cache assumption. Hellas pins
-the verified read-only descriptor and detects path/inode replacement; it does
-not defend against a separate local process that already holds a writable
-descriptor to the same inode and mutates it concurrently.
+Hellas runs AI jobs on GPUs you don't own, and on your own GPU for people you
+trust. Your machine renders each job, for example a Whisper transcription or a
+Qwen chat turn, into an exact program with content-addressed inputs. The
+provider runs that program and signs the result. Your machine checks the
+signature and decodes the result. You pay a provider with devnet coins, run
+under access someone shared with you, or run the job yourself.
 
 ## Install
-
-Portable CLI binaries for [Linux](https://hydra.hellas.ai/job/hellas/hellas-cli/x86_64-linux.artifacts.portable-x86_64) and [macOS](https://hydra.hellas.ai/job/hellas/hellas-cli/aarch64-darwin.artifacts.portable-aarch64) are built as our [Hydra channel](https://hydra.hellas.ai/jobset/hellas/hellas-cli) advances. Install like so:
 
 ```sh
 curl -fsSL https://github.com/hellas-ai/hellas/releases/latest/download/install.sh | sh
 ```
 
-## Own a worker and share access
+This installs the portable client. GPU machines run the `ghcr.io/hellas-ai/hellas:hip`
+or `:cuda` image, or the [NixOS module](docs/nix.md).
 
-Download and convert multilingual Whisper tiny, then download the sample audio:
-
-```sh
-mkdir whisper-tiny-original
-base=https://huggingface.co/openai/whisper-tiny/resolve/169d4a4341b33bc18d8881c4b69c2e104e1cc0af
-curl -fL --output-dir whisper-tiny-original --remote-name-all \
-  "$base/config.json" "$base/generation_config.json" \
-  "$base/tokenizer.json" "$base/model.safetensors"
-hellas convert-whisper --checkpoint ./whisper-tiny-original --output ./whisper-tiny
-curl -fL https://raw.githubusercontent.com/ggml-org/whisper.cpp/b0a11594aec50892a02cd8d129eee2dfe93a8bb8/samples/jfk.wav -o speech.wav
-printf '%s  speech.wav\n' 59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e | sha256sum -c -
-```
-
-Start a worker with the converted model. `--audio-model` declares its weights pin, admits its program as signed Work
-input, creates its machine/account budgets, and serves one job at a time; no
-resource JSON is required. The resource is named after the directory,
-`whisper-tiny`. Here is the CUDA container command for an NVIDIA CDI host:
+Hellas does not host model weights. Every machine converts the same pinned
+checkpoint, and a pinned commit converts to the same bytes on every machine.
+That is how your job names the provider's weights by hash. Fetch Whisper tiny,
+a small Qwen3 and a sample recording:
 
 ```sh
-mkdir -m 700 worker
-docker run -d --name hellas-gpu --network host --device nvidia.com/gpu=all \
-  --user "$(id -u):$(id -g)" \
-  -v "$PWD/worker:/state" -v "$PWD/whisper-tiny:/models/whisper-tiny:ro" \
-  "ghcr.io/hellas-ai/hellas:sha-${REVISION}-cuda" \
-  --home /state --software-root \
-  --await-owner --audio-model /models/whisper-tiny \
-  --gpu-session-asset-bytes 2147483648 --gpu-session-programs 1
+hellas convert-whisper openai/whisper-tiny@169d4a4341b33bc18d8881c4b69c2e104e1cc0af -o whisper-tiny
+curl -fLo qwen3.gguf https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/50968a4468ef4233ed78cd7c3de230dd1d61a56b/Qwen3-0.6B-BF16.gguf
+curl -fLo speech.wav https://raw.githubusercontent.com/ggml-org/whisper.cpp/b0a11594aec50892a02cd8d129eee2dfe93a8bb8/samples/jfk.wav
 ```
 
-For Strix Halo, use the matching `-hip` image, replace the NVIDIA device option
-with `--device /dev/kfd --device /dev/dri`, and add the host's render/video groups
-with Docker `--group-add`. Allow spare GPU memory; do not load a second model
-beside a memory-constrained distributed service. MI300X model execution and fresh
-Runpod inference are outside this initial walkthrough.
+## 1. Try it: no GPU, no account
 
-The worker writes a private `worker/node/invitation.json` when ready. Create your
-client identity and owner key, then pair with that invitation from the machine
-you control:
+Get devnet coins, then pay the public devnet provider to transcribe the
+recording. `DEVNET_PROVIDER` is that provider's address. It runs only the
+programs it was configured with, and it quotes its price before you sign
+anything. `--pay 20` is the most you accept per job:
 
 ```sh
-hellas --software-root identity init --passkey-out owner.passkey
-hellas --passkey owner.passkey admin bootstrap-remote \
-  --invitation worker/node/invitation.json --profile-out operator
+hellas faucet
+hellas transcribe --model whisper-tiny --audio speech.wav --pay 20 --provider "$DEVNET_PROVIDER"
 ```
 
-Bootstrap creates the owner administration scopes and saves the pinned node and
-credential in `operator/profile.json`. The owner grant lasts one year. Custom
-scopes remain available through `--administrator` and `--credential-scope`.
-The owner key stays on the client, outside the worker mount.
+It prints the transcript, "And so my fellow Americans, ask not what your
+country can do for you…". Your first command creates your identity under
+`~/.hellas`. Your first paid job opens a payment channel, and later jobs reuse
+it.
 
-Give your principal and device a one-request share, import it, and transcribe:
+## 2. Share your GPU with a friend
+
+On your GPU machine, start a node that serves the converted weights and admits
+the two programs that read them. `hellas program` prints a program's ID:
 
 ```sh
-hellas --passkey owner.passkey contact export --display-name me --out me.contact
-hellas identity show-holder > me.holder
-hellas --passkey owner.passkey admin --profile operator/profile.json share \
-  --contact me.contact --holder me.holder --resource whisper-tiny \
-  --limit requests:total:1 --max-job 15m --expires 1h --out me.access
-hellas --passkey owner.passkey offer import-bundle me.access --name box
-hellas --passkey owner.passkey transcribe --offer box.whisper-tiny \
-  --model ./whisper-tiny --audio speech.wav --language en --output my-result
+docker run -d --name hellas --network host --device /dev/kfd --device /dev/dri \
+  -v hellas:/var/lib/hellas -v "$PWD:/models:ro" ghcr.io/hellas-ai/hellas:hip \
+  --content /models/whisper-tiny --program "$(hellas program whisper-tiny)" \
+  --content /models/qwen3.gguf --program "$(hellas program qwen3.gguf)"
+docker logs hellas
 ```
 
-`--offer` supplies the provider and device-bound profile. The output includes a
-signed transcript and the transcription should begin “And so my fellow Americans”.
-
-For a second principal, the recipient creates their own key/device and exports
-only their contact and holder. To exercise this locally with separate credentials:
+A new node has no owner yet. It prints one `hellas-invite:` line and waits.
+Claim it with that line. NVIDIA hosts use the `:cuda` image with
+`--device nvidia.com/gpu=all` instead.
 
 ```sh
-hellas --home guest-home --software-root identity init --passkey-out guest.passkey
-hellas --passkey guest.passkey contact export --display-name guest --out guest.contact
-hellas --home guest-home identity show-holder > guest.holder
-hellas --passkey owner.passkey admin --profile operator/profile.json share \
-  --contact guest.contact --holder guest.holder --resource whisper-tiny \
-  --limit requests:total:1 --max-job 15m --expires 1h --out guest.access
-hellas --home guest-home --passkey guest.passkey offer import-bundle guest.access --name box
-hellas --home guest-home --passkey guest.passkey transcribe --offer box.whisper-tiny \
-  --model ./whisper-tiny --audio speech.wav --language en --output guest-result
+hellas pair hellas-invite:…
 ```
 
-In a remote handoff, return only the private access bundle to the recipient;
-they keep their key and identity. Another device of the same principal shares
-its existing counters. See [renewal](docs/admin.md) before replacing a credential.
-
-A different request must now fail the guest's one-request quota:
+Your friend prints their contact and sends it to you:
 
 ```sh
-hellas --home guest-home --passkey guest.passkey transcribe --offer box.whisper-tiny \
-  --model ./whisper-tiny --audio speech.wav --language en --max-tokens 255
+hellas contact
 ```
 
-Stop the worker and repeat the original request. This uses the retained signed
-result and consumes no additional request:
+Give that contact ten requests for a day, and send them `friend.access`:
 
 ```sh
-docker stop hellas-gpu
-hellas --home guest-home --passkey guest.passkey transcribe --offer box.whisper-tiny \
-  --model ./whisper-tiny --audio speech.wav --language en --output guest-replay
-cmp guest-result/transcript.cbor guest-replay/transcript.cbor
+hellas share --to hellas-contact:… --limit requests:total:10 --expires 1d --out friend.access
 ```
 
-For paid jobs, follow the [paid quickstart](#quickstart-sell-and-buy-one-job).
-Grant execution does not prove paid settlement; the final release also needs a
-paid job and confirmed settlement using its matching artifacts.
-
-
-## Sealed Fetch
-
-Fetch route names are operator-defined routing labels. The sealed destination
-selects the trusted adaptor, fixed official endpoint, no-redirect HTTP driver,
-and response projector as one unit. A configuration cannot supply a URL or
-claim a different adaptor identity.
-
-A provider route file contains a `routes` array. Each route has `service`,
-`method`, `destination` and optional `capabilities` (model and output limits).
-The former `callers` field is rejected; the mounted Work channel authorizes jobs.
-Use `serve --fetch-config FILE --paid-work-config FILE` to sell it.
-See [paid Work](crates/channel/README.md) for channel configuration and
-[HTTPS Fetch](crates/providers/HTTPS.md) for provider credentials and egress.
-
-## HTTP gateway
-
-For upstream APIs, [HTTP Fetch routes](docs/http-gateway.md) preserve the vendor's
-request, response and streaming formats. CLI gateways archive payloads by default;
-`--zdr` or `x-hellas-zdr: true` disables application payload persistence.
-
-`--text-model` also runs without a chain: with the compute-enabled package,
-`--local-grant ID` runs this node's own configured allowance's policies on its
-executor (with the `serve` content and GPU flags; no ledger), and `--offer
-ALIAS` reaches an allowance on another node you own. Such memory-only jobs read
-weights the provider already holds; they never write them.
-
-`--text-model FILE.gguf` serves a dense Qwen3 GGUF on the text routes. The
-gateway renders each request as a Compute job from the GGUF's configuration
-and tokenizer. It bundles its own reachable Catena stdlib into one Hex source
-and sends the job to its paid pool or grant; the weights are not
-uploaded, so providers must already hold that GGUF (see the quickstart). The
-API model label is the file name without its extension.
-
-Buy a single job with [`run`, `transact` or `fetch`](docs/jobs.md).
-Configure a funded pool using the [paid gateway guide](docs/paid-gateway.md),
-then pass `--paid-work-config POOL` together with `--text-model`.
-
-It binds loopback by default; non-loopback listening requires `--allow-remote`.
-Every gateway requires a private `--gateway-profile FILE` selecting a provisioned
-local Auth authority and a bearer credential scoped to `gateway.invoke`.
-See [HTTP authority provisioning](docs/admin.md#http-gateway-authority). The
-text routes use the shared Qwen3 model adapter for completions, chat and tool
-calls. One gateway serves every presentation its work source admits: the text
-routes with `--text-model`, `/v1/responses` as a Fetch when the source seals
-one Responses route, and exact HTTPS routes from `--http-fetch-config` or a
-grant's HTTPS resource. A path served by several presentations is split by the
-request's `model`; overlapping models refuse to start. See the
-[HTTP gateway guide](docs/http-gateway.md#responses-grants).
-
-The exposed routes are:
-
-```text
-POST /v1/completions
-POST /v1/responses
-POST /v1/chat/completions
-POST /v1/messages
-POST /v1/audio/transcriptions    (--audio-model)
-POST /v1/images/generations     (--image-model)
-```
-
-`--image-model DIR` serves a converted Flux2 Klein 4B package. Each image is
-one Compute job containing text encoding, denoising and image decoding; the
-gateway returns a base64 PNG and the provider's signed evidence. Images are
-limited to 512×512. The same package works with `hellas image`; see
-[image jobs](docs/jobs.md#image-jobs) for conversion and requests.
-
-Monitor discovery and peer health with `hellas monitor --timeout-secs 30`.
-
-## Chain
-
-The standard CLI includes `chain query`, `chain open`, and `chain close`.
-The `indexer` feature adds `chain indexer follow`; the `validator` feature adds
-`chain validator config`, `chain validator run`, and
-`chain validator check-config`.
-
-Validator metrics default to `127.0.0.1`. A remote scraper requires an explicit
-`metrics_bind_address` in validator TOML, `--metrics-bind-address` when generating
-it, or `services.hellas-chain-validators.<name>.metricsBindAddress` in NixOS.
-For the devnet's VictoriaMetrics WireGuard scrape, set that option to each
-validator host's WireGuard IP before deploying this change.
-
-`chain query --rpc URL` supports `latest-block`, `state-root`, `finalization`,
-`finalized-block`, `coin`, `edge`, `validators`, `coins-by-owner`, and
-`edges-by-owner`. Coin and edge reads are proven at the latest applied root;
-`--trusted-rpc URL` reads them without proofs from an endpoint you trust, such
-as your own node.
-
-`chain open` reads each 32-byte secret scalar from `--maker-key FILE` and
-`--taker-key FILE`; `--maker-auth` and `--taker-auth` accept `webauthn` or
-`native`. Funding IDs use repeatable or comma-separated `--maker-funding` and
-`--taker-funding`. Terms use `--protocol`, `--timeout`, and repeatable or
-comma-separated `--timeout-payout SETTLEMENT_KEY:VALUE`. `--terms-out FILE`
-writes the canonical reveal for a later timeout close.
-
-`chain close --kind mutual` takes repeatable or comma-separated
-`--payout SETTLEMENT_KEY:VALUE` plus both key and auth pairs. `--kind timeout`
-takes the same committed payouts and `--terms-file FILE`, with no signer
-options.
-
-Stored ownership uses raw, untagged 33-byte settlement keys. P-256 and
-secp256k1 keys can own stored coins. The single kernel `Auth` verifier selects
-the curve from the authorization variant.
-
-Given two P-256 key files whose settlement keys each own a 100-value coin:
-
-```bash
-RPC=ws://127.0.0.1:56946
-MAKER_KEY=maker.key
-TAKER_KEY=taker.key
-MAKER_OWNER=maker-settlement-key
-TAKER_OWNER=taker-settlement-key
-MAKER_COIN=maker-coin-id
-TAKER_COIN=taker-coin-id
-
-OPEN=$(
-  cargo run -- chain open \
-    --rpc "$RPC" \
-    --maker-key "$MAKER_KEY" --maker-auth webauthn \
-    --taker-key "$TAKER_KEY" --taker-auth webauthn \
-    --maker-funding "$MAKER_COIN" --taker-funding "$TAKER_COIN" \
-    --protocol 1 --timeout 1000 \
-    --timeout-payout "$MAKER_OWNER:100" \
-    --timeout-payout "$TAKER_OWNER:100"
-)
-EDGE_ID=$(printf '%s\n' "$OPEN" | awk '$1 == "edge_id" { print $2 }')
-
-# After the open finalizes:
-cargo run -- chain query --rpc "$RPC" edge --object-id "$EDGE_ID"
-
-cargo run -- chain close \
-  --rpc "$RPC" --edge-id "$EDGE_ID" --kind mutual \
-  --payout "$MAKER_OWNER:100" --payout "$TAKER_OWNER:100" \
-  --maker-key "$MAKER_KEY" --maker-auth webauthn \
-  --taker-key "$TAKER_KEY" --taker-auth webauthn
-
-# After the close finalizes:
-cargo run -- \
-  chain query --rpc "$RPC" coins-by-owner --owner "$MAKER_OWNER"
-cargo run -- \
-  chain query --rpc "$RPC" coins-by-owner --owner "$TAKER_OWNER"
-```
-
-## Nix
-
-The main outputs are `.#cli` (client, node, gateway and the Catena GPU
-runtime) and `.#cli-validator`.
-Hellas imports only `catena-lang` from the Catena workspace, pinned to a
-published Git revision in `Cargo.toml` and `Cargo.lock`. Nix vendors the same
-locked dependency; a sibling Catena checkout is not required.
-
-Enter an x86_64 Linux GPU development shell with:
+Your friend runs jobs on your GPU with it:
 
 ```sh
-nix develop .#rocm --no-write-lock-file  # AMD
-nix develop .#cuda --no-write-lock-file  # NVIDIA
+hellas transcribe --model whisper-tiny --audio speech.wav --access friend.access
 ```
 
-Catena selects a runtime inside an isolated worker. Use `serve
---gpu-backend auto|hip|cuda` to choose one; `auto` chooses CUDA on a NixOS NVIDIA
-host and HIP otherwise.
+The node runs one job at a time and refuses programs it was not configured
+with. Each job runs in its own process group, which contains crashes and
+timeouts. This is not a sandbox: a program can reach whatever the node's user
+can reach, and nothing meters GPU memory. Compiling a new program has no time
+limit; a node's first job of each program pays for it. A grant or paid-terms
+configuration can admit any program instead. That hands anyone who can submit
+jobs roughly root on your machine, so `serve` refuses it unless you also pass
+`--knowingly-unsafe`.
 
-The NixOS module provisions the matching toolchain and device access:
+## 3. Run it yourself
 
-```nix
-services.hellas = {
-  enable = true;
-  workConfigFile = "/srv/hellas/paid-work.toml"; # passed as --paid-work-config
-  passkey = "/srv/hellas/owner.passkey";
-  gpuBackend = "cuda"; # or "hip" / "auto"
-  content = {
-    lower = [ "/srv/hellas/content" ];
-    index = "resume";
-    # Add config/* pin declarations using the IDs and lengths from store index.
-  };
-};
+The GPU image runs the same job on your own GPU, with no network:
+
+```sh
+docker run --rm --device /dev/kfd --device /dev/dri -v "$PWD:/work" -w /work \
+  --entrypoint hellas ghcr.io/hellas-ai/hellas:hip \
+  transcribe --model whisper-tiny --audio speech.wav --local
 ```
 
-Keep models and compiler artifacts outside `/nix/store`; they are runtime data.
+`--local` exists only in GPU builds. `hellas text --model qwen3.gguf --prompt
+…` and `hellas run` take the same `--pay`, `--access` and `--local`. See
+[jobs](docs/jobs.md).
 
-Fetch providers likewise use runtime files: set `fetchConfigFile` to the JSON
-configuration path and `environmentFile` to a systemd environment file holding
-provider-local secrets such as `OPENAI_API_KEY`. Do not put either file in a
-Nix expression or in the store. In particular, never interpolate the file as a
-Nix path and never use `builtins.readFile` on it: both operations expose its
-contents during evaluation, before any module assertion or runtime validation
-can protect it. Paid Fetch uses metadata-only journals; see
-[provider retention](crates/channel/README.md).
+## 4. An OpenAI-compatible endpoint
 
-On Darwin, the Home Manager launch agent remains network-only but supports the
-same runtime-secret boundary:
+`hellas gateway` serves OpenAI and Anthropic routes on localhost. It renders
+every request into a job and runs it the way you choose, here on your
+friend's GPU:
 
-```nix
-programs.hellas = {
-  enable = true;
-  serve = {
-    enable = true;
-    workConfigFile = "/Users/alice/.config/hellas/paid-work.toml";
-    passkey = "/Users/alice/.config/hellas/owner.passkey";
-    fetchConfigFile = "/Users/alice/.config/hellas/fetch.json";
-    environmentFile = "/Users/alice/.config/hellas/provider.env";
-  };
-};
+```sh
+hellas gateway --model qwen3.gguf --access friend.access &
+curl -s localhost:8080/v1/chat/completions -H "authorization: Bearer $(cat ~/.hellas/gateway/bearer)" \
+  -H 'content-type: application/json' -d '{"model":"qwen3","messages":[{"role":"user","content":"Hi"}]}'
 ```
 
-Provision the environment file outside Nix and restrict it to the user, with no
-group or other permission bits. The runtime wrapper resolves parent symlinks,
-rejects the Nix store, opens the final component without following symlinks and
-without blocking on special files, then requires that same opened descriptor to
-name a regular file owned by the agent's effective user. Its
-grammar is deliberately small: blank lines and `#` comments in column one are
-allowed; every other line is `NAME=VALUE`, with names matching
-`[A-Za-z_][A-Za-z0-9_]*`. Values are literal, so spaces, `#`, and `=` are kept
-and quotes, escapes, substitutions, and shell commands have no special
-meaning. Duplicate names, malformed lines, CR/NUL bytes, or any failed security
-check stop the agent before Hellas runs. The launchd plist contains the absolute
-file path, never its contents. As above, never use Nix interpolation or
-`builtins.readFile` for this file; validation cannot undo an evaluation-time
-secret leak.
+The gateway keeps its own bearer in `~/.hellas/gateway/bearer`, so a web page
+you visit cannot spend your access. `--pay MAX --provider ID` and `--local`
+work here too. See the [HTTP gateway guide](docs/http-gateway.md).
 
-Work on the kernel Quint models:
+## 5. Drive a coding agent
 
-```bash
-nix develop .#kernel
-nix run .#check-kernel-models
-nix run .#check-kernel-model-verify
+A home runs one gateway at a time, so stop the one from the previous section
+first (Ctrl-C). `--wrap` starts the agent with its OpenAI and Anthropic base URLs
+and token pointed at the gateway, and stops the gateway when the agent exits:
+
+```sh
+hellas gateway --model qwen3.gguf --access friend.access --wrap claude
 ```
 
-`nix run .#check` runs the PR lints and unit tests. CLI, GPU execution and
-consensus have independent Hydra release jobsets for their heavier tests and
-artifacts. `devnet` tracks chain rollout; it does not trigger
-CLI or GPU releases.
+## More
 
-The `unit` check (`nix build .#checks.x86_64-linux.unit`, the PR "Unit tests"
-job) runs the workspace tests once under `cargo llvm-cov`. It fails on a
-failing test and prints line coverage, which is informational and never fails
-the check. Its output holds `lcov.info`, `summary.json` and `summary.txt`.
-
-## Docker
-
-The default `docker` output is a network-only node image. It contains no local Catena or
-GPU runtime and is tagged `ghcr.io/hellas-ai/hellas:network`. The derivation
-streams a Docker archive to stdout:
-
-```bash
-$(nix build .#docker --print-out-paths) | docker load
-```
-
-GPU images include Catena and the corresponding runtime compiler:
-
-```bash
-$(nix build .#docker-cuda --print-out-paths) | docker load
-$(nix build .#docker-hip --print-out-paths) | docker load
-
-# NVIDIA with a configured CDI device specification:
-docker run --rm --device nvidia.com/gpu=all \
-  -v hellas-state:/var/lib/hellas -v /srv/hellas/content:/content:ro \
-  -v /srv/hellas/content.toml:/etc/hellas-content.toml:ro \
-  ghcr.io/hellas-ai/hellas:cuda --software-root --content-config /etc/hellas-content.toml
-
-# AMD:
-docker run --rm --device /dev/kfd --device /dev/dri \
-  -v hellas-state:/var/lib/hellas -v /srv/hellas/content:/content:ro \
-  -v /srv/hellas/content.toml:/etc/hellas-content.toml:ro \
-  ghcr.io/hellas-ai/hellas:hip --software-root --content-config /etc/hellas-content.toml
-```
-
-The mounted content file should name `/content` as its lower and declare the
-Jobs pins needed by the workload. Both GPU images default to `serve` with their matching backend. The host supplies
-the GPU driver and model content stays on runtime volumes. Published images are
-the Hydra-built artifacts of a commit whose CLI and GPU releases both passed.
-
-A GPU asset owner uploads verified weights once and execution workers receive
-them as read-only views over GPU IPC. Worker replacement retains weights; asset
-pressure recreates the owner.
-
-## Recording and replaying jobs
-
-The gateway keeps no inference cache. `hellas_gateway::start` runs over any
-`WorkExecutionBackend`, and text and Fetch events are serializable, so an
-application can record and replay jobs by wrapping its work source.
-
-## Dependency maintenance
-
-Available in the development shell:
-
-```bash
-cargo audit                # security advisories
-cargo outdated --workspace --root-deps-only  # outdated deps
-cargo update --workspace   # update Cargo.lock
-```
-
-### Optional metrics and OpenTelemetry
-
-The default-off `otel` Cargo feature enables metrics and OTLP export across the
-CLI. Default packages, including public musl and Docker builds, omit the metrics
-server, `--metrics-port`/`--metrics-addr`, and gateway/executor instruments.
-Dependencies may still collect their own telemetry independently. Use an `otel`
-build (`cli.override { otel = true; }` or the `docker-otel` image) for metrics.
-
-With that build, `hellas serve --metrics-port 9090` and
-`hellas gateway --metrics-port 9091` serve Prometheus text at
-`http://127.0.0.1:<port>/metrics`. This unauthenticated listener defaults to
-loopback. `--metrics-addr IP` explicitly selects another interface, including
-`0.0.0.0` for container scraping. One-shot commands do not start a metrics server.
-Scrapes collect executor and gateway instruments from the same meter provider
-used for optional OTLP push; both can run together. OTLP environment opt-outs,
-including `OTEL_SDK_DISABLED`, leave the requested local listener active.
-Iroh endpoint metrics share the response for serve and remote-grant gateways;
-paid-pool gateways do not expose their private endpoint.
-
-NixOS exposes `services.hellas.metricsPort` and
-`services.hellas.gateway.metricsPort`, with `metricsAddress` beside each port
-(default `"127.0.0.1"`). Set `services.hellas.otel.enable = true` to select the
-feature-enabled default package, even for local scraping without a collector.
-Metrics ports require this setting; custom packages must also enable `otel`.
-Chain validators retain their separate `--metrics-bind-address` spelling.
-
-The exported NixOS, nix-darwin and Home Manager modules share `otel` options:
-
-```nix
-# NixOS node and gateway:
-services.hellas.otel = {
-  enable = true;
-  collectorEndpoint = "http://127.0.0.1:4318";
-  sampleRate = 1.0;
-};
-# nix-darwin CLI or Home Manager CLI (including Darwin's launchd agent):
-programs.hellas.otel.collectorEndpoint = "http://127.0.0.1:4318";
-# Validator clusters use services.hellas-chain-validators.<name>.otel.
-```
-
-A configured endpoint enables the feature on the module's default package;
-`otel.enable = false` selects the build without metrics or OTLP export. Custom
-packages remain the caller's choice. `collectorEndpoint` is the standard OTLP
-HTTP/protobuf base URL for traces and metrics; the existing `endpoint` option
-continues to accept an exact trace URL. Home Manager and nix-darwin scope
-variables to `hellas`, rather than enabling unrelated applications.
-Home Manager's `programs.hellas.serve` supplies the Darwin user service.
-Direct package users can use `cli.override { otel = true; }` (also
-`cli-validator`) and the standard `OTEL_*` environment variables.
-
-One CLI SDK lifecycle owns traces and metrics, including validators. Native
-operations follow the GenAI Development conventions at
-`c88d504ab3d9879f8e50d3cc87e69775e11db234`; these conventions are still evolving.
-Hellas-specific work/payment metadata uses `hellas.*`, with W3C TraceContext
-in RPC metadata and HTTP headers. Prompts, model output, tool arguments and
-credentials are not recorded. Log events stay in the local log sinks, rather
-than being duplicated into OTLP. Normal shutdown flushes both providers;
-existing forced-exit paths cannot guarantee a final flush.
+- [Jobs](docs/jobs.md): job folders, `run`, `transact`, signed HTTPS Fetch and
+  what each application proves.
+- [Node administration](docs/admin.md): sharing, renewal, revocation and the
+  owner's authority.
+- [Selling on the devnet](docs/paid-gateway.md): paid terms, stake and
+  channels.
+- [Chain](docs/chain.md): querying the devnet and running validators.
+- [Nix, Docker and NixOS](docs/nix.md): builds, the module, images, metrics
+  and development checks.

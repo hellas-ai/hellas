@@ -258,6 +258,38 @@ pub enum ModelOptions {
     Flux(ImageOptions),
 }
 
+impl ModelOptions {
+    /// The routes a model path serves, by its layout, under the name of its
+    /// file or directory.
+    pub fn at(model: PathBuf, default_max_tokens: u32) -> Self {
+        use hellas_client::model::ModelKind;
+        let name = |path: &std::path::Path, stem: bool| {
+            let name = if stem {
+                path.file_stem()
+            } else {
+                path.file_name()
+            };
+            name.map_or_else(String::new, |name| name.to_string_lossy().into_owned())
+        };
+        match ModelKind::of(&model) {
+            ModelKind::Text => Self::Text(TextOptions {
+                model_name: name(&model, true),
+                model,
+                default_max_tokens,
+            }),
+            ModelKind::Transcription => Self::Whisper(AudioOptions {
+                model_name: name(&model, false),
+                model,
+                default_max_tokens: default_max_tokens as usize,
+            }),
+            ModelKind::Image => Self::Flux(ImageOptions {
+                model_name: name(&model, false),
+                model,
+            }),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ImageOptions {
     /// Converted Flux2 Klein package metadata and tokenizer.

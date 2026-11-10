@@ -1,7 +1,7 @@
-//! `hellas run`: one call of a Catena program, written as a job folder and
-//! transacted exactly as `hellas transact --job DIR`. Multi-step loops are
+//! `hellas run`: one call of a Catena program, written as a job folder at the
+//! price its target quotes and run like `hellas transact --job DIR`. Multi-step loops are
 //! described in a hand-written job.toml.
-use super::{ClientArgs, Context, TransactArgs};
+use super::{ClientArgs, Context};
 use anyhow::Context as _;
 use clap::Args;
 use hellas_rpc::protocol::invocation::{
@@ -14,10 +14,9 @@ use std::path::PathBuf;
 
 const BYTES_FORMAT: &str = "catena.bytes.v1";
 
+/// One call of a Catena program.
 #[derive(Debug, Args)]
-pub struct RunArgs {
-    #[command(flatten)]
-    pub(super) client: ClientArgs,
+pub struct Program {
     /// Catena source files, compiled in order.
     #[arg(long = "source", value_name = "FILE", num_args = 1.., required = true)]
     sources: Vec<PathBuf>,
@@ -33,9 +32,17 @@ pub struct RunArgs {
     /// Kind of each returned value, in order: bool, u16, u32, u64, f32 or buffer:MAX_BYTES.
     #[arg(long = "returns", value_name = "KIND", value_parser = parse_returns)]
     returns: Vec<OutputKind>,
-    /// Flat price the provider charges per job; paid work only.
-    #[arg(long, conflicts_with = "offer", value_parser = clap::value_parser!(u64).range(1..))]
-    payment: Option<u64>,
+}
+
+#[derive(Debug, Args)]
+pub struct RunArgs {
+    #[command(flatten)]
+    pub(super) client: ClientArgs,
+    #[command(flatten)]
+    pub(super) program: Program,
+    /// Pay the provider named by --provider its quoted price per job, at most MAX.
+    #[arg(long, value_name = "MAX", requires = "provider", conflicts_with = "access", value_parser = clap::value_parser!(u64).range(1..))]
+    pay: Option<u64>,
     #[command(flatten)]
     target: super::TargetArgs,
     /// Job folder to write (default: under the client state, by job digest).
@@ -83,8 +90,8 @@ fn parse_returns(value: &str) -> Result<OutputKind, String> {
     }))
 }
 
-impl RunArgs {
-    pub(super) async fn job(&self) -> super::super::CliResult<Job> {
+impl Program {
+    pub(super) async fn job(&self, price: u64) -> super::super::CliResult<Job> {
         let read = |path: &PathBuf, label, limit| {
             super::super::read_bounded_regular_file(path, label, limit)
         };
@@ -144,35 +151,22 @@ impl RunArgs {
                 })
                 .collect(),
         };
-        Ok(Job::compute(
-            self.payment.unwrap_or(0),
-            environment,
-            plan,
-            inputs,
-            content,
-        )
-        .await?)
+        Ok(Job::compute(price, environment, plan, inputs, content).await?)
     }
 }
 
 pub async fn run(args: RunArgs, context: Context) -> super::super::CliResult<()> {
-    let job = args.job().await?;
-    let directory = args.save_job.clone().unwrap_or_else(|| {
-        args.client
-            .root(&context)
-            .join("jobs")
-            .join(job.digest().to_string())
-    });
-    job.save(&directory).await?;
-    eprintln!("job: {}", directory.display());
-    super::run(
-        TransactArgs {
-            client: args.client,
-            job: Some(directory),
-            output: args.output,
-            target: args.target,
+    super::run_quoted(
+        &args.client,
+        args.target,
+        &context,
+        args.pay,
+        args.save_job.clone(),
+        async |price| args.program.job(price).await,
+        |_| args.output.clone(),
+        |job, completed, provider| {
+            super::present_job(job, completed, provider, args.output.as_deref())
         },
-        context,
     )
     .await
 }

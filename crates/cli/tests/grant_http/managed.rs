@@ -11,8 +11,7 @@ struct ManagedWorker {
     pin: String,
     address: String,
     profile: PathBuf,
-    work_profile: PathBuf,
-    trust_root: PathBuf,
+    access: PathBuf,
     gateway_profile: PathBuf,
     gateway_token: String,
 }
@@ -22,11 +21,11 @@ impl ManagedWorker {
         let root = directory.path();
         hellas_private::restrict_directory(root).unwrap();
         let owner = Cli::new(root, "owner", AGENT_PASSKEY);
-        owner.run(&["--software-root", "identity", "init"]).await;
+        owner.run(&["identity", "init"]).await;
         let state = root.join("worker");
         hellas_private::create_dir_all_durable(&state).unwrap();
         let worker = Cli::new(&state, "identity", ROOT_PASSKEY);
-        worker.run(&["--software-root", "identity", "init"]).await;
+        worker.run(&["identity", "init"]).await;
         let exported = worker.output(&["identity", "export-enrollment"]).await;
         assert!(exported.status.success());
         let provider = decode_enrollment(&exported.stdout).unwrap();
@@ -60,7 +59,6 @@ impl ManagedWorker {
         let mut node = worker.spawn(
             &[
                 "serve",
-                "--await-owner",
                 "--grant-config",
                 string(&resources),
                 "--fetch-config",
@@ -83,58 +81,8 @@ impl ManagedWorker {
             .unwrap()
             .port();
         let address = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)).to_string();
-        let invitation_file = root.join("invitation.json");
-        std::fs::write(&invitation_file, serde_json::to_vec(&invitation).unwrap()).unwrap();
-        let authority = auth::AuthorityId(hellas_auth::Digest::hash(b"normal host fixture"));
-        let now = auth::UnixMillis::now().unwrap();
-        let extra: Vec<_> = hellas_authority::operations::OPERATIONS
-            .iter()
-            .filter(|operation| {
-                !matches!(
-                    operation.scope,
-                    hellas_authority::operations::Scope::Allowance
-                )
-            })
-            .map(|operation| {
-                (
-                    operation.name,
-                    operation.permission(authority, None).unwrap().resource,
-                )
-            })
-            .collect();
-        let administrator = common_node::admin_spec(
-            authority,
-            owner.principal(),
-            &extra,
-            (now, auth::UnixMillis(now.0 + 3_600_000)),
-            (3_600_000, 8),
-            &[hellas_authority::grant_service::WORK_EXECUTE],
-        );
-        let administrator_file = root.join("administrator.json");
-        let scope_file = root.join("scope.json");
-        std::fs::write(
-            &administrator_file,
-            serde_json::to_vec(&administrator).unwrap(),
-        )
-        .unwrap();
-        let scope = administrator;
-        std::fs::write(&scope_file, serde_json::to_vec(&scope).unwrap()).unwrap();
-        let profile_dir = root.join("administration");
         let bootstrap = owner
-            .output(&[
-                "admin",
-                "bootstrap-remote",
-                "--invitation",
-                string(&invitation_file),
-                "--root-grant",
-                &GrantId([0; 16]).to_string(),
-                "--administrator",
-                string(&administrator_file),
-                "--credential-scope",
-                string(&scope_file),
-                "--profile-out",
-                string(&profile_dir),
-            ])
+            .output(&["pair", &invitation.encode().unwrap(), "--name", "worker"])
             .await;
         assert!(
             bootstrap.status.success(),
@@ -225,11 +173,13 @@ impl ManagedWorker {
         owner
             .run(&args.iter().map(String::as_str).collect::<Vec<_>>())
             .await;
-        owner
-            .run(&["offer", "import", string(&offer), "--name", "worker"])
-            .await;
+        let signed = hellas_authority::model::grant::records::SignedOffer::decode(
+            &std::fs::read(&offer).unwrap(),
+            hellas_auth::authority::UnixMillis(0),
+        )
+        .unwrap();
+        let access = access_file(&owner, &signed, &work_profile, &root.join("worker.access")).await;
         let (gateway_profile, gateway_token) = gateway_profile(root).await;
-        let trust_root = approve(root, "worker", provider.content_id());
         Self {
             root: directory,
             owner,
@@ -238,8 +188,7 @@ impl ManagedWorker {
             pin,
             address,
             profile,
-            work_profile,
-            trust_root,
+            access,
             gateway_profile,
             gateway_token,
         }
@@ -261,14 +210,8 @@ impl ManagedWorker {
         let mut gateway = self.owner.spawn(
             &[
                 "gateway",
-                "--trust-store",
-                string(&self.trust_root),
-                "--trust-policy",
-                "worker",
-                "--offer",
-                "worker",
-                "--work-profile",
-                string(&self.work_profile),
+                "--access",
+                string(&self.access),
                 "--port",
                 "0",
                 "--gateway-profile",
@@ -304,10 +247,7 @@ async fn invitation(node: &mut Process) -> Invitation {
     let deadline = tokio::time::Instant::now() + HANG_GUARD;
     loop {
         let log = std::fs::read_to_string(&node.log).unwrap();
-        if let Some(invitation) = log
-            .lines()
-            .find_map(|line| serde_json::from_str::<Invitation>(line).ok())
-        {
+        if let Some(invitation) = log.lines().find_map(|line| Invitation::decode(line).ok()) {
             return invitation;
         }
         assert!(
@@ -328,7 +268,7 @@ async fn normal_host_reconnects_through_its_original_enrollment() {
     let before = worker.control(&["status"]).await;
     assert_eq!(before["configuration"]["revision"], 1);
     let stranger = Cli::new(worker.root.path(), "stranger", STRANGER_PASSKEY);
-    stranger.run(&["--software-root", "identity", "init"]).await;
+    stranger.run(&["identity", "init"]).await;
     let refused = stranger
         .output(&[
             "admin",

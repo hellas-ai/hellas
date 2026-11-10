@@ -124,8 +124,9 @@ accounts. In the CLI's Fetch route file, use:
 
 The route file wraps entries in `routes`. Work payment channels authorize jobs
 and charge their fixed price; grants authorize jobs within their allowances.
-For CLI paid requests, `hellas fetch URL --provider NODE_ID --payment 20`
-selects the contract from the provider quote. `--save-job DIR` writes a reusable
+For CLI paid requests, `hellas fetch URL --contract http --pay 20 --provider
+ENROLLMENT_ID@NODE_ID` runs under the named contract; a quote that does not
+admit it is refused. `--save-job DIR` writes a reusable
 [job folder](../../docs/jobs.md) for `hellas transact --job DIR`.
 
 Results contain one `Adaptor.Http.Head` event followed by base64 body events

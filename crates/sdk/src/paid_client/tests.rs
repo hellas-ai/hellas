@@ -218,6 +218,25 @@ async fn insufficient_quoted_collateral_is_rejected_before_a_bond_request_or_jou
             }
         ))
     ));
+    // The requested price is a ceiling: a cheaper quote passes this check,
+    // a dearer one is refused before anything is signed.
+    let price = policy.payment_policy.fixed_price;
+    let higher = PaidWorkOptions {
+        expected_price: price + 1,
+        ..args.clone()
+    };
+    assert!(matches!(
+        super::offer::check_policy(&higher, &policy, 51),
+        Err(PaidClientError::WorkSetup(_))
+    ));
+    let lower = PaidWorkOptions {
+        expected_price: price - 1,
+        ..args
+    };
+    assert!(matches!(
+        super::offer::check_policy(&lower, &policy, 51),
+        Err(PaidClientError::PriceAbove { quoted, maximum }) if quoted == price && maximum == price - 1
+    ));
     assert!(!journal_root.exists());
 }
 

@@ -40,7 +40,7 @@ pub enum Error {
 }
 
 /// No owner keys or bootstrap credentials cross this interface. The pinned
-/// template explicitly opts into `hellas serve --await-owner`; the machine generates
+/// template runs `hellas serve`, which waits for its owner to pair; the machine generates
 /// its own node identity.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -147,7 +147,7 @@ pub async fn run(
         );
         let reconcile = args.content_config.is_some();
         let loaded =
-            crate::content_configuration::ContentConfiguration::load(args.content_config, None)?;
+            crate::content_configuration::ContentConfiguration::load(args.content_config, vec![])?;
         let config = loaded.config().clone();
         if let StoreCommand::Index { paths, recheck } = args.command {
             return index(&config, home, paths, recheck).await;
@@ -182,16 +182,17 @@ pub async fn run(
     );
     let identity = identity.context("daemon operations require the holding device identity")?;
     let path = args.profile.as_deref().unwrap();
-    let node = ClientProfile::remote_node(path)?;
+    let pinned = ClientProfile::remote_node(path)?;
     let profile = ClientProfile::load(path)?;
     let key = passkey.map_or(SessionKey::Node(&identity.node_key), SessionKey::Passkey);
-    if let Some(node) = node {
+    if let Some((node, mut addresses)) = pinned {
+        addresses.extend(args.addresses);
         ensure!(
             args.control_socket.is_none(),
             "a paired remote profile cannot use --control-socket"
         );
         let (endpoint, client, _) =
-            crate::commands::admin::connect_remote(identity, node, args.addresses, &profile, key)
+            crate::commands::admin::connect_remote(identity, node, addresses, &profile, key)
                 .await?;
         let result = remote(client.transport().clone(), args.command).await;
         endpoint.close().await;

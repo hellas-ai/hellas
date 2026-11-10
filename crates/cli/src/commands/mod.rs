@@ -7,8 +7,9 @@ pub mod admin;
 pub mod chain;
 pub(crate) mod codex_auth;
 pub mod contributions;
+pub mod convert;
+pub mod faucet;
 
-pub mod grant_gateway;
 pub mod identity;
 pub mod monitor;
 pub mod rpc;

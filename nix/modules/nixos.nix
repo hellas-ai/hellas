@@ -46,21 +46,10 @@ let
     ] providerUpper) providerUpper
   );
   gatewayContentPaths = lib.unique (map normalizeRuntimePath (gateway.content.lower or [ ]));
-  gatewayPaidUpper =
-    if gateway.paidWorkConfig == null then
-      null
-    else
-      let
-        name = builtins.baseNameOf gateway.paidWorkConfig;
-        extension = builtins.match "(.+)\\.[^.]*" name;
-        stem = if extension == null then name else builtins.head extension;
-      in
-      "${builtins.dirOf gateway.paidWorkConfig}/${stem}.content";
   gatewayWriteRoots = lib.unique (
     map normalizeRuntimePath (
       [ gateway.home ]
       ++ lib.optional (gateway.content ? upper) gateway.content.upper
-      ++ lib.optional (gatewayPaidUpper != null) gatewayPaidUpper
       ++ lib.optional (gateway.authorityJournal != null) gateway.authorityJournal
     )
   );
@@ -74,12 +63,11 @@ let
     writable: lib.all (content: !pathsOverlap writable content) providerContentPaths
   ) providerWriteRoots;
   providerCatenaConfigured = hellas.catenaConfigured cfg;
-  providerLocalExecutionEnabled =
-    hellas.catenaConfigured cfg
-    && (cfg.workConfigFile != null || cfg.grantConfigFile != null || cfg.awaitOwner);
+  # Every provider runs Compute: paid, or granted by the owner it pairs with.
+  providerLocalExecutionEnabled = hellas.catenaConfigured cfg;
   providerGpuConfigured = hellas.catenaPlatform pkgs && providerLocalExecutionEnabled;
-  # The gateway runs the same native executor in process for --local-grant.
-  gatewayGpuConfigured = hellas.catenaPlatform pkgs && gateway.localGrant != null;
+  # The gateway runs the same native executor in process for --local.
+  gatewayGpuConfigured = hellas.catenaPlatform pkgs && gateway.local;
   defaultGpuSessionAssetBytes = 128 * 1024 * 1024 * 1024;
   effectiveGpuSessionAssetBytes =
     if cfg.gpuSessionAssetBytes == null then defaultGpuSessionAssetBytes else cfg.gpuSessionAssetBytes;
@@ -133,17 +121,14 @@ let
   ++ lib.optional (cfg.fetchConfigFile != null) cfg.fetchConfigFile
   ++ lib.optional (cfg.environmentFile != null) cfg.environmentFile;
   gatewayRuntimePaths = lib.optionals gateway.enable (
-    lib.optional (gateway.textModel != null) gateway.textModel
+    gateway.models
     ++ [ gateway.home ]
     ++ (gateway.content.lower or [ ])
     ++ lib.optional (gateway.content ? upper) gateway.content.upper
-    ++ lib.optional (gatewayPaidUpper != null) gatewayPaidUpper
     ++ lib.optional (gateway.environmentFile != null) gateway.environmentFile
-    ++ lib.optional (gateway.paidWorkConfig != null) gateway.paidWorkConfig
+    ++ lib.optional (gateway.access != null) gateway.access
     ++ lib.optional (gateway.chainConfig != null) gateway.chainConfig
-    ++ lib.optional (gateway.grantPoolConfig != null) gateway.grantPoolConfig
     ++ lib.optional (gateway.trustStore != null) gateway.trustStore
-    ++ lib.optional (gateway.workProfile != null) gateway.workProfile
     ++ lib.optional (gateway.passkey != null) gateway.passkey
     ++ lib.optional (gateway.gatewayProfile != null) gateway.gatewayProfile
     ++ lib.optional (gateway.authorityJournal != null) gateway.authorityJournal
@@ -242,8 +227,8 @@ in
         message = "services.hellas metrics ports require otel.enable and packages built with the otel feature.";
       }
       {
-        assertion = !gateway.enable || gateway.gatewayProfile != null;
-        message = "services.hellas.gateway requires gatewayProfile for its provisioned HTTP authority.";
+        assertion = !gateway.allowRemote || gateway.gatewayProfile != null;
+        message = "services.hellas.gateway.allowRemote requires gatewayProfile for its explicitly provisioned HTTP authority.";
       }
       {
         assertion = pkgs.stdenv.hostPlatform.isLinux;
@@ -278,8 +263,8 @@ in
         message = "services.hellas.gateway content.lower must be disjoint from writable journal and upper paths.";
       }
       {
-        assertion = gateway.content == { } || gateway.localGrant != null;
-        message = "services.hellas.gateway.content requires localGrant.";
+        assertion = gateway.content == { } || gateway.local;
+        message = "services.hellas.gateway.content requires local.";
       }
       {
         assertion = !cfg.enable || providerWritablePathsAreDisjoint;
@@ -313,63 +298,20 @@ in
         assertion =
           !gateway.enable
           ||
-            lib.count (target: target != null) [
-              gateway.offer
-              gateway.paidWorkConfig
-              gateway.grantPoolConfig
-              gateway.localGrant
+            lib.count lib.id [
+              (gateway.access != null)
+              (gateway.pay != null)
+              gateway.local
             ] == 1;
-        message = "services.hellas.gateway execution requires exactly one of offer, paidWorkConfig, grantPoolConfig or localGrant.";
+        message = "services.hellas.gateway execution requires exactly one of access, pay or local.";
       }
       {
-        assertion =
-          gateway.paidWorkConfig == null
-          || (
-            gateway.trustStore == null && gateway.trustPolicy == null && gateway.assurance == "producer-signed"
-          );
-        message = "services.hellas.gateway.paidWorkConfig requires producer-signed execution without a trust policy.";
+        assertion = (gateway.pay == null) == (gateway.provider == null);
+        message = "services.hellas.gateway.pay and provider must be configured together.";
       }
       {
-        assertion =
-          !gateway.enable
-          || gateway.grantPoolConfig != null
-          || (gateway.trustStore == null) == (gateway.trustPolicy == null);
+        assertion = (gateway.trustStore == null) == (gateway.trustPolicy == null);
         message = "services.hellas.gateway.trustStore and trustPolicy must be configured together.";
-      }
-      {
-        assertion =
-          gateway.offer == null
-          || (
-            gateway.trustStore != null
-            && gateway.trustPolicy != null
-            && gateway.workProfile != null
-            && gateway.passkey != null
-          );
-        message = "services.hellas.gateway grant execution requires trustStore, trustPolicy, workProfile and passkey.";
-      }
-      {
-        assertion =
-          gateway.grantPoolConfig == null
-          || (
-            gateway.trustStore != null
-            && gateway.passkey != null
-            && gateway.trustPolicy == null
-            && gateway.grantPolicy == null
-            && gateway.workProfile == null
-          );
-        message = "services.hellas.gateway grant pool requires trustStore and passkey without trustPolicy, grantPolicy or workProfile.";
-      }
-      {
-        assertion =
-          gateway.localGrant == null
-          || (
-            gateway.trustStore != null
-            && gateway.trustPolicy != null
-            && gateway.workProfile != null
-            && gateway.passkey != null
-            && gateway.assurance == "producer-signed"
-          );
-        message = "services.hellas.gateway.localGrant requires trustStore, trustPolicy, workProfile and passkey with producer-signed assurance.";
       }
     ];
 

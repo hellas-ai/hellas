@@ -34,25 +34,13 @@ For example, the scalar of account 7 can be reproduced with:
 python3 -c 'import hashlib; print(hashlib.sha256(b"hellas-devnet-3/faucet/v1\0" + (7).to_bytes(4, "big")).hexdigest())'
 ```
 
-The CLI's global `--faucet` selects one random account for that invocation.
-`serve` retains its first selection with the provider identity across restarts.
-`--faucet-account N` selects a particular one. Both print the selected index
-and settlement address to stderr and supply the existing software passkey
-authenticator. They cannot be combined with each other or `--passkey`.
-For example:
-
-```sh
-hellas contact export --faucet-account 7 --display-name "Public devnet user"
-hellas serve --faucet
-```
-
-The account is the P-256 owner, separate from a node's secp256k1 signing key.
-`serve --faucet` uses its passkey to bootstrap the normal authority, approve a
-bounded HTTP Fetch policy, and delegate stake automatically. It confirms the
-exact owner transaction and reuses that delegation after restart. See
-[paid gateway onboarding](../../../../docs/paid-gateway.md) for defaults and
-overrides. `chain delegate --faucet-account N` remains the explicit owner path;
-a faucet flag on another command selects its owner without creating a bond.
+`hellas faucet [--amount N]` picks one random account for that invocation,
+prints its index and settlement address to stderr, and pays N coins from it to
+the home's principal key. It waits until the payment is final and prints the
+principal's balance. The account is a P-256 owner, separate from a node's
+secp256k1 signing key; the principal then pays for jobs or, on a provider,
+approves paid terms and delegates stake. See the
+[paid work guide](../../../../docs/paid-gateway.md).
 
 `trust.json` is the offline seed-100 `chain validator config` / `export-trust`
 output for this exact genesis. `genesis-payload.hex` is independently derived

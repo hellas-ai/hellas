@@ -383,8 +383,9 @@ async fn run_owner_coins(
     owner: Option<&hellas_kernel::SoftPasskey>,
     profile: &ChainProfile,
 ) -> CliResult {
-    let owner = owner
-        .context("chain delegate/sweep/send requires --passkey, --faucet or --faucet-account")?;
+    let owner = owner.context(
+        "chain delegate/sweep/send spends the principal's coins; this home has no principal key (run `hellas faucet` or pass --passkey)",
+    )?;
     let selected = parse_coin_ids::<MAX_EDGE_INPUTS>(&args.coins, "coin")?;
     let network = NetworkId::new(profile.network_id()).expect("validated profile");
     let client = connect_with_verified_snapshots(args.rpc, profile).await?;
@@ -750,7 +751,7 @@ async fn run_close(args: CloseArgs, profile: &ChainProfile) -> CliResult {
     Ok(())
 }
 
-async fn connect_with_verified_snapshots(
+pub(super) async fn connect_with_verified_snapshots(
     rpc: Option<String>,
     profile: &ChainProfile,
 ) -> CliResult<RemoteLightClient> {

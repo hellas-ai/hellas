@@ -97,6 +97,52 @@ impl GrantConfig {
         }
     }
 
+    /// One generic Compute resource, `compute`, over the given programs, with
+    /// fixed job bounds and one job at a time. Owners narrow it with
+    /// `--grant-config`; nothing here knows what a program computes.
+    pub fn compute(
+        home: &StoreLocation,
+        programs: hellas_rpc::protocol::invocation::ComputePrograms,
+    ) -> Result<Self, GrantConfigError> {
+        use hellas_rpc::protocol::invocation::{Admission, InvocationPolicy, Limits, compute};
+        let account = ResourceId(hellas_auth::Digest::hash(b"hellas.compute.account.v1"));
+        let policy = GrantPolicy {
+            resource: ResourceId(hellas_auth::Digest::hash(b"hellas.compute.resource.v1")),
+            account,
+            revision: Revision(1),
+            name: "compute".into(),
+            invocation_policy: InvocationPolicy {
+                admissions: vec![Admission::Compute {
+                    evaluator: compute::EVALUATOR.into(),
+                    programs,
+                }],
+                limits: Limits {
+                    max_upload_bytes: 8 << 20,
+                    max_output_bytes: 4 << 20,
+                    max_steps: 4096,
+                    execution_timeout_ms: 900_000,
+                },
+            },
+            https: None,
+            responses: None,
+            pricing: hellas_authority::model::grant::pricing::Pricing {
+                revision: Revision(1),
+                rates: Some(vec![]),
+            },
+        };
+        let budget = ConfiguredBudget {
+            max_in_flight: std::num::NonZeroU16::MIN,
+            limits: vec![],
+        };
+        let mut config = Self::unconfigured(home);
+        config.configuration = NodeConfiguration::new(
+            Some(budget.clone()),
+            [(account, budget)].into(),
+            vec![policy],
+        )?;
+        Ok(config)
+    }
+
     /// Provider authority state is fixed under the selected home.
     pub fn load(path: &Path, home: &StoreLocation) -> Result<Self, GrantConfigError> {
         let bytes = hellas_private::read_bounded_regular_file(path, 1 << 20)?;

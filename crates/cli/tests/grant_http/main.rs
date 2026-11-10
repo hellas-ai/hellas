@@ -184,16 +184,33 @@ impl Cli {
         ))
         .unwrap()
     }
-    /// The holder naming this CLI's node key, as `identity show-holder` prints it.
+    /// This CLI's `hellas contact` string, named after its home.
+    async fn contact(&self) -> String {
+        let name = self
+            .home
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        self.run(&["contact", "--name", &name])
+            .await
+            .trim()
+            .to_owned()
+    }
+    /// The holder naming this CLI's node key, as its contact names it.
     async fn holder(&self) -> hellas_auth::authority::CredentialHolder {
-        serde_json::from_str(&self.run(&["identity", "show-holder"]).await).unwrap()
+        hellas_auth::authority::CredentialHolder::Node(
+            hellas_sdk::contact::Contact::decode(&self.contact().await)
+                .unwrap()
+                .holder,
+        )
     }
     async fn holder_file(&self) -> PathBuf {
         let path = self.root.join(format!(
             "{}-holder.json",
             self.home.file_name().unwrap().to_string_lossy()
         ));
-        std::fs::write(&path, self.run(&["identity", "show-holder"]).await).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&self.holder().await).unwrap()).unwrap();
         path
     }
     fn command(&self, args: &[&str]) -> Command {
@@ -476,51 +493,6 @@ async fn issue_work_profile_at(
         &hellas_sdk::node_control::profile::read_credential(&output).unwrap(),
     )
 }
-/// A Work credential for `subject` on `allowance`, held by `holder`, issued
-/// through the checked node API by the passkey session of `administrator`'s
-/// subject.
-async fn execution_credential(
-    node: &hellas_authority::node::NodeCoordinator,
-    administrator: &hellas_auth::authority::CredentialSecret,
-    subject: hellas_auth::authority::PrincipalId,
-    allowance: GrantId,
-    holder: hellas_auth::authority::CredentialHolder,
-) -> hellas_auth::authority::CredentialSecret {
-    use hellas_auth::authority as auth;
-    let caller = hellas_authority::test_support::session(node, administrator).await;
-    let root = GrantId([0; 16]);
-    let scope = auth::GrantSpec {
-        authority: caller.authority(),
-        subject,
-        permissions: [auth::Permission {
-            operation: auth::OperationId::new(hellas_authority::grant_service::WORK_EXECUTE)
-                .unwrap(),
-            resource: hellas_authority::grant_service::allowance_resource(
-                caller.authority(),
-                allowance,
-            ),
-        }]
-        .into(),
-        not_before: auth::UnixMillis(1000),
-        expires: auth::UnixMillis(u64::MAX),
-        delegation_depth: 0,
-        issuance: None,
-    };
-    node.grant(
-        &caller,
-        auth::GrantCommand::Issue {
-            authorization: root,
-            id: common_node::EXECUTION_AUTHORIZATION,
-            spec: scope.clone(),
-        },
-    )
-    .await
-    .unwrap();
-    hellas_authority::test_support::credentials::issue_one(node, &caller, root, scope, holder)
-        .await
-        .unwrap()
-        .1
-}
 /// An HTTP authority whose administrator issues the gateway a separate
 /// bearer credential; the bootstrap credential is never the bearer.
 async fn gateway_profile(root: &Path) -> (PathBuf, String) {
@@ -634,23 +606,6 @@ fn http_invocation_policy() -> hellas_rpc::protocol::invocation::InvocationPolic
         },
     }
 }
-/// Record an independent caller approval of one provider.
-fn approve(root: &Path, name: &str, provider_genesis: hellas_rpc::ContentId) -> PathBuf {
-    let trust_root = root.join(format!("{name}-trust"));
-    hellas_sdk::trust_policy::TrustPolicyStore::new(&trust_root)
-        .approve(
-            name,
-            0,
-            hellas_sdk::trust_policy::TrustPolicy {
-                provider_genesis,
-                assurance: hellas_rpc::Assurance::ProducerSigned,
-                apple: None,
-            },
-            "independent test approval".into(),
-        )
-        .unwrap();
-    trust_root
-}
 async fn post(client: &reqwest::Client, url: &str, body: Value) -> reqwest::Response {
     client.post(url).json(&body).send().await.unwrap()
 }
@@ -683,4 +638,31 @@ async fn assert_http_response(
         );
     }
     body
+}
+
+/// A provider's signed offer and the Work profile it issued, as one access
+/// file for `client`'s device: what `hellas share` writes.
+async fn access_file(
+    client: &Cli,
+    offer: &hellas_authority::model::grant::records::SignedOffer,
+    work_profile: &Path,
+    out: &Path,
+) -> PathBuf {
+    let hellas_auth::authority::CredentialHolder::Node(holder) = client.holder().await else {
+        panic!("a device holds the credential")
+    };
+    let profile = hellas_sdk::node_control::profile::ClientProfile::load(work_profile).unwrap();
+    hellas_sdk::access_bundle::AccessBundle {
+        offers: vec![offer.clone()],
+        authority: profile.authority,
+        authorization: profile.authorization,
+        subject: client.principal(),
+        holder,
+        credential: profile.credential,
+        expires: offer.offer().valid_until,
+        label: None,
+    }
+    .save(out)
+    .unwrap();
+    out.to_owned()
 }

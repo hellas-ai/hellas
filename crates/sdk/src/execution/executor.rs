@@ -1,8 +1,9 @@
-//! A command is a pool of one: open its target, run the one lifecycle, close.
+//! One job on one target: open it, run the one lifecycle, close. A command
+//! runs one; a gateway runs one per request.
 use super::{
     AttemptError, Completed, Controls, Delivery, ExecutionAttempt, ExecutionError,
-    ExecutionSession, ExecutionTarget, ExecutionTerms, PaidOpen, Result, Stop, Terminal,
-    before_proposal, open_paid_session, within,
+    ExecutionObservers, ExecutionSession, ExecutionTarget, ExecutionTerms, PaidOpen, Result, Stop,
+    Terminal, before_proposal, open_paid_session, within,
 };
 use crate::gateway_work::WorkRequest;
 use crate::job::Job;
@@ -26,7 +27,9 @@ pub struct PaidExecution {
     pub settlement_key: hellas_kernel::Secp256k1Signer,
     pub owner: std::sync::Arc<crate::client_owner::ClientOwner>,
     pub funding: crate::paid_client::SessionFundingOptions,
-    pub attempt: ExecutionAttempt,
+    /// A command's durable attempt; a gateway request has none and its
+    /// proposed work is finished by the running process.
+    pub attempt: Option<ExecutionAttempt>,
     /// Settle the channel after delivery, within the same deadline.
     pub settle: bool,
 }
@@ -35,7 +38,8 @@ pub struct GrantExecution {
     pub options: crate::grant_client::GrantSessionOptions,
     pub transport: crate::grant_client::GrantTransport,
     pub resource: hellas_auth::authority::ResourceId,
-    pub attempt: ExecutionAttempt,
+    /// As for [`PaidExecution::attempt`].
+    pub attempt: Option<ExecutionAttempt>,
 }
 
 impl Executor {
@@ -43,30 +47,36 @@ impl Executor {
     /// anything. One absolute `deadline` covers opening, queueing, execution,
     /// delivery, its report and settlement; `stop` abandons only unproposed
     /// work. An unresolved earlier attempt is reported with its facts.
+    /// `observers` see acceptance and signed output prefixes as they arrive.
     pub async fn run(
         self,
         job: &Job,
         signer: &ProducerSigningKey,
         deadline: Option<tokio::time::Instant>,
         stop: Stop,
+        observers: ExecutionObservers,
         deliver: Delivery<'_>,
     ) -> Result<Completed> {
+        let controls = Controls {
+            deadline,
+            stop: Some(stop.clone()),
+            observers,
+            deliver: Some(deliver),
+        };
         match self {
-            Self::Paid(target) => target.run(job, signer, deadline, stop, deliver).await,
-            Self::Grant(target) => target.run(job, deadline, stop, deliver).await,
+            Self::Paid(target) => target.run(job, signer, stop, controls).await,
+            Self::Grant(target) => target.run(job, stop, controls).await,
             #[cfg(feature = "compute")]
             Self::Local(target, policy) => {
+                let Controls {
+                    observers, deliver, ..
+                } = controls;
                 let completed = target
-                    .run(
-                        job.input(),
-                        &policy,
-                        signer,
-                        deadline,
-                        &stop,
-                        Default::default(),
-                    )
+                    .run(job.input(), &policy, signer, deadline, &stop, observers)
                     .await?;
-                deliver(&completed).map_err(ExecutionError::Delivery)?;
+                deliver
+                    .map_or(Ok(()), |deliver| deliver(&completed))
+                    .map_err(ExecutionError::Delivery)?;
                 Ok(completed)
             }
         }
@@ -77,9 +87,11 @@ impl Executor {
 fn replay(
     attempt: &mut ExecutionAttempt,
     completed: Completed,
-    deliver: Delivery<'_>,
+    deliver: Option<Delivery<'_>>,
 ) -> Result<Completed> {
-    deliver(&completed).map_err(ExecutionError::Delivery)?;
+    if let Some(deliver) = deliver {
+        deliver(&completed).map_err(ExecutionError::Delivery)?;
+    }
     attempt.reported()?;
     Ok(completed)
 }
@@ -89,9 +101,8 @@ impl PaidExecution {
         self,
         job: &Job,
         signer: &ProducerSigningKey,
-        deadline: Option<tokio::time::Instant>,
         stop: Stop,
-        deliver: Delivery<'_>,
+        controls: Controls<'_>,
     ) -> Result<Completed> {
         let Self {
             options,
@@ -99,59 +110,65 @@ impl PaidExecution {
             settlement_key,
             owner,
             funding,
-            mut attempt,
+            attempt,
             settle,
         } = self;
-        let mut completed = match attempt.retained_paid_result()? {
-            Some(completed) => {
-                attempt.bind_target(ExecutionTarget {
-                    network: options.config.network(),
-                    provider: options.provider,
-                })?;
-                replay(&mut attempt, completed, deliver)?
-            }
+        let deadline = controls.deadline;
+        let open = |open| {
+            open_paid_session(
+                options.clone(),
+                endpoint.clone(),
+                settlement_key.clone(),
+                owner.clone(),
+                funding,
+                open,
+                None,
+            )
+        };
+        let request = WorkRequest::Job(job.input().clone());
+        let terms = ExecutionTerms::Paid { price: job.price() };
+        let mut completed = match attempt {
             None => {
-                if attempt.inspect()?.terminal == Terminal::Rejected {
-                    return Err(ExecutionError::Terminal);
-                }
-                let mut session = before_proposal(
-                    deadline,
-                    &stop,
-                    None,
-                    open_paid_session(
-                        options.clone(),
-                        endpoint.clone(),
-                        settlement_key.clone(),
-                        owner.clone(),
-                        funding,
-                        PaidOpen::Attempt(job, &mut attempt),
-                        None,
-                    ),
-                )
-                .await??;
+                let mut session =
+                    before_proposal(deadline, &stop, None, open(PaidOpen::Job(job))).await??;
                 let run = ExecutionSession::Paid(&mut session)
-                    .run(
-                        &WorkRequest::Job(job.input().clone()),
-                        ExecutionTerms::Paid { price: job.price() },
-                        signer,
-                        Controls {
-                            deadline,
-                            stop: Some(stop),
-                            deliver: Some(deliver),
-                            ..Default::default()
-                        },
-                        Some(&mut attempt),
-                    )
+                    .run(&request, terms, signer, controls, None)
                     .await;
-                let run = unresolved(run, deadline, async {
-                    ExecutionSession::Paid(&mut session)
-                        .recover(&mut attempt)
-                        .await
-                })
-                .await;
                 session.shutdown().await;
                 run?
             }
+            Some(mut attempt) => match attempt.retained_paid_result()? {
+                Some(completed) => {
+                    attempt.bind_target(ExecutionTarget {
+                        network: options.config.network(),
+                        provider: options.provider,
+                    })?;
+                    replay(&mut attempt, completed, controls.deliver)?
+                }
+                None => {
+                    if attempt.inspect()?.terminal == Terminal::Rejected {
+                        return Err(ExecutionError::Terminal);
+                    }
+                    let mut session = before_proposal(
+                        deadline,
+                        &stop,
+                        None,
+                        open(PaidOpen::Attempt(job, &mut attempt)),
+                    )
+                    .await??;
+                    let run = ExecutionSession::Paid(&mut session)
+                        .run(&request, terms, signer, controls, Some(&mut attempt))
+                        .await;
+                    let run = unresolved(run, deadline, async {
+                        ExecutionSession::Paid(&mut session)
+                            .recover(&mut attempt)
+                            .await
+                    })
+                    .await;
+                    session.shutdown().await;
+                    run?
+                }
+            },
         };
         if settle && let Some(paid) = &mut completed.paid {
             let receipt = within(
@@ -174,19 +191,33 @@ impl PaidExecution {
 }
 
 impl GrantExecution {
-    async fn run(
-        self,
-        job: &Job,
-        deadline: Option<tokio::time::Instant>,
-        stop: Stop,
-        deliver: Delivery<'_>,
-    ) -> Result<Completed> {
+    async fn run(self, job: &Job, stop: Stop, controls: Controls<'_>) -> Result<Completed> {
         let Self {
             options,
             transport,
             resource,
-            mut attempt,
+            attempt,
         } = self;
+        let deadline = controls.deadline;
+        let request = WorkRequest::Job(job.input().clone());
+        let terms = ExecutionTerms::Grant { resource };
+        let Some(mut attempt) = attempt else {
+            let mut session = before_proposal(
+                deadline,
+                &stop,
+                None,
+                crate::grant_client::GrantSession::open(options, transport),
+            )
+            .await??;
+            let signer = session.execution_signer().clone();
+            let run = ExecutionSession::Grant(&mut session)
+                .run(&request, terms, &signer, controls, None)
+                .await;
+            let closed = session.shutdown().await;
+            let completed = run?;
+            closed?;
+            return Ok(completed);
+        };
         if let Some(retained) = attempt.retained_result()? {
             let provider_key = hellas_auth::PublicKey::Secp256k1(
                 hellas_authority::model::grant::records::grant_producer(
@@ -203,7 +234,7 @@ impl GrantExecution {
                 paid: None,
                 live: None,
             };
-            return replay(&mut attempt, completed, deliver);
+            return replay(&mut attempt, completed, controls.deliver);
         }
         let mut session = before_proposal(
             deadline,
@@ -214,18 +245,7 @@ impl GrantExecution {
         .await??;
         let signer = session.execution_signer().clone();
         let run = ExecutionSession::Grant(&mut session)
-            .run(
-                &WorkRequest::Job(job.input().clone()),
-                ExecutionTerms::Grant { resource },
-                &signer,
-                Controls {
-                    deadline,
-                    stop: Some(stop),
-                    deliver: Some(deliver),
-                    ..Default::default()
-                },
-                Some(&mut attempt),
-            )
+            .run(&request, terms, &signer, controls, Some(&mut attempt))
             .await;
         let run = unresolved(run, deadline, async {
             ExecutionSession::Grant(&mut session)

@@ -41,7 +41,7 @@ fn bundle() -> AccessBundle {
 }
 
 #[test]
-fn a_saved_bundle_is_private_and_installs_the_contact_profile() {
+fn a_saved_bundle_is_private_and_carries_the_contact_profile() {
     let directory = tempfile::tempdir().unwrap();
     let original = bundle();
     let path = directory.path().join("friend.access");
@@ -69,97 +69,21 @@ fn a_saved_bundle_is_private_and_installs_the_contact_profile() {
     ));
     let loaded = AccessBundle::load(&path, &original.subject, &original.holder).unwrap();
     assert_eq!(*loaded.encode().unwrap(), *original.encode().unwrap());
-    let profile = profile::ClientProfile::load(
-        &loaded
-            .install_profile(&directory.path().join("profile"))
-            .unwrap(),
-    )
-    .unwrap();
-    let (offers, parts) = loaded.into_parts();
+    let (offers, profile) = loaded.into_parts();
     assert_eq!(offers.len(), 2);
     for (offer, original) in offers.iter().zip(&original.offers) {
         assert_eq!(offer.encode().unwrap(), original.encode().unwrap());
     }
-    for profile in [profile, parts] {
-        assert_eq!(
-            (profile.authority, profile.authorization),
-            (original.authority, original.authorization)
-        );
-        assert_eq!(profile.credential.id(), original.credential.id());
-        assert_eq!(
-            profile.credential.expose_secret(),
-            original.credential.expose_secret()
-        );
-        assert!(profile.local.is_none());
-    }
-}
-
-#[test]
-fn grant_store_imports_bound_profiles_and_never_rolls_back_standing() {
-    let directory = tempfile::tempdir().unwrap();
-    let mut bundle = bundle();
-    bundle.offers.truncate(1);
-    let source = directory.path().join("bundle");
-    bundle.save(&source).unwrap();
-    let store = crate::grant_store::GrantStore::new(directory.path().join("store"));
-    let imported = store
-        .import_bundle(&source, "shared", &bundle.subject, &bundle.holder, false)
-        .unwrap();
-    assert_eq!(imported.offers.len(), 1);
-    let profile = store
-        .load_profile("shared", &bundle.subject, &bundle.holder)
-        .unwrap();
-    assert_eq!(profile.credential.id(), bundle.credential.id());
-    assert!(
-        store
-            .load_profile("shared", &bundle.subject, &node_key(8))
-            .is_err()
-    );
-    assert!(
-        store
-            .load_profile("../shared", &bundle.subject, &bundle.holder)
-            .is_err()
-    );
-    let name = &imported.offers[0].name;
-    let mut newer = bundle.offers[0].offer().clone();
-    newer.sequence += 1;
-    let newer = SignedOffer::sign(newer, &principal(2).1).unwrap();
-    let offer_file = directory.path().join("offer");
-    std::fs::write(&offer_file, newer.encode().unwrap()).unwrap();
-    store.import_offer(&offer_file, name, false).unwrap();
     assert_eq!(
-        store.load_offer(name).unwrap().encode().unwrap(),
-        newer.encode().unwrap()
+        (profile.authority, profile.authorization),
+        (original.authority, original.authorization)
     );
-    std::fs::write(&offer_file, bundle.offers[0].encode().unwrap()).unwrap();
-    assert!(matches!(
-        store.import_offer(&offer_file, name, true),
-        Err(crate::grant_store::GrantStoreError::Rollback)
-    ));
+    assert_eq!(profile.credential.id(), original.credential.id());
     assert_eq!(
-        store.load_offer(name).unwrap().encode().unwrap(),
-        newer.encode().unwrap()
+        profile.credential.expose_secret(),
+        original.credential.expose_secret()
     );
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(
-            std::fs::metadata(store.offer_path(name).unwrap())
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-        assert_eq!(
-            std::fs::metadata(imported.profile)
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-    }
+    assert!(profile.local.is_none());
 }
 
 #[test]
@@ -234,44 +158,5 @@ fn truncated_or_oversized_bundles_are_refused() {
     assert!(matches!(
         AccessBundle::load(&path, &original.subject, &original.holder),
         Err(AccessBundleError::TooLarge)
-    ));
-}
-
-#[test]
-fn imported_access_resolves_dotted_bundle_and_policy_names_and_checks_holder() {
-    let root = tempfile::tempdir().unwrap();
-    let mut bundle = bundle();
-    bundle.offers.truncate(1);
-    let mut offer = bundle.offers[0].offer().clone();
-    offer.grant.policies[0].name = "model.v1".into();
-    bundle.offers[0] = SignedOffer::sign(offer, &principal(2).1).unwrap();
-    let path = root.path().join("bundle");
-    bundle.save(&path).unwrap();
-    let store = crate::grant_store::GrantStore::new(root.path().join("store"));
-    store
-        .import_bundle(&path, "node.one", &bundle.subject, &bundle.holder, false)
-        .unwrap();
-    let (offer, profile) = store
-        .load_access("node.one.model.v1", &bundle.subject, &bundle.holder)
-        .unwrap();
-    assert_eq!(offer.encode().unwrap(), bundle.offers[0].encode().unwrap());
-    assert_eq!(profile.authorization, bundle.authorization);
-    assert_eq!(profile.credential.id(), bundle.credential.id());
-    assert!(
-        store
-            .load_access("node.one.model.v1", &bundle.subject, &node_key(8))
-            .is_err()
-    );
-    assert!(
-        store
-            .load_access("node.one.model.v1", &principal(8).0, &bundle.holder)
-            .is_err()
-    );
-    let plain = root.path().join("offer");
-    std::fs::write(&plain, offer.encode().unwrap()).unwrap();
-    store.import_offer(&plain, "plain", false).unwrap();
-    assert!(matches!(
-        store.load_access("plain", &bundle.subject, &bundle.holder),
-        Err(crate::grant_store::GrantStoreError::AccessAlias)
     ));
 }

@@ -36,16 +36,19 @@ fn durability_is_global_and_defaults_to_crash() {
 
 #[test]
 fn image_cli_and_gateway_surfaces_are_available() {
-    let convert = Cli::try_parse_from([
-        "hellas",
-        "convert-flux",
-        "--checkpoint",
-        "snapshot",
-        "--output",
-        "klein",
-    ])
-    .unwrap();
-    assert!(matches!(convert.command, Commands::ConvertFlux { .. }));
+    let commit = "ab".repeat(20);
+    let snapshot = format!("org/klein@{commit}");
+    for command in ["convert-flux", "convert-whisper"] {
+        let convert = Cli::try_parse_from(["hellas", command, &snapshot, "-o", "out"]).unwrap();
+        assert!(matches!(
+            convert.command,
+            Commands::ConvertFlux { .. } | Commands::ConvertWhisper { .. }
+        ));
+        assert!(
+            Cli::try_parse_from(["hellas", command, "--checkpoint", "dir", "-o", "out"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["hellas", command, "org/klein@main", "-o", "out"]).is_err());
+    }
     let provider = format!("{}@{}", "11".repeat(32), "22".repeat(32));
     let image = Cli::try_parse_from([
         "hellas",
@@ -56,7 +59,7 @@ fn image_cli_and_gateway_surfaces_are_available() {
         "klein",
         "--prompt",
         "fox",
-        "--payment",
+        "--pay",
         "20",
         "--seed",
         "42",
@@ -69,14 +72,17 @@ fn image_cli_and_gateway_surfaces_are_available() {
     ])
     .unwrap();
     assert!(matches!(image.command, Commands::Image(_)));
-    let gateway = parse_gateway(&["--image-model", "klein"]).unwrap();
-    assert!(matches!(
-        gateway.command,
-        Commands::Gateway {
-            image_model: Some(_),
-            ..
-        }
-    ));
+    let gateway = parse_gateway(&["--model", "klein", "--model", "qwen.gguf"]).unwrap();
+    let Commands::Gateway { models, .. } = gateway.command else {
+        panic!("gateway")
+    };
+    assert_eq!(
+        models,
+        [
+            std::path::Path::new("klein"),
+            std::path::Path::new("qwen.gguf")
+        ]
+    );
 }
 
 #[cfg(unix)]
@@ -91,21 +97,10 @@ const TEST_REMOTE_TRUST_ARGS: &[&str] = &[
     "apple-app-attest",
 ];
 
-fn assert_test_remote_trust(remote_trust: &RemoteTrustArgs) {
-    assert_eq!(
-        remote_trust.trust_store.as_deref(),
-        Some(Path::new("/state/trust"))
-    );
-    assert_eq!(remote_trust.trust_policy.as_deref(), Some("provider"));
-    assert_eq!(
-        remote_trust.assurance,
-        hellas_rpc::Assurance::AppleAppAttest
-    );
-}
-
+/// A gateway under an access file, plus `args`.
 fn parse_gateway(args: &[&str]) -> Result<Cli, clap::Error> {
     Cli::try_parse_from(
-        ["hellas", "gateway"]
+        ["hellas", "gateway", "--access", "friend.access"]
             .into_iter()
             .chain(args.iter().copied()),
     )
@@ -117,33 +112,9 @@ fn identity_init_has_an_explicit_dispatch_command() {
     assert!(matches!(
         cli.command,
         Commands::Identity {
-            command: IdentityCommand::Init { passkey_out: None },
+            command: IdentityCommand::Init,
         }
     ));
-}
-
-#[test]
-fn identity_free_commands_reject_software_root_but_allow_home() {
-    let cli = Cli::try_parse_from([
-        "hellas",
-        "--home",
-        "/state",
-        "offer",
-        "import",
-        "provider.offer",
-        "--name",
-        "provider",
-        "--software-root",
-    ])
-    .unwrap();
-    assert!(validate_identity_options(&cli.command, cli.software_root).is_err());
-}
-
-#[test]
-fn identity_queries_reject_a_root_selection_they_cannot_use() {
-    let cli =
-        Cli::try_parse_from(["hellas", "identity", "show-node-id", "--software-root"]).unwrap();
-    assert!(validate_identity_options(&cli.command, cli.software_root).is_err());
 }
 
 #[test]
@@ -205,19 +176,39 @@ fn serve_accepts_only_its_command_local_assurance() {
 }
 
 #[test]
-fn gateway_accepts_remote_trust_policy() {
-    let cli = parse_gateway(TEST_REMOTE_TRUST_ARGS).unwrap();
-    let Commands::Gateway { remote_trust, .. } = cli.command else {
-        panic!("gateway");
+fn gateway_takes_the_job_commands_targets() {
+    let provider = format!("{}@{}", "11".repeat(32), "22".repeat(32));
+    let gateway = |args: &[&str]| {
+        Cli::try_parse_from(
+            ["hellas", "gateway"]
+                .into_iter()
+                .chain(args.iter().copied()),
+        )
     };
-    assert_test_remote_trust(&remote_trust);
-}
-
-#[test]
-fn gateway_rejects_address_without_node_id() {
-    let result = parse_gateway(&["--address", "127.0.0.1:31145"]);
-
-    assert!(result.is_err());
+    assert!(gateway(&["--access", "friend.access"]).is_ok());
+    assert!(gateway(&["--pay", "20", "--provider", &provider]).is_ok());
+    assert_eq!(cfg!(feature = "compute"), gateway(&["--local"]).is_ok());
+    for refused in [
+        &[][..],
+        &["--pay", "20"][..],
+        &[
+            "--access",
+            "friend.access",
+            "--pay",
+            "20",
+            "--provider",
+            &provider,
+        ][..],
+        &["--offer", "lan"][..],
+        &[
+            "--paid-work-config",
+            "pool.json",
+            "--access",
+            "friend.access",
+        ][..],
+    ] {
+        assert!(gateway(refused).is_err(), "{refused:?}");
+    }
 }
 
 #[test]
@@ -257,21 +248,18 @@ fn admin_target_is_shared_and_requires_an_identity_pin() {
 }
 
 #[test]
-fn serve_rejects_software_root_with_apple_assurance() {
-    assert!(validate_serve_assurance(true, hellas_rpc::Assurance::AppleAppAttest, None).is_err());
+fn apple_assurance_requires_a_secure_enclave_root() {
     assert!(
         validate_serve_assurance(
-            false,
             hellas_rpc::Assurance::AppleAppAttest,
-            Some(hellas_rpc::RootKind::Software),
+            hellas_rpc::RootKind::Software,
         )
         .is_err()
     );
     assert!(
         validate_serve_assurance(
-            false,
             hellas_rpc::Assurance::AppleAppAttest,
-            Some(hellas_rpc::RootKind::SecureEnclave),
+            hellas_rpc::RootKind::SecureEnclave,
         )
         .is_ok()
     );
@@ -324,25 +312,20 @@ fn gateway_responses_fetch_takes_overrides_and_its_models() {
 }
 
 #[test]
-fn identity_show_holder_accepts_global_home() {
+fn identity_commands_accept_global_home() {
     let cli = Cli::try_parse_from([
         "hellas",
         "--home",
         "/state/hellas",
         "identity",
-        "show-holder",
+        "show-node-id",
     ])
     .unwrap();
     assert_eq!(
         cli.home.as_deref(),
         Some(std::path::Path::new("/state/hellas"))
     );
-    assert!(matches!(
-        cli.command,
-        Commands::Identity {
-            command: IdentityCommand::ShowHolder
-        }
-    ));
+    assert!(Cli::try_parse_from(["hellas", "identity", "show-holder"]).is_err());
     assert!(Cli::try_parse_from(["hellas", "producer-key", "show"]).is_err());
 }
 
@@ -368,10 +351,7 @@ fn an_unreadable_settlement_identity_is_a_startup_failure() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("identity");
     std::fs::write(&path, b"not an identity").unwrap();
-    let paid =
-        Cli::try_parse_from(["hellas", "serve", "--paid-work-config", "/tmp/work.toml"]).unwrap();
-
-    let Err(error) = load_command_identity(&paid.command, &path) else {
+    let Err(error) = identity::load_or_create(&path) else {
         panic!("an identity file that is not one is not a key to settle with");
     };
 
@@ -474,79 +454,6 @@ fn serve_uses_bounded_fetch_defaults() {
 }
 
 #[test]
-fn offer_gateway_uses_its_private_resources_and_existing_identity() {
-    let cli = Cli::try_parse_from([
-        "hellas",
-        "gateway",
-        "--offer",
-        "lan-model",
-        "--grant-policy",
-        "chat",
-        "--work-profile",
-        "/work.json",
-        "--gateway-profile",
-        "/gateway.json",
-    ])
-    .unwrap();
-    assert!(validate_identity_options(&cli.command, true).is_err());
-    let root = tempfile::tempdir().unwrap();
-    let path = root.path().join("missing-identity");
-    assert!(load_command_identity(&cli.command, &path).is_err());
-    assert!(!path.exists());
-    let Commands::Gateway {
-        grant_policy,
-        work_profile,
-        gateway_profile,
-        ..
-    } = &cli.command
-    else {
-        panic!("gateway")
-    };
-    assert_eq!(grant_policy.as_deref(), Some("chat"));
-    assert_eq!(work_profile.as_deref(), Some(Path::new("/work.json")));
-    assert_eq!(gateway_profile.as_deref(), Some(Path::new("/gateway.json")));
-    for args in [
-        vec!["--paid-work-config", "/pool.json"],
-        vec!["--local-grant", "00000000000000000000000000000000"],
-    ] {
-        let mut argv = vec!["hellas", "gateway", "--offer", "lan-model"];
-        argv.extend(args);
-        assert!(Cli::try_parse_from(argv).is_err());
-    }
-}
-
-#[test]
-fn offer_gateway_accepts_independent_apple_trust_policy() {
-    let cli = Cli::try_parse_from(
-        ["hellas", "gateway", "--offer", "provider"]
-            .into_iter()
-            .chain(TEST_REMOTE_TRUST_ARGS.iter().copied()),
-    )
-    .unwrap();
-    let Commands::Gateway { remote_trust, .. } = cli.command else {
-        panic!("gateway");
-    };
-    assert_test_remote_trust(&remote_trust);
-    for flag in [
-        "--provider",
-        "--apple-app-attest-app-id",
-        "--apple-app-attest-cdhashes",
-    ] {
-        assert!(
-            Cli::try_parse_from([
-                "hellas",
-                "gateway",
-                "--offer",
-                "provider",
-                flag,
-                "unapproved"
-            ])
-            .is_err()
-        );
-    }
-}
-
-#[test]
 #[cfg(feature = "otel")]
 fn metrics_address_defaults_to_loopback_and_accepts_an_explicit_ip() {
     for command in ["serve", "gateway"] {
@@ -578,7 +485,12 @@ fn metrics_address_defaults_to_loopback_and_accepts_an_explicit_ip() {
                 "::1",
             ),
         ] {
-            let cli = Cli::try_parse_from(args).unwrap();
+            let target = ["--access", "friend.access"];
+            let cli = Cli::try_parse_from(
+                args.into_iter()
+                    .chain(target.into_iter().filter(|_| command == "gateway")),
+            )
+            .unwrap();
             let (port, address) = match cli.command {
                 Commands::Serve {
                     metrics_port,
@@ -613,36 +525,81 @@ fn metrics_flags_require_the_otel_build() {
 }
 
 #[test]
-fn grant_pool_gateway_flags_enforce_source_exclusivity() {
-    let cli = parse_gateway(&[
-        "--grant-pool-config",
-        "pool.json",
-        "--trust-store",
-        "trust",
-        "--check-config",
-    ])
-    .unwrap();
-    assert!(matches!(
-        cli.command,
-        Commands::Gateway {
-            grant_pool_config: Some(_),
-            check_config: true,
-            ..
-        }
-    ));
-    for selector in [
-        "--offer",
-        "--local-grant",
-        "--paid-work-config",
-        "--work-profile",
-        "--grant-policy",
-        "--http-fetch-config",
-        "--trust-policy",
+fn serve_admits_configured_programs_and_acknowledges_any_only_from_configuration() {
+    let manifest = "ab".repeat(32);
+    let Commands::Serve {
+        programs,
+        knowingly_unsafe,
+        ..
+    } = Cli::try_parse_from(["hellas", "serve", "--program", &manifest])
+        .unwrap()
+        .command
+    else {
+        panic!("serve")
+    };
+    assert_eq!(programs, vec![manifest.parse().unwrap()]);
+    assert!(!knowingly_unsafe);
+    // An acknowledgement for configuration that admits any program, never a mode.
+    for args in [
+        vec![
+            "hellas",
+            "serve",
+            "--knowingly-unsafe",
+            "--grant-config",
+            "g.json",
+        ],
+        vec![
+            "hellas",
+            "serve",
+            "--knowingly-unsafe",
+            "--paid-work-config",
+            "p.toml",
+        ],
     ] {
-        assert!(
-            parse_gateway(&["--grant-pool-config", "pool.json", selector, "other"]).is_err(),
-            "{selector}"
-        );
+        assert!(Cli::try_parse_from(&args).is_ok(), "{args:?}");
     }
-    assert!(parse_gateway(&["--check-config"]).is_err());
+    for args in [
+        vec![
+            "hellas",
+            "serve",
+            "--program",
+            &manifest,
+            "--paid-work-config",
+            "p.toml",
+        ],
+        vec![
+            "hellas",
+            "serve",
+            "--program",
+            &manifest,
+            "--grant-config",
+            "g.json",
+        ],
+        vec!["hellas", "serve", "--program", "not-a-hash"],
+        vec!["hellas", "serve", "--await-owner"],
+    ] {
+        assert!(Cli::try_parse_from(&args).is_err(), "{args:?}");
+    }
+}
+
+#[test]
+fn pair_takes_one_invite_and_an_optional_name() {
+    let Commands::Pair { invite, name } =
+        Cli::try_parse_from(["hellas", "pair", "hellas-invite:abc"])
+            .unwrap()
+            .command
+    else {
+        panic!("pair")
+    };
+    assert_eq!(
+        (invite.as_str(), name.as_str()),
+        ("hellas-invite:abc", "default")
+    );
+    assert!(acts_for_principal(
+        &Cli::try_parse_from(["hellas", "pair", "x", "--name", "gpu"])
+            .unwrap()
+            .command
+    ));
+    assert!(Cli::try_parse_from(["hellas", "pair"]).is_err());
+    assert!(Cli::try_parse_from(["hellas", "admin", "bootstrap-remote"]).is_err());
 }

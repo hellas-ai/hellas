@@ -436,12 +436,15 @@ fn assert_permission_denied(error: anyhow::Error) {
 }
 
 #[tokio::test]
-async fn online_admin_requires_an_explicit_profile() {
+async fn online_admin_without_a_profile_needs_a_paired_node() {
     let mut daemon = Daemon::start().await;
     let error = run(offline_args(AdminCommand::Status, None), &daemon.identity)
         .await
         .unwrap_err();
-    assert_eq!(error.to_string(), "--profile is required");
+    assert_eq!(
+        error.to_string(),
+        "no paired node: run `hellas pair INVITE` or pass --profile"
+    );
     daemon.stop().await;
 }
 

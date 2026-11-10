@@ -385,3 +385,30 @@ async fn image_output_is_checked_and_png_quantization_matches_upstream() {
         Outcome::Failed(hellas_rpc::protocol::invocation::output::FailureReason::Execution);
     assert!(model.decode(&invalid).is_err());
 }
+
+#[test]
+fn the_snapshot_files_include_every_text_encoder_shard_its_index_names() {
+    let directory = tempfile::tempdir().unwrap();
+    let index = directory.path().join(SOURCES[0]);
+    std::fs::create_dir_all(index.parent().unwrap()).unwrap();
+    std::fs::write(
+        &index,
+        r#"{"metadata":{},"weight_map":{"a":"model-1.safetensors","b":"model-2.safetensors","c":"model-1.safetensors"}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        text_shards(directory.path())
+            .unwrap()
+            .into_iter()
+            .collect::<Vec<_>>(),
+        [
+            "text_encoder/model-1.safetensors",
+            "text_encoder/model-2.safetensors"
+        ]
+    );
+    assert!(CHECKPOINT.contains(&SOURCES[0]));
+    for shard in ["../escape", "a/b", ""] {
+        std::fs::write(&index, format!(r#"{{"weight_map":{{"a":{shard:?}}}}}"#)).unwrap();
+        assert!(text_shards(directory.path()).is_err(), "{shard}");
+    }
+}

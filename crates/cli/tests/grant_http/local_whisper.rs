@@ -1,13 +1,13 @@
 //! Manual local-grant smoke on a supported gfx11 HIP GPU. Set the three
 //! HELLAS_TEST_WHISPER_* paths to a converted package, the reference WAV,
 //! and tokens.json produced by pinned catena-models whisper-asr (en, max 64).
-//! Run with `nix develop .#rocm -c cargo test -p hellas-cli --test grant_http local_grant_whisper -- --ignored --nocapture`.
+//! Run with `nix develop .#rocm -c cargo test -p hellas-cli --test grant_http local_gateway_whisper -- --ignored --nocapture`.
 use super::*;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs gfx11 HIP, HELLAS_TEST_WHISPER_MODEL, HELLAS_TEST_WHISPER_WAV and HELLAS_TEST_WHISPER_TOKENS"]
-async fn local_grant_whisper_matches_reference_tokens_without_a_chain() {
-    use hellas_rpc::protocol::invocation::{Limits, compute};
+async fn local_gateway_whisper_matches_reference_tokens_without_a_chain() {
+    use hellas_rpc::protocol::invocation::compute;
     let model = PathBuf::from(
         std::env::var("HELLAS_TEST_WHISPER_MODEL").expect("HELLAS_TEST_WHISPER_MODEL"),
     );
@@ -27,15 +27,7 @@ async fn local_grant_whisper_matches_reference_tokens_without_a_chain() {
     let weights = model.join("weights.bf16");
     let mut node = super::local_compute::LocalCompute::start(
         &model,
-        "--audio-model",
         &weights,
-        Limits {
-            max_upload_bytes: 4 << 20,
-            max_output_bytes: 1 << 20,
-            max_steps: 64,
-            execution_timeout_ms: 600_000,
-        },
-        std::num::NonZeroU64::new(600_000),
         &["--default-max-tokens", "64"],
     )
     .await;

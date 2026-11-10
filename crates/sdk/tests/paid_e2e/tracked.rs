@@ -299,7 +299,7 @@ fn executor_retries_unspent_attempts_replays_and_bounds_settlement() {
                         max_funding,
                         approval: None,
                     },
-                    attempt,
+                    attempt: Some(attempt),
                     settle,
                 })
             };
@@ -317,6 +317,7 @@ fn executor_retries_unspent_attempts_replays_and_bounds_settlement() {
                     &signer,
                     None,
                     stop_on(std::future::pending()),
+                    Default::default(),
                     deliver(),
                 )
                 .await;
@@ -334,6 +335,7 @@ fn executor_retries_unspent_attempts_replays_and_bounds_settlement() {
                     &signer,
                     None,
                     stop_on(std::future::pending()),
+                    Default::default(),
                     deliver(),
                 )),
             )
@@ -351,6 +353,7 @@ fn executor_retries_unspent_attempts_replays_and_bounds_settlement() {
                     &signer,
                     Some(deadline),
                     stop_on(std::future::pending()),
+                    Default::default(),
                     deliver(),
                 )
                 .await;

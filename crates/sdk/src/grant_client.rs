@@ -255,6 +255,7 @@ pub struct GrantSessionOptions {
 /// A session borrows its transport: whoever binds the remote endpoint closes
 /// it, and whoever builds the local service shuts it down, after the session
 /// has shut down.
+#[derive(Clone)]
 pub enum GrantTransport {
     Remote(Endpoint),
     Local(GrantService),

@@ -6,7 +6,7 @@ use hellas_private::StoreLocation;
 #[test]
 fn grant_execution_requires_explicit_access_and_refuses_paid_options() {
     let base = ["hellas", "transact", "--job", "job"];
-    let grant = ["--offer", "shared.model"];
+    let grant = ["--access", "shared.access"];
     let parse = |extra: &[&str]| {
         crate::Cli::try_parse_from(base.iter().chain(grant.iter()).chain(extra.iter()).copied())
     };
@@ -33,9 +33,8 @@ fn grant_execution_requires_explicit_access_and_refuses_paid_options() {
 async fn an_expired_command_closes_the_endpoint_it_bound() {
     let root = tempfile::tempdir().unwrap();
     let identity = crate::identity::load_or_create(&root.path().join("identity")).unwrap();
-    let cli = crate::Cli::try_parse_from(["hellas", "--faucet-account", "7", "serve"]).unwrap();
     let chain = hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet);
-    let owner = cli.owner.load(&chain).unwrap().unwrap();
+    let owner = hellas_kernel::SoftPasskey::from_secret_scalar([7; 32]).unwrap();
     let context = Context::new(
         &identity,
         Some(&owner),
@@ -63,14 +62,7 @@ async fn paid_deadline_options_reach_the_signed_job_configuration() {
     let root = tempfile::tempdir().unwrap();
     let identity_path = root.path().join("identity");
     let identity = crate::identity::load_or_create(&identity_path).unwrap();
-    let cli = crate::Cli::try_parse_from(["hellas", "--faucet-account", "7", "serve"]).unwrap();
-    let owner = cli
-        .owner
-        .load(&hellas_chain::genesis::ChainProfile::known(
-            hellas_chain::genesis::Chain::Devnet,
-        ))
-        .unwrap()
-        .unwrap();
+    let owner = hellas_kernel::SoftPasskey::from_secret_scalar([7; 32]).unwrap();
     let location = StoreLocation::for_test(root.path());
     let context = Context::new(
         &identity,
@@ -196,7 +188,7 @@ fn fetch_args(extra: &[&str]) -> FetchArgs {
         "https://example.test/path",
         "--provider",
         &id,
-        "--payment",
+        "--pay",
         "20",
     ];
     if !extra.contains(&"--max-response-bytes") {
@@ -227,7 +219,7 @@ fn provider_is_named_only_by_its_enrollment_and_node() {
                 "hellas",
                 "fetch",
                 "https://example.test",
-                "--payment",
+                "--pay",
                 "1",
                 "--contract",
                 "http",
@@ -298,7 +290,7 @@ fn command_shapes_require_a_job_or_settlement_and_remove_paid_work() {
         p.addresses,
         vec!["127.0.0.1:1234".parse::<SocketAddr>().unwrap()]
     );
-    assert!(fetch_args(&["--faucet"]).client.timeout.is_none());
+    assert!(fetch_args(&[]).client.timeout.is_none());
 }
 
 #[test]
@@ -310,7 +302,7 @@ fn fetch_runs_only_under_a_contract_the_buyer_names() {
         "https://example.test/path",
         "--provider",
         &id,
-        "--payment",
+        "--pay",
         "20",
     ])
     .err()
@@ -551,7 +543,7 @@ async fn run_writes_one_call_job_that_transact_loads_unchanged() {
         "u64",
         "--returns",
         "buffer:16",
-        "--payment",
+        "--pay",
         "20",
     ])
     .unwrap()
@@ -560,7 +552,7 @@ async fn run_writes_one_call_job_that_transact_loads_unchanged() {
         panic!("run");
     };
     assert!(args.client.timeout.is_none());
-    let job = args.job().await.unwrap();
+    let job = args.program.job(20).await.unwrap();
     let folder = root.path().join("job");
     job.save(&folder).await.unwrap();
     let loaded = Job::load(&folder).await.unwrap();
@@ -621,16 +613,17 @@ fn execution_helpers_choose_payment_or_an_imported_offer() {
             crate::Cli::try_parse_from(base.iter().copied().chain(flags.iter().copied()))
         };
         assert!(parse(&[]).is_err());
-        assert!(parse(&["--payment", "20"]).is_err());
-        assert!(parse(&["--payment", "20", "--provider", &provider]).is_ok());
-        assert!(parse(&["--payment", "0", "--provider", &provider]).is_err());
-        assert!(parse(&["--offer", "box.model"]).is_ok());
-        assert!(parse(&["--offer", "box.model", "--provider", &provider]).is_ok());
-        assert!(parse(&["--payment", "20", "--offer", "box.model"]).is_err());
-        assert!(parse(&["--offer", "box.model", "--buy-again"]).is_err());
+        assert!(parse(&["--pay", "20"]).is_err());
+        assert!(parse(&["--pay", "20", "--provider", &provider]).is_ok());
+        assert!(parse(&["--pay", "0", "--provider", &provider]).is_err());
+        assert!(parse(&["--payment", "20", "--provider", &provider]).is_err());
+        assert!(parse(&["--access", "box.access"]).is_ok());
+        assert!(parse(&["--access", "box.access", "--provider", &provider]).is_ok());
+        assert!(parse(&["--pay", "20", "--access", "box.access"]).is_err());
+        assert!(parse(&["--access", "box.access", "--buy-again"]).is_err());
         // Local execution exists only in the compute build.
         assert_eq!(parse(&["--local"]).is_ok(), cfg!(feature = "compute"));
-        assert!(parse(&["--local", "--offer", "box.model"]).is_err());
+        assert!(parse(&["--local", "--access", "box.access"]).is_err());
         assert!(parse(&["--local", "--provider", &provider]).is_err());
     }
 }
@@ -646,7 +639,7 @@ fn paid_commands_require_a_provider_before_opening_chain_state() {
             "https://example.test",
             "--contract",
             "http",
-            "--payment",
+            "--pay",
             "20",
         ],
     ] {

@@ -38,7 +38,7 @@ async fn slow_durable_admission_retries_once() {
             fixture.host.backend.calls.load(Ordering::SeqCst),
             usize::from(!persistent)
         );
-        let session = fixture.gateway.source.channels[0].session.lock().await;
+        let session = fixture.session().await;
         assert_eq!(session.store().next_nonce().unwrap(), 3);
         assert!(session.store().book().pending_proposal().is_none());
         drop(session);
@@ -50,11 +50,7 @@ async fn slow_durable_admission_retries_once() {
 
 #[tokio::test]
 async fn ambiguous_acceptance_recovers_original_work_without_replacement() {
-    let fixture = Fixture::builder()
-        .remote()
-        .with_max_job_millis(30_000)
-        .build()
-        .await;
+    let fixture = Fixture::builder().with_max_job_millis(30_000).build().await;
     let ticking = follow_clock(&fixture);
     // The actual Accepted INSERT commits, but its acknowledgement misses the
     // control timeout. The provider continues independently of the client RPC.
@@ -69,17 +65,11 @@ async fn ambiguous_acceptance_recovers_original_work_without_replacement() {
         Err(WorkGatewayError::Timeout(_))
     ));
     assert_eq!(delayed.load(Ordering::SeqCst), 1);
-    let mut session = fixture.gateway.source.channels[0].session.lock().await;
-    let work = session
-        .store()
-        .book()
-        .pending_proposal()
-        .expect("timeout retains proposal");
+    // The timed-out request's session recovered the proposal it retained
+    // before closing: the original work stands and nothing replaced it.
     drop(hook);
-    assert_eq!(
-        session.recover().await.unwrap(),
-        crate::grant_client::Recovery::Accepted(work)
-    );
+    let session = fixture.session().await;
+    assert!(session.store().book().pending_proposal().is_none());
     assert_eq!(session.store().next_nonce().unwrap(), 2);
     drop(session);
     within(fixture.host.backend.started.notified()).await;

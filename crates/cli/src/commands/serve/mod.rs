@@ -13,7 +13,6 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub mod audio_model;
 pub mod bootstrap;
 mod codex_provider;
 mod configuration;
@@ -22,7 +21,6 @@ pub use hellas_sdk::work_config::WorkConfig;
 
 pub struct ServeOptions {
     pub home: StoreLocation,
-    pub transport: Option<iroh::Endpoint>,
     pub grants: Option<hellas_sdk::grant_config::GrantConfig>,
     pub port: Option<u16>,
     pub discovery: bool,
@@ -73,7 +71,7 @@ pub fn validate_provider_config(
     home: &StoreLocation,
 ) -> CliResult<()> {
     if let Some(path) = content {
-        crate::content_configuration::ContentConfiguration::load(Some(path.into()), None)?;
+        crate::content_configuration::ContentConfiguration::load(Some(path.into()), vec![])?;
     }
     let routes = fetch
         .map(|path| load_fetch_config(path, home))
@@ -86,7 +84,22 @@ pub fn validate_provider_config(
     Ok(())
 }
 
-pub async fn run(options: ServeOptions) -> CliResult<()> {
+pub async fn run(mut options: ServeOptions) -> CliResult<()> {
+    // A node without paid work is administered by its owner. Without a
+    // Fetch configuration of its own, it serves the owner-managed one.
+    if options.paid.is_none() && options.fetch_config_file.is_none() {
+        let root = hellas_sdk::grant_config::GrantConfig::provider_dir(&options.home);
+        hellas_private::create_dir_all_durable(&root)?;
+        let path = root.join("fetch.json");
+        if !path.try_exists()? {
+            hellas_private::write_atomically(
+                &path,
+                ".initializing",
+                br#"{"revision":0,"routes":[]}"#,
+            )?;
+        }
+        options.fetch_config_file = Some(path);
+    }
     let fetch_routes = match options.fetch_config_file.as_deref() {
         // The config file is the single source of fetch truth: routes,
         // capabilities, cross-validated at load. No file
@@ -167,24 +180,36 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
         open_identity: options.open_identity,
     };
     let node = match &options.paid {
+        // Paid work bootstraps its own authority from the owner key.
         Some(paid) => {
-            paid.start(
-                provider,
-                options.grants,
-                options.fetch_config_file,
-                options.transport,
-            )
-            .await?
+            paid.start(provider, options.grants, options.fetch_config_file)
+                .await?
         }
-        None => configuration::start_host(
-            provider,
-            options.grants,
-            options.fetch_config_file,
-            options.transport,
-            &options.home,
-        )
-        .await
-        .context("failed to start node server")?,
+        // Everything local is checked: wait for the owner if the node has none.
+        None => {
+            let (grants, transport) = bootstrap::prepare(
+                &options.home,
+                &provider.secret_key,
+                provider.open_identity.enrollment(),
+                options.port,
+                options.grants,
+            )
+            .await?;
+            let started = configuration::start_host(
+                provider,
+                Some(grants),
+                options.fetch_config_file,
+                transport.clone(),
+                &options.home,
+            )
+            .await;
+            if started.is_err()
+                && let Some(endpoint) = transport
+            {
+                endpoint.close().await;
+            }
+            started.context("failed to start node server")?
+        }
     };
 
     // Provider startup restores every journal before completing the shared

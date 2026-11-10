@@ -506,6 +506,38 @@ impl Repo {
         repo.validate()?;
         Ok(repo)
     }
+    /// Copies the published bytes of one file at this repository's
+    /// immutable commit, `{hub}/{repo}/resolve/{commit}/{path}`, into `out`.
+    /// The node's HF credential goes only to HF origins.
+    pub fn download(&self, path: &str, out: &mut impl std::io::Write) -> Result<u64> {
+        self.validate()?;
+        if !immutable_sha(&self.revision) {
+            return Err(FetchError::Malformed(
+                "a download needs an immutable commit SHA".into(),
+            ));
+        }
+        crate::content::tree::validate_path(path, false)
+            .map_err(|_| FetchError::Malformed(format!("invalid repository path {path:?}")))?;
+        let kind = match self.kind {
+            RepoKind::Model => "",
+            RepoKind::Dataset => "datasets/",
+        };
+        let url = format!(
+            "https://huggingface.co/{kind}{}/resolve/{}/{path}",
+            self.id, self.revision
+        );
+        let context = || format!("GET {url}");
+        let mut response = authenticated_get(&url, node_token().as_deref())
+            .call()
+            .map_err(|source| FetchError::Http {
+                context: context(),
+                source: Box::new(source),
+            })?;
+        std::io::copy(&mut response.body_mut().as_reader(), out).map_err(|source| FetchError::Io {
+            context: context(),
+            source,
+        })
+    }
     pub(crate) fn validate(&self) -> Result<()> {
         let parts: Vec<_> = self.id.split('/').collect();
         if parts.len() != 2

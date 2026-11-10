@@ -18,9 +18,9 @@ pub struct ImageArgs {
     height: usize,
     #[arg(long, default_value_t = 4)]
     steps: usize,
-    /// Flat price the provider charges per job; paid work only.
-    #[arg(long, conflicts_with = "offer", value_parser = clap::value_parser!(u64).range(1..))]
-    payment: Option<u64>,
+    /// Pay the provider named by --provider its quoted price per job, at most MAX.
+    #[arg(long, value_name = "MAX", requires = "provider", conflicts_with = "access", value_parser = clap::value_parser!(u64).range(1..))]
+    pay: Option<u64>,
     #[command(flatten)]
     target: TargetArgs,
     #[arg(short = 'o', long, default_value = "image.png", value_name = "PNG")]
@@ -35,23 +35,29 @@ pub async fn image(args: ImageArgs, context: Context) -> super::super::CliResult
         height: args.height,
         steps: args.steps,
     };
-    let (package, job, directory) = prepare(
-        &args.model,
-        request,
-        args.payment.unwrap_or(0),
-        &args.client.root(&context),
-    )
-    .await?;
-    eprintln!("job: {}", directory.display());
+    request.validate()?;
+    let package = ModelPackage::open(&args.model).await?;
+    let rendered = package.render_job(&ModelRequest::Image(request)).await?;
     let mut target = args.target;
     target.model = Some(args.model.clone());
-    run_job(
+    run_quoted(
         &args.client,
         target,
         &context,
-        &job,
-        Some(&directory.join("result")),
-        |completed, _| {
+        args.pay,
+        None,
+        async |price| {
+            Ok(Job::compute(
+                price,
+                rendered.environment,
+                rendered.plan,
+                rendered.inputs,
+                rendered.content,
+            )
+            .await?)
+        },
+        |directory| Some(directory.join("result")),
+        |_, completed, _| {
             let ModelResponse::Image(image) = package.decode(&completed.output)? else {
                 bail!("expected image");
             };
@@ -64,28 +70,6 @@ pub async fn image(args: ImageArgs, context: Context) -> super::super::CliResult
     .await
 }
 
-async fn prepare(
-    model: &Path,
-    request: ImageRequest<'_>,
-    payment: u64,
-    root: &Path,
-) -> anyhow::Result<(ModelPackage, Job, PathBuf)> {
-    request.validate()?;
-    let package = ModelPackage::open(model).await?;
-    let rendered = package.render_job(&ModelRequest::Image(request)).await?;
-    let job = Job::compute(
-        payment,
-        rendered.environment,
-        rendered.plan,
-        rendered.inputs,
-        rendered.content,
-    )
-    .await?;
-    let directory = root.join("jobs").join(job.digest().to_string());
-    job.save(&directory).await?;
-    Ok((package, job, directory))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,20 +77,29 @@ mod tests {
     async fn image_cli_prepares_a_saved_job_with_provider_held_weights() {
         let model = Path::new(env!("CARGO_MANIFEST_DIR")).join("../client/src/model/flux/fixture");
         let root = tempfile::tempdir().unwrap();
-        let (_, job, directory) = prepare(
-            &model,
-            ImageRequest {
+        let rendered = ModelPackage::open(&model)
+            .await
+            .unwrap()
+            .render_job(&ModelRequest::Image(ImageRequest {
                 prompt: "a red fox",
                 seed: 42,
                 width: 16,
                 height: 16,
                 steps: 1,
-            },
+            }))
+            .await
+            .unwrap();
+        let job = Job::compute(
             20,
-            root.path(),
+            rendered.environment,
+            rendered.plan,
+            rendered.inputs,
+            rendered.content,
         )
         .await
         .unwrap();
+        let directory = root.path().join("job");
+        job.save(&directory).await.unwrap();
         let loaded = Job::load(&directory).await.unwrap();
         assert_eq!(loaded.digest(), job.digest());
         let JobInput::Compute {

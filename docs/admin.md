@@ -1,26 +1,31 @@
 # Node administration
 
-A principal is a person or bot, identified by one P-256 passkey. A node holds
-only machine keys: an iroh transport key for QUIC and a secp256k1 node key. The
-CLI acts for the principal of a software passkey file given with `--passkey`
-(32 raw bytes or 64 hex digits); `--home` selects the directory holding the node's keys and state (`<home>/identity`).
+A principal is a person or bot, identified by one P-256 key. A node holds
+only machine keys: an iroh transport key for QUIC and a secp256k1 node key.
+`--home` (default `HELLAS_HOME` or `~/.hellas`) selects the directory holding
+the node's keys and state (`<home>/identity`). The CLI acts for the home's
+principal key, `<home>/principal.key`, a private software key created on first
+use by every command that acts for a principal. `--passkey FILE` (32 raw bytes
+or 64 hex digits) points at a key held outside the home instead, as services do
+with secrets under `/run`.
 
-For first setup, `hellas --software-root identity init --passkey-out owner.passkey`
-creates both the client device identity and a fresh private owner key. It never
-overwrites an existing key. Start a model worker with `serve --audio-model DIR
---await-owner`: the converted Whisper package supplies a model-pinned
-resource, a machine/account budget, and the indexed weights. The directory's
-basename is its resource name; one job may run at a time. Use `--grant-config`
-instead for custom resources or budgets.
+Start a worker with `--program MANIFEST` for each Compute program it admits,
+plus `--content PATH` for the files those programs read. `hellas program PATH`
+prints the manifest of a converted Whisper package or a Qwen GGUF. That
+configures one `compute` resource with a machine/account budget; one job runs at
+a time. Use `--grant-config` instead for custom resources or budgets. A
+resource or paid terms may admit any program; compiling and running a program
+from an unknown author hands that author roughly root on the host, so `serve`
+refuses such a configuration unless `--knowingly-unsafe` acknowledges it.
 
-The worker writes a private `<home>/provider/invitation.json`. Pair with
-`hellas --passkey owner.passkey admin bootstrap-remote --invitation FILE
---profile-out operator`. Without custom scopes, the pairing owner receives
-one year of full node administration; `--administrator` and `--credential-scope`
-can supply narrower scopes together. The resulting profile retains the node
-pin from the authenticated invitation. Later `admin --profile operator/profile.json`
-commands need no `--node`; an explicit different node is rejected.
-See the [complete command sequence](../README.md#own-a-worker-and-share-access).
+A node with no paid terms and no owner prints one `hellas-invite:` line and
+waits. `hellas pair INVITE [--name NAME]` claims it with the home principal key.
+The pairing owner receives one year of full node administration, and the
+profile, kept at `<home>/nodes/NAME/profile.json` (`NAME` defaults to
+`default`), retains the node pin from the authenticated invite. `admin` and
+`share` use the only paired node unless `--profile` names another; an explicit
+different `--node` is rejected. See the
+[sharing section](../README.md#2-share-your-gpu-with-a-friend).
 
 Node administration requires a scoped application credential and explicit
 operation grants. A credential is issued to a principal and held by a device: it
@@ -38,18 +43,20 @@ checks local TLS and remote QUIC calls. Socket ownership only limits admission.
 It grants no application rights. The node writer rechecks current credentials and
 grants before each effect.
 
-Online commands take a private `--profile` file. With `--passkey` the session is a
-passkey session; without it, the node key in `<home>/identity` opens a daily session:
+Online commands take a private `--profile` file, by default the only paired
+node's. With a principal key (the home's `principal.key`, or `--passkey`) the
+session is a passkey session; without one, the node key in `<home>/identity`
+opens a daily session:
 
 ```sh
-hellas --home node-home admin --profile operator.json status
-hellas --home node-home --passkey operator.passkey admin --profile operator.json grant change.json
-hellas --home node-home --passkey operator.passkey admin --profile operator.json issue-credential --scope recipient-scope.json --holder recipient-holder.json --credential-out recipient.credential
-hellas --home node-home --passkey operator.passkey admin --profile operator.json revoke-credential --credential-id ID --expected-revision 1
-hellas --home node-home --passkey operator.passkey admin --profile operator.json bind-provider --enrollment provider.enrollment
-hellas --home node-home admin --profile operator.json work allowance.json
-hellas --home node-home admin --profile operator.json work export.json --offer-out recipient.offer
-hellas --home laptop-home admin --profile remote.json --node node.enrollment --address 192.0.2.10:9000 status
+hellas admin status
+hellas admin grant change.json
+hellas admin issue-credential --scope recipient-scope.json --holder recipient-holder.json --credential-out recipient.credential
+hellas admin revoke-credential --credential-id ID --expected-revision 1
+hellas admin bind-provider --enrollment provider.enrollment
+hellas admin work allowance.json
+hellas admin work export.json --offer-out recipient.offer
+hellas admin --profile remote.json --node node.enrollment --address 192.0.2.10:9000 status
 ```
 
 `status` requires `host.status` on this authority's host resource. It includes the
@@ -78,9 +85,9 @@ table is full.
 
 `issue-credential` takes an Auth `GrantSpec` scope, bounded by the issuer's explicit
 credential-issuance ceiling, and a `--holder` file: the JSON `CredentialHolder` of
-the device that will hold it. `hellas --home node-home identity
-show-holder` prints that device's holder, `{"Node":[1,[...]]}`, its node key with
-the secp256k1 curve tag. Issuing creates no grant: the recipient also needs current
+the device that will hold it, `{"Node":[1,[...]]}`: that device's node key with
+the secp256k1 curve tag. (`hellas share` takes the holder from the contact string
+instead.) Issuing creates no grant: the recipient also needs current
 grants for the requested operations. The client prepares the credential using the
 authenticated session generation and saves its secret in a new private file before
 submitting the verifier and ID. The secret never crosses the issuance RPC. After
@@ -250,19 +257,15 @@ separate revocation state. Revisions require the current allowance revision. Gen
 resource repair require their own expected versions, so retrying an old request
 cannot silently reset another generation or clear newer faults. Mutations return
 the changed versions; private usage is returned only by authorized inspection.
-`Offers` with one explicit allowance ID can write `--offer-out` for `offer import`.
-Offer export and import print the provider's enrollment content ID to stderr.
+`Offers` with one explicit allowance ID can write one signed offer with
+`--offer-out`; export prints the provider's enrollment content ID to stderr.
 
-A contact is a person. `contact export --display-name NAME` signs a contact card
-with `--passkey`: the principal's passkey public key and display name, with the
-passkey's assertion over both. `contact import CARD --name ALIAS` verifies the card
-and saves it under the importing principal; it prints the card's principal, display
-name and fingerprint. The exporter sees the same fingerprint on stderr. A
-fingerprint has 12 base32 characters in three groups, derived from a hash of the
-complete curve-tagged key. Compare it with the other person over an independent
-channel before granting the imported principal. The credential subject fingerprint
-matches that subject's contact card. These displays do not approve provider trust;
-the full keys remain authoritative.
+A contact is a person on one device. `hellas contact [--name NAME]` prints one
+`hellas-contact:` string: a contact card signed by the principal key (its public
+key and display name, `$USER` by default) plus this device's node key. Send it
+to whoever will share with you; `share --to` verifies it. The credential subject
+fingerprint matches that subject's contact card. These displays do not approve
+provider trust; the full keys remain authoritative.
 
 Work terms confer no authorization, and Work administration cannot issue Auth grants
 or credentials without their separate permissions. Allowances require explicit
@@ -276,7 +279,7 @@ device signs its jobs with its node key. Channels are created on first accepted 
 standing and delivery require the same principal and device, including after Auth
 grant revisions. A bearer credential has no channel. Work audience IDs are the same
 validated principals used by Auth. Provider trust still pins the provider enrollment.
-CLI contact, offer and access state is stored per principal, under
+CLI grant attempt and journal state is stored per principal, under
 `p256-<compressed key>` in the grant data directory.
 
 The profile has these fields. Unknown fields are refused.
@@ -297,8 +300,8 @@ that node's enrollment (`identity export-enrollment`), verified out of band. The
 expected authority always comes from the profile. The client never learns trust or
 permission from the server's authentication challenge.
 
-The default local path is the `--passkey` principal's `control.sock`; use
-`--control-socket` when administering a different local daemon or without a passkey.
+The default local path is this home's `control.sock`; use `--control-socket`
+when administering a different local daemon.
 The directory must be private (0700 on Unix); the listener creates a 0600 socket and
 checks peer ownership. Both carriers require the application credential and a
 passkey or node-key proof bound to the live connection. Revocation applies to an
@@ -329,42 +332,42 @@ attribute a request to that actor.
 
 ## Share a resource
 
-`admin share` gives one principal metered access to one resource declared by the
-node's grant configuration. It uses a verified contact card as the subject and
-an explicit `CredentialHolder` for the receiving device. A principal can have
-many devices; a contact card never chooses one. Sharing with yourself follows
-the same metered path.
+`hellas share` gives one principal, on one device, metered access to one
+resource declared by the node's grant configuration. Its subject is the
+contact's verified card, and the credential is bound to the device named in the
+same contact string. A principal can have many devices; each device sends its
+own contact. Sharing with yourself follows the same metered path.
 
-On the receiving device, export its principal's contact card and device holder:
+On the receiving device:
 
 ```sh
-hellas --passkey me.passkey contact export --display-name me --out me.contact
-hellas --home laptop-home identity show-holder > me.holder
+hellas contact --name me
 ```
 
-Give both files to the node administrator. The administrator selects the
-configured resource name; its account comes from the node's configuration:
+The administrator shares with the printed string:
 
 ```sh
-hellas --home admin-home --passkey operator.passkey admin --profile operator.json --node NODE_PIN \
-  share --contact me.contact --holder me.holder --resource klein \
+hellas share --to hellas-contact:… --resource compute \
   --limit requests:total:100 --max-job 15m --expires 1h --label "My node" --out me.access
 ```
 
-The command derives one pool, allowance and Auth grant per
-(authority, principal, resource). It creates the pool under the resource's
-configured account, then a subject budget with the supplied limits and one job
-in flight. The allowance admits only that resource, including its configured
-upstream account when applicable. Its grant carries only `work.execute` on the
-allowance. The node's machine and account limits continue to apply.
+`--resource` names a configured resource and defaults to the node's only one;
+its account comes from the node's configuration. `--profile` selects the node
+when more than one is paired. The command derives one pool, allowance and Auth
+grant per (authority, principal, resource). It creates the pool under the
+resource's configured account, then a subject budget with the supplied limits
+and one job in flight. The allowance admits only that resource, including its
+configured upstream account when applicable. Its grant carries only
+`work.execute` on the allowance. The node's machine and account limits continue
+to apply.
 
 Repeat `--limit METER:WINDOW:AMOUNT` for different meter/window pairs. Meters are
 `requests`, `input-tokens`, `output-tokens`, `device-millis` and `usd-micros`;
 windows are `hour`, `day`, `week` and `total`. Duplicate pairs are refused.
-Omitting all limits bounds concurrency and job duration only. `--max-job` is
-required and cannot exceed the node's configured maximum. Durations accept
-`ms`, `s`, `m`, `h` and `d`; `--expires` defaults to `30d` and must fit the
-administrator's issuance ceiling.
+Omitting all limits bounds concurrency and job duration only. `--max-job`
+defaults to the resource's execution timeout and cannot exceed the node's
+configured maximum. Durations accept `ms`, `s`, `m`, `h` and `d`; `--expires`
+defaults to `30d` and must fit the administrator's issuance ceiling.
 
 A rerun uses the same identifiers and changes only differing budget/allowance
 terms with checked revisions, preserving usage and reservations. It resumes after
@@ -373,53 +376,40 @@ keeps its original expiry, so a second device's share does not invalidate the
 first. A changed duration or an expired grant starts a new validity period on the
 same grant. A revoked grant stays revoked. Concurrent edits fail their revision
 check; inspect and rerun. Each successful call issues a new credential for the
-explicit holder, so use a new output path.
+contact's device, so use a new output path.
 
-## Access bundles
+## Access files
 
-`share` exports one signed offer and one new device-bound credential into a
-private access bundle. It also carries the authority, grant and subject IDs,
+`share` writes one signed offer and one new device-bound credential into a
+private access file. It also carries the authority, grant and subject IDs,
 holder, expiry and optional provider label (at most 64 bytes). It contains no
-provider trust. The bundle is canonical DAG-CBOR tagged
+provider trust. The file is canonical DAG-CBOR tagged
 `hellas.access-bundle.v2`; the secret is never printed.
 
-The bundle is saved before the credential verifier is submitted, as with
+The file is saved before the credential verifier is submitted, as with
 `issue-credential`. The output never replaces an existing file. Failed or
-unconfirmed issuance leaves that bundle pending: inspect its reported credential
+unconfirmed issuance leaves that file pending: inspect its reported credential
 ID before distributing it or retrying issuance.
 
-On the receiving device:
+The receiving device runs jobs with it directly:
 
 ```sh
-hellas --home laptop-home --passkey me.passkey offer import-bundle me.access --name box
+hellas transcribe --model whisper-tiny --audio speech.wav --access me.access
 ```
 
-Import refuses a different principal or device and verifies the provider's offer
-signature. It installs offers as `NAME.POLICY` and a remote Work profile under
-`accesses/NAME` in the principal's data directory, refusing a non-empty profile
-directory. It prints the offer names, grant IDs and profile path. Delete the
-received bundle after importing, since it contains the credential secret.
+Every job command (`transcribe`, `text`, `image`, `run`, `fetch` and
+`transact --job DIR`) takes `--access FILE`, as does `gateway`. The file is
+checked against this home's principal and device, and the provider's offer
+signature is verified. A single-policy offer selects its resource
+automatically; an offer with several policies also takes `--resource ID`. The
+provider address comes from the verified signed offer. An explicit
+`--provider ENROLLMENT_ID@NODE_ID` must match it. Apple providers also require
+the caller's independently approved `--trust-store` and `--trust-policy`.
+Repeated jobs reuse durable attempts by provider, grant and job; `--attempt
+FILE` selects an explicit record. See [jobs](jobs.md) for recovery and results.
+The file holds the credential secret: keep it private.
 
-Use the imported offer directly; its signed policy selects the resource and
-its bundle alias locates the bound profile:
-
-```sh
-hellas --home laptop-home --passkey me.passkey image \
-  --offer box.klein --model ./klein --prompt "a fox"
-```
-
-`run`, `image` and `transcribe` accept either `--offer NAME.POLICY` or
-`--payment AMOUNT`. `transact --job DIR --offer NAME.POLICY` uses the same
-profile lookup. A single-policy offer selects its resource automatically. An
-imported allowance with multiple policies also accepts `--resource ID` to select
-an exact resource explicitly; `--work-profile` is unnecessary.
-The provider address comes from the verified signed offer. An explicit
-`--provider ENROLLMENT_ID@NODE_ID` must match that address. Apple providers also
-require the caller's independently approved `--trust-store` and `--trust-policy`.
-Repeated jobs reuse durable attempts by offer and job; `--attempt FILE` selects
-an explicit record. See [jobs](jobs.md) for recovery and results.
-
-### Renew an imported share
+### Renew a share
 
 Rerunning an unexpired share with the same `--expires` duration keeps its original
 expiry. After it expires, the same duration starts a new validity period. To
@@ -427,34 +417,28 @@ renew earlier, choose a different duration that fits the administrator's issuanc
 ceiling, and repeat the desired limits and job duration:
 
 ```sh
-hellas --home admin-home --passkey operator.passkey admin --profile operator.json --node NODE_PIN \
-  share --contact me.contact --holder me.holder --resource klein \
+hellas share --to hellas-contact:… --resource compute \
   --limit requests:total:100 --max-job 15m --expires 2h --out me-renewed.access
 ```
 
 The example renews the earlier `1h` share for `2h`; it requires an issuance
-ceiling that permits that duration. Keep the new bundle private and deliver it
-to the same recipient device. Each call issues a new credential while retaining
-the pool, allowance and grant identifiers and their used counters.
+ceiling that permits that duration. Deliver the new file privately to the same
+device. Each call issues a new credential while retaining the pool, allowance
+and grant identifiers and their used counters.
 
-On that device, import the renewed bundle under a new alias. An existing profile
-directory is never overwritten, including with `--replace`:
+On that device, use the new file. To re-run a saved job with the new credential
+rather than replay its retained result, name a new attempt:
 
 ```sh
-hellas --home laptop-home --passkey me.passkey offer import-bundle me-renewed.access --name box-renewed
-hellas --home laptop-home --passkey me.passkey transact --job ./saved-job \
-  --offer box-renewed.klein \
+hellas transact --job ./saved-job --access me-renewed.access \
   --attempt ./renewed-attempt.json --output ./renewed-result
 ```
 
-Use the new alias in subsequent commands, and delete the received bundle after
-import. The explicit new attempt above executes the saved job once with the new
-credential and consumes the existing allowance. Changing only the alias does not
-request new work: the default attempt for an identical provider, allowance and
-job still replays its retained result. Keep old profiles and attempt records until
-unresolved work has been recovered. When retiring the previous credential, the
-administrator can use `admin revoke-credential` with its old credential ID; the
-shared grant remains the same.
+The default attempt for an identical provider, grant and job replays its
+retained result. Keep old attempt records until unresolved work has been
+recovered. When retiring the previous credential, the administrator can use
+`admin revoke-credential` with its old credential ID; the shared grant remains
+the same.
 
 `admin work` and `admin grant` remain the typed primitive commands for custom
 administration.
@@ -507,8 +491,8 @@ After explicit initialization, start the daemon with `--grant-config`. Its file
 contains `max_job_millis`, optional listener settings, machine/account budgets
 and complete resource policies. Resource entries require the full invocation
 policy and pricing fields accepted by the strict grant-config loader. The
-[README walkthrough](../README.md#own-a-worker-and-share-access) describes the
-Whisper owner setup.
+[sharing section](../README.md#2-share-your-gpu-with-a-friend) shows the
+ordinary setup, which needs no file.
 
 Serving resources requires `machine`; every resource's account must be declared in
 `accounts`, and every declared account must be used. Limits use the same
@@ -562,29 +546,27 @@ Provisioning uses the client-side `machines --credential-source FILE
 shown in [machine provider configuration](machine-provider-config.md). Provisioning
 passes no owner credential or transport secret to the provider.
 
-The ordinary node image runs `serve --port 31145`. Owner bootstrap is an explicit
-opt-in: append `--await-owner` to its arguments. An unowned
-node prints a pairing document containing its public transport pin, direct
-addresses, expiry and a fresh random secret. Obtain that document through the
-provider's authenticated console/output and keep it private. Before ownership,
-only the bounded one-shot bootstrap exchange is available. Eight incorrect pairing proofs
-invalidate the invitation. Malformed traffic and stalled connections do not consume
+The ordinary node image runs `serve --port 31145`. A node with no paid terms
+and no owner prints one `hellas-invite:` line: its public transport pin, direct
+addresses, expiry and a fresh random secret. Copy it from the node's own
+console or output and keep it private. Before ownership, only the bounded
+one-shot bootstrap exchange is available. Eight incorrect pairing proofs
+invalidate the invite. Malformed traffic and stalled connections do not consume
 that budget; concurrent handshakes and per-source capacity are bounded separately.
-The invitation expires after 15 minutes. Restarting generates a fresh 256-bit secret
+The invite expires after 15 minutes. Restarting generates a fresh 256-bit secret
 and resets the attempt budget, so unauthenticated exhaustion cannot permanently
 disable bootstrap. No attempt state or pairing secret is persisted.
 
-The owner uses `admin bootstrap-remote --invitation FILE --root-grant ID
---administrator FILE --credential-scope FILE --profile-out DIRECTORY` with their
-passkey. The CLI saves the prepared credential and pinned remote profile before
-sending the owner approval. The v3 bootstrap digest binds that approval to the
-machine's public transport pin as well as the authority and credential scope. A lost acknowledgement does not require issuing a
-second credential: use the saved profile to inspect the node. The authority store
-is published atomically and refuses another bootstrap after success.
+The owner runs `hellas pair INVITE`. The CLI saves the prepared credential and
+pinned remote profile before sending the owner approval. The v3 bootstrap
+digest binds that approval to the machine's public transport pin as well as the
+authority and credential scope. A lost acknowledgement does not require issuing
+a second credential: use the saved profile to inspect the node. The authority
+store is published atomically and refuses another bootstrap after success.
 
 The normal host keeps that endpoint and authority alive across provider restarts.
-Use the saved `admin --profile DIRECTORY/profile.json` for status, capacity, authority and Work
-administration. `admin configure-provider FILE` applies a typed, revision-checked
+Use `admin` (with `--profile <home>/nodes/NAME/profile.json` when several
+nodes are paired) for status, capacity, authority and Work administration. `admin configure-provider FILE` applies a typed, revision-checked
 upstream mutation. Adding a new key requires a daily application session; replacing
 or removing a key and changing endpoints require a passkey session. Status exposes
 endpoint metadata and key names, never key material. Configuration is validated
@@ -595,8 +577,8 @@ the prior configuration and keys and reports failed until
 `admin set-provider-state --enabled true` explicitly starts it again. A rollback
 I/O failure is reported as a failure, never as successful recovery.
 
-Share execution through a signed allowance offer, import it, then select
-`gateway --offer ALIAS` with the caller's approved trust policy and Work profile.
+Share execution with `hellas share`; the recipient passes the access file to
+job commands or `gateway --access FILE`.
 
 
 ## Embedded host lifecycle
@@ -606,8 +588,7 @@ an authenticated local control listener and a bounded lifecycle supervisor. Prov
 factory for the OpenAI Responses adapter that keeps the caller's root prover and
 enrollment as supplied. Other providers prepare the shared SDK provider options
 and select `on_host(control)` before startup. That attaches the existing writer;
-it cannot open a second journal. A gateway over a grant uses the same writer and
-`grant_gateway::GrantServeOptions::into_factory`.
+it cannot open a second journal.
 
 `SetProviderState` and `SetGatewayState` carry an `authorization` grant and require
 `host.provider.configure` and `host.gateway.configure`, respectively. Their
@@ -629,27 +610,35 @@ Full host shutdown joins its local listener and both services.
 and the current scoped HTTP Auth credential only while the gateway is running.
 Remote control is disabled by default. Explicit credential-gated ingress permits
 application authentication from any transport key; a configured endpoint allowlist
-restricts it further. `--await-owner` opts into credential-gated ingress.
+restricts it further. A node started by `serve` without paid terms uses
+credential-gated ingress so its owner can administer it after pairing.
 A standalone `NodeControl` without a host supervisor leaves lifecycle operations
 unmounted; constructing the composed host supplies their implementation.
 
 
 Caller trust for paid and grant execution is configured separately with `hellas trust`.
 `approve` requires a reviewed policy file, expected revision (zero for creation) and
-reason; `show` reports current pins and latest approval. Paid requests and grant gateways (`--offer`) select
-`--trust-store` and `--trust-policy`; imported offers cannot replace the approved pins.
+reason; `show` reports current pins and latest approval. Paid and granted jobs and
+gateways select `--trust-store` and `--trust-policy`; an access file cannot replace
+the approved pins.
 See [paid gateway trust configuration](paid-gateway.md) for the file format and
 replacement procedure. This does not grant provider administration rights.
 
 Restart the gateway to use an updated caller policy.
-Nix gateway services use `trustStore`, `trustPolicy`, `workProfile` and the
-principal's `passkey` file, plus `offer`.
+Nix gateway services use `trustStore`, `trustPolicy` and the principal's
+`passkey` file, plus `access`, or `pay` with `provider`.
 Provision these private files for the service user before startup; Nix declarations
 do not approve trust or create grants.
 
 ## HTTP gateway authority
 
-A standalone gateway requires `--gateway-profile FILE`, a private JSON file with
+A loopback gateway provisions its own authority on first start: under
+`<home>/gateway`, owned by the home principal, with one bearer credential that
+may only invoke the gateway, kept in `<home>/gateway/bearer`. Local clients read
+it and `--wrap` hands it to its child.
+
+A gateway with `--allow-remote` requires `--gateway-profile FILE`, an explicitly
+provisioned authority: a private JSON file with
 `journal`, `authority`, `authorization`, and `credential` fields. `journal` names
 an explicitly bootstrapped local NodeStore; `authority` and `authorization` are its
 Auth AuthorityId and selected GrantId in their usual JSON forms. `credential` names

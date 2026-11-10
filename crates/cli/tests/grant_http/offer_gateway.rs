@@ -19,11 +19,8 @@ struct OfferHost {
     reader_grant: GrantId,
     root_grant: GrantId,
     signed_offer: hellas_authority::model::grant::records::SignedOffer,
-    offer: PathBuf,
-    id: GrantId,
     work_profile: PathBuf,
     exported_offer: std::process::Output,
-    imported_offer: std::process::Output,
 }
 impl OfferHost {
     async fn start() -> Self {
@@ -54,6 +51,7 @@ impl OfferHost {
         client_identity: Option<&Path>,
         invocation_policy: hellas_rpc::protocol::invocation::InvocationPolicy,
     ) -> Self {
+        let any_program = invocation_policy.admits_any_program();
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         hellas_private::restrict_directory(root).unwrap();
@@ -70,7 +68,7 @@ impl OfferHost {
         assert_eq!(provider.principal(), ROOT.principal());
         assert_eq!(client.principal(), FRIEND.principal());
         for cli in [&provider, &client] {
-            cli.run(&["--software-root", "identity", "init"]).await;
+            cli.run(&["identity", "init"]).await;
         }
         let exported = provider.output(&["identity", "export-enrollment"]).await;
         assert!(exported.status.success());
@@ -94,24 +92,12 @@ impl OfferHost {
             .spec()
             .clone();
         let contact = root.join("contact");
-        client
-            .run(&[
-                "contact",
-                "export",
-                "--display-name",
-                "Client",
-                "--out",
-                string(&contact),
-            ])
-            .await;
-        provider
-            .run(&["contact", "import", string(&contact), "--name", "client"])
-            .await;
-        let grantee = hellas_authority::model::grant::records::decode_contact_card(
-            &std::fs::read(&contact).unwrap(),
-        )
-        .unwrap()
-        .principal();
+        std::fs::write(&contact, client.contact().await).unwrap();
+        let grantee =
+            hellas_sdk::contact::Contact::decode(&std::fs::read_to_string(&contact).unwrap())
+                .unwrap()
+                .card
+                .principal();
         reader.subject = grantee;
         reader.permissions = [hellas_auth::authority::Permission {
             operation: hellas_auth::authority::OperationId::new(
@@ -156,21 +142,22 @@ impl OfferHost {
         }}}]}).to_string()).unwrap();
         std::fs::write(&resources,json!({"remote_control_peers":[client.run(&["identity", "show-node-id"]).await.trim()],"max_job_millis":10000,"machine":{"max_in_flight":2,"limits":[]},"accounts":[{"account":hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),"max_in_flight":256,"limits":[]}],"resources":[{"resource":hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test resource")),"account":hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),"revision":1,"pricing":{"revision":1,"rates":null},"name":"glm","invocation_policy":invocation_policy,
             "https":{"origin":https.origin,"paths":["/v1/chat/completions"],"methods":["POST"],"credential":"glm-account","tls":{"roots":{"mode":"certificates","der_base64":[https.root_der]},"spki_sha256":[]},"accounting":"openai-chat","max_output_tokens":8,"max_response_bytes":65536}}]}).to_string()).unwrap();
-        let mut node = provider.spawn(
-            &[
-                "serve",
-                #[cfg(feature = "otel")]
-                "--metrics-port",
-                #[cfg(feature = "otel")]
-                "0",
-                "--no-discovery",
-                "--fetch-config",
-                string(&fetch),
-                "--grant-config",
-                string(&resources),
-            ],
-            "provider.log",
-        );
+        let mut serve = vec![
+            "serve",
+            #[cfg(feature = "otel")]
+            "--metrics-port",
+            #[cfg(feature = "otel")]
+            "0",
+            "--no-discovery",
+            "--fetch-config",
+            string(&fetch),
+            "--grant-config",
+            string(&resources),
+        ];
+        if any_program {
+            serve.push("--knowingly-unsafe");
+        }
+        let mut node = provider.spawn(&serve, "provider.log");
         node.wait_for("RPC server running.").await;
         #[cfg(feature = "otel")]
         let metrics = node
@@ -236,14 +223,6 @@ impl OfferHost {
             id,
         )
         .await;
-        let import = client
-            .output(&["offer", "import", string(&offer), "--name", "lan"])
-            .await;
-        assert!(
-            import.status.success(),
-            "{}",
-            String::from_utf8_lossy(&import.stderr)
-        );
         OfferHost {
             directory,
             https,
@@ -260,48 +239,24 @@ impl OfferHost {
             reader_grant,
             root_grant,
             signed_offer,
-            offer,
-            id,
             work_profile,
             exported_offer,
-            imported_offer: import,
         }
     }
     fn root(&self) -> &Path {
         self.directory.path()
     }
-    async fn approve_trust(&self) -> PathBuf {
-        let trust_root = self.root().join("caller-trust");
-        let trust_source = self.root().join("caller-policy.json");
-        std::fs::write(
-            &trust_source,
-            serde_json::to_vec(&hellas_sdk::trust_policy::TrustPolicy {
-                provider_genesis: self.signed_offer.offer().provider.content_id(),
-                assurance: hellas_rpc::Assurance::ProducerSigned,
-                apple: None,
-            })
-            .unwrap(),
+    async fn access(&self) -> PathBuf {
+        access_file(
+            &self.client,
+            &self.signed_offer,
+            &self.work_profile,
+            &self.root().join("friend.access"),
         )
-        .unwrap();
-        self.client
-            .run(&[
-                "trust",
-                "--store",
-                string(&trust_root),
-                "approve",
-                "lan",
-                "--expected-revision",
-                "0",
-                "--policy",
-                string(&trust_source),
-                "--reason",
-                "independent test provider approval",
-            ])
-            .await;
-        trust_root
+        .await
     }
     async fn gateway(&self) -> Gateway {
-        let trust_root = self.approve_trust().await;
+        let access = self.access().await;
         let (profile, token) = gateway_profile(self.root()).await;
         let mut process = self.client.spawn(
             &[
@@ -310,14 +265,8 @@ impl OfferHost {
                 "--metrics-port",
                 #[cfg(feature = "otel")]
                 "0",
-                "--offer",
-                "lan",
-                "--trust-store",
-                string(&trust_root),
-                "--trust-policy",
-                "lan",
-                "--work-profile",
-                string(&self.work_profile),
+                "--access",
+                string(&access),
                 "--port",
                 "0",
                 "--gateway-profile",
@@ -352,29 +301,13 @@ struct Gateway {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn offer_import_reports_the_exported_provider_identity() {
+async fn offer_export_reports_the_provider_identity() {
     let host = OfferHost::start().await;
     let fingerprint = format!(
         "Provider enrollment: {}",
         host.provider_enrollment.content_id()
     );
     assert!(String::from_utf8_lossy(&host.exported_offer.stderr).contains(&fingerprint));
-    assert!(String::from_utf8_lossy(&host.imported_offer.stderr).contains(&fingerprint));
-    assert_eq!(
-        String::from_utf8_lossy(&host.imported_offer.stdout).trim(),
-        hex::encode(host.id.0)
-    );
-    // Import is a public description, independent of execution authority.
-    let stranger = Cli::new(host.root(), "stranger", STRANGER_PASSKEY);
-    stranger
-        .run(&[
-            "offer",
-            "import",
-            string(&host.offer),
-            "--name",
-            "forwarded",
-        ])
-        .await;
     host.stop().await;
 }
 
@@ -446,41 +379,6 @@ async fn remote_admin_uses_the_explicit_reader_profile() {
         panic!("allowance list")
     };
     assert_eq!(listed.len(), 1);
-    host.stop().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn gateway_requires_a_caller_approved_trust_policy() {
-    let host = OfferHost::start().await;
-    let trust_root = host.approve_trust().await;
-    let (gateway_profile, _) = gateway_profile(host.root()).await;
-    std::fs::remove_file(trust_root.join("lan.json")).unwrap();
-    let before = host.https.calls.load(Ordering::SeqCst);
-    let refused = host
-        .client
-        .output(&[
-            "gateway",
-            "--offer",
-            "lan",
-            "--work-profile",
-            string(&host.work_profile),
-            "--trust-store",
-            string(&trust_root),
-            "--trust-policy",
-            "lan",
-            "--gateway-profile",
-            string(&gateway_profile),
-            "--port",
-            "0",
-        ])
-        .await;
-    assert!(!refused.status.success());
-    let error = String::from_utf8_lossy(&refused.stderr);
-    assert_eq!(
-        error.trim(),
-        "error: No such file or directory (os error 2)"
-    );
-    assert_eq!(host.https.calls.load(Ordering::SeqCst), before);
     host.stop().await;
 }
 
@@ -742,20 +640,14 @@ async fn controlled_gateway_profile(root: &Path) -> (PathBuf, PathBuf) {
 async fn gateway_control_issues_and_revokes_live_credentials() {
     let host = OfferHost::start().await;
     let root = host.root();
-    let trust_root = host.approve_trust().await;
+    let access = host.access().await;
     let (gateway_profile, admin) = controlled_gateway_profile(root).await;
     let socket = root.join("ctl/control.sock");
     let mut process = host.client.spawn(
         &[
             "gateway",
-            "--offer",
-            "lan",
-            "--trust-store",
-            string(&trust_root),
-            "--trust-policy",
-            "lan",
-            "--work-profile",
-            string(&host.work_profile),
+            "--access",
+            string(&access),
             "--port",
             "0",
             "--gateway-profile",
@@ -843,7 +735,7 @@ async fn gateway_control_issues_and_revokes_live_credentials() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_restricted_administrator_can_share_and_the_recipient_can_import_renewal() {
+async fn a_restricted_administrator_can_share_and_renew() {
     use hellas_auth::authority as auth;
     let host = OfferHost::start().await;
     let root = host.root();
@@ -851,9 +743,7 @@ async fn a_restricted_administrator_can_share_and_the_recipient_can_import_renew
         .unwrap()
         .authority;
     let administrator = Cli::new(root, "sharing-admin", AGENT_PASSKEY);
-    administrator
-        .run(&["--software-root", "identity", "init"])
-        .await;
+    administrator.run(&["identity", "init"]).await;
     let authorization = GrantId([0x31; 16]);
     let now = auth::UnixMillis::now().unwrap();
     let machine = hellas_authority::node::machine_resource(authority);
@@ -989,21 +879,17 @@ async fn a_restricted_administrator_can_share_and_the_recipient_can_import_renew
     };
     assert!(!records.iter().any(|grant| grant.id() == authorization));
 
-    let contact = root.join("contact");
-    let holder = host.client.holder_file().await;
+    let contact = std::fs::read_to_string(root.join("contact")).unwrap();
     let share = async |out: &Path, expires: &str| {
         let output = administrator
             .run(&[
-                "admin",
+                "share",
                 "--profile",
                 string(&administrator_profile),
                 "--control-socket",
                 string(&host.socket),
-                "share",
-                "--contact",
-                string(&contact),
-                "--holder",
-                string(&holder),
+                "--to",
+                &contact,
                 "--resource",
                 "glm",
                 "--limit",
@@ -1018,22 +904,19 @@ async fn a_restricted_administrator_can_share_and_the_recipient_can_import_renew
             .await;
         serde_json::from_str::<Value>(&output).unwrap()
     };
+    let auth::CredentialHolder::Node(holder) = host.client.holder().await else {
+        panic!()
+    };
+    let load = |file: &Path| {
+        hellas_sdk::access_bundle::AccessBundle::load(file, &host.client.principal(), &holder)
+            .unwrap()
+    };
     let first_file = root.join("restricted.access");
     let first = share(&first_file, "5m").await;
-    let first_import: Value = serde_json::from_str(
-        &host
-            .client
-            .run(&[
-                "offer",
-                "import-bundle",
-                string(&first_file),
-                "--name",
-                "restricted",
-            ])
-            .await,
-    )
-    .unwrap();
-    assert_eq!(first_import["offers"][0]["name"], "restricted.glm");
+    assert_eq!(
+        load(&first_file).offers[0].offer().grant.policies[0].name,
+        "glm"
+    );
     let renewed_file = root.join("restricted-renewed.access");
     let renewed = share(&renewed_file, "6m").await;
     for field in ["pool", "allowance", "grant"] {
@@ -1041,43 +924,7 @@ async fn a_restricted_administrator_can_share_and_the_recipient_can_import_renew
     }
     assert!(renewed["expires"].as_u64().unwrap() > first["expires"].as_u64().unwrap());
     assert_ne!(first["credential_id"], renewed["credential_id"]);
-    let same_alias = host
-        .client
-        .output(&[
-            "offer",
-            "import-bundle",
-            string(&renewed_file),
-            "--name",
-            "restricted",
-        ])
-        .await;
-    assert!(
-        !same_alias.status.success(),
-        "renewal must not overwrite the existing profile"
-    );
-    let imported: Value = serde_json::from_str(
-        &host
-            .client
-            .run(&[
-                "offer",
-                "import-bundle",
-                string(&renewed_file),
-                "--name",
-                "restricted-renewed",
-            ])
-            .await,
-    )
-    .unwrap();
-    assert_eq!(imported["offers"][0]["name"], "restricted-renewed.glm");
-    let auth::CredentialHolder::Node(holder) = host.client.holder().await else {
-        panic!()
-    };
-    let installed = hellas_sdk::node_control::profile::ClientProfile::load_bound(
-        Path::new(imported["work_profile"].as_str().unwrap()),
-        &host.client.principal(),
-        &holder,
-    )
-    .unwrap();
+    let installed = load(&renewed_file);
     assert_eq!(
         installed.credential.id().to_string(),
         renewed["credential_id"]
@@ -1103,29 +950,26 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
         .unwrap()
         .authority;
     let bundle = root.join("client.access");
-    let contact = root.join("contact");
     let export = |resource: String,
                   out: PathBuf,
-                  holder: PathBuf,
+                  contact: String,
                   limit: &'static str,
                   max_job: &'static str| {
-        let (provider, profile, socket, contact) = (
+        let (provider, profile, socket) = (
             &host.provider,
             host.provider_profile.clone(),
             host.socket.clone(),
-            contact.clone(),
         );
         async move {
             provider
                 .output(&[
-                    "admin",
+                    "share",
                     "--profile",
                     string(&profile),
                     "--control-socket",
                     string(&socket),
-                    "share",
-                    "--contact",
-                    string(&contact),
+                    "--to",
+                    &contact,
                     "--resource",
                     &resource,
                     "--limit",
@@ -1134,8 +978,6 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
                     max_job,
                     "--expires",
                     "5m",
-                    "--holder",
-                    string(&holder),
                     "--out",
                     string(&out),
                 ])
@@ -1145,20 +987,20 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
     let refused = export(
         "missing".into(),
         root.join("refused.access"),
-        host.client.holder_file().await,
+        host.client.contact().await,
         "requests:total:100",
         "5s",
     )
     .await;
     assert!(!refused.status.success());
     assert!(!root.join("refused.access").exists());
-    let holder_file = host.client.holder_file().await;
+    let client_contact = host.client.contact().await;
     // Failure after budgets were created is resumable: the corrected call
     // reuses them at revision 1 and creates only the missing allowance/grant.
     let interrupted = export(
         "glm".into(),
         root.join("interrupted.access"),
-        holder_file.clone(),
+        client_contact.clone(),
         "requests:total:100",
         "11s",
     )
@@ -1168,7 +1010,7 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
     let exported = export(
         "glm".into(),
         bundle.clone(),
-        holder_file.clone(),
+        client_contact.clone(),
         "requests:total:100",
         "5s",
     )
@@ -1208,7 +1050,7 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
     let unchanged = export(
         "glm".into(),
         root.join("unchanged.access"),
-        holder_file.clone(),
+        client_contact.clone(),
         "requests:total:100",
         "5s",
     )
@@ -1271,7 +1113,7 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
     let revised = export(
         "glm".into(),
         root.join("revised.access"),
-        holder_file.clone(),
+        client_contact.clone(),
         "requests:total:101",
         "6s",
     )
@@ -1317,7 +1159,7 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
         !export(
             "glm".into(),
             bundle.clone(),
-            holder_file,
+            client_contact,
             "requests:total:101",
             "6s"
         )
@@ -1325,32 +1167,13 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
         .status
         .success()
     );
-    // Another device of the same principal cannot import the credential.
     let other_device = Cli::new(root, "client-laptop", FRIEND_PASSKEY);
-    other_device
-        .run(&["--software-root", "identity", "init"])
-        .await;
-    let wrong = other_device
-        .output(&[
-            "offer",
-            "import-bundle",
-            string(&bundle),
-            "--name",
-            "shared",
-        ])
-        .await;
-    assert!(!wrong.status.success());
-    assert!(
-        String::from_utf8_lossy(&wrong.stderr).contains("bound to another device"),
-        "{}",
-        String::from_utf8_lossy(&wrong.stderr)
-    );
     // A second device gets its own credential on the same share. The first
     // device's original credential must continue to execute below.
     let laptop = export(
         "glm".into(),
         root.join("laptop.access"),
-        other_device.holder_file().await,
+        other_device.contact().await,
         "requests:total:101",
         "6s",
     )
@@ -1364,23 +1187,16 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
     assert_eq!(laptop["grant"], shared["grant"]);
     assert_eq!(laptop["allowance"], shared["allowance"]);
     assert_ne!(laptop["credential_id"], shared["credential_id"]);
-    let imported: Value = serde_json::from_str(
-        &host
-            .client
-            .run(&[
-                "offer",
-                "import-bundle",
-                string(&bundle),
-                "--name",
-                "shared",
-            ])
-            .await,
-    )
-    .unwrap();
-    assert_eq!(imported["offers"][0]["name"], "shared.glm");
-    assert_eq!(imported["offers"][0]["grant"], hex::encode(allowance.0));
-    // The same imported bundle works directly through the CLI, without an
-    // HTTP gateway or any chain funding. Retry must not consume it twice.
+    let auth::CredentialHolder::Node(holder) = host.client.holder().await else {
+        panic!()
+    };
+    let access =
+        hellas_sdk::access_bundle::AccessBundle::load(&bundle, &host.client.principal(), &holder)
+            .unwrap();
+    assert_eq!(access.offers[0].offer().grant.policies[0].name, "glm");
+    assert_eq!(access.offers[0].offer().grant.id, allowance);
+    // The access file works directly through the CLI, without an HTTP
+    // gateway or any chain funding. Retry must not consume it twice.
     let request = hellas_rpc::http_fetch::HttpFetchRequest {
         url: format!("{}/v1/chat/completions", host.https.origin),
         method: "POST".into(),
@@ -1417,8 +1233,8 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
     let result_dir = root.join("grant-result");
     let args = [
         "transact",
-        "--offer",
-        "shared.glm",
+        "--access",
+        string(&bundle),
         "--attempt",
         string(&attempt),
         "--job",
@@ -1437,7 +1253,14 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
     refused.extend(["--provider", &wrong_provider]);
     assert!(!host.client.output(&refused).await.status.success());
     assert!(!attempt.exists());
-    assert!(!other_device.output(&args).await.status.success());
+    // Another device of the same principal cannot use the credential.
+    let wrong = other_device.output(&args).await;
+    assert!(!wrong.status.success());
+    assert!(
+        String::from_utf8_lossy(&wrong.stderr).contains("bound to another device"),
+        "{}",
+        String::from_utf8_lossy(&wrong.stderr)
+    );
     assert_eq!(host.https.calls.load(Ordering::SeqCst), 0);
     for _ in 0..2 {
         host.client.run(&args).await;
@@ -1471,25 +1294,12 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
     changed_args[at + 1] = string(&changed_dir);
     assert!(!host.client.output(&changed_args).await.status.success());
     assert_eq!(host.https.calls.load(Ordering::SeqCst), 1);
-    let trust_root = host.approve_trust().await;
-    let pool = root.join("grant-pool.json");
-    std::fs::write(
-        &pool,
-        serde_json::to_vec(&json!({"channels": [{
-            "offer": "shared.glm", "work_profile": "shared", "trust_policy": "lan",
-            "resources": [host.signed_offer.offer().grant.policies[0].resource.0.to_string()]
-        }]}))
-        .unwrap(),
-    )
-    .unwrap();
     let (gateway_profile, token) = gateway_profile(root).await;
     let mut gateway = host.client.spawn(
         &[
             "gateway",
-            "--grant-pool-config",
-            string(&pool),
-            "--trust-store",
-            string(&trust_root),
+            "--access",
+            string(&bundle),
             "--port",
             "0",
             "--gateway-profile",
@@ -1537,8 +1347,8 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
         "main",
         "--returns",
         "u64",
-        "--offer",
-        "shared.glm",
+        "--access",
+        string(&bundle),
         "--save-job",
         string(&invalid_dir),
         "--output",
@@ -1572,94 +1382,4 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
     assert!(!replay.status.success());
     assert!(String::from_utf8_lossy(&replay.stderr).contains("Compilation"));
     assert_eq!(std::fs::read(retained_path).unwrap(), retained);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn pool_gateway_opens_two_independent_providers() {
-    use hellas_auth::authority::{CredentialHolder, UnixMillis};
-    use hellas_sdk::access_bundle::AccessBundle;
-    use hellas_sdk::node_control::profile::ClientProfile;
-    use hellas_sdk::trust_policy::{TrustPolicy, TrustPolicyStore};
-
-    let first = OfferHost::start().await;
-    let second = OfferHost::start_with_identity(None, None, Some(&first.client.identity)).await;
-    let root = first.root();
-    let CredentialHolder::Node(holder) = first.client.holder().await else {
-        panic!("expected node-bound client");
-    };
-    assert_eq!(first.client.holder().await, second.client.holder().await);
-    let trust_root = root.join("pool-trust");
-    let mut channels = Vec::new();
-    for (host, name) in [(&first, "first"), (&second, "second")] {
-        let profile = ClientProfile::load(&host.work_profile).unwrap();
-        let bundle = AccessBundle {
-            offers: vec![host.signed_offer.clone()],
-            authority: profile.authority,
-            authorization: profile.authorization,
-            subject: first.client.principal(),
-            holder,
-            credential: profile.credential,
-            expires: UnixMillis(UnixMillis::now().unwrap().0 + 600_000),
-            label: None,
-        };
-        let path = root.join(format!("{name}.access"));
-        bundle.save(&path).unwrap();
-        first
-            .client
-            .run(&["offer", "import-bundle", string(&path), "--name", name])
-            .await;
-        TrustPolicyStore::new(&trust_root)
-            .approve(
-                name,
-                0,
-                TrustPolicy {
-                    provider_genesis: host.provider_enrollment.content_id(),
-                    assurance: hellas_rpc::Assurance::ProducerSigned,
-                    apple: None,
-                },
-                "independent provider approval".into(),
-            )
-            .unwrap();
-        channels.push(json!({
-            "offer": format!("{name}.glm"), "work_profile": name, "trust_policy": name,
-            "resources": [host.signed_offer.offer().grant.policies[0].resource.0.to_string()]
-        }));
-    }
-    let pool = root.join("two-provider-pool.json");
-    std::fs::write(
-        &pool,
-        serde_json::to_vec(&json!({"channels": channels})).unwrap(),
-    )
-    .unwrap();
-    let (profile, token) = gateway_profile(root).await;
-    let mut gateway = first.client.spawn(
-        &[
-            "gateway",
-            "--grant-pool-config",
-            string(&pool),
-            "--trust-store",
-            string(&trust_root),
-            "--port",
-            "0",
-            "--gateway-profile",
-            string(&profile),
-            "--zdr",
-        ],
-        "two-provider-gateway.log",
-    );
-    let address = gateway.wait_for("gateway listening on ").await;
-    let response = post(
-        &gateway_client(&token),
-        &format!("http://{address}/v1/chat/completions"),
-        json!({"messages":[]}),
-    )
-    .await;
-    assert_eq!(response.status(), reqwest::StatusCode::OK);
-    assert_eq!(
-        first.https.calls.load(Ordering::SeqCst) + second.https.calls.load(Ordering::SeqCst),
-        1
-    );
-    gateway.stop().await;
-    second.stop().await;
-    first.stop().await;
 }

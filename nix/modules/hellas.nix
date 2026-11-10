@@ -199,7 +199,7 @@ rec {
     "--chain"
     "--chain-config"
     "--grant-config"
-    "--await-owner"
+    "--knowingly-unsafe"
     "--passkey"
     "--metrics-port"
     "--metrics-addr"
@@ -213,16 +213,16 @@ rec {
     "--content-config"
     "--metrics-port"
     "--metrics-addr"
-    "--paid-work-config"
     "--chain"
     "--chain-config"
-    "--grant-pool-config"
-    "--local-grant"
+    "--access"
+    "--pay"
+    "--provider"
+    "--local"
+    "--model"
     "--gateway-profile"
     "--home"
     "--log-file"
-    "--assurance"
-    "--text-model"
     "--host"
     "--port"
     "--default-max-tokens"
@@ -230,10 +230,7 @@ rec {
     "--responses-model"
     "--trust-store"
     "--trust-policy"
-    "--offer"
     "--passkey"
-    "--work-profile"
-    "--grant-policy"
   ];
 
   extraArgsAreSafe =
@@ -452,19 +449,17 @@ rec {
           workConfigFile. Keep it outside the Nix store.
         '';
       };
-      awaitOwner = mkOption {
-        type = types.bool;
-        default = false;
-        example = true;
-        description = ''
-          Wait for one owner pairing when the grant journal is uninitialized,
-          storing authority state under the configured home/provider directory.
-        '';
-      };
+      knowinglyUnsafe = lib.mkEnableOption ''
+        serving workConfigFile or grantConfigFile when it admits any Compute
+        program (`mode = "any"`, or `Any` in a resource). Without this the node
+        refuses to start on such a configuration: compiling and running a
+        program from an unknown author hands that author roughly root on the
+        host
+      '';
       passkey = mkOption {
         type = types.nullOr runtimePath;
         default = null;
-        description = "Private software passkey of the provider's owner, passed as --passkey; required by workConfigFile unless extraArgs selects a faucet account.";
+        description = "Private software passkey of the provider's owner, passed as --passkey. Without it, workConfigFile uses the principal key in the provider's home, or an owner-approved policy.";
       };
       fetchConfigFile = mkOption {
         type = types.nullOr runtimePath;
@@ -513,7 +508,7 @@ rec {
       extraArgs = mkOption {
         type = types.listOf types.str;
         default = [ ];
-        description = "Extra arguments to pass to `hellas serve`. They may add unsupported harmless switches such as `--software-root`, but may not override module-managed runtime, content, identity, trust, or configuration flags (including `--flag=value`).";
+        description = "Extra arguments to pass to `hellas serve`. They may add harmless switches such as `--no-discovery`, but may not override module-managed runtime, content, identity, trust, or configuration flags (including `--flag=value`).";
       };
     };
 
@@ -529,12 +524,36 @@ rec {
       content = mkOption {
         inherit (pkgs.formats.toml { }) type;
         default = { };
-        description = "The local-grant [content] declaration, rendered as one --content-config file. An absent upper keeps the dedicated authority-local upper. Use runtime lower paths outside the Nix store.";
+        description = "The local [content] declaration, rendered as one --content-config file. An absent upper keeps the dedicated authority-local upper. Use runtime lower paths outside the Nix store.";
       };
-      paidWorkConfig = mkOption {
+      access = mkOption {
         type = types.nullOr runtimePath;
         default = null;
-        description = "Runtime JSON provider pool for funded paid-work channels. Requests must match a configured provider's fixed generation policy; authenticated output is returned after payment acknowledgement. Content lives in a sibling upper obtained by replacing the config extension with .content. Provision that directory for the service user and preserve it with the client journals.";
+        example = "/run/secrets/friend.access";
+        description = "Access file someone shared with this gateway's principal and device, passed as --access. Requests run under its grant.";
+      };
+      pay = mkOption {
+        type = types.nullOr positiveU32;
+        default = null;
+        description = "Most the gateway pays `provider` per request, passed as --pay. The provider's quoted price applies.";
+      };
+      provider = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "ENROLLMENT_ID@NODE_ID";
+        description = "Paid provider address passed as --provider with pay.";
+      };
+      local = mkEnableOption "running requests on this machine's executor (--local), with the native content and GPU flags";
+      models = mkOption {
+        type = types.listOf (types.strMatching "/.*");
+        default = [ ];
+        example = [ "/srv/hellas/models/qwen3.gguf" ];
+        description = ''
+          Model paths passed as --model: a Qwen GGUF file, or a converted
+          Whisper or Flux package directory. The gateway renders jobs from
+          them; providers must hold the same converted weights. This is
+          operator-managed runtime data, not a Nix-store artifact.
+        '';
       };
       chain = mkOption {
         type = types.nullOr (types.enum [ "devnet" ]);
@@ -546,36 +565,12 @@ rec {
         default = null;
         description = "Authenticated custom chain profile passed as --chain-config.";
       };
-      grantPoolConfig = mkOption {
-        type = types.nullOr runtimePath;
-        default = null;
-        example = "/run/hellas/grant-pool.json";
-        description = ''
-          Runtime JSON grant pool selecting explicit resources from
-          independently provisioned grant channels, passed as
-          --grant-pool-config. Requires trustStore and passkey; conflicts with
-          offer, localGrant, paidWorkConfig, trustPolicy, grantPolicy,
-          workProfile and httpFetchConfig. Keep it outside the Nix store.
-        '';
-      };
-      localGrant = mkOption {
-        type = types.nullOr types.str;
-        default = null;
-        example = "00000000000000000000000000000000";
-        description = ''
-          Hex ID of this node's already configured allowance, passed as
-          --local-grant and served in process with the native content and GPU
-          flags. Requires trustStore, trustPolicy, workProfile and passkey, and
-          producer-signed assurance. Conflicts with offer, paidWorkConfig and
-          grantPoolConfig.
-        '';
-      };
       allowRemote = mkEnableOption "non-loopback gateway listening";
       gatewayProfile = mkOption {
         type = types.nullOr runtimePath;
         default = null;
         example = "/var/lib/hellas-gateway/gateway-profile.json";
-        description = "Private runtime profile selecting an explicitly provisioned HTTP authority, grant and gateway.invoke bearer credential. Startup never issues credentials.";
+        description = "Private runtime profile selecting an explicitly provisioned HTTP authority, grant and gateway.invoke bearer credential; required with allowRemote. Without it, a loopback gateway creates its own authority under home and keeps its bearer in home/gateway/bearer.";
       };
       authorityJournal = mkOption {
         type = types.nullOr runtimePath;
@@ -602,40 +597,15 @@ rec {
         default = null;
         description = "Optional unauthenticated Prometheus metrics port. Requires otel.enable and a package built with the otel feature.";
       };
-      offer = mkOption {
-        type = types.nullOr types.str;
-        default = null;
-        description = "Previously imported allowance offer alias.";
-      };
       passkey = mkOption {
         type = types.nullOr runtimePath;
         default = null;
-        description = "Private software passkey of the principal whose offer allowance execution uses.";
-      };
-      workProfile = mkOption {
-        type = types.nullOr runtimePath;
-        default = null;
-        description = "Provisioned private application credential and Work authorization profile.";
-      };
-      grantPolicy = mkOption {
-        type = types.nullOr types.str;
-        default = null;
-        description = "Select one granted resource by name.";
+        description = "Private software passkey of the principal the gateway acts for, outside home.";
       };
       defaultMaxTokens = mkOption {
         type = types.nullOr positiveU32;
         default = null;
         description = "Fallback max output tokens when a request omits a limit.";
-      };
-      textModel = mkOption {
-        type = types.nullOr (types.strMatching "/.*");
-        default = null;
-        example = "/srv/hellas/models/qwen3.gguf";
-        description = ''
-          GGUF passed as --text-model and served by the native text routes.
-          Providers must already hold it. This is operator-managed runtime
-          data, not a Nix-store artifact.
-        '';
       };
       responsesOverrides = mkOption {
         type = types.attrsOf types.anything;
@@ -646,14 +616,6 @@ rec {
         type = types.listOf types.str;
         default = [ ];
         description = "Models the Responses Fetch answers to when /v1/responses is shared with the text routes.";
-      };
-      assurance = mkOption {
-        type = types.enum [
-          "producer-signed"
-          "apple-app-attest"
-        ];
-        default = "producer-signed";
-        description = "Assurance requested from the selected execution provider.";
       };
       trustStore = mkOption {
         type = types.nullOr runtimePath;
@@ -756,7 +718,7 @@ rec {
     ++ optArg "--chain" serve.chain
     ++ optArg "--chain-config" serve.chainConfig
     ++ optArg "--grant-config" serve.grantConfigFile
-    ++ lib.optional serve.awaitOwner "--await-owner"
+    ++ lib.optional serve.knowinglyUnsafe "--knowingly-unsafe"
     ++ optArg "--passkey" serve.passkey
     ++ lib.optionals (otel.enable && serve.metricsPort != null) [
       "--metrics-port"
@@ -793,8 +755,6 @@ rec {
       "--home"
       gateway.home
       "gateway"
-      "--assurance"
-      gateway.assurance
     ]
     ++ lib.optionals (gateway.content != { }) [
       "--content-config"
@@ -802,14 +762,15 @@ rec {
     ]
     ++ optArg "--trust-store" gateway.trustStore
     ++ optArg "--trust-policy" gateway.trustPolicy
-    ++ optArg "--offer" gateway.offer
-    ++ optArg "--grant-pool-config" gateway.grantPoolConfig
-    ++ optArg "--local-grant" gateway.localGrant
+    ++ optArg "--access" gateway.access
+    ++ optArg "--pay" gateway.pay
+    ++ optArg "--provider" gateway.provider
+    ++ lib.optional gateway.local "--local"
     ++ optArg "--passkey" gateway.passkey
-    ++ optArg "--work-profile" gateway.workProfile
-    ++ optArg "--grant-policy" gateway.grantPolicy
-    ++ optArg "--text-model" gateway.textModel
-    ++ optArg "--paid-work-config" gateway.paidWorkConfig
+    ++ lib.concatMap (model: [
+      "--model"
+      model
+    ]) gateway.models
     ++ optArg "--chain" gateway.chain
     ++ optArg "--chain-config" gateway.chainConfig
     ++ lib.optional gateway.allowRemote "--allow-remote"
