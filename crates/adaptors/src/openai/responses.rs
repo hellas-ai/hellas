@@ -116,14 +116,14 @@ impl WireAdaptor for OpenAiResponsesAdaptor {
         context: RenderContext,
     ) -> AdaptorResult<WireResponse> {
         let failed = result.error.as_ref();
-        let body = response_json(ResponseJsonParts {
+        let mut body = response_json(ResponseJsonParts {
             response_id: &context.response_id,
             created_at: context.created_at,
             model: &request.model,
             status: if failed.is_some() {
                 "failed"
             } else {
-                "completed"
+                terminal_response_status(result.stop_reason)
             },
             output: output_items_json(
                 &context.message_id,
@@ -131,23 +131,21 @@ impl WireAdaptor for OpenAiResponsesAdaptor {
                 if failed.is_some() {
                     "incomplete"
                 } else {
-                    "completed"
+                    terminal_item_status(result.stop_reason)
                 },
             )?,
             usage: result.usage,
             metadata: request_metadata(request),
             provenance: result.provenance.as_ref(),
         });
-        let body = if let Some(error) = failed {
-            let mut body = body;
+        if let Some(error) = failed {
             body["error"] = json!({
                 "code": error.code.clone().unwrap_or_else(|| "server_error".to_string()),
                 "message": error.message.clone(),
             });
-            body
         } else {
-            body
-        };
+            apply_terminal_details(&mut body, result.stop_reason);
+        }
         Ok(WireResponse::json(200, body))
     }
 
@@ -177,6 +175,17 @@ impl WireAdaptor for OpenAiResponsesAdaptor {
 
     fn attest(&self, state: &mut Self::StreamState, provenance: crate::Provenance) {
         crate::execution::merge_provenance(&mut state.provenance, provenance);
+    }
+
+    /// Responses names no code for a request that fails the same way each
+    /// time; `invalid_prompt` is the one clients do not retry.
+    fn error_code(&self, status: u16) -> Option<String> {
+        let code = match status {
+            429 => "rate_limit_exceeded",
+            400..=499 => "invalid_prompt",
+            _ => "server_error",
+        };
+        Some(code.to_string())
     }
 
     fn render_stream_event(
@@ -1851,5 +1860,24 @@ mod tests {
             completed["response"]["output"][1]["content"][0]["text"],
             "{\"answer\":\"after\"}"
         );
+    }
+
+    /// opencode 1.19.5's session request, as sent with long texts shortened.
+    #[test]
+    fn opencode_requests_project_with_their_tools() {
+        let request: JsonValue = serde_json::from_str(include_str!(
+            "../../tests/fixtures/agents/opencode-responses.json"
+        ))
+        .unwrap();
+        let parsed = adaptor().parse(raw(request.clone())).unwrap();
+        let canonical = adaptor().to_execution_request(&parsed).unwrap().canonical;
+        assert_eq!(
+            canonical.tools.len(),
+            request["tools"].as_array().unwrap().len()
+        );
+        assert_eq!(canonical.tool_choice, crate::ToolChoice::Auto);
+        assert!(canonical.sampling.temperature.is_none());
+        assert_eq!(adaptor().error_code(422).as_deref(), Some("invalid_prompt"));
+        assert_eq!(adaptor().error_code(502).as_deref(), Some("server_error"));
     }
 }

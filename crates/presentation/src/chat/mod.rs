@@ -40,15 +40,7 @@ impl TextPresentation {
             request.reasoning.is_none(),
             "reasoning options are not supported by the configured chat template"
         );
-        let supports_tools = matches!(
-            self.chat_template,
-            Some(ChatTemplate::Qwen3 | ChatTemplate::Qwen35)
-        );
-        let tools = if supports_tools {
-            input::chat_tools(request)?
-        } else {
-            Vec::new()
-        };
+        let tools = input::chat_tools(request)?;
         let selected = request
             .tools
             .iter()
@@ -63,20 +55,15 @@ impl TextPresentation {
             request.tool_choice,
             ToolChoice::Required | ToolChoice::Tool { .. }
         );
-        anyhow::ensure!(
-            supports_tools || !require_tool,
-            "the configured model adapter cannot satisfy a required tool choice"
-        );
         let parser: Box<dyn IncrementalToolCallParser> = if tools.is_empty() {
             Box::new(PassthroughParser)
         } else {
             let directory = Arc::new(ToolDirectory::new(selected)?);
             let codec: Box<dyn sentinel_engine::PayloadCodec> = match self.chat_template {
-                Some(ChatTemplate::Qwen3) => Box::new(codecs::json::JsonObjectOrArrayCodec),
-                Some(ChatTemplate::Qwen35) => Box::new(
-                    codecs::xml_function::XmlFunctionCodec::new(directory.clone()),
-                ),
-                _ => anyhow::bail!("tools require a model adapter supporting them"),
+                ChatTemplate::Qwen3 => Box::new(codecs::json::JsonObjectOrArrayCodec),
+                ChatTemplate::Qwen35 => Box::new(codecs::xml_function::XmlFunctionCodec::new(
+                    directory.clone(),
+                )),
             };
             Box::new(sentinel_engine::SentinelEngine::new_pair(
                 directory,
@@ -234,7 +221,7 @@ mod tests {
             tokenizer: crate::tests::tokenizer(
                 r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"<unk>":0},"unk_token":"<unk>"}}"#,
             ),
-            chat_template: Some(ChatTemplate::Qwen3),
+            chat_template: ChatTemplate::Qwen3,
         }
     }
 
@@ -294,7 +281,7 @@ mod tests {
     #[test]
     fn qwen36_fragmented_xml_preserves_string_arguments_and_tool_history() {
         let mut presentation = presentation();
-        presentation.chat_template = Some(ChatTemplate::Qwen35);
+        presentation.chat_template = ChatTemplate::Qwen35;
         for command in ["df -h", "true", "123", "echo café"] {
             let mut turn = presentation.prepare(&request()).unwrap().turn;
             let output = format!(
@@ -420,7 +407,7 @@ mod tests {
                 "required": ["command", "count"], "additionalProperties": false
             });
             let mut presentation = presentation();
-            presentation.chat_template = Some(ChatTemplate::Qwen35);
+            presentation.chat_template = ChatTemplate::Qwen35;
             for text in ["123", "true", "null"] {
                 let mut turn = presentation.prepare(&request).unwrap().turn;
                 let events = turn.feed(&format!("<tool_call><function=bash><parameter=command>{text}</parameter><parameter=count>2</parameter></function></tool_call>")).unwrap();
@@ -447,7 +434,7 @@ mod tests {
                 (combinator): [{"properties": properties}]
             });
             let mut presentation = presentation();
-            presentation.chat_template = Some(ChatTemplate::Qwen35);
+            presentation.chat_template = ChatTemplate::Qwen35;
             let mut turn = presentation.prepare(&request).unwrap().turn;
             let events = turn.feed("<tool_call><function=bash><parameter=a>1</parameter><parameter=b>2</parameter><parameter=c>3</parameter></function></tool_call>").unwrap();
             let args = events
@@ -474,7 +461,7 @@ mod tests {
             ]
         });
         let mut presentation = presentation();
-        presentation.chat_template = Some(ChatTemplate::Qwen35);
+        presentation.chat_template = ChatTemplate::Qwen35;
         let mut turn = presentation.prepare(&request).unwrap().turn;
         let events = turn.feed("<tool_call><function=bash><parameter=a>1</parameter><parameter=b>2</parameter></function></tool_call>").unwrap();
         let args = events

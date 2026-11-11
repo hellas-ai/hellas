@@ -350,4 +350,28 @@ mod tests {
         });
         assert!(text_chat_message(&message).is_err());
     }
+
+    /// Claude Code puts a system-role message after the user's turn and
+    /// offers a deferred placeholder tool. Both Qwen formats render the
+    /// request with one system prompt ahead of the conversation.
+    #[test]
+    fn claude_code_requests_render_in_both_qwen_formats() {
+        let adaptor = AnthropicMessagesAdaptor;
+        let raw = RawRequest::from_slice(include_bytes!(
+            "../../../adaptors/tests/fixtures/agents/claude-code-messages.json"
+        ))
+        .unwrap();
+        let canonical = adaptor
+            .to_execution_request(&adaptor.parse(raw).unwrap())
+            .unwrap()
+            .canonical;
+        let messages = text_chat_messages(&canonical.input, None).unwrap();
+        let tools = chat_tools(&canonical).unwrap();
+        for template in [crate::ChatTemplate::Qwen3, crate::ChatTemplate::Qwen35] {
+            let prompt = template.render_with_tools(&messages, &tools).unwrap();
+            assert_eq!(prompt.matches("<|im_start|>system").count(), 1);
+            assert!(prompt.starts_with("<|im_start|>system"));
+            assert!(!prompt.contains("DeferredToolPlaceholder"));
+        }
+    }
 }

@@ -270,6 +270,20 @@ async fn text_routes_carry_provenance_at_start_and_end() {
                     &json!({"commitment": commitment, "provider": provider, "transcript": encoded}),
                     "{what}"
                 );
+                // The response names the model the request named, not the
+                // served file, and a spent budget is the format's length stop.
+                assert_eq!(body["model"], "m", "{what}");
+                let stop = match path {
+                    "/v1/messages" => &body["stop_reason"],
+                    "/v1/responses" => &body["incomplete_details"]["reason"],
+                    _ => &body["choices"][0]["finish_reason"],
+                };
+                let expected = match path {
+                    "/v1/messages" => "max_tokens",
+                    "/v1/responses" => "max_output_tokens",
+                    _ => "length",
+                };
+                assert_eq!(stop, expected, "{what}: {body}");
                 continue;
             }
             let events = std::str::from_utf8(&bytes)
@@ -376,6 +390,15 @@ async fn generation_controls_are_honoured_or_rejected() {
     let prepare =
         async |request: &WireExecutionRequest| state.prepare_wire_execution(request).await;
 
+    // Native execution decodes greedily: temperature 0 is what it does.
+    prepare(&chat(json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 1,
+        "temperature": 0
+    })))
+    .await
+    .unwrap();
     for (field, value) in [
         ("temperature", json!(0.5)),
         ("top_p", json!(0.9)),
@@ -602,5 +625,194 @@ async fn anthropic_controls_are_rejected_before_submitting_a_job() {
             "accepted {field}"
         );
     }
+    assert!(work.jobs.lock().unwrap().is_empty());
+}
+
+/// A budget beyond the work source's terms is cut to them rather than
+/// refused, and the job stops at that bound as at any token budget.
+#[tokio::test]
+async fn output_budgets_are_cut_to_the_terms() {
+    use hellas_adaptors::{RawRequest, WireAdaptor, anthropic::AnthropicMessagesAdaptor};
+    use serde_json::json;
+
+    struct Bounded(Capturing);
+    impl WorkExecutionBackend for Bounded {
+        fn max_steps(&self) -> Option<u64> {
+            Some(3)
+        }
+        fn run(
+            &self,
+            job: hellas_client::model::ComputeJob,
+        ) -> Result<crate::WorkOutputStream<ComputeEvent>, crate::WorkGatewayError> {
+            self.0.run(job)
+        }
+        fn drain(&self) -> futures::future::BoxFuture<'_, Result<(), crate::WorkShutdownError>> {
+            self.0.drain()
+        }
+    }
+
+    let work = Arc::new(Bounded(Capturing {
+        jobs: std::sync::Mutex::new(Vec::new()),
+    }));
+    let state = open(work.clone()).await;
+    let adaptor = AnthropicMessagesAdaptor;
+    for max_tokens in [128_000, 2] {
+        let parsed = adaptor
+            .parse(
+                RawRequest::from_value(json!({
+                    "model": "m", "max_tokens": max_tokens,
+                    "messages": [{"role": "user", "content": "hi"}]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        state
+            .prepare_wire_execution(&adaptor.to_execution_request(&parsed).unwrap())
+            .await
+            .unwrap();
+    }
+    let jobs = work.0.jobs.lock().unwrap();
+    let steps = jobs
+        .iter()
+        .map(|job| job.plan.step.as_ref().unwrap().stop.max_steps)
+        .collect::<Vec<_>>();
+    assert_eq!(steps, [3, 2]);
+}
+
+/// A backend that streams some text, then fails the way an undecodable
+/// tool call does.
+struct Undecodable;
+
+impl hellas_adaptors::ExecutionBackend for Undecodable {
+    fn stream<'a>(
+        &'a self,
+        _: hellas_adaptors::BackendRequest,
+    ) -> hellas_adaptors::BackendFuture<'a, hellas_adaptors::BackendStream> {
+        Box::pin(async {
+            Ok(hellas_adaptors::BackendStream::new(
+                futures::stream::iter([
+                    Ok(hellas_adaptors::OutputEvent::TextDelta {
+                        index: 0,
+                        delta: "Checking".into(),
+                        channel: hellas_adaptors::TextChannel::Output,
+                    }
+                    .into()),
+                    Err(BackendError::Output(
+                        "model tool call at <tool_call> could not be decoded".into(),
+                    )),
+                ]),
+                None,
+            ))
+        })
+    }
+}
+
+/// The same request fails the same way again, so a decode failure is no
+/// retryable server error: 422 before the stream, and the matching error type
+/// or code once it has begun.
+#[tokio::test]
+async fn undecodable_output_is_reported_as_unprocessable() {
+    use hellas_adaptors::{
+        anthropic::AnthropicMessagesAdaptor, openai::responses::OpenAiResponsesAdaptor,
+    };
+    use serde_json::json;
+
+    async fn body(response: axum::response::Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+    let last_event = |sse: &str| -> serde_json::Value {
+        sse.lines()
+            .rev()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .find_map(|data| serde_json::from_str(data).ok())
+            .unwrap()
+    };
+    let context = || crate::dispatch::render_context("t");
+    let messages = json!({"model":"m","max_tokens":8,"messages":[{"role":"user","content":"hi"}]});
+    let responses = json!({"model":"m","input":"hi"});
+    for stream in [false, true] {
+        let mut request = messages.clone();
+        request["stream"] = json!(stream);
+        let response = crate::dispatch::serve(
+            AnthropicMessagesAdaptor,
+            "Anthropic Messages",
+            context(),
+            Undecodable,
+            &serde_json::to_vec(&request).unwrap(),
+        )
+        .await;
+        let status = response.status();
+        let text = body(response).await;
+        let error = if stream {
+            assert_eq!(status, axum::http::StatusCode::OK);
+            last_event(&text)
+        } else {
+            assert_eq!(status, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+            serde_json::from_str(&text).unwrap()
+        };
+        assert_eq!(error["error"]["type"], "invalid_request_error", "{text}");
+
+        let mut request = responses.clone();
+        request["stream"] = json!(stream);
+        let response = crate::dispatch::serve(
+            OpenAiResponsesAdaptor,
+            "OpenAI Responses",
+            context(),
+            Undecodable,
+            &serde_json::to_vec(&request).unwrap(),
+        )
+        .await;
+        let status = response.status();
+        let text = body(response).await;
+        if stream {
+            assert_eq!(status, axum::http::StatusCode::OK);
+            assert_eq!(
+                last_event(&text)["response"]["error"]["code"],
+                "invalid_prompt",
+                "{text}"
+            );
+        } else {
+            assert_eq!(
+                status,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "{text}"
+            );
+        }
+    }
+}
+
+/// opencode titles a session at temperature 0.5. Greedy decoding cannot
+/// honour it, so the request is refused, before any job, as a request error
+/// that names the control; a session's own requests carry no temperature.
+#[tokio::test]
+async fn sampled_temperatures_are_refused_by_name() {
+    use tower::ServiceExt as _;
+
+    let work = Arc::new(Capturing {
+        jobs: std::sync::Mutex::new(Vec::new()),
+    });
+    let response = super::router(Arc::new(open(work.clone()).await))
+        .oneshot(
+            axum::http::Request::post("/v1/responses")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    &include_bytes!(
+                        "../../../adaptors/tests/fixtures/agents/opencode-responses-title.json"
+                    )[..],
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("`temperature` 0.5"), "{message}");
     assert!(work.jobs.lock().unwrap().is_empty());
 }

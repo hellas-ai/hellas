@@ -732,6 +732,17 @@ impl GatewayTarget {
         })
     }
 
+    /// The most steps one Compute job may take: the quoted terms of a paid
+    /// provider, the granted resource's, none on this machine.
+    pub fn max_steps(&self) -> Option<u64> {
+        match self {
+            Self::Paid { policy, .. } => Some(policy.limits.step_bound()),
+            Self::Grant { policy, .. } => Some(policy.invocation_policy.limits.step_bound()),
+            #[cfg(feature = "compute")]
+            Self::Local { .. } => None,
+        }
+    }
+
     /// The Fetch routes this target admits.
     pub fn fetch_routes(&self) -> Result<Vec<hellas_gateway::FetchRoute>, WorkGatewayError> {
         let Some(provider) = self.provider()? else {
@@ -936,6 +947,9 @@ impl Inner {
 impl WorkExecutionBackend for ExecutorGateway {
     fn fetch_routes(&self) -> Vec<hellas_gateway::FetchRoute> {
         self.inner.target.fetch_routes().unwrap_or_default()
+    }
+    fn max_steps(&self) -> Option<u64> {
+        self.inner.target.max_steps()
     }
     fn fetch(
         &self,

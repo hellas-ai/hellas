@@ -54,10 +54,10 @@ struct AnthropicToolCallState {
     block_index: usize,
 }
 
-/// A refusal or failure as the Anthropic Messages API reports it.
-pub fn render_error(status: u16, message: String) -> WireResponse {
-    let kind = match status {
-        400 | 409 => "invalid_request_error",
+/// The Anthropic error type of a failure reported with HTTP `status`.
+fn error_type(status: u16) -> &'static str {
+    match status {
+        400 | 409 | 422 => "invalid_request_error",
         401 => "authentication_error",
         403 => "permission_error",
         404 => "not_found_error",
@@ -65,10 +65,14 @@ pub fn render_error(status: u16, message: String) -> WireResponse {
         429 => "rate_limit_error",
         503 | 529 => "overloaded_error",
         _ => "api_error",
-    };
+    }
+}
+
+/// A refusal or failure as the Anthropic Messages API reports it.
+pub fn render_error(status: u16, message: String) -> WireResponse {
     WireResponse::json(
         status,
-        json!({ "type": "error", "error": { "type": kind, "message": message } }),
+        json!({ "type": "error", "error": { "type": error_type(status), "message": message } }),
     )
 }
 
@@ -178,6 +182,10 @@ impl WireAdaptor for AnthropicMessagesAdaptor {
         render_error(status, message)
     }
 
+    fn error_code(&self, status: u16) -> Option<String> {
+        Some(error_type(status).to_string())
+    }
+
     fn attest(&self, state: &mut Self::StreamState, provenance: crate::Provenance) {
         crate::execution::merge_provenance(&mut state.provenance, provenance);
     }
@@ -227,7 +235,7 @@ impl WireAdaptor for AnthropicMessagesAdaptor {
                     json!({
                         "type": "error",
                         "error": {
-                            "type": code.unwrap_or_else(|| "invalid_request_error".to_string()),
+                            "type": code.unwrap_or_else(|| "api_error".to_string()),
                             "message": message,
                         },
                     }),
@@ -268,29 +276,46 @@ impl ParsedAnthropicMessageRequest {
         // remain harmless, but execution-affecting options must not disappear.
         reject_fields(
             object,
-            &[
-                "top_k",
-                "output_config",
-                "output_format",
-                "context_management",
-                "container",
-                "mcp_servers",
-            ],
+            &["top_k", "output_format", "container", "mcp_servers"],
         )?;
+        if let Some(config) = object.get("output_config").filter(|v| !v.is_null()) {
+            validate_output_config(config)?;
+        }
+        if let Some(edits) = object.get("context_management").filter(|v| !v.is_null()) {
+            validate_context_management(edits)?;
+        }
         let model = required_string(object, "model")?;
         let max_tokens = required_u32(object, "max_tokens")?;
         let stream = optional_bool(object, "stream")?;
+        // The chat templates take one system prompt, ahead of the
+        // conversation. System-role messages join it in their order.
+        let mut system = text_content(object.get("system"))?;
         let mut items = Vec::new();
-        if let Some(system) = object.get("system") {
-            items.push(InputItem::Message(Message {
-                role: "system".into(),
-                content: text_content(Some(system))?,
-                name: None,
-                tool_calls: Vec::new(),
-            }));
-        }
         for message in required_array(object, "messages")? {
+            if message.get("role").and_then(JsonValue::as_str) == Some("system") {
+                let content = text_content(Some(message.get("content").ok_or_else(|| {
+                    AdaptorError::invalid_request("Anthropic message missing `content`")
+                })?))?;
+                if !system.is_empty() && !content.is_empty() {
+                    system.push(ContentPart::Text {
+                        text: "\n\n".into(),
+                    });
+                }
+                system.extend(content);
+                continue;
+            }
             project_message(&message, &mut items)?;
+        }
+        if object.contains_key("system") || !system.is_empty() {
+            items.insert(
+                0,
+                InputItem::Message(Message {
+                    role: "system".into(),
+                    content: system,
+                    name: None,
+                    tool_calls: Vec::new(),
+                }),
+            );
         }
         let mut canonical =
             CanonicalExecution::new(ModelRef::new(model.clone()), Input::Items(items));
@@ -309,20 +334,19 @@ impl ParsedAnthropicMessageRequest {
         canonical.tools = optional_array(object, "tools")?
             .unwrap_or_default()
             .iter()
-            .map(project_tool)
+            .filter_map(|tool| project_tool(tool).transpose())
             .collect::<AdaptorResult<_>>()?;
         if let Some(value) = object.get("tool_choice") {
             let projected = project_tool_choice(value)?;
             canonical.tool_choice = projected.choice;
             canonical.sampling.parallel_tool_calls = projected.parallel_tool_calls;
         }
-        if let Some(thinking) = object.get("thinking") {
-            validate_thinking(thinking)?;
-            if thinking["type"] != "disabled" {
-                canonical.reasoning = Some(ReasoningOptions {
-                    value: thinking.clone(),
-                });
-            }
+        if let Some(thinking) = object.get("thinking")
+            && thinking_requested(thinking)?
+        {
+            canonical.reasoning = Some(ReasoningOptions {
+                value: thinking.clone(),
+            });
         }
         Ok(Self {
             raw,
@@ -412,14 +436,21 @@ fn project_message(value: &JsonValue, items: &mut Vec<InputItem>) -> AdaptorResu
                         "tool_result blocks must precede user text",
                     ));
                 }
-                if optional_bool(block, "is_error")? == Some(true) {
+                let output = text_content(block.get("content"))?;
+                // The chat formats, like OpenAI's tool messages, carry no
+                // error flag: a failed call reaches the model as its message.
+                if optional_bool(block, "is_error")? == Some(true)
+                    && output
+                        .iter()
+                        .all(|part| matches!(part, ContentPart::Text { text } if text.is_empty()))
+                {
                     return Err(AdaptorError::invalid_request(
-                        "tool_result `is_error` is not supported by the chat template",
+                        "an error tool_result needs content describing the error",
                     ));
                 }
                 items.push(InputItem::ToolResult {
                     call_id: required_string(block, "tool_use_id")?,
-                    output: text_content(block.get("content"))?,
+                    output,
                 });
             }
             kind => {
@@ -436,7 +467,9 @@ fn project_message(value: &JsonValue, items: &mut Vec<InputItem>) -> AdaptorResu
     Ok(())
 }
 
-fn project_tool(value: &JsonValue) -> AdaptorResult<ToolSpec> {
+/// A tool the model is offered, or `None` for one deferred until a tool
+/// search loads it: the model is not shown a deferred tool.
+fn project_tool(value: &JsonValue) -> AdaptorResult<Option<ToolSpec>> {
     let object = value
         .as_object()
         .ok_or_else(|| AdaptorError::invalid_request("Anthropic tool must be a JSON object"))?;
@@ -445,21 +478,20 @@ fn project_tool(value: &JsonValue) -> AdaptorResult<ToolSpec> {
             "only custom function tools are supported",
         ));
     }
-    for flag in ["strict", "defer_loading"] {
-        if optional_bool(object, flag)? == Some(true) {
-            return Err(AdaptorError::invalid_request(format!(
-                "tool `{flag}` is not supported"
-            )));
-        }
+    if optional_bool(object, "strict")? == Some(true) {
+        return Err(AdaptorError::invalid_request(
+            "tool `strict` is not supported",
+        ));
     }
     reject_fields(object, &["allowed_callers", "input_examples"])?;
-    Ok(ToolSpec {
+    let tool = ToolSpec {
         name: required_string(object, "name")?,
         description: optional_string(object, "description")?,
         parameters: required_object(object, "input_schema", "tool")?,
         kind: ToolKind::Function,
         raw: value.clone(),
-    })
+    };
+    Ok((optional_bool(object, "defer_loading")? != Some(true)).then_some(tool))
 }
 
 /// An Anthropic `tool_choice` and the parallel-call permission it carries.
@@ -549,20 +581,60 @@ fn text_content(value: Option<&JsonValue>) -> AdaptorResult<Vec<ContentPart>> {
     }
 }
 
-fn validate_thinking(value: &JsonValue) -> AdaptorResult<()> {
+/// Whether `thinking` asks the model to think. Adaptive thinking leaves the
+/// choice to the model, so a model that does not think satisfies it.
+fn thinking_requested(value: &JsonValue) -> AdaptorResult<bool> {
     let object = value
         .as_object()
         .ok_or_else(|| AdaptorError::invalid_request("`thinking` must be a JSON object"))?;
     match required_string(object, "type")?.as_str() {
         "enabled" => {
             required_u32(object, "budget_tokens")?;
-            Ok(())
+            Ok(true)
         }
-        "disabled" => Ok(()),
+        "adaptive" | "disabled" => Ok(false),
         other => Err(AdaptorError::invalid_request(format!(
             "unsupported Anthropic thinking type `{other}`"
         ))),
     }
+}
+
+/// `effort` steers how much a model spends on a response, which a model
+/// without that control cannot honour or violate. Any other output control,
+/// such as a response format, would change the result and is refused.
+fn validate_output_config(value: &JsonValue) -> AdaptorResult<()> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| AdaptorError::invalid_request("`output_config` must be a JSON object"))?;
+    for key in object.keys() {
+        if key != "effort" {
+            return Err(AdaptorError::invalid_request(format!(
+                "Anthropic `output_config.{key}` is not supported"
+            )));
+        }
+    }
+    optional_string(object, "effort")?;
+    Ok(())
+}
+
+/// Clearing thinking from earlier turns changes nothing here: history never
+/// carries thinking blocks. Any other edit would rewrite the prompt.
+fn validate_context_management(value: &JsonValue) -> AdaptorResult<()> {
+    let object = value.as_object().ok_or_else(|| {
+        AdaptorError::invalid_request("`context_management` must be a JSON object")
+    })?;
+    for edit in optional_array(object, "edits")?.unwrap_or_default() {
+        let kind = edit
+            .get("type")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| AdaptorError::invalid_request("context edit requires a `type`"))?;
+        if !kind.starts_with("clear_thinking_") {
+            return Err(AdaptorError::invalid_request(format!(
+                "Anthropic context edit `{kind}` is not supported"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn output_blocks_json(output: &[OutputItem]) -> Vec<JsonValue> {

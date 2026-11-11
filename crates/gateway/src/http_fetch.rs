@@ -256,9 +256,9 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
                 BackendError::Busy(_) => "Work Fetch is busy; retry later",
                 BackendError::Conflict(_) => "conflicting request",
                 BackendError::Timeout(_) => "authenticated Fetch timed out",
-                BackendError::Unavailable(_) | BackendError::Failed(_) => {
-                    "authenticated Fetch failed"
-                }
+                BackendError::Unavailable(_)
+                | BackendError::Failed(_)
+                | BackendError::Output(_) => "authenticated Fetch failed",
             };
             if matches!(
                 error,

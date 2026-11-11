@@ -24,7 +24,7 @@ pub(super) fn text_events(
             match crate::before_deadline(deadline, inner.next()).await {
                 Ok(Some(Ok(GenerationEvent::Transcript(signed)))) => transcript = Some(signed),
                 Ok(Some(Ok(GenerationEvent::Delta(delta)))) => {
-                    for event in tools.feed(&delta).map_err(|error| BackendError::failed(error.to_string()))? { yield event.into(); }
+                    for event in tools.feed(&delta).map_err(|error| BackendError::Output(error.to_string()))? { yield event.into(); }
                 }
                 Ok(Some(Ok(GenerationEvent::Done(TextCompletion {
                     output_tokens,
@@ -42,7 +42,7 @@ pub(super) fn text_events(
                     if let Some(transcript) = &transcript {
                         yield BackendEvent::Provenance(completed_provenance(stream_provenance.as_ref(), transcript));
                     }
-                    for event in tools.finish(stop_reason_from_runtime(stop_reason.clone())).map_err(|error| BackendError::failed(error.to_string()))? { yield event.into(); }
+                    for event in tools.finish(stop_reason_from_runtime(stop_reason.clone())).map_err(|error| BackendError::Output(error.to_string()))? { yield event.into(); }
                     yield OutputEvent::Finished {
                         stop_reason: if tools.called() { hellas_adaptors::StopReason::ToolCall } else { stop_reason_from_runtime(stop_reason) },
                         usage: Some(usage(prompt_tokens, output_tokens)),
@@ -161,5 +161,76 @@ mod tests {
                 ));
             }
         }
+    }
+
+    /// Output that breaks the turn's tool contract is the model's, and the
+    /// same request repeats it: it is reported as unusable, not as a failure
+    /// a retry could cure.
+    #[tokio::test]
+    async fn output_breaking_the_tool_contract_is_unusable() {
+        use hellas_adaptors::{
+            RawRequest, WireAdaptor, openai::chat_completions::OpenAiChatCompletionsAdaptor,
+        };
+        let presentation = std::sync::Arc::new(
+            hellas_presentation::TextPresentation::from_gguf(
+                &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../client/src/model/package/mini-qwen3.gguf"),
+            )
+            .unwrap(),
+        );
+        let adaptor = OpenAiChatCompletionsAdaptor;
+        let parsed = adaptor
+            .parse(
+                RawRequest::from_value(serde_json::json!({
+                    "model": "m", "messages": [{"role": "user", "content": "hi"}],
+                    "tools": [{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}],
+                    "tool_choice": "required"
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let canonical = adaptor.to_execution_request(&parsed).unwrap().canonical;
+        let chat = presentation.prepare(&canonical).unwrap().turn;
+        let emitted = Artifact::new("emitted", "catena.u64le.v1", 2u64.to_le_bytes().to_vec());
+        let prepared = PreparedGeneration {
+            chat: Some(chat),
+            prepared: Box::pin(futures::stream::iter([
+                Ok(crate::WorkEvent::Output(ComputeEvent::Output(
+                    hellas_rpc::protocol::invocation::output::ArtifactChunk {
+                        name: emitted.name.clone(),
+                        format: emitted.format.clone(),
+                        offset: 0,
+                        bytes: emitted.bytes.clone(),
+                    },
+                ))),
+                Ok(crate::WorkEvent::Output(ComputeEvent::Done {
+                    output: InvocationOutput {
+                        outcome: Outcome::Succeeded,
+                        artifacts: vec![emitted],
+                        metadata: hellas_rpc::JsonBytes(
+                            hellas_rpc::canonical_dag_cbor(&RunMetadata {
+                                steps: 1,
+                                stop: Some(StopReason::Matched(3)),
+                            })
+                            .unwrap(),
+                        ),
+                    },
+                    provider: hellas_auth::ProducerSigningKey::from_secret_bytes([7; 32])
+                        .unwrap()
+                        .public_key(),
+                })),
+            ])),
+            provenance: None,
+            prompt_tokens: 1,
+            presentation,
+            deadline: None,
+        };
+        let events = text_events(prepared).collect::<Vec<_>>().await;
+        let error = events.last().unwrap().as_ref().unwrap_err();
+        assert!(matches!(error, BackendError::Output(_)), "{error}");
+        assert_eq!(
+            crate::backend_status(error),
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY
+        );
     }
 }

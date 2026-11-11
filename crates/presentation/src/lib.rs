@@ -3,44 +3,40 @@
 //! Nothing in this crate is part of the Catena causal-LM environment or
 //! Hellas's execution guarantee. The protocol commits the resulting input
 //! token IDs, caller-selected generation policy, exact execution environment,
-//! and output token IDs. A caller selects this local presentation
-//! configuration independently.
+//! and output token IDs. The chat format follows the caller's own model file.
 
 pub mod chat;
 mod qwen35;
 
-use std::{path::Path, str::FromStr};
+use std::path::Path;
 
 use anyhow::{Context, Result};
-use catena_models::tokenizer::{QwenDecodeStream, QwenTokenizer};
+use catena_models::{
+    checkpoint::read_gguf_model_config,
+    spec::ModelArchitecture,
+    tokenizer::{QwenDecodeStream, QwenTokenizer},
+};
 
 pub struct TextPresentation {
     tokenizer: QwenTokenizer,
-    chat_template: Option<ChatTemplate>,
+    chat_template: ChatTemplate,
 }
 
-/// An explicitly selected local chat format, independent of execution policy.
+/// A local chat format, independent of execution policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChatTemplate {
     /// Qwen3 text chat, with thinking disabled for new generations.
     Qwen3,
     /// Qwen3.5/3.6 text chat and XML function calls, with thinking disabled.
     Qwen35,
-    /// SmolLM2 Instruct text chat.
-    SmolLm2,
 }
 
-impl FromStr for ChatTemplate {
-    type Err = anyhow::Error;
-
-    fn from_str(value: &str) -> Result<Self> {
-        match value {
-            "qwen3" => Ok(Self::Qwen3),
-            "qwen3.5" | "qwen3.6" => Ok(Self::Qwen35),
-            "smollm2" => Ok(Self::SmolLm2),
-            _ => anyhow::bail!(
-                "unsupported chat template {value:?}; expected qwen3, qwen3.5/qwen3.6, or smollm2"
-            ),
+impl ChatTemplate {
+    /// The chat format a model of `architecture` was trained on.
+    pub fn of(architecture: ModelArchitecture) -> Self {
+        match architecture {
+            ModelArchitecture::Qwen3Dense => Self::Qwen3,
+            ModelArchitecture::Qwen35Dense | ModelArchitecture::Qwen35Moe => Self::Qwen35,
         }
     }
 }
@@ -64,10 +60,8 @@ impl ChatTemplate {
         tools: &[serde_json::Value],
     ) -> Result<String> {
         anyhow::ensure!(!messages.is_empty(), "chat requires at least one message");
-        match self {
-            Self::Qwen35 => return qwen35::render(messages, tools),
-            Self::SmolLm2 => return render_smollm2(messages, tools),
-            Self::Qwen3 => {}
+        if self == Self::Qwen35 {
+            return qwen35::render(messages, tools);
         }
         // Qwen/Qwen3-30B-A3B tokenizer_config.json at
         // ad44e777bcd18fa416d9da3bd8f70d33ebb85d39: text-only branch,
@@ -175,7 +169,8 @@ impl ChatTemplate {
 }
 
 impl TextPresentation {
-    /// Load the tokenizer embedded in an application-selected GGUF model.
+    /// The tokenizer embedded in an application-selected GGUF model, and the
+    /// chat format of its architecture.
     ///
     /// This performs local file I/O only. Neither Catena nor an RPC peer
     /// selects presentation for the caller.
@@ -184,13 +179,8 @@ impl TextPresentation {
             .with_context(|| format!("{} has no embedded tokenizer", path.display()))?;
         Ok(Self {
             tokenizer,
-            chat_template: None,
+            chat_template: ChatTemplate::of(read_gguf_model_config(path)?.architecture),
         })
-    }
-
-    pub fn with_chat_template(mut self, template: Option<ChatTemplate>) -> Self {
-        self.chat_template = template;
-        self
     }
 
     pub fn encode_chat(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
@@ -202,10 +192,7 @@ impl TextPresentation {
         messages: &[ChatMessage],
         tools: &[serde_json::Value],
     ) -> Result<Vec<u32>> {
-        let template = self.chat_template.context(
-            "chat requires an explicitly configured --chat-template (qwen3, qwen3.5/qwen3.6, or smollm2)",
-        )?;
-        self.encode(&template.render_with_tools(messages, tools)?)
+        self.encode(&self.chat_template.render_with_tools(messages, tools)?)
     }
 
     /// Plain text tokenization, independent of the selected chat template.
@@ -221,42 +208,6 @@ impl TextPresentation {
         let tokens = tokens.iter().copied().map(u64::from).collect::<Vec<_>>();
         self.tokenizer.decode(&tokens, true)
     }
-}
-
-fn render_smollm2(messages: &[ChatMessage], tools: &[serde_json::Value]) -> Result<String> {
-    anyhow::ensure!(
-        tools.is_empty(),
-        "SmolLM2 text chat does not support function tools"
-    );
-
-    // HuggingFaceTB/SmolLM2-135M-Instruct tokenizer_config.json at
-    // 12fd25f77366fa6b3b4b768ec3050bf629380bac, with
-    // add_generation_prompt=true. The checkpoint expects the default system
-    // turn when a conversation does not begin with one.
-    let mut prompt = String::new();
-    if messages[0].role != "system" {
-        prompt.push_str(
-            "<|im_start|>system\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>\n",
-        );
-    }
-    for message in messages {
-        anyhow::ensure!(
-            matches!(message.role.as_str(), "system" | "user" | "assistant"),
-            "SmolLM2 text chat does not support role {:?}",
-            message.role
-        );
-        anyhow::ensure!(
-            message.tool_calls.is_empty(),
-            "SmolLM2 text chat does not support tool-call history"
-        );
-        prompt.push_str("<|im_start|>");
-        prompt.push_str(&message.role);
-        prompt.push('\n');
-        prompt.push_str(&message.content);
-        prompt.push_str("<|im_end|>\n");
-    }
-    prompt.push_str("<|im_start|>assistant\n");
-    Ok(prompt)
 }
 
 /// Stateful streamed-token decoder for presentation UIs.
@@ -326,7 +277,7 @@ mod tests {
     fn presentation() -> Arc<TextPresentation> {
         Arc::new(TextPresentation {
             tokenizer: tokenizer(WORDS),
-            chat_template: None,
+            chat_template: ChatTemplate::Qwen3,
         })
     }
 
@@ -370,29 +321,25 @@ mod tests {
                 "<|im_start|>assistant\n<think>\n\n</think>\n\n",
             )
         );
-        assert!(presentation().encode_chat(&messages).is_err());
-        let selected = TextPresentation {
-            tokenizer: tokenizer(WORDS),
-            chat_template: Some(ChatTemplate::Qwen3),
-        };
-        assert_eq!(selected.encode("hello world").unwrap(), [0, 1]);
     }
 
+    /// A Qwen3.5 model rendered with the Qwen3 template writes tool calls its
+    /// parser cannot decode, so the format follows the GGUF's architecture.
     #[test]
-    fn smollm2_chat_matches_instruct_template() {
-        let messages = [ChatMessage {
-            role: "user".into(),
-            content: "Say hello".into(),
-            ..Default::default()
-        }];
+    fn chat_template_follows_the_gguf_architecture() {
+        let model = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../client/src/model/package/mini-qwen3.gguf");
         assert_eq!(
-            ChatTemplate::SmolLm2.render(&messages).unwrap(),
-            concat!(
-                "<|im_start|>system\n",
-                "You are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>\n",
-                "<|im_start|>user\nSay hello<|im_end|>\n",
-                "<|im_start|>assistant\n",
-            )
+            TextPresentation::from_gguf(&model).unwrap().chat_template,
+            ChatTemplate::Qwen3
+        );
+        assert_eq!(
+            ChatTemplate::of(ModelArchitecture::Qwen35Dense),
+            ChatTemplate::Qwen35
+        );
+        assert_eq!(
+            ChatTemplate::of(ModelArchitecture::Qwen35Moe),
+            ChatTemplate::Qwen35
         );
     }
 
@@ -421,7 +368,7 @@ mod tests {
             tokenizer: tokenizer(
                 r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":true},"model":{"type":"WordLevel","vocab":{"Ã":0,"©":1,"<unk>":2},"unk_token":"<unk>"}}"#,
             ),
-            chat_template: None,
+            chat_template: ChatTemplate::Qwen3,
         };
         let first = hellas_rpc::encode_token_ids(&[0]);
         let second = hellas_rpc::encode_token_ids(&[1]);

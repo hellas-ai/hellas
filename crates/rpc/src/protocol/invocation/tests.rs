@@ -1460,3 +1460,20 @@ fn compute_evaluator_matches_locked_catena_revision() {
         "compute evaluator must identify the locked Catena compiler"
     );
 }
+
+/// A requester sizes a text job's token budget to the terms: the step bound
+/// is the largest step loop the plan bounds admit, by steps or output bytes.
+#[test]
+fn the_step_bound_is_the_largest_admitted_step_loop() {
+    let mut limits = policy().limits;
+    for (max_steps, max_output_bytes, bound) in [(1024, 1 << 20, 1024), (1024, 100, 12)] {
+        limits.max_steps = max_steps;
+        limits.max_output_bytes = max_output_bytes;
+        assert_eq!(limits.step_bound(), bound);
+        let mut plan = step_plan();
+        plan.step.as_mut().unwrap().stop.max_steps = bound;
+        plan.validate_bounds(&limits).unwrap();
+        plan.step.as_mut().unwrap().stop.max_steps = bound + 1;
+        assert!(plan.validate_bounds(&limits).is_err());
+    }
+}

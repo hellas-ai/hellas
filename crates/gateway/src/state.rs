@@ -15,7 +15,7 @@ use hellas_adaptors::{
     WireAdaptor,
 };
 use hellas_client::model::ModelPackage;
-use hellas_presentation::{ChatTemplate, TextPresentation};
+use hellas_presentation::TextPresentation;
 use hellas_rpc::provenance::ExecutionProvenance;
 use std::sync::Arc;
 use tokio::time::Duration;
@@ -27,8 +27,15 @@ fn validate_native_text_request(canonical: &CanonicalExecution) -> Result<(), Ba
             "custom stop sequences are not supported by native text execution",
         ));
     }
+    // Native execution always takes the most likely token: temperature 0.
+    if let Some(temperature) = canonical.sampling.temperature
+        && temperature != 0.0
+    {
+        return Err(BackendError::rejected(format!(
+            "`temperature` {temperature} is not supported: native text execution decodes greedily, as at temperature 0"
+        )));
+    }
     for (name, present) in [
-        ("temperature", canonical.sampling.temperature.is_some()),
         ("top_p", canonical.sampling.top_p.is_some()),
         ("top_logprobs", canonical.sampling.top_logprobs.is_some()),
         ("truncation", canonical.sampling.truncation.is_some()),
@@ -100,10 +107,9 @@ where
 {
     post(
         move |State(state): State<Arc<TextState>>, body: Bytes| async move {
-            let model = state.model_name.clone();
             let backend = super::backend::GatewayBackend::new(state);
             let context = super::dispatch::render_context(id);
-            super::dispatch::serve(adaptor, surface, context, backend, Some(&model), &body).await
+            super::dispatch::serve(adaptor, surface, context, backend, &body).await
         },
     )
 }
@@ -111,7 +117,8 @@ where
 pub(super) struct TextState {
     pub(super) inference_metrics: super::backend::telemetry::InferenceMetrics,
     default_max_tokens: u32,
-    pub(super) model_name: String,
+    /// The most tokens one job may generate under the work source's terms.
+    max_tokens: Option<u32>,
     pub(super) inference_timeout: Option<Duration>,
     presentation: Arc<TextPresentation>,
     text: Arc<ModelPackage>,
@@ -143,17 +150,16 @@ impl TextState {
         let text = ModelPackage::open(&path)
             .await
             .map_err(|error| crate::GatewayError::Presentation(error.into()))?;
-        let presentation = tokio::task::spawn_blocking(move || {
-            TextPresentation::from_gguf(&path)
-                .map(|presentation| presentation.with_chat_template(Some(ChatTemplate::Qwen3)))
-        })
-        .await
-        .map_err(crate::GatewayError::Task)?
-        .map_err(|error| crate::GatewayError::Presentation(error.into()))?;
+        let presentation = tokio::task::spawn_blocking(move || TextPresentation::from_gguf(&path))
+            .await
+            .map_err(crate::GatewayError::Task)?
+            .map_err(|error| crate::GatewayError::Presentation(error.into()))?;
         Ok(Self {
             inference_metrics: super::backend::telemetry::InferenceMetrics::new(),
             default_max_tokens: options.default_max_tokens,
-            model_name: options.model_name.clone(),
+            max_tokens: work
+                .max_steps()
+                .map(|steps| u32::try_from(steps).unwrap_or(u32::MAX)),
             inference_timeout: work.timeout(),
             presentation: Arc::new(presentation),
             text: Arc::new(text),
@@ -167,10 +173,13 @@ impl TextState {
     ) -> Result<PreparedGeneration, BackendError> {
         let canonical = &req.canonical;
         validate_native_text_request(canonical)?;
+        // A budget beyond the terms is cut to them; generation then ends
+        // with the format's ordinary length stop.
         let max_tokens = canonical
             .sampling
             .max_output_tokens
-            .unwrap_or(self.default_max_tokens);
+            .unwrap_or(self.default_max_tokens)
+            .min(self.max_tokens.unwrap_or(u32::MAX));
         let chat = self.presentation.prepare(canonical).map_err(|err| {
             BackendError::rejected(format!("Failed to prepare model input: {err:#}"))
         })?;

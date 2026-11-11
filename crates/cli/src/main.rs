@@ -299,7 +299,7 @@ enum Commands {
     },
     /// Transcribe one WAV with a client-rendered Whisper job.
     Transcribe(commands::transact::TranscribeArgs),
-    /// Answer one prompt with a client-rendered Qwen3 text job.
+    /// Answer one prompt with a client-rendered Qwen text job.
     Text(commands::transact::TextArgs),
     /// Fetch a published distilled Flux2 Klein 4B snapshot and convert it
     /// into client metadata and provider assets.

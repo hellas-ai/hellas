@@ -452,7 +452,7 @@ fn unsupported_history_semantics_are_rejected_during_parse() {
         ),
         (
             "user",
-            json!([{"type":"tool_result","tool_use_id":"a","content":"failed","is_error":true}]),
+            json!([{"type":"tool_result","tool_use_id":"a","content":"","is_error":true}]),
         ),
         (
             "user",
@@ -500,4 +500,178 @@ fn execution_options_are_validated_but_metadata_is_preserved() {
             .is_none()
     );
     assert_eq!(parsed.raw.value()["metadata"]["user_id"], "test");
+}
+
+/// Claude Code 2.1.316's first request of a session, as it was sent with
+/// only long texts shortened.
+const CLAUDE_CODE: &str = include_str!("../../tests/fixtures/agents/claude-code-messages.json");
+
+fn text_of(content: &[ContentPart]) -> String {
+    content
+        .iter()
+        .map(|part| match part {
+            ContentPart::Text { text } => text.as_str(),
+            other => panic!("non-text part {other:?}"),
+        })
+        .collect()
+}
+
+#[test]
+fn claude_code_requests_project_to_one_system_prompt_and_its_offered_tools() {
+    let request: JsonValue = serde_json::from_str(CLAUDE_CODE).unwrap();
+    let parsed = adaptor().parse(raw(request.clone())).unwrap();
+    let canonical = adaptor().to_execution_request(&parsed).unwrap().canonical;
+    assert_eq!(canonical.sampling.max_output_tokens, Some(128_000));
+    // Adaptive thinking leaves the choice to the model.
+    assert!(canonical.reasoning.is_none());
+    // The deferred placeholder is never shown to the model.
+    let offered = request["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|tool| tool.get("defer_loading").is_none())
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        offered.len() + 1,
+        request["tools"].as_array().unwrap().len()
+    );
+    assert_eq!(
+        canonical
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        offered
+    );
+    // The system-role message follows the system blocks in the one system
+    // prompt, ahead of the conversation.
+    let Input::Items(items) = &canonical.input else {
+        panic!("expected input items");
+    };
+    let [InputItem::Message(system), InputItem::Message(user)] = &items[..] else {
+        panic!("expected a system prompt and one user turn: {items:?}");
+    };
+    assert_eq!(
+        (system.role.as_str(), user.role.as_str()),
+        ("system", "user")
+    );
+    let blocks = |value: &JsonValue| {
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|block| block["text"].as_str().unwrap())
+            .collect::<String>()
+    };
+    assert_eq!(
+        text_of(&system.content),
+        format!(
+            "{}\n\n{}",
+            blocks(&request["system"]),
+            blocks(&request["messages"][1]["content"])
+        )
+    );
+}
+
+/// Controls that only steer thinking or effort are accepted; those that would
+/// change the prompt or the output's form are refused.
+#[test]
+fn agent_controls_are_honoured_accepted_or_refused() {
+    let parse = |key: &str, value: JsonValue| {
+        let mut body =
+            json!({"model":"m","max_tokens":8,"messages":[{"role":"user","content":"hello"}]});
+        body[key] = value;
+        adaptor()
+            .parse(raw(body))
+            .map(|parsed| adaptor().to_execution_request(&parsed).unwrap().canonical)
+    };
+    for (key, value) in [
+        ("output_config", json!({"effort": "high"})),
+        (
+            "context_management",
+            json!({"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]}),
+        ),
+        (
+            "thinking",
+            json!({"type": "adaptive", "display": "updates"}),
+        ),
+    ] {
+        let canonical = parse(key, value).unwrap_or_else(|error| panic!("{key}: {error}"));
+        assert!(canonical.reasoning.is_none(), "{key}");
+    }
+    assert!(
+        parse(
+            "thinking",
+            json!({"type": "enabled", "budget_tokens": 1024})
+        )
+        .unwrap()
+        .reasoning
+        .is_some()
+    );
+    for (key, value) in [
+        ("output_config", json!({"format": {"type": "json_schema"}})),
+        ("output_config", json!({"effort": 3})),
+        (
+            "context_management",
+            json!({"edits": [{"type": "clear_tool_uses_20250919"}]}),
+        ),
+        ("thinking", json!({"type": "sometimes"})),
+    ] {
+        assert!(parse(key, value.clone()).is_err(), "accepted {key} {value}");
+    }
+}
+
+/// A failure after the stream began carries the error type the same failure
+/// has before it: a deterministic output failure is no server error.
+#[test]
+fn stream_errors_carry_the_type_of_their_status() {
+    let request = sample_request();
+    let mut state = adaptor().initial_state(&request, RenderContext::new("msg_1", "m", 0));
+    let events = adaptor()
+        .render_stream_event(
+            &request,
+            &mut state,
+            OutputEvent::Error {
+                message: "unusable model output".into(),
+                code: adaptor().error_code(422),
+            },
+        )
+        .unwrap();
+    let WireEventData::Json(error) = &events.last().unwrap().data else {
+        panic!("expected a JSON error event");
+    };
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    let WireBody::Json(body) = render_error(422, "unusable model output".into()).body else {
+        panic!("expected a JSON body");
+    };
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(adaptor().error_code(500).as_deref(), Some("api_error"));
+}
+
+/// A failed tool call's result reaches the model as its message, as an
+/// OpenAI tool message would: Claude Code reports a failed write this way.
+#[test]
+fn error_tool_results_reach_the_model_as_their_message() {
+    let parsed = adaptor()
+        .parse(raw(json!({"model":"m","max_tokens":8,"messages":[
+            {"role":"user","content":"write it"},
+            {"role":"assistant","content":[{"type":"tool_use","id":"a","name":"Write","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"a",
+                "content":"EACCES: permission denied","is_error":true}]}
+        ]})))
+        .unwrap();
+    let Input::Items(items) = adaptor()
+        .to_execution_request(&parsed)
+        .unwrap()
+        .canonical
+        .input
+    else {
+        panic!("expected input items");
+    };
+    let Some(InputItem::ToolResult { call_id, output }) = items.last() else {
+        panic!("expected a tool result: {items:?}");
+    };
+    assert_eq!(call_id, "a");
+    assert_eq!(text_of(output), "EACCES: permission denied");
 }

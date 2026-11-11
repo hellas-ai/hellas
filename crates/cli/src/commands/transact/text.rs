@@ -1,13 +1,14 @@
-//! `hellas text`: one Qwen3 chat turn, tokenized here and run as a Compute job.
+//! `hellas text`: one chat turn, tokenized here in the model's chat format
+//! and run as a Compute job.
 use super::*;
 use hellas_client::model::{ModelPackage, ModelRequest, ModelResponse};
-use hellas_presentation::{ChatMessage, ChatTemplate, TextPresentation};
+use hellas_presentation::{ChatMessage, TextPresentation};
 
 #[derive(Debug, Args)]
 pub struct TextArgs {
     #[command(flatten)]
     client: ClientArgs,
-    /// Qwen3 GGUF; the provider holds the same weights.
+    /// Qwen GGUF; the provider holds the same weights.
     #[arg(long, value_name = "FILE")]
     model: PathBuf,
     #[arg(long)]
@@ -66,11 +67,8 @@ async fn prepare(
     hellas_client::model::ComputeJob,
 )> {
     let model = args.model.clone();
-    let presentation = tokio::task::spawn_blocking(move || {
-        TextPresentation::from_gguf(&model)
-            .map(|presentation| presentation.with_chat_template(Some(ChatTemplate::Qwen3)))
-    })
-    .await??;
+    let presentation =
+        tokio::task::spawn_blocking(move || TextPresentation::from_gguf(&model)).await??;
     let messages: Vec<_> = args
         .system
         .iter()
