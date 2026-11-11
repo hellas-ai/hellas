@@ -31,3 +31,14 @@ pub(crate) fn parse_json_object(
         Err(err) => Err(format!("invalid JSON object: {err}")),
     }
 }
+
+pub(crate) fn parse_gpu_backend(value: &str) -> Result<hellas_client::model::GpuDialect, String> {
+    use hellas_client::model::GpuDialect;
+    match value {
+        "hip" => Ok(GpuDialect::Hip),
+        "cuda" => Ok(GpuDialect::Cuda),
+        "auto" if std::path::Path::new("/dev/nvidiactl").exists() => Ok(GpuDialect::Cuda),
+        "auto" => Ok(GpuDialect::Hip),
+        _ => Err("GPU runtime must be auto, hip, or cuda".into()),
+    }
+}

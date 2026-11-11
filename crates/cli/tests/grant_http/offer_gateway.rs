@@ -940,7 +940,7 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
     policy
         .admissions
         .push(hellas_rpc::protocol::invocation::Admission::Compute {
-            evaluator: hellas_rpc::protocol::invocation::compute::EVALUATOR.into(),
+            evaluator: hellas_channel::test_support::channel::evaluator(),
             programs: hellas_rpc::protocol::invocation::ComputePrograms::Any {},
         });
     let mut host = OfferHost::start_with_policy(None, None, None, policy).await;

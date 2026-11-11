@@ -23,6 +23,11 @@ struct Fake {
     started: tokio::sync::Notify,
 }
 impl WorkExecutionBackend for Fake {
+    fn evaluator(&self) -> Option<String> {
+        Some(hellas_client::model::evaluator(
+            hellas_client::model::GpuDialect::Hip,
+        ))
+    }
     fn timeout(&self) -> Option<std::time::Duration> {
         self.timeout
     }

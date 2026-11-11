@@ -21,6 +21,7 @@ enum Family {
 
 pub struct ModelPackage {
     family: Family,
+    evaluator: String,
 }
 
 /// What a model path serves, from its layout alone.
@@ -78,29 +79,37 @@ pub enum ModelResponse {
 }
 
 impl ModelPackage {
-    /// A Qwen GGUF, or a converted Whisper or Flux package directory.
-    pub async fn open(path: &Path) -> Result<Self> {
+    /// A Qwen GGUF, or a converted Whisper or Flux package directory, rendering
+    /// programs with the renderer registered under `evaluator`.
+    pub async fn open(path: &Path, evaluator: &str) -> Result<Self> {
+        let dialect = super::renderer(evaluator)?;
         Ok(Self {
+            evaluator: evaluator.into(),
             family: match ModelKind::of(path) {
                 ModelKind::Image => Family::Flux(Arc::new({
                     let path = path.to_owned();
-                    tokio::task::spawn_blocking(move || Flux::open(&path)).await??
+                    tokio::task::spawn_blocking(move || Flux::open(&path, dialect)).await??
                 })),
-                ModelKind::Transcription => Family::Whisper(Arc::new(Whisper::open(path).await?)),
-                ModelKind::Text => Family::Qwen3(Arc::new(Qwen3::open(path).await?)),
+                ModelKind::Transcription => {
+                    Family::Whisper(Arc::new(Whisper::open(path, dialect).await?))
+                }
+                ModelKind::Text => Family::Qwen3(Arc::new(Qwen3::open(path, dialect).await?)),
             },
         })
     }
-    /// The program manifest every job this model renders runs, which a
+    /// The program id (evaluator and manifest) every job this model renders runs, which a
     /// provider admits with `serve --program`. An image program depends on
     /// each request's size and steps, so an image model has none.
-    pub fn program(&self) -> Result<hellas_rpc::ContentId> {
+    pub fn program(&self) -> Result<hellas_rpc::protocol::invocation::compute::ProgramId> {
         let environment = match &self.family {
             Family::Whisper(model) => model.environment(),
             Family::Qwen3(model) => model.environment(),
             Family::Flux(_) => bail!("an image program depends on each request's size and steps"),
         };
-        Ok(environment.manifest()?.content_id())
+        Ok(hellas_rpc::protocol::invocation::compute::ProgramId {
+            evaluator: self.evaluator.clone(),
+            manifest: environment.manifest(&self.evaluator)?.content_id(),
+        })
     }
     pub fn is_image(&self) -> bool {
         matches!(self.family, Family::Flux(_))

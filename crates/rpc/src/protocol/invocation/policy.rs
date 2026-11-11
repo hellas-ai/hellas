@@ -82,6 +82,24 @@ pub enum Admission {
     },
 }
 impl Admission {
+    /// Admit exactly `programs`, which must share one evaluator.
+    pub fn compute_only(programs: &[compute::ProgramId]) -> Result<Self, CanonicalDecodeError> {
+        let [first, ..] = programs else {
+            return Err(error("compute admission requires a nonempty program list"));
+        };
+        if programs
+            .iter()
+            .any(|program| program.evaluator != first.evaluator)
+        {
+            return Err(error("admitted programs must share one evaluator"));
+        }
+        Ok(Self::Compute {
+            evaluator: first.evaluator.clone(),
+            programs: ComputePrograms::Only {
+                manifests: programs.iter().map(|program| program.manifest).collect(),
+            },
+        })
+    }
     pub const fn capacity_domain(&self) -> CapacityDomain {
         match self {
             Self::Compute { .. } => CapacityDomain::Gpu,
@@ -102,8 +120,7 @@ impl Admission {
                 evaluator,
                 programs,
             } => {
-                evaluator == compute::EVALUATOR
-                    && manifest.application().evaluator() == evaluator
+                manifest.application().evaluator() == evaluator
                     && manifest.application().adaptor() == compute::ADAPTOR
                     && programs.admits(manifest)
             }
@@ -132,6 +149,15 @@ pub struct InvocationPolicy {
     pub limits: Limits,
 }
 impl InvocationPolicy {
+    /// The evaluator id the policy's Compute admission runs programs for.
+    pub fn compute_evaluator(&self) -> Option<&str> {
+        self.admissions
+            .iter()
+            .find_map(|admission| match admission {
+                Admission::Compute { evaluator, .. } => Some(evaluator.as_str()),
+                Admission::Fetch { .. } => None,
+            })
+    }
     /// Whether this policy admits Compute programs nobody configured.
     pub fn admits_any_program(&self) -> bool {
         self.admissions.iter().any(|admission| {

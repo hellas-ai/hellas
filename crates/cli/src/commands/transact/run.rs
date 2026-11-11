@@ -91,7 +91,7 @@ fn parse_returns(value: &str) -> Result<OutputKind, String> {
 }
 
 impl Program {
-    pub(super) async fn job(&self, price: u64) -> super::super::CliResult<Job> {
+    pub(super) async fn job(&self, price: u64, evaluator: String) -> super::super::CliResult<Job> {
         let read = |path: &PathBuf, label, limit| {
             super::super::read_bounded_regular_file(path, label, limit)
         };
@@ -151,7 +151,7 @@ impl Program {
                 })
                 .collect(),
         };
-        Ok(Job::compute(price, environment, plan, inputs, content).await?)
+        Ok(Job::compute(price, evaluator, environment, plan, inputs, content).await?)
     }
 }
 
@@ -162,7 +162,7 @@ pub async fn run(args: RunArgs, context: Context) -> super::super::CliResult<()>
         &context,
         args.pay,
         args.save_job.clone(),
-        async |price| args.program.job(price).await,
+        async |price, evaluator| args.program.job(price, evaluator).await,
         |_| args.output.clone(),
         |job, completed, provider| {
             super::present_job(job, completed, provider, args.output.as_deref())

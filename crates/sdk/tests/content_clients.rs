@@ -239,7 +239,7 @@ async fn job_loading_reserves_before_opening_oversized_declared_objects() {
         ContentRef::for_bytes(b"declared").id(),
         hellas_channel::content::DEFAULT_MAX_STAGING_BYTES + 1,
     );
-    let mut doc = serde_json::json!({"format":hellas_sdk::job::FORMAT,"application":{"evaluator":compute::EVALUATOR,"adaptor":compute::ADAPTOR},"payment":{"price":0},"compute":{"environment":"environment.cbor","plan":hellas_channel::test_support::channel::plan(),"inputs":[],"objects":[{"object":object,"path":"must-not-be-opened"}]}});
+    let mut doc = serde_json::json!({"format":hellas_sdk::job::FORMAT,"application":{"evaluator":hellas_channel::test_support::channel::evaluator(),"adaptor":compute::ADAPTOR},"payment":{"price":0},"compute":{"environment":"environment.cbor","plan":hellas_channel::test_support::channel::plan(),"inputs":[],"objects":[{"object":object,"path":"must-not-be-opened"}]}});
     doc["compute"]["plan"]
         .as_object_mut()
         .unwrap()
@@ -272,7 +272,15 @@ async fn job_constructor_checks_root_and_streaming_folder_round_trip_keeps_ident
     };
     let plan = hellas_channel::test_support::channel::plan();
     assert!(matches!(
-        Job::compute(1, environment.clone(), plan.clone(), vec![], content()).await,
+        Job::compute(
+            1,
+            hellas_channel::test_support::channel::evaluator(),
+            environment.clone(),
+            plan.clone(),
+            vec![],
+            content()
+        )
+        .await,
         Err(JobError::Content(hellas_store::content::Error::Missing))
     ));
     let source = content();
@@ -285,9 +293,16 @@ async fn job_constructor_checks_root_and_streaming_folder_round_trip_keeps_ident
     hellas_channel::content::upload_object(&source.0, &environment.canonical_bytes().unwrap())
         .await
         .unwrap();
-    let job = Job::compute(1, environment, plan, vec![], source)
-        .await
-        .unwrap();
+    let job = Job::compute(
+        1,
+        hellas_channel::test_support::channel::evaluator(),
+        environment,
+        plan,
+        vec![],
+        source,
+    )
+    .await
+    .unwrap();
     let root = tempfile::tempdir().unwrap();
     job.save(root.path()).await.unwrap();
     let loaded = Job::load(root.path()).await.unwrap();

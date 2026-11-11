@@ -33,6 +33,7 @@ models = [
     "work",
     "dep:hexpr",
     "dep:anyhow",
+    "dep:catena-lang",
     "dep:catena-models",
     "dep:hellas-private",
     "dep:hellas-store",
@@ -52,6 +53,7 @@ models = [
 [dependencies]
 anyhow = { workspace = true, optional = true }
 async-stream = { workspace = true, optional = true }
+catena-lang = { workspace = true, optional = true }
 catena-models = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 hellas-attestation = { workspace = true, features = [

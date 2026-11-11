@@ -606,6 +606,18 @@ pub enum GatewayTarget {
 }
 
 impl GatewayTarget {
+    /// The evaluator id this target runs programs for: what its Compute
+    /// admission names, or the local runtime's registered id.
+    pub fn evaluator(&self) -> Option<String> {
+        match self {
+            Self::Paid { policy, .. } => policy.compute_evaluator().map(Into::into),
+            Self::Grant { policy, .. } => {
+                policy.invocation_policy.compute_evaluator().map(Into::into)
+            }
+            #[cfg(feature = "compute")]
+            Self::Local { execution, .. } => Some(execution.backend.evaluator()),
+        }
+    }
     /// The endpoint requests reach their provider through, if remote.
     pub fn endpoint(&self) -> Option<&iroh::Endpoint> {
         match self {
@@ -934,6 +946,9 @@ impl Inner {
 }
 
 impl WorkExecutionBackend for ExecutorGateway {
+    fn evaluator(&self) -> Option<String> {
+        self.inner.target.evaluator()
+    }
     fn fetch_routes(&self) -> Vec<hellas_gateway::FetchRoute> {
         self.inner.target.fetch_routes().unwrap_or_default()
     }
@@ -947,7 +962,13 @@ impl WorkExecutionBackend for ExecutorGateway {
         &self,
         job: hellas_client::model::ComputeJob,
     ) -> Result<WorkOutputStream<ComputeEvent>, WorkGatewayError> {
+        let evaluator = self
+            .inner
+            .target
+            .evaluator()
+            .ok_or(WorkGatewayError::Unsupported)?;
         self.request(WorkRequest::Job(JobInput::Compute {
+            evaluator,
             environment: job.environment,
             plan: job.plan,
             inputs: job.inputs,

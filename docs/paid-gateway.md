@@ -27,13 +27,13 @@ unless the authority already holds them, and delegate the stake its offers
 bond. Paid work is sold only with this file; nothing has a built-in
 default. [`faucet-provider.toml`](examples/faucet-provider.toml) is a complete
 example: price, jobs per channel, channel credit, offer bounds, upload/output
-limits, maximum steps, the execution limit, `[compute]` with `mode = "any"` and an optional
-`[fetch]` section. `mode = "any"` admits any program, which hands anyone who
-can submit jobs roughly root on the host, so `serve` refuses it unless
-`--knowingly-unsafe` acknowledges that. To restrict Compute to reviewed programs, use
-`[compute]` with `mode = "only"` and a nonempty `manifests` list of exact
-program manifest content IDs; `hellas program PATH` prints the manifest of a
-converted Whisper package or a Qwen GGUF. These bind the rendered code and asset hashes;
+limits, maximum steps, the execution limit, `[compute]` with `any` set to a compute
+id (the evaluator a GPU runtime registers, such as `hellas/catena-dfad87438018-hip`)
+and an optional `[fetch]` section. `any` admits any program of that compute id,
+which hands anyone who can submit jobs roughly root on the host, so `serve`
+refuses it unless `--knowingly-unsafe` acknowledges that. To restrict Compute to
+reviewed programs, use `[compute]` with a nonempty `only` list of program ids;
+`hellas program PATH` prints the id of a converted Whisper package or a Qwen GGUF. These bind the rendered code and asset hashes;
 request inputs and plans still vary within the configured limits. Omit
 `[compute]` to disable Compute. The same explicit `programs` selection applies
 to Compute admissions in owner-issued grant policies.

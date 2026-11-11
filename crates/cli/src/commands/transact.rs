@@ -581,6 +581,26 @@ impl Target {
     /// The terms a job built for this target must satisfy, if it has any,
     /// and the price it charges: a paid provider quotes first, at most the
     /// `--pay` ceiling, and the job is then built at exactly that price.
+    /// The evaluator id jobs for this target are rendered for: the local
+    /// runtime's registered id, or what the quoted or granted Compute
+    /// admission names.
+    fn evaluator(
+        &self,
+        policy: Option<&hellas_rpc::protocol::invocation::InvocationPolicy>,
+    ) -> super::CliResult<String> {
+        #[cfg(feature = "compute")]
+        if let Target::Local { native, .. } = self {
+            return native
+                .as_ref()
+                .and_then(crate::compute::ServeArgs::evaluator)
+                .context("local execution has no GPU runtime");
+        }
+        policy
+            .and_then(|policy| policy.compute_evaluator())
+            .map(Into::into)
+            .context("the target admits no Compute program")
+    }
+
     async fn quote(
         &mut self,
         client: &ClientArgs,
@@ -836,6 +856,23 @@ fn select_policy(
     }
 }
 
+/// A rendered model job at `price`.
+async fn compute_job(
+    price: u64,
+    evaluator: String,
+    rendered: hellas_client::model::ComputeJob,
+) -> super::CliResult<Job> {
+    Ok(Job::compute(
+        price,
+        evaluator,
+        rendered.environment,
+        rendered.plan,
+        rendered.inputs,
+        rendered.content,
+    )
+    .await?)
+}
+
 /// Helper commands quote first: resolve the target, take its price (a paid
 /// provider's quote, at most `pay`), build the job at that price, save it
 /// (in `save`, or under the client state by digest) and run it once.
@@ -847,7 +884,7 @@ async fn run_quoted(
     context: &Context,
     pay: Option<u64>,
     save: Option<PathBuf>,
-    build: impl AsyncFnOnce(u64) -> super::CliResult<Job>,
+    build: impl AsyncFnOnce(u64, String) -> super::CliResult<Job>,
     evidence: impl FnOnce(&Path) -> Option<PathBuf>,
     present: impl FnOnce(&Job, &Completed, &str) -> super::CliResult<()> + Send,
 ) -> super::CliResult<()> {
@@ -858,8 +895,8 @@ async fn run_quoted(
         )
         .await?;
         let result = async {
-            let (_, price) = within(deadline, target.quote(client, context)).await?;
-            let job = build(price).await?;
+            let (policy, price) = within(deadline, target.quote(client, context)).await?;
+            let job = build(price, target.evaluator(policy.as_ref())?).await?;
             let directory = save.unwrap_or_else(|| {
                 client
                     .root(context)

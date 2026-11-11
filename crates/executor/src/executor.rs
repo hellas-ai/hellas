@@ -142,6 +142,11 @@ impl Executor {
     }
 }
 impl ExecutorHandle {
+    /// The evaluator id this executor's GPU runtime registered.
+    #[cfg(feature = "compute")]
+    pub fn evaluator(&self) -> String {
+        catena::evaluator(self.inner.config.gpu_config.backend)
+    }
     fn capacity(&self, domain: CapacityDomain) -> Result<Arc<Semaphore>, BackendFault> {
         match domain {
             CapacityDomain::Fetch => Ok(self.inner.fetch_capacity.clone()),
@@ -227,9 +232,14 @@ impl ExecutorHandle {
                 let mut task = tokio::spawn(async move {
                     let opened = {
                         let opening = async {
-                            catena::program::BoundProgram::open(&content, &prepared, &limits)
-                                .await
-                                .map_err(|error| error.to_string())
+                            catena::program::BoundProgram::open(
+                                &content,
+                                &prepared,
+                                &limits,
+                                &catena::evaluator(executor.config.gpu_config.backend),
+                            )
+                            .await
+                            .map_err(|error| error.to_string())
                         };
                         tokio::pin!(opening);
                         // The caller below cancels on admission cancellation or

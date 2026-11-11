@@ -552,7 +552,14 @@ async fn run_writes_one_call_job_that_transact_loads_unchanged() {
         panic!("run");
     };
     assert!(args.client.timeout.is_none());
-    let job = args.program.job(20).await.unwrap();
+    let job = args
+        .program
+        .job(
+            20,
+            hellas_rpc::protocol::invocation::compute::EVALUATOR.into(),
+        )
+        .await
+        .unwrap();
     let folder = root.path().join("job");
     job.save(&folder).await.unwrap();
     let loaded = Job::load(&folder).await.unwrap();

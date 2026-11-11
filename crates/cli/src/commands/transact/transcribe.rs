@@ -24,19 +24,12 @@ pub struct TranscribeArgs {
 }
 
 pub async fn transcribe(args: TranscribeArgs, context: Context) -> super::super::CliResult<()> {
-    let package = ModelPackage::open(&args.model).await?;
     let samples = wav::decode(&super::super::read_bounded_regular_file(
         &args.audio,
         "WAV",
         wav::MAX_WAV_BYTES,
     )?)?;
-    let rendered = package
-        .render_job(&ModelRequest::Transcription {
-            samples: &samples,
-            language: args.language.as_deref(),
-            max_new_tokens: args.max_tokens,
-        })
-        .await?;
+    let package = std::sync::OnceLock::new();
     let mut target = args.target;
     target.models = vec![args.model.clone()];
     run_quoted(
@@ -45,19 +38,24 @@ pub async fn transcribe(args: TranscribeArgs, context: Context) -> super::super:
         &context,
         args.pay,
         None,
-        async |price| {
-            Ok(Job::compute(
-                price,
-                rendered.environment,
-                rendered.plan,
-                rendered.inputs,
-                rendered.content,
-            )
-            .await?)
+        async |price, evaluator| {
+            let opened = ModelPackage::open(&args.model, &evaluator).await?;
+            let opened = package.get_or_init(|| opened);
+            let rendered = opened
+                .render_job(&ModelRequest::Transcription {
+                    samples: &samples,
+                    language: args.language.as_deref(),
+                    max_new_tokens: args.max_tokens,
+                })
+                .await?;
+            compute_job(price, evaluator, rendered).await
         },
         |_| args.output.clone(),
         |_, completed, _| {
-            let ModelResponse::Transcription(transcription) = package.decode(&completed.output)?
+            let ModelResponse::Transcription(transcription) = package
+                .get()
+                .expect("the job was rendered")
+                .decode(&completed.output)?
             else {
                 bail!("expected transcription");
             };
@@ -75,7 +73,12 @@ mod tests {
     #[tokio::test]
     async fn whisper_plan_validates_against_the_compiled_bundle() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../client/src/model/whisper/mini");
-        let package = ModelPackage::open(&path).await.unwrap();
+        let package = ModelPackage::open(
+            &path,
+            &hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip),
+        )
+        .await
+        .unwrap();
         let mut job = package
             .render_job(&ModelRequest::Transcription {
                 samples: &[0.; 400],

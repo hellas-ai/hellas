@@ -187,6 +187,11 @@ pub trait WorkExecutionBackend: Send + Sync {
         Err(WorkGatewayError::Unsupported)
     }
 
+    /// The evaluator id the source runs Compute programs for, if it runs any.
+    fn evaluator(&self) -> Option<String> {
+        None
+    }
+
     /// An explicit end-to-end budget, including queued time, if the source has one.
     fn timeout(&self) -> Option<std::time::Duration> {
         None

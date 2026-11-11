@@ -102,13 +102,16 @@ fn paid_compute_program_selection_survives_config_parsing() {
         sources: vec![hellas_rpc::ContentRef::for_bytes(b"approved program")],
         assets: vec![],
     };
-    let manifest = environment.manifest().unwrap();
+    let manifest = environment
+        .manifest(hellas_rpc::protocol::invocation::compute::EVALUATOR)
+        .unwrap();
+    let program = hellas_rpc::protocol::invocation::compute::ProgramId {
+        evaluator: hellas_rpc::protocol::invocation::compute::EVALUATOR.into(),
+        manifest: manifest.content_id(),
+    };
     let selected = example.replace(
-        "mode = \"any\"",
-        &format!(
-            "mode = \"only\"\nmanifests = [\"{}\"]",
-            manifest.content_id()
-        ),
+        "any = \"hellas/catena-dfad87438018-hip\"",
+        &format!("only = [\"{program}\"]"),
     );
     let file: PaidWorkFile = toml::from_str(&selected).unwrap();
     let policy = file
@@ -123,14 +126,17 @@ fn paid_compute_program_selection_survives_config_parsing() {
         hellas_rpc::ContentId::hash(b"other"),
     );
     assert!(policy.invocation_policy.classify_manifest(&other).is_err());
-    let empty = selected.replace(&format!("\"{}\"", manifest.content_id()), "");
+    // The program id names its evaluator: the same program for another is not admitted.
+    let other = environment.manifest("hellas/another-evaluator").unwrap();
+    assert!(policy.invocation_policy.classify_manifest(&other).is_err());
+    let empty = selected.replace(&format!("\"{program}\""), "");
     assert!(
         toml::from_str::<PaidWorkFile>(&empty)
             .unwrap()
             .policy(Some(hellas_rpc::FetchContract::http().unwrap()))
             .is_err()
     );
-    let ambiguous = selected.replace("mode = \"only\"", "mode = \"any\"");
+    let ambiguous = selected.replace("only =", "any = \"hellas/catena-dfad87438018-hip\"\nonly =");
     assert!(toml::from_str::<PaidWorkFile>(&ambiguous).is_err());
 }
 

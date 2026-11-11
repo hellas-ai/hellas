@@ -59,6 +59,14 @@ pub fn child_main() -> Result<bool> {
     Ok(catena_lang::safe_runtime::run_safe_runtime_child_if_requested()?)
 }
 
+/// The runtime's name, in its evaluator id and the compile child's environment.
+pub(crate) fn name(dialect: GpuDialect) -> &'static str {
+    match dialect {
+        GpuDialect::Hip => "hip",
+        GpuDialect::Cuda => "cuda",
+    }
+}
+
 pub fn compile_sources(sources: &[String], dialect: GpuDialect) -> Result<RuntimeModule> {
     let raw = metacat::theory::RawTheorySet::from_texts(sources.iter().map(String::as_str))?;
     Ok(catena_lang::compile::compile(
@@ -149,13 +157,7 @@ fn compile_child(
         return Err("sources exceed compile limit".into());
     }
     let mut child = Command::new(executable)
-        .env(
-            COMPILE_ENV,
-            match dialect {
-                GpuDialect::Hip => "hip",
-                GpuDialect::Cuda => "cuda",
-            },
-        )
+        .env(COMPILE_ENV, name(dialect))
         .env_remove("CATENA_SAFE_RUNTIME_CHILD")
         .process_group(0)
         .stdin(Stdio::piped())

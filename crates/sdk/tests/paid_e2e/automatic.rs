@@ -108,9 +108,14 @@ impl WorkBackend for HostCompute {
             self.0.started.notify_one();
             self.0.release.notified().await;
         }
-        let opened = BoundProgram::open(&content, &prepared, &limits)
-            .await
-            .map_err(|error| error.to_string());
+        let opened = BoundProgram::open(
+            &content,
+            &prepared,
+            &limits,
+            &hellas_executor::catena::evaluator(hellas_executor::GpuDialect::Hip),
+        )
+        .await
+        .map_err(|error| error.to_string());
         let state = self.0.clone();
         tokio::task::spawn_blocking(move || -> Result<_, String> {
             let dialect = hellas_executor::GpuDialect::Hip;
@@ -1273,9 +1278,16 @@ async fn compute_job(source: &str, plan: Plan) -> (hellas_sdk::job::Job, hellas_
     };
     bytes.push(environment.canonical_bytes().unwrap());
     let content = source_content(bytes).await;
-    let job = hellas_sdk::job::Job::compute(JOB_PRICE, environment, plan, vec![], content)
-        .await
-        .unwrap();
+    let job = hellas_sdk::job::Job::compute(
+        JOB_PRICE,
+        hellas_channel::test_support::channel::evaluator(),
+        environment,
+        plan,
+        vec![],
+        content,
+    )
+    .await
+    .unwrap();
     (job, source_ref)
 }
 /// `Job::prepare` without B's policy pre-check, as a client that skips it.
@@ -1640,7 +1652,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
     let mut policy = paid_policy();
     policy.invocation_policy = InvocationPolicy {
         admissions: vec![Admission::Compute {
-            evaluator: invocation::compute::EVALUATOR.into(),
+            evaluator: hellas_channel::test_support::channel::evaluator(),
             programs: hellas_rpc::protocol::invocation::ComputePrograms::Any {},
         }],
         limits: Limits {
@@ -2202,6 +2214,7 @@ fn grant_composition<'a>(
         let environment = hellas_channel::test_support::channel::environment();
         let content = source_content([environment.canonical_bytes().unwrap()]).await;
         let input = hellas_sdk::job::JobInput::Compute {
+            evaluator: hellas_channel::test_support::channel::evaluator(),
             environment,
             plan: hellas_channel::test_support::channel::plan(),
             inputs: vec![],

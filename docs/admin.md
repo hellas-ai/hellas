@@ -11,7 +11,8 @@ with secrets under `/run`.
 
 Start a worker with `--program MANIFEST` for each Compute program it admits,
 plus `--content PATH` for the files those programs read. `hellas program PATH`
-prints the manifest of a converted Whisper package or a Qwen GGUF. That
+prints the id of a converted Whisper package or a Qwen GGUF, compiled
+for this host's GPU runtime (`--backend hip|cuda` picks another). That
 configures one `compute` resource with a machine/account budget; one job runs at
 a time. Use `--grant-config` instead for custom resources or budgets. A
 resource or paid terms may admit any program; compiling and running a program
