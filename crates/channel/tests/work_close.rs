@@ -372,6 +372,39 @@ async fn adjudication_waits_for_the_window_in_block_time() {
     );
 }
 
+/// A provider that died mid-job leaves the client holding an accepted job
+/// with no result. The client's own close start is the cutoff for it: the
+/// job ends as expired at the cursor, exactly as a contest would end it,
+/// and the start is signed rather than refused until the terminal deadline.
+#[tokio::test]
+async fn a_client_closes_over_an_accepted_job_whose_result_never_came() {
+    let root = temp();
+    let ready = hellas_channel::test_support::channel::ready();
+    let mut store = store_at(root.path(), &ready, Role::Client, CURSOR).await;
+    let id = hellas_channel::test_support::channel::accept(&mut [&mut store]).await;
+    let mut endpoint = ClientEndpoint::new(ready, store, client()).unwrap();
+    let start = endpoint
+        .prepare_close()
+        .await
+        .expect("an accepted job without a result does not hold the channel open");
+    let state = endpoint.state();
+    assert_eq!(state.jobs().len(), 0);
+    assert_eq!(
+        state.terminal_by_id(id).map(|t| t.outcome.clone()),
+        Some(TerminalOutcome::Expired {
+            deadline: hellas_channel::test_support::channel::deadlines().payment,
+            height: CURSOR,
+            payload: payload_at(CURSOR),
+        })
+    );
+    assert_eq!(state.includable_close_start(CURSOR), Some(&start));
+    assert_eq!(
+        endpoint.prepare_close().await.unwrap(),
+        start,
+        "the retained start is offered again"
+    );
+}
+
 // ── Re-anchoring ──────────────────────────────────────────────────────
 
 async fn provider_store(root: &std::path::Path) -> ChannelStore {

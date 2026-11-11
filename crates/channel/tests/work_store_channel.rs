@@ -1427,10 +1427,6 @@ async fn an_interrupted_invocation_stays_indeterminate() {
 
 /// The one job's price is checked against the compute limit before the
 /// provider co-signs, one unit either side.
-///
-/// There is no accumulation across jobs — the channel admits one job for
-/// life — so the whole of the check is the one job's price against the
-/// limit.
 #[tokio::test]
 async fn compute_credit_bounds_what_may_be_co_signed() {
     let verifier = Secp256k1Verifier::new();
@@ -1464,6 +1460,97 @@ async fn compute_credit_bounds_what_may_be_co_signed() {
     let job = job_at(&roomy, 1, 0);
     if let Err(error) = commit_with_content(&mut store, job.proposed(), &verifier).await {
         panic!("a job within the compute limit co-signs: {error}");
+    }
+}
+
+/// A reservation leaves "reserved" exactly once: payment credits it, and
+/// every other ending of an accepted job loses it. Lost compute and lost
+/// delivery count against their limits for the channel's life, through a
+/// checkpoint rotation and a replay, so unpaid work never refills them.
+/// A proposal the provider never co-signed loses nothing.
+#[tokio::test]
+async fn unpaid_endings_are_lost_and_never_refill_the_credit_limits() {
+    let verifier = Secp256k1Verifier::new();
+    let dir = temp();
+    let channel = channel_with(EdgeId::from_bytes([0xe7; 32]), limits(2 * PRICE, 2 * PRICE));
+    let mut store = open_on(dir.path(), channel.clone(), Role::Provider).await;
+    let ledger = |store: &ChannelStore| {
+        let ledger = store.state().ledger();
+        (ledger.lost_compute(), ledger.lost_delivery())
+    };
+
+    // Delivered, then never paid: compute and delivery are both lost.
+    let delivered = job_at(&channel, 1, 0);
+    commit_all(
+        &mut store,
+        &provider_sequence(&channel, &delivered).await[..5],
+    )
+    .await;
+    let expired = |job: &Job| ChannelRecord::JobTerminated {
+        work_id: job.work_id,
+        outcome: TerminalOutcome::Expired {
+            deadline: job.authorization.payment_deadline,
+            height: job.authorization.payment_deadline + 1,
+            payload: payload_at(job.authorization.payment_deadline + 1),
+        },
+    };
+    commit_all(&mut store, &[expired(&delivered)]).await;
+    assert_eq!(ledger(&store), (PRICE, PRICE));
+
+    // Never co-signed: nothing was spent, so nothing is lost.
+    let unsigned = job_at(&channel, 2, 0);
+    commit_all(&mut store, &[unsigned.proposed(), expired(&unsigned)]).await;
+    assert_eq!(ledger(&store), (PRICE, PRICE));
+
+    // Accepted and ended by the provider's own failure: compute is lost.
+    let failed = job_at(&channel, 3, 0);
+    commit_all(
+        &mut store,
+        &[
+            failed.proposed(),
+            failed.accepted(),
+            ChannelRecord::JobTerminated {
+                work_id: failed.work_id,
+                outcome: TerminalOutcome::Failed { code: 2 },
+            },
+        ],
+    )
+    .await;
+    assert_eq!(ledger(&store), (2 * PRICE, PRICE));
+    assert_eq!(store.state().jobs().len(), 0, "nothing stays reserved");
+
+    let refused = |error: &WorkStoreError| {
+        matches!(
+            error,
+            WorkStoreError::Channel(ChannelStateError::OverCredit {
+                ledger: "compute",
+                used,
+                reserved: 0,
+                price: PRICE,
+                limit,
+            }) if *used == 2 * PRICE && *limit == 2 * PRICE
+        )
+    };
+    let next = job_at(&channel, 4, 0);
+    let error = commit_with_content(&mut store, next.proposed(), &verifier)
+        .await
+        .expect_err("lost compute fills the limit");
+    assert!(refused(&error), "unexpected error: {error}");
+
+    // A replay of the records reaches the same totals, and so does a
+    // checkpoint that carries them across a rotation.
+    for rotate in [false, true] {
+        if rotate {
+            store.rotate().await.unwrap();
+        }
+        store.content_store().close().await;
+        drop(store);
+        store = open_on(dir.path(), channel.clone(), Role::Provider).await;
+        assert_eq!(ledger(&store), (2 * PRICE, PRICE));
+        let error = commit_with_content(&mut store, next.proposed(), &verifier)
+            .await
+            .expect_err("a restart does not refill the limit");
+        assert!(refused(&error), "unexpected error: {error}");
     }
 }
 

@@ -314,6 +314,13 @@ impl WorkService {
                                 _ => { yield Err(WireStatus::new(hellas_wire::WireCode::Internal, "result frame exceeds bound")); return; }
                             }
                         }
+                        // A released failure is never paid for; end it now
+                        // rather than hold its price until the payment deadline.
+                        if delivery.result.outcome == ResultOutcome::Failed
+                            && let Err(error) = service.end_failed_delivery(work_id).await
+                        {
+                            tracing::warn!(target: TARGET, %error, "a released failed result stays open until its deadline");
+                        }
                         return;
                     }
                     Err(refusal) if refusal.code != WorkRefusal::NotReady => {

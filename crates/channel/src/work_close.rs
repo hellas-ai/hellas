@@ -546,10 +546,11 @@ pub async fn observe<V: SigVerifier>(
 /// Ends every open job at an expired terminal, at the read that closed
 /// the channel to it.
 ///
-/// A contest or a close is the cutoff: no payment is credited after it,
-/// so a job still in flight is one that can no longer be paid for, and
-/// the provider bears whatever compute or delivery it already spent.
-async fn end_open_jobs<V: SigVerifier>(
+/// A contest, a close, or a client's own close start is the cutoff: no
+/// payment is credited after it, so a job still in flight is one that can
+/// no longer be paid for, and the provider bears whatever compute or
+/// delivery it already spent.
+pub(crate) async fn end_open_jobs<V: SigVerifier>(
     store: &mut ChannelStore,
     height: u64,
     payload: [u8; 32],
