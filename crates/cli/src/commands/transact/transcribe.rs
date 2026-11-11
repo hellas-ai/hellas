@@ -38,7 +38,7 @@ pub async fn transcribe(args: TranscribeArgs, context: Context) -> super::super:
         })
         .await?;
     let mut target = args.target;
-    target.model = Some(args.model.clone());
+    target.models = vec![args.model.clone()];
     run_quoted(
         &args.client,
         target,

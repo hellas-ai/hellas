@@ -5,6 +5,8 @@ use futures::StreamExt;
 use hellas_rpc::pb::work::{WorkStreamEvent, work_stream_event};
 use hellas_rpc::protocol::invocation::output;
 
+/// Receives a running job's signed output prefix, one event at a time. Work
+/// run through this crate never passes it the terminal or failure event.
 pub type PaidProgress = Arc<dyn Fn(OutputEventEnvelope) -> Result<(), BackendFault> + Send + Sync>;
 pub type PaidResultStream = hellas_rpc::call::ResponseStream<WorkStreamEvent>;
 
@@ -241,12 +243,6 @@ impl WorkService {
         facts: &AdmissionFacts,
         event: OutputEventEnvelope,
     ) -> Result<(), BackendFault> {
-        if matches!(
-            event.event().body().kind(),
-            output::TERMINAL | output::FAILURE
-        ) {
-            return Ok(());
-        }
         let mut jobs = self
             .progress
             .lock()

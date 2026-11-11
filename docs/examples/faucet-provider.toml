@@ -38,7 +38,9 @@ redelegate_payout = true
 # Includes a freshly shipped Whisper program, log-mel features and token masks.
 max_upload_bytes = 4194304
 max_output_bytes = 1048576
-max_steps = 64
+# A text job takes one step per generated token; this admits the text
+# command's and the gateway's default token budgets.
+max_steps = 256
 execution_timeout_ms = 90000
 
 # Caller-signed HTTPS Fetch. Remove this section to sell compute only.

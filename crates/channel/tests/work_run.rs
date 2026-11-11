@@ -293,6 +293,62 @@ fn a_providers_producer_key_is_its_party_key() {
 
 // ── One accepted job, one invocation ──────────────────────────────────
 
+/// A backend may hand its progress every event it signs, as the executor
+/// does. Work run through the shared core still shows progress only the
+/// output prefix: the terminal, or the failure, arrives once, in the
+/// returned transcript.
+#[tokio::test]
+async fn admitted_progress_sees_only_the_signed_output_prefix() {
+    use hellas_channel::work::{PaidProgress, admission::WorkAdmission, run_admitted};
+    use hellas_rpc::protocol::invocation::output::{FailureReason, OutputStream};
+    struct EveryEvent(Vec<OutputEventEnvelope>);
+    impl WorkBackend for EveryEvent {
+        fn try_admit(
+            &self,
+            domain: hellas_channel::work::admission::CapacityDomain,
+        ) -> Result<hellas_channel::work::admission::WorkPermit, BackendFault> {
+            Err(hellas_channel::work::admission::AdmissionError::Unsupported(domain).into())
+        }
+        async fn execute_stream(
+            &self,
+            _input: hellas_channel::work::Admitted,
+            progress: PaidProgress,
+        ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
+            for event in &self.0 {
+                progress(event.clone())?;
+            }
+            Ok(self.0.clone())
+        }
+    }
+    let request = bundle(1).request;
+    let (_, failed) = OutputStream::new(&request, &provider_producer(), 1 << 20)
+        .unwrap()
+        .fail(FailureReason::Compilation)
+        .unwrap();
+    for transcript in [answer_transcript(&request), failed] {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let progress: PaidProgress = {
+            let seen = seen.clone();
+            Arc::new(move |event| {
+                seen.lock().unwrap().push(event);
+                Ok(())
+            })
+        };
+        let events = run_admitted(
+            &EveryEvent(transcript.clone()),
+            bundle(1),
+            &work_policy(),
+            hellas_channel::test_support::channel::program_content().await,
+            WorkAdmission::payment(),
+            progress,
+        )
+        .await
+        .unwrap();
+        assert_eq!(events, transcript);
+        assert_eq!(*seen.lock().unwrap(), transcript[..transcript.len() - 1]);
+    }
+}
+
 /// One accepted job reaches the backend once, across a retry and across
 /// a restart.
 ///

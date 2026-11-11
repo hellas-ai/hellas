@@ -756,13 +756,6 @@ impl GrantService {
         }
     }
     fn progress(&self, id: Digest, event: OutputEventEnvelope) -> Result<(), BackendFault> {
-        if matches!(
-            event.event().body().kind(),
-            hellas_rpc::protocol::invocation::output::TERMINAL
-                | hellas_rpc::protocol::invocation::output::FAILURE
-        ) {
-            return Ok(());
-        }
         let mut held = self
             .inner
             .lock()

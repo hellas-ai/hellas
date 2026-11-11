@@ -11,7 +11,9 @@ pub(super) struct LocalCompute {
 }
 
 impl LocalCompute {
-    pub async fn start(model: &Path, content: &Path, extra: &[&str]) -> Self {
+    /// `content`, if any, is served through a content configuration; the
+    /// gateway serves `model` to its jobs either way.
+    pub async fn start(model: &Path, content: Option<&Path>, extra: &[&str]) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         hellas_private::restrict_directory(root).unwrap();
@@ -22,14 +24,12 @@ impl LocalCompute {
         };
         let journal = owner.home.join("provider");
         let (gateway_profile, gateway_token) = gateway_profile(root).await;
-        let configuration = prepare_content(root, &journal, content);
-        let mut args = vec![
-            "gateway",
-            "--local",
-            "--model",
-            string(model),
-            "--content-config",
-            string(&configuration),
+        let configuration = content.map(|content| prepare_content(root, &journal, content));
+        let mut args = vec!["gateway", "--local", "--model", string(model)];
+        if let Some(configuration) = &configuration {
+            args.extend(["--content-config", string(configuration)]);
+        }
+        args.extend([
             "--gpu-backend",
             "hip",
             "--port",
@@ -37,7 +37,7 @@ impl LocalCompute {
             "--gateway-profile",
             string(&gateway_profile),
             "--zdr",
-        ];
+        ]);
         args.extend_from_slice(extra);
         let mut gateway = owner.spawn(&args, "local-model-gateway.log");
         let address = gateway.wait_for("gateway listening on ").await;
