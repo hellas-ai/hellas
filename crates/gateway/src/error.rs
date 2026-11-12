@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, process::ExitStatus};
+use std::net::SocketAddr;
 
 pub type GatewayResult<T> = Result<T, GatewayError>;
 
@@ -35,13 +35,6 @@ pub enum GatewayError {
     },
     #[error("gateway bind address {host}:{port} resolved to no address")]
     NoAddress { host: String, port: u16 },
-    #[error("failed to spawn {command}")]
-    Spawn {
-        command: String,
-        source: std::io::Error,
-    },
-    #[error("wrapped command exited with status {0}")]
-    WrappedCommand(ExitStatus),
     #[error("model presentation failed: {0}")]
     Presentation(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error(transparent)]
@@ -90,10 +83,10 @@ pub enum GatewayConfigError {
     RouteConflict(String),
     #[error("several sealed Responses routes; select one resource")]
     AmbiguousResponses,
-    #[error("backend {0} has no HTTPS Fetch route on its provider")]
-    MissingFetchRoute(String),
-    #[error("backend {0} names a Fetch route its provider's policy does not seal")]
-    FetchRouteMismatch(String),
-    #[error("backend {0}'s provider seals several HTTPS routes; name one with service and method")]
-    AmbiguousFetchRoute(String),
+    #[error("backend has no HTTPS Fetch route")]
+    MissingFetchRoute,
+    #[error("backend names a Fetch route its policy does not seal")]
+    FetchRouteMismatch,
+    #[error("backend seals several HTTPS routes; name one with service and method")]
+    AmbiguousFetchRoute,
 }

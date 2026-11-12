@@ -139,7 +139,7 @@ impl FixtureBuilder {
         );
         let options = host.options(addresses);
         let gateway = ExecutorGateway::new(
-            GatewayTarget::Grant {
+            crate::Backend::Grant {
                 policy: options.target.offer().grant.policies[0].clone(),
                 options,
                 transport,
@@ -157,14 +157,14 @@ impl FixtureBuilder {
 }
 impl Fixture {
     fn options(&self) -> &crate::grant_client::GrantSessionOptions {
-        let GatewayTarget::Grant { options, .. } = self.gateway.target() else {
+        let crate::Backend::Grant { options, .. } = self.gateway.target() else {
             unreachable!("a grant fixture")
         };
         options
     }
     /// A fresh session on the gateway's channel, to read its client store.
     async fn session(&self) -> GrantSession {
-        let GatewayTarget::Grant {
+        let crate::Backend::Grant {
             options, transport, ..
         } = self.gateway.target()
         else {
@@ -214,8 +214,6 @@ impl Fixture {
                 port: Some(0),
                 access,
                 allow_remote: false,
-                wrap: None,
-                wrap_args: vec![],
             },
             work: self.gateway.clone(),
             presentations: hellas_gateway::Presentations {
@@ -251,9 +249,6 @@ impl Fixture {
             max_response_bytes: template.max_response_bytes,
         };
         WorkFetchRequest {
-            resource: None,
-            channel: None,
-            provider: self.gateway.target().provider().unwrap().unwrap(),
             service: "openai".into(),
             method: "responses".into(),
             body: serde_json::to_vec(&http).unwrap(),
@@ -468,36 +463,6 @@ async fn refreshed_https_bounds_are_checked_before_proposal() {
         assert_eq!(fixture.session().await.store().next_nonce().unwrap(), 1);
         fixture.shutdown().await;
     }
-}
-
-#[tokio::test]
-async fn wrong_resource_or_channel_never_reaches_a_proposal() {
-    let fixture = Fixture::builder().build().await;
-    let resource = fixture.host.allowance.policies[0].resource;
-    let channel = super::channel(fixture.options()).unwrap();
-    for (selected_resource, selected_channel) in [
-        (
-            Some(hellas_auth::authority::ResourceId(
-                hellas_auth::Digest::hash(b"other"),
-            )),
-            Some(channel),
-        ),
-        (
-            Some(resource),
-            Some(hellas_channel::model::grant::ChannelId(
-                hellas_auth::Digest::hash(b"other"),
-            )),
-        ),
-        (Some(resource), None),
-    ] {
-        let mut request = fixture.request(None);
-        request.resource = selected_resource;
-        request.channel = selected_channel;
-        assert!(fixture.gateway.fetch(request).is_err());
-    }
-    assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 0);
-    assert_eq!(fixture.session().await.store().next_nonce().unwrap(), 1);
-    fixture.shutdown().await;
 }
 
 #[tokio::test]
@@ -936,7 +901,7 @@ async fn single_signed_model_responses_route_tracks_continuation() {
         .await
         .unwrap();
     let gateway = ExecutorGateway::new(
-        GatewayTarget::Grant {
+        crate::Backend::Grant {
             policy: options.target.offer().grant.policies[0].clone(),
             options,
             transport: GrantTransport::Remote(endpoint),
@@ -956,8 +921,6 @@ async fn single_signed_model_responses_route_tracks_continuation() {
             port: Some(0),
             access,
             allow_remote: false,
-            wrap: None,
-            wrap_args: vec![],
         },
         work: gateway.clone(),
         presentations: hellas_gateway::Presentations {
@@ -1021,12 +984,6 @@ async fn the_command_executor_runs_a_grant_once_and_replays_it() {
         max_response_bytes: template.max_response_bytes,
     };
     let input = WorkRequest::Fetch(WorkFetchRequest {
-        resource: None,
-        channel: None,
-        provider: iroh::EndpointId::from_bytes(
-            &grant_transport(&options.target.offer().provider).unwrap(),
-        )
-        .unwrap(),
         service: "openai".into(),
         method: "responses".into(),
         body: serde_json::to_vec(&http).unwrap(),

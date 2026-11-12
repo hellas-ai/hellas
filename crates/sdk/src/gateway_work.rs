@@ -5,7 +5,7 @@ use crate::execution::{ExecutionError, Executor, RequestStopped};
 use crate::grant_client::GrantClientError;
 use crate::job::{Job, JobError, JobInput};
 use futures::{future::BoxFuture, stream::BoxStream};
-use hellas_authority::model::grant::records::{GrantPolicy, grant_transport};
+use hellas_authority::model::grant::records::GrantPolicy;
 use hellas_authority::model::grant::resource::HttpsResource;
 use hellas_gateway::{
     ComputeEvent, WorkEvent, WorkExecutionBackend, WorkFetchRequest, WorkGatewayBusy,
@@ -406,23 +406,15 @@ impl<E: GatewayEvent, X: std::fmt::Display + Send + 'static> Requester<E, X> {
 }
 
 /// What HTTP asks for, before any source has matched it to a policy.
+#[expect(clippy::large_enum_variant, reason = "one owned input per request")]
 pub enum WorkRequest {
-    /// Pinned to one provider by the HTTP account router; the contract comes
-    /// from the admitting policy.
+    /// The contract comes from the admitting policy.
     Fetch(WorkFetchRequest),
     /// A complete input; any admitting provider may run it.
     Job(JobInput),
 }
 
 impl WorkRequest {
-    /// The provider this request must run on, if it names one.
-    pub fn pinned(&self) -> Option<iroh::EndpointId> {
-        match self {
-            WorkRequest::Fetch(request) => Some(request.provider),
-            WorkRequest::Job(_) => None,
-        }
-    }
-
     /// The one input `policy` admits for this request. A Fetch tries each
     /// Fetch contract of `policy`; an HTTPS body is first repaired under
     /// `https`, a complete HTTPS job's body too. Two admitting contracts are
@@ -501,38 +493,6 @@ fn repair(https: &HttpsResource, body: &[u8]) -> Result<Vec<u8>, JobError> {
     Ok(serde_json::to_vec(&http)?)
 }
 
-/// The Fetch routes `policy` admits on `provider`, each once.
-pub(crate) fn fetch_routes<'a>(
-    provider: iroh::EndpointId,
-    policies: impl IntoIterator<Item = &'a InvocationPolicy>,
-) -> Vec<hellas_gateway::FetchRoute> {
-    use hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy;
-    let mut routes = Vec::new();
-    for policy in policies {
-        for admission in &policy.admissions {
-            let Admission::Fetch { admission } = admission else {
-                continue;
-            };
-            let route = hellas_gateway::FetchRoute {
-                resource: None,
-                channel: None,
-                provider,
-                schema: admission.contract.schema(),
-                sealed: match &admission.route {
-                    FetchRoutePolicy::SealedRoute { service, method } => {
-                        Some((service.clone(), method.clone()))
-                    }
-                    FetchRoutePolicy::OpenFetch { .. } => None,
-                },
-            };
-            if !routes.contains(&route) {
-                routes.push(route);
-            }
-        }
-    }
-    routes
-}
-
 /// What a gateway serves beyond what its work source admits.
 #[derive(Clone)]
 pub struct GatewayServeOptions {
@@ -580,13 +540,14 @@ pub async fn serve_gateway(
 }
 
 /// Where every request of one gateway runs: the job commands' targets.
-#[expect(clippy::large_enum_variant, reason = "one per gateway")]
-pub enum GatewayTarget {
-    /// The provider's quoted terms, asked once when the gateway starts;
-    /// `options.expected_price` is the quoted price.
+#[derive(Clone)]
+#[expect(clippy::large_enum_variant, reason = "one per backend")]
+pub enum Backend {
+    /// Paid execution options and, after `quote`, the provider's terms.
+    /// A saved job already carries its price and needs no new quote.
     Paid {
         options: crate::paid_client::PaidWorkOptions,
-        policy: InvocationPolicy,
+        policy: Option<InvocationPolicy>,
         endpoint: iroh::Endpoint,
         settlement_key: hellas_kernel::Secp256k1Signer,
         owner: Arc<crate::client_owner::ClientOwner>,
@@ -605,7 +566,7 @@ pub enum GatewayTarget {
     },
 }
 
-impl GatewayTarget {
+impl Backend {
     /// The endpoint requests reach their provider through, if remote.
     pub fn endpoint(&self) -> Option<&iroh::Endpoint> {
         match self {
@@ -618,66 +579,62 @@ impl GatewayTarget {
         }
     }
 
-    /// The provider every request runs on; none for this machine.
-    fn provider(&self) -> Result<Option<iroh::EndpointId>, WorkGatewayError> {
-        Ok(match self {
-            Self::Paid { options, .. } => Some(options.provider.node),
-            Self::Grant { options, .. } => Some(
-                iroh::EndpointId::from_bytes(
-                    &grant_transport(&options.target.offer().provider).map_err(execution)?,
+    /// Quote paid work before rendering a job. Saved jobs already carry their
+    /// price and can execute without requesting another quote.
+    pub async fn quote(&mut self) -> Result<u64, crate::paid_client::PaidClientError> {
+        match self {
+            Self::Paid {
+                options,
+                policy,
+                endpoint,
+                settlement_key,
+                owner,
+            } => {
+                let quote = crate::paid_client::request_paid_quote(
+                    options,
+                    endpoint,
+                    settlement_key,
+                    owner.principal(),
                 )
-                .map_err(execution)?,
-            ),
-            #[cfg(feature = "compute")]
-            Self::Local { .. } => None,
-        })
+                .await?;
+                options.expected_price = quote.policy.payment_policy.fixed_price;
+                *policy = Some(quote.policy.invocation_policy);
+                Ok(options.expected_price)
+            }
+            _ => Ok(0),
+        }
     }
 
     /// The one job `request` becomes under this target's terms.
     fn job(&self, request: &WorkRequest) -> Result<Job, WorkGatewayError> {
-        if let Some(provider) = request.pinned()
-            && self.provider()? != Some(provider)
-        {
-            return Err(WorkGatewayError::Provider(provider));
-        }
         let input = match self {
             Self::Paid {
                 options, policy, ..
-            } => {
-                if matches!(request, WorkRequest::Fetch(fetch) if fetch.resource.is_some() || fetch.channel.is_some())
-                {
-                    return Err(rejected(std::io::Error::other(
-                        "paid work has no grant resource selector",
-                    )));
-                }
-                request.admitted(policy, None, options.assurance, true)
-            }
+            } => request.admitted(
+                policy.as_ref().ok_or(WorkGatewayError::Unsupported)?,
+                None,
+                options.assurance,
+                true,
+            ),
             Self::Grant {
                 options, policy, ..
-            } => {
-                if let WorkRequest::Fetch(fetch) = request
-                    && (fetch.resource.is_some() != fetch.channel.is_some()
-                        || fetch.resource.is_some_and(|id| id != policy.resource)
-                        || fetch.channel.is_some_and(|id| Some(id) != channel(options)))
-                {
-                    return Err(rejected(std::io::Error::other(
-                        "the request names another granted resource",
-                    )));
-                }
-                request.admitted(
-                    &policy.invocation_policy,
-                    policy.https.as_ref(),
-                    options.target.trust().required_assurance,
-                    false,
-                )
-            }
+            } => request.admitted(
+                &policy.invocation_policy,
+                policy.https.as_ref(),
+                options.target.trust().required_assurance,
+                false,
+            ),
             #[cfg(feature = "compute")]
             Self::Local { timeout, .. } => match request {
-                WorkRequest::Job(input) => {
-                    crate::execution::local::policy(input, *timeout).and_then(|policy| {
-                        request.admitted(&policy, None, hellas_rpc::Assurance::ProducerSigned, false)
-                    })
-                }
+                WorkRequest::Job(input) => crate::execution::local::policy(input, *timeout)
+                    .and_then(|policy| {
+                        request.admitted(
+                            &policy,
+                            None,
+                            hellas_rpc::Assurance::ProducerSigned,
+                            false,
+                        )
+                    }),
                 WorkRequest::Fetch(_) => return Err(WorkGatewayError::Unsupported),
             },
         }
@@ -697,7 +654,7 @@ impl GatewayTarget {
             reason = "only local runs size their terms to the job"
         )
     )]
-    fn executor(&self, job: &Job) -> Result<Executor, ExecutionError> {
+    pub fn executor(&self, job: &Job) -> Result<Executor, ExecutionError> {
         Ok(match self {
             Self::Paid {
                 options,
@@ -732,26 +689,26 @@ impl GatewayTarget {
         })
     }
 
-    /// The Fetch routes this target admits.
-    pub fn fetch_routes(&self) -> Result<Vec<hellas_gateway::FetchRoute>, WorkGatewayError> {
-        let Some(provider) = self.provider()? else {
-            return Ok(Vec::new());
-        };
-        Ok(match self {
-            Self::Paid { policy, .. } => fetch_routes(provider, [policy]),
-            Self::Grant {
-                options, policy, ..
-            } => fetch_routes(provider, [&policy.invocation_policy])
-                .into_iter()
-                .map(|mut route| {
-                    route.resource = Some(policy.resource);
-                    route.channel = channel(options);
-                    route
-                })
-                .collect(),
+    /// The Fetch schemas and routes admitted by this backend, each once.
+    pub fn fetch_routes(&self) -> Vec<(hellas_rpc::FetchSchema, FetchRoutePolicy)> {
+        let policy = match self {
+            Self::Paid { policy, .. } => policy.as_ref(),
+            Self::Grant { policy, .. } => Some(&policy.invocation_policy),
             #[cfg(feature = "compute")]
-            Self::Local { .. } => Vec::new(),
-        })
+            Self::Local { .. } => None,
+        };
+        let mut routes = Vec::new();
+        if let Some(policy) = policy {
+            for admission in &policy.admissions {
+                if let Admission::Fetch { admission } = admission {
+                    let route = (admission.contract.schema(), admission.route.clone());
+                    if !routes.contains(&route) {
+                        routes.push(route);
+                    }
+                }
+            }
+        }
+        routes
     }
 
     /// The HTTP routes a granted HTTPS resource presents, if it has one.
@@ -830,23 +787,6 @@ fn policy_http_routes(
     Ok((service.clone(), method.clone(), routes))
 }
 
-/// The grant channel this device opens with the offer.
-fn channel(
-    options: &crate::grant_client::GrantSessionOptions,
-) -> Option<hellas_channel::model::grant::ChannelId> {
-    let node =
-        hellas_auth::authority::NodeKey::from_public_key(options.signer.public_key()).ok()?;
-    Some(
-        options
-            .target
-            .offer()
-            .channel(hellas_channel::model::grant::ChannelClient {
-                principal: options.principal,
-                node,
-            }),
-    )
-}
-
 /// The gateway backend: one [`Executor`] run per request, one at a time,
 /// since a channel journal, a funding wallet and a machine each have one owner.
 /// It owns its target's endpoint and closes it when it drains.
@@ -857,7 +797,7 @@ pub struct ExecutorGateway {
 }
 
 struct Inner {
-    target: GatewayTarget,
+    target: Backend,
     evaluator: Option<String>,
     signer: Arc<hellas_auth::ProducerSigningKey>,
     serial: tokio::sync::Mutex<()>,
@@ -867,7 +807,7 @@ impl ExecutorGateway {
     /// `evaluator` is the renderer Compute requests are rendered for, if any;
     /// `signer` signs paid and local proposals: the caller's device key.
     pub fn new(
-        target: GatewayTarget,
+        target: Backend,
         evaluator: Option<String>,
         signer: Arc<hellas_auth::ProducerSigningKey>,
     ) -> Arc<Self> {
@@ -883,7 +823,7 @@ impl ExecutorGateway {
         })
     }
 
-    pub fn target(&self) -> &GatewayTarget {
+    pub fn target(&self) -> &Backend {
         &self.inner.target
     }
 
@@ -944,8 +884,8 @@ impl WorkExecutionBackend for ExecutorGateway {
     fn evaluator(&self) -> Option<String> {
         self.inner.evaluator.clone()
     }
-    fn fetch_routes(&self) -> Vec<hellas_gateway::FetchRoute> {
-        self.inner.target.fetch_routes().unwrap_or_default()
+    fn fetch_routes(&self) -> Vec<(hellas_rpc::FetchSchema, FetchRoutePolicy)> {
+        self.inner.target.fetch_routes()
     }
     fn fetch(
         &self,

@@ -124,8 +124,6 @@ impl Host {
                     host: "127.0.0.1".into(),
                     port: Some(0),
                     allow_remote: false,
-                    wrap: None,
-                    wrap_args: vec![],
                 },
                 models: Vec::new(),
                 http: None,
@@ -271,7 +269,7 @@ impl GrantGateway {
             Box::pin(async move {
                 let endpoint = crate::grant_client::bind_endpoint(key).await?;
                 let signer = options.session.signer.clone();
-                let target = crate::GatewayTarget::Grant {
+                let target = crate::Backend::Grant {
                     policy: options.session.target.offer().grant.policies[0].clone(),
                     options: options.session,
                     transport: crate::grant_client::GrantTransport::Remote(endpoint),

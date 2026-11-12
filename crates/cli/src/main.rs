@@ -10,6 +10,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 mod compute;
 mod content_configuration;
+mod wrap;
 
 mod commands;
 mod identity;
@@ -862,8 +863,6 @@ async fn async_main() {
                             allow_remote,
                             host,
                             port,
-                            wrap,
-                            wrap_args,
                         },
                         models,
                         http,
@@ -871,7 +870,7 @@ async fn async_main() {
                         responses_models,
                     };
                     let gateway = hellas_sdk::serve_gateway(work, serve).await?;
-                    Ok(hellas_gateway::wait_for_shutdown(gateway).await?)
+                    wrap::wait(gateway, wrap.as_deref(), &wrap_args).await
                 })
                 .await;
                 let stopped = match control {

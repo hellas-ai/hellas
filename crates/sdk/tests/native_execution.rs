@@ -771,9 +771,9 @@ async fn check_gateway_quote(
     .await
     .unwrap();
     let gateway = hellas_sdk::ExecutorGateway::new(
-        hellas_sdk::GatewayTarget::Paid {
+        hellas_sdk::Backend::Paid {
             options: options.clone(),
-            policy: quote.policy.invocation_policy,
+            policy: Some(quote.policy.invocation_policy),
             endpoint,
             settlement_key: settlement,
             owner,
@@ -796,9 +796,6 @@ async fn check_gateway_quote(
     assert!(
         gateway
             .fetch(hellas_gateway::WorkFetchRequest {
-                resource: None,
-                channel: None,
-                provider: options.provider.node,
                 service: "openai".into(),
                 method: "wrong-route".into(),
                 body: BODY.to_vec(),
@@ -813,9 +810,6 @@ async fn check_gateway_quote(
     assert!(
         gateway
             .fetch(hellas_gateway::WorkFetchRequest {
-                resource: None,
-                channel: None,
-                provider: options.provider.node,
                 service: "openai".into(),
                 method: "responses".into(),
                 body: oversized.into_bytes(),

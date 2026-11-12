@@ -20,9 +20,9 @@ fn gateway_waits_for_slow_funding_finality() {
             .await
             .unwrap();
             let gateway = hellas_sdk::ExecutorGateway::new(
-                hellas_sdk::GatewayTarget::Paid {
+                hellas_sdk::Backend::Paid {
                     options: case.options.clone(),
-                    policy: quote.policy.invocation_policy,
+                    policy: Some(quote.policy.invocation_policy),
                     endpoint: case.endpoint.clone(),
                     settlement_key: client_settlement(),
                     owner: case.owner.clone(),
@@ -33,9 +33,6 @@ fn gateway_waits_for_slow_funding_finality() {
             let started = tokio::time::Instant::now();
             let request = gateway
                 .fetch(hellas_gateway::WorkFetchRequest {
-                    resource: None,
-                    channel: None,
-                    provider: case.options.provider.node,
                     service: "openai".into(),
                     method: "responses".into(),
                     body: BODY.to_vec(),

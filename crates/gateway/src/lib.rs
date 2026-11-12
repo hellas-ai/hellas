@@ -16,16 +16,14 @@ mod image;
 mod provenance_layer;
 mod responses_fetch;
 mod state;
-mod wrap;
 
-use axum::Router;
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use futures::Stream;
 use hellas_adaptors::BackendError;
 use hellas_auth::authority::UnixMillis;
-use iroh::EndpointId;
+use hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy;
 use serde::Serialize;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::convert::Infallible;
@@ -40,26 +38,11 @@ pub use http_fetch::{HttpBackend, HttpGatewayConfig, HttpRoute, RoutingError};
 
 const DEFAULT_HTTP_PORT: u16 = 8080;
 
-/// A Fetch pinned to one funded provider by the HTTP account router.
+/// A Fetch run under the selected backend's policy.
 pub struct WorkFetchRequest {
-    pub provider: EndpointId,
-    pub resource: Option<hellas_auth::authority::ResourceId>,
-    pub channel: Option<hellas_channel::model::grant::ChannelId>,
     pub service: String,
     pub method: String,
     pub body: Vec<u8>,
-}
-
-/// One Fetch a work source can run: the provider, the contract schema, and
-/// the route the provider's policy seals, if it seals one.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FetchRoute {
-    pub provider: EndpointId,
-    pub resource: Option<hellas_auth::authority::ResourceId>,
-    pub channel: Option<hellas_channel::model::grant::ChannelId>,
-    pub schema: hellas_rpc::FetchSchema,
-    /// `None` for an open Fetch, whose route the caller names.
-    pub sealed: Option<(String, String)>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -72,8 +55,6 @@ pub enum WorkGatewayError {
     Quota(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("Work backend does not support this application")]
     Unsupported,
-    #[error("provider {0} has no HTTP Fetch resource")]
-    Provider(EndpointId),
     #[error(transparent)]
     Busy(#[from] WorkGatewayBusy),
     #[error("provider is unreachable: {0}")]
@@ -89,9 +70,9 @@ impl From<WorkGatewayError> for BackendError {
     fn from(error: WorkGatewayError) -> Self {
         let message = error.to_string();
         match error {
-            WorkGatewayError::Rejected(_)
-            | WorkGatewayError::Unsupported
-            | WorkGatewayError::Provider(_) => BackendError::Rejected(message),
+            WorkGatewayError::Rejected(_) | WorkGatewayError::Unsupported => {
+                BackendError::Rejected(message)
+            }
             WorkGatewayError::Denied(_) => BackendError::Denied(message),
             WorkGatewayError::Quota(_) => BackendError::Quota(message),
             WorkGatewayError::Busy(_) => BackendError::Busy(message),
@@ -166,7 +147,7 @@ pub enum WorkShutdownError {
 /// The source every presentation runs its jobs on.
 pub trait WorkExecutionBackend: Send + Sync {
     /// The Fetches this source can run, for presentations that pin one.
-    fn fetch_routes(&self) -> Vec<FetchRoute> {
+    fn fetch_routes(&self) -> Vec<(hellas_rpc::FetchSchema, FetchRoutePolicy)> {
         Vec::new()
     }
 
@@ -232,8 +213,6 @@ pub struct ServerOptions {
     pub allow_remote: bool,
     pub host: String,
     pub port: Option<u16>,
-    pub wrap: Option<String>,
-    pub wrap_args: Vec<String>,
 }
 
 /// One gateway: HTTP presentations over one work source.
@@ -322,7 +301,6 @@ pub struct TextOptions {
 
 #[derive(Clone)]
 pub struct ResponsesFetch {
-    pub provider: EndpointId,
     pub service: String,
     pub method: String,
     /// Merged into every request body before signing.
@@ -334,26 +312,25 @@ pub struct ResponsesFetch {
 impl ResponsesFetch {
     /// The one sealed Responses route among `routes`, if there is one.
     pub fn from_routes(
-        routes: &[FetchRoute],
+        routes: &[(hellas_rpc::FetchSchema, FetchRoutePolicy)],
         overrides: JsonMap<String, JsonValue>,
         models: Vec<String>,
     ) -> GatewayResult<Option<Self>> {
-        let mut sealed = routes.iter().filter_map(|route| match &route.sealed {
-            Some((service, method))
-                if route.schema == hellas_rpc::FetchSchema::StatelessResponsesV1 =>
+        let mut sealed = routes.iter().filter_map(|(schema, route)| match route {
+            FetchRoutePolicy::SealedRoute { service, method }
+                if *schema == hellas_rpc::FetchSchema::StatelessResponsesV1 =>
             {
-                Some((route.provider, service, method))
+                Some((service, method))
             }
             _ => None,
         });
-        let Some((provider, service, method)) = sealed.next() else {
+        let Some((service, method)) = sealed.next() else {
             return Ok(None);
         };
         if sealed.next().is_some() {
             return Err(GatewayConfigError::AmbiguousResponses.into());
         }
         Ok(Some(Self {
-            provider,
             service: service.clone(),
             method: method.clone(),
             overrides,
@@ -447,37 +424,9 @@ async fn start_gateway(options: GatewayOptions) -> crate::GatewayResult<GatewayH
         info!("timeout: {}s", timeout.as_secs());
     }
 
-    launch_gateway(
-        app,
-        listener,
-        bearer,
-        server.wrap.as_deref(),
-        &server.wrap_args,
-        work,
-    )
-    .await
-}
-
-async fn launch_gateway(
-    app: Router,
-    listener: tokio::net::TcpListener,
-    bearer: GatewayAccess,
-    wrap_command: Option<&str>,
-    wrap_args: &[String],
-    work: Arc<dyn WorkExecutionBackend>,
-) -> crate::GatewayResult<GatewayHandle> {
     let bound_addr = listener.local_addr()?;
     info!("gateway listening on {bound_addr}");
     bearer.announce();
-
-    let wrap_child = if let Some(command) = wrap_command {
-        let base = format!("http://{bound_addr}");
-        info!("wrapping `{command}` with gateway base {base}");
-        Some(wrap::spawn(command, wrap_args, &base, &bearer.bearer())?)
-    } else {
-        None
-    };
-
     let bearer_value = bearer.bearer();
     let (shutdown, mut server_shutdown) = tokio::sync::watch::channel(false);
     let server = std::future::IntoFuture::into_future(
@@ -490,36 +439,8 @@ async fn launch_gateway(
         }),
     );
 
-    let task_shutdown = shutdown.clone();
     let task = tokio::spawn(async move {
-        let result = async {
-            match wrap_child {
-                Some(mut child) => {
-                    tokio::pin!(server);
-                    tokio::select! {
-                        res = &mut server => {
-                            // Gateway stopped or errored; kill_on_drop tears the
-                            // wrapped child down too.
-                            res?;
-                        }
-                        status = child.wait() => {
-                            let status = status?;
-                            task_shutdown.send_replace(true);
-                            server.await?;
-                            if !status.success() {
-                                return Err(GatewayError::WrappedCommand(status));
-                            }
-                        }
-                    }
-                }
-                None => {
-                    server.await?;
-                }
-            }
-            Ok(())
-        }
-        .await;
-        finish_cleanup(result, work.drain().await)
+        finish_cleanup(server.await.map_err(GatewayError::from), work.drain().await)
     });
 
     Ok(GatewayHandle {
@@ -545,8 +466,8 @@ fn finish_cleanup<T>(
     }
 }
 
-/// Wait for a process signal or wrapped child, then join every gateway listener.
-pub async fn wait_for_shutdown(mut handle: GatewayHandle) -> crate::GatewayResult<()> {
+/// Wait for a process signal, then join the gateway listener.
+pub async fn wait_for_shutdown(handle: &mut GatewayHandle) -> crate::GatewayResult<()> {
     tokio::select! {
         signal = shutdown_signal() => {
             handle.request_shutdown();
@@ -574,43 +495,16 @@ async fn shutdown_signal() -> crate::GatewayResult<()> {
     Ok(())
 }
 
-/// Bind the configured gateway interface. All inference routes require
-/// bearer authentication. With `--port`, fail on conflict (the user asked for that
-/// exact port). Without it, try 8080 first and fall back to an
-/// OS-assigned port on EADDRINUSE so a stray dev gateway doesn't block a
-/// fresh one.
+/// Bind exactly the configured interface, using port 8080 when omitted.
 async fn bind_gateway(
     host: &str,
     port: Option<u16>,
     allow_remote: bool,
 ) -> crate::GatewayResult<tokio::net::TcpListener> {
-    if let Some(p) = port {
-        let addr = access::bind_addr(host, p, allow_remote).await?;
-        return tokio::net::TcpListener::bind(addr)
-            .await
-            .map_err(|source| GatewayError::Bind {
-                address: addr,
-                source,
-            });
-    }
-    let preferred = access::bind_addr(host, DEFAULT_HTTP_PORT, allow_remote).await?;
-    match tokio::net::TcpListener::bind(preferred).await {
-        Ok(listener) => Ok(listener),
-        Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
-            let fallback = SocketAddr::new(preferred.ip(), 0);
-            info!("failed to bind {preferred}; attempting to bind {fallback}");
-            tokio::net::TcpListener::bind(fallback)
-                .await
-                .map_err(|source| GatewayError::Bind {
-                    address: fallback,
-                    source,
-                })
-        }
-        Err(err) => Err(GatewayError::Bind {
-            address: preferred,
-            source: err,
-        }),
-    }
+    let address = access::bind_addr(host, port.unwrap_or(DEFAULT_HTTP_PORT), allow_remote).await?;
+    tokio::net::TcpListener::bind(address)
+        .await
+        .map_err(|source| GatewayError::Bind { address, source })
 }
 
 /// A refusal or failure in the OpenAI error shape.

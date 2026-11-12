@@ -16,7 +16,6 @@ struct RecordedFetch {
 
 impl WorkExecutionBackend for RecordedFetch {
     fn fetch(&self, request: WorkFetchRequest) -> Result<WorkFetchStream, WorkGatewayError> {
-        assert_eq!(request.provider, provider());
         assert_eq!(request.service, "openai");
         assert_eq!(request.method, "responses");
         assert_eq!(
@@ -39,10 +38,6 @@ impl WorkExecutionBackend for RecordedFetch {
     fn drain(&self) -> futures::future::BoxFuture<'_, Result<(), WorkShutdownError>> {
         Box::pin(async { Ok(()) })
     }
-}
-
-fn provider() -> iroh::EndpointId {
-    iroh::SecretKey::from_bytes(&[9; 32]).public()
 }
 
 fn text(delta: &str, channel: TextChannel) -> OutputEvent {
@@ -73,7 +68,6 @@ async fn fixture(name: &str, request: Value, events: Vec<OutputEvent>, expected:
     let backend = FetchBackend {
         work: work.clone(),
         options: crate::ResponsesFetch {
-            provider: provider(),
             service: "openai".into(),
             method: "responses".into(),
             overrides: serde_json::Map::new(),
@@ -193,7 +187,6 @@ async fn responses_carry_provenance_at_start_and_end() {
         });
         let app = router(
             crate::ResponsesFetch {
-                provider: provider(),
                 service: "openai".into(),
                 method: "responses".into(),
                 overrides: serde_json::Map::new(),

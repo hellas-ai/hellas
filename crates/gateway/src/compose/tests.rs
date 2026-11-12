@@ -1,33 +1,37 @@
 use super::*;
 use crate::{
-    FetchRoute, HttpGatewayConfig, ResponsesFetch, WorkFetchRequest, WorkFetchStream,
-    WorkGatewayError, WorkShutdownError,
+    HttpGatewayConfig, ResponsesFetch, WorkFetchRequest, WorkFetchStream, WorkGatewayError,
+    WorkShutdownError,
 };
 use std::sync::Mutex;
 
 /// Records which Fetch route each request reached, then refuses it.
 struct Recorder {
-    provider: iroh::EndpointId,
     seen: Mutex<Vec<(String, String)>>,
 }
 
 impl WorkExecutionBackend for Recorder {
-    fn fetch_routes(&self) -> Vec<FetchRoute> {
+    fn fetch_routes(
+        &self,
+    ) -> Vec<(
+        hellas_rpc::FetchSchema,
+        hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy,
+    )> {
         vec![
-            FetchRoute {
-                resource: None,
-                channel: None,
-                provider: self.provider,
-                schema: hellas_rpc::FetchSchema::HttpV1,
-                sealed: Some(("http".into(), "request".into())),
-            },
-            FetchRoute {
-                resource: None,
-                channel: None,
-                provider: self.provider,
-                schema: hellas_rpc::FetchSchema::StatelessResponsesV1,
-                sealed: Some(("openai".into(), "responses".into())),
-            },
+            (
+                hellas_rpc::FetchSchema::HttpV1,
+                hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy::SealedRoute {
+                    service: "http".into(),
+                    method: "request".into(),
+                },
+            ),
+            (
+                hellas_rpc::FetchSchema::StatelessResponsesV1,
+                hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy::SealedRoute {
+                    service: "openai".into(),
+                    method: "responses".into(),
+                },
+            ),
         ]
     }
     fn fetch(&self, request: WorkFetchRequest) -> Result<WorkFetchStream, WorkGatewayError> {
@@ -85,7 +89,6 @@ async fn post(app: &Router, model: &str) -> StatusCode {
 #[tokio::test]
 async fn a_shared_path_is_split_by_model() {
     let recorder = Arc::new(Recorder {
-        provider: iroh::SecretKey::from_bytes(&[4; 32]).public(),
         seen: Mutex::new(Vec::new()),
     });
     let work: Arc<dyn WorkExecutionBackend> = recorder.clone();
@@ -122,7 +125,6 @@ async fn a_shared_path_is_split_by_model() {
 #[tokio::test]
 async fn overlapping_or_unnamed_models_on_a_shared_path_refuse_to_start() {
     let recorder = Arc::new(Recorder {
-        provider: iroh::SecretKey::from_bytes(&[4; 32]).public(),
         seen: Mutex::new(Vec::new()),
     });
     let work: Arc<dyn WorkExecutionBackend> = recorder.clone();

@@ -362,8 +362,6 @@ impl ShareFixtureBuilder {
                             zdr: true,
                         },
                         allow_remote: false,
-                        wrap: None,
-                        wrap_args: Vec::new(),
                     },
                     models: Vec::new(),
                     http: None,
@@ -702,7 +700,7 @@ impl GrantServeOptions {
             Box::pin(async move {
                 let endpoint = hellas_sdk::grant_client::bind_endpoint(key).await?;
                 let signer = options.session.signer.clone();
-                let target = hellas_sdk::GatewayTarget::Grant {
+                let target = hellas_sdk::Backend::Grant {
                     policy: options.session.target.offer().grant.policies[0].clone(),
                     options: options.session,
                     transport: hellas_sdk::grant_client::GrantTransport::Remote(endpoint),

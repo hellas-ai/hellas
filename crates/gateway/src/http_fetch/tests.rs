@@ -14,18 +14,23 @@ async fn http_uses_the_paid_backend_and_waits_for_its_payment_completion() {
         requests: AtomicUsize,
         drained: AtomicBool,
         ack: Arc<tokio::sync::Notify>,
-        provider: iroh::EndpointId,
+
         busy: bool,
     }
     impl WorkExecutionBackend for Paid {
-        fn fetch_routes(&self) -> Vec<crate::FetchRoute> {
-            vec![crate::FetchRoute {
-                resource: None,
-                channel: None,
-                provider: self.provider,
-                schema: hellas_rpc::FetchSchema::HttpV1,
-                sealed: Some(("http".into(), "request".into())),
-            }]
+        fn fetch_routes(
+            &self,
+        ) -> Vec<(
+            hellas_rpc::FetchSchema,
+            hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy,
+        )> {
+            vec![(
+                hellas_rpc::FetchSchema::HttpV1,
+                hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy::SealedRoute {
+                    service: "http".into(),
+                    method: "request".into(),
+                },
+            )]
         }
         fn run(
             &self,
@@ -38,7 +43,7 @@ async fn http_uses_the_paid_backend_and_waits_for_its_payment_completion() {
             request: WorkFetchRequest,
         ) -> Result<crate::WorkFetchStream, crate::WorkGatewayError> {
             self.requests.fetch_add(1, Ordering::Relaxed);
-            assert_eq!(request.provider, self.provider);
+
             assert_eq!((&*request.service, &*request.method), ("http", "request"));
             let http = hellas_rpc::http_fetch::HttpFetchRequest::decode(&request.body).unwrap();
             assert_eq!(http.url, "https://example.com/v1/responses?x=%2F&x=y");
@@ -65,12 +70,10 @@ async fn http_uses_the_paid_backend_and_waits_for_its_payment_completion() {
         }
     }
     for busy in [false, true] {
-        let provider = iroh::SecretKey::from_bytes(&[12; 32]).public();
         let paid = Arc::new(Paid {
             requests: AtomicUsize::new(0),
             drained: AtomicBool::new(false),
             ack: Arc::default(),
-            provider,
             busy,
         });
         let config: HttpGatewayConfig = serde_json::from_value(serde_json::json!({
@@ -90,8 +93,6 @@ async fn http_uses_the_paid_backend_and_waits_for_its_payment_completion() {
                 port: Some(0),
                 access: fixture.access,
                 allow_remote: false,
-                wrap: None,
-                wrap_args: Vec::new(),
             },
             work: paid.clone(),
             presentations: crate::Presentations {
@@ -281,17 +282,24 @@ fn extension_headers_and_duplicates_survive_but_connection_tokens_do_not() {
 
 #[test]
 fn a_provider_sealing_several_https_routes_needs_the_route_named() {
-    struct Sealed(iroh::EndpointId);
+    struct Sealed;
     impl WorkExecutionBackend for Sealed {
-        fn fetch_routes(&self) -> Vec<crate::FetchRoute> {
+        fn fetch_routes(
+            &self,
+        ) -> Vec<(
+            hellas_rpc::FetchSchema,
+            hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy,
+        )> {
             ["a", "b"]
                 .into_iter()
-                .map(|method| crate::FetchRoute {
-                    resource: None,
-                    channel: None,
-                    provider: self.0,
-                    schema: hellas_rpc::FetchSchema::HttpV1,
-                    sealed: Some(("http".into(), method.into())),
+                .map(|method| {
+                    (
+                        hellas_rpc::FetchSchema::HttpV1,
+                        hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy::SealedRoute {
+                            service: "http".into(),
+                            method: method.into(),
+                        },
+                    )
                 })
                 .collect()
         }
@@ -299,7 +307,7 @@ fn a_provider_sealing_several_https_routes_needs_the_route_named() {
             Box::pin(async { Ok(()) })
         }
     }
-    let work = Arc::new(Sealed(iroh::SecretKey::from_bytes(&[13; 32]).public()));
+    let work = Arc::new(Sealed);
     let config = |route: serde_json::Value| -> HttpGatewayConfig {
         let mut value = serde_json::json!({"routes": [{
             "path": "/v1/responses", "method": "POST", "url": "https://example.com/v1/responses"
@@ -313,7 +321,7 @@ fn a_provider_sealing_several_https_routes_needs_the_route_named() {
     assert!(matches!(
         router(config(serde_json::json!({})), work.clone()),
         Err(crate::GatewayError::Config(
-            crate::GatewayConfigError::AmbiguousFetchRoute(_)
+            crate::GatewayConfigError::AmbiguousFetchRoute
         ))
     ));
     assert!(
@@ -329,86 +337,33 @@ fn a_provider_sealing_several_https_routes_needs_the_route_named() {
             work
         ),
         Err(crate::GatewayError::Config(
-            crate::GatewayConfigError::FetchRouteMismatch(_)
+            crate::GatewayConfigError::FetchRouteMismatch
         ))
-    ));
-}
-
-#[test]
-fn resource_selection_resolves_same_provider_routes_independently() {
-    let provider = iroh::SecretKey::from_bytes(&[13; 32]).public();
-    let first = hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"first"));
-    let second = hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"second"));
-    let channel = hellas_channel::model::grant::ChannelId(hellas_auth::Digest::hash(b"channel"));
-    let routes = vec![
-        crate::FetchRoute {
-            provider,
-            resource: Some(first),
-            channel: Some(channel),
-            schema: hellas_rpc::FetchSchema::HttpV1,
-            sealed: Some(("http".into(), "first".into())),
-        },
-        crate::FetchRoute {
-            provider,
-            resource: Some(second),
-            channel: Some(channel),
-            schema: hellas_rpc::FetchSchema::HttpV1,
-            sealed: Some(("other".into(), "second".into())),
-        },
-    ];
-    let config: HttpGatewayConfig = serde_json::from_value(serde_json::json!({"routes": [{
-        "path": "/v1/test", "method": "POST", "url": "https://example.test/v1/test"
-    }]}))
-    .unwrap();
-    let mut routing = routing::Routing::new(&config, &[provider]).unwrap();
-    let backend = &mut routing.backends[0];
-    assert!(matches!(
-        fetch_route(&routes, backend, None),
-        Err(crate::GatewayConfigError::AmbiguousFetchRoute(_))
-    ));
-    backend.resource = Some(first);
-    backend.channel = Some(channel);
-    assert_eq!(
-        fetch_route(&routes, backend, None).unwrap(),
-        ("http".into(), "first".into())
-    );
-    backend.resource = Some(second);
-    assert_eq!(
-        fetch_route(&routes, backend, None).unwrap(),
-        ("other".into(), "second".into())
-    );
-    assert!(fetch_route(&routes, backend, Some(&("http".into(), "first".into()))).is_err());
-    let mut wrong_schema = routes.clone();
-    wrong_schema[0].schema = hellas_rpc::FetchSchema::StatelessResponsesV1;
-    let http_routes: Vec<_> = wrong_schema
-        .into_iter()
-        .filter(|route| route.schema == hellas_rpc::FetchSchema::HttpV1)
-        .collect();
-    backend.resource = Some(first);
-    assert!(matches!(
-        fetch_route(&http_routes, backend, None),
-        Err(crate::GatewayConfigError::MissingFetchRoute(_))
     ));
 }
 
 /// A provider that accepts the request, answers with `status` and the given
 /// body, and signs `transcript`.
 struct Proxied {
-    provider: iroh::EndpointId,
     status: u16,
     body: Option<&'static str>,
     transcript: Vec<u8>,
 }
 
 impl WorkExecutionBackend for Proxied {
-    fn fetch_routes(&self) -> Vec<crate::FetchRoute> {
-        vec![crate::FetchRoute {
-            resource: None,
-            channel: None,
-            provider: self.provider,
-            schema: hellas_rpc::FetchSchema::HttpV1,
-            sealed: Some(("http".into(), "request".into())),
-        }]
+    fn fetch_routes(
+        &self,
+    ) -> Vec<(
+        hellas_rpc::FetchSchema,
+        hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy,
+    )> {
+        vec![(
+            hellas_rpc::FetchSchema::HttpV1,
+            hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy::SealedRoute {
+                service: "http".into(),
+                method: "request".into(),
+            },
+        )]
     }
     fn fetch(
         &self,
@@ -491,8 +446,6 @@ async fn proxy(paid: Arc<Proxied>) -> (crate::GatewayHandle, tempfile::TempDir) 
             port: Some(0),
             access: fixture.access,
             allow_remote: false,
-            wrap: None,
-            wrap_args: Vec::new(),
         },
         work: paid,
         presentations: crate::Presentations {
@@ -516,7 +469,6 @@ async fn https_responses_carry_provenance_in_headers_and_the_transcript_in_trail
     let provider = format!("secp256k1:{}", "02".repeat(33));
     for (status, body) in [(200, Some("streamed body")), (204, None)] {
         let paid = Arc::new(Proxied {
-            provider: iroh::SecretKey::from_bytes(&[12; 32]).public(),
             status,
             body,
             transcript: transcript.clone(),
@@ -576,7 +528,6 @@ async fn oversized_transcripts_are_named_by_digest_instead_of_inlined() {
     let digest = encode_hex(&digest);
     for (status, body) in [(200, Some("streamed body")), (204, None)] {
         let paid = Arc::new(Proxied {
-            provider: iroh::SecretKey::from_bytes(&[12; 32]).public(),
             status,
             body,
             transcript: transcript.clone(),
@@ -614,20 +565,22 @@ async fn oversized_transcripts_are_named_by_digest_instead_of_inlined() {
 }
 
 struct ContinuationBackend {
-    provider: iroh::EndpointId,
     calls: std::sync::atomic::AtomicUsize,
-    resource: Option<hellas_auth::authority::ResourceId>,
-    channel: Option<hellas_channel::model::grant::ChannelId>,
 }
 impl WorkExecutionBackend for ContinuationBackend {
-    fn fetch_routes(&self) -> Vec<crate::FetchRoute> {
-        vec![crate::FetchRoute {
-            resource: self.resource,
-            channel: self.channel,
-            provider: self.provider,
-            schema: hellas_rpc::FetchSchema::HttpV1,
-            sealed: Some(("http".into(), "request".into())),
-        }]
+    fn fetch_routes(
+        &self,
+    ) -> Vec<(
+        hellas_rpc::FetchSchema,
+        hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy,
+    )> {
+        vec![(
+            hellas_rpc::FetchSchema::HttpV1,
+            hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy::SealedRoute {
+                service: "http".into(),
+                method: "request".into(),
+            },
+        )]
     }
     fn fetch(
         &self,
@@ -652,12 +605,7 @@ impl WorkExecutionBackend for ContinuationBackend {
 #[tokio::test]
 async fn signed_single_route_registers_response_for_followup() {
     use tower::ServiceExt;
-    let work = Arc::new(ContinuationBackend {
-        provider: iroh::SecretKey::from_bytes(&[19; 32]).public(),
-        calls: 0.into(),
-        resource: None,
-        channel: None,
-    });
+    let work = Arc::new(ContinuationBackend { calls: 0.into() });
     let config: HttpGatewayConfig = serde_json::from_value(serde_json::json!({
         "service":"http", "method":"request", "routes":[{
             "path":"/v1/responses", "method":"POST", "url":"https://example.com/v1/responses", "models":["m"]
@@ -689,16 +637,9 @@ async fn signed_single_route_registers_response_for_followup() {
 #[tokio::test]
 async fn duplicate_session_header_never_discards_an_unknown_continuation() {
     use tower::ServiceExt;
-    let resource = hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"resource"));
-    let channel = hellas_channel::model::grant::ChannelId(hellas_auth::Digest::hash(b"channel"));
-    let work = Arc::new(ContinuationBackend {
-        provider: iroh::SecretKey::from_bytes(&[20; 32]).public(),
-        calls: 0.into(),
-        resource: Some(resource),
-        channel: Some(channel),
-    });
+    let work = Arc::new(ContinuationBackend { calls: 0.into() });
     let config: HttpGatewayConfig = serde_json::from_value(serde_json::json!({
-        "backends":{"one":{"models":[], "provider":work.provider, "resource":resource, "channel":channel, "routes":[{
+        "backends":{"one":{"models":[], "routes":[{
             "path":"/v1/responses", "method":"POST", "url":"https://example.com/v1/responses"
         }, {
             "path":"/v1/audio/transcriptions", "method":"POST", "url":"https://example.com/v1/audio/transcriptions"

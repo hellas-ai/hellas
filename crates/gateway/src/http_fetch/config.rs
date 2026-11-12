@@ -29,13 +29,6 @@ pub struct HttpBackend {
     pub credential: Option<String>,
     pub routes: Vec<HttpRoute>,
     pub max_in_flight: Option<usize>,
-    /// Endpoint in the paid pool. May be omitted when there is exactly one.
-    pub provider: Option<iroh::EndpointId>,
-    /// Canonical resource selected within the provider's grant channel.
-    #[serde(default)]
-    pub resource: Option<hellas_auth::authority::ResourceId>,
-    #[serde(default)]
-    pub channel: Option<hellas_channel::model::grant::ChannelId>,
 }
 
 fn default_concurrency() -> usize {
@@ -90,8 +83,7 @@ impl HttpGatewayConfig {
             if name.is_empty() || name.len() > 64 {
                 return Err(crate::GatewayConfigError::BackendName.into());
             }
-            if !((!backend.models.is_empty() || backend.resource.is_some())
-                && backend.models.len() <= 256
+            if !(backend.models.len() <= 256
                 && backend
                     .models
                     .iter()
@@ -111,11 +103,7 @@ impl HttpGatewayConfig {
             validate_routes(&backend.routes)?;
         }
         let mut grant_paths = BTreeMap::<(&str, &str), (bool, bool)>::new();
-        for backend in self
-            .backends
-            .values()
-            .filter(|backend| backend.resource.is_some())
-        {
+        for backend in self.backends.values() {
             for route in &backend.routes {
                 let flags = grant_paths.entry((&route.path, &route.method)).or_default();
                 if route.models.is_some() {

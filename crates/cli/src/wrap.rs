@@ -29,7 +29,7 @@ pub fn spawn(
     args: &[String],
     base_url: &str,
     credential: &str,
-) -> crate::GatewayResult<Child> {
+) -> std::io::Result<Child> {
     let mut command = Command::new(cmd);
     command
         .args(args)
@@ -64,10 +64,33 @@ pub fn spawn(
         });
     }
 
-    command
-        .spawn()
-        .map_err(|source| crate::GatewayError::Spawn {
-            command: cmd.into(),
-            source,
-        })
+    command.spawn()
+}
+
+/// Own the wrapped child and drain accepted work when either side ends.
+pub async fn wait(
+    mut gateway: hellas_gateway::GatewayHandle,
+    command: Option<&str>,
+    args: &[String],
+) -> crate::commands::CliResult<()> {
+    let Some(command) = command else {
+        return Ok(hellas_gateway::wait_for_shutdown(&mut gateway).await?);
+    };
+    let base = format!("http://{}", gateway.address());
+    let mut child = match spawn(command, args, &base, gateway.bearer()) {
+        Ok(child) => child,
+        Err(error) => {
+            gateway.shutdown().await?;
+            return Err(anyhow::Error::from(error).context(format!("spawn {command}")));
+        }
+    };
+    tokio::select! {
+        result = hellas_gateway::wait_for_shutdown(&mut gateway) => Ok(result?),
+        status = child.wait() => {
+            gateway.shutdown().await?;
+            let status = status?;
+            anyhow::ensure!(status.success(), "wrapped command exited with status {status}");
+            Ok(())
+        }
+    }
 }

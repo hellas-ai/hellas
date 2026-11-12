@@ -61,9 +61,7 @@ pub mod grant_config;
 pub mod node_control;
 
 mod gateway_work;
-pub use gateway_work::{
-    ExecutorGateway, GatewayServeOptions, GatewayTarget, WorkRequest, serve_gateway,
-};
+pub use gateway_work::{Backend, ExecutorGateway, GatewayServeOptions, WorkRequest, serve_gateway};
 
 mod resource_config;
 pub use resource_config::ResourceConfigError;

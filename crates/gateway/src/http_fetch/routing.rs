@@ -67,15 +67,6 @@ const SESSION_IDLE: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug, thiserror::Error)]
 pub enum RoutingError {
-    #[error("HTTP backend {backend} must name a provider from the paid pool")]
-    AmbiguousProvider { backend: String },
-    #[error(
-        "HTTP backend {backend} names provider {provider} without a paid HTTP Fetch configuration"
-    )]
-    UnfundedProvider {
-        backend: String,
-        provider: iroh::EndpointId,
-    },
     #[error("HTTP backend {backend} must use one account or origin")]
     MixedAccounts { backend: String },
     #[error("HTTP backend {backend} shares an account with a different concurrency limit")]
@@ -86,9 +77,6 @@ pub(super) struct Backend {
     pub name: String,
     pub models: Vec<String>,
     pub routes: Vec<HttpRoute>,
-    pub provider: iroh::EndpointId,
-    pub resource: Option<hellas_auth::authority::ResourceId>,
-    pub channel: Option<hellas_channel::model::grant::ChannelId>,
     account: Arc<Account>,
 }
 
@@ -228,10 +216,7 @@ impl Unavailable {
 }
 
 impl Routing {
-    pub fn new(
-        config: &HttpGatewayConfig,
-        providers: &[iroh::EndpointId],
-    ) -> Result<Self, RoutingError> {
+    pub fn new(config: &HttpGatewayConfig) -> Result<Self, RoutingError> {
         let routes = config.routes.iter().enumerate().map(|(index, route)| {
             (
                 format!("route-{index}"),
@@ -240,26 +225,12 @@ impl Routing {
                     credential: route.credential.clone(),
                     routes: vec![route.clone()],
                     max_in_flight: None,
-                    provider: None,
-                    resource: None,
-                    channel: None,
                 },
             )
         });
         let mut backends = Vec::new();
         let mut accounts = HashMap::new();
         for (name, mut backend) in routes.chain(config.backends.clone()) {
-            let provider = match backend.provider {
-                Some(provider) => provider,
-                None if providers.len() == 1 => providers[0],
-                None => return Err(RoutingError::AmbiguousProvider { backend: name }),
-            };
-            if !providers.contains(&provider) {
-                return Err(RoutingError::UnfundedProvider {
-                    backend: name,
-                    provider,
-                });
-            }
             for route in &mut backend.routes {
                 route.credential = backend.credential.clone();
             }
@@ -269,7 +240,7 @@ impl Routing {
             }
             let capacity = backend.max_in_flight.unwrap_or(config.max_in_flight);
             let account = accounts
-                .entry((provider, account))
+                .entry(account)
                 .or_insert_with(|| Arc::new(Account::new(capacity)));
             if account.capacity != capacity {
                 return Err(RoutingError::InconsistentCapacity { backend: name });
@@ -278,9 +249,6 @@ impl Routing {
                 name,
                 models: backend.models,
                 routes: backend.routes,
-                provider,
-                resource: backend.resource,
-                channel: backend.channel,
                 account: account.clone(),
             });
         }
@@ -313,9 +281,9 @@ impl Routing {
                 .filter(move |route| route.path == path && route.method == method)
                 .map(move |route| (backend, route))
         });
-        let model_routed = matching_routes.clone().any(|(backend, route)| {
-            route.models.is_some() || (backend.resource.is_none() && !backend.models.is_empty())
-        });
+        let model_routed = matching_routes
+            .clone()
+            .any(|(backend, route)| route.models.is_some() || (!backend.models.is_empty()));
         let signed_model_routed = matching_routes
             .clone()
             .any(|(_, route)| route.models.is_some());
@@ -341,8 +309,7 @@ impl Routing {
                     .and_then(|endpoint| {
                         let route = &backend.routes[endpoint];
                         let models = route.models.as_deref().or_else(|| {
-                            (backend.resource.is_none() && !backend.models.is_empty())
-                                .then_some(backend.models.as_slice())
+                            (!backend.models.is_empty()).then_some(backend.models.as_slice())
                         });
                         model
                             .is_none_or(|model| {

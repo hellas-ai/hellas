@@ -14,37 +14,9 @@ fn config() -> HttpGatewayConfig {
         "backends":{"a":backend("a", &["k3"]),"b":backend("b", &["k3"]),"c":backend("c", &["other"])}})).unwrap()
 }
 
-fn routing(mut config: HttpGatewayConfig) -> Arc<Routing> {
+fn routing(config: HttpGatewayConfig) -> Arc<Routing> {
     config.validate().unwrap();
-    let default = iroh::SecretKey::from_bytes(&[1; 32]).public();
-    let mut providers = vec![default];
-    for backend in config.backends.values_mut() {
-        let provider = *backend.provider.get_or_insert(default);
-        if !providers.contains(&provider) {
-            providers.push(provider);
-        }
-    }
-    Arc::new(Routing::new(&config, &providers).unwrap())
-}
-
-#[test]
-fn every_backend_must_resolve_to_a_configured_paid_provider() {
-    let first = iroh::SecretKey::from_bytes(&[1; 32]).public();
-    let second = iroh::SecretKey::from_bytes(&[2; 32]).public();
-    let mut config = config();
-    assert!(matches!(
-        Routing::new(&config, &[]),
-        Err(RoutingError::AmbiguousProvider { .. })
-    ));
-    assert!(matches!(
-        Routing::new(&config, &[first, second]),
-        Err(RoutingError::AmbiguousProvider { .. })
-    ));
-    config.backends.get_mut("a").unwrap().provider = Some(second);
-    assert!(matches!(
-        Routing::new(&config, &[first]),
-        Err(RoutingError::UnfundedProvider { .. })
-    ));
+    Arc::new(Routing::new(&config).unwrap())
 }
 
 #[test]
@@ -52,9 +24,6 @@ fn signed_models_are_selected_per_path_and_legacy_mix_is_rejected() {
     let mut config = config();
     config.backends.remove("c");
     for (name, backend) in &mut config.backends {
-        backend.resource = Some(hellas_auth::authority::ResourceId(
-            hellas_auth::Digest::hash(name.as_bytes()),
-        ));
         backend.models.clear();
         backend.routes[0].models = Some(vec![if name == "a" { "alpha" } else { "other" }.into()]);
         backend.routes[1].models = Some(vec![if name == "a" { "beta" } else { "other" }.into()]);
@@ -376,7 +345,7 @@ fn full_affinity_table_does_not_evict_live_sessions_and_expired_server_state_is_
 }
 
 #[test]
-fn repeated_aliases_share_limits_but_distinct_provider_nodes_keep_them_separate() {
+fn repeated_aliases_share_limits() {
     let mut config = config();
     config.backends.get_mut("b").unwrap().credential = Some("a".into());
     let shared = routing(config.clone());
@@ -385,21 +354,6 @@ fn repeated_aliases_share_limits_but_distinct_provider_nodes_keep_them_separate(
         select(&shared, "k3", "second").err().unwrap().status,
         StatusCode::SERVICE_UNAVAILABLE
     );
-    let node = iroh::SecretKey::generate().public();
-    config.backends.get_mut("b").unwrap().provider = Some(node);
-    let mut same_provider = config.clone();
-    same_provider.backends.get_mut("b").unwrap().provider =
-        Some(iroh::SecretKey::from_bytes(&[1; 32]).public());
-    let same_provider = routing(same_provider);
-    let _first = select(&same_provider, "k3", "first").unwrap();
-    assert_eq!(
-        select(&same_provider, "k3", "second").err().unwrap().status,
-        StatusCode::SERVICE_UNAVAILABLE
-    );
-    let split = routing(config);
-    let _first = select(&split, "k3", "first").unwrap();
-    assert_eq!(select(&split, "k3", "second").unwrap().backend, 1);
-    assert_eq!(split.backends[1].provider, node);
 }
 
 #[test]

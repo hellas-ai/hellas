@@ -44,8 +44,7 @@ fn attributed(mut response: Response, name: &str) -> Response {
 }
 
 struct HttpState {
-    /// The Fetch route of each backend, by backend index.
-    fetch_routes: Vec<(String, String)>,
+    fetch_route: (String, String),
     paid: Arc<dyn WorkExecutionBackend>,
     routing: Arc<routing::Routing>,
     metrics: observation::Metrics,
@@ -70,32 +69,47 @@ pub(super) fn router(
     paid: Arc<dyn WorkExecutionBackend>,
 ) -> crate::GatewayResult<(Router, Vec<ServedPath>)> {
     config.validate()?;
-    let routes: Vec<_> = paid
-        .fetch_routes()
-        .into_iter()
-        .filter(|route| route.schema == hellas_rpc::FetchSchema::HttpV1)
-        .collect();
-    let mut providers = Vec::new();
-    for route in &routes {
-        if !providers.contains(&route.provider) {
-            providers.push(route.provider);
+    let routing = Arc::new(routing::Routing::new(&config)?);
+    let routes = paid.fetch_routes();
+    let mut sealed = Vec::new();
+    let mut open = false;
+    for (schema, route) in &routes {
+        if *schema != hellas_rpc::FetchSchema::HttpV1 {
+            continue;
+        }
+        match route {
+            hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy::SealedRoute {
+                service,
+                method,
+            } => {
+                let route = (service.clone(), method.clone());
+                if !sealed.contains(&route) {
+                    sealed.push(route);
+                }
+            }
+            hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy::OpenFetch { .. } => {
+                open = true
+            }
         }
     }
-    let routing = Arc::new(routing::Routing::new(&config, &providers)?);
-    let named = config.service.clone().zip(config.method.clone());
-    let fetch_routes = routing
-        .backends
-        .iter()
-        .map(|backend| fetch_route(&routes, backend, named.as_ref()))
-        .collect::<Result<Vec<_>, _>>()?;
+    let fetch_route = match (
+        config.service.clone().zip(config.method.clone()),
+        sealed.as_slice(),
+    ) {
+        (Some(named), _) if open || sealed.contains(&named) => named,
+        (Some(_), _) => return Err(crate::GatewayConfigError::FetchRouteMismatch.into()),
+        (None, [one]) => one.clone(),
+        (None, []) => return Err(crate::GatewayConfigError::MissingFetchRoute.into()),
+        (None, _) => return Err(crate::GatewayConfigError::AmbiguousFetchRoute.into()),
+    };
     let mut paths = std::collections::BTreeMap::<String, Option<Vec<String>>>::new();
     for backend in &routing.backends {
         for route in &backend.routes {
             let models = paths.entry(route.path.clone()).or_insert(Some(Vec::new()));
-            let restricted = route.models.as_ref().or_else(|| {
-                (backend.resource.is_none() && !backend.models.is_empty())
-                    .then_some(&backend.models)
-            });
+            let restricted = route
+                .models
+                .as_ref()
+                .or_else(|| (!backend.models.is_empty()).then_some(&backend.models));
             match (models.as_mut(), restricted) {
                 (Some(models), Some(restricted)) => models.extend(restricted.iter().cloned()),
                 _ => *models = None,
@@ -103,7 +117,7 @@ pub(super) fn router(
         }
     }
     let state = Arc::new(HttpState {
-        fetch_routes,
+        fetch_route,
         paid,
         routing,
         metrics: observation::Metrics::new(),
@@ -117,49 +131,6 @@ pub(super) fn router(
         .map(|(path, models)| (path, models.unwrap_or_default()))
         .collect();
     Ok((app.with_state(state), paths))
-}
-
-/// The one Fetch route a backend uses on its provider. A provider may seal
-/// several HTTPS routes; the configuration then names one of them.
-fn fetch_route(
-    routes: &[crate::FetchRoute],
-    backend: &routing::Backend,
-    named: Option<&(String, String)>,
-) -> Result<(String, String), crate::GatewayConfigError> {
-    if backend.resource.is_some() != backend.channel.is_some()
-        || (backend.resource.is_some() && named.is_some())
-    {
-        return Err(crate::GatewayConfigError::FetchRouteMismatch(
-            backend.name.clone(),
-        ));
-    }
-    let mut sealed = Vec::new();
-    let mut open = false;
-    for route in routes.iter().filter(|route| {
-        route.provider == backend.provider
-            && backend
-                .resource
-                .is_none_or(|resource| route.resource == Some(resource))
-            && backend
-                .channel
-                .is_none_or(|channel| route.channel == Some(channel))
-    }) {
-        match &route.sealed {
-            Some(route) => sealed.push(route),
-            None => open = true,
-        }
-    }
-    let name = || backend.name.clone();
-    match (named, sealed.as_slice()) {
-        (Some(named), sealed) if sealed.contains(&named) || (open && sealed.is_empty()) => {
-            Ok(named.clone())
-        }
-        (Some(_), _) if !open => Err(crate::GatewayConfigError::FetchRouteMismatch(name())),
-        (Some(named), _) => Ok(named.clone()),
-        (None, [one]) => Ok((*one).clone()),
-        (None, []) => Err(crate::GatewayConfigError::MissingFetchRoute(name())),
-        (None, _) => Err(crate::GatewayConfigError::AmbiguousFetchRoute(name())),
-    }
 }
 
 async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Response {
@@ -239,7 +210,7 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
             return json_error(StatusCode::BAD_REQUEST, "invalid HTTP request");
         }
     };
-    let result = open(&state, selected.backend, backend.provider, payload)
+    let result = open(&state, payload)
         .instrument(observed.span.clone())
         .await;
     let (accepted, status, headers, mut events) = match result {
@@ -399,17 +370,9 @@ type Opened = (
     super::WorkFetchStream,
 );
 
-async fn open(
-    state: &HttpState,
-    backend: usize,
-    provider: iroh::EndpointId,
-    payload: Vec<u8>,
-) -> Result<Opened, HttpOpenError> {
-    let (service, method) = &state.fetch_routes[backend];
+async fn open(state: &HttpState, payload: Vec<u8>) -> Result<Opened, HttpOpenError> {
+    let (service, method) = &state.fetch_route;
     let mut stream = state.paid.fetch(WorkFetchRequest {
-        provider,
-        resource: state.routing.backends[backend].resource,
-        channel: state.routing.backends[backend].channel,
         service: service.clone(),
         method: method.clone(),
         body: payload,
