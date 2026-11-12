@@ -232,6 +232,7 @@ impl Fixture {
         let access = self.host.gateway_access().await;
         let bearer = access.bearer();
         let server = hellas_gateway::start(hellas_gateway::GatewayOptions {
+            jobs: self.gateway.jobs.clone(),
             server: hellas_gateway::ServerOptions {
                 archive: hellas_gateway::ArchiveOptions {
                     directory: self.host.root.path().join("archive"),
@@ -279,7 +280,11 @@ impl Fixture {
         }
     }
     async fn result(&self, cap: Option<u64>) -> Result<(), WorkGatewayError> {
-        let mut stream = self.gateway.fetch("test", self.request(cap))?;
+        let mut stream = self.gateway.fetch(
+            "test",
+            crate::test_support::request_job(&self.gateway.jobs),
+            self.request(cap),
+        )?;
         let mut terminal = false;
         while let Some(event) = stream.next().await {
             terminal |= matches!(event?, WorkEvent::Output(event) if event.terminal().is_some());
@@ -298,7 +303,11 @@ async fn delivered_transcripts_verify_against_the_accepting_provider() {
     let fixture = Fixture::builder().build().await;
     let mut stream = fixture
         .gateway
-        .fetch("test", fixture.request(None))
+        .fetch(
+            "test",
+            crate::test_support::request_job(&fixture.gateway.jobs),
+            fixture.request(None),
+        )
         .unwrap();
     let mut events = Vec::new();
     while let Some(event) = within(stream.next()).await {
@@ -386,7 +395,11 @@ async fn disconnected_consumers_do_not_abandon_accepted_work() {
     let fixture = Fixture::builder().hold_completion().build().await;
     let mut stream = fixture
         .gateway
-        .fetch("test", fixture.request(None))
+        .fetch(
+            "test",
+            crate::test_support::request_job(&fixture.gateway.jobs),
+            fixture.request(None),
+        )
         .unwrap();
     assert!(matches!(
         within(stream.next()).await.unwrap().unwrap(),
@@ -411,10 +424,11 @@ async fn disconnected_consumers_do_not_abandon_accepted_work() {
     assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 1);
     drop(stream);
     fixture.host.backend.finish.release();
+    let queued = crate::test_support::request_job(&fixture.gateway.jobs);
     fixture.gateway.drain().await.unwrap();
     assert_eq!(fixture.host.backend.slots.available_permits(), 2);
     assert_err!(
-        fixture.gateway.fetch("test", fixture.request(None)),
+        fixture.gateway.fetch("test", queued, fixture.request(None)),
         WorkGatewayError::PreProposal(error) if matches!(*error, WorkGatewayError::Busy(_))
     );
 }
@@ -473,7 +487,11 @@ async fn refreshed_https_bounds_are_checked_before_proposal() {
         let guard = fixture.gateway.backends["test"].grant.lock().await;
         let mut stream = fixture
             .gateway
-            .fetch("test", fixture.request(Some(6)))
+            .fetch(
+                "test",
+                crate::test_support::request_job(&fixture.gateway.jobs),
+                fixture.request(Some(6)),
+            )
             .unwrap();
         let admin = hellas_authority::test_support::common_node::WorkAdmin::new(
             fixture.host.world.service.clone(),
@@ -562,7 +580,11 @@ async fn reused_policy_name_cannot_retarget_an_in_flight_request() {
     let guard = fixture.gateway.backends["test"].grant.lock().await;
     let mut stream = fixture
         .gateway
-        .fetch("test", fixture.request(None))
+        .fetch(
+            "test",
+            crate::test_support::request_job(&fixture.gateway.jobs),
+            fixture.request(None),
+        )
         .unwrap();
     let admin = hellas_authority::test_support::common_node::WorkAdmin::new(
         fixture.host.world.service.clone(),
@@ -680,7 +702,11 @@ async fn streams_outlast_the_control_timeout_while_they_progress() {
     let pace = fixture.host.backend.pace.clone().unwrap();
     let mut stream = fixture
         .gateway
-        .fetch("test", fixture.request(None))
+        .fetch(
+            "test",
+            crate::test_support::request_job(&fixture.gateway.jobs),
+            fixture.request(None),
+        )
         .unwrap();
     assert!(matches!(
         within(stream.next()).await.unwrap().unwrap(),
@@ -724,7 +750,11 @@ async fn silent_first_result_outlasts_the_control_timeout() {
         .await;
     let mut stream = fixture
         .gateway
-        .fetch("test", fixture.request(None))
+        .fetch(
+            "test",
+            crate::test_support::request_job(&fixture.gateway.jobs),
+            fixture.request(None),
+        )
         .unwrap();
     within(fixture.host.backend.started.notified()).await;
     assert!(matches!(
@@ -757,7 +787,11 @@ async fn silent_later_result_outlasts_the_control_timeout() {
         .await;
     let mut stream = fixture
         .gateway
-        .fetch("test", fixture.request(None))
+        .fetch(
+            "test",
+            crate::test_support::request_job(&fixture.gateway.jobs),
+            fixture.request(None),
+        )
         .unwrap();
     // The acceptance, then the response head.
     for _ in 0..2 {
@@ -791,7 +825,11 @@ async fn silent_work_still_ends_at_the_signed_deadline() {
         .await;
     let mut stream = fixture
         .gateway
-        .fetch("test", fixture.request(None))
+        .fetch(
+            "test",
+            crate::test_support::request_job(&fixture.gateway.jobs),
+            fixture.request(None),
+        )
         .unwrap();
     within(fixture.host.backend.started.notified()).await;
     assert!(matches!(
@@ -835,7 +873,8 @@ async fn queued_requests_wait_without_a_deadline_and_cancel_on_disconnect() {
             .target
             .job(&WorkRequest::Fetch(fixture.request(None)))
             .unwrap();
-        let (requester, stream) = Requester::<OutputEvent, WorkGatewayError>::new();
+        let (requester, stream) =
+            Requester::<OutputEvent, WorkGatewayError>::new(crate::test_support::job());
         let run = fixture.gateway.backends["test"].run(job, requester);
         tokio::pin!(run);
         assert!(futures::poll!(run.as_mut()).is_pending());
@@ -905,7 +944,8 @@ async fn disconnect_during_control_does_not_propose() {
         .target
         .job(&WorkRequest::Fetch(fixture.request(None)))
         .unwrap();
-    let (requester, stream) = Requester::<OutputEvent, WorkGatewayError>::new();
+    let (requester, stream) =
+        Requester::<OutputEvent, WorkGatewayError>::new(crate::test_support::job());
     {
         let run = fixture.gateway.backends["test"].run(job, requester);
         tokio::pin!(run);
@@ -964,6 +1004,7 @@ async fn single_signed_model_responses_route_tracks_continuation() {
     let access = host.gateway_access().await;
     let bearer = access.bearer();
     let server = hellas_gateway::start(hellas_gateway::GatewayOptions {
+        jobs: gateway.jobs.clone(),
         server: hellas_gateway::ServerOptions {
             archive: hellas_gateway::ArchiveOptions {
                 directory: host.root.path().join("archive"),
@@ -1142,6 +1183,7 @@ async fn two_grant_nodes_fail_over_before_proposal_and_rejoin_on_demand() {
     let access = first.host.gateway_access().await;
     let bearer = access.bearer();
     let server = hellas_gateway::start(hellas_gateway::GatewayOptions {
+        jobs: work.jobs.clone(),
         server: hellas_gateway::ServerOptions {
             access,
             allow_remote: false,
@@ -1205,20 +1247,30 @@ async fn two_grant_nodes_fail_over_before_proposal_and_rejoin_on_demand() {
 }
 
 #[tokio::test]
-async fn grant_jobs_overlap_on_one_journal_and_finish_after_a_consumer_disconnects() {
+async fn grant_jobs_overlap_and_finish_after_disconnect_or_cancellation() {
+    grant_concurrency(false).await;
+    grant_concurrency(true).await;
+}
+
+async fn grant_concurrency(cancel: bool) {
     let fixture = Fixture::builder()
         .max_in_flight(2)
         .with_budget(100)
         .hold_completion()
         .build()
         .await;
+    let first_job = crate::test_support::request_job(&fixture.gateway.jobs);
     let mut first = fixture
         .gateway
-        .fetch("test", fixture.request(None))
+        .fetch("test", first_job.clone(), fixture.request(None))
         .unwrap();
     let mut second = fixture
         .gateway
-        .fetch("test", fixture.request(None))
+        .fetch(
+            "test",
+            crate::test_support::request_job(&fixture.gateway.jobs),
+            fixture.request(None),
+        )
         .unwrap();
     let accepted = |event| match event {
         WorkEvent::Accepted(provenance) => {
@@ -1238,7 +1290,11 @@ async fn grant_jobs_overlap_on_one_journal_and_finish_after_a_consumer_disconnec
     assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 2);
     assert_eq!(fixture.gateway.backends()[0].in_flight, 2);
     assert!(matches!(
-        fixture.gateway.fetch("test", fixture.request(None)),
+        fixture.gateway.fetch(
+            "test",
+            crate::test_support::request_job(&fixture.gateway.jobs),
+            fixture.request(None)
+        ),
         Err(WorkGatewayError::PreProposal(_))
     ));
     {
@@ -1259,6 +1315,10 @@ async fn grant_jobs_overlap_on_one_journal_and_finish_after_a_consumer_disconnec
             .proposal_nonce;
         assert_eq!([first.min(second), first.max(second)], [1, 2]);
         assert_eq!(session.store().next_nonce().unwrap(), 3);
+    }
+    if cancel {
+        assert!(fixture.gateway.jobs.cancel(first_job.id()));
+        assert!(within(first.next()).await.is_none());
     }
     drop(first);
     fixture.host.backend.finish.release();

@@ -33,6 +33,7 @@ impl WorkExecutionBackend for Fake {
     fn fetch(
         &self,
         backend: &str,
+        _request_job: Arc<crate::jobs::Job>,
         _: WorkFetchRequest,
     ) -> Result<crate::WorkFetchStream, WorkGatewayError> {
         self.calls.lock().unwrap().push(backend.into());
@@ -83,6 +84,7 @@ fn choose(
                 ..Default::default()
             },
             None,
+            crate::test_support::job(),
         )
         .map(|(_, selection)| selection)
 }
@@ -107,7 +109,13 @@ fn routes_match_exact_keys_and_order_by_load_then_rotating_ties() {
     );
     assert_eq!(
         routing
-            .select("/v1/responses", "GET", Default::default(), None)
+            .select(
+                "/v1/responses",
+                "GET",
+                Default::default(),
+                None,
+                crate::test_support::job()
+            )
             .err()
             .unwrap()
             .status,
@@ -210,6 +218,7 @@ fn continuation_keys_and_upstream_cooldown_never_move_a_pinned_request() {
                 ..Default::default()
             },
             None,
+            crate::test_support::job(),
         )
     };
     assert_eq!(order_of(follow("resp").unwrap().1), ["a"]);
@@ -311,6 +320,7 @@ async fn compute_is_rendered_for_each_selected_evaluator() {
         fn run(
             &self,
             backend: &str,
+            _request_job: Arc<crate::jobs::Job>,
             job: ComputeJob,
         ) -> Result<crate::WorkOutputStream<crate::ComputeEvent>, WorkGatewayError> {
             self.calls.lock().unwrap().push((backend.into(), job));
@@ -353,11 +363,7 @@ async fn compute_is_rendered_for_each_selected_evaluator() {
         stops: &[],
     };
     let (_, mut stream) = execution
-        .compute(
-            &mut choose(&routing, Some("tiny"), None).unwrap(),
-            &request,
-            None,
-        )
+        .compute(&mut choose(&routing, Some("tiny"), None).unwrap(), &request)
         .await
         .unwrap();
     assert!(matches!(

@@ -118,88 +118,6 @@ pub fn response_stream<E: Send + 'static, X: Send + 'static>(
     })
 }
 
-/// Owns accepted tasks until their futures physically terminate. Drain polls the
-/// handles in place so dropping a drain future cannot detach unfinished work.
-#[derive(Default)]
-pub struct WorkTasks {
-    state: std::sync::Mutex<TaskState>,
-    draining: tokio::sync::Mutex<()>,
-}
-#[derive(Default)]
-struct TaskState {
-    closed: bool,
-    tasks: Vec<tokio::task::JoinHandle<()>>,
-    failure: Option<Arc<tokio::task::JoinError>>,
-}
-impl TaskState {
-    fn poll(&mut self, cx: &mut std::task::Context<'_>, finished_only: bool) {
-        use std::{future::Future as _, pin::Pin, task::Poll};
-        let failure = &mut self.failure;
-        self.tasks.retain_mut(|task| {
-            if finished_only && !task.is_finished() {
-                return true;
-            }
-            match Pin::new(task).poll(cx) {
-                Poll::Pending => true,
-                Poll::Ready(Ok(())) => false,
-                Poll::Ready(Err(error)) => {
-                    failure.get_or_insert_with(|| Arc::new(error));
-                    false
-                }
-            }
-        });
-    }
-}
-impl WorkTasks {
-    pub fn spawn(
-        &self,
-        future: impl std::future::Future<Output = ()> + Send + 'static,
-    ) -> Result<(), hellas_gateway::WorkGatewayBusy> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| hellas_gateway::WorkGatewayBusy)?;
-        if state.closed {
-            return Err(hellas_gateway::WorkGatewayBusy);
-        }
-        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
-        state.poll(&mut cx, true);
-        state.tasks.push(tokio::spawn(future));
-        Ok(())
-    }
-
-    pub fn close(&self) {
-        match self.state.lock() {
-            Ok(mut state) => state.closed = true,
-            Err(error) => error.into_inner().closed = true,
-        }
-    }
-
-    pub async fn drain(&self) -> Result<(), hellas_gateway::WorkShutdownError> {
-        use hellas_gateway::WorkShutdownError;
-        self.close();
-        let _draining = self.draining.lock().await;
-        std::future::poll_fn(|cx| {
-            let (mut state, poisoned) = match self.state.lock() {
-                Ok(state) => (state, false),
-                Err(error) => (error.into_inner(), true),
-            };
-            state.poll(cx, false);
-            if !state.tasks.is_empty() {
-                return std::task::Poll::Pending;
-            }
-            std::task::Poll::Ready(if let Some(error) = &state.failure {
-                Err(WorkShutdownError::Task(error.clone()))
-            } else if poisoned {
-                Err(WorkShutdownError::Poisoned)
-            } else {
-                Ok(())
-            })
-        })
-        .await
-    }
-}
-
 /// Gateway events derived from one invocation's signed output.
 pub trait GatewayEvent: serde::Serialize + Send + Sized + 'static {
     fn prefix(chunk: ArtifactChunk, pending: &mut Vec<u8>) -> Result<Vec<Self>, WorkGatewayError>;
@@ -281,6 +199,7 @@ pub type RequestStream<E, X> = BoxStream<'static, Result<WorkEvent<E>, X>>;
 
 /// The listening side of one accepted request.
 pub struct Requester<E, X> {
+    job: Arc<hellas_gateway::jobs::Job>,
     sender: mpsc::Sender<BufferedEvent<WorkEvent<E>, X>>,
     overflow: watch::Sender<bool>,
     budget: Arc<Semaphore>,
@@ -288,6 +207,7 @@ pub struct Requester<E, X> {
 impl<E, X> Clone for Requester<E, X> {
     fn clone(&self) -> Self {
         Self {
+            job: self.job.clone(),
             sender: self.sender.clone(),
             overflow: self.overflow.clone(),
             budget: self.budget.clone(),
@@ -295,29 +215,36 @@ impl<E, X> Clone for Requester<E, X> {
     }
 }
 impl<E: GatewayEvent, X: std::fmt::Display + Send + 'static> Requester<E, X> {
-    pub(crate) fn new() -> (Self, RequestStream<E, X>)
+    pub(crate) fn new(job: Arc<hellas_gateway::jobs::Job>) -> (Self, RequestStream<E, X>)
     where
         X: From<WorkGatewayError>,
     {
         let (sender, receiver) = mpsc::channel(OUTPUT_BUFFER_EVENTS);
         let (overflow, overflow_receiver) = watch::channel(false);
         let requester = Self {
+            job: job.clone(),
             sender,
             overflow,
             budget: Arc::new(Semaphore::new(OUTPUT_BUFFER_BYTES)),
         };
         (
             requester,
-            response_stream(receiver, overflow_receiver, || {
-                X::from(WorkGatewayError::Execution(Box::new(
-                    std::io::Error::other(
-                        "gateway output consumer is too slow; accepted work continues",
-                    ),
-                )))
-            }),
+            Box::pin(futures::StreamExt::take_until(
+                response_stream(receiver, overflow_receiver, || {
+                    X::from(WorkGatewayError::Execution(Box::new(
+                        std::io::Error::other(
+                            "gateway output consumer is too slow; accepted work continues",
+                        ),
+                    )))
+                }),
+                async move { job.cancelled().await },
+            )),
         )
     }
     pub(crate) fn emit(&self, event: Result<WorkEvent<E>, X>) {
+        if self.job.is_cancelled() {
+            return;
+        }
         // The signed transcript is one mandatory evidence record whose size is
         // fixed by the job's authorised spool, not by how fast the consumer
         // reads. Charging it against the slow-consumer byte budget made a
@@ -353,7 +280,10 @@ impl<E: GatewayEvent, X: std::fmt::Display + Send + 'static> Requester<E, X> {
     /// Reports the provider's acceptance as it happens, before any output.
     pub(crate) fn accepted(&self) -> crate::transact::Accepted {
         let requester = self.clone();
-        Arc::new(move |provenance| requester.emit(Ok(WorkEvent::Accepted(provenance))))
+        Arc::new(move |provenance| {
+            requester.job.accepted();
+            requester.emit(Ok(WorkEvent::Accepted(provenance)));
+        })
     }
     /// Signed prefixes, decoded and delivered as they arrive.
     pub(crate) fn progress(&self) -> hellas_channel::work::PaidProgress {
@@ -379,7 +309,10 @@ impl<E: GatewayEvent, X: std::fmt::Display + Send + 'static> Requester<E, X> {
     /// Disconnecting stops a request only before its proposal.
     pub(crate) fn stop(&self) -> crate::execution::Stop {
         let sender = self.sender.clone();
-        crate::execution::stop_on(async move { sender.closed().await })
+        let job = self.job.clone();
+        crate::execution::stop_on(async move {
+            tokio::select! { _ = sender.closed() => {}, _ = job.cancelled() => {} }
+        })
     }
     pub(crate) fn observers(&self) -> crate::execution::ExecutionObservers {
         crate::execution::ExecutionObservers {
@@ -776,9 +709,11 @@ pub struct BackendEntry {
 
 pub struct ExecutorGateway {
     backends: std::collections::BTreeMap<String, Arc<Inner>>,
-    tasks: WorkTasks,
+    pub jobs: Arc<hellas_gateway::jobs::Jobs>,
 }
 struct Inner {
+    id: String,
+    jobs: Arc<hellas_gateway::jobs::Jobs>,
     target: Backend,
     evaluator: Option<String>,
     signer: Arc<hellas_auth::ProducerSigningKey>,
@@ -793,13 +728,16 @@ impl ExecutorGateway {
         backends: std::collections::BTreeMap<String, BackendEntry>,
         signer: Arc<hellas_auth::ProducerSigningKey>,
     ) -> Arc<Self> {
+        let jobs = Arc::new(hellas_gateway::jobs::Jobs::default());
         Arc::new(Self {
             backends: backends
                 .into_iter()
                 .map(|(id, entry)| {
                     (
-                        id,
+                        id.clone(),
                         Arc::new(Inner {
+                            id,
+                            jobs: jobs.clone(),
                             target: entry.backend,
                             evaluator: entry.evaluator,
                             signer: signer.clone(),
@@ -812,12 +750,13 @@ impl ExecutorGateway {
                     )
                 })
                 .collect(),
-            tasks: WorkTasks::default(),
+            jobs,
         })
     }
     fn request<E: GatewayEvent>(
         &self,
         id: &str,
+        request_job: Arc<hellas_gateway::jobs::Job>,
         request: WorkRequest,
     ) -> Result<WorkOutputStream<E>, WorkGatewayError> {
         let inner = self
@@ -834,9 +773,9 @@ impl ExecutorGateway {
             .target
             .job(&request)
             .map_err(|error| WorkGatewayError::PreProposal(Box::new(error)))?;
-        let (requester, stream) = Requester::<E, WorkGatewayError>::new();
-        self.tasks
-            .spawn(async move {
+        let (requester, stream) = Requester::<E, WorkGatewayError>::new(request_job.clone());
+        request_job
+            .spawn(id, async move {
                 let _permit = permit;
                 if let Err(error) = inner.run(job, requester.clone()).await {
                     requester.emit(Err(error));
@@ -847,6 +786,23 @@ impl ExecutorGateway {
     }
 }
 impl Inner {
+    fn health(&self, down: bool) {
+        self.jobs.change(|| {
+            (self.down.swap(down, std::sync::atomic::Ordering::AcqRel) != down).then(|| {
+                hellas_gateway::jobs::Event::Backend {
+                    id: self.id.clone(),
+                    down,
+                    reason: if down {
+                        "session failed"
+                    } else {
+                        "session opened"
+                    }
+                    .into(),
+                }
+            })
+        });
+    }
+
     async fn run<E: GatewayEvent>(
         &self,
         job: Job,
@@ -895,8 +851,9 @@ impl Inner {
         let result = match run {
             Ok(_) => Ok(()),
             Err(AttemptError::PreProposal(error)) => {
+                requester.job.pre_proposal_failure();
                 if backend_failed(&error) {
-                    self.down.store(true, std::sync::atomic::Ordering::Release);
+                    self.health(true);
                 }
                 Err(WorkGatewayError::PreProposal(Box::new(gateway_error(
                     *error,
@@ -909,11 +866,16 @@ impl Inner {
                         ExecutionError::Grant(GrantClientError::Refused { .. })
                     )
                 {
-                    self.down.store(true, std::sync::atomic::Ordering::Release);
+                    self.health(true);
                 }
                 Err(gateway_error(*error))
             }
-            Err(AttemptError::Stopped(crate::execution::RequestStopped::Disconnected)) => Ok(()),
+            Err(AttemptError::Stopped(crate::execution::RequestStopped::Disconnected)) => {
+                requester
+                    .job
+                    .finish(hellas_gateway::jobs::Outcome::Cancelled);
+                Ok(())
+            }
             Err(AttemptError::Stopped(error)) => Err(gateway_error(error.into())),
         };
         // Keep a healthy channel open. A failed channel closes after its last
@@ -930,6 +892,13 @@ impl Inner {
             if let Some(mut session) = self.paid.lock().await.take() {
                 session.shutdown().await;
             }
+        }
+        if !matches!(&result, Err(WorkGatewayError::PreProposal(_))) {
+            requester.job.finish(if result.is_ok() {
+                hellas_gateway::jobs::Outcome::Completed
+            } else {
+                hellas_gateway::jobs::Outcome::Failed
+            });
         }
         result
     }
@@ -977,7 +946,7 @@ impl Inner {
             .await?
             .map_err(pre)?;
             *guard = Some(opened);
-            self.down.store(false, Ordering::Release);
+            self.health(false);
         }
         let session = guard
             .as_mut()
@@ -1003,7 +972,7 @@ impl Inner {
                     .ok();
                 let error = ExecutionError::from(error);
                 if backend_failed(&error) {
-                    self.down.store(true, Ordering::Release);
+                    self.health(true);
                 }
                 return Err(
                     if !proposed.load(Ordering::Acquire) && after == Some(floor) {
@@ -1032,7 +1001,7 @@ impl Inner {
             .pay(collected)
             .await;
         if result.is_err() {
-            self.down.store(true, Ordering::Release);
+            self.health(true);
         }
         let result = result.map_err(|error| committed(error.into()))?;
         drop(guard);
@@ -1074,7 +1043,7 @@ impl Inner {
             .await?
             .map_err(|error| pre(error.into()))?;
             *guard = Some(opened);
-            self.down.store(false, std::sync::atomic::Ordering::Release);
+            self.health(false);
         }
         let session = guard
             .as_mut()
@@ -1183,13 +1152,15 @@ impl WorkExecutionBackend for ExecutorGateway {
     fn fetch(
         &self,
         backend: &str,
+        request_job: Arc<hellas_gateway::jobs::Job>,
         request: WorkFetchRequest,
     ) -> Result<WorkOutputStream<OutputEvent>, WorkGatewayError> {
-        self.request(backend, WorkRequest::Fetch(request))
+        self.request(backend, request_job, WorkRequest::Fetch(request))
     }
     fn run(
         &self,
         backend: &str,
+        request_job: Arc<hellas_gateway::jobs::Job>,
         job: hellas_client::model::ComputeJob,
     ) -> Result<WorkOutputStream<ComputeEvent>, WorkGatewayError> {
         let evaluator = self
@@ -1199,6 +1170,7 @@ impl WorkExecutionBackend for ExecutorGateway {
             .ok_or(WorkGatewayError::Unsupported)?;
         self.request(
             backend,
+            request_job,
             WorkRequest::Job(JobInput::Compute {
                 evaluator,
                 environment: job.environment,
@@ -1212,9 +1184,9 @@ impl WorkExecutionBackend for ExecutorGateway {
         for backend in self.backends.values() {
             backend.slots.close();
         }
-        self.tasks.close();
+        self.jobs.close();
         Box::pin(async move {
-            let mut drained = self.tasks.drain().await;
+            let mut drained = self.jobs.drain().await;
             for backend in self.backends.values() {
                 if let Some(mut session) = backend.grant.lock().await.take()
                     && let Err(error) = session.shutdown().await
@@ -1330,74 +1302,6 @@ fn grant_error(e: GrantClientError) -> WorkGatewayError {
     reason = "inventory class A/B/C: test timing fixtures pending their rollout"
 )]
 mod grant_tests;
-
-#[cfg(test)]
-mod task_tests {
-    use super::WorkTasks;
-    use hellas_gateway::WorkShutdownError;
-    use tokio::sync::oneshot;
-
-    #[tokio::test]
-    async fn cancelled_drain_keeps_tasks_even_when_state_is_poisoned() {
-        for poison in [false, true] {
-            let tasks = WorkTasks::default();
-            let (release, released) = oneshot::channel();
-            let (finished, completed) = oneshot::channel();
-            tasks
-                .spawn(async move {
-                    released.await.unwrap();
-                    finished.send(()).unwrap();
-                })
-                .unwrap();
-            if poison {
-                assert!(
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let _state = tasks.state.lock().unwrap();
-                        panic!("inject poisoned task state");
-                    }))
-                    .is_err()
-                );
-            }
-            {
-                let mut first = std::pin::pin!(tasks.drain());
-                assert!(futures::poll!(&mut first).is_pending());
-            }
-            assert!(tasks.spawn(async {}).is_err());
-            let mut second = std::pin::pin!(tasks.drain());
-            assert!(futures::poll!(&mut second).is_pending());
-            release.send(()).unwrap();
-            let result = second.await;
-            completed.await.unwrap();
-            if poison {
-                assert!(matches!(result, Err(WorkShutdownError::Poisoned)));
-            } else {
-                result.unwrap();
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn task_panic_is_reported_after_other_work_finishes() {
-        let tasks = WorkTasks::default();
-        tasks
-            .spawn(async {
-                panic!("inject gateway task panic");
-            })
-            .unwrap();
-        let (release, released) = oneshot::channel();
-        tasks
-            .spawn(async {
-                released.await.unwrap();
-            })
-            .unwrap();
-        let mut draining = std::pin::pin!(tasks.drain());
-        assert!(futures::poll!(&mut draining).is_pending());
-        tokio::task::yield_now().await;
-        assert!(futures::poll!(&mut draining).is_pending());
-        release.send(()).unwrap();
-        assert!(matches!(draining.await, Err(WorkShutdownError::Task(error)) if error.is_panic()));
-    }
-}
 
 #[cfg(test)]
 mod output_tests {
@@ -1528,7 +1432,7 @@ mod output_tests {
 
     #[tokio::test]
     async fn buffered_reconnect_burst_is_delivered_and_releases_byte_budget() {
-        let (requester, mut response) = TestRequester::new();
+        let (requester, mut response) = TestRequester::new(crate::test_support::job());
         let budget = requester.budget.clone();
         // Retained output can arrive in one burst before HTTP gets a poll.
         for position in 0..128 {
@@ -1546,7 +1450,7 @@ mod output_tests {
 
     #[tokio::test]
     async fn a_transcript_larger_than_the_output_budget_is_delivered() {
-        let (requester, mut response) = TestRequester::new();
+        let (requester, mut response) = TestRequester::new(crate::test_support::job());
         // A job may be authorised to spool more evidence than the whole
         // slow-consumer queue holds. That evidence is mandatory and already
         // resident, so it must not be charged against the reader's budget;
@@ -1572,7 +1476,7 @@ mod output_tests {
 
     #[tokio::test]
     async fn slow_reader_gets_an_error_without_blocking_payment() {
-        let (requester, mut response) = TestRequester::new();
+        let (requester, mut response) = TestRequester::new(crate::test_support::job());
         // A stalled reader cannot retain more than the byte budget, and the
         // synchronous producer callback still returns without waiting on it.
         let half = OUTPUT_BUFFER_BYTES / 2 - OUTPUT_EVENT_OVERHEAD - text("").bytes();

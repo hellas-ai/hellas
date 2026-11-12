@@ -714,6 +714,7 @@ impl GrantServeOptions {
                 );
                 Ok(
                     hellas_sdk::gateway::start(hellas_sdk::gateway::GatewayOptions {
+                        jobs: work.jobs.clone(),
                         server: options.serve,
                         work,
                         routes,

@@ -41,6 +41,7 @@ pub(crate) struct Routing {
 
 #[derive(Clone)]
 pub(crate) struct Selection {
+    pub job: Arc<crate::jobs::Job>,
     routing: Arc<Routing>,
     candidates: Vec<String>,
     cursor: usize,
@@ -164,9 +165,6 @@ impl Routing {
                 }
             }
         }
-        if keys.is_empty() {
-            return Err(RoutingError("no HTTP routes".into()));
-        }
         for (path, method, model) in keys.keys() {
             if model.is_some() && keys.contains_key(&(path.clone(), method.clone(), None)) {
                 return Err(RoutingError(
@@ -193,6 +191,7 @@ impl Routing {
         method: &str,
         hints: Hints,
         connection: Option<&crate::ConnectionId>,
+        job: Arc<crate::jobs::Job>,
     ) -> Result<(usize, Selection), Unavailable> {
         let named = self
             .keys
@@ -327,6 +326,7 @@ impl Routing {
         Ok((
             row,
             Selection {
+                job,
                 routing: self.clone(),
                 candidates: candidates.into_iter().map(|(_, b)| b.id.clone()).collect(),
                 cursor: 0,

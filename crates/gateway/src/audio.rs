@@ -96,11 +96,6 @@ async fn handle(
         Ok(fields) => fields,
         Err(error) => return crate::request_error(error),
     };
-    let deadline = state
-        .work
-        .work
-        .timeout()
-        .map(|timeout| tokio::time::Instant::now() + timeout);
     let samples = match tokio::task::spawn_blocking(move || wav::decode(&file)).await {
         Ok(Ok(samples)) => samples,
         Ok(Err(error)) => return json_error(StatusCode::BAD_REQUEST, error.to_string()),
@@ -115,7 +110,6 @@ async fn handle(
                 language: language.as_deref(),
                 max_new_tokens: state.options.default_max_tokens,
             },
-            deadline,
         )
         .await
     {
@@ -126,7 +120,7 @@ async fn handle(
         output,
         accepted,
         transcript,
-    } = crate::compute::collect(stream, deadline, "transcription timed out").await;
+    } = crate::compute::collect(stream).await;
     let mut response = match output {
         Ok(output) => match package.decode(&output) {
             Ok(ModelResponse::Transcription(result)) if text => {

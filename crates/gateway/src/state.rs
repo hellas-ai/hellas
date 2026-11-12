@@ -17,7 +17,6 @@ use hellas_adaptors::{
 use hellas_presentation::{ChatTemplate, TextPresentation};
 use hellas_rpc::provenance::ExecutionProvenance;
 use std::sync::Arc;
-use tokio::time::Duration;
 
 /// Reject controls the native executor cannot enforce before creating a job.
 fn validate_native_text_request(canonical: &CanonicalExecution) -> Result<(), BackendError> {
@@ -113,7 +112,6 @@ pub(super) struct TextState {
     pub(super) inference_metrics: super::backend::telemetry::InferenceMetrics,
     default_max_tokens: u32,
     pub(super) model_name: String,
-    pub(super) inference_timeout: Option<Duration>,
     presentation: Arc<TextPresentation>,
     execution: Arc<RouteExecution>,
 }
@@ -128,7 +126,6 @@ pub(super) struct PreparedGeneration {
     pub(super) provenance: Option<ExecutionProvenance>,
     pub(super) prompt_tokens: u32,
     pub(super) presentation: Arc<TextPresentation>,
-    pub(super) deadline: Option<tokio::time::Instant>,
 }
 
 impl TextState {
@@ -151,7 +148,6 @@ impl TextState {
             inference_metrics: super::backend::telemetry::InferenceMetrics::new(),
             default_max_tokens: options.default_max_tokens,
             model_name: options.model_name.clone(),
-            inference_timeout: execution.work.timeout(),
             presentation: Arc::new(presentation),
             execution,
         })
@@ -183,9 +179,6 @@ impl TextState {
         chat: Option<hellas_presentation::chat::ChatTurn>,
         selection: &mut crate::routing::Selection,
     ) -> Result<PreparedGeneration, BackendError> {
-        let deadline = self
-            .inference_timeout
-            .map(|timeout| tokio::time::Instant::now() + timeout);
         let prompt_tokens = input_ids.len() as u32;
         let prompt = input_ids.into_iter().map(u64::from).collect::<Vec<_>>();
         let (_, prepared) = self
@@ -197,39 +190,23 @@ impl TextState {
                     max_new: u64::from(max_tokens),
                     stops: &[],
                 },
-                deadline,
             )
             .await?;
-        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
-            return Err(BackendError::Timeout(
-                "inference preparation timed out".into(),
-            ));
-        }
         Ok(PreparedGeneration {
             chat,
             prepared,
             provenance: None,
             prompt_tokens,
             presentation: self.presentation.clone(),
-            deadline,
         })
     }
 }
 
 impl PreparedGeneration {
-    /// Wait, within the inference budget, for the provider to accept the
-    /// job, so that its identity can head the response.
+    /// Wait for acceptance so its identity can head the response.
     pub(super) async fn accept(&mut self) -> Result<(), BackendError> {
-        let deadline = self.deadline();
-        self.provenance = crate::before_deadline(deadline, crate::accepted(&mut self.prepared))
-            .await
-            .map_err(|_| BackendError::failed("inference timed out"))?;
+        self.provenance = crate::accepted(&mut self.prepared).await;
         Ok(())
-    }
-
-    /// The same absolute budget covers preparation, acceptance and output.
-    pub(super) fn deadline(&self) -> Option<tokio::time::Instant> {
-        self.deadline
     }
 }
 

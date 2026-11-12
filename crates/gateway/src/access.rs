@@ -93,36 +93,35 @@ impl GatewayAccess {
         }
     }
 
-    async fn authorizes(&self, headers: &HeaderMap) -> bool {
+    async fn authorizes(&self, headers: &HeaderMap) -> Option<crate::jobs::Origin> {
         let mut values = headers.get_all(header::AUTHORIZATION).iter();
-        let Some(value) = values.next() else {
-            return false;
-        };
+        let value = values.next()?;
         if values.next().is_some() {
-            return false;
+            return None;
         }
         let value = value.as_bytes();
-        let Some((scheme, text)) = value.split_at_checked(7) else {
-            return false;
-        };
+        let (scheme, text) = value.split_at_checked(7)?;
         if !scheme.eq_ignore_ascii_case(b"bearer ") {
-            return false;
+            return None;
         }
         let Ok(text) = std::str::from_utf8(text) else {
-            return false;
+            return None;
         };
         let Ok(bytes) = hellas_auth::hex::parse_lower::<48>(text) else {
-            return false;
+            return None;
         };
         let Ok(id) = CredentialId::try_from(&bytes[..16]) else {
-            return false;
+            return None;
         };
         let Ok(secret) = bytes[16..].try_into() else {
-            return false;
+            return None;
         };
         self.authenticate(&CredentialSecret::from_parts(id, secret))
             .await
-            .is_ok()
+            .ok()?;
+        Some(crate::jobs::Origin::Http {
+            credential: id.to_string(),
+        })
     }
 }
 impl fmt::Debug for GatewayAccess {
@@ -171,9 +170,10 @@ where
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
         Box::pin(async move {
-            if !access.authorizes(request.headers()).await {
+            let Some(origin) = access.authorizes(request.headers()).await else {
                 return Ok(unauthorized(request.uri().path()));
-            }
+            };
+            request.extensions_mut().insert(origin);
             // This credential belongs to local HTTP admission, never upstream.
             request.headers_mut().remove(header::AUTHORIZATION);
             inner.call(request).await

@@ -549,3 +549,17 @@ pub fn gateway(
         signer,
     )
 }
+
+pub fn job() -> std::sync::Arc<hellas_gateway::jobs::Job> {
+    request_job(&std::sync::Arc::new(hellas_gateway::jobs::Jobs::default()))
+}
+pub fn request_job(
+    jobs: &std::sync::Arc<hellas_gateway::jobs::Jobs>,
+) -> std::sync::Arc<hellas_gateway::jobs::Job> {
+    jobs.admit(&hellas_gateway::jobs::Request {
+        origin: hellas_gateway::jobs::Origin::Local,
+        method: "POST".into(),
+        path: "/test".into(),
+    })
+    .unwrap()
+}

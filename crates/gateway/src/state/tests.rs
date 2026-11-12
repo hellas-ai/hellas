@@ -50,6 +50,7 @@ async fn authenticated_prefixes_arrive_before_the_paid_terminal() {
         fn run(
             &self,
             _backend: &str,
+            _request_job: Arc<crate::jobs::Job>,
             job: hellas_client::model::ComputeJob,
         ) -> Result<crate::WorkOutputStream<ComputeEvent>, crate::WorkGatewayError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -126,7 +127,7 @@ async fn authenticated_prefixes_arrive_before_the_paid_terminal() {
 }
 
 #[tokio::test]
-async fn paid_capacity_is_a_retryable_error_and_uses_the_pool_deadline() {
+async fn paid_capacity_is_a_retryable_error() {
     struct Busy;
     impl crate::WorkExecutionBackend for Busy {
         fn backends(&self) -> Vec<crate::BackendInfo> {
@@ -136,12 +137,10 @@ async fn paid_capacity_is_a_retryable_error_and_uses_the_pool_deadline() {
                 ))
             })
         }
-        fn timeout(&self) -> Option<Duration> {
-            Some(Duration::from_secs(17))
-        }
         fn run(
             &self,
             _backend: &str,
+            _request_job: Arc<crate::jobs::Job>,
             _: hellas_client::model::ComputeJob,
         ) -> Result<crate::WorkOutputStream<crate::ComputeEvent>, crate::WorkGatewayError> {
             Err(crate::WorkGatewayBusy.into())
@@ -151,7 +150,6 @@ async fn paid_capacity_is_a_retryable_error_and_uses_the_pool_deadline() {
         }
     }
     let state = open(Arc::new(Busy)).await;
-    assert_eq!(state.inference_timeout, Some(Duration::from_secs(17)));
     let error = state
         .prepare_ids(
             vec![0],
@@ -186,6 +184,7 @@ impl WorkExecutionBackend for Accepting {
     fn run(
         &self,
         _backend: &str,
+        _request_job: Arc<crate::jobs::Job>,
         _: hellas_client::model::ComputeJob,
     ) -> Result<crate::WorkOutputStream<ComputeEvent>, crate::WorkGatewayError> {
         use crate::WorkEvent;
@@ -355,6 +354,7 @@ impl WorkExecutionBackend for Capturing {
     fn run(
         &self,
         _backend: &str,
+        _request_job: Arc<crate::jobs::Job>,
         job: hellas_client::model::ComputeJob,
     ) -> Result<crate::WorkOutputStream<ComputeEvent>, crate::WorkGatewayError> {
         self.jobs.lock().unwrap().push(job);

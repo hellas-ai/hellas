@@ -48,6 +48,11 @@ impl WorkBackend for Controlled {
 
 #[tokio::test]
 async fn paid_jobs_collect_concurrently_and_pay_in_completion_order() {
+    paid_concurrency(false).await;
+    paid_concurrency(true).await;
+}
+
+async fn paid_concurrency(cancel: bool) {
     tokio::time::timeout(Duration::from_secs(20), async {
         let fixture = PaidFixture::new();
         let provider = fixture.provider().await;
@@ -158,6 +163,8 @@ async fn paid_jobs_collect_concurrently_and_pay_in_completion_order() {
         )
         .unwrap();
         let key = ProducerSigningKey::from_secret_bytes([1; 32]).unwrap();
+        let jobs = Arc::new(hellas_gateway::jobs::Jobs::default());
+        let mut request_jobs = Vec::new();
         let mut tasks = Vec::new();
         let mut streams = Vec::new();
         for index in 0..2 {
@@ -169,10 +176,12 @@ async fn paid_jobs_collect_concurrently_and_pay_in_completion_order() {
                 .await
                 .unwrap();
             assert!(proposed.load(Ordering::Acquire));
+            let request_job = crate::test_support::request_job(&jobs);
+            request_jobs.push(request_job.clone());
             let (requester, mut stream) = crate::gateway_work::Requester::<
                 OutputEvent,
                 hellas_gateway::WorkGatewayError,
-            >::new();
+            >::new(request_job);
             tasks.push(tokio::spawn({
                 let session = session.clone();
                 async move {
@@ -213,8 +222,13 @@ async fn paid_jobs_collect_concurrently_and_pay_in_completion_order() {
             })
             .await
             .unwrap();
-        // A disconnected consumer cannot abandon an accepted purchase.
-        drop(streams.remove(0));
+        // Cancellation and disconnect both leave collection and settlement owned.
+        let mut first_stream = streams.remove(0);
+        if cancel {
+            assert!(jobs.cancel(request_jobs[0].id()));
+            assert!(first_stream.next().await.is_none());
+        }
+        drop(first_stream);
         gates[1].add_permits(1);
         let second = tasks.pop().unwrap().await.unwrap();
         assert_eq!(second.credited_cumulative, PRICE);

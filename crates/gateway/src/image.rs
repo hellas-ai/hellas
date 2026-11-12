@@ -68,17 +68,11 @@ async fn handle(
     if let Err(error) = image_request(&request).validate() {
         return json_error(StatusCode::BAD_REQUEST, error.to_string());
     }
-    let deadline = state
-        .work
-        .work
-        .timeout()
-        .map(|timeout| tokio::time::Instant::now() + timeout);
     let (package, stream) = match state
         .work
         .compute(
             &mut selection,
             &ModelRequest::Image(image_request(&request)),
-            deadline,
         )
         .await
     {
@@ -89,7 +83,7 @@ async fn handle(
         output,
         accepted,
         transcript,
-    } = crate::compute::collect(stream, deadline, "image generation timed out").await;
+    } = crate::compute::collect(stream).await;
     let (status, body) = match output {
         Ok(output) => {
             let png = tokio::task::spawn_blocking(
@@ -100,19 +94,15 @@ async fn handle(
                     image.png(width, height).map_err(Into::into)
                 },
             );
-            match crate::before_deadline(deadline, png).await {
-                Ok(Ok(Ok(png))) => (
+            match png.await {
+                Ok(Ok(png)) => (
                     StatusCode::OK,
                     images::render(&png, crate::now_unix() as u64),
                 ),
-                Ok(Ok(Err(error))) => (StatusCode::BAD_GATEWAY, error_json(error.to_string())),
-                Ok(Err(error)) => (
+                Ok(Err(error)) => (StatusCode::BAD_GATEWAY, error_json(error.to_string())),
+                Err(error) => (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     error_json(error.to_string()),
-                ),
-                Err(_) => (
-                    StatusCode::GATEWAY_TIMEOUT,
-                    error_json("image encoding timed out"),
                 ),
             }
         }

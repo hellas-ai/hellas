@@ -117,7 +117,6 @@ impl RouteExecution {
         &self,
         selection: &mut crate::routing::Selection,
         request: &ModelRequest<'_>,
-        deadline: Option<tokio::time::Instant>,
     ) -> Result<(Arc<ModelPackage>, WorkOutputStream<crate::ComputeEvent>), WorkGatewayError> {
         let mut last = WorkGatewayError::Busy(crate::WorkGatewayBusy);
         while let Some(id) = selection.next() {
@@ -138,12 +137,9 @@ impl RouteExecution {
                     .render_job(request)
                     .await
                     .map_err(|error| WorkGatewayError::Rejected(error.into()))?;
-                first(self.work.run(&id, job)).await
+                first(self.work.run(&id, selection.job.clone(), job)).await
             };
-            match crate::before_deadline(deadline, attempt)
-                .await
-                .map_err(|_| WorkGatewayError::Timeout("preparation timed out".into()))?
-            {
+            match attempt.await {
                 Ok(stream) => {
                     selection.accept(&id);
                     return Ok((package, stream));
@@ -162,7 +158,7 @@ impl RouteExecution {
     ) -> Result<crate::WorkFetchStream, WorkGatewayError> {
         let mut last = WorkGatewayError::Busy(crate::WorkGatewayBusy);
         while let Some(id) = selection.next() {
-            match first(self.work.fetch(&id, request.clone())).await {
+            match first(self.work.fetch(&id, selection.job.clone(), request.clone())).await {
                 Ok(stream) => {
                     selection.accept(&id);
                     return Ok(stream);

@@ -41,6 +41,14 @@ fn gateway_waits_for_slow_funding_finality() {
             let request = gateway
                 .fetch(
                     "test",
+                    gateway
+                        .jobs
+                        .admit(&hellas_gateway::jobs::Request {
+                            origin: hellas_gateway::jobs::Origin::Local,
+                            method: "POST".into(),
+                            path: "/v1/responses".into(),
+                        })
+                        .unwrap(),
                     hellas_gateway::WorkFetchRequest {
                         service: "openai".into(),
                         method: "responses".into(),

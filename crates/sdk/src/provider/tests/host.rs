@@ -297,6 +297,7 @@ impl GrantGateway {
                     signer,
                 );
                 Ok(hellas_gateway::start(hellas_gateway::GatewayOptions {
+                    jobs: work.jobs.clone(),
                     server: options.serve,
                     work,
                     routes,

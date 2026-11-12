@@ -790,6 +790,7 @@ async fn async_main() {
                             authorities.push((host.node, host.control));
                             gateways.push(
                                 hellas_gateway::start(hellas_gateway::GatewayOptions {
+                                    jobs: work.jobs.clone(),
                                     server,
                                     work: work.clone(),
                                     routes: routes.clone(),

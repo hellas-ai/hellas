@@ -37,6 +37,7 @@ pub fn selection(work: Arc<dyn WorkExecutionBackend>) -> Selection {
             "POST",
             Default::default(),
             None,
+            crate::test_support::job(),
         )
         .unwrap()
         .1
@@ -47,5 +48,15 @@ pub async fn execution(
 ) -> Arc<RouteExecution> {
     RouteExecution::open(&route(presentation), work)
         .await
+        .unwrap()
+}
+
+pub fn job() -> Arc<crate::jobs::Job> {
+    Arc::new(crate::jobs::Jobs::default())
+        .admit(&crate::jobs::Request {
+            origin: crate::jobs::Origin::Local,
+            method: "POST".into(),
+            path: "/test".into(),
+        })
         .unwrap()
 }

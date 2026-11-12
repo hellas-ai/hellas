@@ -1,3 +1,4 @@
+pub mod jobs;
 #[macro_use]
 extern crate tracing;
 
@@ -13,7 +14,7 @@ mod backend;
 mod compute;
 mod dispatch;
 mod error;
-mod router;
+pub mod router;
 pub use error::{GatewayConfigError, GatewayError, GatewayResult};
 mod http_fetch;
 mod image;
@@ -169,6 +170,7 @@ pub trait WorkExecutionBackend: Send + Sync {
     fn fetch(
         &self,
         _backend: &str,
+        _request_job: Arc<jobs::Job>,
         _request: WorkFetchRequest,
     ) -> Result<WorkFetchStream, WorkGatewayError> {
         Err(WorkGatewayError::Unsupported)
@@ -180,14 +182,10 @@ pub trait WorkExecutionBackend: Send + Sync {
     fn run(
         &self,
         _backend: &str,
+        _request_job: Arc<jobs::Job>,
         _job: hellas_client::model::ComputeJob,
     ) -> Result<WorkOutputStream<ComputeEvent>, WorkGatewayError> {
         Err(WorkGatewayError::Unsupported)
-    }
-
-    /// An explicit end-to-end budget, including queued time, if the source has one.
-    fn timeout(&self) -> Option<std::time::Duration> {
-        None
     }
 
     /// Finish accepted work and its funding obligations during graceful shutdown.
@@ -229,6 +227,7 @@ pub struct ServerOptions {
 
 /// One gateway: HTTP presentations over one work source.
 pub struct GatewayOptions {
+    pub jobs: Arc<jobs::Jobs>,
     pub server: ServerOptions,
     pub work: Arc<dyn WorkExecutionBackend>,
     pub routes: Vec<Route>,
@@ -321,6 +320,7 @@ async fn start_gateway(options: GatewayOptions) -> crate::GatewayResult<GatewayH
         server,
         work,
         routes,
+        jobs,
     } = options;
     let listener = bind_gateway(&server.host, server.port, server.allow_remote).await?;
     let bearer = server.access.clone();
@@ -328,7 +328,7 @@ async fn start_gateway(options: GatewayOptions) -> crate::GatewayResult<GatewayH
     let archive_policy = archive::Policy::new(server.archive.clone());
     archive_policy.prepare();
 
-    let app = router::router(routes, work.clone()).await?;
+    let app = router::router(routes, work.clone(), jobs).await?;
     // Every route reaches a work source, so every route is behind the
     // provisioned Auth credential. The layer goes on last, which in axum
     // puts it outermost: a request without the credential is answered
@@ -344,10 +344,6 @@ async fn start_gateway(options: GatewayOptions) -> crate::GatewayResult<GatewayH
         hellas_rpc::telemetry::http::trace_request,
     ));
     let app = app.layer(access::BearerLayer::new(bearer.clone()));
-    if let Some(timeout) = work.timeout() {
-        info!("timeout: {}s", timeout.as_secs());
-    }
-
     let bound_addr = listener.local_addr()?;
     info!("gateway listening on {bound_addr}");
     bearer.announce();
@@ -484,17 +480,6 @@ fn next_id(prefix: &str) -> String {
 
 fn now_unix() -> i64 {
     (UnixMillis::now().unwrap_or_default().0 / 1_000) as i64
-}
-
-/// Wait without a client deadline unless the work source explicitly supplies one.
-async fn before_deadline<F: std::future::Future>(
-    deadline: Option<tokio::time::Instant>,
-    future: F,
-) -> Result<F::Output, tokio::time::error::Elapsed> {
-    match deadline {
-        Some(deadline) => tokio::time::timeout_at(deadline, future).await,
-        None => Ok(future.await),
-    }
 }
 
 #[cfg(test)]

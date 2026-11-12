@@ -23,6 +23,7 @@ impl WorkExecutionBackend for RecordedFetch {
     fn fetch(
         &self,
         _backend: &str,
+        _request_job: Arc<crate::jobs::Job>,
         request: WorkFetchRequest,
     ) -> Result<WorkFetchStream, WorkGatewayError> {
         assert_eq!(request.service, "openai");
@@ -40,6 +41,7 @@ impl WorkExecutionBackend for RecordedFetch {
     fn run(
         &self,
         _backend: &str,
+        _request_job: Arc<crate::jobs::Job>,
         _: hellas_client::model::ComputeJob,
     ) -> Result<WorkOutputStream<ComputeEvent>, WorkGatewayError> {
         Err(WorkGatewayError::Unsupported)
@@ -195,10 +197,14 @@ async fn responses_carry_provenance_at_start_and_end() {
             ],
             calls: AtomicUsize::new(0),
         });
-        let app = crate::router::router(vec![crate::test_support::route(presentation())], work)
-            .await
-            .unwrap()
-            .layer(crate::provenance_layer::ProvenanceLayer);
+        let app = crate::router::router(
+            vec![crate::test_support::route(presentation())],
+            work,
+            Arc::new(crate::jobs::Jobs::default()),
+        )
+        .await
+        .unwrap()
+        .layer(crate::provenance_layer::ProvenanceLayer);
         let response = app
             .oneshot(
                 axum::http::Request::post(PATH)

@@ -76,7 +76,8 @@ async fn paid_image_burst_is_verified_and_delivered() {
         commitment_id: [23; 32],
         provider: key.public_key(),
     };
-    let (requester, mut response) = Requester::<ComputeEvent, WorkGatewayError>::new();
+    let (requester, mut response) =
+        Requester::<ComputeEvent, WorkGatewayError>::new(crate::test_support::job());
     // A retained result can arrive in one burst before the consumer polls.
     requester.accepted()(accepted.clone());
     let progress = requester.progress();

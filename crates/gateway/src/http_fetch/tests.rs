@@ -22,6 +22,7 @@ async fn http_uses_the_paid_backend_and_waits_for_its_payment_completion() {
         fn run(
             &self,
             _backend: &str,
+            _request_job: Arc<crate::jobs::Job>,
             _: hellas_client::model::ComputeJob,
         ) -> Result<crate::WorkOutputStream<crate::ComputeEvent>, crate::WorkGatewayError> {
             unreachable!("HTTP must use Fetch")
@@ -29,6 +30,7 @@ async fn http_uses_the_paid_backend_and_waits_for_its_payment_completion() {
         fn fetch(
             &self,
             _backend: &str,
+            _request_job: Arc<crate::jobs::Job>,
             request: WorkFetchRequest,
         ) -> Result<crate::WorkFetchStream, crate::WorkGatewayError> {
             self.requests.fetch_add(1, Ordering::Relaxed);
@@ -69,6 +71,7 @@ async fn http_uses_the_paid_backend_and_waits_for_its_payment_completion() {
         let archive = tempfile::tempdir().unwrap();
         let fixture = crate::access::tests::Fixture::new().await;
         let handle = crate::start(crate::GatewayOptions {
+            jobs: Arc::new(crate::jobs::Jobs::default()),
             server: crate::ServerOptions {
                 archive: crate::ArchiveOptions {
                     directory: archive.path().into(),
@@ -256,6 +259,7 @@ impl WorkExecutionBackend for Proxied {
     fn fetch(
         &self,
         _backend: &str,
+        _request_job: Arc<crate::jobs::Job>,
         _: WorkFetchRequest,
     ) -> Result<crate::WorkFetchStream, crate::WorkGatewayError> {
         let mut events = vec![
@@ -321,6 +325,7 @@ async fn proxy(paid: Arc<Proxied>) -> (crate::GatewayHandle, tempfile::TempDir) 
     let archive = tempfile::tempdir().unwrap();
     let fixture = crate::access::tests::Fixture::new().await;
     let handle = crate::start(crate::GatewayOptions {
+        jobs: Arc::new(crate::jobs::Jobs::default()),
         server: crate::ServerOptions {
             archive: crate::ArchiveOptions {
                 directory: archive.path().into(),
@@ -456,6 +461,7 @@ impl WorkExecutionBackend for ContinuationBackend {
     fn fetch(
         &self,
         _backend: &str,
+        _request_job: Arc<crate::jobs::Job>,
         _: WorkFetchRequest,
     ) -> Result<crate::WorkFetchStream, crate::WorkGatewayError> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -479,7 +485,9 @@ async fn signed_single_route_registers_response_for_followup() {
     use tower::ServiceExt;
     let work = Arc::new(ContinuationBackend { calls: 0.into() });
     let config = vec![http("/v1/responses", Some(vec!["m".into()]), None)];
-    let app = crate::router::router(config, work.clone()).await.unwrap();
+    let app = crate::router::router(config, work.clone(), Arc::new(crate::jobs::Jobs::default()))
+        .await
+        .unwrap();
     for body in [
         r#"{"model":"m"}"#,
         r#"{"model":"m","previous_response_id":"resp_1"}"#,
@@ -510,7 +518,9 @@ async fn duplicate_session_header_never_discards_an_unknown_continuation() {
         http("/v1/responses", None, None),
         http("/v1/audio/transcriptions", None, None),
     ];
-    let app = crate::router::router(config, work.clone()).await.unwrap();
+    let app = crate::router::router(config, work.clone(), Arc::new(crate::jobs::Jobs::default()))
+        .await
+        .unwrap();
     let response = app
         .clone()
         .oneshot(

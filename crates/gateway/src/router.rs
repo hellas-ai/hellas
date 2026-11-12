@@ -7,9 +7,10 @@ use axum::{Router, body::Body, extract::Request, http::StatusCode, response::Res
 use std::sync::Arc;
 use tower::ServiceExt;
 
-pub(crate) async fn router(
+pub async fn router(
     routes: Vec<Route>,
     work: Arc<dyn WorkExecutionBackend>,
+    jobs: Arc<crate::jobs::Jobs>,
 ) -> GatewayResult<Router> {
     let routing = Routing::new(routes, work.clone())?;
     let mut presentations = Vec::new();
@@ -79,11 +80,35 @@ pub(crate) async fn router(
         presentations.push(router);
     }
     Ok(Router::new()
-        .fallback(move |request| dispatch(routing.clone(), presentations.clone(), request))
+        .fallback(move |request| {
+            dispatch(
+                routing.clone(),
+                presentations.clone(),
+                jobs.clone(),
+                request,
+            )
+        })
         .layer(axum::extract::DefaultBodyLimit::disable()))
 }
 
-async fn dispatch(routing: Arc<Routing>, presentations: Vec<Router>, request: Request) -> Response {
+async fn dispatch(
+    routing: Arc<Routing>,
+    presentations: Vec<Router>,
+    jobs: Arc<crate::jobs::Jobs>,
+    request: Request,
+) -> Response {
+    let job = match jobs.admit(&crate::jobs::Request {
+        origin: request
+            .extensions()
+            .get::<crate::jobs::Origin>()
+            .cloned()
+            .unwrap_or(crate::jobs::Origin::Local),
+        method: request.method().to_string(),
+        path: request.uri().path().into(),
+    }) {
+        Ok(job) => job,
+        Err(error) => return path_error(request.uri().path(), error.status, error.message),
+    };
     let limit = request_limit(request.uri().path());
     let (mut parts, body) = request.into_parts();
     let path = parts.uri.path().to_owned();
@@ -120,18 +145,19 @@ async fn dispatch(routing: Arc<Routing>, presentations: Vec<Router>, request: Re
         .extensions
         .get::<axum::extract::ConnectInfo<crate::ConnectionId>>()
         .map(|c| &c.0);
-    let (row, selection) = match routing.select(&path, parts.method.as_str(), hints, connection) {
-        Ok(selected) => selected,
-        Err(failure) => {
-            let mut response = path_error(&path, failure.status, failure.message);
-            if let Some(retry) = failure.retry {
-                response
-                    .headers_mut()
-                    .insert("retry-after", retry.to_string().parse().unwrap());
+    let (row, selection) =
+        match routing.select(&path, parts.method.as_str(), hints, connection, job) {
+            Ok(selected) => selected,
+            Err(failure) => {
+                let mut response = path_error(&path, failure.status, failure.message);
+                if let Some(retry) = failure.retry {
+                    response
+                        .headers_mut()
+                        .insert("retry-after", retry.to_string().parse().unwrap());
+                }
+                return response;
             }
-            return response;
-        }
-    };
+        };
     parts.extensions.insert(selection);
     match presentations[row]
         .clone()

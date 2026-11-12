@@ -804,6 +804,14 @@ async fn check_gateway_quote(
         gateway
             .fetch(
                 "test",
+                gateway
+                    .jobs
+                    .admit(&hellas_gateway::jobs::Request {
+                        origin: hellas_gateway::jobs::Origin::Local,
+                        method: "POST".into(),
+                        path: "/v1/responses".into()
+                    })
+                    .unwrap(),
                 hellas_gateway::WorkFetchRequest {
                     service: "openai".into(),
                     method: "wrong-route".into(),
@@ -821,6 +829,14 @@ async fn check_gateway_quote(
         gateway
             .fetch(
                 "test",
+                gateway
+                    .jobs
+                    .admit(&hellas_gateway::jobs::Request {
+                        origin: hellas_gateway::jobs::Origin::Local,
+                        method: "POST".into(),
+                        path: "/v1/responses".into()
+                    })
+                    .unwrap(),
                 hellas_gateway::WorkFetchRequest {
                     service: "openai".into(),
                     method: "responses".into(),
