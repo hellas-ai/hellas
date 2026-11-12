@@ -121,8 +121,24 @@ pub async fn run(mut options: ServeOptions) -> CliResult<()> {
     );
     let content = content_configuration
         .config()
-        .open(&options.home, ram, options.paid.is_none())
+        .open(&options.home, ram, false)
         .await?;
+
+    let recovered: CliResult<()> = async {
+        hellas_sdk::chain_home::recover_provider_chains(
+            &options.home,
+            &options.settlement_key,
+            &content,
+        )
+        .await?;
+        content.finish_recovery().await?;
+        Ok(())
+    }
+    .await;
+    if let Err(error) = recovered {
+        content.close().await;
+        return Err(error);
+    }
 
     // What the operator configured, said back once. A node with a
     // paid-work configuration serves its journals, answers every

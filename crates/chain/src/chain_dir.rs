@@ -1,5 +1,5 @@
 //! Native storage paths for one validated chain profile.
-use crate::genesis::{ChainProfile, ChainProfileError};
+use crate::genesis::{ChainProfile, ChainProfileError, CustomChainFile};
 use hellas_private::StoreLocation;
 use std::{io, path::Path};
 
@@ -15,13 +15,59 @@ impl ChainDir {
     /// Chain stores inherit `home`'s durability.
     pub fn open(home: &StoreLocation, profile: &ChainProfile) -> io::Result<Self> {
         let root = home.child("chains").child(profile.state_key());
-        hellas_private::create_dir_all_durable(&root)?;
+        let path = root.join("profile.json");
+        let bytes = serde_json::to_vec(&profile.to_file()).map_err(invalid_profile)?;
+        if bytes.len() > MAX_PROFILE_BYTES {
+            return Err(invalid_profile("chain profile is too large"));
+        }
+        root.durability().create_dir_all(&root)?;
+        let previous = match hellas_private::read_bounded_regular_file(&path, MAX_PROFILE_BYTES) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        if previous.as_deref() != Some(bytes.as_slice()) {
+            root.durability()
+                .write_atomically(&path, ".profile", &bytes)?;
+        }
         tracing::info!("chain {} state: {}", profile.network_id(), root.display());
         Ok(Self {
             home: home.clone(),
             root,
             profile: profile.clone(),
         })
+    }
+
+    /// Read every retained chain without creating directories or rewriting profiles.
+    /// Missing, malformed or misplaced profiles refuse recovery.
+    pub fn discover(home: &StoreLocation) -> io::Result<Vec<Self>> {
+        directories(&home.child("chains"))?
+            .into_iter()
+            .map(|root| {
+                let bytes = hellas_private::read_bounded_regular_file(
+                    &root.join("profile.json"),
+                    MAX_PROFILE_BYTES,
+                )?;
+                let file: CustomChainFile =
+                    serde_json::from_slice(&bytes).map_err(invalid_profile)?;
+                let profile = ChainProfile::custom(file).map_err(invalid_profile)?;
+                if root.file_name() != Some(std::ffi::OsStr::new(&profile.state_key())) {
+                    return Err(invalid_profile(
+                        "chain profile does not match its directory",
+                    ));
+                }
+                Ok(Self {
+                    home: home.clone(),
+                    root,
+                    profile,
+                })
+            })
+            .collect()
+    }
+
+    /// All provider roots sharing this chain's client content store.
+    pub fn client_journal_roots(&self) -> io::Result<Vec<StoreLocation>> {
+        directories(&self.client().child("channels"))
     }
 
     pub fn as_path(&self) -> &Path {
@@ -75,12 +121,78 @@ impl std::ops::Deref for ChainDir {
     }
 }
 
+const MAX_PROFILE_BYTES: usize = 4 << 20;
+
+fn invalid_profile(error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error)
+}
+
+fn directories(root: &StoreLocation) -> io::Result<Vec<StoreLocation>> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(error) => return Err(error),
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            return Err(invalid_profile(format!(
+                "expected directory: {}",
+                entry.path().display()
+            )));
+        }
+        paths.push(root.child(entry.file_name()));
+    }
+    paths.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+    Ok(paths)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::genesis::{Chain, CustomChainFile, Genesis};
     use hellas_private::Durability::Crash;
     use sha2::{Digest as _, Sha256};
+
+    #[test]
+    fn discovery_preserves_the_profile_and_refuses_missing_or_misplaced_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = StoreLocation::from_home(&directory.path().join("home"), Crash);
+        assert!(ChainDir::discover(&home).unwrap().is_empty());
+        assert!(!home.exists(), "discovery must not create a home");
+        let profile = ChainProfile::known(Chain::Devnet)
+            .with_validators(vec!["wss://example.com/chain".into()])
+            .unwrap();
+        let chain = ChainDir::open(&home, &profile).unwrap();
+        let file = chain.as_path().join("profile.json");
+        let original = std::fs::read(&file).unwrap();
+        let found = ChainDir::discover(&home).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].state_key(), profile.state_key());
+        assert_eq!(found[0].validators(), profile.validators());
+        assert_eq!(found[0].genesis_json(), profile.genesis_json());
+        assert_eq!(
+            serde_json::to_value(found[0].trust()).unwrap(),
+            serde_json::to_value(profile.trust()).unwrap()
+        );
+        assert!(chain.client_journal_roots().unwrap().is_empty());
+        assert!(!chain.client().exists());
+        // Reopening unchanged input keeps the published profile file in place.
+        let published = std::fs::metadata(&file).unwrap().modified().unwrap();
+        ChainDir::open(&home, &profile).unwrap();
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().modified().unwrap(),
+            published
+        );
+        std::fs::remove_file(&file).unwrap();
+        assert!(ChainDir::discover(&home).is_err());
+        std::fs::write(&file, b"invalid").unwrap();
+        assert!(ChainDir::discover(&home).is_err());
+        std::fs::write(&file, original).unwrap();
+        std::fs::rename(chain.as_path(), home.child("chains").child("wrong-key")).unwrap();
+        assert!(ChainDir::discover(&home).is_err());
+    }
 
     #[test]
     fn store_locations_keep_the_selected_durability() {
