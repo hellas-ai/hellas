@@ -1348,7 +1348,7 @@ fn provider_journals(home: &Path) -> std::path::PathBuf {
     (crate::test_support::chain_dir(home, network()).provider_journals()).into_path_buf()
 }
 
-async fn write_setup_journal(root: &Path) {
+pub(crate) async fn write_setup_journal(root: &Path) {
     OfferFixture::first()
         .write_completed_setup_for(root, default_route_peer())
         .await;
@@ -1377,7 +1377,7 @@ async fn open_channel(root: &Path) -> ChannelStore {
 
 // ── One job, paid for, and then contested ─────────────────────────
 
-fn bundle() -> PreparedInvocation {
+pub(crate) fn bundle() -> PreparedInvocation {
     hellas_channel::test_support::channel::bundle(0x9e)
 }
 
@@ -1542,7 +1542,7 @@ async fn propose_and_accept(store: &mut ChannelStore) -> Digest {
 
 /// The provider journal a process can find after crashing between its
 /// durable acceptance and the detached backend task's first poll.
-async fn write_accepted_channel(root: &Path) -> Digest {
+pub(crate) async fn write_accepted_channel(root: &Path) -> Digest {
     let mut store = open_channel(root).await;
     let work = propose_and_accept(&mut store).await;
     store.content_store().close().await;

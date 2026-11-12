@@ -17,15 +17,15 @@ pub enum ChainHomeError {
 }
 
 /// Restore pins and reservations from all retained provider chains, including
-/// unconfigured chains. This does not drive or close their channels, and does
-/// not finish the store's recovery barrier: the host owns that barrier.
+/// unconfigured chains, then finish recovery. This does not drive or close their channels.
 pub async fn recover_provider_chains(
     home: &StoreLocation,
     settlement_key: &hellas_kernel::Secp256k1Signer,
     content: &DiskStore,
 ) -> Result<(), ChainHomeError> {
     for chain in ChainDir::discover(home)? {
-        let recovered = WorkRunner::discover(
+        // DiskStore retains the restored pins and reservations after writers close.
+        WorkRunner::discover(
             WorkRunnerConfig {
                 chain,
                 settlement_key: settlement_key.clone(),
@@ -34,17 +34,38 @@ pub async fn recover_provider_chains(
             MountedSetup::with_content_store(content.clone()),
         )
         .await?;
-        // DiskStore retains the restored pins and reservations after writers close.
-        drop(recovered);
     }
+    content.finish_recovery().await?;
     Ok(())
 }
 
 /// Open the chain's shared client content store and recover every provider root
 /// before cleanup, including providers other than the next operation's target.
 pub async fn open_client_content(chain: &ChainDir) -> Result<DiskStore, ChainHomeError> {
-    let store = DiskStore::open(
+    open_content(
         chain.client().child("content"),
+        chain,
+        chain.client_journal_roots()?,
+    )
+    .await
+}
+
+/// Open one provider's gateway content store and recover its journals before cleanup.
+pub async fn open_gateway_content(
+    chain: &ChainDir,
+    provider: hellas_client::ProviderAddress,
+) -> Result<DiskStore, ChainHomeError> {
+    let root = crate::paid_client::PaidJournalKind::Gateway.journal_root(chain, provider);
+    open_content(root.child("content"), chain, vec![root]).await
+}
+
+async fn open_content(
+    location: StoreLocation,
+    chain: &ChainDir,
+    journals: Vec<StoreLocation>,
+) -> Result<DiskStore, ChainHomeError> {
+    let store = DiskStore::open(
+        location,
         vec![],
         IndexMode::Resume,
         None,
@@ -53,7 +74,7 @@ pub async fn open_client_content(chain: &ChainDir) -> Result<DiskStore, ChainHom
     )
     .await?;
     let restored = async {
-        for root in chain.client_journal_roots()? {
+        for root in journals {
             crate::paid_client::recover_content(&root, chain.network(), &store).await?;
         }
         store.finish_recovery().await?;
@@ -72,7 +93,49 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn refused_client_recovery_closes_the_store_before_reopening() {
+    async fn provider_recovery_restores_retained_content_before_cleanup() {
+        use crate::provider::tests::node::{bundle, write_accepted_channel, write_setup_journal};
+        use hellas_channel::test_support::channel::{content_store, provider};
+        use hellas_store::content::{ContentStore as _, LocalStore, Scope, owner_pins};
+
+        let directory = tempfile::tempdir().unwrap();
+        write_setup_journal(directory.path()).await;
+        write_accepted_channel(directory.path()).await;
+        let content = content_store(directory.path()).await;
+        let pins = owner_pins(&content, "channel/").await.unwrap();
+        assert_eq!(pins.len(), 1);
+        for (name, pin) in &pins {
+            content
+                .set_pin(&Scope::Owner, name, Some(pin), None)
+                .await
+                .unwrap();
+        }
+        content.close().await;
+        let content = content_store(directory.path()).await;
+        recover_provider_chains(
+            &StoreLocation::for_test(directory.path()),
+            &provider(),
+            &content,
+        )
+        .await
+        .unwrap();
+        assert_eq!(owner_pins(&content, "channel/").await.unwrap(), pins);
+        assert_eq!(content.collect(&Scope::Owner).await.unwrap().objects, 0);
+        let input = bundle().canonical_bytes().unwrap();
+        let bytes = hellas_channel::content::read(
+            &LocalStore::Disk(content.clone()),
+            &Scope::Owner,
+            hellas_rpc::ContentRef::for_bytes(&input),
+            input.len() as u64,
+        )
+        .await
+        .unwrap();
+        assert_eq!(bytes, input);
+        content.close().await;
+    }
+
+    #[tokio::test]
+    async fn invalid_client_roots_refuse_before_opening_content() {
         let directory = tempfile::tempdir().unwrap();
         let home = StoreLocation::for_test(directory.path());
         let profile =
@@ -82,6 +145,7 @@ mod tests {
         std::fs::create_dir_all(root.parent().unwrap()).unwrap();
         std::fs::write(&root, b"bad root").unwrap();
         assert!(open_client_content(&chain).await.is_err());
+        assert!(!chain.client().join("content").exists());
         std::fs::remove_file(&root).unwrap();
         let content = open_client_content(&chain).await.unwrap();
         content.close().await;

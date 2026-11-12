@@ -21,15 +21,8 @@ impl ChainDir {
             return Err(invalid_profile("chain profile is too large"));
         }
         root.durability().create_dir_all(&root)?;
-        let previous = match hellas_private::read_bounded_regular_file(&path, MAX_PROFILE_BYTES) {
-            Ok(bytes) => Some(bytes),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error),
-        };
-        if previous.as_deref() != Some(bytes.as_slice()) {
-            root.durability()
-                .write_atomically(&path, ".profile", &bytes)?;
-        }
+        root.durability()
+            .write_atomically(&path, ".profile", &bytes)?;
         tracing::info!("chain {} state: {}", profile.network_id(), root.display());
         Ok(Self {
             home: home.clone(),
@@ -39,7 +32,7 @@ impl ChainDir {
     }
 
     /// Read every retained chain without creating directories or rewriting profiles.
-    /// Missing, malformed or misplaced profiles refuse recovery.
+    /// Missing or malformed profiles refuse recovery.
     pub fn discover(home: &StoreLocation) -> io::Result<Vec<Self>> {
         directories(&home.child("chains"))?
             .into_iter()
@@ -51,11 +44,6 @@ impl ChainDir {
                 let file: CustomChainFile =
                     serde_json::from_slice(&bytes).map_err(invalid_profile)?;
                 let profile = ChainProfile::custom(file).map_err(invalid_profile)?;
-                if root.file_name() != Some(std::ffi::OsStr::new(&profile.state_key())) {
-                    return Err(invalid_profile(
-                        "chain profile does not match its directory",
-                    ));
-                }
                 Ok(Self {
                     home: home.clone(),
                     root,
@@ -156,7 +144,7 @@ mod tests {
     use sha2::{Digest as _, Sha256};
 
     #[test]
-    fn discovery_preserves_the_profile_and_refuses_missing_or_misplaced_identity() {
+    fn discovery_preserves_the_profile_and_refuses_missing_or_malformed_identity() {
         let directory = tempfile::tempdir().unwrap();
         let home = StoreLocation::from_home(&directory.path().join("home"), Crash);
         assert!(ChainDir::discover(&home).unwrap().is_empty());
@@ -166,31 +154,17 @@ mod tests {
             .unwrap();
         let chain = ChainDir::open(&home, &profile).unwrap();
         let file = chain.as_path().join("profile.json");
-        let original = std::fs::read(&file).unwrap();
         let found = ChainDir::discover(&home).unwrap();
         assert_eq!(found.len(), 1);
-        assert_eq!(found[0].state_key(), profile.state_key());
-        assert_eq!(found[0].validators(), profile.validators());
-        assert_eq!(found[0].genesis_json(), profile.genesis_json());
         assert_eq!(
-            serde_json::to_value(found[0].trust()).unwrap(),
-            serde_json::to_value(profile.trust()).unwrap()
+            serde_json::to_vec(&found[0].to_file()).unwrap(),
+            serde_json::to_vec(&profile.to_file()).unwrap()
         );
         assert!(chain.client_journal_roots().unwrap().is_empty());
         assert!(!chain.client().exists());
-        // Reopening unchanged input keeps the published profile file in place.
-        let published = std::fs::metadata(&file).unwrap().modified().unwrap();
-        ChainDir::open(&home, &profile).unwrap();
-        assert_eq!(
-            std::fs::metadata(&file).unwrap().modified().unwrap(),
-            published
-        );
         std::fs::remove_file(&file).unwrap();
         assert!(ChainDir::discover(&home).is_err());
         std::fs::write(&file, b"invalid").unwrap();
-        assert!(ChainDir::discover(&home).is_err());
-        std::fs::write(&file, original).unwrap();
-        std::fs::rename(chain.as_path(), home.child("chains").child("wrong-key")).unwrap();
         assert!(ChainDir::discover(&home).is_err());
     }
 
