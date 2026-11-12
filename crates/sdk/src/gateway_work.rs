@@ -871,9 +871,7 @@ impl Inner {
                 Err(gateway_error(*error))
             }
             Err(AttemptError::Stopped(crate::execution::RequestStopped::Disconnected)) => {
-                requester
-                    .job
-                    .finish(hellas_gateway::jobs::Outcome::Cancelled);
+                requester.job.stopped();
                 Ok(())
             }
             Err(AttemptError::Stopped(error)) => Err(gateway_error(error.into())),

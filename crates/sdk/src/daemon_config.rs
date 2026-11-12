@@ -112,11 +112,21 @@ pub struct Credential {
     pub secret: Option<String>,
 }
 
+impl Default for Document {
+    fn default() -> Self {
+        Self {
+            revision: Revision(0),
+            listeners: BTreeMap::new(),
+            backends: BTreeMap::new(),
+            routes: vec![],
+            authority: Default::default(),
+            limits: Default::default(),
+        }
+    }
+}
+
 impl Document {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.backends.is_empty() || self.listeners.is_empty() {
-            return Err("configure at least one listener and backend");
-        }
         if self
             .backends
             .keys()
@@ -125,21 +135,24 @@ impl Document {
         {
             return Err("invalid listener or backend id");
         }
+        if self
+            .backends
+            .values()
+            .any(|backend| backend.max_in_flight.get() > tokio::sync::Semaphore::MAX_PERMITS)
+        {
+            return Err("backend capacity exceeds the runtime limit");
+        }
         for listener in self.listeners.values() {
             match listener {
                 Listener::Iroh { backends, .. } => {
-                    let mut keys = std::collections::BTreeSet::new();
+                    let mut ids = std::collections::BTreeSet::new();
                     for id in backends {
-                        let backend = self.backends.get(id).ok_or("unknown iroh backend")?;
-                        let key = match &backend.kind {
-                            BackendKind::Local { runtime, .. } => ("compute", runtime.as_str(), ""),
-                            BackendKind::Fetch {
-                                service, method, ..
-                            } => ("fetch", service.as_str(), method.as_str()),
+                        if !ids.insert(id) {
+                            return Err("duplicate iroh backend");
+                        }
+                        match &self.backends.get(id).ok_or("unknown iroh backend")?.kind {
+                            BackendKind::Local { .. } | BackendKind::Fetch { .. } => {}
                             _ => return Err("iroh listeners only serve local and fetch backends"),
-                        };
-                        if !keys.insert(key) {
-                            return Err("ambiguous iroh invocation key");
                         }
                     }
                 }
@@ -153,11 +166,40 @@ impl Document {
         }
         for route in &self.routes {
             for id in &route.backends {
-                if matches!(
-                    self.backends.get(id).ok_or("unknown HTTP backend")?.kind,
-                    BackendKind::Fetch { .. }
-                ) {
-                    return Err("HTTP routes only use local, grant and paid backends");
+                self.backends.get(id).ok_or("unknown HTTP backend")?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Runtime aliases are resolved before checking an iroh listener's exact keys.
+    pub fn validate_resolved(
+        &self,
+        resolved: &[hellas_gateway::BackendInfo],
+    ) -> Result<(), &'static str> {
+        self.validate()?;
+        for listener in self.listeners.values() {
+            let Listener::Iroh { backends, .. } = listener else {
+                continue;
+            };
+            let mut keys = std::collections::BTreeSet::new();
+            for id in backends {
+                let key = match &self.backends[id].kind {
+                    BackendKind::Local { .. } => {
+                        let evaluator = resolved
+                            .iter()
+                            .find(|backend| backend.id == *id)
+                            .and_then(|backend| backend.evaluator.as_deref())
+                            .ok_or("local backend has no registered evaluator")?;
+                        ("compute", evaluator, "")
+                    }
+                    BackendKind::Fetch {
+                        service, method, ..
+                    } => ("fetch", service.as_str(), method.as_str()),
+                    _ => return Err("iroh listeners only serve local and fetch backends"),
+                };
+                if !keys.insert(key) {
+                    return Err("ambiguous iroh invocation key");
                 }
             }
         }
@@ -168,3 +210,6 @@ impl Document {
 fn initial_revision() -> Revision {
     Revision(0)
 }
+
+#[cfg(test)]
+mod tests;

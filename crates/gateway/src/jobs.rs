@@ -3,9 +3,14 @@ use crate::{WorkGatewayBusy, WorkShutdownError};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex, Weak},
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use tokio::sync::{broadcast, watch};
+mod limits;
+pub use limits::RequestLimit;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -171,6 +176,7 @@ impl Jobs {
                 id,
                 jobs: self.clone(),
                 stop: watch::channel(false).0,
+                accepted: AtomicBool::new(false),
                 reservations: Mutex::new(Some(std::mem::take(&mut reservations))),
             });
             let info = Info {
@@ -274,6 +280,7 @@ pub struct Job {
     id: u64,
     jobs: Arc<Jobs>,
     stop: watch::Sender<bool>,
+    accepted: AtomicBool,
     reservations: Mutex<Option<Vec<Box<dyn Reservation>>>>,
 }
 impl Job {
@@ -293,10 +300,19 @@ impl Job {
         });
     }
     pub fn accepted(&self) {
+        self.accepted.store(true, Ordering::Release);
         self.update(|info| {
             if info.state != State::Cancelling {
                 info.state = State::Accepted;
             }
+        });
+    }
+    /// Cancellation after acceptance cannot certify that no work was done.
+    pub fn stopped(&self) {
+        self.finish(if self.accepted.load(Ordering::Acquire) {
+            Outcome::Failed
+        } else {
+            Outcome::Cancelled
         });
     }
     fn update(&self, update: impl FnOnce(&mut Info)) {

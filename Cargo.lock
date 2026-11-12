@@ -3378,6 +3378,7 @@ dependencies = [
  "flate2",
  "futures",
  "hellas-adaptors",
+ "hellas-admission",
  "hellas-auth",
  "hellas-authority",
  "hellas-channel",

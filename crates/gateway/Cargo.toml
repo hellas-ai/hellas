@@ -23,6 +23,7 @@ base64.workspace = true
 flate2 = "1"
 futures = { workspace = true }
 hellas-adaptors.workspace = true
+hellas-admission.workspace = true
 hellas-auth.workspace = true
 hellas-authority.workspace = true
 hellas-channel.workspace = true
