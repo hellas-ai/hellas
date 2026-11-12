@@ -657,6 +657,9 @@ async fn output_budgets_are_cut_to_the_terms() {
 
     struct Bounded(Capturing);
     impl WorkExecutionBackend for Bounded {
+        fn evaluator(&self) -> Option<String> {
+            self.0.evaluator()
+        }
         fn max_steps(&self) -> Option<u64> {
             Some(3)
         }
