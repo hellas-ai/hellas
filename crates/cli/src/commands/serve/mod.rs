@@ -121,7 +121,7 @@ pub async fn run(mut options: ServeOptions) -> CliResult<()> {
     );
     let content = content_configuration
         .config()
-        .open(&options.home, ram, false)
+        .open(&options.home, ram, options.paid.is_none())
         .await?;
 
     let recovered: CliResult<()> = async {
