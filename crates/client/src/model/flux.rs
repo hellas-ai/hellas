@@ -211,9 +211,10 @@ pub(super) struct Flux {
     config: Config,
     assets: Vec<NamedAsset>,
     args: [Vec<Arg>; 3],
+    dialect: super::GpuDialect,
 }
 impl Flux {
-    pub fn open(directory: &Path) -> Result<Self> {
+    pub fn open(directory: &Path, dialect: super::GpuDialect) -> Result<Self> {
         let config = Config::read(directory)?;
         let tensors = config.tensors()?;
         let assets: Vec<NamedAsset> =
@@ -246,6 +247,7 @@ impl Flux {
             config,
             assets,
             args,
+            dialect,
         })
     }
     pub fn render_job(&self, request: &ImageRequest<'_>) -> Result<(ComputeJob, String)> {
@@ -265,11 +267,12 @@ impl Flux {
             ))),
             Scope::Owner,
         );
-        let source = super::program::render(&self.config.source(
-            request.width,
-            request.height,
-            request.steps,
-        )?)?;
+        let source = super::program::render(
+            &self
+                .config
+                .source(request.width, request.height, request.steps)?,
+            self.dialect,
+        )?;
         ensure!(
             source.len() as u64 <= MAX_SOURCE_BYTES,
             "image program exceeds source limit"

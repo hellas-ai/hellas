@@ -166,12 +166,12 @@ enum Commands {
         /// Resources and listeners for an explicitly initialized authority store.
         #[arg(long = "grant-config")]
         grant_config_file: Option<PathBuf>,
-        /// Admit this exact Compute program manifest (64-hex content ID) in the
+        /// Admit this exact Compute program (an id from `hellas program`) in the
         /// one shared `compute` resource; repeat for each program.
-        #[arg(long = "program", value_name = "MANIFEST", conflicts_with_all = ["grant_config_file", "work_config_file"])]
-        programs: Vec<hellas_rpc::ContentId>,
-        /// Serve a configuration that admits any Compute program (`mode =
-        /// "any"` in paid terms, or `Any` in a grant resource); without it
+        #[arg(long = "program", value_name = "PROGRAM", conflicts_with_all = ["grant_config_file", "work_config_file"])]
+        programs: Vec<hellas_rpc::protocol::invocation::compute::ProgramId>,
+        /// Serve a configuration that admits any Compute program (`any` in
+        /// paid terms, or `Any` in a grant resource); without it
         /// such a node refuses to start. Compiling and running a program from
         /// an unknown author hands that author roughly root on this host.
         #[arg(long)]
@@ -296,6 +296,9 @@ enum Commands {
     Program {
         #[arg(value_name = "PATH")]
         model: PathBuf,
+        /// The registered renderer (evaluator id) the program is compiled for.
+        #[arg(long, value_name = "EVALUATOR")]
+        backend: String,
     },
     /// Transcribe one WAV with a client-rendered Whisper job.
     Transcribe(commands::transact::TranscribeArgs),
@@ -540,8 +543,8 @@ async fn async_main() {
             }
             return;
         }
-        Commands::Program { model } => {
-            let result = hellas_client::model::ModelPackage::open(&model)
+        Commands::Program { model, backend } => {
+            let result = hellas_client::model::ModelPackage::open(&model, &backend)
                 .await
                 .and_then(|package| package.program())
                 .map(|program| println!("{program}"));
@@ -707,9 +710,9 @@ async fn async_main() {
                             );
                             Some(hellas_sdk::grant_config::GrantConfig::compute(
                                 &home,
-                                hellas_rpc::protocol::invocation::ComputePrograms::Only {
-                                    manifests: programs,
-                                },
+                                hellas_rpc::protocol::invocation::Admission::compute_only(
+                                    &programs,
+                                )?,
                             )?)
                         } else {
                             None

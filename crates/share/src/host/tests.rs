@@ -710,7 +710,11 @@ impl GrantServeOptions {
                 if options.serve.http.is_none() {
                     options.serve.http = target.http_config()?;
                 }
-                let work = hellas_sdk::ExecutorGateway::new(target, signer);
+                let work = hellas_sdk::ExecutorGateway::new(
+                    target,
+                    Some(hellas_channel::test_support::channel::evaluator()),
+                    signer,
+                );
                 Ok(hellas_sdk::serve_gateway(work, options.serve).await?)
             })
         })

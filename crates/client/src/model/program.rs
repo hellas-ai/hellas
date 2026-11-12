@@ -1,8 +1,7 @@
-//! Ship the client's reachable stdlib with the model as one Hex source.
+//! Ship the complete program catena-models compiles for a model source.
 use anyhow::Result;
-use metacat::theory::RawTheorySet;
+use catena_models::catena::{program_sources, runtime_sources};
 
-pub(super) fn render(model: &str) -> Result<String> {
-    let raw = RawTheorySet::from_texts(catena_models::catena::runtime_sources(model))?;
-    Ok(catena_models::catena::prepare_sources(raw)?.to_hexpr_text())
+pub(super) fn render(model: &str, dialect: super::GpuDialect) -> Result<String> {
+    Ok(program_sources(runtime_sources(model), dialect)?.to_hexpr_text())
 }

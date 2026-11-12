@@ -409,7 +409,7 @@ fn golden_digests_bind_the_encoded_network() {
     );
     assert_eq!(
         hex(&work_id(&channel, &authorization()).into_bytes()),
-        "2cc33c7a67bcd98f892941f78fe0338f6f83c5206de39f8fa37e13a6024c5137"
+        "9a680bd1df521e21e1f71b4e1f370dc0e28d2e2ab5fe379b07f9fe0f93f65114"
     );
 
     let other = channel_on(
@@ -1351,7 +1351,7 @@ fn digest_preimages_are_reproducible_by_hand() {
     assert_eq!(preimage.len(), 30 + 16 + 32 + 139);
     assert_eq!(
         hex(&Digest::hash(&preimage).into_bytes()),
-        "976d5872843d37dbc1d0876b93f5972fb16d49821b4510504c67c078fd3b3f83"
+        "574f95bea680f5376aa3f0600dfb44f2c866e60a4f96fb47f18c6fba1d7f456f"
     );
 
     // The payment binding, whose three fields are all 32 bytes: a round

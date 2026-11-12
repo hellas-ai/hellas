@@ -54,6 +54,8 @@ pub enum JobInput {
         assurance: Assurance,
     },
     Compute {
+        /// The evaluator id the program is rendered for.
+        evaluator: String,
         environment: compute::Environment,
         plan: compute::Plan,
         inputs: Vec<Artifact>,
@@ -172,12 +174,13 @@ impl JobInput {
                 contract.manifest()
             }
             JobInput::Compute {
+                evaluator,
                 environment,
                 plan,
                 inputs,
                 ..
             } => {
-                let manifest = environment.manifest()?;
+                let manifest = environment.manifest(evaluator)?;
                 InvocationInput {
                     parameters: JsonBytes(plan.canonical_bytes()?),
                     artifacts: inputs.clone(),
@@ -303,6 +306,7 @@ impl Job {
     }
     pub async fn compute(
         price: u64,
+        evaluator: String,
         environment: compute::Environment,
         plan: compute::Plan,
         inputs: Vec<Artifact>,
@@ -311,6 +315,7 @@ impl Job {
         let job = Self::from_input(
             price,
             JobInput::Compute {
+                evaluator,
                 environment,
                 plan,
                 inputs,
@@ -511,6 +516,7 @@ impl Job {
                 }
                 Self::compute(
                     doc.payment.price,
+                    doc.application.evaluator.clone(),
                     environment,
                     compute.plan,
                     inputs,

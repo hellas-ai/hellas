@@ -167,7 +167,7 @@ fn policy_is_bounded_canonical_and_has_no_compile_budget() {
     let bytes = p.canonical_bytes().unwrap();
     assert_eq!(
         p.content_id().unwrap().to_string(),
-        "1902f37e33fcda1bc7cc17d0dba5d8ea7e1d6fab03730f9146adc483a331603a"
+        "9de3a4e03988e29d402e54ba54d6bac631f4c7884c0b9a6076a996bc1e2fc405"
     );
     assert_eq!(InvocationPolicy::from_canonical_bytes(&bytes).unwrap(), p);
     let mut trailing = bytes.clone();
@@ -493,7 +493,7 @@ fn compute_prepared(policy: &InvocationPolicy, plan: &compute::Plan) -> Prepared
         sources: vec![crate::ContentRef::for_bytes(b"program")],
         assets: vec![],
     }
-    .manifest()
+    .manifest(crate::protocol::invocation::compute::EVALUATOR)
     .unwrap();
     let input = InvocationInput {
         parameters: JsonBytes(plan.canonical_bytes().unwrap()),
@@ -631,15 +631,6 @@ fn application_admission_binds_owner_bytes_caller_and_staging_classification() {
             .classify_manifest(&prepared.manifest().unwrap())
             .is_err()
     );
-    let unknown = crate::ProgramManifest::new(
-        crate::Application::new("unknown/evaluator", compute::ADAPTOR).unwrap(),
-        compute.manifest().unwrap().root(),
-    );
-    forged.admissions = vec![Admission::Compute {
-        evaluator: "unknown/evaluator".into(),
-        programs: ComputePrograms::Any {},
-    }];
-    assert!(forged.classify_manifest(&unknown).is_err());
 }
 
 #[test]
@@ -651,7 +642,9 @@ fn compute_program_selection_binds_sources_and_weights_before_admission() {
             object: crate::ContentRef::for_bytes(b"approved weights"),
         }],
     };
-    let manifest = environment.manifest().unwrap();
+    let manifest = environment
+        .manifest(crate::protocol::invocation::compute::EVALUATOR)
+        .unwrap();
     let mut restricted = policy();
     restricted.admissions[0] = Admission::Compute {
         evaluator: compute::EVALUATOR.into(),
@@ -722,7 +715,9 @@ fn compute_program_selection_binds_sources_and_weights_before_admission() {
                         crate::ContentRef::new(asset.id(), asset.bytes() + 1);
                 }
             }
-            let other = changed.manifest().unwrap();
+            let other = changed
+                .manifest(crate::protocol::invocation::compute::EVALUATOR)
+                .unwrap();
             let request = prepare(&other, original.input.clone(), retain);
             assert!(restricted.classify_manifest(&other).is_err());
             assert!(restricted.admit(&request, &caller()).is_err());
@@ -1283,7 +1278,9 @@ fn content_closure_opens_the_signed_root_and_returns_unique_exact_references() {
         compute::Environment::from_canonical_bytes(&bytes).unwrap(),
         environment
     );
-    let manifest = environment.manifest().unwrap();
+    let manifest = environment
+        .manifest(crate::protocol::invocation::compute::EVALUATOR)
+        .unwrap();
     let actual = policy().content_closure(&manifest, &bytes).unwrap();
     assert_eq!(actual.len(), 3);
     assert!(actual.contains(&crate::ContentRef::for_bytes(&bytes)));

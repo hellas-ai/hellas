@@ -31,6 +31,11 @@ async fn authenticated_prefixes_arrive_before_the_paid_terminal() {
         payment_ack: Arc<tokio::sync::Notify>,
     }
     impl WorkExecutionBackend for Paid {
+        fn evaluator(&self) -> Option<String> {
+            Some(hellas_client::model::evaluator(
+                hellas_client::model::GpuDialect::Hip,
+            ))
+        }
         fn run(
             &self,
             job: hellas_client::model::ComputeJob,
@@ -104,6 +109,11 @@ async fn authenticated_prefixes_arrive_before_the_paid_terminal() {
 async fn paid_capacity_is_a_retryable_error_and_uses_the_pool_deadline() {
     struct Busy;
     impl crate::WorkExecutionBackend for Busy {
+        fn evaluator(&self) -> Option<String> {
+            Some(hellas_client::model::evaluator(
+                hellas_client::model::GpuDialect::Hip,
+            ))
+        }
         fn timeout(&self) -> Option<Duration> {
             Some(Duration::from_secs(17))
         }
@@ -138,6 +148,11 @@ struct Accepting {
 }
 
 impl WorkExecutionBackend for Accepting {
+    fn evaluator(&self) -> Option<String> {
+        Some(hellas_client::model::evaluator(
+            hellas_client::model::GpuDialect::Hip,
+        ))
+    }
     fn run(
         &self,
         _: hellas_client::model::ComputeJob,
@@ -313,6 +328,11 @@ struct Capturing {
 }
 
 impl WorkExecutionBackend for Capturing {
+    fn evaluator(&self) -> Option<String> {
+        Some(hellas_client::model::evaluator(
+            hellas_client::model::GpuDialect::Hip,
+        ))
+    }
     fn run(
         &self,
         job: hellas_client::model::ComputeJob,

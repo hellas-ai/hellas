@@ -117,7 +117,12 @@ async fn converted_asset_and_program_are_stable_and_ship_with_every_job() {
     );
     let second = root.path().join("second");
     assert_eq!(convert_whisper(&checkpoint_dir, &second).unwrap(), object);
-    let model = ModelPackage::open(&converted).await.unwrap();
+    let model = ModelPackage::open(
+        &converted,
+        &crate::model::evaluator(crate::model::GpuDialect::Hip),
+    )
+    .await
+    .unwrap();
     for _ in 0..2 {
         let job = model
             .render_job(&ModelRequest::Transcription {
@@ -143,10 +148,10 @@ async fn converted_asset_and_program_are_stable_and_ship_with_every_job() {
         assert_eq!(
             job.environment.sources[0],
             ContentRef::new(
-                "909951524418bfeeb7827977d1a22e67c8f164a7f8247b27d4a320e46b68da7a"
+                "73f3bb55f094376597053c573814bd00599518b8c2703fbd1f72dc2f0e247da3"
                     .parse()
                     .unwrap(),
-                351878,
+                424931,
             ),
         );
         assert!(
@@ -207,7 +212,12 @@ async fn decode_validates_the_result_header_and_decodes_client_side() {
     checkpoint(&original);
     let converted = root.path().join("converted");
     convert_whisper(&original, &converted).unwrap();
-    let model = ModelPackage::open(&converted).await.unwrap();
+    let model = ModelPackage::open(
+        &converted,
+        &crate::model::evaluator(crate::model::GpuDialect::Hip),
+    )
+    .await
+    .unwrap();
     let output = |values: &[u64]| InvocationOutput {
         outcome: Outcome::Succeeded,
         artifacts: vec![Artifact::new(

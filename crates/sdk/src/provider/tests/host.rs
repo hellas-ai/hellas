@@ -279,7 +279,11 @@ impl GrantGateway {
                 if options.serve.http.is_none() {
                     options.serve.http = target.http_config()?;
                 }
-                let work = crate::ExecutorGateway::new(target, signer);
+                let work = crate::ExecutorGateway::new(
+                    target,
+                    Some(hellas_channel::test_support::channel::evaluator()),
+                    signer,
+                );
                 Ok(crate::serve_gateway(work, options.serve).await?)
             })
         })

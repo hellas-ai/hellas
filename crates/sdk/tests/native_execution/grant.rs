@@ -103,6 +103,7 @@ async fn granted_compute_executes_through_the_native_facade() {
     let environment = hellas_channel::test_support::channel::environment();
     let content = super::source_content([environment.canonical_bytes().unwrap()]).await;
     let input = hellas_sdk::job::JobInput::Compute {
+        evaluator: hellas_channel::test_support::channel::evaluator(),
         environment,
         plan: hellas_channel::test_support::channel::plan(),
         inputs: vec![],

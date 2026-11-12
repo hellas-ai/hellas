@@ -574,7 +574,9 @@ async fn unseen_program_requires_complete_verified_source_and_asset_closure() {
                 object: ContentRef::for_bytes(&asset),
             }],
         };
-        let manifest = environment.manifest().unwrap();
+        let manifest = environment
+            .manifest(&hellas_channel::test_support::channel::evaluator())
+            .unwrap();
         let program_root = environment.canonical_bytes().unwrap();
         let source_store = program_content().await;
         for body in [program_root.as_slice(), source.as_slice(), asset.as_slice()] {

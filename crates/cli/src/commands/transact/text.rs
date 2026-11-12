@@ -27,7 +27,8 @@ pub struct TextArgs {
 }
 
 pub async fn text(args: TextArgs, context: Context) -> super::super::CliResult<()> {
-    let (package, presentation, rendered) = prepare(&args).await?;
+    let evaluator = args.target.renderer()?;
+    let (package, presentation, rendered) = prepare(&args, &evaluator).await?;
     let mut target = args.target;
     target.models = vec![args.model.clone()];
     run_quoted(
@@ -36,16 +37,7 @@ pub async fn text(args: TextArgs, context: Context) -> super::super::CliResult<(
         &context,
         args.pay,
         None,
-        async |price| {
-            Ok(Job::compute(
-                price,
-                rendered.environment,
-                rendered.plan,
-                rendered.inputs,
-                rendered.content,
-            )
-            .await?)
-        },
+        async |price| compute_job(price, evaluator, rendered).await,
         |_| args.output.clone(),
         |_, completed, _| {
             let ModelResponse::Tokens(tokens) = package.decode(&completed.output)? else {
@@ -61,6 +53,7 @@ pub async fn text(args: TextArgs, context: Context) -> super::super::CliResult<(
 
 async fn prepare(
     args: &TextArgs,
+    evaluator: &str,
 ) -> anyhow::Result<(
     ModelPackage,
     TextPresentation,
@@ -85,7 +78,7 @@ async fn prepare(
         .into_iter()
         .map(u64::from)
         .collect();
-    let package = ModelPackage::open(&args.model).await?;
+    let package = ModelPackage::open(&args.model, evaluator).await?;
     let rendered = package
         .render_job(&ModelRequest::Text {
             prompt_ids: &prompt,
@@ -106,6 +99,7 @@ mod tests {
         let model = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../client/src/model/package/mini-qwen3.gguf");
         let model = model.display().to_string();
+        let evaluator = hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip);
         let parse = |system: &[&str]| {
             let mut argv = vec![
                 "hellas",
@@ -118,6 +112,8 @@ mod tests {
                 "3",
                 "--access",
                 "box.access",
+                "--backend",
+                &evaluator,
             ];
             argv.extend(system);
             let crate::Commands::Text(args) = crate::Cli::try_parse_from(argv).unwrap().command
@@ -126,8 +122,9 @@ mod tests {
             };
             args
         };
-        let (_, presentation, job) = prepare(&parse(&[])).await.unwrap();
-        let (_, _, with_system) = prepare(&parse(&["--system", "be brief"])).await.unwrap();
+        let render = async |args: TextArgs| prepare(&args, &args.target.renderer()?).await;
+        let (_, presentation, job) = render(parse(&[])).await.unwrap();
+        let (_, _, with_system) = render(parse(&["--system", "be brief"])).await.unwrap();
         assert_ne!(job.inputs, with_system.inputs);
         let (plan, inputs) = (job.plan, job.inputs);
         assert_eq!(plan.step.as_ref().unwrap().stop.max_steps, 3);

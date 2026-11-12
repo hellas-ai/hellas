@@ -219,6 +219,7 @@ rec {
     "--pay"
     "--provider"
     "--local"
+    "--backend"
     "--model"
     "--gateway-profile"
     "--home"
@@ -544,6 +545,12 @@ rec {
         description = "Paid provider address passed as --provider with pay.";
       };
       local = mkEnableOption "running requests on this machine's executor (--local), with the native content and GPU flags";
+      backend = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "hellas/catena-dfad87438018-hip";
+        description = "Renderer (evaluator id) that remote requests' programs are rendered for, passed as --backend: the id the provider's GPU runtime registers. Local requests render for this machine's GPU runtime.";
+      };
       models = mkOption {
         type = types.listOf (types.strMatching "/.*");
         default = [ ];
@@ -766,6 +773,7 @@ rec {
     ++ optArg "--pay" gateway.pay
     ++ optArg "--provider" gateway.provider
     ++ lib.optional gateway.local "--local"
+    ++ optArg "--backend" gateway.backend
     ++ optArg "--passkey" gateway.passkey
     ++ lib.concatMap (model: [
       "--model"

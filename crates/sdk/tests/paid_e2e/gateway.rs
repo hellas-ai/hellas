@@ -27,6 +27,7 @@ fn gateway_waits_for_slow_funding_finality() {
                     settlement_key: client_settlement(),
                     owner: case.owner.clone(),
                 },
+                None,
                 Arc::new(ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap()),
             );
             let started = tokio::time::Instant::now();

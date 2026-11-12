@@ -3,7 +3,40 @@ use serde::{Deserialize, Serialize};
 
 use crate::ContentRef;
 
-pub const EVALUATOR: &str = "hellas/catena-a621c8b54a7b";
+/// The locked Catena compiler. A GPU runtime that compiles its programs
+/// registers an evaluator id that extends it with the runtime's name.
+pub const EVALUATOR: &str = "hellas/catena-dfad87438018";
+/// A program by compute id: `<evaluator>/<manifest>`, such as
+/// `hellas/catena-dfad87438018-hip/<64-hex manifest>`.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub struct ProgramId {
+    pub evaluator: String,
+    pub manifest: crate::ContentId,
+}
+impl std::str::FromStr for ProgramId {
+    type Err = String;
+    fn from_str(id: &str) -> Result<Self, String> {
+        let (evaluator, manifest) = id
+            .rsplit_once('/')
+            .ok_or_else(|| format!("program {id} is not <evaluator>/<manifest>"))?;
+        Ok(Self {
+            evaluator: evaluator.to_owned(),
+            manifest: manifest.parse().map_err(|e| format!("program {id}: {e}"))?,
+        })
+    }
+}
+impl TryFrom<String> for ProgramId {
+    type Error = String;
+    fn try_from(id: String) -> Result<Self, String> {
+        id.parse()
+    }
+}
+impl std::fmt::Display for ProgramId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.evaluator, self.manifest)
+    }
+}
 pub const MAX_ENVIRONMENT_BYTES: usize = 1 << 20;
 // Every reference contains at least its 32-byte content identifier.
 pub const MAX_ENVIRONMENT_REFERENCES: usize = MAX_ENVIRONMENT_BYTES / 32;
@@ -345,9 +378,12 @@ impl Environment {
         decoder.finish()?;
         Ok(Self { sources, assets })
     }
-    pub fn manifest(&self) -> Result<crate::ProgramManifest, crate::value::CanonicalDecodeError> {
+    pub fn manifest(
+        &self,
+        evaluator: &str,
+    ) -> Result<crate::ProgramManifest, crate::value::CanonicalDecodeError> {
         Ok(crate::ProgramManifest::new(
-            crate::Application::new(EVALUATOR, ADAPTOR).map_err(|e| super::error(e.to_string()))?,
+            crate::Application::new(evaluator, ADAPTOR).map_err(|e| super::error(e.to_string()))?,
             crate::ContentId::hash(&self.canonical_bytes()?),
         ))
     }
