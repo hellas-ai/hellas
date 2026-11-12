@@ -71,7 +71,7 @@ and its matching backend, including CUDA driver-library setup where needed. In R
 ```
 
 Put the converted weights on the persistent volume before using that command;
-`hellas program PATH` prints the manifest for `--program`. A template does not
+`hellas program --backend EVALUATOR PATH` prints the program id for `--program`. A template does not
 create an allowance or download models. Use `--grant-config` and
 `--content-config` instead for explicit resources and Jobs pins. Then pair,
 share and run a job as in the

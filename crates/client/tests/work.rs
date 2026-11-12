@@ -255,9 +255,12 @@ async fn model_job_restart_inner(provider_held: bool) {
     let fixture =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/model/package/mini-qwen3.gguf");
 
-    let package = ModelPackage::open(&fixture)
-        .await
-        .expect("the miniature Qwen model opens");
+    let package = ModelPackage::open(
+        &fixture,
+        &hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip),
+    )
+    .await
+    .expect("the miniature Qwen model opens");
     let job = package
         .render_job(&ModelRequest::Text {
             prompt_ids: &[2, 1],
@@ -323,7 +326,7 @@ async fn model_job_restart_inner(provider_held: bool) {
     let policy = ready.invocation_policy();
     let manifest = job
         .environment
-        .manifest()
+        .manifest(&hellas_channel::test_support::channel::evaluator())
         .expect("the environment has a manifest");
     let input = InvocationInput {
         artifacts: job.inputs.clone(),

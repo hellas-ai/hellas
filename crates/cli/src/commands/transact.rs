@@ -164,11 +164,16 @@ pub(super) struct TargetArgs {
     /// Run on this machine's executor under your own limits; nothing is
     /// paid, granted or tracked.
     #[cfg(feature = "compute")]
-    #[arg(long, conflicts_with_all = ["access", "provider", "settle", "buy_again", "validators", "addresses", "acceptance_blocks", "terminal_blocks", "payment_blocks", "trust_store"])]
+    #[arg(long, conflicts_with_all = ["access", "provider", "backend", "settle", "buy_again", "validators", "addresses", "acceptance_blocks", "terminal_blocks", "payment_blocks", "trust_store"])]
     local: bool,
     #[cfg(feature = "compute")]
     #[command(flatten)]
     native: crate::compute::ServeArgs,
+    /// The registered renderer (evaluator id) remote jobs are rendered for,
+    /// as `hellas program --backend` takes; local jobs render for this
+    /// machine's GPU runtime.
+    #[arg(long, value_name = "EVALUATOR")]
+    backend: Option<String>,
     /// The model files or packages a helper or the gateway renders jobs
     /// from; local execution reads the jobs' weights from them.
     #[arg(skip)]
@@ -500,6 +505,23 @@ enum Target {
 }
 
 impl TargetArgs {
+    /// The evaluator id jobs for this target are rendered for.
+    fn evaluator(&self) -> Option<String> {
+        #[cfg(feature = "compute")]
+        if self.local {
+            return Some(hellas_executor::catena::evaluator(
+                self.native.gpu.gpu_backend,
+            ));
+        }
+        self.backend.clone()
+    }
+
+    /// The evaluator a rendered job names, which remote work must select.
+    fn renderer(&self) -> super::CliResult<String> {
+        self.evaluator()
+            .context("remote jobs name their renderer with --backend EVALUATOR")
+    }
+
     /// `pay` is the most a paid job may cost; free targets take 0.
     async fn resolve(
         self,
@@ -788,6 +810,7 @@ pub async fn gateway(
         pay,
         mut target,
     } = args;
+    let evaluator = target.evaluator();
     target.models = models;
     ensure!(
         !client.settle && !client.buy_again && target.attempt.is_none(),
@@ -807,6 +830,7 @@ pub async fn gateway(
             let gateway = target.gateway(&client, &context, policy).await?;
             serve(ExecutorGateway::new(
                 gateway,
+                evaluator,
                 Arc::new(context.producer.clone()),
             ))
             .await
@@ -834,6 +858,23 @@ fn select_policy(
             Ok(&policies[0])
         }
     }
+}
+
+/// A rendered model job at `price`.
+async fn compute_job(
+    price: u64,
+    evaluator: String,
+    rendered: hellas_client::model::ComputeJob,
+) -> super::CliResult<Job> {
+    Ok(Job::compute(
+        price,
+        evaluator,
+        rendered.environment,
+        rendered.plan,
+        rendered.inputs,
+        rendered.content,
+    )
+    .await?)
 }
 
 /// Helper commands quote first: resolve the target, take its price (a paid

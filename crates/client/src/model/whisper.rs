@@ -192,7 +192,7 @@ pub struct Transcription {
     pub truncated: bool,
 }
 impl Whisper {
-    pub async fn open(dir: &Path) -> Result<Self> {
+    pub async fn open(dir: &Path, dialect: super::GpuDialect) -> Result<Self> {
         let dir = dir.to_owned();
         let (config, generation, tokenizer, views, object, source) =
             tokio::task::spawn_blocking(move || -> Result<_> {
@@ -204,7 +204,7 @@ impl Whisper {
                     object.bytes() == offset + bytes,
                     "derived weight file has wrong length"
                 );
-                let source = super::program::render(&graph::bundle(&config, false)?)?;
+                let source = super::program::render(&graph::bundle(&config, false)?, dialect)?;
                 Ok((config, generation, tokenizer, views, object, source))
             })
             .await??;

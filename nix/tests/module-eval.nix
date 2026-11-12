@@ -664,6 +664,7 @@ let
             enable = true;
             gatewayProfile = "/run/hellas/gateway-profile.json";
             access = "/run/hellas/friend.access";
+            backend = "hellas/catena-dfad87438018-hip";
             models = [ "/srv/hellas/qwen3.gguf" ];
             passkey = "/run/hellas/principal.passkey";
             metricsPort = 9401;
@@ -877,6 +878,8 @@ in
     assert lib.hasInfix "--default-max-tokens 4294967295" gatewayService.serviceConfig.ExecStart;
     assert lib.hasInfix "--model /srv/hellas/qwen3.gguf" gatewayService.serviceConfig.ExecStart;
     assert lib.hasInfix "--access /run/hellas/friend.access" gatewayService.serviceConfig.ExecStart;
+    assert lib.hasInfix "--backend hellas/catena-dfad87438018-hip"
+      gatewayService.serviceConfig.ExecStart;
     assert lib.elem "/run/hellas/friend.access" gatewayService.unitConfig.RequiresMountsFor;
     assert lib.hasInfix "--trust-policy provider" gatewayService.serviceConfig.ExecStart;
     assert lib.hasInfix "--trust-store /var/lib/hellas-gateway/trust"

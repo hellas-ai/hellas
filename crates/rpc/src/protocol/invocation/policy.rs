@@ -82,6 +82,24 @@ pub enum Admission {
     },
 }
 impl Admission {
+    /// Admit exactly `programs`, which must share one evaluator.
+    pub fn compute_only(programs: &[compute::ProgramId]) -> Result<Self, CanonicalDecodeError> {
+        let [first, ..] = programs else {
+            return Err(error("compute admission requires a nonempty program list"));
+        };
+        if programs
+            .iter()
+            .any(|program| program.evaluator != first.evaluator)
+        {
+            return Err(error("admitted programs must share one evaluator"));
+        }
+        Ok(Self::Compute {
+            evaluator: first.evaluator.clone(),
+            programs: ComputePrograms::Only {
+                manifests: programs.iter().map(|program| program.manifest).collect(),
+            },
+        })
+    }
     pub const fn capacity_domain(&self) -> CapacityDomain {
         match self {
             Self::Compute { .. } => CapacityDomain::Gpu,
@@ -102,8 +120,7 @@ impl Admission {
                 evaluator,
                 programs,
             } => {
-                evaluator == compute::EVALUATOR
-                    && manifest.application().evaluator() == evaluator
+                manifest.application().evaluator() == evaluator
                     && manifest.application().adaptor() == compute::ADAPTOR
                     && programs.admits(manifest)
             }

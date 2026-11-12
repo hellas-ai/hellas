@@ -10,7 +10,12 @@ async fn faucet_upload_terms_admit_a_fresh_whisper_program_and_features() {
     };
     let fixture =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../client/src/model/whisper/mini");
-    let model = ModelPackage::open(&fixture).await.unwrap();
+    let model = ModelPackage::open(
+        &fixture,
+        &hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip),
+    )
+    .await
+    .unwrap();
     let job = model
         .render_job(&ModelRequest::Transcription {
             samples: &[0.; 400],
@@ -71,7 +76,10 @@ async fn faucet_upload_terms_admit_a_fresh_whisper_program_and_features() {
     // The generic `compute` resource a plain `serve --program` offers admits it too.
     let compute = hellas_sdk::grant_config::GrantConfig::compute(
         &hellas_private::StoreLocation::for_test(root.path()),
-        hellas_rpc::protocol::invocation::ComputePrograms::Any {},
+        hellas_rpc::protocol::invocation::Admission::Compute {
+            evaluator: hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip),
+            programs: hellas_rpc::protocol::invocation::ComputePrograms::Any {},
+        },
     )
     .unwrap();
     let generic = compute.configuration.resources()[0]
@@ -135,16 +143,19 @@ async fn example_terms_and_the_generic_grant_admit_a_default_text_budget() {
     use hellas_client::model::{ModelPackage, ModelRequest};
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../client/src/model/package/mini-qwen3.gguf");
-    let mut job = ModelPackage::open(&fixture)
-        .await
-        .unwrap()
-        .render_job(&ModelRequest::Text {
-            prompt_ids: &[1],
-            max_new: 1,
-            stops: &[],
-        })
-        .await
-        .unwrap();
+    let mut job = ModelPackage::open(
+        &fixture,
+        &hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip),
+    )
+    .await
+    .unwrap()
+    .render_job(&ModelRequest::Text {
+        prompt_ids: &[1],
+        max_new: 1,
+        stops: &[],
+    })
+    .await
+    .unwrap();
     // One step per new token; the fixture's context is shorter than 256.
     let stop = &mut job.plan.step.as_mut().unwrap().stop;
     assert_eq!(stop.max_steps, 1);
@@ -156,7 +167,10 @@ async fn example_terms_and_the_generic_grant_admit_a_default_text_budget() {
     let root = tempfile::tempdir().unwrap();
     let grant = hellas_sdk::grant_config::GrantConfig::compute(
         &hellas_private::StoreLocation::for_test(root.path()),
-        hellas_rpc::protocol::invocation::ComputePrograms::Any {},
+        hellas_rpc::protocol::invocation::Admission::Compute {
+            evaluator: hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip),
+            programs: hellas_rpc::protocol::invocation::ComputePrograms::Any {},
+        },
     )
     .unwrap();
     for limits in [

@@ -39,13 +39,15 @@ services.hellas = {
 Keep models and compiler artifacts outside `/nix/store`; they are runtime data.
 
 The gateway service takes the same choices as `hellas gateway`: `models`, and
-one of `access` (an access file), `pay` with `provider`, or `local`:
+one of `access` (an access file), `pay` with `provider`, or `local`. Remote
+models render for `backend`, the provider's registered renderer:
 
 ```nix
 services.hellas.gateway = {
   enable = true;
   models = [ "/srv/hellas/models/qwen3.gguf" ];
   access = "/run/secrets/friend.access";
+  backend = "hellas/catena-dfad87438018-hip";
 };
 ```
 

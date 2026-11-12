@@ -264,8 +264,12 @@ pub fn environment() -> compute::Environment {
         assets: vec![],
     }
 }
+/// The evaluator a HIP executor registers, so test jobs run on one.
+pub fn evaluator() -> String {
+    format!("{}-hip", compute::EVALUATOR)
+}
 pub fn manifest() -> ProgramManifest {
-    environment().manifest().unwrap()
+    environment().manifest(&evaluator()).unwrap()
 }
 pub fn plan() -> compute::Plan {
     compute::Plan {
@@ -642,7 +646,7 @@ pub async fn store_at(
 pub fn work_policy() -> InvocationPolicy {
     InvocationPolicy {
         admissions: vec![Admission::Compute {
-            evaluator: compute::EVALUATOR.into(),
+            evaluator: evaluator(),
             programs: hellas_rpc::protocol::invocation::ComputePrograms::Any {},
         }],
         limits: Limits {

@@ -9,8 +9,9 @@ use super::package::ComputeJob;
 use anyhow::{Context, Result, ensure};
 use catena_models::{
     catena,
+    catena::InferenceOptions,
     checkpoint::read_gguf_model_config,
-    spec::{ModelConfig, WeightDtype, weight_specs},
+    spec::{ModelArchitecture, ModelConfig, WeightDtype, weight_specs},
 };
 use hellas_channel::content::{DEFAULT_MAX_STAGING_BYTES, upload_object};
 use hellas_rpc::protocol::invocation::{Artifact, compute::*};
@@ -29,7 +30,7 @@ pub(super) struct Qwen3 {
 }
 
 impl Qwen3 {
-    pub async fn open(path: &Path) -> Result<Self> {
+    pub async fn open(path: &Path, dialect: super::GpuDialect) -> Result<Self> {
         let path = path.to_owned();
         let (config, views, object, source, states) =
             tokio::task::spawn_blocking(move || -> Result<_> {
@@ -59,8 +60,14 @@ impl Qwen3 {
                     views.push((tensor.offset, tensor.bytes));
                 }
                 let object = hellas_store::content::file_content(&path)?;
-                let model = catena::generated_model_source_for(&config)?;
-                let source = super::program::render(&model)?;
+                // Qwen3.5 prefills with matrix cores; Qwen3 has only SIMT kernels.
+                let wmma = matches!(
+                    config.architecture,
+                    ModelArchitecture::Qwen35Dense | ModelArchitecture::Qwen35Moe
+                );
+                let options = InferenceOptions::default().with_wmma_prefill(wmma);
+                let model = catena::generated_model_source_for_options(&config, options)?;
+                let source = super::program::render(&model, dialect)?;
                 let raw = metacat::theory::RawTheorySet::from_text(&source)?;
                 let init = raw
                     .theories
