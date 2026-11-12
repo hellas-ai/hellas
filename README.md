@@ -32,11 +32,15 @@ curl -fLo speech.wav https://raw.githubusercontent.com/ggml-org/whisper.cpp/b0a1
 Get devnet coins, then pay the public devnet provider to transcribe the
 recording. `DEVNET_PROVIDER` is that provider's address. It runs only the
 programs it was configured with, and it quotes its price before you sign
-anything. `--pay 20` is the most you accept per job:
+anything. `--pay 20` is the most you accept per job. Your client renders the
+program for the provider's GPU before it asks for a quote: `--backend` names
+that renderer, the evaluator id the provider's GPU runtime registers (here an
+AMD GPU's):
 
 ```sh
 hellas faucet
-hellas transcribe --model whisper-tiny --audio speech.wav --pay 20 --provider "$DEVNET_PROVIDER"
+hellas transcribe --model whisper-tiny --audio speech.wav --pay 20 --provider "$DEVNET_PROVIDER" \
+  --backend hellas/catena-dfad87438018-hip
 ```
 
 It prints the transcript, "And so my fellow Americans, ask not what your
@@ -47,19 +51,21 @@ it.
 ## 2. Share your GPU with a friend
 
 On your GPU machine, start a node that serves the converted weights and admits
-the two programs that read them. `hellas program` prints a program's ID:
+the two programs that read them. `hellas program` prints a program's ID for a
+renderer:
 
 ```sh
 docker run -d --name hellas --network host --device /dev/kfd --device /dev/dri \
   -v hellas:/var/lib/hellas -v "$PWD:/models:ro" ghcr.io/hellas-ai/hellas:hip \
-  --content /models/whisper-tiny --program "$(hellas program whisper-tiny)" \
-  --content /models/qwen3.gguf --program "$(hellas program qwen3.gguf)"
+  --content /models/whisper-tiny --program "$(hellas program --backend hellas/catena-dfad87438018-hip whisper-tiny)" \
+  --content /models/qwen3.gguf --program "$(hellas program --backend hellas/catena-dfad87438018-hip qwen3.gguf)"
 docker logs hellas
 ```
 
 A new node has no owner yet. It prints one `hellas-invite:` line and waits.
 Claim it with that line. NVIDIA hosts use the `:cuda` image with
-`--device nvidia.com/gpu=all` instead.
+`--device nvidia.com/gpu=all` and the `hellas/catena-dfad87438018-cuda` renderer
+instead.
 
 ```sh
 hellas pair hellas-invite:…
@@ -77,14 +83,15 @@ Give that contact ten requests for a day, and send them `friend.access`:
 hellas share --to hellas-contact:… --limit requests:total:10 --expires 1d --out friend.access
 ```
 
-Your friend runs jobs on your GPU with it:
+Your friend runs jobs on your GPU with it, rendered for your GPU's runtime:
 
 ```sh
-hellas transcribe --model whisper-tiny --audio speech.wav --access friend.access
+hellas transcribe --model whisper-tiny --audio speech.wav --access friend.access \
+  --backend hellas/catena-dfad87438018-hip
 ```
 
 The node runs one job at a time and refuses programs it was not configured
-with. Each job runs in its own process group, which contains crashes and
+with, including programs rendered for a GPU runtime it does not run. Each job runs in its own process group, which contains crashes and
 timeouts. This is not a sandbox: a program can reach whatever the node's user
 can reach, and nothing meters GPU memory. Compiling a new program has no time
 limit; a node's first job of each program pays for it. A grant or paid-terms
@@ -102,8 +109,9 @@ docker run --rm --device /dev/kfd --device /dev/dri -v "$PWD:/work" -w /work \
   transcribe --model whisper-tiny --audio speech.wav --local
 ```
 
-`--local` exists only in GPU builds. `hellas text --model qwen3.gguf --prompt
-…` and `hellas run` take the same `--pay`, `--access` and `--local`. See
+`--local` exists only in GPU builds; it renders for this machine's GPU runtime,
+so it takes no `--backend`. `hellas text --model qwen3.gguf --prompt …` and
+`hellas run` take the same `--pay`, `--access`, `--backend` and `--local`. See
 [jobs](docs/jobs.md).
 
 ## 4. An OpenAI-compatible endpoint
@@ -113,14 +121,14 @@ every request into a job and runs it the way you choose, here on your
 friend's GPU:
 
 ```sh
-hellas gateway --model qwen3.gguf --access friend.access &
+hellas gateway --model qwen3.gguf --access friend.access --backend hellas/catena-dfad87438018-hip &
 curl -s localhost:8080/v1/chat/completions -H "authorization: Bearer $(cat ~/.hellas/gateway/bearer)" \
   -H 'content-type: application/json' -d '{"model":"qwen3","messages":[{"role":"user","content":"Hi"}]}'
 ```
 
 The gateway keeps its own bearer in `~/.hellas/gateway/bearer`, so a web page
 you visit cannot spend your access. `--pay MAX --provider ID` and `--local`
-work here too. See the [HTTP gateway guide](docs/http-gateway.md).
+work here too; models render for `--backend`, or locally for this machine. See the [HTTP gateway guide](docs/http-gateway.md).
 
 ## 5. Drive a coding agent
 
@@ -129,7 +137,7 @@ first (Ctrl-C). `--wrap` starts the agent with its OpenAI and Anthropic base URL
 and token pointed at the gateway, and stops the gateway when the agent exits:
 
 ```sh
-hellas gateway --model qwen3.gguf --access friend.access --wrap claude
+hellas gateway --model qwen3.gguf --access friend.access --backend hellas/catena-dfad87438018-hip --wrap claude
 ```
 
 ## More

@@ -227,9 +227,14 @@ impl ExecutorHandle {
                 let mut task = tokio::spawn(async move {
                     let opened = {
                         let opening = async {
-                            catena::program::BoundProgram::open(&content, &prepared, &limits)
-                                .await
-                                .map_err(|error| error.to_string())
+                            catena::program::BoundProgram::open(
+                                &content,
+                                &prepared,
+                                &limits,
+                                &catena::evaluator(executor.config.gpu_config.backend),
+                            )
+                            .await
+                            .map_err(|error| error.to_string())
                         };
                         tokio::pin!(opening);
                         // The caller below cancels on admission cancellation or

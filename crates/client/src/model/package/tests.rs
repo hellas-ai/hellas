@@ -24,7 +24,12 @@ fn fixture() -> std::path::PathBuf {
 
 #[tokio::test]
 async fn canonical_qwen3_job_bytes_are_stable() {
-    let package = ModelPackage::open(&fixture()).await.unwrap();
+    let package = ModelPackage::open(
+        &fixture(),
+        &crate::model::evaluator(crate::model::GpuDialect::Hip),
+    )
+    .await
+    .unwrap();
     let job = package.text_job(&[2, 1], 2, &[0, 0]).await.unwrap();
     assert_eq!(
         job.environment.canonical_bytes().unwrap(),
@@ -40,14 +45,28 @@ async fn canonical_qwen3_job_bytes_are_stable() {
 /// manifest of every job the model renders, whatever the request.
 #[tokio::test]
 async fn program_is_the_manifest_every_rendered_job_runs() {
-    let qwen = ModelPackage::open(&fixture()).await.unwrap();
+    let qwen = ModelPackage::open(
+        &fixture(),
+        &crate::model::evaluator(crate::model::GpuDialect::Hip),
+    )
+    .await
+    .unwrap();
     for (prompt, max_new) in [(&[2, 1][..], 2), (&[1][..], 1)] {
         let job = qwen.text_job(prompt, max_new, &[0]).await.unwrap();
-        let manifest = job.environment.manifest().unwrap().content_id();
-        assert_eq!(qwen.program().unwrap(), manifest);
+        let manifest = job
+            .environment
+            .manifest(&crate::model::evaluator(crate::model::GpuDialect::Hip))
+            .unwrap()
+            .content_id();
+        assert_eq!(qwen.program().unwrap().manifest, manifest);
     }
     let whisper = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/model/whisper/mini");
-    let whisper = ModelPackage::open(&whisper).await.unwrap();
+    let whisper = ModelPackage::open(
+        &whisper,
+        &crate::model::evaluator(crate::model::GpuDialect::Hip),
+    )
+    .await
+    .unwrap();
     for (language, max_new_tokens) in [(Some("en"), 4), (None, 2)] {
         let job = whisper
             .render_job(&ModelRequest::Transcription {
@@ -57,14 +76,23 @@ async fn program_is_the_manifest_every_rendered_job_runs() {
             })
             .await
             .unwrap();
-        let manifest = job.environment.manifest().unwrap().content_id();
-        assert_eq!(whisper.program().unwrap(), manifest);
+        let manifest = job
+            .environment
+            .manifest(&crate::model::evaluator(crate::model::GpuDialect::Hip))
+            .unwrap()
+            .content_id();
+        assert_eq!(whisper.program().unwrap().manifest, manifest);
     }
 }
 
 #[tokio::test]
 async fn tiny_gguf_renders_the_complete_qwen3_step_job() {
-    let package = ModelPackage::open(&fixture()).await.unwrap();
+    let package = ModelPackage::open(
+        &fixture(),
+        &crate::model::evaluator(crate::model::GpuDialect::Hip),
+    )
+    .await
+    .unwrap();
     let job = package.text_job(&[2, 1], 2, &[0, 0]).await.unwrap();
 
     let [source] = job.environment.sources[..] else {
@@ -192,7 +220,12 @@ async fn tiny_gguf_renders_the_complete_qwen3_step_job() {
 
 #[tokio::test]
 async fn empty_oversized_and_out_of_vocabulary_requests_are_refused() {
-    let package = ModelPackage::open(&fixture()).await.unwrap();
+    let package = ModelPackage::open(
+        &fixture(),
+        &crate::model::evaluator(crate::model::GpuDialect::Hip),
+    )
+    .await
+    .unwrap();
     assert!(package.text_job(&[], 1, &[]).await.is_err());
     assert!(package.text_job(&[2], 0, &[]).await.is_err());
     assert!(package.text_job(&[2], 128, &[]).await.is_err());

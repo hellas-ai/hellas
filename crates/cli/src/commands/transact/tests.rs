@@ -552,7 +552,14 @@ async fn run_writes_one_call_job_that_transact_loads_unchanged() {
         panic!("run");
     };
     assert!(args.client.timeout.is_none());
-    let job = args.program.job(20).await.unwrap();
+    let job = args
+        .program
+        .job(
+            20,
+            hellas_rpc::protocol::invocation::compute::EVALUATOR.into(),
+        )
+        .await
+        .unwrap();
     let folder = root.path().join("job");
     job.save(&folder).await.unwrap();
     let loaded = Job::load(&folder).await.unwrap();
@@ -625,6 +632,7 @@ fn execution_helpers_choose_payment_or_an_imported_offer() {
         assert_eq!(parse(&["--local"]).is_ok(), cfg!(feature = "compute"));
         assert!(parse(&["--local", "--access", "box.access"]).is_err());
         assert!(parse(&["--local", "--provider", &provider]).is_err());
+        assert!(parse(&["--local", "--backend", "renderer"]).is_err());
     }
 }
 

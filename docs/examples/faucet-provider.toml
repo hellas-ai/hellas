@@ -7,12 +7,13 @@
 # profile on the command line with --chain-config chain.json.
 
 jobs_per_channel = 10
-# Omit this table to disable Compute. Use mode = "only" and a nonempty
-# manifests = ["<64-hex program manifest id>", ...] to restrict programs.
-# Admitting every program hands anyone who can submit jobs roughly root on
-# the host, so serve refuses this table's "any" without --knowingly-unsafe.
+# Omit this table to disable Compute. `any` admits every program of one compute
+# id, the evaluator a GPU runtime registers; use only = ["<id from hellas
+# program>", ...] to restrict programs. Admitting every program hands anyone
+# who can submit jobs roughly root on the host, so serve refuses "any" without
+# --knowingly-unsafe.
 [compute]
-mode = "any"
+any = "hellas/catena-dfad87438018-hip"
 
 [payment]
 fixed_price = 20
