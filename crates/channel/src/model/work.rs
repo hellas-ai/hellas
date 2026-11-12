@@ -1153,15 +1153,20 @@ pub fn next_payment(
     Ok((certificate, binding))
 }
 
-/// What one endpoint has already credited on one channel.
+/// What one endpoint has already credited, and lost, on one channel.
 ///
-/// One value: the cumulative amount already credited. Individual jobs
-/// are retained by the durable work store, while this value supplies the
-/// arithmetic shared by all of them: each payment adds its price on top
-/// of it and its certificate must settle exactly that sum.
+/// Every open job holds its price against the channel's limits until its
+/// terminal, and the terminal moves that reservation to exactly one of two
+/// places: a payment adds it to the credited cumulative, which its
+/// certificate must settle; any other ending of an accepted job adds it to
+/// the lost compute — and, if plaintext had left, the lost delivery. A
+/// loss is never given back, so a channel's credit limits bound what the
+/// provider can lose over the channel's life rather than at one time.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CreditLedger {
     credited_cumulative: u64,
+    lost_compute: u64,
+    lost_delivery: u64,
 }
 
 impl CreditLedger {
@@ -1171,21 +1176,44 @@ impl CreditLedger {
         Self::default()
     }
 
-    /// Restores a checkpointed cumulative credit total.
+    /// Restores checkpointed totals.
     ///
-    /// A journal checkpoint carries this value across a rotation. The
-    /// store validates it against its retained payment terminals before
-    /// it is trusted; this constructor only restores the number.
+    /// A journal checkpoint carries these across a rotation. The store
+    /// validates the credited total against its retained payment terminals
+    /// before it is trusted; this constructor only restores the numbers.
     #[must_use]
-    pub const fn from_credited_cumulative(credited_cumulative: u64) -> Self {
+    pub const fn restore(credited_cumulative: u64, lost_compute: u64, lost_delivery: u64) -> Self {
         Self {
             credited_cumulative,
+            lost_compute,
+            lost_delivery,
         }
     }
 
     /// Returns the cumulative amount already credited.
     pub const fn credited_cumulative(&self) -> u64 {
         self.credited_cumulative
+    }
+
+    /// Returns the summed price of accepted jobs that ended unpaid.
+    pub const fn lost_compute(&self) -> u64 {
+        self.lost_compute
+    }
+
+    /// Returns the summed price of jobs whose plaintext left unpaid.
+    pub const fn lost_delivery(&self) -> u64 {
+        self.lost_delivery
+    }
+
+    /// Records one job that ended without payment. Compute is lost once the
+    /// provider co-signed it, delivery once its plaintext left.
+    pub const fn lose(&mut self, price: u64, accepted: bool, delivered: bool) {
+        if accepted {
+            self.lost_compute = self.lost_compute.saturating_add(price);
+        }
+        if delivered {
+            self.lost_delivery = self.lost_delivery.saturating_add(price);
+        }
     }
 
     /// Checks that a certificate and its binding pay for exactly this

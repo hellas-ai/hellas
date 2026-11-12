@@ -526,7 +526,11 @@ fn metrics_flags_require_the_otel_build() {
 
 #[test]
 fn serve_admits_configured_programs_and_acknowledges_any_only_from_configuration() {
-    let manifest = "ab".repeat(32);
+    let manifest = format!(
+        "{}/{}",
+        hellas_rpc::protocol::invocation::compute::EVALUATOR,
+        "ab".repeat(32)
+    );
     let Commands::Serve {
         programs,
         knowingly_unsafe,

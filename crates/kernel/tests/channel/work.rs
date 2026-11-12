@@ -2808,8 +2808,8 @@ fn an_unleased_work_bond_times_out_at_once() {
     );
 }
 
-/// Once a channel is leasing the bond, the provider's stake stays where
-/// the client's recourse can reach it until the horizon both sides
+/// While a live channel is leasing the bond, the provider's stake stays
+/// where the client's recourse can reach it until the horizon both sides
 /// committed to — and the lease leaves with it.
 #[test]
 fn a_leased_work_bond_waits_for_its_horizon_and_takes_the_lease_with_it() {

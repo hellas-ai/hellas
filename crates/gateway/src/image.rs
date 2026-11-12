@@ -26,9 +26,14 @@ pub(super) async fn router(
     work: Arc<dyn WorkExecutionBackend>,
 ) -> GatewayResult<Router> {
     let path = options.model.clone();
-    let package = ModelPackage::open(&path)
-        .await
-        .map_err(|error| GatewayError::Presentation(error.into()))?;
+    let package = ModelPackage::open(
+        &path,
+        &work.evaluator().ok_or(crate::GatewayError::Presentation(
+            "Compute models need a renderer (evaluator id)".into(),
+        ))?,
+    )
+    .await
+    .map_err(|error| GatewayError::Presentation(error.into()))?;
     if !package.is_image() {
         return Err(GatewayError::Presentation(
             "image route requires a Flux model".into(),

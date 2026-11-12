@@ -7,7 +7,7 @@ use hellas_chain::{LightClient as _, client::RemoteLightClient, domain::Transact
 use hellas_kernel::{CoinId, EdgeValues, Fees, SoftPasskey};
 use hellas_private::StoreLocation;
 use hellas_rpc::protocol::invocation::{
-    Admission, ComputePrograms, InvocationPolicy, Limits,
+    Admission, ComputePrograms, InvocationPolicy, Limits, compute,
     fetch::{FetchAdmission, FetchLimits},
 };
 use hellas_sdk::node_control::profile;
@@ -32,10 +32,17 @@ struct PaidWorkFile {
     channel: PaidChannelPolicyV1,
     offers: OfferPolicy,
     limits: Limits,
-    /// Explicitly admit any Compute program or only selected manifests.
-    compute: Option<ComputePrograms>,
+    /// Admit any program of one compute id, or only the listed programs.
+    compute: Option<ComputeTerms>,
     /// Admit caller-signed HTTPS Fetch under these bounds.
     fetch: Option<FetchFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+enum ComputeTerms {
+    Any(String),
+    Only(Vec<compute::ProgramId>),
 }
 
 #[derive(Debug, Deserialize)]
@@ -110,11 +117,15 @@ impl PaidWorkFile {
             .checked_add(self.offers.omission_bond)
             .context("paid funding overflow")?;
         let mut admissions = Vec::new();
-        if let Some(programs) = self.compute {
-            admissions.push(Admission::Compute {
-                evaluator: hellas_rpc::protocol::invocation::compute::EVALUATOR.into(),
-                programs,
-            });
+        match self.compute {
+            Some(ComputeTerms::Any(evaluator)) => admissions.push(Admission::Compute {
+                evaluator,
+                programs: ComputePrograms::Any {},
+            }),
+            Some(ComputeTerms::Only(programs)) => {
+                admissions.push(Admission::compute_only(&programs)?);
+            }
+            None => {}
         }
         if let Some(fetch) = self.fetch {
             admissions.push(Admission::Fetch {

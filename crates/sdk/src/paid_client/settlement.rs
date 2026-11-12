@@ -95,7 +95,8 @@ where
 }
 
 /// One read, one close step, and a start signed and sent if none is live.
-/// Returns whether the close is settled.
+/// Returns whether the close is settled; the read that shows it settled
+/// also submits the bond Timeout that returns the provider's stake.
 async fn close_step<C>(client: &mut C, chain: &WorkBlocks<RemoteLightClient>) -> Result<bool>
 where
     C: ClientChannel + Send,
@@ -108,6 +109,19 @@ where
         .advance_close(&snapshot.observed_channel(), chain)
         .await?;
     if endpoint.state().close_settled().is_some() {
+        // The settled channel's bond is free at once; return the provider's
+        // stake now rather than wait for its own clock to see the close.
+        let bond_timeout = hellas_channel::work_close::due_bond_timeout(
+            endpoint.state(),
+            &snapshot.observed_channel(),
+        )?;
+        drop(endpoint);
+        if let Some(tx) = bond_timeout {
+            chain
+                .submit(tx)
+                .await
+                .map_err(hellas_channel::work_close::CatchUpError::from)?;
+        }
         return Ok(true);
     }
     if !endpoint.state().is_closing() {

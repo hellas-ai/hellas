@@ -74,10 +74,10 @@ const WORK_STAKE_BOND_TAG: u8 = 4;
 /// Stake a work channel leases.
 ///
 /// The maker is the provider funding the stake; the taker is the client
-/// the channel serves. The bond admits only `Timeout`: unleased it
-/// returns the stake immediately and permissionlessly to the provider,
-/// leased it returns at `timeout`, which is also the channel's
-/// admission horizon.
+/// the channel serves. The bond admits only `Timeout`, which returns the
+/// stake permissionlessly to the provider: immediately while no live
+/// payment edge leases it, and at `timeout` — also the channel's
+/// admission horizon — otherwise.
 ///
 /// The stake is the edge's own locked value. There is deliberately no
 /// second `stake` scalar to disagree with it.

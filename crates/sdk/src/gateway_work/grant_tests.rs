@@ -144,6 +144,7 @@ impl FixtureBuilder {
                 options,
                 transport,
             },
+            Some(hellas_channel::test_support::channel::evaluator()),
             Arc::new(ProducerSigningKey::from_secret_bytes([8; 32]).unwrap()),
         );
         Fixture {
@@ -940,6 +941,7 @@ async fn single_signed_model_responses_route_tracks_continuation() {
             options,
             transport: GrantTransport::Remote(endpoint),
         },
+        Some(hellas_channel::test_support::channel::evaluator()),
         Arc::new(ProducerSigningKey::from_secret_bytes([8; 32]).unwrap()),
     );
     let access = host.gateway_access().await;

@@ -480,6 +480,8 @@ impl Channel<PaymentFunding> {
         put_u64(&mut out, settlement.omission_bond());
         out.push(role_code(*role));
         put_u64(&mut out, ledger.credited_cumulative());
+        put_u64(&mut out, ledger.lost_compute());
+        put_u64(&mut out, ledger.lost_delivery());
         put_u64(&mut out, jobs.len() as u64);
         for job in jobs.values() {
             let JobState {
@@ -614,6 +616,8 @@ impl Channel<PaymentFunding> {
             });
         }
         let credited = cursor.u64().ok_or(ChannelStateError::Malformed)?;
+        let lost_compute = cursor.u64().ok_or(ChannelStateError::Malformed)?;
+        let lost_delivery = cursor.u64().ok_or(ChannelStateError::Malformed)?;
         let jobs_len = cursor.u64().ok_or(ChannelStateError::Malformed)?;
         let mut jobs = BTreeMap::new();
         for _ in 0..jobs_len {
@@ -740,7 +744,7 @@ impl Channel<PaymentFunding> {
                 retained_roots,
             },
             role,
-            ledger: CreditLedger::from_credited_cumulative(credited),
+            ledger: CreditLedger::restore(credited, lost_compute, lost_delivery),
             book: JobBook {
                 pending_proposal,
                 jobs,

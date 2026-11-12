@@ -65,8 +65,8 @@
 //! either: there is no dormant game policy in the tag-4 body, no
 //! challenge bitmap or live-game pointer in [`BondLease`], no
 //! unreachable close kind, and no external seal verifier. A tag-4
-//! bond's only exit is its `Timeout` — immediate while unleased, at the
-//! horizon while leased. Do not read the landed payment close as
+//! bond's only exit is its `Timeout` — immediate while no live payment
+//! edge leases it, at the horizon otherwise. Do not read the landed payment close as
 //! evidence that fraud proofs work end to end: nothing in this crate
 //! proves a job was computed wrongly, and the stake is leased capital
 //! that returns on time rather than working insurance. The game slice

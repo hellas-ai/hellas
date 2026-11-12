@@ -153,7 +153,9 @@ async fn unseen_grant_program_closure_reaches_only_the_ram_backend_and_never_fil
         }],
     };
     let root = environment.canonical_bytes().unwrap();
-    let manifest = environment.manifest().unwrap();
+    let manifest = environment
+        .manifest(&hellas_channel::test_support::channel::evaluator())
+        .unwrap();
     let mut invocation_request = proposal.input.request.clone();
     invocation_request.execution_environment = manifest.content_id();
     proposal.input = hellas_rpc::protocol::invocation::PreparedInvocation::new(

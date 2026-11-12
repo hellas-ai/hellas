@@ -99,7 +99,8 @@ pub enum ChannelStateError {
     OverCredit {
         /// Which limit.
         ledger: &'static str,
-        /// Already spent against it: capacity credited to payments.
+        /// Already spent against it: capacity credited to payments, or
+        /// compute and delivery lost to unpaid jobs.
         used: u64,
         /// Reserved against the open jobs.
         reserved: u64,

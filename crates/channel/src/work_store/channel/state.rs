@@ -1564,7 +1564,7 @@ impl Channel<PaymentFunding> {
             ),
             TerminalOutcome::Rejected {
                 result_digest: named,
-                evidence_digest,
+                ..
             } => {
                 self.require_role("refuting a result", Role::Client)?;
                 if job.phase != JobPhase::Ready {
@@ -1586,27 +1586,32 @@ impl Channel<PaymentFunding> {
                         field: "rejected result_digest",
                     });
                 }
-                self.book.rest_at(JobTerminal {
-                    work_id: job.work_id,
-                    phase: job.phase,
-                    outcome: TerminalOutcome::Rejected {
-                        result_digest: *named,
-                        evidence_digest: *evidence_digest,
-                    },
-                });
+                self.rest_unpaid(&job, outcome.clone());
                 Ok(Applied::Changed)
             }
             TerminalOutcome::Expired { .. }
             | TerminalOutcome::Failed { .. }
             | TerminalOutcome::Indeterminate => {
-                self.book.rest_at(JobTerminal {
-                    work_id: job.work_id,
-                    phase: job.phase,
-                    outcome: outcome.clone(),
-                });
+                self.rest_unpaid(&job, outcome.clone());
                 Ok(Applied::Changed)
             }
         }
+    }
+
+    /// Rests a job at an unpaid terminal and moves its reservation to the
+    /// loss totals: compute once it was co-signed, delivery once its
+    /// plaintext left. Nothing it held stays reserved.
+    fn rest_unpaid(&mut self, job: &JobState, outcome: TerminalOutcome) {
+        self.ledger.lose(
+            job.authorization.price,
+            job.provider_signature.is_some(),
+            job.phase.delivered(),
+        );
+        self.book.rest_at(JobTerminal {
+            work_id: job.work_id,
+            phase: job.phase,
+            outcome,
+        });
     }
 
     /// Credits one client payment and rests the job at a certified
@@ -1730,17 +1735,26 @@ impl Channel<PaymentFunding> {
         )
     }
 
-    /// Reserves this job's price against the channel's outstanding compute credit.
+    /// Reserves this job's price against the compute credit: what was lost
+    /// to unpaid jobs plus what the open jobs hold.
     fn check_compute_limit(&self, price: u64) -> Result<(), ChannelStateError> {
         let limit = self.funding.channel.channel_policy().compute_credit_limit;
-        reserve("compute", 0, self.reserved(|_| true), price, limit)
+        let lost = self.ledger.lost_compute();
+        reserve("compute", lost, self.reserved(|_| true), price, limit)
     }
 
-    /// Checks the one job's price against the delivery limit.
+    /// Reserves this job's price against the delivery credit: what was lost
+    /// to unpaid deliveries plus what the open delivered jobs hold.
     fn check_delivery_limit(&self, price: u64) -> Result<(), ChannelStateError> {
         let limit = self.funding.channel.channel_policy().delivery_credit_limit;
         let reserved = self.reserved(|job| job.phase.delivered());
-        reserve("delivery", 0, reserved, price, limit)
+        reserve(
+            "delivery",
+            self.ledger.lost_delivery(),
+            reserved,
+            price,
+            limit,
+        )
     }
 
     /// The summed price of the open jobs `held` selects.

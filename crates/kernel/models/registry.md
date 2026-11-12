@@ -37,7 +37,8 @@ written down.
 
 **The bond lease is unmodelled too.** A work-payment open now creates a
 two-chunk `BondLease` over the tag-4 bond it names, and a tag-4 timeout
-reads it and — at the horizon — deletes it. No `.qnt` action opens a
+reads it and deletes it — at the horizon while its payment edge is live, at
+once when that edge is gone. No `.qnt` action opens a
 payment edge, so nothing abstract says a bond backs at most one channel,
 and nothing abstract distinguishes an unleased bond from a leased one.
 
