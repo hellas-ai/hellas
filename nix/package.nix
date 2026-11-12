@@ -199,40 +199,14 @@ let
     selection: "cargo check --locked ${selection} --all-targets\n"
   ) (lib.attrValues cargoSelections);
 
-  # One external consumer per publishable library: neither workspace siblings
-  # nor the library's dev-dependencies may supply its default feature graph.
-  checkStandaloneLibraries = ''
-    export CARGO_TARGET_DIR="$PWD/target"
-    consumers=$(mktemp -d)
-    cargo metadata --locked --no-deps --format-version 1 > "$consumers/metadata.json"
-    jq -r '
-      .workspace_members as $members | .packages[]
-      | select(.id as $id | $members | index($id))
-      | select(.publish == null or (.publish | length) > 0)
-      | select(any(.targets[]; any(.kind[]; . == "lib" or . == "proc-macro")))
-      | [.name, (.manifest_path | sub("/Cargo.toml$"; ""))] | @tsv
-    ' "$consumers/metadata.json" > "$consumers/libraries.tsv"
-    while IFS=$'\t' read -r name path; do
-      echo "Checking standalone default features: $name"
-      consumer="$consumers/$name"
-      mkdir -p "$consumer/src"
-      touch "$consumer/src/lib.rs"
-      cat > "$consumer/Cargo.toml" <<EOF
-    [package]
-    name = "hellas-standalone-check"
-    version = "0.0.0"
-    edition = "2024"
-    [workspace]
-    resolver = "2"
-    [dependencies]
-    $name = { path = "$path" }
-    EOF
-      # Preserve the pinned versions; Cargo only needs to add the consumer
-      # and prune unused packages. All sources come from the vendored lock.
-      cp Cargo.lock "$consumer/Cargo.lock"
-      cargo check --offline --manifest-path "$consumer/Cargo.toml" --lib
-    done < "$consumers/libraries.tsv"
-    rm -rf "$consumers"
+  # Each library on its own, as a dependent builds it: `--lib` leaves out the
+  # dev-dependencies, and one package per command keeps workspace siblings
+  # from unifying features into it.
+  checkLibraries = ''
+    for package in $(cargo metadata --locked --no-deps --format-version 1 \
+      | jq -r '.packages[] | select(any(.targets[]; any(.kind[]; . == "lib"))) | .name'); do
+      cargo check --locked -p "$package" --lib
+    done
   '';
 
   # nixpkgs tests cargo-llvm-cov with its own rustc, whose raw profiles
@@ -336,7 +310,8 @@ let
             RUST_TEST_THREADS = "1";
           }
         );
-    # Type-check downstream default features and every release target.
+    # Type-checks each library as a dependent builds it, then every target of
+    # every release selection: what Hydra's validation compiles.
     feature-targets = craneLib.mkCargoDerivation (
       craneArgs
       // {
@@ -345,7 +320,7 @@ let
         # Terminal check: nothing consumes its target directory.
         doInstallCargoArtifacts = false;
         nativeBuildInputs = craneArgs.nativeBuildInputs ++ [ pkgs.buildPackages.jq ];
-        buildPhaseCargoCommand = checkStandaloneLibraries + checkSelections;
+        buildPhaseCargoCommand = checkLibraries + checkSelections;
         installPhaseCommand = "mkdir -p $out";
       }
     );
