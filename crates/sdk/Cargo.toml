@@ -41,6 +41,7 @@ hellas-rpc = { workspace = true, features = [
     "fetch",
     "work",
     "host-control",
+    "swarm",
 ] }
 hellas-store.workspace = true
 hellas-wire = { workspace = true, features = [

@@ -938,7 +938,11 @@ impl Sealer {
                 .indexer
                 .publish_proof(
                     block.clone(),
-                    &crate::finality_proof::encode(&certificate.clone().encode(), &[]).unwrap(),
+                    &crate::finality_proof::FinalityProof::encode(
+                        &certificate.clone().encode(),
+                        &[],
+                    )
+                    .unwrap(),
                 )
                 .await
                 .expect("a certified block is ingested");

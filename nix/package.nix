@@ -199,6 +199,16 @@ let
     selection: "cargo check --locked ${selection} --all-targets\n"
   ) (lib.attrValues cargoSelections);
 
+  # Each library on its own, as a dependent builds it: `--lib` leaves out the
+  # dev-dependencies, and one package per command keeps workspace siblings
+  # from unifying features into it.
+  checkLibraries = ''
+    for package in $(cargo metadata --locked --no-deps --format-version 1 \
+      | jq -r '.packages[] | select(any(.targets[]; any(.kind[]; . == "lib"))) | .name'); do
+      cargo check --locked -p "$package" --lib
+    done
+  '';
+
   # nixpkgs tests cargo-llvm-cov with its own rustc, whose raw profiles
   # (format 11) its paired llvm-profdata (format 10) cannot read. At run
   # time the tool uses our toolchain's llvm-tools-preview instead.
@@ -300,8 +310,8 @@ let
             RUST_TEST_THREADS = "1";
           }
         );
-    # Type-checks every target of every release selection: what Hydra's
-    # validation compiles, without running it.
+    # Type-checks each library as a dependent builds it, then every target of
+    # every release selection: what Hydra's validation compiles.
     feature-targets = craneLib.mkCargoDerivation (
       craneArgs
       // {
@@ -309,7 +319,8 @@ let
         cargoArtifacts = cargoDeps;
         # Terminal check: nothing consumes its target directory.
         doInstallCargoArtifacts = false;
-        buildPhaseCargoCommand = checkSelections;
+        nativeBuildInputs = craneArgs.nativeBuildInputs ++ [ pkgs.buildPackages.jq ];
+        buildPhaseCargoCommand = checkLibraries + checkSelections;
         installPhaseCommand = "mkdir -p $out";
       }
     );
