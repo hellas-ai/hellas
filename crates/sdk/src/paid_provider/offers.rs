@@ -326,9 +326,8 @@ impl OfferAllocator {
                     if taker.owner().to_bytes() != principal || taker.signer().to_bytes() != key {
                         return Err(invalid());
                     }
-                    // A settled payment cannot be resumed. Its still-live bond
-                    // continues to occupy this client's stake allowance, so
-                    // refuse before a quote could trigger another owner spend.
+                    // A settled channel's bond is reclaimed by the next Timeout
+                    // either party submits; refuse until it is gone.
                     if state
                         .origin()
                         .is_some_and(|origin| snapshot.block().height >= origin.height)

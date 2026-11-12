@@ -14,8 +14,9 @@
 //! naming the same bond finds the slots occupied and is refused.
 //!
 //! It is also what tells a bond close whether anyone still has recourse
-//! against it. An unleased bond has no challenge exposure, so its
-//! `Timeout` is immediate; a leased one must wait for the admission
+//! against it. A bond with no lease, or whose lease names a payment edge
+//! that is gone, has no challenge exposure, so its `Timeout` is
+//! immediate; one leased by a live payment edge waits for the admission
 //! horizon it committed to.
 //!
 //! # Two chunks, and why absence is decided by both

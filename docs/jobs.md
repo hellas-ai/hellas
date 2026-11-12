@@ -91,8 +91,8 @@ Fetch's encoded-input size check uses the largest purchase-nonce encoding,
 reserving up to 32 bytes more than a particular purchase needs. One owner
 approval funds the quoted channel amount; later jobs reuse its balance.
 `--settle` closes the channel after the job. With no `--job`, it discovers
-retained channels from signed local journals and closes their exact bonds using
-verified finalized blocks. This path resumes an interrupted close without
+retained channels from signed local journals, keyed by their exact bonds, and
+closes them using verified finalized blocks. This path resumes an interrupted close without
 contacting the provider, reading live object proofs or requesting new funding.
 Missing, corrupt or mismatched journals stop settlement rather than being
 silently replaced.
@@ -338,10 +338,10 @@ If payment succeeded but output was lost before reporting, retry prints
 `already paid (work …, price …), result lost` and refuses another charge.
 `--buy-again` explicitly buys another result. It preserves the identity of an
 unfinished unpaid purchase. `transact --settle --provider ENROLLMENT_ID@NODE_ID` still closes
-the original channel. After finalized payment closure, the provider reclaims its
-bond stake, freeing the per-client allowance for another channel. While that
-reclaim is still pending, a fresh channel is refused before another owner
-funding approval. A payment interrupted before acknowledgement is resolved
+the original channel. After finalized payment closure, whichever party sees it
+first returns the provider's bond stake by its Timeout, freeing the per-client
+allowance for another channel. While that reclaim is still pending, a fresh
+channel is refused before another owner funding approval. A payment interrupted before acknowledgement is resolved
 against the existing signed channel journal.
 
 Fetch request/response bodies stay in memory in channel/provider journals.
