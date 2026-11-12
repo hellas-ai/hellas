@@ -51,22 +51,8 @@ pub enum GatewayError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum GatewayConfigError {
-    #[error("configure either HTTP backends or opaque routes")]
-    RouteMode,
-    #[error("invalid HTTP concurrency limit")]
-    HttpConcurrency,
-    #[error("too many HTTP backends")]
-    BackendCount,
-    #[error("invalid backend name")]
-    BackendName,
     #[error("invalid backend model names")]
     ModelNames,
-    #[error("invalid backend concurrency limit")]
-    BackendConcurrency,
-    #[error("set the credential on the backend, not its routes")]
-    BackendCredential,
-    #[error("HTTP backend needs at least one route")]
-    EmptyRoutes,
     #[error("HTTP routes must be exact paths")]
     RoutePath,
     #[error("duplicate HTTP route")]
@@ -79,14 +65,4 @@ pub enum GatewayConfigError {
     RemoteBinding,
     #[error("the gateway serves no presentation")]
     NoPresentation,
-    #[error("{0} is served by several presentations without distinct model names")]
-    RouteConflict(String),
-    #[error("several sealed Responses routes; select one resource")]
-    AmbiguousResponses,
-    #[error("backend has no HTTPS Fetch route")]
-    MissingFetchRoute,
-    #[error("backend names a Fetch route its policy does not seal")]
-    FetchRouteMismatch,
-    #[error("backend seals several HTTPS routes; name one with service and method")]
-    AmbiguousFetchRoute,
 }

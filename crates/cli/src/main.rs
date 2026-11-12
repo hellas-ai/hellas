@@ -210,63 +210,18 @@ enum Commands {
         )]
         fetch_queue_size: usize,
     },
-    /// Run HTTP gateway exposing OpenAI/Anthropic/plain APIs over Hellas network
-    ///
-    /// Every route requires `Authorization: Bearer <token>`. On loopback the
-    /// gateway keeps its own authority under the home and its bearer in
-    /// `gateway/bearer` there, so a web page cannot spend what it runs on;
-    /// --gateway-profile selects an explicitly provisioned one instead.
+    /// Run the HTTP listeners in a daemon configuration document.
     Gateway {
-        /// The models the routes render jobs from, and where requests run:
-        /// the job commands' --access, --pay or --local.
-        #[command(flatten)]
-        execution: commands::transact::GatewayArgs,
-        /// Serve exact HTTP routes through HTTPS Fetch. A grant with an HTTPS
-        /// resource supplies its own routes.
         #[arg(long, value_name = "FILE")]
-        http_fetch_config: Option<PathBuf>,
-        /// Disable payload archives and require ZDR for every HTTP request.
-        #[arg(long)]
-        zdr: bool,
-        /// Private profile selecting a provisioned HTTP authority and scoped credential.
-        #[arg(long = "gateway-profile", value_name = "FILE")]
-        gateway_profile: Option<PathBuf>,
-        /// Allow a non-loopback listener using the provisioned gateway authority.
-        #[arg(long, requires = "gateway_profile")]
-        allow_remote: bool,
-        /// Host interface to bind. Every request requires bearer authentication.
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
-        /// Port to listen on (default: 8080). Fail if the port is unavailable.
-        #[arg(long)]
-        port: Option<u16>,
+        config: PathBuf,
         #[cfg(feature = "otel")]
-        /// Prometheus metrics port (e.g. 9090).
         #[arg(long)]
         metrics_port: Option<u16>,
         #[cfg(feature = "otel")]
-        /// IP address for unauthenticated metrics; non-loopback exposes them to the network.
         #[arg(long, default_value = "127.0.0.1")]
         metrics_addr: std::net::IpAddr,
-        /// Fallback max new tokens when request omits max_tokens
-        #[arg(
-            long = "default-max-tokens",
-            default_value_t = 128,
-            value_parser = clap::value_parser!(u32).range(1..)
-        )]
-        default_max_tokens: u32,
-        /// JSON object merged into OpenAI Responses requests before they are
-        /// signed and sent as a Fetch.
-        #[arg(long = "responses-overrides", value_parser = parse_json_object)]
-        responses_overrides: Option<serde_json::Map<String, serde_json::Value>>,
-        /// Models the Responses Fetch answers to when /v1/responses is shared
-        /// with other routes. Repeat or use commas.
-        #[arg(long = "responses-model", value_delimiter = ',')]
-        responses_models: Vec<String>,
-        /// Wrap a child command with the gateway as its OpenAI/Anthropic backend.
-        #[arg(long = "wrap")]
+        #[arg(long)]
         wrap: Option<String>,
-        /// Trailing args forwarded verbatim to the wrapped command (after `--`).
         #[arg(last = true, allow_hyphen_values = true, requires = "wrap")]
         wrap_args: Vec<String>,
     },
@@ -758,129 +713,119 @@ async fn async_main() {
             }
         }
         Commands::Gateway {
-            execution,
-            http_fetch_config,
-            zdr,
-            gateway_profile,
-            allow_remote,
-            host,
-            port,
+            config,
+            wrap,
+            wrap_args,
             #[cfg(feature = "otel")]
                 metrics_port: _,
             #[cfg(feature = "otel")]
                 metrics_addr: _,
-            default_max_tokens,
-            responses_overrides,
-            responses_models,
-            wrap,
-            wrap_args,
         } => {
             async {
+                let bytes = commands::read_bounded_regular_file(&config, "daemon config", 4 << 20)?;
+                let document: hellas_sdk::daemon_config::Document = serde_json::from_slice(&bytes)?;
+                document.validate().map_err(anyhow::Error::msg)?;
+                anyhow::ensure!(
+                    document
+                        .listeners
+                        .values()
+                        .all(|l| matches!(l, hellas_sdk::daemon_config::Listener::Http { .. })),
+                    "gateway requires HTTP listeners"
+                );
+                anyhow::ensure!(
+                    wrap.is_none() || document.listeners.len() == 1,
+                    "wrapping requires one HTTP listener"
+                );
                 let principal = match owner.as_ref() {
                     Some(owner) => owner.clone(),
                     None => owner::principal(&home)?,
                 };
-                let directory = home.join("gateway");
-                let own = gateway_profile.is_none();
-                let profile = match gateway_profile {
-                    Some(profile) => profile,
-                    None => {
-                        commands::admin::gateway_profile(
-                            &directory,
-                            &home,
-                            &local_identity,
-                            &principal,
-                        )
-                        .await?
-                    }
-                };
-                let hellas_sdk::node_control::profile::GatewayHost {
-                    node,
-                    access,
-                    control,
-                } = hellas_sdk::node_control::profile::GatewayProfile::load(&home.child(profile))
-                    .await?;
-                if own {
-                    let bearer = directory.join("bearer");
-                    if !bearer.try_exists()? {
-                        hellas_private::write_atomically(
-                            &bearer,
-                            ".writing",
-                            access.bearer().as_bytes(),
-                        )?;
-                    }
-                    eprintln!("gateway bearer: {}", bearer.display());
-                }
-                let http = http_fetch_config
-                    .map(
-                        |path| -> anyhow::Result<hellas_gateway::HttpGatewayConfig> {
-                            let bytes = commands::read_bounded_regular_file(
-                                &path,
-                                "HTTP gateway config",
-                                4 << 20,
-                            )?;
-                            Ok(serde_json::from_slice(&bytes)?)
-                        },
-                    )
-                    .transpose()?;
-                let models = execution
-                    .models
-                    .iter()
-                    .map(|model| {
-                        hellas_gateway::ModelOptions::at(model.clone(), default_max_tokens)
-                    })
-                    .collect();
                 let context = commands::transact::Context::new(
                     &local_identity,
                     Some(&principal),
                     &home,
                     &selected_chain,
                 )?;
-                let served = commands::transact::gateway(execution, context, async |work| {
+                commands::transact::gateway(document.clone(), context, async |work, routes| {
                     #[cfg(feature = "otel")]
                     if let Some((address, bundle)) = metrics {
-                        let bundle = match work.target().endpoint() {
-                            Some(endpoint) => {
-                                let (_, receiver) =
-                                    tokio::sync::watch::channel(Some(endpoint.clone()));
-                                bundle.with_iroh(receiver)
-                            }
-                            None => bundle,
-                        };
                         metrics::spawn_metrics_server(address, bundle).await?;
                     }
-                    let http = match http {
-                        Some(http) => Some(http),
-                        None => work.target().http_config()?,
-                    };
-                    let serve = hellas_sdk::GatewayServeOptions {
-                        server: hellas_gateway::ServerOptions {
-                            access,
-                            archive: hellas_gateway::ArchiveOptions {
-                                directory: home.join("gateway-archive"),
-                                zdr,
-                            },
-                            allow_remote,
-                            host,
-                            port,
-                        },
-                        models,
-                        http,
-                        responses_overrides: responses_overrides.unwrap_or_default(),
-                        responses_models,
-                    };
-                    let gateway = hellas_sdk::serve_gateway(work, serve).await?;
-                    wrap::wait(gateway, wrap.as_deref(), &wrap_args).await
-                })
-                .await;
-                let stopped = match control {
-                    Some(control) => {
-                        served.and(control.shutdown().await.map_err(anyhow::Error::from))
+                    let mut gateways = Vec::new();
+                    let mut authorities = Vec::new();
+                    let serving = async {
+                        for listener in document.listeners.values() {
+                            let hellas_sdk::daemon_config::Listener::Http { bind, profile, zdr } =
+                                listener
+                            else {
+                                unreachable!()
+                            };
+                            let directory = home.join("gateway");
+                            let profile = match profile {
+                                Some(profile) => profile.clone(),
+                                None => {
+                                    commands::admin::gateway_profile(
+                                        &directory,
+                                        &home,
+                                        &local_identity,
+                                        &principal,
+                                    )
+                                    .await?
+                                }
+                            };
+                            let host = hellas_sdk::node_control::profile::GatewayProfile::load(
+                                &home.child(profile),
+                            )
+                            .await?;
+                            let server = hellas_gateway::ServerOptions {
+                                access: host.access,
+                                archive: hellas_gateway::ArchiveOptions {
+                                    directory: home.join("gateway-archive"),
+                                    zdr: *zdr,
+                                },
+                                allow_remote: !bind.ip().is_loopback(),
+                                host: bind.ip().to_string(),
+                                port: Some(bind.port()),
+                            };
+                            authorities.push((host.node, host.control));
+                            gateways.push(
+                                hellas_gateway::start(hellas_gateway::GatewayOptions {
+                                    server,
+                                    work: work.clone(),
+                                    routes: routes.clone(),
+                                })
+                                .await?,
+                            );
+                        }
+                        if let Some(wrap) = wrap.as_deref() {
+                            wrap::wait(gateways.pop().unwrap(), Some(wrap), &wrap_args).await
+                        } else {
+                            futures::future::select_all(
+                                gateways.iter_mut().map(|handle| {
+                                    Box::pin(hellas_gateway::wait_for_shutdown(handle))
+                                }),
+                            )
+                            .await
+                            .0
+                            .map_err(anyhow::Error::from)
+                        }
                     }
-                    None => served,
-                };
-                node.close().await;
-                stopped
+                    .await;
+                    for gateway in &gateways {
+                        gateway.request_shutdown();
+                    }
+                    for gateway in gateways {
+                        let _ = gateway.shutdown().await;
+                    }
+                    for (node, control) in authorities {
+                        if let Some(control) = control {
+                            control.shutdown().await?;
+                        }
+                        node.close().await;
+                    }
+                    serving
+                })
+                .await
             }
             .await
         }

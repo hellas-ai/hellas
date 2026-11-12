@@ -7,13 +7,12 @@
 //! omitted and `x-hellas-transcript-digest` names the lowercase hex SHA-256 of
 //! the canonical signed bytes, which the caller must obtain out of band. The
 //! gateway neither retains nor serves that copy.
-pub(crate) mod affinity;
 mod config;
 mod observation;
-mod routing;
-pub use routing::RoutingError;
+use crate::routing;
+pub use crate::routing::RoutingError;
 
-pub use config::{HttpBackend, HttpGatewayConfig, HttpRoute};
+pub use config::HttpRoute;
 #[cfg(test)]
 mod tests;
 
@@ -31,7 +30,7 @@ use http_body::Frame;
 use std::sync::Arc;
 use tracing::Instrument;
 
-use super::{WorkEvent, WorkExecutionBackend, WorkFetchRequest, json_error};
+use super::{WorkEvent, WorkFetchRequest, json_error};
 use crate::backend::provenance::transcript_header;
 use hellas_adaptors::BackendError;
 
@@ -45,8 +44,8 @@ fn attributed(mut response: Response, name: &str) -> Response {
 
 struct HttpState {
     fetch_route: (String, String),
-    paid: Arc<dyn WorkExecutionBackend>,
-    routing: Arc<routing::Routing>,
+    paid: Arc<crate::route::RouteExecution>,
+    route: HttpRoute,
     metrics: observation::Metrics,
 }
 
@@ -60,80 +59,29 @@ enum HttpOpenError {
     Headers(#[from] hellas_rpc::http_fetch::HttpRequestError),
 }
 
-/// A path and the models it answers to; empty means any model.
-pub(super) type ServedPath = (String, Vec<String>);
-
-/// The HTTPS presentation over `paid`, and the paths it serves.
 pub(super) fn router(
-    config: HttpGatewayConfig,
-    paid: Arc<dyn WorkExecutionBackend>,
-) -> crate::GatewayResult<(Router, Vec<ServedPath>)> {
-    config.validate()?;
-    let routing = Arc::new(routing::Routing::new(&config)?);
-    let routes = paid.fetch_routes();
-    let mut sealed = Vec::new();
-    let mut open = false;
-    for (schema, route) in &routes {
-        if *schema != hellas_rpc::FetchSchema::HttpV1 {
-            continue;
-        }
-        match route {
-            hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy::SealedRoute {
-                service,
-                method,
-            } => {
-                let route = (service.clone(), method.clone());
-                if !sealed.contains(&route) {
-                    sealed.push(route);
-                }
-            }
-            hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy::OpenFetch { .. } => {
-                open = true
-            }
-        }
-    }
-    let fetch_route = match (
-        config.service.clone().zip(config.method.clone()),
-        sealed.as_slice(),
-    ) {
-        (Some(named), _) if open || sealed.contains(&named) => named,
-        (Some(_), _) => return Err(crate::GatewayConfigError::FetchRouteMismatch.into()),
-        (None, [one]) => one.clone(),
-        (None, []) => return Err(crate::GatewayConfigError::MissingFetchRoute.into()),
-        (None, _) => return Err(crate::GatewayConfigError::AmbiguousFetchRoute.into()),
-    };
-    let mut paths = std::collections::BTreeMap::<String, Option<Vec<String>>>::new();
-    for backend in &routing.backends {
-        for route in &backend.routes {
-            let models = paths.entry(route.path.clone()).or_insert(Some(Vec::new()));
-            let restricted = route
-                .models
-                .as_ref()
-                .or_else(|| (!backend.models.is_empty()).then_some(&backend.models));
-            match (models.as_mut(), restricted) {
-                (Some(models), Some(restricted)) => models.extend(restricted.iter().cloned()),
-                _ => *models = None,
-            }
-        }
-    }
-    let state = Arc::new(HttpState {
-        fetch_route,
-        paid,
-        routing,
-        metrics: observation::Metrics::new(),
-    });
-    let mut app = Router::new();
-    for path in paths.keys() {
-        app = app.route(path, axum::routing::any(handle));
-    }
-    let paths = paths
-        .into_iter()
-        .map(|(path, models)| (path, models.unwrap_or_default()))
-        .collect();
-    Ok((app.with_state(state), paths))
+    route: HttpRoute,
+    service: String,
+    method: String,
+    paid: Arc<crate::route::RouteExecution>,
+) -> crate::GatewayResult<Router> {
+    route.validate()?;
+    let path = route.path.clone();
+    Ok(Router::new()
+        .route(&path, axum::routing::any(handle))
+        .with_state(Arc::new(HttpState {
+            fetch_route: (service, method),
+            paid,
+            route,
+            metrics: observation::Metrics::new(),
+        })))
 }
 
-async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Response {
+async fn handle(
+    State(state): State<Arc<HttpState>>,
+    axum::Extension(mut selected): axum::Extension<routing::Selection>,
+    request: Request,
+) -> Response {
     let mut observed = observation::Observation::new(&state.metrics, request.uri().path());
     let (parts, body) = request.into_parts();
     // Reserve space for URL, headers and JSON around the base64 body.
@@ -149,45 +97,8 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
             );
         }
     };
-    let connection = parts
-        .extensions
-        .get::<axum::extract::ConnectInfo<super::ConnectionId>>()
-        .map(|c| &c.0);
-    let selected = match state.routing.select(
-        parts.uri.path(),
-        parts.method.as_str(),
-        &parts.headers,
-        &body,
-        connection,
-    ) {
-        Ok(selected) => selected,
-        Err(failure) => {
-            observed.status(failure.status.as_u16());
-            observed.complete();
-            let mut response = json_error(failure.status, failure.message);
-            if let Some(seconds) = failure.retry {
-                response
-                    .headers_mut()
-                    .insert("retry-after", seconds.to_string().parse().unwrap());
-            }
-            if let Some(backend) = failure.backend {
-                let name = &state.routing.backends[backend].name;
-                observed.backend(name, failure.affinity.unwrap_or("session"));
-                return attributed(response, name);
-            }
-            return response;
-        }
-    };
-    let backend = &state.routing.backends[selected.backend];
-    let route = &backend.routes[selected.endpoint];
-    let permit = selected.permit;
-    observed.backend(&backend.name, selected.affinity);
+    let route = &state.route;
     observed.model(selected.model.as_deref());
-    observed.bind_response(
-        state
-            .routing
-            .response_binding(selected.backend, &route.path),
-    );
     let mut upstream = match route.request(body, &parts.headers) {
         Ok(upstream) => upstream,
         Err(_) => {
@@ -210,7 +121,7 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
             return json_error(StatusCode::BAD_REQUEST, "invalid HTTP request");
         }
     };
-    let result = open(&state, payload)
+    let result = open(&state, &mut selected, payload)
         .instrument(observed.span.clone())
         .await;
     let (accepted, status, headers, mut events) = match result {
@@ -235,14 +146,19 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
                 error,
                 BackendError::Timeout(_) | BackendError::Unavailable(_) | BackendError::Failed(_)
             ) {
-                tracing::warn!(backend = %backend.name, %error, "HTTP Fetch failed");
-                state.routing.transport_failed(selected.backend);
+                tracing::warn!(backend = ?selected.backend, %error, "HTTP Fetch failed");
             }
             let status = super::backend_status(&error);
             observed.status(status.as_u16());
-            return attributed(json_error(status, message), &backend.name);
+            return attributed(
+                json_error(status, message),
+                selected.backend.as_deref().unwrap_or(""),
+            );
         }
     };
+    let backend = selected.backend.as_deref().unwrap_or("");
+    observed.backend(backend, selected.affinity);
+    observed.bind_response(selected.response_binding(&route.path));
     observed.status(status);
     let representation_length = if parts.method == axum::http::Method::HEAD || status == 304 {
         headers
@@ -264,7 +180,7 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
             .get("content-encoding")
             .and_then(|value| value.to_str().ok()),
     );
-    state.routing.observe(selected.backend, status, &headers);
+    selected.observe(status, &headers);
     if parts.method == axum::http::Method::HEAD || status == 204 || status == 304 {
         let mut end = events.next().instrument(observed.span.clone()).await;
         let mut transcript = None;
@@ -291,11 +207,10 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
         let mut response = Response::new(Body::empty());
         *response.status_mut() = StatusCode::from_u16(status).unwrap();
         *response.headers_mut() = std::mem::take(&mut headers);
-        return provenanced(attributed(response, &backend.name), accepted);
+        return provenanced(attributed(response, backend), accepted);
     }
-    let name = backend.name.clone();
+    let name = backend.to_owned();
     let stream = async_stream::try_stream! {
-        let _permit = permit;
         let mut size = 0usize;
         let mut transcript = None;
         while let Some(event) = events.next().instrument(observed.span.clone()).await {
@@ -351,7 +266,7 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
     let mut response = Response::new(Body::new(http_body_util::StreamBody::new(stream)));
     *response.status_mut() = StatusCode::from_u16(status).unwrap();
     *response.headers_mut() = headers;
-    provenanced(attributed(response, &backend.name), accepted)
+    provenanced(attributed(response, backend), accepted)
 }
 
 /// The accepted job's identity, for the provenance layer to render as headers.
@@ -370,13 +285,23 @@ type Opened = (
     super::WorkFetchStream,
 );
 
-async fn open(state: &HttpState, payload: Vec<u8>) -> Result<Opened, HttpOpenError> {
+async fn open(
+    state: &HttpState,
+    selection: &mut routing::Selection,
+    payload: Vec<u8>,
+) -> Result<Opened, HttpOpenError> {
     let (service, method) = &state.fetch_route;
-    let mut stream = state.paid.fetch(WorkFetchRequest {
-        service: service.clone(),
-        method: method.clone(),
-        body: payload,
-    })?;
+    let mut stream = state
+        .paid
+        .fetch(
+            selection,
+            WorkFetchRequest {
+                service: service.clone(),
+                method: method.clone(),
+                body: payload,
+            },
+        )
+        .await?;
     let accepted = super::accepted(&mut stream).await;
     match stream.next().await.transpose()? {
         Some(WorkEvent::Output(OutputEvent::Adaptor(AdaptorEvent::Http(

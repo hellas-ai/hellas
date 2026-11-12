@@ -192,13 +192,20 @@ pub struct Transcription {
     pub truncated: bool,
 }
 impl Whisper {
-    pub async fn open(dir: &Path, dialect: super::GpuDialect) -> Result<Self> {
+    pub async fn open(
+        dir: &Path,
+        dialect: super::GpuDialect,
+        weights: Option<ContentRef>,
+    ) -> Result<Self> {
         let dir = dir.to_owned();
         let (config, generation, tokenizer, views, object, source) =
             tokio::task::spawn_blocking(move || -> Result<_> {
                 let (config, generation, tokenizer) = metadata(&dir)?;
                 let views = views(&config)?;
-                let object = hellas_store::content::file_content(&dir.join(WEIGHTS_FILE))?;
+                let object = weights.map_or_else(
+                    || hellas_store::content::file_content(&dir.join(WEIGHTS_FILE)),
+                    Ok,
+                )?;
                 let (offset, bytes) = views.last().context("model has no weights")?;
                 ensure!(
                     object.bytes() == offset + bytes,

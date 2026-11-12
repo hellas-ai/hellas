@@ -1,4 +1,5 @@
 use super::*;
+use crate::WorkExecutionBackend;
 use crate::{
     ComputeEvent, WorkEvent, WorkFetchStream, WorkGatewayError, WorkOutputStream, WorkShutdownError,
 };
@@ -15,7 +16,15 @@ struct RecordedFetch {
 }
 
 impl WorkExecutionBackend for RecordedFetch {
-    fn fetch(&self, request: WorkFetchRequest) -> Result<WorkFetchStream, WorkGatewayError> {
+    fn backends(&self) -> Vec<crate::BackendInfo> {
+        crate::test_support::backend(None)
+    }
+
+    fn fetch(
+        &self,
+        _backend: &str,
+        request: WorkFetchRequest,
+    ) -> Result<WorkFetchStream, WorkGatewayError> {
         assert_eq!(request.service, "openai");
         assert_eq!(request.method, "responses");
         assert_eq!(
@@ -30,6 +39,7 @@ impl WorkExecutionBackend for RecordedFetch {
 
     fn run(
         &self,
+        _backend: &str,
         _: hellas_client::model::ComputeJob,
     ) -> Result<WorkOutputStream<ComputeEvent>, WorkGatewayError> {
         Err(WorkGatewayError::Unsupported)
@@ -66,12 +76,12 @@ async fn fixture(name: &str, request: Value, events: Vec<OutputEvent>, expected:
         calls: AtomicUsize::new(0),
     });
     let backend = FetchBackend {
-        work: work.clone(),
+        work: crate::test_support::execution(work.clone(), presentation()).await,
+        selection: crate::test_support::selection(work.clone()),
         options: crate::ResponsesFetch {
             service: "openai".into(),
             method: "responses".into(),
             overrides: serde_json::Map::new(),
-            models: Vec::new(),
         },
     };
     // Pin only rendering metadata; compare the actual SSE body without
@@ -185,16 +195,10 @@ async fn responses_carry_provenance_at_start_and_end() {
             ],
             calls: AtomicUsize::new(0),
         });
-        let app = router(
-            crate::ResponsesFetch {
-                service: "openai".into(),
-                method: "responses".into(),
-                overrides: serde_json::Map::new(),
-                models: Vec::new(),
-            },
-            work,
-        )
-        .layer(crate::provenance_layer::ProvenanceLayer);
+        let app = crate::router::router(vec![crate::test_support::route(presentation())], work)
+            .await
+            .unwrap()
+            .layer(crate::provenance_layer::ProvenanceLayer);
         let response = app
             .oneshot(
                 axum::http::Request::post(PATH)
@@ -226,5 +230,14 @@ async fn responses_carry_provenance_at_start_and_end() {
         let last = events.last().unwrap();
         assert_eq!(last["type"], "response.completed");
         assert_eq!(last["response"]["hellas"], end);
+    }
+}
+
+fn presentation() -> crate::Presentation {
+    crate::Presentation::Responses {
+        service: "openai".into(),
+        method: "responses".into(),
+        models: vec![],
+        overrides: Default::default(),
     }
 }

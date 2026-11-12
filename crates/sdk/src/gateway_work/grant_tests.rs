@@ -48,9 +48,14 @@ struct FixtureBuilder {
     paced_chunks: usize,
     hold_first: bool,
     max_job_millis: Option<u64>,
+    transport_key: u8,
 }
 impl FixtureBuilder {
     /// Body chunks, and the usage chunk after them, each wait for `backend.pace`.
+    fn transport_key(mut self, key: u8) -> Self {
+        self.transport_key = key;
+        self
+    }
     fn hold_first(mut self) -> Self {
         self.hold_first = true;
         self
@@ -121,6 +126,7 @@ impl FixtureBuilder {
             ..Backend::default()
         };
         let host = crate::test_support::Host::builder()
+            .with_transport_key(self.transport_key)
             .with_allowance(allowance)
             .with_capacity(Capacity::new(2))
             .with_backend(backend)
@@ -138,7 +144,7 @@ impl FixtureBuilder {
                 .unwrap(),
         );
         let options = host.options(addresses);
-        let gateway = ExecutorGateway::new(
+        let gateway = crate::test_support::gateway(
             crate::Backend::Grant {
                 policy: options.target.offer().grant.policies[0].clone(),
                 options,
@@ -157,7 +163,7 @@ impl FixtureBuilder {
 }
 impl Fixture {
     fn options(&self) -> &crate::grant_client::GrantSessionOptions {
-        let crate::Backend::Grant { options, .. } = self.gateway.target() else {
+        let crate::Backend::Grant { options, .. } = &self.gateway.backends["test"].target else {
             unreachable!("a grant fixture")
         };
         options
@@ -166,7 +172,7 @@ impl Fixture {
     async fn session(&self) -> GrantSession {
         let crate::Backend::Grant {
             options, transport, ..
-        } = self.gateway.target()
+        } = &self.gateway.backends["test"].target
         else {
             unreachable!("a grant fixture")
         };
@@ -183,6 +189,7 @@ impl Fixture {
             paced_chunks: 0,
             hold_first: false,
             max_job_millis: None,
+            transport_key: 5,
         }
     }
     async fn command(&self, command: WorkControlCommand) -> WorkControlReply {
@@ -216,10 +223,7 @@ impl Fixture {
                 allow_remote: false,
             },
             work: self.gateway.clone(),
-            presentations: hellas_gateway::Presentations {
-                http: self.gateway.target().http_config().unwrap(),
-                ..Default::default()
-            },
+            routes: self.gateway.backends["test"].target.routes("test").unwrap(),
         })
         .await
         .unwrap();
@@ -255,7 +259,7 @@ impl Fixture {
         }
     }
     async fn result(&self, cap: Option<u64>) -> Result<(), WorkGatewayError> {
-        let mut stream = self.gateway.fetch(self.request(cap))?;
+        let mut stream = self.gateway.fetch("test", self.request(cap))?;
         let mut terminal = false;
         while let Some(event) = stream.next().await {
             terminal |= matches!(event?, WorkEvent::Output(event) if event.terminal().is_some());
@@ -272,7 +276,10 @@ impl Fixture {
 #[tokio::test]
 async fn delivered_transcripts_verify_against_the_accepting_provider() {
     let fixture = Fixture::builder().build().await;
-    let mut stream = fixture.gateway.fetch(fixture.request(None)).unwrap();
+    let mut stream = fixture
+        .gateway
+        .fetch("test", fixture.request(None))
+        .unwrap();
     let mut events = Vec::new();
     while let Some(event) = within(stream.next()).await {
         events.push(event.unwrap());
@@ -340,9 +347,15 @@ async fn resource_repair_precedes_client_signing() {
         .inspect_request(inspect_chat)
         .build()
         .await;
-    let config = fixture.gateway.target().http_config().unwrap().unwrap();
-    assert_eq!(config.routes[0].max_response_bytes, 4096);
-    assert_eq!(config.routes[0].tls, fixture.template.tls);
+    let config = fixture.gateway.backends["test"]
+        .target
+        .routes("test")
+        .unwrap();
+    let hellas_gateway::Presentation::Http { route, .. } = &config[0].presentation else {
+        panic!("HTTP route")
+    };
+    assert_eq!(route.max_response_bytes, 4096);
+    assert_eq!(route.tls, fixture.template.tls);
     fixture.result(None).await.unwrap();
     assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 1);
     fixture.shutdown().await;
@@ -351,7 +364,10 @@ async fn resource_repair_precedes_client_signing() {
 #[tokio::test]
 async fn disconnected_consumers_do_not_abandon_accepted_work() {
     let fixture = Fixture::builder().hold_completion().build().await;
-    let mut stream = fixture.gateway.fetch(fixture.request(None)).unwrap();
+    let mut stream = fixture
+        .gateway
+        .fetch("test", fixture.request(None))
+        .unwrap();
     assert!(matches!(
         within(stream.next()).await.unwrap().unwrap(),
         WorkEvent::Accepted(_)
@@ -378,15 +394,15 @@ async fn disconnected_consumers_do_not_abandon_accepted_work() {
     fixture.gateway.drain().await.unwrap();
     assert_eq!(fixture.host.backend.slots.available_permits(), 2);
     assert_err!(
-        fixture.gateway.fetch(fixture.request(None)),
-        WorkGatewayError::Busy(_)
+        fixture.gateway.fetch("test", fixture.request(None)),
+        WorkGatewayError::PreProposal(error) if matches!(*error, WorkGatewayError::Busy(_))
     );
 }
 
 #[tokio::test]
 async fn requests_above_the_resource_cap_do_not_execute() {
     let fixture = Fixture::builder().build().await;
-    assert_err!(fixture.result(Some(7)).await, WorkGatewayError::Rejected(_));
+    assert_err!(fixture.result(Some(7)).await, WorkGatewayError::PreProposal(error) if matches!(*error, WorkGatewayError::Rejected(_)));
     assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 0);
     fixture.shutdown().await;
 }
@@ -434,8 +450,11 @@ async fn refreshed_https_bounds_are_checked_before_proposal() {
             3 => https.paths = vec!["/changed".into()],
             _ => https.max_response_bytes = 128,
         }
-        let guard = fixture.gateway.inner.serial.lock().await;
-        let mut stream = fixture.gateway.fetch(fixture.request(Some(6))).unwrap();
+        let guard = fixture.gateway.backends["test"].serial.lock().await;
+        let mut stream = fixture
+            .gateway
+            .fetch("test", fixture.request(Some(6)))
+            .unwrap();
         let admin = hellas_authority::test_support::common_node::WorkAdmin::new(
             fixture.host.world.service.clone(),
             fixture.host.world.secret(ROOT),
@@ -520,8 +539,11 @@ async fn reused_policy_name_cannot_retarget_an_in_flight_request() {
     let mut replacement = old.clone();
     replacement.resource =
         hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"replacement"));
-    let guard = fixture.gateway.inner.serial.lock().await;
-    let mut stream = fixture.gateway.fetch(fixture.request(None)).unwrap();
+    let guard = fixture.gateway.backends["test"].serial.lock().await;
+    let mut stream = fixture
+        .gateway
+        .fetch("test", fixture.request(None))
+        .unwrap();
     let admin = hellas_authority::test_support::common_node::WorkAdmin::new(
         fixture.host.world.service.clone(),
         fixture.host.world.secret(ROOT),
@@ -592,9 +614,11 @@ async fn repaired_resources_are_usable_through_the_gateway() {
         .build()
         .await;
     // L2 owns the quarantine threshold and counters; arrange that state through Work.
-    for _ in 0..3 {
+    for _ in 0..2 {
         fixture.result(None).await.unwrap();
     }
+    // The result that quarantines the resource also ends its delivery.
+    assert_err!(fixture.result(None).await, WorkGatewayError::Denied(_));
     let http = fixture.http().await;
     assert_eq!(http.status().await, reqwest::StatusCode::FORBIDDEN);
     let WorkControlReply::Resource {
@@ -634,7 +658,10 @@ async fn streams_outlast_the_control_timeout_while_they_progress() {
         .build()
         .await;
     let pace = fixture.host.backend.pace.clone().unwrap();
-    let mut stream = fixture.gateway.fetch(fixture.request(None)).unwrap();
+    let mut stream = fixture
+        .gateway
+        .fetch("test", fixture.request(None))
+        .unwrap();
     assert!(matches!(
         within(stream.next()).await.unwrap().unwrap(),
         WorkEvent::Accepted(_)
@@ -675,7 +702,10 @@ async fn silent_first_result_outlasts_the_control_timeout() {
         .with_max_job_millis(60_000)
         .build()
         .await;
-    let mut stream = fixture.gateway.fetch(fixture.request(None)).unwrap();
+    let mut stream = fixture
+        .gateway
+        .fetch("test", fixture.request(None))
+        .unwrap();
     within(fixture.host.backend.started.notified()).await;
     assert!(matches!(
         within(stream.next()).await.unwrap().unwrap(),
@@ -705,7 +735,10 @@ async fn silent_later_result_outlasts_the_control_timeout() {
         .with_max_job_millis(60_000)
         .build()
         .await;
-    let mut stream = fixture.gateway.fetch(fixture.request(None)).unwrap();
+    let mut stream = fixture
+        .gateway
+        .fetch("test", fixture.request(None))
+        .unwrap();
     // The acceptance, then the response head.
     for _ in 0..2 {
         within(stream.next()).await.unwrap().unwrap();
@@ -736,7 +769,10 @@ async fn silent_work_still_ends_at_the_signed_deadline() {
         .with_max_job_millis(20_000)
         .build()
         .await;
-    let mut stream = fixture.gateway.fetch(fixture.request(None)).unwrap();
+    let mut stream = fixture
+        .gateway
+        .fetch("test", fixture.request(None))
+        .unwrap();
     within(fixture.host.backend.started.notified()).await;
     assert!(matches!(
         within(stream.next()).await.unwrap().unwrap(),
@@ -774,15 +810,13 @@ async fn silent_work_still_ends_at_the_signed_deadline() {
 async fn queued_requests_wait_without_a_deadline_and_cancel_on_disconnect() {
     let fixture = Fixture::builder().build().await;
     for disconnect in [false, true] {
-        let held = fixture.gateway.inner.serial.lock().await;
-        let job = fixture
-            .gateway
-            .inner
+        let held = fixture.gateway.backends["test"].serial.lock().await;
+        let job = fixture.gateway.backends["test"]
             .target
             .job(&WorkRequest::Fetch(fixture.request(None)))
             .unwrap();
         let (requester, stream) = Requester::<OutputEvent, WorkGatewayError>::new();
-        let run = fixture.gateway.inner.run(job, requester);
+        let run = fixture.gateway.backends["test"].run(job, requester);
         tokio::pin!(run);
         assert!(futures::poll!(run.as_mut()).is_pending());
         tokio::time::pause();
@@ -847,15 +881,13 @@ async fn disconnect_during_control_does_not_propose() {
     let fixture = Fixture::builder().build().await;
     let node = fixture.host.world.service.node();
     let held = hellas_authority::test_support::hold_writer(&node).await;
-    let job = fixture
-        .gateway
-        .inner
+    let job = fixture.gateway.backends["test"]
         .target
         .job(&WorkRequest::Fetch(fixture.request(None)))
         .unwrap();
     let (requester, stream) = Requester::<OutputEvent, WorkGatewayError>::new();
     {
-        let run = fixture.gateway.inner.run(job, requester);
+        let run = fixture.gateway.backends["test"].run(job, requester);
         tokio::pin!(run);
         assert!(futures::poll!(run.as_mut()).is_pending());
         drop(stream);
@@ -900,7 +932,7 @@ async fn single_signed_model_responses_route_tracks_continuation() {
         .bind()
         .await
         .unwrap();
-    let gateway = ExecutorGateway::new(
+    let gateway = crate::test_support::gateway(
         crate::Backend::Grant {
             policy: options.target.offer().grant.policies[0].clone(),
             options,
@@ -923,10 +955,7 @@ async fn single_signed_model_responses_route_tracks_continuation() {
             allow_remote: false,
         },
         work: gateway.clone(),
-        presentations: hellas_gateway::Presentations {
-            http: gateway.target().http_config().unwrap(),
-            ..Default::default()
-        },
+        routes: gateway.backends["test"].target.routes("test").unwrap(),
     })
     .await
     .unwrap();
@@ -1042,4 +1071,115 @@ async fn the_command_executor_runs_a_grant_once_and_replays_it() {
             .unwrap()
             .reported
     );
+}
+
+#[tokio::test]
+async fn two_grant_nodes_fail_over_before_proposal_and_rejoin_on_demand() {
+    let mut first = Fixture::builder()
+        .with_budget(40)
+        .hold_completion()
+        .build()
+        .await;
+    let second = Fixture::builder()
+        .transport_key(6)
+        .with_budget(40)
+        .hold_completion()
+        .build()
+        .await;
+    let address = first
+        .remote
+        .endpoint
+        .bound_sockets()
+        .into_iter()
+        .next()
+        .unwrap();
+    let entry = |fixture: &Fixture| {
+        let mut backend = fixture.gateway.backends["test"].target.clone();
+        if let crate::Backend::Grant { options, .. } = &mut backend {
+            options.control_timeout = Duration::from_millis(500);
+        }
+        crate::BackendEntry {
+            backend,
+            evaluator: None,
+            max_in_flight: std::num::NonZeroUsize::new(1).unwrap(),
+        }
+    };
+    let work = ExecutorGateway::new(
+        [
+            ("first".into(), entry(&first)),
+            ("second".into(), entry(&second)),
+        ]
+        .into(),
+        first.options().signer.clone(),
+    );
+    let mut routes = first.gateway.backends["test"]
+        .target
+        .routes("first")
+        .unwrap();
+    for route in &mut routes {
+        route.backends.push("second".into());
+    }
+    let access = first.host.gateway_access().await;
+    let bearer = access.bearer();
+    let server = hellas_gateway::start(hellas_gateway::GatewayOptions {
+        server: hellas_gateway::ServerOptions {
+            access,
+            allow_remote: false,
+            host: "127.0.0.1".into(),
+            port: Some(0),
+            archive: hellas_gateway::ArchiveOptions {
+                directory: first.host.root.path().join("archive"),
+                zdr: true,
+            },
+        },
+        work: work.clone(),
+        routes,
+    })
+    .await
+    .unwrap();
+    first.remote.shutdown().await;
+    let client = reqwest::Client::new();
+    let send = || {
+        client
+            .post(format!(
+                "http://{}{}",
+                server.address(),
+                first.template.paths[0]
+            ))
+            .bearer_auth(&bearer)
+            .json(&serde_json::json!({"messages":[],"stream":true}))
+            .send()
+    };
+    let response = within(send()).await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(first.host.backend.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(second.host.backend.calls.load(Ordering::SeqCst), 1);
+    assert!(
+        work.backends()
+            .iter()
+            .find(|backend| backend.id == "first")
+            .unwrap()
+            .down
+    );
+    // No probe or delay recovers a Down backend: with the live backend full,
+    // the next request tries it once and its successful open marks it Up.
+    first.remote = first.host.remote_at(address).await;
+    let returned = within(send()).await.unwrap();
+    assert_eq!(returned.status(), reqwest::StatusCode::OK);
+    assert_eq!(first.host.backend.calls.load(Ordering::SeqCst), 1);
+    assert!(
+        !work
+            .backends()
+            .iter()
+            .find(|backend| backend.id == "first")
+            .unwrap()
+            .down
+    );
+    first.host.backend.finish.release();
+    second.host.backend.finish.release();
+    within(response.bytes()).await.unwrap();
+    within(returned.bytes()).await.unwrap();
+    server.shutdown().await.unwrap();
+    first.shutdown().await;
+    second.shutdown().await;
 }

@@ -1,11 +1,8 @@
 use super::config::{HttpRoute, public_tls};
-use super::routing::retry_delay;
 use super::*;
+use crate::WorkExecutionBackend;
 use hellas_rpc::provenance::ExecutionProvenance;
-use std::{
-    collections::BTreeMap,
-    time::{Duration, SystemTime},
-};
+use std::time::Duration;
 
 #[tokio::test]
 async fn http_uses_the_paid_backend_and_waits_for_its_payment_completion() {
@@ -18,28 +15,20 @@ async fn http_uses_the_paid_backend_and_waits_for_its_payment_completion() {
         busy: bool,
     }
     impl WorkExecutionBackend for Paid {
-        fn fetch_routes(
-            &self,
-        ) -> Vec<(
-            hellas_rpc::FetchSchema,
-            hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy,
-        )> {
-            vec![(
-                hellas_rpc::FetchSchema::HttpV1,
-                hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy::SealedRoute {
-                    service: "http".into(),
-                    method: "request".into(),
-                },
-            )]
+        fn backends(&self) -> Vec<crate::BackendInfo> {
+            crate::test_support::backend(None)
         }
+
         fn run(
             &self,
+            _backend: &str,
             _: hellas_client::model::ComputeJob,
         ) -> Result<crate::WorkOutputStream<crate::ComputeEvent>, crate::WorkGatewayError> {
             unreachable!("HTTP must use Fetch")
         }
         fn fetch(
             &self,
+            _backend: &str,
             request: WorkFetchRequest,
         ) -> Result<crate::WorkFetchStream, crate::WorkGatewayError> {
             self.requests.fetch_add(1, Ordering::Relaxed);
@@ -76,11 +65,7 @@ async fn http_uses_the_paid_backend_and_waits_for_its_payment_completion() {
             ack: Arc::default(),
             busy,
         });
-        let config: HttpGatewayConfig = serde_json::from_value(serde_json::json!({
-            "service":"http", "method":"request", "routes":[{
-                "path":"/v1/responses", "method":"POST", "url":"https://example.com/v1/responses", "credential":"account"
-            }]
-        })).unwrap();
+        let config = vec![http("/v1/responses", None, Some("account"))];
         let archive = tempfile::tempdir().unwrap();
         let fixture = crate::access::tests::Fixture::new().await;
         let handle = crate::start(crate::GatewayOptions {
@@ -95,10 +80,7 @@ async fn http_uses_the_paid_backend_and_waits_for_its_payment_completion() {
                 allow_remote: false,
             },
             work: paid.clone(),
-            presentations: crate::Presentations {
-                http: Some(config),
-                ..Default::default()
-            },
+            routes: config,
         })
         .await
         .unwrap();
@@ -195,20 +177,6 @@ fn forward_only_protocol_headers_and_keep_retry_and_quota_metadata() {
     assert_eq!(response.len(), 3);
     assert_eq!(response["retry-after"], "3");
     assert_eq!(response["x-ratelimit-remaining-tokens"], "0");
-    assert_eq!(retry_delay(&response), Duration::from_secs(3));
-}
-
-#[test]
-fn retry_after_supports_dates_and_has_a_nonzero_fallback() {
-    assert_eq!(retry_delay(&HeaderMap::new()), Duration::from_secs(1));
-    for value in ["invalid", "0", "-2"] {
-        let headers =
-            HeaderMap::from_iter([("retry-after".parse().unwrap(), value.parse().unwrap())]);
-        assert_eq!(retry_delay(&headers), Duration::from_secs(1));
-    }
-    let date = httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(60));
-    let headers = HeaderMap::from_iter([("retry-after".parse().unwrap(), date.parse().unwrap())]);
-    assert!((59..=60).contains(&retry_delay(&headers).as_secs()));
 }
 
 #[test]
@@ -218,21 +186,15 @@ fn credentials_and_hop_headers_cannot_be_configured_as_static_headers() {
         .copied()
         .chain(["host", "connection"])
     {
-        let config = HttpGatewayConfig {
-            service: Some("http".into()),
-            method: Some("request".into()),
-            max_in_flight: 2,
-            backends: BTreeMap::new(),
-            routes: vec![HttpRoute {
-                max_response_bytes: hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES,
-                path: "/v1/messages".into(),
-                method: "POST".into(),
-                url: "https://example.com/v1/messages".into(),
-                credential: Some("account".into()),
-                tls: public_tls(),
-                headers: vec![(name.into(), "secret".into())],
-                models: None,
-            }],
+        let config = HttpRoute {
+            max_response_bytes: hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES,
+            path: "/v1/messages".into(),
+            method: "POST".into(),
+            url: "https://example.com/v1/messages".into(),
+            credential: Some("account".into()),
+            tls: public_tls(),
+            headers: vec![(name.into(), "secret".into())],
+            models: None,
         };
         assert!(config.validate().is_err());
     }
@@ -280,70 +242,6 @@ fn extension_headers_and_duplicates_survive_but_connection_tokens_do_not() {
     assert_eq!(response["location"], "/next");
 }
 
-#[test]
-fn a_provider_sealing_several_https_routes_needs_the_route_named() {
-    struct Sealed;
-    impl WorkExecutionBackend for Sealed {
-        fn fetch_routes(
-            &self,
-        ) -> Vec<(
-            hellas_rpc::FetchSchema,
-            hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy,
-        )> {
-            ["a", "b"]
-                .into_iter()
-                .map(|method| {
-                    (
-                        hellas_rpc::FetchSchema::HttpV1,
-                        hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy::SealedRoute {
-                            service: "http".into(),
-                            method: method.into(),
-                        },
-                    )
-                })
-                .collect()
-        }
-        fn drain(&self) -> futures::future::BoxFuture<'_, Result<(), crate::WorkShutdownError>> {
-            Box::pin(async { Ok(()) })
-        }
-    }
-    let work = Arc::new(Sealed);
-    let config = |route: serde_json::Value| -> HttpGatewayConfig {
-        let mut value = serde_json::json!({"routes": [{
-            "path": "/v1/responses", "method": "POST", "url": "https://example.com/v1/responses"
-        }]});
-        value
-            .as_object_mut()
-            .unwrap()
-            .extend(route.as_object().unwrap().clone());
-        serde_json::from_value(value).unwrap()
-    };
-    assert!(matches!(
-        router(config(serde_json::json!({})), work.clone()),
-        Err(crate::GatewayError::Config(
-            crate::GatewayConfigError::AmbiguousFetchRoute
-        ))
-    ));
-    assert!(
-        router(
-            config(serde_json::json!({"service": "http", "method": "b"})),
-            work.clone()
-        )
-        .is_ok()
-    );
-    assert!(matches!(
-        router(
-            config(serde_json::json!({"service": "http", "method": "c"})),
-            work
-        ),
-        Err(crate::GatewayError::Config(
-            crate::GatewayConfigError::FetchRouteMismatch
-        ))
-    ));
-}
-
-/// A provider that accepts the request, answers with `status` and the given
-/// body, and signs `transcript`.
 struct Proxied {
     status: u16,
     body: Option<&'static str>,
@@ -351,22 +249,13 @@ struct Proxied {
 }
 
 impl WorkExecutionBackend for Proxied {
-    fn fetch_routes(
-        &self,
-    ) -> Vec<(
-        hellas_rpc::FetchSchema,
-        hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy,
-    )> {
-        vec![(
-            hellas_rpc::FetchSchema::HttpV1,
-            hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy::SealedRoute {
-                service: "http".into(),
-                method: "request".into(),
-            },
-        )]
+    fn backends(&self) -> Vec<crate::BackendInfo> {
+        crate::test_support::backend(None)
     }
+
     fn fetch(
         &self,
+        _backend: &str,
         _: WorkFetchRequest,
     ) -> Result<crate::WorkFetchStream, crate::WorkGatewayError> {
         let mut events = vec![
@@ -428,12 +317,7 @@ async fn exchange(address: std::net::SocketAddr, bearer: &str) -> String {
 /// A gateway serving the HTTP Fetch presentation, with archiving enabled so
 /// trailers must pass through it too. The directory stays alive with the test.
 async fn proxy(paid: Arc<Proxied>) -> (crate::GatewayHandle, tempfile::TempDir) {
-    let config: HttpGatewayConfig = serde_json::from_value(serde_json::json!({
-        "service": "http", "method": "request", "routes": [{
-            "path": "/v1/responses", "method": "POST", "url": "https://example.com/v1/responses"
-        }]
-    }))
-    .unwrap();
+    let config = vec![http("/v1/responses", None, None)];
     let archive = tempfile::tempdir().unwrap();
     let fixture = crate::access::tests::Fixture::new().await;
     let handle = crate::start(crate::GatewayOptions {
@@ -448,10 +332,7 @@ async fn proxy(paid: Arc<Proxied>) -> (crate::GatewayHandle, tempfile::TempDir) 
             allow_remote: false,
         },
         work: paid,
-        presentations: crate::Presentations {
-            http: Some(config),
-            ..Default::default()
-        },
+        routes: config,
     })
     .await
     .unwrap();
@@ -568,22 +449,13 @@ struct ContinuationBackend {
     calls: std::sync::atomic::AtomicUsize,
 }
 impl WorkExecutionBackend for ContinuationBackend {
-    fn fetch_routes(
-        &self,
-    ) -> Vec<(
-        hellas_rpc::FetchSchema,
-        hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy,
-    )> {
-        vec![(
-            hellas_rpc::FetchSchema::HttpV1,
-            hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy::SealedRoute {
-                service: "http".into(),
-                method: "request".into(),
-            },
-        )]
+    fn backends(&self) -> Vec<crate::BackendInfo> {
+        crate::test_support::backend(None)
     }
+
     fn fetch(
         &self,
+        _backend: &str,
         _: WorkFetchRequest,
     ) -> Result<crate::WorkFetchStream, crate::WorkGatewayError> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -606,12 +478,8 @@ impl WorkExecutionBackend for ContinuationBackend {
 async fn signed_single_route_registers_response_for_followup() {
     use tower::ServiceExt;
     let work = Arc::new(ContinuationBackend { calls: 0.into() });
-    let config: HttpGatewayConfig = serde_json::from_value(serde_json::json!({
-        "service":"http", "method":"request", "routes":[{
-            "path":"/v1/responses", "method":"POST", "url":"https://example.com/v1/responses", "models":["m"]
-        }]
-    })).unwrap();
-    let (app, _) = router(config, work.clone()).unwrap();
+    let config = vec![http("/v1/responses", Some(vec!["m".into()]), None)];
+    let app = crate::router::router(config, work.clone()).await.unwrap();
     for body in [
         r#"{"model":"m"}"#,
         r#"{"model":"m","previous_response_id":"resp_1"}"#,
@@ -638,15 +506,11 @@ async fn signed_single_route_registers_response_for_followup() {
 async fn duplicate_session_header_never_discards_an_unknown_continuation() {
     use tower::ServiceExt;
     let work = Arc::new(ContinuationBackend { calls: 0.into() });
-    let config: HttpGatewayConfig = serde_json::from_value(serde_json::json!({
-        "backends":{"one":{"models":[], "routes":[{
-            "path":"/v1/responses", "method":"POST", "url":"https://example.com/v1/responses"
-        }, {
-            "path":"/v1/audio/transcriptions", "method":"POST", "url":"https://example.com/v1/audio/transcriptions"
-        }]}}
-    }))
-    .unwrap();
-    let (app, _) = router(config, work.clone()).unwrap();
+    let config = vec![
+        http("/v1/responses", None, None),
+        http("/v1/audio/transcriptions", None, None),
+    ];
+    let app = crate::router::router(config, work.clone()).await.unwrap();
     let response = app
         .clone()
         .oneshot(
@@ -706,4 +570,21 @@ async fn duplicate_session_header_never_discards_an_unknown_continuation() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(work.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+fn http(path: &str, models: Option<Vec<String>>, credential: Option<&str>) -> crate::Route {
+    crate::test_support::route(crate::Presentation::Http {
+        service: "http".into(),
+        method: "request".into(),
+        route: HttpRoute {
+            path: path.into(),
+            method: "POST".into(),
+            url: format!("https://example.com{path}"),
+            credential: credential.map(str::to_owned),
+            tls: public_tls(),
+            headers: vec![],
+            max_response_bytes: hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES,
+            models,
+        },
+    })
 }

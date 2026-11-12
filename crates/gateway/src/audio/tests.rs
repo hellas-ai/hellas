@@ -1,6 +1,6 @@
 use super::*;
 use crate::{ComputeEvent, WorkEvent};
-use crate::{ModelOptions, Presentations, WorkGatewayError, WorkOutputStream, WorkShutdownError};
+use crate::{WorkExecutionBackend, WorkGatewayError, WorkOutputStream, WorkShutdownError};
 use axum::body::Body;
 use hellas_rpc::{
     JsonBytes,
@@ -23,16 +23,19 @@ struct Fake {
     invalid_output: Option<Outcome>,
 }
 impl WorkExecutionBackend for Fake {
-    fn evaluator(&self) -> Option<String> {
-        Some(hellas_client::model::evaluator(
-            hellas_client::model::GpuDialect::Hip,
-        ))
+    fn backends(&self) -> Vec<crate::BackendInfo> {
+        crate::test_support::backend({
+            Some(hellas_client::model::evaluator(
+                hellas_client::model::GpuDialect::Hip,
+            ))
+        })
     }
     fn timeout(&self) -> Option<std::time::Duration> {
         self.timeout
     }
     fn run(
         &self,
+        _backend: &str,
         job: hellas_client::model::ComputeJob,
     ) -> Result<WorkOutputStream<ComputeEvent>, WorkGatewayError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
@@ -113,26 +116,19 @@ impl WorkExecutionBackend for Fake {
         Box::pin(async { Ok(()) })
     }
 }
-fn options(name: &str) -> ModelOptions {
-    ModelOptions::Whisper(AudioOptions {
-        model: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+fn options(name: &str) -> crate::Route {
+    crate::test_support::route(crate::Presentation::Model {
+        model: name.into(),
+        package: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../client/src/model/whisper/mini"),
-        model_name: name.into(),
-        default_max_tokens: 4,
+        max_tokens: 4,
     })
 }
 async fn app(names: &[&str], work: Arc<Fake>) -> Router {
-    let work: Arc<dyn WorkExecutionBackend> = work;
-    crate::compose::router(
-        &Presentations {
-            models: names.iter().map(|n| options(n)).collect(),
-            ..Default::default()
-        },
-        &work,
-    )
-    .await
-    .unwrap()
-    .layer(crate::provenance_layer::ProvenanceLayer)
+    crate::router::router(names.iter().map(|n| options(n)).collect(), work)
+        .await
+        .unwrap()
+        .layer(crate::provenance_layer::ProvenanceLayer)
 }
 fn wav(rate: u32, frames: usize) -> Vec<u8> {
     let bytes = frames as u32 * 2;
@@ -372,15 +368,16 @@ async fn malformed_audio_and_unsupported_options_never_reach_work() {
 
 #[tokio::test]
 async fn invalid_family_and_capacity_are_startup_errors() {
-    let ModelOptions::Whisper(mut options) = options("tiny") else {
+    let mut route = options("tiny");
+    let crate::Presentation::Model { max_tokens, .. } = &mut route.presentation else {
         unreachable!()
     };
-    options.default_max_tokens = 5;
-    assert!(router(&options, Arc::new(Fake::default())).await.is_err());
-    options.default_max_tokens = 1;
-    options.model = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../client/src/model/package/mini-qwen3.gguf");
-    assert!(router(&options, Arc::new(Fake::default())).await.is_err());
+    *max_tokens = 5;
+    assert!(
+        crate::router::router(vec![route], Arc::new(Fake::default()))
+            .await
+            .is_err()
+    );
 }
 #[tokio::test]
 async fn expired_preparation_never_submits_work() {

@@ -30,7 +30,11 @@ pub(super) struct Qwen3 {
 }
 
 impl Qwen3 {
-    pub async fn open(path: &Path, dialect: super::GpuDialect) -> Result<Self> {
+    pub async fn open(
+        path: &Path,
+        dialect: super::GpuDialect,
+        weights: Option<hellas_rpc::ContentRef>,
+    ) -> Result<Self> {
         let path = path.to_owned();
         let (config, views, object, source, states) =
             tokio::task::spawn_blocking(move || -> Result<_> {
@@ -59,7 +63,8 @@ impl Qwen3 {
                     );
                     views.push((tensor.offset, tensor.bytes));
                 }
-                let object = hellas_store::content::file_content(&path)?;
+                let object =
+                    weights.map_or_else(|| hellas_store::content::file_content(&path), Ok)?;
                 // Qwen3.5 prefills with matrix cores; Qwen3 has only SIMT kernels.
                 let wmma = matches!(
                     config.architecture,

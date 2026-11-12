@@ -72,17 +72,6 @@ fn image_cli_and_gateway_surfaces_are_available() {
     ])
     .unwrap();
     assert!(matches!(image.command, Commands::Image(_)));
-    let gateway = parse_gateway(&["--model", "klein", "--model", "qwen.gguf"]).unwrap();
-    let Commands::Gateway { execution, .. } = gateway.command else {
-        panic!("gateway")
-    };
-    assert_eq!(
-        execution.models,
-        [
-            std::path::Path::new("klein"),
-            std::path::Path::new("qwen.gguf")
-        ]
-    );
 }
 
 #[cfg(unix)]
@@ -97,10 +86,10 @@ const TEST_REMOTE_TRUST_ARGS: &[&str] = &[
     "apple-app-attest",
 ];
 
-/// A gateway under an access file, plus `args`.
+/// The route-document gateway command, plus process arguments.
 fn parse_gateway(args: &[&str]) -> Result<Cli, clap::Error> {
     Cli::try_parse_from(
-        ["hellas", "gateway", "--access", "friend.access"]
+        ["hellas", "gateway", "--config", "daemon.json"]
             .into_iter()
             .chain(args.iter().copied()),
     )
@@ -176,42 +165,6 @@ fn serve_accepts_only_its_command_local_assurance() {
 }
 
 #[test]
-fn gateway_takes_the_job_commands_targets() {
-    let provider = format!("{}@{}", "11".repeat(32), "22".repeat(32));
-    let gateway = |args: &[&str]| {
-        Cli::try_parse_from(
-            ["hellas", "gateway"]
-                .into_iter()
-                .chain(args.iter().copied()),
-        )
-    };
-    assert!(gateway(&["--access", "friend.access"]).is_ok());
-    assert!(gateway(&["--pay", "20", "--provider", &provider]).is_ok());
-    assert_eq!(cfg!(feature = "compute"), gateway(&["--local"]).is_ok());
-    for refused in [
-        &[][..],
-        &["--pay", "20"][..],
-        &[
-            "--access",
-            "friend.access",
-            "--pay",
-            "20",
-            "--provider",
-            &provider,
-        ][..],
-        &["--offer", "lan"][..],
-        &[
-            "--paid-work-config",
-            "pool.json",
-            "--access",
-            "friend.access",
-        ][..],
-    ] {
-        assert!(gateway(refused).is_err(), "{refused:?}");
-    }
-}
-
-#[test]
 fn admin_target_is_shared_and_requires_an_identity_pin() {
     for operation in [vec!["status"], vec!["grant", "change.json"]] {
         for before in [true, false] {
@@ -266,11 +219,6 @@ fn apple_assurance_requires_a_secure_enclave_root() {
 }
 
 #[test]
-fn gateway_rejects_a_zero_default_output_limit() {
-    assert!(parse_gateway(&["--default-max-tokens", "0"]).is_err());
-}
-
-#[test]
 fn gateway_wrap_forwards_trailing_args() {
     let cli = parse_gateway(&["--wrap", "pi", "--", "-p", "--no-session", "say hello"]).unwrap();
     match cli.command {
@@ -288,27 +236,6 @@ fn gateway_wrap_forwards_trailing_args() {
 fn gateway_wrap_args_require_wrap() {
     let result = parse_gateway(&["--", "-p", "hi"]);
     assert!(result.is_err(), "trailing args without --wrap should error");
-}
-
-#[test]
-fn gateway_responses_fetch_takes_overrides_and_its_models() {
-    let cli = parse_gateway(&[
-        "--responses-overrides",
-        r#"{"store":false}"#,
-        "--responses-model",
-        "gpt-x,gpt-y",
-    ])
-    .unwrap();
-    let Commands::Gateway {
-        responses_overrides,
-        responses_models,
-        ..
-    } = cli.command
-    else {
-        panic!("expected gateway command");
-    };
-    assert_eq!(responses_overrides.unwrap()["store"], false);
-    assert_eq!(responses_models, ["gpt-x", "gpt-y"]);
 }
 
 #[test]

@@ -697,63 +697,162 @@ impl ResolvedBackend {
     }
 }
 
-/// `hellas gateway`'s models, and its execution flags: the job commands' own.
-#[derive(Debug, Args)]
-pub struct GatewayArgs {
-    /// A model the routes render jobs from, named after its file or
-    /// directory: a Qwen GGUF serves the text routes, a converted Whisper
-    /// package /v1/audio/transcriptions and a converted Flux package
-    /// /v1/images/generations. Providers must hold the same weights.
-    #[arg(long = "model", value_name = "PATH")]
-    pub(crate) models: Vec<PathBuf>,
-    #[command(flatten)]
-    client: ClientArgs,
-    /// Pay the provider named by --provider its quoted price per request, at most MAX.
-    #[arg(long, value_name = "MAX", requires = "provider", conflicts_with = "access", value_parser = clap::value_parser!(u64).range(1..))]
-    pay: Option<u64>,
-    #[command(flatten)]
-    target: TargetArgs,
-}
-
-/// Open the gateway's target as a job command opens its own and `serve`
-/// HTTP with it. The endpoints and content it opened close however it ends.
+/// Resolve the document in order, sharing the job commands' backend preparation.
 pub async fn gateway(
-    args: GatewayArgs,
+    document: hellas_sdk::daemon_config::Document,
     context: Context,
-    serve: impl AsyncFnOnce(Arc<ExecutorGateway>) -> super::CliResult<()>,
+    serve: impl AsyncFnOnce(Arc<ExecutorGateway>, Vec<hellas_gateway::Route>) -> super::CliResult<()>,
 ) -> super::CliResult<()> {
-    let GatewayArgs {
-        models,
-        client,
-        pay,
-        mut target,
-    } = args;
-    let evaluator = target.evaluator();
-    target.models = models;
-    ensure!(
-        !client.settle && !client.buy_again && target.attempt.is_none(),
-        "gateway requests are not tracked attempts: drop --settle, --buy-again and --attempt"
-    );
+    use hellas_sdk::daemon_config::BackendKind;
+    document.validate().map_err(anyhow::Error::msg)?;
     bounded(&context, None, async |_| {
-        let mut target = target
-            .resolve(
-                &client,
-                &context,
-                pay.unwrap_or(0),
-                Assurance::ProducerSigned,
-            )
-            .await?;
+        let mut opened = Vec::new();
         let result = async {
-            target.quote().await?;
-            serve(ExecutorGateway::new(
-                target.backend.clone(),
-                evaluator,
-                Arc::new(context.producer.clone()),
-            ))
+            let mut entries = std::collections::BTreeMap::new();
+            let mut routes = document.routes.clone();
+            for (id, configured) in &document.backends {
+                let (access, resource, provider, pay, evaluator, trust, local) = match &configured
+                    .kind
+                {
+                    BackendKind::Grant {
+                        access,
+                        resource,
+                        evaluator,
+                        trust,
+                    } => (
+                        Some(access.clone()),
+                        *resource,
+                        None,
+                        0,
+                        evaluator.clone(),
+                        trust.clone(),
+                        false,
+                    ),
+                    BackendKind::Paid {
+                        provider,
+                        max_price,
+                        evaluator,
+                        trust,
+                    } => (
+                        None,
+                        None,
+                        Some(provider.parse()?),
+                        *max_price,
+                        evaluator.clone(),
+                        trust.clone(),
+                        false,
+                    ),
+                    BackendKind::Local { .. } => (None, None, None, 0, None, None, true),
+                    BackendKind::Fetch { .. } => bail!("Fetch backends require an iroh listener"),
+                };
+                #[cfg(not(feature = "compute"))]
+                ensure!(!local, "local backends require the compute build");
+                let client = ClientArgs {
+                    provider,
+                    addresses: vec![],
+                    timeout: None,
+                    acceptance_blocks: 300,
+                    terminal_blocks: 3000,
+                    payment_blocks: 600,
+                    settle: false,
+                    buy_again: false,
+                    validators: vec![],
+                    trust_store: trust.as_ref().map(|t| t.store.clone()),
+                    trust_policy: trust.as_ref().map(|t| t.policy.clone()),
+                };
+                let target = TargetArgs {
+                    access,
+                    resource,
+                    attempt: None,
+                    backend: evaluator,
+                    models: routes
+                        .iter()
+                        .filter_map(|route| match &route.presentation {
+                            hellas_gateway::Presentation::Model { package, .. }
+                                if route.backends.contains(id) =>
+                            {
+                                Some(package.clone())
+                            }
+                            _ => None,
+                        })
+                        .collect(),
+                    #[cfg(feature = "compute")]
+                    local,
+                    #[cfg(feature = "compute")]
+                    native: {
+                        let (runtime, content) = match &configured.kind {
+                            BackendKind::Local { runtime, content } => {
+                                (runtime.as_str(), content.clone())
+                            }
+                            _ => ("auto", vec![]),
+                        };
+                        crate::compute::ServeArgs {
+                            content_config: None,
+                            content,
+                            gpu: crate::compute::GpuArgs {
+                                gpu_backend: crate::compute::parse_gpu_backend(runtime)
+                                    .map_err(anyhow::Error::msg)?,
+                                gpu_session_programs: hellas_executor::DEFAULT_GPU_SESSION_PROGRAMS,
+                                gpu_session_asset_bytes:
+                                    hellas_executor::DEFAULT_GPU_SESSION_ASSET_BYTES,
+                            },
+                        }
+                    },
+                };
+                let evaluator = target.evaluator();
+                let mut resolved = target
+                    .resolve(
+                        &client,
+                        &context,
+                        pay,
+                        if trust.is_some() {
+                            Assurance::AppleAppAttest
+                        } else {
+                            Assurance::ProducerSigned
+                        },
+                    )
+                    .await?;
+                resolved.quote().await?;
+                if !document
+                    .routes
+                    .iter()
+                    .any(|route| route.backends.contains(id))
+                {
+                    for route in resolved.backend.routes(id)? {
+                        let key = serde_json::to_vec(&route.presentation)?;
+                        if let Some(existing) = routes.iter_mut().find(|r| {
+                            serde_json::to_vec(&r.presentation).ok().as_ref() == Some(&key)
+                        }) {
+                            existing.backends.push(id.clone());
+                        } else {
+                            routes.push(route);
+                        }
+                    }
+                }
+                entries.insert(
+                    id.clone(),
+                    hellas_sdk::BackendEntry {
+                        backend: resolved.backend.clone(),
+                        evaluator,
+                        max_in_flight: configured.max_in_flight,
+                    },
+                );
+                opened.push(resolved);
+            }
+            serve(
+                ExecutorGateway::new(entries, Arc::new(context.producer.clone())),
+                routes,
+            )
             .await
         }
         .await;
-        result.and(target.close().await)
+        let mut cleanup = Ok(());
+        for backend in opened {
+            if let Err(error) = backend.close().await {
+                cleanup = Err(error);
+            }
+        }
+        result.and(cleanup)
     })
     .await
 }

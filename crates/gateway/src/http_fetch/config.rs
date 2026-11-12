@@ -2,40 +2,9 @@ use super::{connection_headers, hop_header};
 use axum::{body::Bytes, http::HeaderMap};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use hellas_rpc::http_fetch::{HttpFetchRequest, HttpTls, HttpTrustRoots, credential_header};
-use serde::Deserialize;
-use std::collections::BTreeMap;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct HttpGatewayConfig {
-    /// The Fetch route, when a provider's policy does not seal one. A sealed
-    /// route is taken from the policy; naming a different one is an error.
-    #[serde(default)]
-    pub service: Option<String>,
-    #[serde(default)]
-    pub method: Option<String>,
-    #[serde(default)]
-    pub routes: Vec<HttpRoute>,
-    #[serde(default)]
-    pub backends: BTreeMap<String, HttpBackend>,
-    #[serde(default = "default_concurrency")]
-    pub max_in_flight: usize,
-}
-
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct HttpBackend {
-    pub models: Vec<String>,
-    pub credential: Option<String>,
-    pub routes: Vec<HttpRoute>,
-    pub max_in_flight: Option<usize>,
-}
-
-fn default_concurrency() -> usize {
-    4
-}
-
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HttpRoute {
     pub path: String,
@@ -64,71 +33,9 @@ pub(super) fn public_tls() -> HttpTls {
     }
 }
 
-impl HttpGatewayConfig {
-    /// Checks routes and backend limits, as the gateway does before it starts.
+impl HttpRoute {
     pub fn validate(&self) -> crate::GatewayResult<()> {
-        if self.routes.is_empty() == self.backends.is_empty() {
-            return Err(crate::GatewayConfigError::RouteMode.into());
-        }
-        if !(self.max_in_flight > 0 && self.max_in_flight <= 1024) {
-            return Err(crate::GatewayConfigError::HttpConcurrency.into());
-        }
-        if !self.routes.is_empty() {
-            return validate_routes(&self.routes);
-        }
-        if self.backends.len() > 256 {
-            return Err(crate::GatewayConfigError::BackendCount.into());
-        }
-        for (name, backend) in &self.backends {
-            if name.is_empty() || name.len() > 64 {
-                return Err(crate::GatewayConfigError::BackendName.into());
-            }
-            if !(backend.models.len() <= 256
-                && backend
-                    .models
-                    .iter()
-                    .all(|m| !m.is_empty() && m.len() <= 256))
-            {
-                return Err(crate::GatewayConfigError::ModelNames.into());
-            }
-            if !(backend
-                .max_in_flight
-                .is_none_or(|n| (1..=1024).contains(&n)))
-            {
-                return Err(crate::GatewayConfigError::BackendConcurrency.into());
-            }
-            if !(backend.routes.iter().all(|r| r.credential.is_none())) {
-                return Err(crate::GatewayConfigError::BackendCredential.into());
-            }
-            validate_routes(&backend.routes)?;
-        }
-        let mut grant_paths = BTreeMap::<(&str, &str), (bool, bool)>::new();
-        for backend in self.backends.values() {
-            for route in &backend.routes {
-                let flags = grant_paths.entry((&route.path, &route.method)).or_default();
-                if route.models.is_some() {
-                    flags.0 = true;
-                } else {
-                    flags.1 = true;
-                }
-            }
-        }
-        if grant_paths
-            .values()
-            .any(|(restricted, unrestricted)| *restricted && *unrestricted)
-        {
-            return Err(crate::GatewayConfigError::ModelNames.into());
-        }
-        Ok(())
-    }
-}
-
-fn validate_routes(routes: &[HttpRoute]) -> crate::GatewayResult<()> {
-    if routes.is_empty() {
-        return Err(crate::GatewayConfigError::EmptyRoutes.into());
-    }
-    let mut paths = std::collections::BTreeSet::new();
-    for route in routes {
+        let route = self;
         if let Some(models) = &route.models {
             let mut unique = std::collections::BTreeSet::new();
             if models.is_empty()
@@ -143,9 +50,6 @@ fn validate_routes(routes: &[HttpRoute]) -> crate::GatewayResult<()> {
         if !route.path.starts_with('/') || route.path.contains(['?', '#', '{', '}']) {
             return Err(crate::GatewayConfigError::RoutePath.into());
         }
-        if !(paths.insert((&route.path, &route.method))) {
-            return Err(crate::GatewayConfigError::DuplicateRoute.into());
-        }
         if !(route
             .headers
             .iter()
@@ -154,23 +58,7 @@ fn validate_routes(routes: &[HttpRoute]) -> crate::GatewayResult<()> {
             return Err(crate::GatewayConfigError::CredentialAlias.into());
         }
         route.request(Bytes::new(), &HeaderMap::new())?.validate()?;
-    }
-    Ok(())
-}
-
-impl HttpRoute {
-    pub(super) fn account(&self) -> String {
-        match &self.credential {
-            Some(alias) => format!("credential:{alias}"),
-            None => format!(
-                "origin:{}",
-                self.url
-                    .parse::<reqwest::Url>()
-                    .expect("validated URL")
-                    .origin()
-                    .ascii_serialization()
-            ),
-        }
+        Ok(())
     }
 
     pub(super) fn request(

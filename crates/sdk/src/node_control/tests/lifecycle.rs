@@ -565,7 +565,7 @@ async fn gateway_host(
         world.root.path(),
         None,
         Some((
-            options.serve.server.access.clone(),
+            options.serve.access.clone(),
             options.into_factory(SecretKey::from_bytes(&[3; 32])),
         )),
     )
@@ -634,7 +634,7 @@ async fn set_gateway_state_starts_the_gateway_chosen_at_run_time() {
     let world = crate::test_support::Host::builder().build().await;
     let remote = world.remote().await;
     let options = world.responses_options(remote.addresses()).await;
-    let access = options.serve.server.access.clone();
+    let access = options.serve.access.clone();
     let chosen = options.into_factory(SecretKey::from_bytes(&[3; 32]));
     let starts = Arc::new(AtomicUsize::new(0));
     let factory: host::GatewayFactory = {
@@ -667,7 +667,7 @@ async fn deferred_gateway_loads_only_on_first_enable_and_reuses_validated_access
     let world = crate::test_support::Host::builder().build().await;
     let remote = world.remote().await;
     let options = world.responses_options(remote.addresses()).await;
-    let access = options.serve.server.access.clone();
+    let access = options.serve.access.clone();
     let factory = options.into_factory(SecretKey::from_bytes(&[3; 32]));
     let loads = Arc::new(AtomicUsize::new(0));
     let loader: host::GatewayAccessLoader = {

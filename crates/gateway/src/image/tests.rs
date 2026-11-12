@@ -1,4 +1,5 @@
 use super::*;
+use crate::WorkExecutionBackend;
 use crate::{ComputeEvent, WorkEvent};
 use axum::body::Body;
 use base64::Engine as _;
@@ -23,16 +24,19 @@ struct Fake {
     started: tokio::sync::Notify,
 }
 impl WorkExecutionBackend for Fake {
-    fn evaluator(&self) -> Option<String> {
-        Some(hellas_client::model::evaluator(
-            hellas_client::model::GpuDialect::Hip,
-        ))
+    fn backends(&self) -> Vec<crate::BackendInfo> {
+        crate::test_support::backend({
+            Some(hellas_client::model::evaluator(
+                hellas_client::model::GpuDialect::Hip,
+            ))
+        })
     }
     fn timeout(&self) -> Option<std::time::Duration> {
         self.timeout
     }
     fn run(
         &self,
+        _backend: &str,
         job: hellas_client::model::ComputeJob,
     ) -> Result<crate::WorkOutputStream<ComputeEvent>, crate::WorkGatewayError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
@@ -93,18 +97,15 @@ impl WorkExecutionBackend for Fake {
         Box::pin(async { Ok(()) })
     }
 }
-async fn app(fake: Arc<Fake>) -> Router {
-    let work: Arc<dyn WorkExecutionBackend> = fake;
-    crate::compose::router(
-        &crate::Presentations {
-            models: vec![crate::ModelOptions::Flux(ImageOptions {
-                model: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../client/src/model/flux/fixture"),
-                model_name: "klein".into(),
-            })],
-            ..Default::default()
-        },
-        &work,
+async fn app(work: Arc<Fake>) -> Router {
+    crate::router::router(
+        vec![crate::test_support::route(crate::Presentation::Model {
+            model: "klein".into(),
+            package: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../client/src/model/flux/fixture"),
+            max_tokens: 128,
+        })],
+        work,
     )
     .await
     .unwrap()

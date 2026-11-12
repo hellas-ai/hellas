@@ -60,8 +60,9 @@ pub mod contact;
 pub mod grant_config;
 pub mod node_control;
 
+pub mod daemon_config;
 mod gateway_work;
-pub use gateway_work::{Backend, ExecutorGateway, GatewayServeOptions, WorkRequest, serve_gateway};
+pub use gateway_work::{Backend, BackendEntry, ExecutorGateway, WorkRequest};
 
 mod resource_config;
 pub use resource_config::ResourceConfigError;

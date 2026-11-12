@@ -1,6 +1,6 @@
 //! Responses presentation over an already funded, authenticated Work backend.
 use super::backend::provenance::{completed_provenance, provenance_from_execution};
-use super::{WorkEvent, WorkExecutionBackend, WorkFetchRequest};
+use super::{WorkEvent, WorkFetchRequest, route::RouteExecution};
 use axum::{Router, body::Bytes, extract::State, response::Response, routing::post};
 use futures::StreamExt;
 use hellas_adaptors::{
@@ -13,24 +13,30 @@ use std::sync::Arc;
 /// The path the Responses presentation serves.
 pub(super) const PATH: &str = "/v1/responses";
 
-pub(super) fn router(
-    options: super::ResponsesFetch,
-    work: Arc<dyn WorkExecutionBackend>,
-) -> Router {
+pub(super) fn router(options: super::ResponsesFetch, work: Arc<RouteExecution>) -> Router {
     Router::new()
         .route(PATH, post(handle))
-        .with_state(Arc::new(FetchBackend { work, options }))
+        .with_state(Arc::new((work, options)))
 }
 
 #[derive(Clone)]
 struct FetchBackend {
-    work: Arc<dyn WorkExecutionBackend>,
+    work: Arc<RouteExecution>,
     options: super::ResponsesFetch,
+    selection: crate::routing::Selection,
 }
 
-async fn handle(State(backend): State<Arc<FetchBackend>>, body: Bytes) -> Response {
+async fn handle(
+    State(state): State<Arc<(Arc<RouteExecution>, super::ResponsesFetch)>>,
+    axum::Extension(selection): axum::Extension<crate::routing::Selection>,
+    body: Bytes,
+) -> Response {
     let context = super::dispatch::render_context("resp");
-    let backend = backend.as_ref().clone();
+    let backend = FetchBackend {
+        work: state.0.clone(),
+        options: state.1.clone(),
+        selection,
+    };
     super::dispatch::serve(
         OpenAiResponsesAdaptor,
         "OpenAI Responses",
@@ -67,12 +73,16 @@ impl ExecutionBackend for FetchBackend {
             body.insert("store".into(), Value::Bool(false));
             let mut events = self
                 .work
-                .fetch(WorkFetchRequest {
-                    service: self.options.service.clone(),
-                    method: self.options.method.clone(),
-                    body: serde_json::to_vec(&body)
-                        .map_err(|e| BackendError::rejected(e.to_string()))?,
-                })
+                .fetch(
+                    &mut self.selection.clone(),
+                    WorkFetchRequest {
+                        service: self.options.service.clone(),
+                        method: self.options.method.clone(),
+                        body: serde_json::to_vec(&body)
+                            .map_err(|e| BackendError::rejected(e.to_string()))?,
+                    },
+                )
+                .await
                 .map_err(BackendError::from)?;
             let accepted = crate::accepted(&mut events).await;
             let initial = accepted.as_ref().map(provenance_from_execution);

@@ -3,7 +3,7 @@
 use super::{Completed, ExecutionError, ExecutionObservers, Result, Stop, before_proposal};
 use crate::job::{JobError, JobInput};
 use hellas_auth::ProducerSigningKey;
-use hellas_channel::work::admission::WorkAdmission;
+use hellas_channel::work::{WorkBackend, admission::WorkAdmission};
 use hellas_rpc::protocol::invocation::{InvocationPolicy, Limits, MAX_INVOCATION_BYTES};
 use hellas_store::content::{DiskStore, LocalStore, Scope};
 
@@ -102,6 +102,14 @@ impl LocalExecution {
             .commitment()
             .map_err(JobError::from)?
             .digest();
+        let domain = policy
+            .classify_manifest(&prepared.manifest().map_err(JobError::from)?)
+            .map_err(JobError::from)?
+            .capacity_domain;
+        let permit = self
+            .backend
+            .try_admit(domain)
+            .map_err(|error| ExecutionError::LocalAdmission(error.to_string()))?;
         if let Some(accepted) = &observers.accepted {
             accepted(hellas_rpc::provenance::ExecutionProvenance {
                 commitment_id: *work_id.as_bytes(),
@@ -117,7 +125,7 @@ impl LocalExecution {
                 prepared.clone(),
                 policy,
                 (LocalStore::Disk(self.content.clone()), Scope::Owner),
-                WorkAdmission::payment(),
+                WorkAdmission::reserved(permit),
                 observers
                     .progress
                     .unwrap_or_else(|| std::sync::Arc::new(|_| Ok(()))),

@@ -1,7 +1,7 @@
 //! The gateway backend: every HTTP request becomes one job on the job
 //! commands' target, run by the same [`Executor`]. Admission, streamed
 //! output and shutdown are shared here.
-use crate::execution::{ExecutionError, Executor, RequestStopped};
+use crate::execution::{ExecutionError, Executor};
 use crate::grant_client::GrantClientError;
 use crate::job::{Job, JobError, JobInput};
 use futures::{future::BoxFuture, stream::BoxStream};
@@ -493,52 +493,6 @@ fn repair(https: &HttpsResource, body: &[u8]) -> Result<Vec<u8>, JobError> {
     Ok(serde_json::to_vec(&http)?)
 }
 
-/// What a gateway serves beyond what its work source admits.
-#[derive(Clone)]
-pub struct GatewayServeOptions {
-    pub server: hellas_gateway::ServerOptions,
-    pub models: Vec<hellas_gateway::ModelOptions>,
-    pub http: Option<hellas_gateway::HttpGatewayConfig>,
-    /// Merged into Responses requests sent as a Fetch.
-    pub responses_overrides: serde_json::Map<String, serde_json::Value>,
-    /// Models the Responses Fetch answers to; empty means any.
-    pub responses_models: Vec<String>,
-}
-
-/// Serve `work` with the caller's presentations, plus Responses when the
-/// source seals exactly one Responses route. A failed start drains `work`.
-pub async fn serve_gateway(
-    work: Arc<dyn WorkExecutionBackend>,
-    options: GatewayServeOptions,
-) -> hellas_gateway::GatewayResult<hellas_gateway::GatewayHandle> {
-    let responses = match hellas_gateway::ResponsesFetch::from_routes(
-        &work.fetch_routes(),
-        options.responses_overrides,
-        options.responses_models,
-    ) {
-        Ok(responses) => responses,
-        Err(error) => {
-            return match work.drain().await {
-                Ok(()) => Err(error),
-                Err(cleanup) => Err(hellas_gateway::GatewayError::Cleanup {
-                    primary: Box::new(error),
-                    cleanup,
-                }),
-            };
-        }
-    };
-    hellas_gateway::start(hellas_gateway::GatewayOptions {
-        server: options.server,
-        work,
-        presentations: hellas_gateway::Presentations {
-            models: options.models,
-            responses,
-            http: options.http,
-        },
-    })
-    .await
-}
-
 /// Where every request of one gateway runs: the job commands' targets.
 #[derive(Clone)]
 #[expect(clippy::large_enum_variant, reason = "one per backend")]
@@ -711,24 +665,50 @@ impl Backend {
         routes
     }
 
-    /// The HTTP routes a granted HTTPS resource presents, if it has one.
-    pub fn http_config(
-        &self,
-    ) -> Result<Option<hellas_gateway::HttpGatewayConfig>, WorkGatewayError> {
+    /// A grant contributes the HTTP routes its resource authorizes.
+    pub fn routes(&self, id: &str) -> Result<Vec<hellas_gateway::Route>, WorkGatewayError> {
         let Self::Grant { policy, .. } = self else {
-            return Ok(None);
+            return Ok(vec![]);
         };
-        if policy.https.is_none() {
-            return Ok(None);
+        if policy.https.is_some() {
+            let (service, method, routes) = policy_http_routes(policy)?;
+            return Ok(routes
+                .into_iter()
+                .map(|route| hellas_gateway::Route {
+                    backends: vec![id.into()],
+                    presentation: hellas_gateway::Presentation::Http {
+                        service: service.clone(),
+                        method: method.clone(),
+                        route,
+                    },
+                })
+                .collect());
         }
-        let (service, method, routes) = policy_http_routes(policy)?;
-        Ok(Some(hellas_gateway::HttpGatewayConfig {
-            service: Some(service),
-            method: Some(method),
-            backends: Default::default(),
-            max_in_flight: 32,
-            routes,
-        }))
+        let Some(resource) = &policy.responses else {
+            return Ok(vec![]);
+        };
+        let routes = self.fetch_routes();
+        let mut sealed = routes.iter().filter_map(|(schema, route)| match route {
+            FetchRoutePolicy::SealedRoute { service, method }
+                if *schema == hellas_rpc::FetchSchema::StatelessResponsesV1 =>
+            {
+                Some((service, method))
+            }
+            _ => None,
+        });
+        let (service, method) = sealed.next().ok_or(WorkGatewayError::Unsupported)?;
+        if sealed.next().is_some() {
+            return Err(WorkGatewayError::Unsupported);
+        }
+        Ok(vec![hellas_gateway::Route {
+            backends: vec![id.into()],
+            presentation: hellas_gateway::Presentation::Responses {
+                service: service.clone(),
+                method: method.clone(),
+                models: vec![resource.model.clone()],
+                overrides: Default::default(),
+            },
+        }])
     }
 }
 
@@ -787,135 +767,294 @@ fn policy_http_routes(
     Ok((service.clone(), method.clone(), routes))
 }
 
-/// The gateway backend: one [`Executor`] run per request, one at a time,
-/// since a channel journal, a funding wallet and a machine each have one owner.
-/// It owns its target's endpoint and closes it when it drains.
-pub struct ExecutorGateway {
-    inner: Arc<Inner>,
-    admission: Arc<Semaphore>,
-    tasks: WorkTasks,
+/// A configured execution destination. Ids are scoped to one daemon document.
+pub struct BackendEntry {
+    pub backend: Backend,
+    pub evaluator: Option<String>,
+    pub max_in_flight: std::num::NonZeroUsize,
 }
 
+pub struct ExecutorGateway {
+    backends: std::collections::BTreeMap<String, Arc<Inner>>,
+    tasks: WorkTasks,
+}
 struct Inner {
     target: Backend,
     evaluator: Option<String>,
     signer: Arc<hellas_auth::ProducerSigningKey>,
     serial: tokio::sync::Mutex<()>,
+    slots: Arc<Semaphore>,
+    capacity: usize,
+    down: std::sync::atomic::AtomicBool,
 }
-
 impl ExecutorGateway {
-    /// `evaluator` is the renderer Compute requests are rendered for, if any;
-    /// `signer` signs paid and local proposals: the caller's device key.
     pub fn new(
-        target: Backend,
-        evaluator: Option<String>,
+        backends: std::collections::BTreeMap<String, BackendEntry>,
         signer: Arc<hellas_auth::ProducerSigningKey>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            inner: Arc::new(Inner {
-                target,
-                evaluator,
-                signer,
-                serial: tokio::sync::Mutex::new(()),
-            }),
-            admission: Arc::new(Semaphore::new(32)),
+            backends: backends
+                .into_iter()
+                .map(|(id, entry)| {
+                    (
+                        id,
+                        Arc::new(Inner {
+                            target: entry.backend,
+                            evaluator: entry.evaluator,
+                            signer: signer.clone(),
+                            serial: tokio::sync::Mutex::new(()),
+                            slots: Arc::new(Semaphore::new(entry.max_in_flight.get())),
+                            capacity: entry.max_in_flight.get(),
+                            down: Default::default(),
+                        }),
+                    )
+                })
+                .collect(),
             tasks: WorkTasks::default(),
         })
     }
-
-    pub fn target(&self) -> &Backend {
-        &self.inner.target
-    }
-
     fn request<E: GatewayEvent>(
         &self,
+        id: &str,
         request: WorkRequest,
     ) -> Result<WorkOutputStream<E>, WorkGatewayError> {
-        let permit = self
-            .admission
+        let inner = self
+            .backends
+            .get(id)
+            .ok_or(WorkGatewayError::Unsupported)?
+            .clone();
+        let permit = inner
+            .slots
             .clone()
             .try_acquire_owned()
-            .map_err(|_| WorkGatewayBusy)?;
-        let job = self.inner.target.job(&request)?;
+            .map_err(|_| WorkGatewayError::PreProposal(Box::new(WorkGatewayBusy.into())))?;
+        let job = inner
+            .target
+            .job(&request)
+            .map_err(|error| WorkGatewayError::PreProposal(Box::new(error)))?;
         let (requester, stream) = Requester::<E, WorkGatewayError>::new();
-        let inner = self.inner.clone();
-        self.tasks.spawn(async move {
-            let _permit = permit;
-            if let Err(error) = inner.run(job, requester.clone()).await {
-                requester.emit(Err(error));
-            }
-        })?;
+        self.tasks
+            .spawn(async move {
+                let _permit = permit;
+                if let Err(error) = inner.run(job, requester.clone()).await {
+                    requester.emit(Err(error));
+                }
+            })
+            .map_err(|error| WorkGatewayError::PreProposal(Box::new(error.into())))?;
         Ok(stream)
     }
 }
-
 impl Inner {
-    /// A request that disconnects while queued never starts.
     async fn run<E: GatewayEvent>(
         &self,
         job: Job,
         requester: Requester<E, WorkGatewayError>,
     ) -> Result<(), WorkGatewayError> {
+        use crate::execution::{
+            AttemptError, Controls, ExecutionSession, ExecutionTerms, PaidOpen, open_paid_session,
+        };
         let stop = requester.stop();
         let Ok(_serial) =
             crate::execution::before_proposal(None, &stop, None, self.serial.lock()).await
         else {
             return Ok(());
         };
-        let executor = self.target.executor(&job).map_err(gateway_error)?;
-        let run = executor
-            .run(
-                &job,
-                &self.signer,
-                None,
-                stop,
-                requester.observers(),
-                requester.delivery(),
-            )
-            .await;
+        let request = WorkRequest::Job(job.input().clone());
+        let controls = Controls {
+            deadline: None,
+            stop: Some(stop.clone()),
+            observers: requester.observers(),
+            deliver: Some(requester.delivery()),
+        };
+        let pre = |error: ExecutionError| AttemptError::PreProposal(Box::new(error));
+        let run = async {
+            match &self.target {
+                Backend::Paid {
+                    options,
+                    endpoint,
+                    settlement_key,
+                    owner,
+                    ..
+                } => {
+                    let mut session = crate::execution::before_proposal(
+                        None,
+                        &stop,
+                        None,
+                        open_paid_session(
+                            options.clone(),
+                            endpoint.clone(),
+                            settlement_key.clone(),
+                            owner.clone(),
+                            Default::default(),
+                            PaidOpen::Job(&job),
+                            None,
+                        ),
+                    )
+                    .await
+                    .map_err(AttemptError::Stopped)?
+                    .map_err(pre)?;
+                    self.down.store(false, std::sync::atomic::Ordering::Release);
+                    let result = ExecutionSession::Paid(&mut session)
+                        .run(
+                            &request,
+                            ExecutionTerms::Paid { price: job.price() },
+                            &self.signer,
+                            controls,
+                            None,
+                        )
+                        .await;
+                    session.shutdown().await;
+                    result
+                }
+                Backend::Grant {
+                    options,
+                    transport,
+                    policy,
+                } => {
+                    let mut session = crate::execution::before_proposal(
+                        None,
+                        &stop,
+                        None,
+                        crate::grant_client::GrantSession::open(options.clone(), transport.clone()),
+                    )
+                    .await
+                    .map_err(AttemptError::Stopped)?
+                    .map_err(|error| pre(error.into()))?;
+                    self.down.store(false, std::sync::atomic::Ordering::Release);
+                    let signer = session.execution_signer().clone();
+                    let result = ExecutionSession::Grant(&mut session)
+                        .run(
+                            &request,
+                            ExecutionTerms::Grant {
+                                resource: policy.resource,
+                            },
+                            &signer,
+                            controls,
+                            None,
+                        )
+                        .await;
+                    let closed = session.shutdown().await;
+                    let completed = result?;
+                    closed.map_err(|error| AttemptError::Committed(Box::new(error.into())))?;
+                    Ok(completed)
+                }
+                #[cfg(feature = "compute")]
+                Backend::Local { .. } => {
+                    let result = self
+                        .target
+                        .executor(&job)
+                        .map_err(|error| AttemptError::Committed(Box::new(error)))?
+                        .run(
+                            &job,
+                            &self.signer,
+                            None,
+                            stop,
+                            controls.observers,
+                            requester.delivery(),
+                        )
+                        .await;
+                    result.map_err(|error| {
+                        if matches!(error, ExecutionError::LocalAdmission(_)) {
+                            pre(error)
+                        } else {
+                            AttemptError::Committed(Box::new(error))
+                        }
+                    })
+                }
+            }
+        }
+        .await;
         match run {
-            Ok(_) | Err(ExecutionError::Stopped(RequestStopped::Disconnected)) => Ok(()),
-            Err(error) => Err(gateway_error(error)),
+            Ok(_) => Ok(()),
+            Err(AttemptError::PreProposal(error)) => {
+                if backend_failed(&error) {
+                    self.down.store(true, std::sync::atomic::Ordering::Release);
+                }
+                Err(WorkGatewayError::PreProposal(Box::new(gateway_error(
+                    *error,
+                ))))
+            }
+            Err(AttemptError::Committed(error)) => Err(gateway_error(*error)),
+            Err(AttemptError::Stopped(crate::execution::RequestStopped::Disconnected)) => Ok(()),
+            Err(AttemptError::Stopped(error)) => Err(gateway_error(error.into())),
         }
     }
 }
-
+fn backend_failed(error: &ExecutionError) -> bool {
+    use crate::grant_client::GrantClientError as G;
+    use crate::paid_client::PaidClientError as P;
+    matches!(
+        error,
+        ExecutionError::RecoveryRequired
+            | ExecutionError::Io(_)
+            | ExecutionError::Paid(
+                P::Connect { .. }
+                    | P::OfferUnavailable { .. }
+                    | P::OfferRefused(_)
+                    | P::SetupEnded(_)
+                    | P::ProviderIdentityPoisoned
+                    | P::Store(_)
+                    | P::Client(_)
+            )
+            | ExecutionError::Grant(
+                G::RecoveryRequired | G::Timeout | G::Wire(_) | G::Client(_) | G::Refused { .. }
+            )
+    )
+}
 impl WorkExecutionBackend for ExecutorGateway {
-    fn evaluator(&self) -> Option<String> {
-        self.inner.evaluator.clone()
-    }
-    fn fetch_routes(&self) -> Vec<(hellas_rpc::FetchSchema, FetchRoutePolicy)> {
-        self.inner.target.fetch_routes()
+    fn backends(&self) -> Vec<hellas_gateway::BackendInfo> {
+        self.backends
+            .iter()
+            .map(|(id, backend)| hellas_gateway::BackendInfo {
+                id: id.clone(),
+                evaluator: backend.evaluator.clone(),
+                max_in_flight: backend.capacity,
+                in_flight: backend.capacity - backend.slots.available_permits(),
+                down: backend.down.load(std::sync::atomic::Ordering::Acquire),
+            })
+            .collect()
     }
     fn fetch(
         &self,
+        backend: &str,
         request: WorkFetchRequest,
     ) -> Result<WorkOutputStream<OutputEvent>, WorkGatewayError> {
-        self.request(WorkRequest::Fetch(request))
+        self.request(backend, WorkRequest::Fetch(request))
     }
     fn run(
         &self,
+        backend: &str,
         job: hellas_client::model::ComputeJob,
     ) -> Result<WorkOutputStream<ComputeEvent>, WorkGatewayError> {
-        let evaluator = self.evaluator().ok_or(WorkGatewayError::Unsupported)?;
-        self.request(WorkRequest::Job(JobInput::Compute {
-            evaluator,
-            environment: job.environment,
-            plan: job.plan,
-            inputs: job.inputs,
-            content: Arc::new(job.content),
-        }))
+        let evaluator = self
+            .backends
+            .get(backend)
+            .and_then(|b| b.evaluator.clone())
+            .ok_or(WorkGatewayError::Unsupported)?;
+        self.request(
+            backend,
+            WorkRequest::Job(JobInput::Compute {
+                evaluator,
+                environment: job.environment,
+                plan: job.plan,
+                inputs: job.inputs,
+                content: Arc::new(job.content),
+            }),
+        )
     }
-    /// Finishes accepted work, then closes the target's endpoint.
     fn drain(&self) -> BoxFuture<'_, Result<(), WorkShutdownError>> {
-        self.admission.close();
+        for backend in self.backends.values() {
+            backend.slots.close();
+        }
         self.tasks.close();
         Box::pin(async move {
             let drained = self.tasks.drain().await;
-            if let Some(endpoint) = self.inner.target.endpoint()
-                && !endpoint.is_closed()
-            {
-                endpoint.close().await;
+            for backend in self.backends.values() {
+                if let Some(endpoint) = backend.target.endpoint()
+                    && !endpoint.is_closed()
+                {
+                    endpoint.close().await;
+                }
             }
             drained
         })
@@ -933,6 +1072,8 @@ fn rejected(e: impl std::error::Error + Send + Sync + 'static) -> WorkGatewayErr
 fn gateway_error(error: ExecutionError) -> WorkGatewayError {
     match error {
         ExecutionError::Grant(error) => grant_error(error),
+        #[cfg(feature = "compute")]
+        ExecutionError::LocalAdmission(_) => WorkGatewayBusy.into(),
         ExecutionError::Job(error) => rejected(error),
         ExecutionError::Identity => rejected(ExecutionError::Identity),
         ExecutionError::Stopped(error) => WorkGatewayError::Timeout(Box::new(error)),

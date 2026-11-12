@@ -1,8 +1,7 @@
 //! Collect a non-streaming Compute response with its accepted identity and evidence.
-use super::{ComputeEvent, WorkEvent, WorkExecutionBackend, WorkGatewayError};
+use super::{ComputeEvent, WorkEvent, WorkGatewayError};
 use axum::http::StatusCode;
 use futures::StreamExt;
-use hellas_client::model::ComputeJob;
 use hellas_rpc::{protocol::invocation::output::InvocationOutput, provenance::ExecutionProvenance};
 
 pub(super) struct Completion {
@@ -12,22 +11,11 @@ pub(super) struct Completion {
 }
 
 pub(super) async fn collect(
-    work: &dyn WorkExecutionBackend,
-    job: ComputeJob,
+    mut stream: crate::WorkOutputStream<ComputeEvent>,
     deadline: Option<tokio::time::Instant>,
     timeout_message: &str,
 ) -> Completion {
     let (mut accepted, mut transcript) = (None, None);
-    let mut stream = match work.run(job) {
-        Ok(stream) => stream,
-        Err(error) => {
-            return Completion {
-                output: Err(failure(error)),
-                accepted,
-                transcript,
-            };
-        }
-    };
     let output = loop {
         match crate::before_deadline(deadline, stream.next()).await {
             Ok(Some(Ok(WorkEvent::Accepted(value)))) => accepted = Some(value),

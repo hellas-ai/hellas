@@ -17,11 +17,12 @@ use super::state::TextState;
 #[derive(Clone)]
 pub(super) struct GatewayBackend {
     state: Arc<TextState>,
+    selection: crate::routing::Selection,
 }
 
 impl GatewayBackend {
-    pub(super) fn new(state: Arc<TextState>) -> Self {
-        Self { state }
+    pub(super) fn new(state: Arc<TextState>, selection: crate::routing::Selection) -> Self {
+        Self { state, selection }
     }
 }
 
@@ -33,7 +34,7 @@ impl ExecutionBackend for GatewayBackend {
                 Ok(()) => {
                     use tracing::Instrument;
                     self.state
-                        .prepare_wire_execution(&request.execution)
+                        .prepare_wire_execution(&request.execution, &mut self.selection.clone())
                         .instrument(inference.span.clone())
                         .await
                 }

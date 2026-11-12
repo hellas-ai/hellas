@@ -2,14 +2,18 @@
 extern crate tracing;
 
 mod access;
+mod affinity;
+mod route;
+mod routing;
 pub use access::GatewayAccess;
+pub use route::{Presentation, Route};
 mod archive;
 mod audio;
 mod backend;
-mod compose;
 mod compute;
 mod dispatch;
 mod error;
+mod router;
 pub use error::{GatewayConfigError, GatewayError, GatewayResult};
 mod http_fetch;
 mod image;
@@ -23,7 +27,6 @@ use axum::response::{IntoResponse, Response};
 use futures::Stream;
 use hellas_adaptors::BackendError;
 use hellas_auth::authority::UnixMillis;
-use hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy;
 use serde::Serialize;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::convert::Infallible;
@@ -34,11 +37,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use archive::ArchiveOptions;
 pub use hellas_rpc::compute_event::ComputeEvent;
-pub use http_fetch::{HttpBackend, HttpGatewayConfig, HttpRoute, RoutingError};
+pub use http_fetch::{HttpRoute, RoutingError};
 
 const DEFAULT_HTTP_PORT: u16 = 8080;
 
 /// A Fetch run under the selected backend's policy.
+#[derive(Clone)]
 pub struct WorkFetchRequest {
     pub service: String,
     pub method: String,
@@ -47,6 +51,8 @@ pub struct WorkFetchRequest {
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorkGatewayError {
+    #[error("{0}")]
+    PreProposal(Box<WorkGatewayError>),
     #[error("request does not match its resource: {0}")]
     Rejected(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("grant access refused: {0}")]
@@ -70,6 +76,7 @@ impl From<WorkGatewayError> for BackendError {
     fn from(error: WorkGatewayError) -> Self {
         let message = error.to_string();
         match error {
+            WorkGatewayError::PreProposal(error) => Self::from(*error),
             WorkGatewayError::Rejected(_) | WorkGatewayError::Unsupported => {
                 BackendError::Rejected(message)
             }
@@ -144,17 +151,26 @@ pub enum WorkShutdownError {
     Recovery(#[source] Arc<dyn std::error::Error + Send + Sync>),
 }
 
+#[derive(Clone, Debug)]
+pub struct BackendInfo {
+    pub id: String,
+    pub evaluator: Option<String>,
+    pub max_in_flight: usize,
+    pub in_flight: usize,
+    pub down: bool,
+}
+
 /// The source every presentation runs its jobs on.
 pub trait WorkExecutionBackend: Send + Sync {
-    /// The Fetches this source can run, for presentations that pin one.
-    fn fetch_routes(&self) -> Vec<(hellas_rpc::FetchSchema, FetchRoutePolicy)> {
-        Vec::new()
-    }
-
+    fn backends(&self) -> Vec<BackendInfo>;
     /// The provider's acceptance, authenticated prefixes, the signed
     /// transcript, then durable completion. After proposal the backend owns
     /// collection and funding obligations across disconnects.
-    fn fetch(&self, _request: WorkFetchRequest) -> Result<WorkFetchStream, WorkGatewayError> {
+    fn fetch(
+        &self,
+        _backend: &str,
+        _request: WorkFetchRequest,
+    ) -> Result<WorkFetchStream, WorkGatewayError> {
         Err(WorkGatewayError::Unsupported)
     }
 
@@ -163,14 +179,10 @@ pub trait WorkExecutionBackend: Send + Sync {
     /// proposed work across requester disconnects.
     fn run(
         &self,
+        _backend: &str,
         _job: hellas_client::model::ComputeJob,
     ) -> Result<WorkOutputStream<ComputeEvent>, WorkGatewayError> {
         Err(WorkGatewayError::Unsupported)
-    }
-
-    /// The evaluator id the source runs Compute programs for, if it runs any.
-    fn evaluator(&self) -> Option<String> {
-        None
     }
 
     /// An explicit end-to-end budget, including queued time, if the source has one.
@@ -219,72 +231,16 @@ pub struct ServerOptions {
 pub struct GatewayOptions {
     pub server: ServerOptions,
     pub work: Arc<dyn WorkExecutionBackend>,
-    pub presentations: Presentations,
-}
-
-/// The HTTP surfaces a gateway offers. A path served by several of them is
-/// split by the request's model; an overlap is a startup error.
-#[derive(Clone, Default)]
-pub struct Presentations {
-    /// OpenAI chat, completions and Responses, and Anthropic messages,
-    /// rendered locally into Compute text jobs.
-    pub models: Vec<ModelOptions>,
-    /// OpenAI Responses forwarded as a Fetch to one sealed route.
-    pub responses: Option<ResponsesFetch>,
-    /// Exact HTTP routes forwarded as HTTPS Fetches, with account routing.
-    pub http: Option<HttpGatewayConfig>,
-}
-
-#[derive(Clone)]
-pub enum ModelOptions {
-    Text(TextOptions),
-    Whisper(AudioOptions),
-    Flux(ImageOptions),
-}
-
-impl ModelOptions {
-    /// The routes a model path serves, by its layout, under the name of its
-    /// file or directory.
-    pub fn at(model: PathBuf, default_max_tokens: u32) -> Self {
-        use hellas_client::model::ModelKind;
-        let name = |path: &std::path::Path, stem: bool| {
-            let name = if stem {
-                path.file_stem()
-            } else {
-                path.file_name()
-            };
-            name.map_or_else(String::new, |name| name.to_string_lossy().into_owned())
-        };
-        match ModelKind::of(&model) {
-            ModelKind::Text => Self::Text(TextOptions {
-                model_name: name(&model, true),
-                model,
-                default_max_tokens,
-            }),
-            ModelKind::Transcription => Self::Whisper(AudioOptions {
-                model_name: name(&model, false),
-                model,
-                default_max_tokens: default_max_tokens as usize,
-            }),
-            ModelKind::Image => Self::Flux(ImageOptions {
-                model_name: name(&model, false),
-                model,
-            }),
-        }
-    }
+    pub routes: Vec<Route>,
 }
 
 #[derive(Clone)]
 pub struct ImageOptions {
-    /// Converted Flux2 Klein package metadata and tokenizer.
-    pub model: PathBuf,
     pub model_name: String,
 }
 
 #[derive(Clone)]
 pub struct AudioOptions {
-    /// Converted Whisper package directory, used only by the client.
-    pub model: PathBuf,
     pub model_name: String,
     pub default_max_tokens: usize,
 }
@@ -305,38 +261,6 @@ pub struct ResponsesFetch {
     pub method: String,
     /// Merged into every request body before signing.
     pub overrides: JsonMap<String, JsonValue>,
-    /// Models these routes answer to; empty means any.
-    pub models: Vec<String>,
-}
-
-impl ResponsesFetch {
-    /// The one sealed Responses route among `routes`, if there is one.
-    pub fn from_routes(
-        routes: &[(hellas_rpc::FetchSchema, FetchRoutePolicy)],
-        overrides: JsonMap<String, JsonValue>,
-        models: Vec<String>,
-    ) -> GatewayResult<Option<Self>> {
-        let mut sealed = routes.iter().filter_map(|(schema, route)| match route {
-            FetchRoutePolicy::SealedRoute { service, method }
-                if *schema == hellas_rpc::FetchSchema::StatelessResponsesV1 =>
-            {
-                Some((service, method))
-            }
-            _ => None,
-        });
-        let Some((service, method)) = sealed.next() else {
-            return Ok(None);
-        };
-        if sealed.next().is_some() {
-            return Err(GatewayConfigError::AmbiguousResponses.into());
-        }
-        Ok(Some(Self {
-            service: service.clone(),
-            method: method.clone(),
-            overrides,
-            models,
-        }))
-    }
 }
 
 /// A running authenticated HTTP gateway owned by its embedding process.
@@ -396,7 +320,7 @@ async fn start_gateway(options: GatewayOptions) -> crate::GatewayResult<GatewayH
     let GatewayOptions {
         server,
         work,
-        presentations,
+        routes,
     } = options;
     let listener = bind_gateway(&server.host, server.port, server.allow_remote).await?;
     let bearer = server.access.clone();
@@ -404,7 +328,7 @@ async fn start_gateway(options: GatewayOptions) -> crate::GatewayResult<GatewayH
     let archive_policy = archive::Policy::new(server.archive.clone());
     archive_policy.prepare();
 
-    let app = compose::router(&presentations, &work).await?;
+    let app = router::router(routes, work.clone()).await?;
     // Every route reaches a work source, so every route is behind the
     // provisioned Auth credential. The layer goes on last, which in axum
     // puts it outermost: a request without the credential is answered
@@ -591,3 +515,11 @@ mod paid_shutdown_tests {
         );
     }
 }
+
+fn work_error(error: WorkGatewayError) -> Response {
+    let error: BackendError = error.into();
+    json_error(backend_status(&error), error.to_string())
+}
+
+#[cfg(test)]
+mod test_support;

@@ -771,14 +771,21 @@ async fn check_gateway_quote(
     .await
     .unwrap();
     let gateway = hellas_sdk::ExecutorGateway::new(
-        hellas_sdk::Backend::Paid {
-            options: options.clone(),
-            policy: Some(quote.policy.invocation_policy),
-            endpoint,
-            settlement_key: settlement,
-            owner,
-        },
-        None,
+        [(
+            "test".into(),
+            hellas_sdk::BackendEntry {
+                backend: hellas_sdk::Backend::Paid {
+                    options: options.clone(),
+                    policy: Some(quote.policy.invocation_policy),
+                    endpoint,
+                    settlement_key: settlement,
+                    owner,
+                },
+                evaluator: None,
+                max_in_flight: std::num::NonZeroUsize::new(32).unwrap(),
+            },
+        )]
+        .into(),
         Arc::new(hellas_auth::ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap()),
     );
     let setups = async || {
@@ -795,11 +802,14 @@ async fn check_gateway_quote(
 
     assert!(
         gateway
-            .fetch(hellas_gateway::WorkFetchRequest {
-                service: "openai".into(),
-                method: "wrong-route".into(),
-                body: BODY.to_vec(),
-            })
+            .fetch(
+                "test",
+                hellas_gateway::WorkFetchRequest {
+                    service: "openai".into(),
+                    method: "wrong-route".into(),
+                    body: BODY.to_vec(),
+                }
+            )
             .is_err(),
         "gateway checks the quoted route before requesting funding"
     );
@@ -809,11 +819,14 @@ async fn check_gateway_quote(
     );
     assert!(
         gateway
-            .fetch(hellas_gateway::WorkFetchRequest {
-                service: "openai".into(),
-                method: "responses".into(),
-                body: oversized.into_bytes(),
-            })
+            .fetch(
+                "test",
+                hellas_gateway::WorkFetchRequest {
+                    service: "openai".into(),
+                    method: "responses".into(),
+                    body: oversized.into_bytes(),
+                }
+            )
             .is_err(),
         "gateway admits the whole request before requesting funding"
     );

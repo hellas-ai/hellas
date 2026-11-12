@@ -30,19 +30,7 @@ pub(super) struct Hints {
 }
 
 impl Hints {
-    pub fn read(headers: &HeaderMap, body: &[u8]) -> Result<Self, &'static str> {
-        Self::read_inner(headers, body, false)
-    }
-
     pub fn read_optional(headers: &HeaderMap, body: &[u8]) -> Result<Self, &'static str> {
-        Self::read_inner(headers, body, true)
-    }
-
-    fn read_inner(
-        headers: &HeaderMap,
-        body: &[u8],
-        allow_opaque: bool,
-    ) -> Result<Self, &'static str> {
         let bytes = decoded_body(headers, body)?;
         let json_content = headers
             .get("content-type")
@@ -62,7 +50,7 @@ impl Hints {
         } else {
             match hellas_authority::model::http_usage::unique_json(&bytes) {
                 Ok(value) => value,
-                Err(_) if allow_opaque && !json_content && !looks_json => Value::Null,
+                Err(_) if !json_content && !looks_json => Value::Null,
                 Err(_) => return Err("model routing requires a JSON request"),
             }
         };
@@ -145,7 +133,7 @@ mod tests {
             "content-encoding".parse().unwrap(),
             HeaderValue::from_static("gzip"),
         )]);
-        let hints = Hints::read(&headers, &wire).unwrap();
+        let hints = Hints::read_optional(&headers, &wire).unwrap();
         assert_eq!(hints.model.as_deref(), Some("k3"));
         assert_eq!(hints.session.unwrap().1, "kimi-session");
         let compressed = zstd::stream::encode_all(body.as_slice(), 1).unwrap();
@@ -154,18 +142,25 @@ mod tests {
             HeaderValue::from_static("zstd"),
         )]);
         assert_eq!(
-            Hints::read(&headers, &compressed).unwrap().model.as_deref(),
+            Hints::read_optional(&headers, &compressed)
+                .unwrap()
+                .model
+                .as_deref(),
             Some("k3")
         );
         let mut headers = HeaderMap::new();
         headers.insert("session-id", HeaderValue::from_static("codex-session"));
         assert_eq!(
-            Hints::read(&headers, body).unwrap().session.unwrap().1,
+            Hints::read_optional(&headers, body)
+                .unwrap()
+                .session
+                .unwrap()
+                .1,
             "codex-session"
         );
         let body=serde_json::to_vec(&serde_json::json!({"model":"claude", "metadata":{"user_id":"{\"device_id\":\"not-a-session\",\"session_id\":\"claude-session\"}"}})).unwrap();
         assert_eq!(
-            Hints::read(&HeaderMap::new(), &body)
+            Hints::read_optional(&HeaderMap::new(), &body)
                 .unwrap()
                 .session
                 .unwrap()
@@ -173,10 +168,10 @@ mod tests {
             "claude-session"
         );
         headers.append("session-id", HeaderValue::from_static("ambiguous"));
-        assert!(Hints::read(&headers, &body).is_err());
-        assert!(Hints::read(&HeaderMap::new(), br#"{"model":4}"#).is_err());
+        assert!(Hints::read_optional(&headers, &body).is_err());
+        assert!(Hints::read_optional(&HeaderMap::new(), br#"{"model":4}"#).is_err());
         assert!(
-            Hints::read(
+            Hints::read_optional(
                 &HeaderMap::new(),
                 br#"{"model":"k3","previous_response_id":{}}"#
             )

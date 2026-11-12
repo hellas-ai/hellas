@@ -529,3 +529,23 @@ pub async fn upload_frames(
         }
     }
 }
+
+/// A one-backend daemon fixture; production callers supply the document's map.
+pub fn gateway(
+    backend: crate::Backend,
+    evaluator: Option<String>,
+    signer: std::sync::Arc<hellas_auth::ProducerSigningKey>,
+) -> std::sync::Arc<crate::ExecutorGateway> {
+    crate::ExecutorGateway::new(
+        [(
+            "test".into(),
+            crate::BackendEntry {
+                backend,
+                evaluator,
+                max_in_flight: std::num::NonZeroUsize::new(32).unwrap(),
+            },
+        )]
+        .into(),
+        signer,
+    )
+}

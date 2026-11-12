@@ -52,7 +52,7 @@ impl ServeArgs {
 }
 
 #[cfg(feature = "compute")]
-fn parse_gpu_backend(value: &str) -> Result<hellas_executor::GpuDialect, String> {
+pub(crate) fn parse_gpu_backend(value: &str) -> Result<hellas_executor::GpuDialect, String> {
     use hellas_executor::GpuDialect;
     match value {
         "hip" => Ok(GpuDialect::Hip),

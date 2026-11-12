@@ -56,6 +56,9 @@ pub enum ExecutionError {
     #[cfg(feature = "compute")]
     #[error("local execution failed: {0}")]
     Local(String),
+    #[cfg(feature = "compute")]
+    #[error("local admission refused: {0}")]
+    LocalAdmission(String),
     #[error(transparent)]
     Stopped(#[from] RequestStopped),
     #[error(transparent)]

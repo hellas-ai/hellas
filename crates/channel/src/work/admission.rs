@@ -60,6 +60,10 @@ impl WorkAdmission {
         Self(Authorization::Payment)
     }
 
+    pub fn reserved(permit: WorkPermit) -> Self {
+        Self(Authorization::Grant(AdmittedWork::payment(permit)))
+    }
+
     pub fn grant(
         permit: WorkPermit,
         deadline: Instant,

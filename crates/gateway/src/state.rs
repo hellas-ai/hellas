@@ -1,5 +1,5 @@
 //! The text presentation: requests rendered locally into Compute text jobs.
-use super::{TextOptions, WorkExecutionBackend};
+use super::{TextOptions, route::RouteExecution};
 use crate::ComputeEvent;
 use axum::Router;
 use axum::body::Bytes;
@@ -14,7 +14,6 @@ use hellas_adaptors::{
     BackendError, CanonicalExecution, ExecutionRequest as WireExecutionRequest, ResponseFormat,
     WireAdaptor,
 };
-use hellas_client::model::ModelPackage;
 use hellas_presentation::{ChatTemplate, TextPresentation};
 use hellas_rpc::provenance::ExecutionProvenance;
 use std::sync::Arc;
@@ -99,9 +98,11 @@ where
     A::StreamState: Send + 'static,
 {
     post(
-        move |State(state): State<Arc<TextState>>, body: Bytes| async move {
+        move |State(state): State<Arc<TextState>>,
+              axum::Extension(selection): axum::Extension<crate::routing::Selection>,
+              body: Bytes| async move {
             let model = state.model_name.clone();
-            let backend = super::backend::GatewayBackend::new(state);
+            let backend = super::backend::GatewayBackend::new(state, selection);
             let context = super::dispatch::render_context(id);
             super::dispatch::serve(adaptor, surface, context, backend, Some(&model), &body).await
         },
@@ -114,8 +115,7 @@ pub(super) struct TextState {
     pub(super) model_name: String,
     pub(super) inference_timeout: Option<Duration>,
     presentation: Arc<TextPresentation>,
-    text: Arc<ModelPackage>,
-    work: Arc<dyn WorkExecutionBackend>,
+    execution: Arc<RouteExecution>,
 }
 
 pub(super) type TextEvents = crate::WorkOutputStream<ComputeEvent>;
@@ -134,20 +134,12 @@ pub(super) struct PreparedGeneration {
 impl TextState {
     pub(super) async fn open(
         options: &TextOptions,
-        work: Arc<dyn WorkExecutionBackend>,
+        execution: Arc<RouteExecution>,
     ) -> crate::GatewayResult<Self> {
         if options.default_max_tokens == 0 {
             return Err(crate::GatewayConfigError::MaxTokens.into());
         }
         let path = options.model.clone();
-        let text = ModelPackage::open(
-            &path,
-            &work.evaluator().ok_or(crate::GatewayError::Presentation(
-                "Compute models need a renderer (evaluator id)".into(),
-            ))?,
-        )
-        .await
-        .map_err(|error| crate::GatewayError::Presentation(error.into()))?;
         let presentation = tokio::task::spawn_blocking(move || {
             TextPresentation::from_gguf(&path)
                 .map(|presentation| presentation.with_chat_template(Some(ChatTemplate::Qwen3)))
@@ -159,16 +151,16 @@ impl TextState {
             inference_metrics: super::backend::telemetry::InferenceMetrics::new(),
             default_max_tokens: options.default_max_tokens,
             model_name: options.model_name.clone(),
-            inference_timeout: work.timeout(),
+            inference_timeout: execution.work.timeout(),
             presentation: Arc::new(presentation),
-            text: Arc::new(text),
-            work,
+            execution,
         })
     }
 
     pub(super) async fn prepare_wire_execution(
         &self,
         req: &WireExecutionRequest,
+        selection: &mut crate::routing::Selection,
     ) -> Result<PreparedGeneration, BackendError> {
         let canonical = &req.canonical;
         validate_native_text_request(canonical)?;
@@ -179,7 +171,7 @@ impl TextState {
         let chat = self.presentation.prepare(canonical).map_err(|err| {
             BackendError::rejected(format!("Failed to prepare model input: {err:#}"))
         })?;
-        self.prepare_ids(chat.input_ids, max_tokens, Some(chat.turn))
+        self.prepare_ids(chat.input_ids, max_tokens, Some(chat.turn), selection)
             .await
     }
 
@@ -189,23 +181,25 @@ impl TextState {
         input_ids: Vec<u32>,
         max_tokens: u32,
         chat: Option<hellas_presentation::chat::ChatTurn>,
+        selection: &mut crate::routing::Selection,
     ) -> Result<PreparedGeneration, BackendError> {
         let deadline = self
             .inference_timeout
             .map(|timeout| tokio::time::Instant::now() + timeout);
         let prompt_tokens = input_ids.len() as u32;
         let prompt = input_ids.into_iter().map(u64::from).collect::<Vec<_>>();
-        let job = self
-            .text
-            .render_job(&hellas_client::model::ModelRequest::Text {
-                prompt_ids: &prompt,
-                max_new: u64::from(max_tokens),
-                stops: &[],
-            })
-            .await
-            .map_err(|error| {
-                BackendError::rejected(format!("Failed to prepare model input: {error:#}"))
-            })?;
+        let (_, prepared) = self
+            .execution
+            .compute(
+                selection,
+                &hellas_client::model::ModelRequest::Text {
+                    prompt_ids: &prompt,
+                    max_new: u64::from(max_tokens),
+                    stops: &[],
+                },
+                deadline,
+            )
+            .await?;
         if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
             return Err(BackendError::Timeout(
                 "inference preparation timed out".into(),
@@ -213,7 +207,7 @@ impl TextState {
         }
         Ok(PreparedGeneration {
             chat,
-            prepared: self.work.run(job)?,
+            prepared,
             provenance: None,
             prompt_tokens,
             presentation: self.presentation.clone(),

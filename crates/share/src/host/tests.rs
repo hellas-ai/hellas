@@ -352,21 +352,15 @@ impl ShareFixtureBuilder {
         let other_location = StoreLocation::for_test(&root.path().join("client"));
         let gateway = controlled_gateway(
             GrantServeOptions {
-                serve: hellas_sdk::GatewayServeOptions {
-                    server: hellas_sdk::gateway::ServerOptions {
-                        access,
-                        host: "127.0.0.1".into(),
-                        port: Some(0),
-                        archive: hellas_sdk::gateway::ArchiveOptions {
-                            directory: root.path().join("archive"),
-                            zdr: true,
-                        },
-                        allow_remote: false,
+                serve: hellas_sdk::gateway::ServerOptions {
+                    access,
+                    host: "127.0.0.1".into(),
+                    port: Some(0),
+                    archive: hellas_sdk::gateway::ArchiveOptions {
+                        directory: root.path().join("archive"),
+                        zdr: true,
                     },
-                    models: Vec::new(),
-                    http: None,
-                    responses_overrides: Default::default(),
-                    responses_models: Vec::new(),
+                    allow_remote: false,
                 },
                 session: hellas_sdk::grant_client::GrantSessionOptions {
                     control_timeout: std::time::Duration::from_millis(
@@ -689,14 +683,14 @@ struct ControlledGateway {
 /// A grant gateway the host starts: each start binds its own endpoint.
 #[derive(Clone)]
 struct GrantServeOptions {
-    serve: hellas_sdk::GatewayServeOptions,
+    serve: hellas_sdk::gateway::ServerOptions,
     session: hellas_sdk::grant_client::GrantSessionOptions,
 }
 impl GrantServeOptions {
     fn into_factory(self, key: iroh::SecretKey) -> hellas_sdk::node_control::host::GatewayFactory {
         Arc::new(move |access| {
             let (mut options, key) = (self.clone(), key.clone());
-            options.serve.server.access = access;
+            options.serve.access = access;
             Box::pin(async move {
                 let endpoint = hellas_sdk::grant_client::bind_endpoint(key).await?;
                 let signer = options.session.signer.clone();
@@ -705,15 +699,27 @@ impl GrantServeOptions {
                     options: options.session,
                     transport: hellas_sdk::grant_client::GrantTransport::Remote(endpoint),
                 };
-                if options.serve.http.is_none() {
-                    options.serve.http = target.http_config()?;
-                }
+                let routes = target.routes("test")?;
                 let work = hellas_sdk::ExecutorGateway::new(
-                    target,
-                    Some(hellas_channel::test_support::channel::evaluator()),
+                    [(
+                        "test".into(),
+                        hellas_sdk::BackendEntry {
+                            backend: target,
+                            evaluator: Some(hellas_channel::test_support::channel::evaluator()),
+                            max_in_flight: std::num::NonZeroUsize::new(32).unwrap(),
+                        },
+                    )]
+                    .into(),
                     signer,
                 );
-                Ok(hellas_sdk::serve_gateway(work, options.serve).await?)
+                Ok(
+                    hellas_sdk::gateway::start(hellas_sdk::gateway::GatewayOptions {
+                        server: options.serve,
+                        work,
+                        routes,
+                    })
+                    .await?,
+                )
             })
         })
     }
@@ -733,10 +739,7 @@ async fn controlled_gateway(
         node,
         secret,
         None,
-        Some((
-            gateway.serve.server.access.clone(),
-            gateway.into_factory(key),
-        )),
+        Some((gateway.serve.access.clone(), gateway.into_factory(key))),
         content,
     )
     .await;
