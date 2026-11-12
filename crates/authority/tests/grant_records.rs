@@ -84,6 +84,7 @@ fn https_offer() -> Offer {
     let client_principal = principal(2).0;
     let route = FetchRoutePolicy::sealed_route("http", "request").unwrap();
     let policy = GrantPolicy {
+        config_change: Default::default(),
         resource: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test resource")),
         account: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),
         revision: hellas_auth::authority::Revision(1),

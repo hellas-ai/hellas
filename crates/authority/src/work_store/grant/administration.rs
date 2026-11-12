@@ -1,8 +1,5 @@
 use super::{NodeStore, NodeStoreError, state::Change};
-use crate::model::grant::{
-    budget::{BudgetDef, BudgetNode},
-    records::GrantDef,
-};
+use crate::model::grant::{budget::BudgetDef, records::GrantDef};
 use hellas_auth::authority::{AuthenticatedCaller, CallerRecord, GrantId as Authorization};
 use hellas_auth::authority::{GrantId, ResourceId, Revision, UnixMillis};
 use serde::{Deserialize, Serialize};
@@ -85,47 +82,25 @@ impl NodeStore {
         self.commit(now, Change::BindProvider(record), true).await
     }
 
-    /// Apply the node's own configuration: the machine budget, then accounts,
-    /// then resources. Each change commits separately, so an interrupted pass
-    /// resumes at the next start; an unchanged configuration commits nothing.
-    pub(crate) async fn reconcile(
+    /// Commit the document and every configuration-owned authority change together.
+    pub(crate) async fn configure(
         &mut self,
+        expected: Revision,
+        document: String,
         configuration: &crate::model::grant::configuration::NodeConfiguration,
         now: UnixMillis,
     ) -> Result<(), NodeStoreError> {
         self.check_authority()?;
-        if let Some(machine) = configuration.machine() {
-            let concurrent = machine.max_in_flight.get();
-            if usize::from(concurrent) > super::store::MAX_OPEN_JOBS {
-                return Err(hellas_auth::authority::AuthorityError::Invalid.into());
-            }
-            let current = super::ledger::definition(&self.state().ledger, BudgetNode::Machine);
-            if current.as_ref().is_none_or(|old| {
-                old.limits != machine.limits || old.max_in_flight != machine.max_in_flight
-            }) {
-                let revision = current.map_or(Revision(0), |old| old.revision);
-                let change = Change::Budget(BudgetDef {
-                    node: BudgetNode::Machine,
-                    parent: None,
-                    revision: revision.next().ok_or(NodeStoreError::Malformed)?,
-                    limits: machine.limits.clone(),
-                    max_in_flight: machine.max_in_flight,
-                });
-                self.commit(now, change, true).await?;
-            }
-        }
-        for definition in configuration
-            .account_changes(|node| super::ledger::definition(&self.state().ledger, node))?
-        {
-            self.commit(now, Change::Budget(definition), true).await?;
-        }
-        for policy in configuration.resources() {
-            if self.state().resource(policy.resource) != Some(policy) {
-                self.commit(now, Change::Resource(policy.clone()), true)
-                    .await?;
-            }
-        }
-        Ok(())
+        self.commit(
+            now,
+            Change::Configure {
+                expected,
+                document,
+                configuration: configuration.clone(),
+            },
+            true,
+        )
+        .await
     }
 
     // The entry point checks before inspecting command data; commit rechecks the

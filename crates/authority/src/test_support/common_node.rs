@@ -254,7 +254,7 @@ impl WorkAdmin {
             limits,
         };
         self.service = Self::configured(self.grants.clone(), &self.machine, &self.policies);
-        self.service.reconcile().await.unwrap();
+        self.service.configure().await.unwrap();
     }
 
     pub async fn create(&self, definition: crate::model::grant::records::GrantDef) {
@@ -290,7 +290,7 @@ impl WorkAdmin {
         let caller = super::session(&node, secret).await;
         let machine = unlimited();
         let configured = Self::configured(service.clone(), &machine, &policies);
-        configured.reconcile().await.unwrap();
+        configured.configure().await.unwrap();
         Self {
             root,
             service: configured,

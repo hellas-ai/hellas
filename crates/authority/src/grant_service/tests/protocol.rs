@@ -3,6 +3,7 @@ use hellas_auth::Digest;
 use hellas_auth::authority::{GrantId, Revision, UnixMillis};
 
 mod cache;
+mod configuration;
 mod delivery;
 mod expiry;
 mod recovery;

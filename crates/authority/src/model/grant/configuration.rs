@@ -20,11 +20,20 @@ pub struct ConfiguredBudget {
 /// A validated node configuration. Serving resources requires a machine
 /// budget; every resource's account is declared, and every declared account is
 /// used. The default serves nothing and configures no budgets.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeConfiguration {
     machine: Option<ConfiguredBudget>,
-    accounts: BTreeMap<ResourceId, ConfiguredBudget>,
+    accounts: Vec<(ResourceId, ConfiguredBudget)>,
     resources: Vec<GrantPolicy>,
+}
+
+/// The daemon's redacted document, committed with its authority configuration.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigurationDocument {
+    pub revision: Revision,
+    pub document: String,
 }
 
 impl NodeConfiguration {
@@ -33,6 +42,21 @@ impl NodeConfiguration {
         accounts: BTreeMap<ResourceId, ConfiguredBudget>,
         resources: Vec<GrantPolicy>,
     ) -> Result<Self, GrantError> {
+        let configuration = Self {
+            machine,
+            accounts: accounts.into_iter().collect(),
+            resources,
+        };
+        configuration.validate()?;
+        Ok(configuration)
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), GrantError> {
+        let Self {
+            machine,
+            accounts,
+            resources,
+        } = self;
         let mut names = std::collections::BTreeSet::new();
         let mut ids = std::collections::BTreeSet::new();
         if resources.len() > MAX_WORK_POLICIES
@@ -41,21 +65,25 @@ impl NodeConfiguration {
                 .iter()
                 .any(|p| !names.insert(&p.name) || !ids.insert(p.resource))
             || (machine.is_none() && !resources.is_empty())
-            || resources.iter().any(|p| !accounts.contains_key(&p.account))
             || accounts
-                .keys()
-                .any(|account| !resources.iter().any(|p| p.account == *account))
+                .iter()
+                .map(|(id, _)| id)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != accounts.len()
+            || resources
+                .iter()
+                .any(|p| !accounts.iter().any(|(id, _)| *id == p.account))
+            || accounts
+                .iter()
+                .any(|(account, _)| !resources.iter().any(|p| p.account == *account))
         {
             return Err(GrantError::Limits);
         }
-        for policy in &resources {
+        for policy in resources {
             policy.validate()?;
         }
-        Ok(Self {
-            machine,
-            accounts,
-            resources,
-        })
+        Ok(())
     }
 
     pub fn machine(&self) -> Option<&ConfiguredBudget> {

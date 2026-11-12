@@ -588,7 +588,7 @@ where
                 grants.config.max_job_millis,
             );
             // The node's own configuration is current before any work is admitted.
-            administration.reconcile().await?;
+            administration.configure().await?;
             let admin = match grants.authority {
                 ProviderAuthority::Host(control) => Some(*control),
                 ProviderAuthority::Journal { .. } => None,

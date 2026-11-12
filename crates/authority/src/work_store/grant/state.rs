@@ -30,6 +30,7 @@ pub(super) const MAX_RESOURCES: usize = 256;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct State {
     pub(super) network: NetworkId,
+    configuration: Option<crate::model::grant::configuration::ConfigurationDocument>,
     pub(super) authority: AuthorityState,
     last_administration: Option<AdministrationRecord>,
     pub(crate) last_work_administration: Option<super::WorkRecord>,
@@ -58,7 +59,7 @@ pub struct ResourceHealth {
 /// It names the frame format, so a journal written under different semantics
 /// is refused at the boundary instead of being reinterpreted. Bump it with
 /// any change to [`Frame`] or [`Change`] that is not readable as written.
-pub(super) const JOURNAL_NAMESPACE: &str = "hellas.node.journal.v4";
+pub(super) const JOURNAL_NAMESPACE: &str = "hellas.node.journal.v5";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct Frame {
@@ -72,6 +73,11 @@ pub(super) enum Change {
         authority: AuthoritySnapshot,
         #[serde(with = "super::codec::optional_provider")]
         provider: Option<ProviderEnrollmentBundle>,
+    },
+    Configure {
+        expected: Revision,
+        document: String,
+        configuration: crate::model::grant::configuration::NodeConfiguration,
     },
     Authority(AdministrationRecord),
     Recover(hellas_auth::authority::RecoveryCommand),
@@ -111,6 +117,11 @@ pub(super) enum Change {
     },
 }
 impl State {
+    pub fn configuration(
+        &self,
+    ) -> Option<&crate::model::grant::configuration::ConfigurationDocument> {
+        self.configuration.as_ref()
+    }
     pub fn paid_policy(&self) -> Option<&hellas_channel::model::paid_policy::StoredPaidPolicy> {
         self.paid_policy.as_ref()
     }
@@ -235,6 +246,7 @@ impl State {
         ledger.advance(authority.now().0);
         Ok(Self {
             network,
+            configuration: None,
             authority,
             last_administration: None,
             last_work_administration: None,
@@ -307,6 +319,60 @@ impl State {
     ) -> Result<Applied, NodeStoreError> {
         match change {
             Change::Initialize { .. } => return Err(NodeStoreError::Malformed),
+            Change::Configure {
+                expected,
+                document,
+                configuration,
+            } => {
+                if self
+                    .configuration
+                    .as_ref()
+                    .map_or(Revision(0), |c| c.revision)
+                    != *expected
+                {
+                    return Err(hellas_auth::authority::AuthorityError::Revision.into());
+                }
+                configuration.validate()?;
+                if let Some(machine) = configuration.machine() {
+                    if usize::from(machine.max_in_flight.get()) > super::store::MAX_OPEN_JOBS {
+                        return Err(hellas_auth::authority::AuthorityError::Invalid.into());
+                    }
+                    let current = ledger::definition(&self.ledger, BudgetNode::Machine);
+                    if current.as_ref().is_none_or(|old| {
+                        old.limits != machine.limits || old.max_in_flight != machine.max_in_flight
+                    }) {
+                        self.apply_change(
+                            &Change::Budget(BudgetDef {
+                                node: BudgetNode::Machine,
+                                parent: None,
+                                revision: current
+                                    .map_or(Revision(0), |old| old.revision)
+                                    .next()
+                                    .ok_or(NodeStoreError::Malformed)?,
+                                limits: machine.limits.clone(),
+                                max_in_flight: machine.max_in_flight,
+                            }),
+                            now,
+                            replay,
+                        )?;
+                    }
+                }
+                for definition in
+                    configuration.account_changes(|node| ledger::definition(&self.ledger, node))?
+                {
+                    self.apply_change(&Change::Budget(definition), now, replay)?;
+                }
+                for policy in configuration.resources() {
+                    if self.resource(policy.resource) != Some(policy) {
+                        self.apply_change(&Change::Resource(policy.clone()), now, replay)?;
+                    }
+                }
+                self.configuration =
+                    Some(crate::model::grant::configuration::ConfigurationDocument {
+                        revision: expected.next().ok_or(NodeStoreError::Malformed)?,
+                        document: document.clone(),
+                    });
+            }
             Change::Authority(record) => {
                 if record.caller().at() != now {
                     return Err(NodeStoreError::Malformed);
@@ -431,7 +497,9 @@ impl State {
                             .book
                             .jobs()
                             .filter(|job| {
-                                job.phase() == JobPhase::Accepted
+                                policy.config_change
+                                    == crate::model::grant::records::ConfigChange::Release
+                                    && job.phase() == JobPhase::Accepted
                                     && job.authorization().resource_id == policy.resource
                             })
                             .map(|job| (ChannelId(*id), job.work_id()))
@@ -902,14 +970,15 @@ fn verify(
 }
 
 /// Snapshots retain health decisions made under the frame accounting semantics.
-/// Refuse pre-v4 state even when rotation removed every old frame.
-const CHECKPOINT_NAMESPACE: &str = "hellas.node.checkpoint.v4";
+/// Refuse pre-v5 state even when rotation removed every old frame.
+const CHECKPOINT_NAMESPACE: &str = "hellas.node.checkpoint.v5";
 
 #[derive(Serialize, Deserialize)]
 pub(super) struct Snapshot {
     namespace: String,
     #[serde(with = "crate::model::grant::records::network")]
     network: NetworkId,
+    configuration: Option<crate::model::grant::configuration::ConfigurationDocument>,
     authority: AuthoritySnapshot,
     last_administration: Option<AdministrationRecord>,
     last_work_administration: Option<super::WorkRecord>,
@@ -946,6 +1015,7 @@ impl State {
         Ok(Snapshot {
             namespace: CHECKPOINT_NAMESPACE.into(),
             network: self.network,
+            configuration: self.configuration.clone(),
             authority: self.authority.snapshot(),
             last_administration: self.last_administration.clone(),
             last_work_administration: self.last_work_administration.clone(),
@@ -1014,6 +1084,10 @@ impl State {
         }) {
             return Err(NodeStoreError::Malformed);
         }
+        if s.configuration.as_ref().is_some_and(|c| c.revision.0 == 0) {
+            return Err(NodeStoreError::Malformed);
+        }
+        state.configuration = s.configuration;
         state.last_administration = s.last_administration;
         if s.last_work_administration.as_ref().is_some_and(|record| {
             record.caller.authority() != state.authority.authority()

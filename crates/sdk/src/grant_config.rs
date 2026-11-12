@@ -36,6 +36,8 @@ struct ResourceFile {
     account: ResourceId,
     revision: Revision,
     name: String,
+    #[serde(default)]
+    config_change: hellas_authority::model::grant::records::ConfigChange,
     invocation_policy: hellas_rpc::protocol::invocation::InvocationPolicy,
     https: Option<HttpsResource>,
     responses: Option<ResponsesResource>,
@@ -107,6 +109,7 @@ impl GrantConfig {
         use hellas_rpc::protocol::invocation::{InvocationPolicy, Limits};
         let account = ResourceId(hellas_auth::Digest::hash(b"hellas.compute.account.v1"));
         let policy = GrantPolicy {
+            config_change: Default::default(),
             resource: ResourceId(hellas_auth::Digest::hash(b"hellas.compute.resource.v1")),
             account,
             revision: Revision(1),
@@ -154,6 +157,7 @@ impl GrantConfig {
             .resources
             .into_iter()
             .map(|p| GrantPolicy {
+                config_change: p.config_change,
                 resource: p.resource,
                 account: p.account,
                 revision: p.revision,

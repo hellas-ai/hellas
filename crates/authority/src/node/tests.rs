@@ -612,7 +612,7 @@ async fn configured_machine_changes_reach_work_admission() {
             common::common_node::configuration_with(machine, policies.clone()),
             std::num::NonZeroU64::new(20 * 60_000).unwrap(),
         )
-        .reconcile()
+        .configure()
         .await
         .unwrap();
     };
@@ -664,7 +664,7 @@ async fn runtime_budget_commands_cannot_replace_the_configured_tree() {
         common::common_node::configuration(vec![common::policy()]),
         std::num::NonZeroU64::new(60_000).unwrap(),
     );
-    admin.reconcile().await.unwrap();
+    admin.configure().await.unwrap();
     let root = world.administrator(common::actors::ROOT).await;
     let [account, pool, subject] = common::common_node::budgets(
         common::common_node::POOL,

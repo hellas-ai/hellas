@@ -40,14 +40,22 @@ impl WorkAdministration {
 
     /// Apply the host's configuration to an initialized authority. The host is
     /// its own operator here: no caller, audited as host configuration.
-    pub async fn reconcile(&self) -> Result<(), NodeStoreError> {
+    pub async fn configure(&self) -> Result<(), NodeStoreError> {
         let mut decision = crate::audit::Decision::new("host.configuration", None, None);
         let configuration = self.configuration.clone();
         let result = self
             .service
             .administer(async |store, now| {
                 decision.observe(store.state().authority(), None, now);
-                store.reconcile(&configuration, now).await
+                let document = serde_json::to_string(configuration.as_ref())
+                    .map_err(|_| NodeStoreError::Malformed)?;
+                let expected = store
+                    .state()
+                    .configuration()
+                    .map_or(Revision(0), |c| c.revision);
+                store
+                    .configure(expected, document, &configuration, now)
+                    .await
             })
             .await;
         decision.finish(result)

@@ -4231,6 +4231,7 @@ async fn provider_startup_preserves_explicit_allowances_and_machine_limits() {
         id,
         hellas_channel::test_support::actors::ROOT.principal(),
         vec![GrantPolicy {
+            config_change: Default::default(),
             resource: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(
                 b"test resource",
             )),
@@ -4260,6 +4261,7 @@ async fn provider_startup_preserves_explicit_allowances_and_machine_limits() {
     let mut changed = config();
     changed.config.configuration =
         hellas_authority::test_support::common_node::configuration(vec![GrantPolicy {
+            config_change: Default::default(),
             resource: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(
                 b"test resource",
             )),
@@ -4410,6 +4412,7 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
         id,
         revision: hellas_auth::authority::Revision(1),
         policies: vec![GrantPolicy {
+            config_change: Default::default(),
             resource: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(
                 b"test resource",
             )),

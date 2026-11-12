@@ -33,6 +33,7 @@ pub fn responses_policy(options: ResponsesPolicyOptions<'_>) -> Result<GrantPoli
     let contract = hellas_adaptors::openai::responses::fetch::responses_contract()
         .map_err(|_| GrantError::Malformed)?;
     let policy = GrantPolicy {
+        config_change: Default::default(),
         resource,
         account,
         revision,

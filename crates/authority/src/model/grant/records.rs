@@ -96,6 +96,15 @@ pub fn verify_provider(provider: &ProviderEnrollmentBundle) -> Result<(), GrantE
     .map_err(|_| GrantError::Signature)
 }
 
+/// Whether a resource revision preserves work already admitted under its old terms.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigChange {
+    #[default]
+    Keep,
+    Release,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GrantPolicy {
@@ -103,6 +112,8 @@ pub struct GrantPolicy {
     pub account: hellas_auth::authority::ResourceId,
     pub revision: Revision,
     pub name: String,
+    #[serde(default)]
+    pub config_change: ConfigChange,
     #[serde(with = "policy_bytes")]
     pub invocation_policy: InvocationPolicy,
     pub https: Option<super::resource::HttpsResource>,

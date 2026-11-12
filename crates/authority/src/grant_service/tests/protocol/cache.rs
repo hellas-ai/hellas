@@ -331,6 +331,7 @@ async fn catalogue_change_discards_bodies_and_cancels_bound_responses_before_lat
             changed.name = "replacement".into();
         } else {
             changed.revision.0 += 1;
+            changed.config_change = crate::model::grant::records::ConfigChange::Release;
         }
         // Configuring the changed resource reconciles it into the catalogue.
         let admin =
