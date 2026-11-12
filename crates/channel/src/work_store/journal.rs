@@ -64,8 +64,9 @@ pub const MAX_CHECKPOINT_BYTES: usize = MAX_RECORD_BYTES;
 pub enum JournalKind {
     /// The two-Open handshake and its recovery state.
     Setup = 1,
-    /// Metadata-only channel accounting, with content retained separately per job.
-    Channel = 5,
+    /// Metadata-only channel accounting, with content retained separately per
+    /// job, and the compute and delivery lost to unpaid jobs.
+    Channel = 6,
     /// Provider-wide, metadata-only grant tree and channel books.
     Grant = 4,
 }
@@ -116,6 +117,13 @@ pub enum JournalError {
     NotAJournal { path: PathBuf },
     #[error("the file at {path} is not this endpoint's {kind:?} journal")]
     HeaderMismatch { path: PathBuf, kind: JournalKind },
+    /// A journal whose format this version does not read: one written by
+    /// another version, never migrated.
+    #[error(
+        "the journal at {path} is format {kind}, which this version does not read; \
+         it was written by another version of Hellas"
+    )]
+    UnknownKind { path: PathBuf, kind: i64 },
     #[error("journal record of {len} bytes exceeds the {MAX_RECORD_BYTES}-byte maximum")]
     RecordTooLarge { len: usize },
     /// A write failed, so the durable state is unknown to this handle.
@@ -637,16 +645,21 @@ async fn read_head(
         return Ok(None);
     };
     use {JournalKind::*, Role::*};
-    let kind = [Setup, Channel, Grant]
+    let Some(kind) = [Setup, Channel, Grant]
         .into_iter()
-        .find(|k| *k as i64 == row.kind);
+        .find(|k| *k as i64 == row.kind)
+    else {
+        return Err(JournalError::UnknownKind {
+            path: path.into(),
+            kind: row.kind,
+        });
+    };
     let role = [Client, Provider]
         .into_iter()
         .find(|r| *r as i64 == row.role);
     let key = <[u8; 32]>::try_from(row.key).ok();
     let generation = u64::try_from(row.generation).ok();
-    let (Some(kind), Some(role), Some(key), Some(generation)) = (kind, role, key, generation)
-    else {
+    let (Some(role), Some(key), Some(generation)) = (role, key, generation) else {
         return Err(not_a_journal());
     };
     Ok(Some((

@@ -21,6 +21,25 @@ pub struct FinalityProof {
 }
 
 impl FinalityProof {
+    /// Wrap an encoded finalization certificate and its canonical descendants.
+    ///
+    /// Enforces the decoder's certificate, descendant-count and total-byte bounds.
+    /// Encoding does not verify signatures or the descendant chain; use [`Self::verify`]
+    /// or [`ConsensusVerifier::verify_snapshot`] to authenticate the proof.
+    pub fn encode(certificate: &[u8], descendants: &[HellasBlock]) -> Result<Vec<u8>, Error> {
+        if certificate.len() > MAX_CERTIFICATE_BYTES || descendants.len() > MAX_FINALITY_DESCENDANTS
+        {
+            return Err(Error::InvalidFinalization);
+        }
+        let mut bytes = MAGIC.to_vec();
+        append_bytes(&mut bytes, certificate)?;
+        bytes.extend_from_slice(&(descendants.len() as u32).to_be_bytes());
+        for block in descendants {
+            append_bytes(&mut bytes, &block.encode())?;
+        }
+        Ok(bytes)
+    }
+
     pub fn decode(encoded: &[u8]) -> Result<Self, Error> {
         if encoded.len() > MAX_FINALITY_PROOF_BYTES {
             return Err(Error::InvalidFinalization);
@@ -110,21 +129,6 @@ impl FinalityProof {
     }
 }
 
-#[cfg(any(feature = "indexer", feature = "validator", test))]
-pub(crate) fn encode(certificate: &[u8], descendants: &[HellasBlock]) -> Result<Vec<u8>, Error> {
-    if descendants.len() > MAX_FINALITY_DESCENDANTS {
-        return Err(Error::InvalidFinalization);
-    }
-    let mut bytes = MAGIC.to_vec();
-    append_bytes(&mut bytes, certificate)?;
-    bytes.extend_from_slice(&(descendants.len() as u32).to_be_bytes());
-    for block in descendants {
-        append_bytes(&mut bytes, &block.encode())?;
-    }
-    Ok(bytes)
-}
-
-#[cfg(any(feature = "indexer", feature = "validator", test))]
 fn append_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), Error> {
     if out.len().saturating_add(4).saturating_add(bytes.len()) > MAX_FINALITY_PROOF_BYTES {
         return Err(Error::InvalidFinalization);

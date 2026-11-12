@@ -171,6 +171,38 @@ pub enum CloseError {
     /// nothing was decided and nothing was written.
     #[error(transparent)]
     Endpoint(#[from] EndpointError),
+    /// The channel's embedded bond terms have no deterministic timeout
+    /// payout, so its stake has no exit to submit.
+    #[error("the channel's embedded bond terms have no timeout payout")]
+    BondTimeoutUnavailable,
+}
+
+/// The bond Timeout this read makes due, if any.
+///
+/// The stake comes back by its Timeout once the payment edge it insured is
+/// closed — the kernel frees a bond whose lease names an absent payment edge
+/// — or once the bond horizon has passed. The transaction is permissionless
+/// and deterministic, so either endpoint may submit it, and a second
+/// submission of the same bytes is a duplicate rather than a fault.
+///
+/// # Errors
+///
+/// [`CloseError::BondTimeoutUnavailable`] when the embedded bond terms have
+/// no timeout payout.
+pub fn due_bond_timeout(
+    state: &crate::work_store::Channel,
+    observed: &ObservedChannel<'_>,
+) -> Result<Option<Tx>, CloseError> {
+    let payment_terms = state.channel().payment_terms();
+    let bond_terms = Terms::work_stake_bond(payment_terms.bond_terms.clone());
+    if observed.bond.is_none()
+        || (state.close_settled().is_none() && observed.height < bond_terms.timeout().get())
+    {
+        return Ok(None);
+    }
+    Tx::timeout_close(payment_terms.bond_edge, &bond_terms)
+        .map(Some)
+        .ok_or(CloseError::BondTimeoutUnavailable)
 }
 
 /// How far this channel's close has got.
@@ -546,10 +578,11 @@ pub async fn observe<V: SigVerifier>(
 /// Ends every open job at an expired terminal, at the read that closed
 /// the channel to it.
 ///
-/// A contest or a close is the cutoff: no payment is credited after it,
-/// so a job still in flight is one that can no longer be paid for, and
-/// the provider bears whatever compute or delivery it already spent.
-async fn end_open_jobs<V: SigVerifier>(
+/// A contest, a close, or a client's own close start is the cutoff: no
+/// payment is credited after it, so a job still in flight is one that can
+/// no longer be paid for, and the provider bears whatever compute or
+/// delivery it already spent.
+pub(crate) async fn end_open_jobs<V: SigVerifier>(
     store: &mut ChannelStore,
     height: u64,
     payload: [u8; 32],

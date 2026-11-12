@@ -220,7 +220,10 @@ impl ChainIndexer {
                         "finalization did not match its certified block".into(),
                     ));
                 }
-                let encoded = crate::finality_proof::encode(&finalization.encode(), &descendants)?;
+                let encoded = crate::finality_proof::FinalityProof::encode(
+                    &finalization.encode(),
+                    &descendants,
+                )?;
                 return Ok(Some(finalized_block(block, encoded)));
             }
             if descendants.len() >= crate::finality_proof::MAX_FINALITY_DESCENDANTS {

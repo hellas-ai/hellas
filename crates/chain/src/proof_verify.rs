@@ -702,7 +702,8 @@ mod tests {
             height: block.height().get(),
             payload: hex::encode(block.digest()),
             state_root: hex::encode(block.state_root()),
-            finalization: crate::finality_proof::encode(&certificate.encode(), &[]).unwrap(),
+            finalization: crate::finality_proof::FinalityProof::encode(&certificate.encode(), &[])
+                .unwrap(),
             canonical_block: block.encode().to_vec(),
             observed_at_ms: 1000,
             epoch: 0,
