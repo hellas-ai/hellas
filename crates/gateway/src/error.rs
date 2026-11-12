@@ -59,7 +59,7 @@ pub enum GatewayConfigError {
     BackendCount,
     #[error("invalid backend name")]
     BackendName,
-    #[error("backend needs explicit model names")]
+    #[error("invalid backend model names")]
     ModelNames,
     #[error("invalid backend concurrency limit")]
     BackendConcurrency,

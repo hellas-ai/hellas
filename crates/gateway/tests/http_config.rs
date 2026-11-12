@@ -89,6 +89,13 @@ fn public_http_validation_refuses_invalid_backend_configuration() {
     let backend = c.backends.get_mut("model").unwrap();
     backend.routes[0].credential = None;
     backend.models.clear();
+    // Opaque routes need no model selector. A configured name must be valid.
+    c.validate().unwrap();
+    c.backends
+        .get_mut("model")
+        .unwrap()
+        .models
+        .push(String::new());
     assert!(matches!(
         c.validate(),
         Err(GatewayError::Config(GatewayConfigError::ModelNames))
