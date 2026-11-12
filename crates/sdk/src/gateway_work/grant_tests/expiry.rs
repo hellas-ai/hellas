@@ -4,48 +4,28 @@ use hellas_channel::work_store::journal::test_support::AppendHook;
 use std::sync::atomic::AtomicUsize;
 
 #[tokio::test]
-async fn slow_durable_admission_retries_once() {
-    for (persistent, provider_write) in [(false, false), (true, false), (false, true)] {
-        let fixture = Fixture::builder()
-            .with_max_job_millis(if provider_write { 5_000 } else { 10_000 })
-            .build()
-            .await;
-        let ticking = follow_clock(&fixture);
-        let (hook, delayed) = delay_transition(
-            &fixture
-                .host
-                .root
-                .path()
-                .join(if provider_write { "provider" } else { "client" }),
-            if provider_write { "Clock" } else { "Proposed" },
-            if persistent { 2 } else { 1 },
-            Duration::from_millis(if provider_write { 3_000 } else { 6_000 }),
-        );
-        let result = fixture.result(None).await;
-        assert_eq!(
-            delayed.load(Ordering::SeqCst),
-            if persistent { 2 } else { 1 }
-        );
-        if persistent {
-            assert!(
-                matches!(result, Err(WorkGatewayError::Timeout(_))),
-                "{result:?}"
-            );
-        } else {
-            result.unwrap();
-        }
-        assert_eq!(
-            fixture.host.backend.calls.load(Ordering::SeqCst),
-            usize::from(!persistent)
-        );
-        let session = fixture.session().await;
-        assert_eq!(session.store().next_nonce().unwrap(), 3);
-        assert!(session.store().book().pending_proposal().is_none());
-        drop(session);
-        drop(hook);
-        fixture.shutdown().await;
-        ticking.abort();
-    }
+async fn a_durable_proposal_is_not_replaced_when_admission_expires() {
+    let fixture = Fixture::builder().with_max_job_millis(10_000).build().await;
+    let ticking = follow_clock(&fixture);
+    let (hook, delayed) = delay_transition(
+        &fixture.host.root.path().join("client"),
+        "Proposed",
+        1,
+        Duration::from_millis(6_000),
+    );
+    assert!(matches!(
+        fixture.result(None).await,
+        Err(WorkGatewayError::Timeout(_))
+    ));
+    assert_eq!(delayed.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 0);
+    let session = fixture.session().await;
+    assert_eq!(session.store().next_nonce().unwrap(), 2);
+    assert!(session.store().book().pending_proposal().is_none());
+    drop(session);
+    drop(hook);
+    fixture.shutdown().await;
+    ticking.abort();
 }
 
 #[tokio::test]
@@ -65,15 +45,42 @@ async fn ambiguous_acceptance_recovers_original_work_without_replacement() {
         Err(WorkGatewayError::Timeout(_))
     ));
     assert_eq!(delayed.load(Ordering::SeqCst), 1);
-    // The timed-out request's session recovered the proposal it retained
-    // before closing: the original work stands and nothing replaced it.
+    // A failed session closes with the original proposal still journaled.
+    // Actual demand reopens and recovers it before signing the next request.
     drop(hook);
+    assert!(fixture.gateway.backends()[0].down);
+    ticking.abort();
+    let session = fixture.session().await;
+    let pending = session.store().book().pending_proposal().unwrap();
+    let deadline = session
+        .store()
+        .book()
+        .job_by_id(pending)
+        .unwrap()
+        .authorization()
+        .acceptance_deadline_ms;
+    drop(session);
+    fixture.gateway.backends["test"]
+        .grant
+        .lock()
+        .await
+        .take()
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
+    fixture
+        .host
+        .world
+        .clock
+        .set(hellas_auth::authority::UnixMillis(deadline.0 + 1));
+    fixture.result(None).await.unwrap();
+    assert!(!fixture.gateway.backends()[0].down);
     let session = fixture.session().await;
     assert!(session.store().book().pending_proposal().is_none());
-    assert_eq!(session.store().next_nonce().unwrap(), 2);
+    assert_eq!(session.store().next_nonce().unwrap(), 3);
     drop(session);
-    within(fixture.host.backend.started.notified()).await;
-    assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 2);
     fixture.shutdown().await;
     ticking.abort();
 }

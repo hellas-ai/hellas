@@ -1396,6 +1396,7 @@ mod tests {
                 .propose(
                     &fixture.proposal(),
                     &hellas_channel::test_support::channel::program_content().await,
+                    None,
                 )
                 .await
                 .unwrap();

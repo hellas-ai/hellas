@@ -64,6 +64,7 @@ async fn fetch_streams_before_terminal_then_pays_once_with_metadata_only_journal
             .propose(
                 &proposal,
                 &hellas_channel::test_support::channel::program_content().await,
+                None,
             )
             .await
             .unwrap();
@@ -182,6 +183,7 @@ async fn invalid_paid_authorizations_never_invoke_fetch() {
             .propose(
                 &proposal(),
                 &hellas_channel::test_support::channel::program_content().await,
+                None,
             )
             .await
             .unwrap();
@@ -438,6 +440,7 @@ async fn paid_fetch_larger_than_a_wire_frame_streams_and_pays_without_disk_paylo
                 deadlines: deadlines(),
             },
             &hellas_channel::test_support::channel::program_content().await,
+            None,
         )
         .await
         .unwrap();
@@ -514,6 +517,7 @@ async fn streamed_fetch_cannot_pay_without_a_complete_authenticated_terminal() {
             .propose(
                 &proposal,
                 &hellas_channel::test_support::channel::program_content().await,
+                None,
             )
             .await
             .unwrap();
@@ -703,6 +707,7 @@ async fn fetch_is_run_delivered_and_paid_without_provider_disk_bodies() {
         .propose(
             &proposal,
             &hellas_channel::test_support::channel::program_content().await,
+            None,
         )
         .await
         .unwrap();
@@ -818,6 +823,7 @@ async fn restarting_an_accepted_fetch_never_reinvokes_from_a_missing_payload() {
         .propose(
             &proposal(),
             &hellas_channel::test_support::channel::program_content().await,
+            None,
         )
         .await
         .unwrap();
@@ -851,7 +857,8 @@ async fn fetch_refuses_payload_journals_and_retention_requests() {
         client
             .propose(
                 &retained,
-                &hellas_channel::test_support::channel::program_content().await
+                &hellas_channel::test_support::channel::program_content().await,
+                None
             )
             .await
             .is_err()
@@ -910,6 +917,7 @@ async fn fetch_output_limits_include_terminal_and_bad_results_are_never_payable(
         .propose(
             &proposal(),
             &hellas_channel::test_support::channel::program_content().await,
+            None,
         )
         .await
         .unwrap();
@@ -988,6 +996,7 @@ async fn app_attest_paid_fetch_uses_the_signed_scheme_without_disk_payloads() {
         .propose(
             &proposal,
             &hellas_channel::test_support::channel::program_content().await,
+            None,
         )
         .await
         .unwrap();
@@ -1052,7 +1061,7 @@ async fn the_generic_proposal_helper_ignores_unneeded_cached_root_openings_for_f
         let content = (LocalStore::Memory(memory), Scope::Owner);
         let (transport, server) = transport::transport_pair();
         let serving = hellas_channel::test_support::channel::serve_work(server, service.clone());
-        let id = propose_work(transport, &mut client, &proposal(), &content)
+        let id = propose_work(transport, &mut client, &proposal(), &content, None)
             .await
             .unwrap();
         assert_eq!(

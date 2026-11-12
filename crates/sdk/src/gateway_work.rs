@@ -782,7 +782,8 @@ struct Inner {
     target: Backend,
     evaluator: Option<String>,
     signer: Arc<hellas_auth::ProducerSigningKey>,
-    serial: tokio::sync::Mutex<()>,
+    paid: tokio::sync::Mutex<Option<crate::paid_client::PaidWorkSession>>,
+    grant: tokio::sync::Mutex<Option<crate::grant_client::GrantSession>>,
     slots: Arc<Semaphore>,
     capacity: usize,
     down: std::sync::atomic::AtomicBool,
@@ -802,7 +803,8 @@ impl ExecutorGateway {
                             target: entry.backend,
                             evaluator: entry.evaluator,
                             signer: signer.clone(),
-                            serial: tokio::sync::Mutex::new(()),
+                            paid: tokio::sync::Mutex::new(None),
+                            grant: tokio::sync::Mutex::new(None),
                             slots: Arc::new(Semaphore::new(entry.max_in_flight.get())),
                             capacity: entry.max_in_flight.get(),
                             down: Default::default(),
@@ -850,15 +852,8 @@ impl Inner {
         job: Job,
         requester: Requester<E, WorkGatewayError>,
     ) -> Result<(), WorkGatewayError> {
-        use crate::execution::{
-            AttemptError, Controls, ExecutionSession, ExecutionTerms, PaidOpen, open_paid_session,
-        };
+        use crate::execution::{AttemptError, Controls};
         let stop = requester.stop();
-        let Ok(_serial) =
-            crate::execution::before_proposal(None, &stop, None, self.serial.lock()).await
-        else {
-            return Ok(());
-        };
         let request = WorkRequest::Job(job.input().clone());
         let controls = Controls {
             deadline: None,
@@ -869,75 +864,8 @@ impl Inner {
         let pre = |error: ExecutionError| AttemptError::PreProposal(Box::new(error));
         let run = async {
             match &self.target {
-                Backend::Paid {
-                    options,
-                    endpoint,
-                    settlement_key,
-                    owner,
-                    ..
-                } => {
-                    let mut session = crate::execution::before_proposal(
-                        None,
-                        &stop,
-                        None,
-                        open_paid_session(
-                            options.clone(),
-                            endpoint.clone(),
-                            settlement_key.clone(),
-                            owner.clone(),
-                            Default::default(),
-                            PaidOpen::Job(&job),
-                            None,
-                        ),
-                    )
-                    .await
-                    .map_err(AttemptError::Stopped)?
-                    .map_err(pre)?;
-                    self.down.store(false, std::sync::atomic::Ordering::Release);
-                    let result = ExecutionSession::Paid(&mut session)
-                        .run(
-                            &request,
-                            ExecutionTerms::Paid { price: job.price() },
-                            &self.signer,
-                            controls,
-                            None,
-                        )
-                        .await;
-                    session.shutdown().await;
-                    result
-                }
-                Backend::Grant {
-                    options,
-                    transport,
-                    policy,
-                } => {
-                    let mut session = crate::execution::before_proposal(
-                        None,
-                        &stop,
-                        None,
-                        crate::grant_client::GrantSession::open(options.clone(), transport.clone()),
-                    )
-                    .await
-                    .map_err(AttemptError::Stopped)?
-                    .map_err(|error| pre(error.into()))?;
-                    self.down.store(false, std::sync::atomic::Ordering::Release);
-                    let signer = session.execution_signer().clone();
-                    let result = ExecutionSession::Grant(&mut session)
-                        .run(
-                            &request,
-                            ExecutionTerms::Grant {
-                                resource: policy.resource,
-                            },
-                            &signer,
-                            controls,
-                            None,
-                        )
-                        .await;
-                    let closed = session.shutdown().await;
-                    let completed = result?;
-                    closed.map_err(|error| AttemptError::Committed(Box::new(error.into())))?;
-                    Ok(completed)
-                }
+                Backend::Paid { .. } => self.run_paid(&job, &stop, &requester).await,
+                Backend::Grant { .. } => self.run_grant(&request, &stop, &requester).await,
                 #[cfg(feature = "compute")]
                 Backend::Local { .. } => {
                     let result = self
@@ -964,7 +892,7 @@ impl Inner {
             }
         }
         .await;
-        match run {
+        let result = match run {
             Ok(_) => Ok(()),
             Err(AttemptError::PreProposal(error)) => {
                 if backend_failed(&error) {
@@ -974,32 +902,270 @@ impl Inner {
                     *error,
                 ))))
             }
-            Err(AttemptError::Committed(error)) => Err(gateway_error(*error)),
+            Err(AttemptError::Committed(error)) => {
+                if backend_failed(&error)
+                    && !matches!(
+                        &*error,
+                        ExecutionError::Grant(GrantClientError::Refused { .. })
+                    )
+                {
+                    self.down.store(true, std::sync::atomic::Ordering::Release);
+                }
+                Err(gateway_error(*error))
+            }
             Err(AttemptError::Stopped(crate::execution::RequestStopped::Disconnected)) => Ok(()),
             Err(AttemptError::Stopped(error)) => Err(gateway_error(error.into())),
+        };
+        // Keep a healthy channel open. A failed channel closes after its last
+        // accepted job; the next demand opens it and performs recovery once.
+        if self.down.load(std::sync::atomic::Ordering::Acquire)
+            && self.slots.available_permits() + 1 == self.capacity
+        {
+            if let Some(mut session) = self.grant.lock().await.take() {
+                session
+                    .shutdown()
+                    .await
+                    .map_err(|error| gateway_error(error.into()))?;
+            }
+            if let Some(mut session) = self.paid.lock().await.take() {
+                session.shutdown().await;
+            }
         }
+        result
+    }
+    async fn run_paid<E: GatewayEvent>(
+        &self,
+        job: &Job,
+        stop: &crate::execution::Stop,
+        requester: &Requester<E, WorkGatewayError>,
+    ) -> Result<crate::execution::Completed, crate::execution::AttemptError> {
+        use crate::execution::{AttemptError, PaidOpen, before_proposal, open_paid_session};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let pre = |error: ExecutionError| AttemptError::PreProposal(Box::new(error));
+        let committed = |error: ExecutionError| AttemptError::Committed(Box::new(error));
+        let Backend::Paid {
+            options,
+            endpoint,
+            settlement_key,
+            owner,
+            ..
+        } = &self.target
+        else {
+            unreachable!()
+        };
+        let mut guard = before_proposal(None, stop, None, self.paid.lock()).await?;
+        if self.down.load(Ordering::Acquire) && guard.is_some() {
+            return Err(pre(ExecutionError::RecoveryRequired));
+        }
+        if guard.is_none() {
+            let opened = before_proposal(None, stop, None, async {
+                let mut session = open_paid_session(
+                    options.clone(),
+                    endpoint.clone(),
+                    settlement_key.clone(),
+                    owner.clone(),
+                    Default::default(),
+                    PaidOpen::Job(job),
+                    None,
+                )
+                .await?;
+                session
+                    .run(None, &crate::paid_client::empty_content(), true, None)
+                    .await?;
+                Ok::<_, ExecutionError>(session)
+            })
+            .await?
+            .map_err(pre)?;
+            *guard = Some(opened);
+            self.down.store(false, Ordering::Release);
+        }
+        let session = guard
+            .as_mut()
+            .ok_or_else(|| pre(ExecutionError::Identity))?;
+        let floor = session
+            .with_state(|state| state.proposal_nonce_high_water())
+            .await
+            .map_err(|error| pre(error.into()))?;
+        let proposed = Arc::new(AtomicBool::new(false));
+        let proposal = before_proposal(
+            None,
+            stop,
+            Some(&proposed),
+            session.propose_job(job, &self.signer, &proposed),
+        )
+        .await?;
+        let delivery = match proposal {
+            Ok(delivery) => delivery,
+            Err(error) => {
+                let after = session
+                    .with_state(|state| state.proposal_nonce_high_water())
+                    .await
+                    .ok();
+                let error = ExecutionError::from(error);
+                if backend_failed(&error) {
+                    self.down.store(true, Ordering::Release);
+                }
+                return Err(
+                    if !proposed.load(Ordering::Acquire) && after == Some(floor) {
+                        pre(error)
+                    } else {
+                        committed(error)
+                    },
+                );
+            }
+        };
+        drop(guard);
+        let collected = delivery
+            .collect(
+                Some(&requester.progress()),
+                Some(&requester.accepted()),
+                None,
+            )
+            .await
+            .map_err(|error| committed(error.into()))?;
+        // Payment uses the proposal mutex: no new proposal can pass an
+        // unacknowledged cumulative certificate.
+        let mut guard = self.paid.lock().await;
+        let result = guard
+            .as_mut()
+            .ok_or_else(|| committed(ExecutionError::Identity))?
+            .pay(collected)
+            .await;
+        if result.is_err() {
+            self.down.store(true, Ordering::Release);
+        }
+        let result = result.map_err(|error| committed(error.into()))?;
+        drop(guard);
+        let completed = crate::execution::paid_completed(result);
+        requester.delivery()(&completed)
+            .map_err(|error| committed(ExecutionError::Delivery(error)))?;
+        Ok(completed)
+    }
+
+    async fn run_grant<E: GatewayEvent>(
+        &self,
+        request: &WorkRequest,
+        stop: &crate::execution::Stop,
+        requester: &Requester<E, WorkGatewayError>,
+    ) -> Result<crate::execution::Completed, crate::execution::AttemptError> {
+        use crate::execution::{AttemptError, before_proposal, prepare_grant_input};
+        let pre = |error: ExecutionError| AttemptError::PreProposal(Box::new(error));
+        let committed = |error: ExecutionError| AttemptError::Committed(Box::new(error));
+        let Backend::Grant {
+            options,
+            transport,
+            policy,
+        } = &self.target
+        else {
+            unreachable!()
+        };
+        let mut guard = before_proposal(None, stop, None, self.grant.lock()).await?;
+        if self.down.load(std::sync::atomic::Ordering::Acquire) && guard.is_some() {
+            return Err(pre(ExecutionError::RecoveryRequired));
+        }
+        if guard.is_none() {
+            let opened = before_proposal(None, stop, None, async {
+                let mut session =
+                    crate::grant_client::GrantSession::open(options.clone(), transport.clone())
+                        .await?;
+                session.recover().await?;
+                Ok::<_, crate::grant_client::GrantClientError>(session)
+            })
+            .await?
+            .map_err(|error| pre(error.into()))?;
+            *guard = Some(opened);
+            self.down.store(false, std::sync::atomic::Ordering::Release);
+        }
+        let session = guard
+            .as_mut()
+            .ok_or_else(|| pre(ExecutionError::Identity))?;
+        let proposed = std::sync::atomic::AtomicBool::new(false);
+        let proposal = before_proposal(None, stop, Some(&proposed), async {
+            session.refresh().await?;
+            let current = session
+                .offer()
+                .offer()
+                .grant
+                .policies
+                .iter()
+                .find(|current| current.resource == policy.resource)
+                .ok_or(ExecutionError::Identity)?;
+            let input = request.admitted(
+                &current.invocation_policy,
+                current.https.as_ref(),
+                session.assurance(),
+                false,
+            )?;
+            let prepared =
+                prepare_grant_input(&input, current, session.offer(), session.execution_signer())?;
+            Ok::<_, ExecutionError>(
+                session
+                    .propose_resource(policy.resource, prepared, &input.content(), Some(&proposed))
+                    .await?,
+            )
+        })
+        .await?;
+        let delivery = proposal.map_err(|error| {
+            if proposed.load(std::sync::atomic::Ordering::Acquire) {
+                committed(error)
+            } else {
+                pre(error)
+            }
+        })?;
+        drop(guard);
+        // A remote acceptance cannot be cancelled by the HTTP consumer.
+        let collected = delivery
+            .collect(Some(requester.progress()), Some(requester.accepted()))
+            .await
+            .map_err(|error| committed(error.into()))?;
+        let result = self
+            .grant
+            .lock()
+            .await
+            .as_mut()
+            .ok_or_else(|| committed(ExecutionError::Identity))?
+            .complete(collected)
+            .await
+            .map_err(|error| committed(error.into()))?;
+        let completed = crate::execution::grant_completed(result)?;
+        requester.delivery()(&completed)
+            .map_err(|error| committed(ExecutionError::Delivery(error)))?;
+        Ok(completed)
     }
 }
 fn backend_failed(error: &ExecutionError) -> bool {
     use crate::grant_client::GrantClientError as G;
     use crate::paid_client::PaidClientError as P;
-    matches!(
-        error,
-        ExecutionError::RecoveryRequired
-            | ExecutionError::Io(_)
-            | ExecutionError::Paid(
-                P::Connect { .. }
-                    | P::OfferUnavailable { .. }
-                    | P::OfferRefused(_)
-                    | P::SetupEnded(_)
-                    | P::ProviderIdentityPoisoned
-                    | P::Store(_)
-                    | P::Client(_)
-            )
-            | ExecutionError::Grant(
-                G::RecoveryRequired | G::Timeout | G::Wire(_) | G::Client(_) | G::Refused { .. }
-            )
-    )
+    use hellas_channel::work::{DeliverError, ProposeError};
+    use hellas_channel::work_store::WorkStoreError;
+    match error {
+        ExecutionError::Paid(error)
+        | ExecutionError::Transaction(crate::transact::TransactError::Client(error)) => matches!(
+            error,
+            P::Connect { .. }
+                | P::OfferUnavailable { .. }
+                | P::OfferRefused(_)
+                | P::SetupEnded(_)
+                | P::ProviderIdentityPoisoned
+                | P::Store(_)
+                | P::Client(_)
+                | P::Payment(_)
+                | P::Timeout { .. }
+                | P::Propose(
+                    ProposeError::Transport(_)
+                        | ProposeError::Endpoint(_)
+                        | ProposeError::Conflict
+                        | ProposeError::Store(WorkStoreError::Journal(_))
+                )
+                | P::Deliver(DeliverError::Transport(_))
+        ),
+        ExecutionError::RecoveryRequired | ExecutionError::Io(_) => true,
+        ExecutionError::Grant(error) => matches!(
+            error,
+            G::RecoveryRequired | G::Timeout | G::Wire(_) | G::Client(_) | G::Refused { .. }
+        ),
+        _ => false,
+    }
 }
 impl WorkExecutionBackend for ExecutorGateway {
     fn backends(&self) -> Vec<hellas_gateway::BackendInfo> {
@@ -1048,8 +1214,16 @@ impl WorkExecutionBackend for ExecutorGateway {
         }
         self.tasks.close();
         Box::pin(async move {
-            let drained = self.tasks.drain().await;
+            let mut drained = self.tasks.drain().await;
             for backend in self.backends.values() {
+                if let Some(mut session) = backend.grant.lock().await.take()
+                    && let Err(error) = session.shutdown().await
+                {
+                    drained = drained.and(Err(WorkShutdownError::Recovery(Arc::new(error))));
+                }
+                if let Some(mut session) = backend.paid.lock().await.take() {
+                    session.shutdown().await;
+                }
                 if let Some(endpoint) = backend.target.endpoint()
                     && !endpoint.is_closed()
                 {

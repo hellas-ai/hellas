@@ -4,7 +4,7 @@ use hellas_private::StoreLocation;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tracing::Instrument as _;
 
 mod content;
@@ -258,13 +258,14 @@ pub struct PaidWorkResult {
     pub input: hellas_rpc::InputCommitment,
 }
 
-/// A funded client channel. Keep one session per journal and serialize its jobs.
+/// A funded channel. Its owner serializes proposal and payment exchanges;
+/// accepted jobs collect concurrently through the shared journal.
 /// Cancellation retains recovery state; call `run(None, true, None)` to resume it.
 pub struct PaidWorkSession {
     args: PaidWorkOptions,
     descriptor: WorkChannelDescriptor,
     policy: ProviderChannelPolicy,
-    dialer: ProviderDialer,
+    dialer: Arc<ProviderDialer>,
     client: ClientService,
     observer: Option<tokio::task::JoinHandle<()>>,
     needs_recovery: bool,
@@ -552,12 +553,12 @@ impl PaidWorkSession {
         if let Some(bind) = intent.before_open.take() {
             bind()?;
         }
-        let dialer = ProviderDialer::new(
+        let dialer = Arc::new(ProviderDialer::new(
             args.provider.node,
             args.provider_addrs.clone(),
             endpoint,
             trust,
-        );
+        ));
         let mut setup = SetupEndpoint::new(
             store,
             settlement_key.clone(),
@@ -757,14 +758,7 @@ impl PaidWorkSession {
         if !payable {
             return Ok(false);
         }
-        pay_when_ready(
-            &self.dialer,
-            &mut self.client,
-            work,
-            hellas_channel::work::SETUP_POLL,
-            self.args.timeout,
-        )
-        .await?;
+        pay_on(&self.dialer, &mut self.client, work).await?;
         Ok(true)
     }
 
@@ -783,6 +777,46 @@ impl PaidWorkSession {
             })
             .await
             .map_err(Into::into)
+    }
+
+    pub(crate) async fn propose_job(
+        &mut self,
+        job: &crate::job::Job,
+        signer: &hellas_auth::ProducerSigningKey,
+        proposed: &Arc<AtomicBool>,
+    ) -> std::result::Result<PaidDelivery, crate::transact::TransactError> {
+        let quoted = self.descriptor.payment_policy().fixed_price;
+        if quoted != job.price() {
+            return Err(crate::transact::TransactError::Price {
+                quoted,
+                requested: job.price(),
+            });
+        }
+        let (_, prepared) = crate::transact::prepare(self, job, signer, false, None).await?;
+        check_request(
+            &self.policy,
+            &prepared,
+            &self.dialer.trust,
+            hellas_auth::PublicKey::Secp256k1(self.descriptor.channel().client_key().to_bytes()),
+        )?;
+        let ready = fresh_readiness(&self.client, self.args.timeout).await?;
+        self.needs_recovery = true;
+        Ok(propose_paid_job(
+            &self.args,
+            prepared,
+            &job.content(),
+            &self.dialer,
+            &mut self.client,
+            &ready,
+            JobLookup::New,
+            Some(proposed),
+        )
+        .await?)
+    }
+
+    pub(crate) async fn pay(&mut self, mut result: PaidWorkResult) -> Result<PaidWorkResult> {
+        result.credited_cumulative = pay_on(&self.dialer, &mut self.client, result.work_id).await?;
+        Ok(result)
     }
 
     /// Reads local journal state under a short lock.
@@ -824,7 +858,7 @@ impl PaidWorkSession {
         recover: bool,
         progress: Option<hellas_channel::work::PaidProgress>,
         accepted: Option<crate::transact::Accepted>,
-        proposed: Option<&AtomicBool>,
+        proposed: Option<&Arc<AtomicBool>>,
         purchase: Option<&mut crate::transact::Purchase>,
     ) -> Result<Option<PaidWorkResult>> {
         let Self {
@@ -853,14 +887,7 @@ impl PaidWorkSession {
         {
             // A lost acknowledgement never requires fresh admission: these
             // exact certificate bytes are already durable on the client.
-            pay_when_ready(
-                dialer,
-                client,
-                work_id,
-                hellas_channel::work::SETUP_POLL,
-                args.timeout,
-            )
-            .await?;
+            pay_on(dialer, client, work_id).await?;
         }
         if client.with_state(|state| state.is_closing()).await? {
             return if prepared.is_none() {
@@ -969,14 +996,7 @@ impl PaidWorkSession {
                         continue;
                     }
                     RecoveredJob::Delivered(work_id) => {
-                        pay_when_ready(
-                            dialer,
-                            client,
-                            work_id,
-                            hellas_channel::work::SETUP_POLL,
-                            args.timeout,
-                        )
-                        .await?;
+                        pay_on(dialer, client, work_id).await?;
                         continue;
                     }
                     RecoveredJob::Unrecoverable(work_id) => {
@@ -1029,7 +1049,6 @@ impl PaidWorkSession {
                     dialer,
                     client,
                     &ready,
-                    hellas_channel::work::SETUP_POLL,
                     None,
                     None,
                     JobLookup::Retained(work_id),
@@ -1074,7 +1093,6 @@ impl PaidWorkSession {
                     dialer,
                     client,
                     &ready,
-                    hellas_channel::work::SETUP_POLL,
                     progress.as_ref(),
                     accepted.as_ref(),
                     if recover {
@@ -1124,95 +1142,34 @@ fn permanently_refused_delivery(error: &PaidClientError) -> bool {
     matches!(delivery, Some(DeliverError::Refused { refusal, .. }) if !refusal.is_retryable())
 }
 
-/// Proposes until a provider accepts or the caller's execution window closes.
-/// A provider catching its chain cursor up replies `NotReady`; that is not an
-/// answer to the job. The retained proposal makes each retry the same request,
-/// while bounded exponential backoff avoids turning recovery into a request
-/// flood.
-async fn propose_when_ready(
-    args: &PaidWorkOptions,
+/// One exchange; an ambiguous proposal or certificate is recovered when the
+/// session next opens, before any new work is admitted.
+async fn propose_on(
     dialer: &ProviderDialer,
     client: &mut ClientService,
     proposal: &JobProposal,
     content: &(LocalStore, Scope),
     retained: Option<hellas_auth::Digest>,
-    proposed: Option<&AtomicBool>,
+    proposed: Option<&Arc<AtomicBool>>,
 ) -> Result<hellas_auth::Digest> {
-    let deadline = args.timeout.map(|timeout| Instant::now() + timeout);
-    let mut delay = hellas_channel::work::SETUP_POLL.max(Duration::from_secs(1));
-    loop {
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            return Err(PaidClientError::Timeout {
-                stage: "provider admission",
-            });
+    let transport = dialer.work().await?;
+    Ok(match retained {
+        Some(work_id) => {
+            if let Some(proposed) = proposed {
+                proposed.store(true, Ordering::Release);
+            }
+            resume_work_proposal(transport, client, work_id, content).await?
         }
-        let transport = dialer.work().await?;
-        // Once a proposal can leave this process, a lost acknowledgement must
-        // be treated as accepted work. HTTP cancellation may no longer stop it.
-        if let Some(proposed) = proposed {
-            proposed.store(true, Ordering::Release);
-        }
-        let result = match retained {
-            Some(work_id) => resume_work_proposal(transport, client, work_id, content).await,
-            None => propose_work(transport, client, proposal, content).await,
-        };
-        match result {
-            Ok(work_id) => return Ok(work_id),
-            Err(hellas_channel::work::ProposeError::Refused { refusal, .. })
-                if refusal.is_retryable() => {}
-            // A confirmation that lapsed while this proposal waited is renewed
-            // by the observer; it is not an answer to the job either.
-            Err(hellas_channel::work::ProposeError::Endpoint(
-                hellas_channel::work::EndpointError::ObservationStale,
-            )) => {}
-            // Finalized setup can reach the client before the provider's clock
-            // mounts Work. Upload has no structured NotReady response; the
-            // retained half-signed proposal makes this retry the same purchase.
-            Err(hellas_channel::work::ProposeError::Transport(status))
-                if status.code() == hellas_wire::WireCode::Unavailable => {}
-            Err(error) => return Err(error.into()),
-        }
-        let remaining = deadline.map_or(delay, |deadline| {
-            deadline.saturating_duration_since(Instant::now())
-        });
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "inventory class C: proposal backoff"
-        )]
-        tokio::time::sleep(delay.min(remaining)).await;
-        delay = delay.saturating_mul(2).min(Duration::from_secs(10));
-    }
+        None => propose_work(transport, client, proposal, content, proposed.cloned()).await?,
+    })
 }
 
-/// A committed certificate remains the same payment when the provider's chain
-/// observation is temporarily unavailable. Both endpoints deduplicate it.
-async fn pay_when_ready(
+async fn pay_on(
     dialer: &ProviderDialer,
     client: &mut ClientService,
     work_id: hellas_auth::Digest,
-    poll: Duration,
-    timeout: Option<Duration>,
 ) -> Result<u64> {
-    within(timeout, "payment acknowledgement", async {
-        let mut delay = poll.max(Duration::from_secs(1));
-        loop {
-            match pay_for_result(dialer.work().await?, client, work_id).await {
-                Ok(credited) => return Ok(credited),
-                Err(hellas_channel::work::PaymentError::Refused { refusal, .. })
-                    if refusal.is_retryable() => {}
-                Err(hellas_channel::work::PaymentError::Transport(status))
-                    if status.code() == hellas_wire::WireCode::Unavailable => {}
-                Err(error) => return Err(error.into()),
-            }
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "inventory class C: payment backoff"
-            )]
-            tokio::time::sleep(delay).await;
-            delay = delay.saturating_mul(2).min(Duration::from_secs(10));
-        }
-    })
-    .await
+    Ok(pay_for_result(dialer.work().await?, client, work_id).await?)
 }
 
 enum JobLookup {
@@ -1226,16 +1183,41 @@ async fn execute_paid_job(
     args: &PaidWorkOptions,
     prepared: PreparedInvocation,
     content: &(LocalStore, Scope),
-    dialer: &ProviderDialer,
+    dialer: &Arc<ProviderDialer>,
     client: &mut ClientService,
     ready: &hellas_channel::model::setup::ReadyChannel,
-    poll: Duration,
     progress: Option<&hellas_channel::work::PaidProgress>,
     accepted: Option<&crate::transact::Accepted>,
     lookup: JobLookup,
-    proposed: Option<&AtomicBool>,
+    proposed: Option<&Arc<AtomicBool>>,
     purchase: Option<&mut crate::transact::Purchase>,
 ) -> Result<PaidWorkResult> {
+    let delivery = propose_paid_job(
+        args, prepared, content, dialer, client, ready, lookup, proposed,
+    )
+    .await?;
+    let mut purchase = purchase;
+    let mut result = delivery
+        .collect(progress, accepted, purchase.as_deref_mut())
+        .await?;
+    result.credited_cumulative = pay_on(dialer, client, result.work_id).await?;
+    if let Some(purchase) = purchase {
+        purchase.paid(result.work_id)?;
+    }
+    Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn propose_paid_job(
+    args: &PaidWorkOptions,
+    prepared: PreparedInvocation,
+    content: &(LocalStore, Scope),
+    dialer: &Arc<ProviderDialer>,
+    client: &mut ClientService,
+    ready: &hellas_channel::model::setup::ReadyChannel,
+    lookup: JobLookup,
+    proposed: Option<&Arc<AtomicBool>>,
+) -> Result<PaidDelivery> {
     let prepared_bytes = prepared.canonical_bytes()?;
     let current = client.with_state(|state| state.cursor().0).await?;
     let deadlines = deadlines(
@@ -1283,16 +1265,7 @@ async fn execute_paid_job(
     }
     let (work_id, collected) = match existing.first().copied() {
         Some((work_id, hellas_channel::work_store::JobPhase::HalfSigned, _)) => (
-            propose_when_ready(
-                args,
-                dialer,
-                client,
-                &proposal,
-                content,
-                Some(work_id),
-                proposed,
-            )
-            .await?,
+            propose_on(dialer, client, &proposal, content, Some(work_id), proposed).await?,
             None,
         ),
         Some((work_id, hellas_channel::work_store::JobPhase::Ready, _))
@@ -1305,12 +1278,12 @@ async fn execute_paid_job(
                 .state()
                 .job_by_id(work_id)
                 .filter(|job| !job.transcript().is_empty())
-                .map(|job| job.transcript.clone());
+                .map(|job| job.transcript.to_vec());
             (work_id, retained)
         }
         Some((work_id, _, _)) => (work_id, None),
         None => (
-            propose_when_ready(args, dialer, client, &proposal, content, None, proposed).await?,
+            propose_on(dialer, client, &proposal, content, None, proposed).await?,
             None,
         ),
     };
@@ -1322,27 +1295,62 @@ async fn execute_paid_job(
         })
         .await?
         .ok_or(PaidClientError::MissingState("accepted work signature"))?;
-    if let Some(accepted) = accepted {
-        accepted(hellas_rpc::provenance::ExecutionProvenance {
-            commitment_id: *work_id.as_bytes(),
-            provider: hellas_auth::PublicKey::Secp256k1(ready.channel().provider_key().to_bytes()),
-        });
-    }
-    let transcript = if let Some(transcript) = collected {
-        transcript
-    } else {
-        let mut emitted = false;
-        let delivery = loop {
-            let result = hellas_channel::work::fetch_result_stream(
+    Ok(PaidDelivery {
+        client: client.clone(),
+        dialer: dialer.clone(),
+        ready: ready.clone(),
+        prepared: proposal.prepared_input,
+        work_id,
+        acceptance_signature,
+        collected,
+    })
+}
+
+pub(crate) struct PaidDelivery {
+    client: ClientService,
+    dialer: Arc<ProviderDialer>,
+    ready: hellas_channel::model::setup::ReadyChannel,
+    prepared: PreparedInvocation,
+    work_id: hellas_auth::Digest,
+    acceptance_signature: hellas_kernel::Sig,
+    collected: Option<Vec<u8>>,
+}
+impl PaidDelivery {
+    pub(crate) async fn collect(
+        self,
+        progress: Option<&hellas_channel::work::PaidProgress>,
+        accepted: Option<&crate::transact::Accepted>,
+        purchase: Option<&mut crate::transact::Purchase>,
+    ) -> Result<PaidWorkResult> {
+        let Self {
+            mut client,
+            dialer,
+            ready,
+            prepared,
+            work_id,
+            acceptance_signature,
+            collected,
+        } = self;
+        let client = &mut client;
+        let ready = &ready;
+        if let Some(accepted) = accepted {
+            accepted(hellas_rpc::provenance::ExecutionProvenance {
+                commitment_id: *work_id.as_bytes(),
+                provider: hellas_auth::PublicKey::Secp256k1(
+                    ready.channel().provider_key().to_bytes(),
+                ),
+            });
+        }
+        let transcript = if let Some(transcript) = collected {
+            transcript
+        } else {
+            let delivery = hellas_channel::work::fetch_result_stream(
                 dialer.work().await?,
                 client,
                 ready,
                 work_id,
                 |event| {
-                    // Output is only exposed when a user stream observes it;
-                    // recovery without one may safely retry after any event.
                     if let Some(progress) = progress {
-                        emitted = true;
                         progress(event.clone()).map_err(|error| {
                             hellas_channel::model::work::PaidWorkError::Transcript(
                                 error.to_string(),
@@ -1352,84 +1360,46 @@ async fn execute_paid_job(
                     Ok(())
                 },
             )
-            .await;
-            let error = match result {
-                Ok(delivery) => break delivery,
-                Err(error) => error,
-            };
-            let retryable = match &error {
-                hellas_channel::work::DeliverError::Transport(status) => {
-                    status.code == hellas_wire::WireCode::Unavailable
-                }
-                hellas_channel::work::DeliverError::Refused { refusal, .. } => {
-                    refusal.is_retryable()
-                }
-                _ => false,
-            };
-            // Retry delivery of this accepted job only before exposing output.
-            // Reopening after a prefix would replay it into the user's stream.
-            if emitted || !retryable {
-                return Err(error.into());
-            }
-            check_payment_window(client, work_id).await?;
-            tracing::debug!(%error, %work_id, "waiting for paid result stream readiness");
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "inventory class C: result-stream retry"
-            )]
-            tokio::time::sleep(poll.max(Duration::from_secs(1))).await;
-        };
-        check_payment_window(client, work_id).await?;
-        delivery.transcript
-    };
-    let verified = verify_transcript(
-        &proposal.prepared_input,
-        ready.invocation_policy(),
-        &hellas_auth::PublicKey::Secp256k1(ready.channel().client_key().to_bytes()),
-        &hellas_auth::PublicKey::Secp256k1(ready.channel().provider_key().to_bytes()),
-        &transcript,
-    )?;
-    let output = verified.output;
-    if let hellas_rpc::protocol::invocation::output::Outcome::Failed(reason) = output.outcome {
-        client
-            .client()
-            .await?
-            .rejected(work_id, verified.transcript.id().digest())
             .await?;
-        if let Some(purchase) = purchase {
-            purchase.unpaid(work_id)?;
+            check_payment_window(client, work_id).await?;
+            delivery.transcript.to_vec()
+        };
+        let verified = verify_transcript(
+            &prepared,
+            ready.invocation_policy(),
+            &hellas_auth::PublicKey::Secp256k1(ready.channel().client_key().to_bytes()),
+            &hellas_auth::PublicKey::Secp256k1(ready.channel().provider_key().to_bytes()),
+            &transcript,
+        )?;
+        let output = verified.output;
+        if let hellas_rpc::protocol::invocation::output::Outcome::Failed(reason) = output.outcome {
+            client
+                .client()
+                .await?
+                .rejected(work_id, verified.transcript.id().digest())
+                .await?;
+            if let Some(purchase) = purchase {
+                purchase.unpaid(work_id)?;
+            }
+            return Err(PaidClientError::InvocationFailed { work_id, reason });
         }
-        return Err(PaidClientError::InvocationFailed { work_id, reason });
+        client.client().await?.verified(work_id, &prepared).await?;
+        Ok(PaidWorkResult {
+            bond_edge: ready.channel().payment_terms().bond_edge,
+            payment_edge: ready.channel().payment_edge(),
+            channel_id: ready.channel().id(),
+            work_id,
+            acceptance_signature,
+            job_price: ready.payment_policy().fixed_price,
+            credited_cumulative: 0,
+            transcript,
+            output,
+            provider_key: hellas_auth::PublicKey::Secp256k1(
+                ready.channel().provider_key().to_bytes(),
+            ),
+            input: prepared.request.input_commitment()?,
+        })
     }
-    client
-        .client()
-        .await?
-        .verified(work_id, &proposal.prepared_input)
-        .await?;
-    let credited = pay_when_ready(
-        dialer,
-        client,
-        work_id,
-        hellas_channel::work::SETUP_POLL,
-        args.timeout,
-    )
-    .await?;
-    if let Some(purchase) = purchase {
-        purchase.paid(work_id)?;
-    }
-    Ok(PaidWorkResult {
-        bond_edge: ready.channel().payment_terms().bond_edge,
-        payment_edge: ready.channel().payment_edge(),
-        channel_id: ready.channel().id(),
-        work_id,
-        acceptance_signature,
-        job_price: ready.payment_policy().fixed_price,
-        credited_cumulative: credited,
-        transcript: transcript.to_vec(),
-        output,
-        provider_key: hellas_auth::PublicKey::Secp256k1(ready.channel().provider_key().to_bytes()),
-        input: proposal.prepared_input.request.input_commitment()?,
-    })
 }
 
 fn verify_transcript(

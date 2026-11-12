@@ -2,6 +2,7 @@ use super::*;
 use crate::test_support::enrollment;
 use futures::StreamExt as _;
 use hellas_private::StoreLocation;
+mod concurrency;
 mod offer;
 mod recovery;
 use hellas_auth::{ProducerSigningKey, PublicKey};

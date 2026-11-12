@@ -494,7 +494,7 @@ async fn model_job_restart_inner(provider_held: bool) {
         }
     });
 
-    let failed = propose_work(transport, &mut endpoint, &proposal, &content).await;
+    let failed = propose_work(transport, &mut endpoint, &proposal, &content, None).await;
 
     serving.abort();
     let _ = serving.await;

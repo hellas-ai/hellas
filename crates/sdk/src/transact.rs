@@ -46,13 +46,13 @@ pub struct TransactionOptions<'a> {
     pub new_purchase: bool,
     pub progress: Option<PaidProgress>,
     pub accepted: Option<Accepted>,
-    pub proposed: Option<&'a AtomicBool>,
+    pub proposed: Option<&'a std::sync::Arc<AtomicBool>>,
 }
 
 /// Selects a retained purchase by its signed content commitment. This works for
 /// metadata-only Fetch journals: the caller supplies the original job folder,
 /// and the existing authorization supplies the durable purchase counter.
-async fn prepare(
+pub(crate) async fn prepare(
     session: &PaidWorkSession,
     job: &Job,
     key: &ProducerSigningKey,

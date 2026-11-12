@@ -118,6 +118,7 @@ pub struct Backend {
     pub cancelled: Arc<Notify>,
     pub stop_on_cancel: bool,
     pub reply: Reply,
+    pub usage: Option<Usage>,
     pub inspect: Option<fn(&FetchInput)>,
     pub inspect_content: Option<ContentInspection>,
     pub signer: Arc<hellas_auth::ProducerSigningKey>,
@@ -135,6 +136,7 @@ impl Default for Backend {
             cancelled: Arc::new(Notify::new()),
             stop_on_cancel: false,
             reply: Reply::text("private-grant-result", 1),
+            usage: None,
             inspect: None,
             inspect_content: None,
             signer: Arc::new(principal(2).1),
@@ -263,7 +265,7 @@ impl WorkBackend for Backend {
                 &payloads,
                 &encode_fetch_terminal_payload(&OutputEvent::Finished {
                     stop_reason: StopReason::EndOfText,
-                    usage: None,
+                    usage: self.usage,
                 })
                 .unwrap(),
             )

@@ -766,6 +766,7 @@ async fn a_provider_signs_no_result_the_frame_would_not_carry() {
                 deadlines: deadlines(),
             },
             &program_content().await,
+            None,
         )
         .await
         .unwrap();
@@ -1057,6 +1058,7 @@ async fn one_channel_runs_fetch_then_compute_with_per_job_retention_and_durable_
                     deadlines: deadlines(),
                 },
                 &program_content().await,
+                None,
             )
             .await
             .unwrap();

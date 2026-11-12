@@ -283,6 +283,7 @@ async fn an_accepted_exchange_leaves_both_signatures_on_both_disks() {
         &mut endpoint,
         &proposal(1),
         &hellas_channel::test_support::channel::program_content().await,
+        None,
     )
     .await;
     let Ok(work_id) = accepted else {
@@ -347,7 +348,13 @@ async fn a_retained_compute_proposal_resumes_after_an_interrupted_preacceptance_
     let content = hellas_channel::test_support::channel::program_content().await;
     let pending_proposal = proposal(1);
     {
-        let sending = propose_work(client_transport, &mut endpoint, &pending_proposal, &content);
+        let sending = propose_work(
+            client_transport,
+            &mut endpoint,
+            &pending_proposal,
+            &content,
+            None,
+        );
         tokio::pin!(sending);
         tokio::time::timeout(hellas_channel::test_support::HANG_GUARD, async {
             tokio::select! {
@@ -438,6 +445,7 @@ async fn a_missing_retained_proposal_root_blocks_recovery_and_collection() {
         .propose(
             &proposal(2),
             &hellas_channel::test_support::channel::program_content().await,
+            None,
         )
         .await
         .unwrap();
@@ -512,6 +520,7 @@ async fn an_unreconstructable_proposal_releases_the_channel_for_a_fresh_nonce() 
                 deadlines: deadlines(),
             },
             &hellas_channel::test_support::channel::program_content().await,
+            None,
         )
         .await
         .unwrap();
@@ -558,6 +567,7 @@ async fn an_unreconstructable_proposal_releases_the_channel_for_a_fresh_nonce() 
                 deadlines: deadlines(),
             },
             &hellas_channel::test_support::channel::program_content().await,
+            None,
         )
         .await
         .expect("a fresh proposal is admitted after the release");
@@ -650,6 +660,7 @@ async fn a_client_journals_its_signature_before_the_request_leaves() {
         .propose(
             &proposal(1),
             &hellas_channel::test_support::channel::program_content().await,
+            None,
         )
         .await
     else {
@@ -697,6 +708,7 @@ async fn a_proposal_refused_before_signing_leaves_no_job() {
         .propose(
             &unreachable,
             &hellas_channel::test_support::channel::program_content().await,
+            None,
         )
         .await;
     assert!(
@@ -733,6 +745,7 @@ async fn a_repeat_proposal_returns_the_retained_request() {
         .propose(
             &proposal(1),
             &hellas_channel::test_support::channel::program_content().await,
+            None,
         )
         .await
     else {
@@ -742,6 +755,7 @@ async fn a_repeat_proposal_returns_the_retained_request() {
         .propose(
             &proposal(1),
             &hellas_channel::test_support::channel::program_content().await,
+            None,
         )
         .await
     else {
@@ -759,6 +773,7 @@ async fn a_retained_proposal_survives_restart_expiry_and_policy_change() {
         .propose(
             &proposal(1),
             &hellas_channel::test_support::channel::program_content().await,
+            None,
         )
         .await
         .unwrap();
@@ -841,6 +856,7 @@ async fn a_different_proposal_waits_for_the_outstanding_reply() {
         .propose(
             &proposal(1),
             &hellas_channel::test_support::channel::program_content().await,
+            None,
         )
         .await
         .unwrap();
@@ -848,7 +864,8 @@ async fn a_different_proposal_waits_for_the_outstanding_reply() {
         endpoint
             .propose(
                 &proposal(2),
-                &hellas_channel::test_support::channel::program_content().await
+                &hellas_channel::test_support::channel::program_content().await,
+                None
             )
             .await,
         Err(ProposeError::Conflict)
@@ -867,7 +884,8 @@ async fn a_different_proposal_waits_for_the_outstanding_reply() {
         endpoint
             .propose(
                 &proposal(1),
-                &hellas_channel::test_support::channel::program_content().await
+                &hellas_channel::test_support::channel::program_content().await,
+                None
             )
             .await
             .unwrap(),
@@ -887,7 +905,8 @@ async fn a_different_proposal_waits_for_the_outstanding_reply() {
         endpoint
             .propose(
                 &proposal(2),
-                &hellas_channel::test_support::channel::program_content().await
+                &hellas_channel::test_support::channel::program_content().await,
+                None
             )
             .await
             .is_ok()
@@ -938,6 +957,7 @@ async fn a_known_refusal_releases_only_the_proposal_slot_durably() {
         .propose(
             &proposal(1),
             &hellas_channel::test_support::channel::program_content().await,
+            None,
         )
         .await
         .unwrap();
@@ -1018,7 +1038,8 @@ async fn a_known_refusal_releases_only_the_proposal_slot_durably() {
         reopened
             .propose(
                 &proposal(2),
-                &hellas_channel::test_support::channel::program_content().await
+                &hellas_channel::test_support::channel::program_content().await,
+                None
             )
             .await,
         Err(ProposeError::Conflict)
@@ -1034,7 +1055,8 @@ async fn a_known_refusal_releases_only_the_proposal_slot_durably() {
         reopened
             .propose(
                 &proposal(2),
-                &hellas_channel::test_support::channel::program_content().await
+                &hellas_channel::test_support::channel::program_content().await,
+                None
             )
             .await
             .is_ok()
@@ -1050,6 +1072,7 @@ async fn a_lost_reply_blocks_new_nonces_across_restart_and_malformed_replies() {
         .propose(
             &proposal(1),
             &hellas_channel::test_support::channel::program_content().await,
+            None,
         )
         .await
         .unwrap();
@@ -1109,7 +1132,8 @@ async fn a_lost_reply_blocks_new_nonces_across_restart_and_malformed_replies() {
         reopened
             .propose(
                 &proposal(2),
-                &hellas_channel::test_support::channel::program_content().await
+                &hellas_channel::test_support::channel::program_content().await,
+                None
             )
             .await,
         Err(ProposeError::Conflict)
@@ -1157,6 +1181,7 @@ async fn a_co_signature_from_another_key_is_not_an_acceptance() {
         .propose(
             &proposal(1),
             &hellas_channel::test_support::channel::program_content().await,
+            None,
         )
         .await
     else {
@@ -1189,6 +1214,7 @@ async fn a_refusal_is_read_back_as_the_refusal_it_names() {
         .propose(
             &proposal(1),
             &hellas_channel::test_support::channel::program_content().await,
+            None,
         )
         .await
     else {
@@ -1232,6 +1258,7 @@ async fn every_wire_code_reads_back_as_the_refusal_it_names() {
             .propose(
                 &proposal(1),
                 &hellas_channel::test_support::channel::program_content().await,
+                None,
             )
             .await
         else {
@@ -1260,6 +1287,7 @@ async fn a_response_this_service_does_not_define_is_malformed() {
         .propose(
             &proposal(1),
             &hellas_channel::test_support::channel::program_content().await,
+            None,
         )
         .await
     else {
@@ -1418,6 +1446,7 @@ async fn a_retry_after_the_deadline_still_returns_the_retained_signature() {
         .propose(
             &proposal(1),
             &hellas_channel::test_support::channel::program_content().await,
+            None,
         )
         .await
         .expect("the client journals its proposal");
@@ -1597,6 +1626,7 @@ async fn expired_upload_returns_the_typed_refusal_and_preserves_the_signed_propo
         &mut endpoint,
         &proposal(1),
         &hellas_channel::test_support::channel::program_content().await,
+        None,
     )
     .await;
     assert!(matches!(
@@ -2128,6 +2158,7 @@ async fn the_wire_carries_the_authorization_the_signature_covers() {
         .propose(
             &proposal(1),
             &hellas_channel::test_support::channel::program_content().await,
+            None,
         )
         .await
     else {
@@ -2179,6 +2210,7 @@ async fn shared_client_can_follow_blocks_while_waiting_for_provider_acceptance()
             &mut client,
             &proposal(1),
             &hellas_channel::test_support::channel::program_content().await,
+            None,
         )
         .await
     });
@@ -2291,7 +2323,8 @@ async fn managed_observers_start_closed_and_stale_certified_reads_cannot_admit()
         client
             .propose(
                 &proposal(1),
-                &hellas_channel::test_support::channel::program_content().await
+                &hellas_channel::test_support::channel::program_content().await,
+                None
             )
             .await,
         Err(ProposeError::Endpoint(EndpointError::ObservationStale))

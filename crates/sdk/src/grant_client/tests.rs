@@ -83,6 +83,11 @@ fn backend(slots: Arc<Semaphore>, calls: Arc<AtomicUsize>) -> Backend {
         calls,
         finish: Completion::Immediate,
         reply: Reply::text("sdk-private-output", 1),
+        usage: Some(hellas_rpc::output::Usage {
+            input_tokens: Some(1),
+            output_tokens: Some(1),
+            total_tokens: Some(2),
+        }),
         ..Backend::default()
     }
 }
@@ -295,7 +300,7 @@ async fn lost_acceptance_recovers_from_metadata_without_replaying_input() {
                 .unwrap();
         let signature = session
             .store
-            .propose(&offer, a, &input, &principal(1).1, UnixMillis(1000))
+            .propose(&offer, a, &input, &principal(1).1, UnixMillis(1000), None)
             .await
             .unwrap();
         if accepted {

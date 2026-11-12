@@ -3039,6 +3039,7 @@ impl ClientEndpoint {
             hellas_store::content::Scope,
         ),
         cancellation: &admission::Cancellation,
+        proposed: Option<&AtomicBool>,
     ) -> Result<AcceptWorkRequest, ProposeError> {
         self.store.check_authority()?;
         if let Some(observation) = &self.observation {
@@ -3071,6 +3072,9 @@ impl ClientEndpoint {
         }
 
         if let Some(id) = retry {
+            if let Some(proposed) = proposed {
+                proposed.store(true, Ordering::Release);
+            }
             return self.resume_proposal(id).await;
         }
 
@@ -3108,6 +3112,9 @@ impl ClientEndpoint {
             authorization.terminal_deadline,
             authorization.payment_deadline,
         )?;
+        self.state()
+            .check_capacity(authorization.price)
+            .map_err(WorkStoreError::from)?;
         let prepared_input = proposal
             .prepared_input
             .canonical_bytes()
@@ -3121,6 +3128,9 @@ impl ClientEndpoint {
                 .await?;
             if cancellation.is_cancelled() {
                 return Err(ProposeError::Content(hellas_store::content::Error::Denied));
+            }
+            if let Some(proposed) = proposed {
+                proposed.store(true, Ordering::Release);
             }
             let signature = self.signer.sign(signing_hash(work_id));
             self.store
@@ -3161,7 +3171,7 @@ impl ClientEndpoint {
             hellas_store::content::Scope,
         ),
     ) -> Result<AcceptWorkRequest, ProposeError> {
-        self.propose_owned(proposal, content, &admission::Cancellation::new())
+        self.propose_owned(proposal, content, &admission::Cancellation::new(), None)
             .await
     }
 
@@ -3710,13 +3720,14 @@ pub async fn propose_work<T>(
         hellas_store::content::LocalStore,
         hellas_store::content::Scope,
     ),
+    proposed: Option<Arc<AtomicBool>>,
 ) -> Result<Digest, ProposeError>
 where
     T: StreamTransport + Clone + Send + Sync,
     T::Error: std::error::Error + Send + Sync + 'static,
     T::Stream: 'static,
 {
-    let request = endpoint.propose(proposal, content).await?;
+    let request = endpoint.propose(proposal, content, proposed).await?;
     content::transfer_proposal(transport, endpoint, request, content).await
 }
 

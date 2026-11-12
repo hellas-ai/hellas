@@ -101,6 +101,7 @@ async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
             .propose(
                 &fixture.proposal(),
                 &hellas_channel::test_support::channel::program_content().await,
+                None,
             )
             .await
             .unwrap();
@@ -117,6 +118,7 @@ async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
             .propose(
                 &delivered_proposal,
                 &hellas_channel::test_support::channel::program_content().await,
+                None,
             )
             .await
             .unwrap();
@@ -270,12 +272,12 @@ async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
                 },
                 descriptor: fixture.descriptor.clone(),
                 policy: fixture.policy.clone(),
-                dialer: ProviderDialer::new(
+                dialer: Arc::new(ProviderDialer::new(
                     server.id(),
                     server.bound_sockets(),
                     endpoint.clone(),
                     trust.clone(),
-                ),
+                )),
                 client,
                 observer: None,
                 needs_recovery: true,

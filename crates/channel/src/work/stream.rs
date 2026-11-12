@@ -1267,6 +1267,7 @@ mod tests {
                     deadlines: fixture::deadlines(),
                 },
                 &fixture::program_content().await,
+                None,
             )
             .await
             .unwrap();

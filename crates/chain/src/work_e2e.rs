@@ -764,6 +764,7 @@ async fn run_one_paid_job(opened: &mut Opened) -> u64 {
         &mut opened.client,
         &proposal,
         &hellas_channel::test_support::channel::program_content().await,
+        None,
     )
     .await
     .expect("the provider accepts the proposed job");

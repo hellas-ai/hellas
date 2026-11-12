@@ -30,9 +30,9 @@ impl ClientChannel for ClientEndpoint {
     }
 }
 
-/// The single request owner for a client channel. Requests retain exclusive
-/// exchange ordering while the observer independently borrows the journal.
-#[derive(Debug)]
+/// Shared journal access. The session owner serializes proposal and payment
+/// exchanges; result collectors and the observer take only short journal locks.
+#[derive(Clone, Debug)]
 pub struct ClientService {
     observer: ClientObserver,
 }
@@ -70,6 +70,7 @@ impl ClientService {
             hellas_store::content::LocalStore,
             hellas_store::content::Scope,
         ),
+        proposed: Option<Arc<AtomicBool>>,
     ) -> Result<AcceptWorkRequest, ProposeError> {
         let mut endpoint = self
             .observer
@@ -83,7 +84,7 @@ impl ClientService {
         let content = content.clone();
         let result = tokio::spawn(async move {
             endpoint
-                .propose_owned(&proposal, &content, &cancellation)
+                .propose_owned(&proposal, &content, &cancellation, proposed.as_deref())
                 .await
         })
         .await
@@ -443,6 +444,7 @@ mod proposal_tests {
                     deadlines: fixture::deadlines(),
                 },
                 &source,
+                None,
             )
             .await
             .unwrap_err();
@@ -468,6 +470,7 @@ mod proposal_tests {
                     deadlines: fixture::deadlines(),
                 },
                 &source,
+                None,
             )
             .await
             .unwrap();
@@ -519,7 +522,7 @@ mod proposal_tests {
             prepared_input: fixture::bundle(1),
             deadlines: fixture::deadlines(),
         };
-        let mut request = Box::pin(client.propose(&proposal, &source));
+        let mut request = Box::pin(client.propose(&proposal, &source, None));
         assert!(futures::poll!(request.as_mut()).is_pending());
         drop(request);
         let mut observed = Box::pin(observer.with_state(|state| state.jobs().count()));
@@ -546,6 +549,7 @@ mod proposal_tests {
                     deadlines: fixture::deadlines(),
                 },
                 &source,
+                None,
             )
             .await
             .unwrap();

@@ -31,7 +31,14 @@ async fn signed_model_and_settings_limits_reject_before_client_signing_and_provi
         wrong_price.pricing_revision = revision;
         assert_err!(
             client
-                .propose(&offer, wrong_price, &valid_input, &principal(1).1, now)
+                .propose(
+                    &offer,
+                    wrong_price,
+                    &valid_input,
+                    &principal(1).1,
+                    now,
+                    None
+                )
                 .await,
             NodeStoreError::Grant(GrantError::OutOfScope)
         );
@@ -68,7 +75,7 @@ async fn signed_model_and_settings_limits_reject_before_client_signing_and_provi
         a.input_content = hellas_rpc::ContentRef::for_bytes(&input.canonical_bytes().unwrap());
         a.prepared_input_digest = hellas_channel::job::bound_prepared_input_digest(network(), a.channel_id.0, &input).unwrap();
         a.request_commitment = input.request.commitment().unwrap();
-        assert_err!(client.propose(&offer, a, &input, &principal(1).1, now).await, NodeStoreError::Resource(error) if error == expected);
+        assert_err!(client.propose(&offer, a, &input, &principal(1).1, now, None).await, NodeStoreError::Resource(error) if error == expected);
         assert_eq!(client.next_nonce().unwrap(), 1);
         assert!(client.book().pending_proposal().is_none());
         let signature = principal(1).1.sign_digest(grant_work_id(network(), &a)).unwrap();
@@ -77,7 +84,7 @@ async fn signed_model_and_settings_limits_reject_before_client_signing_and_provi
         assert_eq!(store.state(), &original);
     }
     let signature = client
-        .propose(&offer, template, &valid_input, &principal(1).1, now)
+        .propose(&offer, template, &valid_input, &principal(1).1, now, None)
         .await
         .unwrap();
     accept(

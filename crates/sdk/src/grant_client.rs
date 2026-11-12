@@ -627,7 +627,7 @@ pub struct GrantSession {
     observed: UnixMillis,
     standing_now: UnixMillis,
     observed_at: Instant,
-    pending_body: Option<(Digest, PreparedInvocation, (LocalStore, Scope))>,
+    pending_body: std::collections::BTreeMap<Digest, (PreparedInvocation, (LocalStore, Scope))>,
 }
 impl GrantSession {
     pub(crate) fn execution_target(&self) -> Result<crate::execution::ExecutionTarget> {
@@ -684,7 +684,7 @@ impl GrantSession {
             observed: standing.now,
             standing_now: standing.now,
             observed_at,
-            pending_body: None,
+            pending_body: Default::default(),
         })
     }
     pub fn offer(&self) -> &SignedOffer {
@@ -794,15 +794,9 @@ impl GrantSession {
             .ok_or(GrantProtocolError::PendingProposal)?;
         let a = *job.authorization();
         let signature = job.client_signature();
-        let prepared = self
-            .pending_body
-            .as_ref()
-            .filter(|(work, _, _)| *work == id)
-            .cloned();
+        let prepared = self.pending_body.get(&id).cloned();
         let prepared = match prepared {
-            Some((_, body, content)) => {
-                Some((PreparedUpload::new(&body, &content).await?, content))
-            }
+            Some((body, content)) => Some((PreparedUpload::new(&body, &content).await?, content)),
             None => None,
         };
         let probe = prepared.is_none();
@@ -865,7 +859,7 @@ impl GrantSession {
                         .map_err(GrantClientError::from)?,
                 );
                 self.store.accepted(id, signature, self.now()).await?;
-                self.pending_body = None;
+                self.pending_body.remove(&id);
                 Ok(())
             }
             Some(accept_work_response::Outcome::Refused(refusal)) => {
@@ -885,7 +879,7 @@ impl GrantSession {
                         }
                     );
                 if conclusive && !malformed_probe {
-                    self.pending_body = None;
+                    self.pending_body.remove(&id);
                     if let Some(tracker) = tracker {
                         tracker
                             .mark_rejected(id)
@@ -912,7 +906,7 @@ impl GrantSession {
             return Err(GrantProtocolError::AcceptanceIdentity.into());
         }
         if pending == Some(work) {
-            self.pending_body = None;
+            self.pending_body.remove(&work);
             self.store.refused(work, self.now()).await?;
         }
         Ok(())
@@ -980,7 +974,39 @@ impl GrantSession {
         proposed: Option<&std::sync::atomic::AtomicBool>,
         tracker: Option<&mut crate::execution::GrantAttempt>,
     ) -> Result<GrantWorkResult> {
-        let (policy, id, mut stream, finish_by) = self
+        let delivery = self
+            .propose_selected(selection, input, content, proposed, tracker)
+            .await?;
+        let completed = delivery.collect(progress, accepted).await?;
+        self.complete(completed).await
+    }
+
+    pub(crate) async fn propose_resource(
+        &mut self,
+        resource: hellas_auth::authority::ResourceId,
+        input: PreparedInvocation,
+        content: &(LocalStore, Scope),
+        proposed: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<GrantDelivery> {
+        self.propose_selected(
+            GrantSelection::Resource(resource),
+            input,
+            content,
+            proposed,
+            None,
+        )
+        .await
+    }
+
+    async fn propose_selected(
+        &mut self,
+        selection: GrantSelection<'_>,
+        input: PreparedInvocation,
+        content: &(LocalStore, Scope),
+        proposed: Option<&std::sync::atomic::AtomicBool>,
+        tracker: Option<&mut crate::execution::GrantAttempt>,
+    ) -> Result<GrantDelivery> {
+        let (policy, id, link, finish_by) = self
             .admit(selection, &input, content, proposed, tracker)
             .await?;
         let acceptance_signature = self
@@ -989,142 +1015,40 @@ impl GrantSession {
             .job_by_id(id)
             .and_then(|job| job.provider_signature())
             .ok_or(GrantProtocolError::AcceptanceIdentity)?;
-        let channel = self.store.channel().id;
-        let facts = policy
-            .invocation_policy
-            .admit(&input, &self.options.signer.public_key())?;
-        let producer = PublicKey::Secp256k1(grant_producer(&self.target.provider)?.to_bytes());
-        if let Some(accepted) = &accepted {
-            accepted(hellas_rpc::provenance::ExecutionProvenance {
-                commitment_id: *id.as_bytes(),
-                provider: producer,
-            });
-        }
-        let mut verifier = StreamVerifier::new(
-            input.request.clone(),
-            producer,
-            facts.max_transcript_payload_bytes as usize,
-        )?;
-        let mut seen = 0u64;
-        let mut captured_bytes = 9u64;
-        let mut captured_heap = 0u64;
-        let (signed, events, output) = tokio::time::timeout_at(finish_by, async {
-            // Compute may remain silent throughout compilation and execution.
-            while let Some(event) = stream.next().await {
-                let event = event?;
-                use prost::Message;
-                if event.encoded_len() as u64 > u64::from(facts.max_encoded_result_frame) {
-                    return Err(GrantProtocolError::FrameBound.into());
-                }
-                match event.outcome {
-                    Some(work_stream_event::Outcome::Prefix(bytes)) => {
-                        for event in decode_transcript(
-                            &bytes,
-                            hellas_channel::work_store::journal::MAX_RECORD_BYTES,
-                        )
-                        .map_err(GrantClientError::from)?
-                        {
-                            seen += 1;
-                            captured_bytes = captured_bytes.saturating_add(
-                                hellas_rpc::canonical_dag_cbor(&event)?.len() as u64,
-                            );
-                            captured_heap = captured_heap.saturating_add(
-                                event
-                                    .retained_heap_bytes()
-                                    .and_then(|n| {
-                                        n.checked_add(
-                                            4 * std::mem::size_of::<OutputEventEnvelope>(),
-                                        )
-                                    })
-                                    .map(|n| n as u64)
-                                    .unwrap_or(u64::MAX),
-                            );
-                            if seen >= facts.max_output_events
-                                || captured_bytes > facts.max_spool_bytes
-                                || captured_heap > facts.max_spool_bytes
-                            {
-                                return Err(GrantProtocolError::OutputBound.into());
-                            }
-                            verifier.push(event.clone())?;
-                            if verifier.terminal_seen() {
-                                return Err(GrantProtocolError::PrefixKind.into());
-                            }
-                            if let Some(progress) = &progress {
-                                progress(event).map_err(GrantClientError::from)?;
-                            }
-                        }
-                    }
-                    Some(work_stream_event::Outcome::Terminal(terminal)) => {
-                        let tail = decode_transcript(
-                            &terminal.terminal_transcript,
-                            hellas_channel::work_store::journal::MAX_RECORD_BYTES,
-                        )
-                        .map_err(GrantClientError::from)?;
-                        if tail.len() != 1 {
-                            return Err(GrantProtocolError::TerminalCount.into());
-                        }
-                        for event in tail {
-                            verifier.push(event)?;
-                        }
-                        let signed = SignedResult {
-                            result: PaidJobResultV1::decode(&terminal.result)
-                                .map_err(GrantClientError::from)?,
-                            signature: Signature::Secp256k1(
-                                terminal
-                                    .provider_signature
-                                    .as_slice()
-                                    .try_into()
-                                    .map_err(GrantClientError::from)?,
-                            ),
-                        };
-                        if tokio::time::timeout(self.options.control_timeout, stream.next())
-                            .await
-                            .map_err(|_| GrantClientError::Timeout)?
-                            .transpose()?
-                            .is_some()
-                        {
-                            return Err(GrantProtocolError::AfterTerminal.into());
-                        }
-                        let (_, events) = verifier.finish()?;
-                        let output = input
-                            .verify_output(
-                                &policy.invocation_policy,
-                                &self.options.signer.public_key(),
-                                &producer,
-                                &events,
-                            )?
-                            .output;
-                        return Ok((signed, events, output));
-                    }
-                    Some(work_stream_event::Outcome::Refused(refusal)) => {
-                        return Err(refusal_error(&refusal, Some((&self.target, channel, id)))?);
-                    }
-                    _ => return Err(GrantProtocolError::StreamEvent.into()),
-                }
-            }
-            Err(GrantProtocolError::MissingResult.into())
+        Ok(GrantDelivery {
+            policy,
+            id,
+            link,
+            finish_by,
+            acceptance_signature,
+            input,
+            channel: self.store.channel().id,
+            target: self.target.clone(),
+            signer: self.options.signer.clone(),
+            control_timeout: self.options.control_timeout,
         })
-        .await
-        .map_err(|_| GrantClientError::Timeout)??;
+    }
+
+    pub(crate) async fn complete(&mut self, completed: GrantCollected) -> Result<GrantWorkResult> {
+        let GrantCollected {
+            policy,
+            input,
+            result,
+        } = completed;
         self.store
             .complete(
-                id,
+                result.work_id,
                 &policy.invocation_policy,
                 &input,
-                &events,
-                signed.clone(),
+                &result.events,
+                SignedResult {
+                    result: result.result,
+                    signature: result.result_signature,
+                },
                 self.now(),
             )
             .await?;
-        Ok(GrantWorkResult {
-            work_id: id,
-            acceptance_signature,
-            result: signed.result,
-            events,
-            output,
-            provider_key: producer,
-            result_signature: signed.signature,
-        })
+        Ok(result)
     }
 
     /// Propose, have accepted and open delivery. The returned instant bounds
@@ -1137,12 +1061,7 @@ impl GrantSession {
         content: &(LocalStore, Scope),
         proposed: Option<&std::sync::atomic::AtomicBool>,
         mut tracker: Option<&mut crate::execution::GrantAttempt>,
-    ) -> Result<(
-        GrantPolicy,
-        Digest,
-        BoxStream<'static, Result<WorkStreamEvent>>,
-        tokio::time::Instant,
-    )> {
+    ) -> Result<(GrantPolicy, Digest, Link, tokio::time::Instant)> {
         if self.store.book().pending_proposal().is_some() {
             return Err(GrantClientError::RecoveryRequired);
         }
@@ -1249,15 +1168,12 @@ impl GrantSession {
                 .bind_proposal(&a, id)
                 .map_err(|error| GrantClientError::Attempt(error.to_string()))?;
         }
-        // Cancellation after this point must retain or recover the proposal.
-        if let Some(proposed) = proposed {
-            proposed.store(true, std::sync::atomic::Ordering::Release);
-        }
         let signature = self
             .store
-            .propose(&self.offer, a, input, &self.options.signer, now)
+            .propose(&self.offer, a, input, &self.options.signer, now, proposed)
             .await?;
-        self.pending_body = Some((id, input.clone(), content.clone()));
+        self.pending_body
+            .insert(id, (input.clone(), content.clone()));
 
         let request = AcceptWorkRequest {
             route: Some(WorkRoute::grant(channel.0)),
@@ -1291,22 +1207,9 @@ impl GrantSession {
             }
             return Err(error);
         }
-        let delivery = StreamResultRequest {
-            route: Some(WorkRoute::grant(channel.0)),
-            work_id: id.as_bytes().to_vec(),
-            client_signature: Vec::new(),
-        };
-        let stream = tokio::time::timeout(self.options.control_timeout, link.stream(delivery))
-            .await
-            .map_err(|_| GrantClientError::Timeout)??;
-        Ok((policy, id, stream, finish_by))
+        Ok((policy, id, link, finish_by))
     }
     pub async fn shutdown(&mut self) -> Result<()> {
-        let recovered = if self.store.book().pending_proposal().is_some() {
-            self.recover().await.map(|_| ())
-        } else {
-            Ok(())
-        };
         let drained = if let SessionTransport::Local { service, .. } = &self.transport {
             service.drain().await.map_err(GrantClientError::from)
         } else {
@@ -1314,9 +1217,186 @@ impl GrantSession {
         };
         self.transport = SessionTransport::Closed;
         self.store.close().await;
-        drained.and(recovered)
+        drained
     }
 }
+/// Accepted work owns its stream and verification state while the session
+/// admits another proposal. Completion only borrows the journal to commit it.
+pub(crate) struct GrantDelivery {
+    policy: GrantPolicy,
+    id: Digest,
+    link: Link,
+    finish_by: tokio::time::Instant,
+    acceptance_signature: Signature,
+    input: PreparedInvocation,
+    channel: ChannelId,
+    target: GrantTarget,
+    signer: Arc<ProducerSigningKey>,
+    control_timeout: Duration,
+}
+pub(crate) struct GrantCollected {
+    policy: GrantPolicy,
+    input: PreparedInvocation,
+    result: GrantWorkResult,
+}
+impl GrantDelivery {
+    pub(crate) async fn collect(
+        self,
+        progress: Option<PaidProgress>,
+        accepted: Option<crate::transact::Accepted>,
+    ) -> Result<GrantCollected> {
+        let Self {
+            policy,
+            id,
+            link,
+            finish_by,
+            acceptance_signature,
+            input,
+            channel,
+            target,
+            signer,
+            control_timeout,
+        } = self;
+        let delivery = StreamResultRequest {
+            route: Some(WorkRoute::grant(channel.0)),
+            work_id: id.as_bytes().to_vec(),
+            client_signature: Vec::new(),
+        };
+        let facts = policy
+            .invocation_policy
+            .admit(&input, &signer.public_key())?;
+        let producer = PublicKey::Secp256k1(grant_producer(&target.provider)?.to_bytes());
+        let mut stream = tokio::time::timeout(control_timeout, link.stream(delivery))
+            .await
+            .map_err(|_| GrantClientError::Timeout)??;
+        if let Some(accepted) = &accepted {
+            accepted(hellas_rpc::provenance::ExecutionProvenance {
+                commitment_id: *id.as_bytes(),
+                provider: producer,
+            });
+        }
+        let mut verifier = StreamVerifier::new(
+            input.request.clone(),
+            producer,
+            facts.max_transcript_payload_bytes as usize,
+        )?;
+        let mut seen = 0u64;
+        let mut captured_bytes = 9u64;
+        let mut captured_heap = 0u64;
+        let (signed, events, output) = tokio::time::timeout_at(finish_by, async {
+            // Compute may remain silent throughout compilation and execution.
+            while let Some(event) = stream.next().await {
+                let event = event?;
+                use prost::Message;
+                if event.encoded_len() as u64 > u64::from(facts.max_encoded_result_frame) {
+                    return Err(GrantProtocolError::FrameBound.into());
+                }
+                match event.outcome {
+                    Some(work_stream_event::Outcome::Prefix(bytes)) => {
+                        for event in decode_transcript(
+                            &bytes,
+                            hellas_channel::work_store::journal::MAX_RECORD_BYTES,
+                        )
+                        .map_err(GrantClientError::from)?
+                        {
+                            seen += 1;
+                            captured_bytes = captured_bytes.saturating_add(
+                                hellas_rpc::canonical_dag_cbor(&event)?.len() as u64,
+                            );
+                            captured_heap = captured_heap.saturating_add(
+                                event
+                                    .retained_heap_bytes()
+                                    .and_then(|n| {
+                                        n.checked_add(
+                                            4 * std::mem::size_of::<OutputEventEnvelope>(),
+                                        )
+                                    })
+                                    .map(|n| n as u64)
+                                    .unwrap_or(u64::MAX),
+                            );
+                            if seen >= facts.max_output_events
+                                || captured_bytes > facts.max_spool_bytes
+                                || captured_heap > facts.max_spool_bytes
+                            {
+                                return Err(GrantProtocolError::OutputBound.into());
+                            }
+                            verifier.push(event.clone())?;
+                            if verifier.terminal_seen() {
+                                return Err(GrantProtocolError::PrefixKind.into());
+                            }
+                            if let Some(progress) = &progress {
+                                progress(event).map_err(GrantClientError::from)?;
+                            }
+                        }
+                    }
+                    Some(work_stream_event::Outcome::Terminal(terminal)) => {
+                        let tail = decode_transcript(
+                            &terminal.terminal_transcript,
+                            hellas_channel::work_store::journal::MAX_RECORD_BYTES,
+                        )
+                        .map_err(GrantClientError::from)?;
+                        if tail.len() != 1 {
+                            return Err(GrantProtocolError::TerminalCount.into());
+                        }
+                        for event in tail {
+                            verifier.push(event)?;
+                        }
+                        let signed = SignedResult {
+                            result: PaidJobResultV1::decode(&terminal.result)
+                                .map_err(GrantClientError::from)?,
+                            signature: Signature::Secp256k1(
+                                terminal
+                                    .provider_signature
+                                    .as_slice()
+                                    .try_into()
+                                    .map_err(GrantClientError::from)?,
+                            ),
+                        };
+                        if tokio::time::timeout(control_timeout, stream.next())
+                            .await
+                            .map_err(|_| GrantClientError::Timeout)?
+                            .transpose()?
+                            .is_some()
+                        {
+                            return Err(GrantProtocolError::AfterTerminal.into());
+                        }
+                        let (_, events) = verifier.finish()?;
+                        let output = input
+                            .verify_output(
+                                &policy.invocation_policy,
+                                &signer.public_key(),
+                                &producer,
+                                &events,
+                            )?
+                            .output;
+                        return Ok((signed, events, output));
+                    }
+                    Some(work_stream_event::Outcome::Refused(refusal)) => {
+                        return Err(refusal_error(&refusal, Some((&target, channel, id)))?);
+                    }
+                    _ => return Err(GrantProtocolError::StreamEvent.into()),
+                }
+            }
+            Err(GrantProtocolError::MissingResult.into())
+        })
+        .await
+        .map_err(|_| GrantClientError::Timeout)??;
+        Ok(GrantCollected {
+            policy,
+            input,
+            result: GrantWorkResult {
+                work_id: id,
+                acceptance_signature,
+                result: signed.result,
+                events,
+                output,
+                provider_key: producer,
+                result_signature: signed.signature,
+            },
+        })
+    }
+}
+
 fn refusal_error(
     refusal: &WorkRefused,
     delivery: Option<(&GrantTarget, ChannelId, Digest)>,

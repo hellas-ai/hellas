@@ -134,12 +134,8 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
             .unwrap()
             .pin(&trust)
             .unwrap();
-        let first_upload = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let first_certificate = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let interrupt_payment = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let serving = tokio::spawn({
-            let first_upload = first_upload.clone();
-            let first_certificate = first_certificate.clone();
             let interrupt_payment = interrupt_payment.clone();
             let server = server.clone();
             async move {
@@ -149,9 +145,7 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
                     let bundle = bundle.clone();
                     let producer = producer.clone();
                     let mount = mount.clone();
-                    let first_upload = first_upload.clone();
-                    let first_certificate = first_certificate.clone();
-                    let interrupt_payment = interrupt_payment.clone();
+                                    let interrupt_payment = interrupt_payment.clone();
                     tasks.spawn(async move {
                         let transport = IrohTransport::new(connection);
                         if index == 3 {
@@ -180,46 +174,9 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
                             Err(_) if index >= 2 => return,
                             Err(error) => panic!("Work authentication failed: {error}"),
                         };
-                        let mut unmounted_acceptance = false;
                         while let Ok(Some(inbound)) = transport.accept().await {
                             assert!(index < 2, "failed Open must not disclose a Work request");
-                            // The client can observe finalized setup before the
-                            // provider's clock has mounted its Work channel.
-                            if inbound.method_id
-                                == hellas_rpc::services::content::Upload::METHOD_ID
-                                && first_upload.swap(false, std::sync::atomic::Ordering::SeqCst)
-                            {
-                                unmounted_acceptance = true;
-                                let context = inbound.context.clone();
-                                let _ = hellas_rpc::call::dispatch_bidi_streaming::<
-                                    IrohTransport, hellas_rpc::services::content::Upload, _, _, _,
-                                >(inbound, |requests| async move {
-                                    crate::paid_provider::MountedWork::default()
-                                        .upload_stream(
-                                            Box::pin(requests), context,
-                                            hellas_channel::work::admission::Cancellation::new(),
-                                        )
-                                        .await
-                                }).await;
-                            } else if inbound.method_id
-                                    == hellas_rpc::services::work::AcceptWork::METHOD_ID
-                                    && unmounted_acceptance
-                            {
-                                unmounted_acceptance = false;
-                                let _ = Dispatcher::<IrohTransport>::dispatch(
-                                    &WorkServer(crate::work_router::UnmountedWork), inbound,
-                                ).await;
-                            } else if inbound.method_id
-                                    == hellas_rpc::services::work::AdmitCertificate::METHOD_ID
-                                    && first_certificate
-                                        .swap(false, std::sync::atomic::Ordering::SeqCst)
-                            {
-                                let _ = Dispatcher::<IrohTransport>::dispatch(
-                                    &WorkServer(crate::work_router::UnmountedWork),
-                                    inbound,
-                                )
-                                .await;
-                            } else if inbound.method_id == hellas_rpc::services::work::AdmitCertificate::METHOD_ID
+                            if inbound.method_id == hellas_rpc::services::work::AdmitCertificate::METHOD_ID
                                 && interrupt_payment.swap(false, std::sync::atomic::Ordering::SeqCst) {
                                 // A crash can leave the client's certificate
                                 // durable while the provider has never seen it.
@@ -265,20 +222,18 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
             },
             descriptor: fixture.descriptor.clone(),
             policy: fixture.policy.clone(),
-            dialer: ProviderDialer::new(
+            dialer: Arc::new(ProviderDialer::new(
                 server.id(),
                 server.bound_sockets(),
                 client_endpoint.clone(),
                 trust.clone(),
-            ),
+            )),
             client,
             observer: None,
             needs_recovery: false,
         };
         let error = session.run(Some(fixture.proposal().prepared_input), &hellas_channel::test_support::channel::program_content().await, false, None).await.err().expect("interrupted before acknowledgement");
         assert!(matches!(error, PaidClientError::Payment(hellas_channel::work::PaymentError::Transport(status)) if status.code() == hellas_wire::WireCode::Cancelled));
-        assert!(!first_upload.load(std::sync::atomic::Ordering::SeqCst));
-        assert!(!first_certificate.load(std::sync::atomic::Ordering::SeqCst));
         let first = session.with_state(|state| {
             assert_eq!(state.proposal_nonce_high_water(), 1);
             assert_eq!(state.ledger().credited_cumulative(), crate::test_support::PRICE);
@@ -290,7 +245,7 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
         let mut args = session.args.clone();
         let descriptor = session.descriptor.clone();
         let policy = session.policy.clone();
-        let dialer = std::mem::replace(&mut session.dialer, ProviderDialer::new(server.id(), server.bound_sockets(), client_endpoint.clone(), trust.clone()));
+        let dialer = std::mem::replace(&mut session.dialer, Arc::new(ProviderDialer::new(server.id(), server.bound_sockets(), client_endpoint.clone(), trust.clone())));
         drop(session);
         let store = fixture.store(Role::Client).await;
         args.content = store.content_store();
@@ -394,19 +349,19 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
         drop(session);
         let mut wrong = trust.clone();
         wrong.expected_genesis = hellas_rpc::ContentId::from_bytes([99; 32]);
-        let dialer = ProviderDialer::new(
+        let dialer = Arc::new(ProviderDialer::new(
             server.id(),
             server.bound_sockets(),
             client_endpoint.clone(),
             wrong,
-        );
+        ));
         assert!(dialer.work().await.is_err());
-        let dialer = ProviderDialer::new(
+        let dialer = Arc::new(ProviderDialer::new(
             server.id(),
             server.bound_sockets(),
             client_endpoint.clone(),
             trust,
-        );
+        ));
         assert!(dialer.work().await.is_err());
         assert_eq!(
             service

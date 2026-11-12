@@ -430,6 +430,7 @@ async fn child(root: &Path, funding: &str, phase: &str, seed: &str) -> ! {
                 deadlines: fixture::deadlines(),
             },
             &content(),
+            None,
         )
         .await
         .unwrap();

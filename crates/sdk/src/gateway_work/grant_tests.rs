@@ -49,8 +49,13 @@ struct FixtureBuilder {
     hold_first: bool,
     max_job_millis: Option<u64>,
     transport_key: u8,
+    max_in_flight: usize,
 }
 impl FixtureBuilder {
+    fn max_in_flight(mut self, limit: usize) -> Self {
+        self.max_in_flight = limit;
+        self
+    }
     /// Body chunks, and the usage chunk after them, each wait for `backend.pace`.
     fn transport_key(mut self, key: u8) -> Self {
         self.transport_key = key;
@@ -132,7 +137,7 @@ impl FixtureBuilder {
             .with_backend(backend)
             .build()
             .await;
-        // Every request opens its own session, over the provider's real transport.
+        // Requests share a session over the provider's real transport.
         let remote = host.remote().await;
         let addresses = remote.addresses();
         let transport = GrantTransport::Remote(
@@ -144,13 +149,20 @@ impl FixtureBuilder {
                 .unwrap(),
         );
         let options = host.options(addresses);
-        let gateway = crate::test_support::gateway(
-            crate::Backend::Grant {
-                policy: options.target.offer().grant.policies[0].clone(),
-                options,
-                transport,
-            },
-            Some(hellas_channel::test_support::channel::evaluator()),
+        let gateway = ExecutorGateway::new(
+            [(
+                "test".into(),
+                BackendEntry {
+                    backend: crate::Backend::Grant {
+                        policy: options.target.offer().grant.policies[0].clone(),
+                        options,
+                        transport,
+                    },
+                    evaluator: Some(hellas_channel::test_support::channel::evaluator()),
+                    max_in_flight: std::num::NonZeroUsize::new(self.max_in_flight).unwrap(),
+                },
+            )]
+            .into(),
             Arc::new(ProducerSigningKey::from_secret_bytes([8; 32]).unwrap()),
         );
         Fixture {
@@ -168,17 +180,24 @@ impl Fixture {
         };
         options
     }
-    /// A fresh session on the gateway's channel, to read its client store.
-    async fn session(&self) -> GrantSession {
-        let crate::Backend::Grant {
-            options, transport, ..
-        } = &self.gateway.backends["test"].target
-        else {
-            unreachable!("a grant fixture")
-        };
-        GrantSession::open(options.clone(), transport.clone())
-            .await
-            .unwrap()
+    /// Inspect the channel's one retained journal under its proposal mutex.
+    async fn session(&self) -> tokio::sync::MappedMutexGuard<'_, GrantSession> {
+        let inner = &self.gateway.backends["test"];
+        let mut guard = inner.grant.lock().await;
+        if guard.is_none() {
+            let crate::Backend::Grant {
+                options, transport, ..
+            } = &inner.target
+            else {
+                unreachable!()
+            };
+            *guard = Some(
+                GrantSession::open(options.clone(), transport.clone())
+                    .await
+                    .unwrap(),
+            );
+        }
+        tokio::sync::MutexGuard::map(guard, |session| session.as_mut().unwrap())
     }
     fn builder() -> FixtureBuilder {
         FixtureBuilder {
@@ -190,6 +209,7 @@ impl Fixture {
             hold_first: false,
             max_job_millis: None,
             transport_key: 5,
+            max_in_flight: 32,
         }
     }
     async fn command(&self, command: WorkControlCommand) -> WorkControlReply {
@@ -431,7 +451,7 @@ async fn paused_terms_are_denied_at_the_gateway() {
             terms,
         })
         .await;
-    assert_err!(fixture.result(None).await, WorkGatewayError::Denied(_));
+    assert_err!(fixture.result(None).await, WorkGatewayError::PreProposal(error) if matches!(*error, WorkGatewayError::Denied(_)));
     assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 0);
     fixture.shutdown().await;
 }
@@ -450,7 +470,7 @@ async fn refreshed_https_bounds_are_checked_before_proposal() {
             3 => https.paths = vec!["/changed".into()],
             _ => https.max_response_bytes = 128,
         }
-        let guard = fixture.gateway.backends["test"].serial.lock().await;
+        let guard = fixture.gateway.backends["test"].grant.lock().await;
         let mut stream = fixture
             .gateway
             .fetch("test", fixture.request(Some(6)))
@@ -539,7 +559,7 @@ async fn reused_policy_name_cannot_retarget_an_in_flight_request() {
     let mut replacement = old.clone();
     replacement.resource =
         hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"replacement"));
-    let guard = fixture.gateway.backends["test"].serial.lock().await;
+    let guard = fixture.gateway.backends["test"].grant.lock().await;
     let mut stream = fixture
         .gateway
         .fetch("test", fixture.request(None))
@@ -810,7 +830,7 @@ async fn silent_work_still_ends_at_the_signed_deadline() {
 async fn queued_requests_wait_without_a_deadline_and_cancel_on_disconnect() {
     let fixture = Fixture::builder().build().await;
     for disconnect in [false, true] {
-        let held = fixture.gateway.backends["test"].serial.lock().await;
+        let held = fixture.gateway.backends["test"].grant.lock().await;
         let job = fixture.gateway.backends["test"]
             .target
             .job(&WorkRequest::Fetch(fixture.request(None)))
@@ -827,7 +847,7 @@ async fn queued_requests_wait_without_a_deadline_and_cancel_on_disconnect() {
             drop(stream);
             // Finish while the other request still owns the mutex.
             within(run).await.unwrap();
-            assert_eq!(fixture.session().await.store().next_nonce().unwrap(), 2);
+            assert_eq!(held.as_ref().unwrap().store().next_nonce().unwrap(), 2);
             drop(held);
         } else {
             drop(held);
@@ -1182,4 +1202,74 @@ async fn two_grant_nodes_fail_over_before_proposal_and_rejoin_on_demand() {
     server.shutdown().await.unwrap();
     first.shutdown().await;
     second.shutdown().await;
+}
+
+#[tokio::test]
+async fn grant_jobs_overlap_on_one_journal_and_finish_after_a_consumer_disconnects() {
+    let fixture = Fixture::builder()
+        .max_in_flight(2)
+        .with_budget(100)
+        .hold_completion()
+        .build()
+        .await;
+    let mut first = fixture
+        .gateway
+        .fetch("test", fixture.request(None))
+        .unwrap();
+    let mut second = fixture
+        .gateway
+        .fetch("test", fixture.request(None))
+        .unwrap();
+    let accepted = |event| match event {
+        WorkEvent::Accepted(provenance) => {
+            hellas_auth::Digest::from_bytes(provenance.commitment_id)
+        }
+        _ => panic!("acceptance must be first"),
+    };
+    let first_id = accepted(within(first.next()).await.unwrap().unwrap());
+    let second_id = accepted(within(second.next()).await.unwrap().unwrap());
+    assert_ne!(first_id, second_id);
+    for stream in [&mut first, &mut second] {
+        assert!(matches!(
+            within(stream.next()).await.unwrap().unwrap(),
+            WorkEvent::Output(_)
+        ));
+    }
+    assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(fixture.gateway.backends()[0].in_flight, 2);
+    assert!(matches!(
+        fixture.gateway.fetch("test", fixture.request(None)),
+        Err(WorkGatewayError::PreProposal(_))
+    ));
+    {
+        let session = fixture.session().await;
+        let first = session
+            .store()
+            .book()
+            .job_by_id(first_id)
+            .unwrap()
+            .authorization()
+            .proposal_nonce;
+        let second = session
+            .store()
+            .book()
+            .job_by_id(second_id)
+            .unwrap()
+            .authorization()
+            .proposal_nonce;
+        assert_eq!([first.min(second), first.max(second)], [1, 2]);
+        assert_eq!(session.store().next_nonce().unwrap(), 3);
+    }
+    drop(first);
+    fixture.host.backend.finish.release();
+    fixture.host.backend.finish.release();
+    let mut terminal = false;
+    while let Some(event) = within(second.next()).await {
+        terminal |=
+            matches!(event.unwrap(), WorkEvent::Output(event) if event.terminal().is_some());
+    }
+    assert!(terminal);
+    fixture.gateway.drain().await.unwrap();
+    assert_eq!(fixture.host.backend.slots.available_permits(), 2);
+    fixture.remote.shutdown().await;
 }
