@@ -239,7 +239,7 @@ and the token budget (`max_tokens`, else `--default-max-tokens`), cut to what
 the quoted or granted terms allow. The provider's step loop feeds each emitted
 token back until that budget; a spent budget ends the response with the API's
 length stop. The payment terms fix the price per job. Model presentation (the
-chat format of the GGUF's architecture, Qwen3 or Qwen3.5, and function tools)
+GGUF's embedded Jinja chat template and Qwen3/Qwen3.5 function tools)
 lives in the shared `hellas-presentation` adapter, usable by clients and the
 gateway.
 

@@ -839,3 +839,32 @@ async fn sampled_temperatures_are_refused_by_name() {
     assert!(message.contains("`temperature` 0.5"), "{message}");
     assert!(work.jobs.lock().unwrap().is_empty());
 }
+
+/// A captured session request must reach the work backend with its tools and
+/// structured input accepted, rather than just surviving adaptor parsing.
+#[tokio::test]
+async fn opencode_session_creates_a_job() {
+    use tower::ServiceExt as _;
+    let work = Arc::new(Capturing {
+        jobs: std::sync::Mutex::new(Vec::new()),
+    });
+    let response = super::router(Arc::new(open(work.clone()).await))
+        .oneshot(
+            axum::http::Request::post("/v1/responses")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    &include_bytes!(
+                        "../../../adaptors/tests/fixtures/agents/opencode-responses.json"
+                    )[..],
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // Capturing intentionally has no output; request admission already ran.
+    drop(response);
+    let jobs = work.jobs.lock().unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert!(!jobs[0].inputs[0].bytes.as_bytes().is_empty());
+    assert_eq!(jobs[0].plan.step.as_ref().unwrap().stop.max_steps, 128);
+}

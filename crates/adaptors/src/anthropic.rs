@@ -287,35 +287,23 @@ impl ParsedAnthropicMessageRequest {
         let model = required_string(object, "model")?;
         let max_tokens = required_u32(object, "max_tokens")?;
         let stream = optional_bool(object, "stream")?;
-        // The chat templates take one system prompt, ahead of the
-        // conversation. System-role messages join it in their order.
-        let mut system = text_content(object.get("system"))?;
+        let mut tools = optional_array(object, "tools")?
+            .unwrap_or_default()
+            .iter()
+            .map(project_tool)
+            .collect::<AdaptorResult<Vec<_>>>()?;
         let mut items = Vec::new();
-        for message in required_array(object, "messages")? {
-            if message.get("role").and_then(JsonValue::as_str) == Some("system") {
-                let content = text_content(Some(message.get("content").ok_or_else(|| {
-                    AdaptorError::invalid_request("Anthropic message missing `content`")
-                })?))?;
-                if !system.is_empty() && !content.is_empty() {
-                    system.push(ContentPart::Text {
-                        text: "\n\n".into(),
-                    });
-                }
-                system.extend(content);
-                continue;
-            }
-            project_message(&message, &mut items)?;
+        let system = text_content(object.get("system"))?;
+        if !system.is_empty() {
+            items.push(InputItem::Message(Message {
+                role: "system".into(),
+                content: system,
+                name: None,
+                tool_calls: Vec::new(),
+            }));
         }
-        if object.contains_key("system") || !system.is_empty() {
-            items.insert(
-                0,
-                InputItem::Message(Message {
-                    role: "system".into(),
-                    content: system,
-                    name: None,
-                    tool_calls: Vec::new(),
-                }),
-            );
+        for message in required_array(object, "messages")? {
+            project_message(&message, &mut items, &mut tools)?;
         }
         let mut canonical =
             CanonicalExecution::new(ModelRef::new(model.clone()), Input::Items(items));
@@ -331,11 +319,10 @@ impl ParsedAnthropicMessageRequest {
                 })
             })
             .collect::<AdaptorResult<_>>()?;
-        canonical.tools = optional_array(object, "tools")?
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|tool| project_tool(tool).transpose())
-            .collect::<AdaptorResult<_>>()?;
+        canonical.tools = tools
+            .into_iter()
+            .filter_map(|(tool, loaded)| loaded.then_some(tool))
+            .collect();
         if let Some(value) = object.get("tool_choice") {
             let projected = project_tool_choice(value)?;
             canonical.tool_choice = projected.choice;
@@ -383,14 +370,18 @@ fn probability(object: &JsonMap<String, JsonValue>, key: &str) -> AdaptorResult<
     Ok(value)
 }
 
-fn project_message(value: &JsonValue, items: &mut Vec<InputItem>) -> AdaptorResult<()> {
+fn project_message(
+    value: &JsonValue,
+    items: &mut Vec<InputItem>,
+    tools: &mut [(ToolSpec, bool)],
+) -> AdaptorResult<()> {
     let object = value
         .as_object()
         .ok_or_else(|| AdaptorError::invalid_request("Anthropic message must be a JSON object"))?;
     let role = required_string(object, "role")?;
-    if !matches!(role.as_str(), "user" | "assistant") {
+    if !matches!(role.as_str(), "user" | "assistant" | "system") {
         return Err(AdaptorError::invalid_request(
-            "Anthropic message role must be user or assistant",
+            "Anthropic message role must be user, assistant or system",
         ));
     }
     let content = object
@@ -436,18 +427,9 @@ fn project_message(value: &JsonValue, items: &mut Vec<InputItem>) -> AdaptorResu
                         "tool_result blocks must precede user text",
                     ));
                 }
-                let output = text_content(block.get("content"))?;
-                // The chat formats, like OpenAI's tool messages, carry no
-                // error flag: a failed call reaches the model as its message.
-                if optional_bool(block, "is_error")? == Some(true)
-                    && output
-                        .iter()
-                        .all(|part| matches!(part, ContentPart::Text { text } if text.is_empty()))
-                {
-                    return Err(AdaptorError::invalid_request(
-                        "an error tool_result needs content describing the error",
-                    ));
-                }
+                let output = tool_result_content(block.get("content"), tools)?;
+                // Chat templates carry the result text, without an error flag.
+                optional_bool(block, "is_error")?;
                 items.push(InputItem::ToolResult {
                     call_id: required_string(block, "tool_use_id")?,
                     output,
@@ -467,9 +449,8 @@ fn project_message(value: &JsonValue, items: &mut Vec<InputItem>) -> AdaptorResu
     Ok(())
 }
 
-/// A tool the model is offered, or `None` for one deferred until a tool
-/// search loads it: the model is not shown a deferred tool.
-fn project_tool(value: &JsonValue) -> AdaptorResult<Option<ToolSpec>> {
+/// A tool definition and whether it has been loaded into the conversation.
+fn project_tool(value: &JsonValue) -> AdaptorResult<(ToolSpec, bool)> {
     let object = value
         .as_object()
         .ok_or_else(|| AdaptorError::invalid_request("Anthropic tool must be a JSON object"))?;
@@ -491,7 +472,48 @@ fn project_tool(value: &JsonValue) -> AdaptorResult<Option<ToolSpec>> {
         kind: ToolKind::Function,
         raw: value.clone(),
     };
-    Ok((optional_bool(object, "defer_loading")? != Some(true)).then_some(tool))
+    Ok((tool, optional_bool(object, "defer_loading")? != Some(true)))
+}
+
+/// Client-side ToolSearch returns references to definitions in this request.
+/// Expand them in place and allow the discovered tools in subsequent output.
+fn tool_result_content(
+    value: Option<&JsonValue>,
+    tools: &mut [(ToolSpec, bool)],
+) -> AdaptorResult<Vec<ContentPart>> {
+    let Some(JsonValue::Array(blocks)) = value else {
+        return text_content(value);
+    };
+    let mut output = Vec::new();
+    for block in blocks {
+        let block = block.as_object().ok_or_else(|| {
+            AdaptorError::invalid_request("tool result block must be a JSON object")
+        })?;
+        match required_string(block, "type")?.as_str() {
+            "text" => output.push(text_part(block)?),
+            "tool_reference" => {
+                let name = required_string(block, "tool_name")?;
+                let (tool, loaded) = tools
+                    .iter_mut()
+                    .find(|(tool, _)| tool.name == name)
+                    .ok_or_else(|| {
+                        AdaptorError::invalid_request(format!(
+                            "tool_reference names unknown tool `{name}`"
+                        ))
+                    })?;
+                *loaded = true;
+                output.push(ContentPart::Text { text: json!({
+                    "type": "function", "function": {"name": tool.name, "description": tool.description, "parameters": tool.parameters}
+                }).to_string() });
+            }
+            _ => {
+                return Err(AdaptorError::invalid_request(
+                    "only text and tool_reference result blocks are supported",
+                ));
+            }
+        }
+    }
+    Ok(output)
 }
 
 /// An Anthropic `tool_choice` and the parallel-call permission it carries.

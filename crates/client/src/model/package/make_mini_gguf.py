@@ -15,6 +15,7 @@ for key,value in [('attention.layer_norm_rms_epsilon',1e-6),('rope.freq_base',10
 meta += [metadata('tokenizer.ggml.model',8,string('gpt2')),metadata('tokenizer.ggml.pre',8,string('qwen2'))]
 for key,values in [('tokens',['h','i','hi','<|endoftext|>']),('merges',['h i'])]: meta.append(metadata('tokenizer.ggml.'+key,9,u32(8)+u64(len(values))+b''.join(string(s) for s in values)))
 meta += [metadata('tokenizer.ggml.eos_token_id',4,u32(3)),metadata('tokenizer.ggml.add_bos_token',7,b'\0'),metadata('tokenizer.ggml.add_eos_token',7,b'\0')]
+meta.append(metadata('tokenizer.chat_template',8,string((Path(__file__).parents[4] / 'presentation/tests/fixtures/qwen3_chat.jinja').read_text())))
 tensors=[('token_embd.weight',[4,32],30),('output_norm.weight',[32],0)]
 for name,shape,dtype in [('attn_norm',[32],0),('attn_q',[32,32],30),('attn_k',[32,32],30),('attn_v',[32,32],30),('attn_output',[32,32],30),('attn_q_norm',[32],0),('attn_k_norm',[32],0),('ffn_norm',[32],0),('ffn_gate',[64,32],30),('ffn_up',[64,32],30),('ffn_down',[32,64],30)]: tensors.append(('blk.0.'+name+'.weight',shape,dtype))
 # Table order deliberately differs from the entry's weight argument order.

@@ -1861,23 +1861,4 @@ mod tests {
             "{\"answer\":\"after\"}"
         );
     }
-
-    /// opencode 1.19.5's session request, as sent with long texts shortened.
-    #[test]
-    fn opencode_requests_project_with_their_tools() {
-        let request: JsonValue = serde_json::from_str(include_str!(
-            "../../tests/fixtures/agents/opencode-responses.json"
-        ))
-        .unwrap();
-        let parsed = adaptor().parse(raw(request.clone())).unwrap();
-        let canonical = adaptor().to_execution_request(&parsed).unwrap().canonical;
-        assert_eq!(
-            canonical.tools.len(),
-            request["tools"].as_array().unwrap().len()
-        );
-        assert_eq!(canonical.tool_choice, crate::ToolChoice::Auto);
-        assert!(canonical.sampling.temperature.is_none());
-        assert_eq!(adaptor().error_code(422).as_deref(), Some("invalid_prompt"));
-        assert_eq!(adaptor().error_code(502).as_deref(), Some("server_error"));
-    }
 }

@@ -6,7 +6,6 @@
 //! and output token IDs. The chat format follows the caller's own model file.
 
 pub mod chat;
-mod qwen35;
 
 use std::path::Path;
 
@@ -20,29 +19,16 @@ use catena_models::{
 pub struct TextPresentation {
     tokenizer: QwenTokenizer,
     chat_template: ChatTemplate,
+    architecture: ModelArchitecture,
 }
 
-/// A local chat format, independent of execution policy.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ChatTemplate {
-    /// Qwen3 text chat, with thinking disabled for new generations.
-    Qwen3,
-    /// Qwen3.5/3.6 text chat and XML function calls, with thinking disabled.
-    Qwen35,
-}
-
-impl ChatTemplate {
-    /// The chat format a model of `architecture` was trained on.
-    pub fn of(architecture: ModelArchitecture) -> Self {
-        match architecture {
-            ModelArchitecture::Qwen3Dense => Self::Qwen3,
-            ModelArchitecture::Qwen35Dense | ModelArchitecture::Qwen35Moe => Self::Qwen35,
-        }
-    }
+/// The model-provided Jinja chat template, independent of execution policy.
+pub struct ChatTemplate {
+    environment: minijinja::Environment<'static>,
 }
 
 /// Chat messages supplied by a host application.
-#[derive(Default)]
+#[derive(Default, serde::Serialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
@@ -50,136 +36,63 @@ pub struct ChatMessage {
 }
 
 impl ChatTemplate {
-    pub fn render(self, messages: &[ChatMessage]) -> Result<String> {
+    pub fn new(source: String) -> Result<Self> {
+        let mut environment = minijinja::Environment::new();
+        environment
+            .set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+        environment.add_function(
+            "raise_exception",
+            |message: String| -> Result<String, minijinja::Error> {
+                Err(minijinja::Error::new(
+                    minijinja::ErrorKind::InvalidOperation,
+                    message,
+                ))
+            },
+        );
+        environment.add_template_owned("chat", source)?;
+        Ok(Self { environment })
+    }
+
+    pub fn render(&self, messages: &[ChatMessage]) -> Result<String> {
         self.render_with_tools(messages, &[])
     }
 
     pub fn render_with_tools(
-        self,
+        &self,
         messages: &[ChatMessage],
         tools: &[serde_json::Value],
     ) -> Result<String> {
         anyhow::ensure!(!messages.is_empty(), "chat requires at least one message");
-        if self == Self::Qwen35 {
-            return qwen35::render(messages, tools);
-        }
-        // Qwen/Qwen3-30B-A3B tokenizer_config.json at
-        // ad44e777bcd18fa416d9da3bd8f70d33ebb85d39: text-only branch,
-        // add_generation_prompt=true, enable_thinking=false.
-        let last_query = messages
-            .iter()
-            .rposition(|message| {
-                message.role == "user"
-                    && !(message.content.starts_with("<tool_response>")
-                        && message.content.ends_with("</tool_response>"))
+        self.environment
+            .get_template("chat")?
+            .render(minijinja::context! {
+                messages => messages, tools => tools, enable_thinking => false,
+                add_generation_prompt => true, add_vision_id => false,
+                bos_token => "<|endoftext|>", eos_token => "<|im_end|>",
             })
-            .unwrap_or(messages.len() - 1);
-        let mut prompt = String::new();
-        if !tools.is_empty() {
-            prompt.push_str("<|im_start|>system\n");
-            if messages[0].role == "system" {
-                prompt.push_str(&messages[0].content);
-                prompt.push_str("\n\n");
-            }
-            prompt.push_str("# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>");
-            for tool in tools {
-                prompt.push('\n');
-                prompt.push_str(&serde_json::to_string(tool)?);
-            }
-            prompt.push_str("\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n");
-        }
-        for (index, message) in messages.iter().enumerate() {
-            if index == 0 && message.role == "system" && !tools.is_empty() {
-                continue;
-            }
-            if message.role == "tool" {
-                if index == 0 || messages[index - 1].role != "tool" {
-                    prompt.push_str("<|im_start|>user");
-                }
-                prompt.push_str("\n<tool_response>\n");
-                prompt.push_str(&message.content);
-                prompt.push_str("\n</tool_response>");
-                if index + 1 == messages.len() || messages[index + 1].role != "tool" {
-                    prompt.push_str("<|im_end|>\n");
-                }
-                continue;
-            }
-            anyhow::ensure!(
-                matches!(message.role.as_str(), "system" | "user" | "assistant"),
-                "qwen3 text chat does not support role {:?}",
-                message.role
-            );
-            prompt.push_str("<|im_start|>");
-            prompt.push_str(&message.role);
-            prompt.push('\n');
-            if message.role == "assistant" {
-                let mut content = message.content.as_str();
-                let mut reasoning = "";
-                if let Some((before, _)) = content.split_once("</think>") {
-                    reasoning = before
-                        .trim_end_matches('\n')
-                        .rsplit("<think>")
-                        .next()
-                        .unwrap_or("")
-                        .trim_start_matches('\n');
-                    content = content
-                        .rsplit("</think>")
-                        .next()
-                        .unwrap_or("")
-                        .trim_start_matches('\n');
-                }
-                if index > last_query && (index + 1 == messages.len() || !reasoning.is_empty()) {
-                    prompt.push_str("<think>\n");
-                    prompt.push_str(reasoning.trim_matches('\n'));
-                    prompt.push_str("\n</think>\n\n");
-                    content = content.trim_start_matches('\n');
-                }
-                prompt.push_str(content);
-                for (call_index, call) in message.tool_calls.iter().enumerate() {
-                    if !content.is_empty() || call_index > 0 {
-                        prompt.push('\n');
-                    }
-                    let function = call.get("function").unwrap_or(call);
-                    let name = function
-                        .get("name")
-                        .and_then(serde_json::Value::as_str)
-                        .context("tool call requires a function name")?;
-                    let arguments = function
-                        .get("arguments")
-                        .context("tool call requires arguments")?;
-                    let arguments = if let Some(json) = arguments.as_str() {
-                        serde_json::from_str(json).context("tool call arguments must be JSON")?
-                    } else {
-                        arguments.clone()
-                    };
-                    prompt.push_str("<tool_call>\n");
-                    prompt.push_str(&serde_json::to_string(
-                        &serde_json::json!({"name": name, "arguments": arguments}),
-                    )?);
-                    prompt.push_str("\n</tool_call>");
-                }
-            } else {
-                prompt.push_str(&message.content);
-            }
-            prompt.push_str("<|im_end|>\n");
-        }
-        prompt.push_str("<|im_start|>assistant\n<think>\n\n</think>\n\n");
-        Ok(prompt)
+            .context("failed to render GGUF chat template")
     }
 }
 
 impl TextPresentation {
     /// The tokenizer embedded in an application-selected GGUF model, and the
-    /// chat format of its architecture.
+    /// chat template embedded alongside it.
     ///
     /// This performs local file I/O only. Neither Catena nor an RPC peer
     /// selects presentation for the caller.
     pub fn from_gguf(path: &Path) -> Result<Self> {
         let tokenizer = QwenTokenizer::from_gguf(path)?
             .with_context(|| format!("{} has no embedded tokenizer", path.display()))?;
+        let chat_template = ChatTemplate::new(
+            tokenizer
+                .chat_template()
+                .context("GGUF has no chat template")?
+                .to_owned(),
+        )?;
         Ok(Self {
             tokenizer,
-            chat_template: ChatTemplate::of(read_gguf_model_config(path)?.architecture),
+            chat_template,
+            architecture: read_gguf_model_config(path)?.architecture,
         })
     }
 
@@ -272,12 +185,25 @@ mod tests {
         QwenTokenizer::open(file.path()).unwrap()
     }
 
+    pub(crate) fn template(qwen35: bool) -> ChatTemplate {
+        ChatTemplate::new(
+            if qwen35 {
+                include_str!("../tests/fixtures/qwen35_chat.jinja")
+            } else {
+                include_str!("../tests/fixtures/qwen3_chat.jinja")
+            }
+            .into(),
+        )
+        .unwrap()
+    }
+
     const WORDS: &str = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"hello":0,"world":1,"<unk>":2},"unk_token":"<unk>"}}"#;
 
     fn presentation() -> Arc<TextPresentation> {
         Arc::new(TextPresentation {
             tokenizer: tokenizer(WORDS),
-            chat_template: ChatTemplate::Qwen3,
+            chat_template: template(false),
+            architecture: ModelArchitecture::Qwen3Dense,
         })
     }
 
@@ -312,7 +238,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            ChatTemplate::Qwen3.render(&messages).unwrap(),
+            template(false).render(&messages).unwrap(),
             concat!(
                 "<|im_start|>system\nBe concise.<|im_end|>\n",
                 "<|im_start|>user\nFirst question<|im_end|>\n",
@@ -323,23 +249,40 @@ mod tests {
         );
     }
 
-    /// A Qwen3.5 model rendered with the Qwen3 template writes tool calls its
-    /// parser cannot decode, so the format follows the GGUF's architecture.
     #[test]
-    fn chat_template_follows_the_gguf_architecture() {
+    fn chat_template_comes_from_the_gguf() {
         let model = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../client/src/model/package/mini-qwen3.gguf");
+        let presentation = TextPresentation::from_gguf(&model).unwrap();
+        let source = presentation.tokenizer.chat_template().unwrap();
+        assert_eq!(source, include_str!("../tests/fixtures/qwen3_chat.jinja"));
+        let messages = [ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+            ..Default::default()
+        }];
         assert_eq!(
-            TextPresentation::from_gguf(&model).unwrap().chat_template,
-            ChatTemplate::Qwen3
+            presentation.chat_template.render(&messages).unwrap(),
+            template(false).render(&messages).unwrap()
         );
-        assert_eq!(
-            ChatTemplate::of(ModelArchitecture::Qwen35Dense),
-            ChatTemplate::Qwen35
-        );
-        assert_eq!(
-            ChatTemplate::of(ModelArchitecture::Qwen35Moe),
-            ChatTemplate::Qwen35
+        // Change only the embedded template, keeping architecture and weights.
+        let mut bytes = std::fs::read(&model).unwrap();
+        let old = b"<|im_start|>assistant";
+        let offset = bytes
+            .windows(old.len())
+            .position(|bytes| bytes == old)
+            .unwrap();
+        bytes[offset..offset + old.len()].copy_from_slice(b"<|im_start|>different");
+        let custom = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(custom.path(), bytes).unwrap();
+        let custom = TextPresentation::from_gguf(custom.path()).unwrap();
+        assert_eq!(custom.architecture, presentation.architecture);
+        assert!(
+            custom
+                .chat_template
+                .render(&messages)
+                .unwrap()
+                .ends_with("<|im_start|>different\n<think>\n\n</think>\n\n")
         );
     }
 
@@ -368,7 +311,8 @@ mod tests {
             tokenizer: tokenizer(
                 r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":true},"model":{"type":"WordLevel","vocab":{"Ã":0,"©":1,"<unk>":2},"unk_token":"<unk>"}}"#,
             ),
-            chat_template: ChatTemplate::Qwen3,
+            chat_template: template(false),
+            architecture: ModelArchitecture::Qwen3Dense,
         };
         let first = hellas_rpc::encode_token_ids(&[0]);
         let second = hellas_rpc::encode_token_ids(&[1]);

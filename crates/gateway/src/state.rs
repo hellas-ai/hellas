@@ -118,7 +118,7 @@ pub(super) struct TextState {
     pub(super) inference_metrics: super::backend::telemetry::InferenceMetrics,
     default_max_tokens: u32,
     /// The most tokens one job may generate under the work source's terms.
-    max_tokens: Option<u32>,
+    max_tokens: u32,
     pub(super) inference_timeout: Option<Duration>,
     presentation: Arc<TextPresentation>,
     text: Arc<ModelPackage>,
@@ -164,7 +164,7 @@ impl TextState {
             default_max_tokens: options.default_max_tokens,
             max_tokens: work
                 .max_steps()
-                .map(|steps| u32::try_from(steps).unwrap_or(u32::MAX)),
+                .map_or(u32::MAX, |steps| u32::try_from(steps).unwrap_or(u32::MAX)),
             inference_timeout: work.timeout(),
             presentation: Arc::new(presentation),
             text: Arc::new(text),
@@ -184,7 +184,7 @@ impl TextState {
             .sampling
             .max_output_tokens
             .unwrap_or(self.default_max_tokens)
-            .min(self.max_tokens.unwrap_or(u32::MAX));
+            .min(self.max_tokens);
         let chat = self.presentation.prepare(canonical).map_err(|err| {
             BackendError::rejected(format!("Failed to prepare model input: {err:#}"))
         })?;

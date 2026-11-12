@@ -41,6 +41,7 @@ pub(super) fn chat_tools(
 pub(super) fn text_chat_messages(
     input: &Input,
     instructions: Option<&str>,
+    require_tool: bool,
 ) -> anyhow::Result<Vec<ChatMessage>> {
     let mut messages = Vec::new();
     if let Some(instructions) = instructions {
@@ -81,6 +82,62 @@ pub(super) fn text_chat_messages(
                     })?,
                 });
             }
+        }
+    }
+    let mut system = Vec::new();
+    if require_tool {
+        system.push("Use one of the provided tools to answer this turn.".to_owned());
+    }
+    messages.retain(|message| {
+        if matches!(message.role.as_str(), "system" | "developer") {
+            if !message.content.is_empty() {
+                system.push(message.content.clone());
+            }
+            false
+        } else {
+            true
+        }
+    });
+    if !system.is_empty() {
+        messages.insert(
+            0,
+            ChatMessage {
+                role: "system".into(),
+                content: system.join("\n\n"),
+                ..Default::default()
+            },
+        );
+    }
+    for message in &mut messages {
+        anyhow::ensure!(
+            matches!(
+                message.role.as_str(),
+                "system" | "user" | "assistant" | "tool"
+            ),
+            "unsupported chat role {:?}",
+            message.role
+        );
+        for call in &mut message.tool_calls {
+            let function = if call.get("function").is_some() {
+                &mut call["function"]
+            } else {
+                call
+            };
+            function
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .context("tool call requires a function name")?;
+            let arguments = function
+                .get_mut("arguments")
+                .context("tool call requires arguments")?;
+            if let Some(json) = arguments.as_str() {
+                *arguments =
+                    serde_json::from_str(json).context("tool call arguments must be JSON")?;
+            }
+            anyhow::ensure!(
+                arguments.is_object(),
+                "tool call arguments must be an object"
+            );
         }
     }
     Ok(messages)
@@ -193,7 +250,6 @@ mod tests {
     use super::*;
     #[test]
     fn chat_adaptor_text_parts_reach_explicit_qwen_template() {
-        use crate::ChatTemplate;
         use hellas_adaptors::{
             RawRequest, WireAdaptor, openai::chat_completions::OpenAiChatCompletionsAdaptor,
         };
@@ -208,9 +264,9 @@ mod tests {
         ]
     })).unwrap()).unwrap();
         let request = adaptor.to_execution_request(&request).unwrap();
-        let messages = text_chat_messages(&request.canonical.input, None).unwrap();
+        let messages = text_chat_messages(&request.canonical.input, None, false).unwrap();
         assert_eq!(
-            ChatTemplate::Qwen3.render(&messages).unwrap(),
+            crate::tests::template(false).render(&messages).unwrap(),
             concat!(
                 "<|im_start|>system\nBe concise.<|im_end|>\n",
                 "<|im_start|>user\nSay hello<|im_end|>\n",
@@ -218,11 +274,16 @@ mod tests {
             )
         );
         assert!(raw_text_chat_message(&json!({"role": "user", "content": [{"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}]})).is_err());
-        let malformed = raw_text_chat_message(
-            &json!({"role": "assistant", "content": "", "tool_calls": [{"id": "call"}]}),
-        )
-        .unwrap();
-        assert!(ChatTemplate::Qwen3.render(&[malformed]).is_err());
+        assert!(
+            text_chat_messages(
+                &Input::Items(vec![InputItem::Raw(
+                    json!({"role": "assistant", "content": "", "tool_calls": [{"id": "call"}]})
+                )]),
+                None,
+                false
+            )
+            .is_err()
+        );
     }
     use hellas_adaptors::{
         HistoricalToolCall, RawRequest, WireAdaptor, anthropic::AnthropicMessagesAdaptor,
@@ -248,7 +309,7 @@ mod tests {
 
     #[test]
     fn anthropic_text_blocks_have_the_same_template_message_as_string_input() {
-        let a = text_chat_messages(&anthropic(json!("hello world"), "user"), None).unwrap();
+        let a = text_chat_messages(&anthropic(json!("hello world"), "user"), None, false).unwrap();
         let b = text_chat_messages(
             &anthropic(
                 json!([
@@ -257,6 +318,7 @@ mod tests {
                 "user",
             ),
             None,
+            false,
         )
         .unwrap();
         assert_eq!(a.len(), 1);
@@ -264,7 +326,7 @@ mod tests {
         assert_eq!(a[0].role, b[0].role);
         assert_eq!(a[0].content, b[0].content);
         assert_eq!(a[0].tool_calls, b[0].tool_calls);
-        for template in [crate::ChatTemplate::Qwen3, crate::ChatTemplate::Qwen35] {
+        for template in [crate::tests::template(false), crate::tests::template(true)] {
             assert_eq!(template.render(&a).unwrap(), template.render(&b).unwrap());
         }
     }
@@ -293,11 +355,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["a", "b"]
         );
-        let messages = text_chat_messages(&input, None).unwrap();
+        let messages = text_chat_messages(&input, None, false).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, "Checking.");
-        for template in [crate::ChatTemplate::Qwen3, crate::ChatTemplate::Qwen35] {
-            let mut conversation = text_chat_messages(&input, None).unwrap();
+        for template in [crate::tests::template(false), crate::tests::template(true)] {
+            let mut conversation = text_chat_messages(&input, None, false).unwrap();
             conversation.insert(
                 0,
                 ChatMessage {
@@ -334,7 +396,7 @@ mod tests {
                 arguments: json!({}),
             },
         ]);
-        let messages = text_chat_messages(&input, None).unwrap();
+        let messages = text_chat_messages(&input, None, false).unwrap();
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].tool_calls.len(), 1);
         assert_eq!(messages[1].tool_calls.len(), 1);
@@ -351,6 +413,60 @@ mod tests {
         assert!(text_chat_message(&message).is_err());
     }
 
+    #[test]
+    fn mid_conversation_system_messages_render_on_qwen35_for_every_format() {
+        use hellas_adaptors::openai::{
+            chat_completions::OpenAiChatCompletionsAdaptor, responses::OpenAiResponsesAdaptor,
+        };
+        let messages = json!([
+            {"role":"system","content":"First."},
+            {"role":"user","content":"Question"},
+            {"role":"system","content":"Second."},
+            {"role":"developer","content":"Third."}
+        ]);
+        let chat = OpenAiChatCompletionsAdaptor;
+        let responses = OpenAiResponsesAdaptor;
+        let inputs = [
+            chat.to_execution_request(
+                &chat
+                    .parse(
+                        RawRequest::from_value(json!({"model":"qwen3.5", "messages":messages}))
+                            .unwrap(),
+                    )
+                    .unwrap(),
+            )
+            .unwrap()
+            .canonical
+            .input,
+            responses
+                .to_execution_request(
+                    &responses
+                        .parse(
+                            RawRequest::from_value(json!({"model":"qwen3.5", "input":messages}))
+                                .unwrap(),
+                        )
+                        .unwrap(),
+                )
+                .unwrap()
+                .canonical
+                .input,
+        ];
+        for input in inputs {
+            for require_tool in [false, true] {
+                let messages =
+                    text_chat_messages(&input, Some("Instructions."), require_tool).unwrap();
+                assert_eq!(messages.len(), 2);
+                let prompt = crate::tests::template(true).render(&messages).unwrap();
+                assert_eq!(prompt.matches("<|im_start|>system").count(), 1);
+                assert!(prompt.contains("Instructions.\n\nFirst.\n\nSecond.\n\nThird.<|im_end|>\n<|im_start|>user\nQuestion"));
+                assert_eq!(
+                    prompt.contains("Use one of the provided tools"),
+                    require_tool
+                );
+            }
+        }
+    }
+
     /// Claude Code puts a system-role message after the user's turn and
     /// offers a deferred placeholder tool. Both Qwen formats render the
     /// request with one system prompt ahead of the conversation.
@@ -365,9 +481,9 @@ mod tests {
             .to_execution_request(&adaptor.parse(raw).unwrap())
             .unwrap()
             .canonical;
-        let messages = text_chat_messages(&canonical.input, None).unwrap();
+        let messages = text_chat_messages(&canonical.input, None, false).unwrap();
         let tools = chat_tools(&canonical).unwrap();
-        for template in [crate::ChatTemplate::Qwen3, crate::ChatTemplate::Qwen35] {
+        for template in [crate::tests::template(false), crate::tests::template(true)] {
             let prompt = template.render_with_tools(&messages, &tools).unwrap();
             assert_eq!(prompt.matches("<|im_start|>system").count(), 1);
             assert!(prompt.starts_with("<|im_start|>system"));

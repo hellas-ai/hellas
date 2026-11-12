@@ -452,10 +452,6 @@ fn unsupported_history_semantics_are_rejected_during_parse() {
         ),
         (
             "user",
-            json!([{"type":"tool_result","tool_use_id":"a","content":"","is_error":true}]),
-        ),
-        (
-            "user",
             json!([{"type":"tool_result","tool_use_id":"a","content":[{"type":"image","text":"not text"}]}]),
         ),
         (
@@ -517,7 +513,7 @@ fn text_of(content: &[ContentPart]) -> String {
 }
 
 #[test]
-fn claude_code_requests_project_to_one_system_prompt_and_its_offered_tools() {
+fn claude_code_requests_preserve_message_order_and_offered_tools() {
     let request: JsonValue = serde_json::from_str(CLAUDE_CODE).unwrap();
     let parsed = adaptor().parse(raw(request.clone())).unwrap();
     let canonical = adaptor().to_execution_request(&parsed).unwrap().canonical;
@@ -544,17 +540,24 @@ fn claude_code_requests_project_to_one_system_prompt_and_its_offered_tools() {
             .collect::<Vec<_>>(),
         offered
     );
-    // The system-role message follows the system blocks in the one system
-    // prompt, ahead of the conversation.
     let Input::Items(items) = &canonical.input else {
         panic!("expected input items");
     };
-    let [InputItem::Message(system), InputItem::Message(user)] = &items[..] else {
-        panic!("expected a system prompt and one user turn: {items:?}");
+    let [
+        InputItem::Message(system),
+        InputItem::Message(user),
+        InputItem::Message(later),
+    ] = &items[..]
+    else {
+        panic!("expected the original message order: {items:?}");
     };
     assert_eq!(
-        (system.role.as_str(), user.role.as_str()),
-        ("system", "user")
+        (
+            system.role.as_str(),
+            user.role.as_str(),
+            later.role.as_str()
+        ),
+        ("system", "user", "system")
     );
     let blocks = |value: &JsonValue| {
         value
@@ -564,13 +567,10 @@ fn claude_code_requests_project_to_one_system_prompt_and_its_offered_tools() {
             .map(|block| block["text"].as_str().unwrap())
             .collect::<String>()
     };
+    assert_eq!(text_of(&system.content), blocks(&request["system"]));
     assert_eq!(
-        text_of(&system.content),
-        format!(
-            "{}\n\n{}",
-            blocks(&request["system"]),
-            blocks(&request["messages"][1]["content"])
-        )
+        text_of(&later.content),
+        blocks(&request["messages"][1]["content"])
     );
 }
 
@@ -653,25 +653,76 @@ fn stream_errors_carry_the_type_of_their_status() {
 /// OpenAI tool message would: Claude Code reports a failed write this way.
 #[test]
 fn error_tool_results_reach_the_model_as_their_message() {
-    let parsed = adaptor()
+    for content in [
+        None,
+        Some(json!("")),
+        Some(json!([])),
+        Some(json!("EACCES: permission denied")),
+    ] {
+        let mut result = json!({"type":"tool_result","tool_use_id":"a","is_error":true});
+        if let Some(content) = &content {
+            result["content"] = content.clone();
+        }
+        let parsed = adaptor()
         .parse(raw(json!({"model":"m","max_tokens":8,"messages":[
             {"role":"user","content":"write it"},
             {"role":"assistant","content":[{"type":"tool_use","id":"a","name":"Write","input":{}}]},
-            {"role":"user","content":[{"type":"tool_result","tool_use_id":"a",
-                "content":"EACCES: permission denied","is_error":true}]}
+            {"role":"user","content":[result]}
         ]})))
         .unwrap();
-    let Input::Items(items) = adaptor()
-        .to_execution_request(&parsed)
+        let Input::Items(items) = adaptor()
+            .to_execution_request(&parsed)
+            .unwrap()
+            .canonical
+            .input
+        else {
+            panic!("expected input items");
+        };
+        let Some(InputItem::ToolResult { call_id, output }) = items.last() else {
+            panic!("expected a tool result: {items:?}");
+        };
+        assert_eq!(call_id, "a");
+        assert_eq!(
+            text_of(output),
+            content.as_ref().and_then(JsonValue::as_str).unwrap_or("")
+        );
+    }
+}
+
+#[test]
+fn tool_search_loads_only_referenced_definitions() {
+    let mut request = json!({"model":"m", "max_tokens":8, "system":[], "tools":[
+        {"name":"ToolSearch","input_schema":{"type":"object"}},
+        {"name":"read","description":"Read a file", "input_schema":{"type":"object"},"defer_loading":true},
+        {"name":"unused","input_schema":{"type":"object"},"defer_loading":true}
+    ], "messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"search", "content":[
+        {"type":"text","text":"Found: "}, {"type":"tool_reference","tool_name":"read"}, {"type":"tool_reference","tool_name":"read"}
+    ]}]}]});
+    let canonical = adaptor()
+        .to_execution_request(&adaptor().parse(raw(request.clone())).unwrap())
         .unwrap()
-        .canonical
-        .input
-    else {
-        panic!("expected input items");
+        .canonical;
+    assert_eq!(
+        canonical
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        ["ToolSearch", "read"]
+    );
+    let Input::Items(items) = canonical.input else {
+        panic!();
     };
-    let Some(InputItem::ToolResult { call_id, output }) = items.last() else {
-        panic!("expected a tool result: {items:?}");
+    let [InputItem::ToolResult { output, .. }] = &items[..] else {
+        panic!("{items:?}");
     };
-    assert_eq!(call_id, "a");
-    assert_eq!(text_of(output), "EACCES: permission denied");
+    assert_eq!(text_of(&output[..1]), "Found: ");
+    let expanded: JsonValue = serde_json::from_str(&text_of(&output[1..2])).unwrap();
+    assert_eq!(expanded["function"]["name"], "read");
+    assert_eq!(expanded["function"]["description"], "Read a file");
+    assert_eq!(expanded["function"]["parameters"], json!({"type":"object"}));
+    for invalid in [json!("missing"), json!(null), json!(3)] {
+        request["messages"][0]["content"][0]["content"][1]["tool_name"] = invalid;
+        assert!(adaptor().parse(raw(request.clone())).is_err());
+    }
 }

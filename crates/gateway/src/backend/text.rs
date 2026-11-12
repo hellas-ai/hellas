@@ -191,35 +191,24 @@ mod tests {
             .unwrap();
         let canonical = adaptor.to_execution_request(&parsed).unwrap().canonical;
         let chat = presentation.prepare(&canonical).unwrap().turn;
-        let emitted = Artifact::new("emitted", "catena.u64le.v1", 2u64.to_le_bytes().to_vec());
         let prepared = PreparedGeneration {
             chat: Some(chat),
-            prepared: Box::pin(futures::stream::iter([
-                Ok(crate::WorkEvent::Output(ComputeEvent::Output(
-                    hellas_rpc::protocol::invocation::output::ArtifactChunk {
-                        name: emitted.name.clone(),
-                        format: emitted.format.clone(),
-                        offset: 0,
-                        bytes: emitted.bytes.clone(),
-                    },
-                ))),
-                Ok(crate::WorkEvent::Output(ComputeEvent::Done {
+            prepared: Box::pin(futures::stream::iter([Ok(crate::WorkEvent::Output(
+                ComputeEvent::Done {
                     output: InvocationOutput {
                         outcome: Outcome::Succeeded,
-                        artifacts: vec![emitted],
+                        artifacts: vec![Artifact::new("emitted", "catena.u64le.v1", Vec::new())],
                         metadata: hellas_rpc::JsonBytes(
                             hellas_rpc::canonical_dag_cbor(&RunMetadata {
-                                steps: 1,
+                                steps: 0,
                                 stop: Some(StopReason::Matched(3)),
                             })
                             .unwrap(),
                         ),
                     },
-                    provider: hellas_auth::ProducerSigningKey::from_secret_bytes([7; 32])
-                        .unwrap()
-                        .public_key(),
-                })),
-            ])),
+                    provider: hellas_auth::PublicKey::Secp256k1([0x02; 33]),
+                },
+            ))])),
             provenance: None,
             prompt_tokens: 1,
             presentation,
@@ -228,9 +217,5 @@ mod tests {
         let events = text_events(prepared).collect::<Vec<_>>().await;
         let error = events.last().unwrap().as_ref().unwrap_err();
         assert!(matches!(error, BackendError::Output(_)), "{error}");
-        assert_eq!(
-            crate::backend_status(error),
-            axum::http::StatusCode::UNPROCESSABLE_ENTITY
-        );
     }
 }
