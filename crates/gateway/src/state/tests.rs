@@ -848,7 +848,31 @@ async fn opencode_session_creates_a_job() {
     let work = Arc::new(Capturing {
         jobs: std::sync::Mutex::new(Vec::new()),
     });
-    let response = super::router(Arc::new(open(work.clone()).await))
+    // The packaging fixture's 128-token context cannot fit the captured
+    // tool schemas plus the default output budget. Enlarge its context only.
+    let mut model = std::fs::read(text_model()).unwrap();
+    let key = b"qwen3.context_length";
+    let offset = model
+        .windows(key.len())
+        .position(|bytes| bytes == key)
+        .unwrap()
+        + key.len()
+        + 4;
+    assert_eq!(&model[offset..offset + 4], &128u32.to_le_bytes());
+    model[offset..offset + 4].copy_from_slice(&8192u32.to_le_bytes());
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), model).unwrap();
+    let state = TextState::open(
+        &crate::TextOptions {
+            model: file.path().to_owned(),
+            model_name: "mini-qwen3".into(),
+            default_max_tokens: 128,
+        },
+        work.clone(),
+    )
+    .await
+    .unwrap();
+    let response = super::router(Arc::new(state))
         .oneshot(
             axum::http::Request::post("/v1/responses")
                 .header("content-type", "application/json")
@@ -862,9 +886,11 @@ async fn opencode_session_creates_a_job() {
         .await
         .unwrap();
     // Capturing intentionally has no output; request admission already ran.
-    drop(response);
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
     let jobs = work.jobs.lock().unwrap();
-    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs.len(), 1, "{}", String::from_utf8_lossy(&bytes));
     assert!(!jobs[0].inputs[0].bytes.as_bytes().is_empty());
     assert_eq!(jobs[0].plan.step.as_ref().unwrap().stop.max_steps, 128);
 }
