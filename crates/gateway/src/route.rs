@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Route {
     pub backends: Vec<String>,
     #[serde(flatten)]

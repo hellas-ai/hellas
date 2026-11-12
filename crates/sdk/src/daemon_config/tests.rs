@@ -133,3 +133,49 @@ fn direct_http_fetch_is_allowed_and_iroh_fetch_keys_must_be_unique() {
         Err("ambiguous iroh invocation key")
     );
 }
+
+#[test]
+fn keys_are_inputs_and_only_omitted_keys_in_existing_entries_are_retained() {
+    let document: Document = serde_json::from_value(serde_json::json!({
+        "listeners": {}, "backends": {
+            "http": { "kind": "fetch", "service": "https", "method": "request", "max_in_flight": 2,
+                "upstream": { "kind": "http", "allowed_hosts": ["example.org"], "credentials": {
+                    "main": { "allowed_origins": ["https://example.org"], "allowed_paths": ["/api"], "allowed_methods": ["POST"], "header_name": "authorization", "secret": "Bearer first-key" }
+                }}
+            },
+            "responses": { "kind": "fetch", "service": "openai", "method": "responses", "max_in_flight": 1,
+                "upstream": { "kind": "openai_responses", "secret": "second-key" }
+            }
+        }
+    })).unwrap();
+    let input = serde_json::to_string(&document).unwrap();
+    assert!(input.contains("first-key") && input.contains("second-key"));
+    let (mut redacted, secrets) = document.redacted();
+    let echo = serde_json::to_string(&redacted).unwrap();
+    assert!(!echo.contains("first-key") && !echo.contains("second-key"));
+    redacted.restore_secrets(&secrets);
+    assert_eq!(serde_json::to_string(&redacted).unwrap(), input);
+
+    let (mut changed, _) = document.redacted();
+    changed.backends.remove("http");
+    let BackendKind::Fetch {
+        upstream: Upstream::OpenaiResponses { secret },
+        ..
+    } = &mut changed.backends.get_mut("responses").unwrap().kind
+    else {
+        unreachable!()
+    };
+    *secret = Some("rotated-key".into());
+    changed.restore_secrets(&secrets);
+    let (_, retained) = changed.redacted();
+    assert_eq!(retained.0.len(), 1);
+    assert_eq!(retained.0["responses"][""], "rotated-key");
+}
+
+#[test]
+fn flattened_backend_and_route_reject_unknown_fields() {
+    let backend = serde_json::json!({"kind":"local", "max_in_flight":1, "typo":true});
+    assert!(serde_json::from_value::<Backend>(backend).is_err());
+    let route = serde_json::json!({"kind":"responses", "backends":["a"], "service":"openai", "method":"responses", "typo":true});
+    assert!(serde_json::from_value::<hellas_gateway::Route>(route).is_err());
+}

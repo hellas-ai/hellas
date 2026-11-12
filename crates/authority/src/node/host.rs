@@ -7,6 +7,8 @@ use hellas_auth::hash_tuple;
 use std::num::NonZeroU16;
 
 pub const HOST_STATUS: &str = "host.status";
+pub const HOST_CONFIGURE: &str = "host.configure";
+pub const HOST_CANCEL_JOB: &str = "host.job.cancel";
 pub const HOST_PROVIDER_CONFIGURE: &str = "host.provider.configure";
 pub const HOST_PROVIDER_BIND: &str = "host.provider.bind";
 pub const HOST_GATEWAY_CONFIGURE: &str = "host.gateway.configure";
@@ -47,6 +49,45 @@ pub struct NodeStatus {
 }
 
 impl NodeCoordinator {
+    /// Trusted in-process restart data; the public watch returns its redacted document.
+    pub async fn configuration(
+        &self,
+    ) -> Result<Option<crate::model::grant::configuration::ConfigurationDocument>, NodeStoreError>
+    {
+        let (store, _) = self.lock().await?;
+        Ok(store.state().configuration().cloned())
+    }
+
+    /// The whole daemon change has one authority check and one durable frame.
+    pub async fn configure(
+        &self,
+        caller: &AuthenticatedCaller,
+        authorization: GrantId,
+        document: crate::model::grant::configuration::ConfigurationDocument,
+        configuration: &crate::model::grant::configuration::NodeConfiguration,
+    ) -> Result<(), NodeStoreError> {
+        let _changed = ChangeNotification(self.changed.clone());
+        self.checked(caller, authorization, HOST_CONFIGURE, async |store, now| {
+            let authority = store.state().authority();
+            authority.authorize_caller(
+                caller,
+                authorization,
+                &Operation::named(HOST_CONFIGURE)?.permission(authority.authority(), None)?,
+                now,
+            )?;
+            store
+                .configure(
+                    document.revision,
+                    document.document,
+                    document.secrets,
+                    configuration,
+                    now,
+                )
+                .await
+        })
+        .await
+    }
+
     /// HTTP admission accepts only a bearer credential restricted to this
     /// operation. An administrator credential must never become an HTTP bearer.
     pub async fn authorize_gateway(
@@ -150,7 +191,12 @@ impl NodeCoordinator {
     ) -> Result<T, NodeStoreError> {
         if !matches!(
             operation,
-            HOST_STATUS | HOST_PROVIDER_CONFIGURE | HOST_GATEWAY_CONFIGURE | HOST_GATEWAY_ACCESS
+            HOST_STATUS
+                | HOST_CONFIGURE
+                | HOST_CANCEL_JOB
+                | HOST_PROVIDER_CONFIGURE
+                | HOST_GATEWAY_CONFIGURE
+                | HOST_GATEWAY_ACCESS
         ) {
             return Err(AuthorityError::Denied.into());
         }

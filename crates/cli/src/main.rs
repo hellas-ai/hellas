@@ -755,24 +755,18 @@ async fn async_main() {
                     let mut authorities = Vec::new();
                     let serving = async {
                         for listener in document.listeners.values() {
-                            let hellas_sdk::daemon_config::Listener::Http { bind, profile, zdr } =
-                                listener
+                            let hellas_sdk::daemon_config::Listener::Http { bind, zdr } = listener
                             else {
                                 unreachable!()
                             };
                             let directory = home.join("gateway");
-                            let profile = match profile {
-                                Some(profile) => profile.clone(),
-                                None => {
-                                    commands::admin::gateway_profile(
-                                        &directory,
-                                        &home,
-                                        &local_identity,
-                                        &principal,
-                                    )
-                                    .await?
-                                }
-                            };
+                            let profile = commands::admin::gateway_profile(
+                                &directory,
+                                &home,
+                                &local_identity,
+                                &principal,
+                            )
+                            .await?;
                             let host = hellas_sdk::node_control::profile::GatewayProfile::load(
                                 &home.child(profile),
                             )

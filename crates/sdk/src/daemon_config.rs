@@ -2,6 +2,7 @@
 use hellas_auth::authority::{ResourceId, Revision};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, net::SocketAddr, num::NonZeroUsize, path::PathBuf};
+mod fetch;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -28,8 +29,6 @@ pub enum Listener {
     Http {
         bind: SocketAddr,
         #[serde(default)]
-        profile: Option<PathBuf>,
-        #[serde(default)]
         zdr: bool,
     },
     Iroh {
@@ -38,7 +37,6 @@ pub enum Listener {
     },
 }
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Backend {
     pub max_in_flight: NonZeroUsize,
     #[serde(flatten)]
@@ -97,7 +95,7 @@ pub enum Upstream {
         credentials: BTreeMap<String, Credential>,
     },
     OpenaiResponses {
-        #[serde(default, skip_serializing)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         secret: Option<String>,
     },
 }
@@ -108,7 +106,7 @@ pub struct Credential {
     pub allowed_paths: Vec<String>,
     pub allowed_methods: Vec<String>,
     pub header_name: String,
-    #[serde(default, skip_serializing)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<String>,
 }
 
@@ -126,6 +124,64 @@ impl Default for Document {
 }
 
 impl Document {
+    /// Keys are inputs only. The redacted copy is the persisted echo and Watch document.
+    pub fn redacted(
+        &self,
+    ) -> (
+        Self,
+        hellas_authority::model::grant::configuration::ConfigurationSecrets,
+    ) {
+        let mut document = self.clone();
+        let mut secrets =
+            hellas_authority::model::grant::configuration::ConfigurationSecrets::default();
+        document.secrets(|backend, alias, secret| {
+            if let Some(value) = secret.take() {
+                secrets
+                    .0
+                    .entry(backend.into())
+                    .or_default()
+                    .insert(alias.into(), value);
+            }
+        });
+        (document, secrets)
+    }
+
+    /// An omitted key retains the previously supplied value for the same entry.
+    pub fn restore_secrets(
+        &mut self,
+        stored: &hellas_authority::model::grant::configuration::ConfigurationSecrets,
+    ) {
+        self.secrets(|backend, alias, secret| {
+            if secret.is_none() {
+                *secret = stored
+                    .0
+                    .get(backend)
+                    .and_then(|values| values.get(alias))
+                    .cloned();
+            }
+        });
+    }
+
+    fn secrets(&mut self, mut visit: impl FnMut(&str, &str, &mut Option<String>)) {
+        for (id, backend) in &mut self.backends {
+            match &mut backend.kind {
+                BackendKind::Fetch {
+                    upstream: Upstream::Http { credentials, .. },
+                    ..
+                } => {
+                    for (alias, credential) in credentials {
+                        visit(id, alias, &mut credential.secret);
+                    }
+                }
+                BackendKind::Fetch {
+                    upstream: Upstream::OpenaiResponses { secret },
+                    ..
+                } => visit(id, "", secret),
+                _ => {}
+            }
+        }
+    }
+
     pub fn validate(&self) -> Result<(), &'static str> {
         if self
             .backends
@@ -143,25 +199,17 @@ impl Document {
             return Err("backend capacity exceeds the runtime limit");
         }
         for listener in self.listeners.values() {
-            match listener {
-                Listener::Iroh { backends, .. } => {
-                    let mut ids = std::collections::BTreeSet::new();
-                    for id in backends {
-                        if !ids.insert(id) {
-                            return Err("duplicate iroh backend");
-                        }
-                        match &self.backends.get(id).ok_or("unknown iroh backend")?.kind {
-                            BackendKind::Local { .. } | BackendKind::Fetch { .. } => {}
-                            _ => return Err("iroh listeners only serve local and fetch backends"),
-                        }
+            if let Listener::Iroh { backends, .. } = listener {
+                let mut ids = std::collections::BTreeSet::new();
+                for id in backends {
+                    if !ids.insert(id) {
+                        return Err("duplicate iroh backend");
+                    }
+                    match &self.backends.get(id).ok_or("unknown iroh backend")?.kind {
+                        BackendKind::Local { .. } | BackendKind::Fetch { .. } => {}
+                        _ => return Err("iroh listeners only serve local and fetch backends"),
                     }
                 }
-                Listener::Http { bind, profile, .. }
-                    if !bind.ip().is_loopback() && profile.is_none() =>
-                {
-                    return Err("remote HTTP requires an authority profile");
-                }
-                _ => {}
             }
         }
         for route in &self.routes {

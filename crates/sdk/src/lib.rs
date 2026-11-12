@@ -60,6 +60,7 @@ pub mod contact;
 pub mod grant_config;
 pub mod node_control;
 
+pub mod daemon;
 pub mod daemon_config;
 mod gateway_work;
 pub use gateway_work::{Backend, BackendEntry, ExecutorGateway, WorkRequest};

@@ -87,62 +87,86 @@ impl LocalExecution {
                 .await
                 .map_err(content)?;
         }
-        let key = signer.public_key();
-        // The caller's own disk store retains what it runs.
-        let prepared = input.prepare(
-            &input.manifest()?,
-            signer,
-            rand::random(),
-            key,
+        run(
+            &self.backend,
+            (LocalStore::Disk(self.content.clone()), Scope::Owner),
+            input,
             policy,
-            true,
-        )?;
-        let work_id = prepared
-            .request
-            .commitment()
-            .map_err(JobError::from)?
-            .digest();
-        let domain = policy
-            .classify_manifest(&prepared.manifest().map_err(JobError::from)?)
-            .map_err(JobError::from)?
-            .capacity_domain;
-        let permit = self
-            .backend
-            .try_admit(domain)
-            .map_err(|error| ExecutionError::LocalAdmission(error.to_string()))?;
-        if let Some(accepted) = &observers.accepted {
-            accepted(hellas_rpc::provenance::ExecutionProvenance {
-                commitment_id: *work_id.as_bytes(),
-                provider: key,
-            });
-        }
-        let events = before_proposal(
+            signer,
             deadline,
             stop,
-            None,
-            hellas_channel::work::run_admitted(
-                &self.backend,
-                prepared.clone(),
-                policy,
-                (LocalStore::Disk(self.content.clone()), Scope::Owner),
-                WorkAdmission::reserved(permit),
-                observers
-                    .progress
-                    .unwrap_or_else(|| std::sync::Arc::new(|_| Ok(()))),
-            ),
+            observers,
         )
-        .await?
-        .map_err(|fault| ExecutionError::Local(fault.to_string()))?;
-        let verified = prepared
-            .verify_output(policy, &key, &key, &events)
-            .map_err(JobError::from)?;
-        Ok(Completed {
-            work_id,
-            output: verified.output,
-            transcript: verified.transcript_bytes,
-            provider_key: key,
-            paid: None,
-            live: None,
-        })
+        .await
     }
+}
+
+/// Local Compute and Fetch have the same admission, cancellation and signed result path.
+#[expect(clippy::too_many_arguments, reason = "shared local execution boundary")]
+pub(crate) async fn run(
+    backend: &hellas_executor::ExecutorHandle,
+    content: (LocalStore, Scope),
+    input: &JobInput,
+    policy: &InvocationPolicy,
+    signer: &ProducerSigningKey,
+    deadline: Option<tokio::time::Instant>,
+    stop: &Stop,
+    observers: ExecutionObservers,
+) -> Result<Completed> {
+    let key = signer.public_key();
+    // The caller's own disk store retains what it runs.
+    let prepared = input.prepare(
+        &input.manifest()?,
+        signer,
+        rand::random(),
+        key,
+        policy,
+        true,
+    )?;
+    let work_id = prepared
+        .request
+        .commitment()
+        .map_err(JobError::from)?
+        .digest();
+    let domain = policy
+        .classify_manifest(&prepared.manifest().map_err(JobError::from)?)
+        .map_err(JobError::from)?
+        .capacity_domain;
+    let permit = backend
+        .try_admit(domain)
+        .map_err(|error| ExecutionError::LocalAdmission(error.to_string()))?;
+    if let Some(accepted) = &observers.accepted {
+        accepted(hellas_rpc::provenance::ExecutionProvenance {
+            commitment_id: *work_id.as_bytes(),
+            provider: key,
+        });
+    }
+    let events = before_proposal(
+        deadline,
+        stop,
+        None,
+        hellas_channel::work::run_admitted(
+            backend,
+            prepared.clone(),
+            policy,
+            content,
+            WorkAdmission::reserved(permit),
+            observers
+                .progress
+                .unwrap_or_else(|| std::sync::Arc::new(|_| Ok(()))),
+        ),
+    )
+    .await?
+    .map_err(|fault| ExecutionError::Local(fault.to_string()))?;
+    let verified = prepared
+        .verify_output(policy, &key, &key, &events)
+        .map_err(JobError::from)?;
+    Ok(Completed {
+        work_id,
+        output: verified.output,
+        transcript: verified.transcript_bytes,
+        provider_key: key,
+        paid: None,
+        live: None,
+    })
 }

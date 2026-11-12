@@ -35,6 +35,8 @@ pub const OPERATIONS: &[Operation] = &[
     Operation::new(crate::content::COLLECT, Scope::Host, Mount::Host),
     Operation::new(crate::content::RESOLVE, Scope::Host, Mount::Host),
     Operation::new(node::HOST_STATUS, Scope::Host, Mount::Host),
+    Operation::new(node::HOST_CONFIGURE, Scope::Host, Mount::Host),
+    Operation::new(node::HOST_CANCEL_JOB, Scope::Host, Mount::Host),
     Operation::new(node::HOST_PROVIDER_CONFIGURE, Scope::Host, Mount::Host),
     Operation::new(node::HOST_PROVIDER_BIND, Scope::Host, Mount::Host),
     Operation::new(node::HOST_GATEWAY_CONFIGURE, Scope::Host, Mount::Host),

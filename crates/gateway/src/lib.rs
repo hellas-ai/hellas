@@ -152,7 +152,7 @@ pub enum WorkShutdownError {
     Recovery(#[source] Arc<dyn std::error::Error + Send + Sync>),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
 pub struct BackendInfo {
     pub id: String,
     pub evaluator: Option<String>,
@@ -369,6 +369,46 @@ async fn start_gateway(options: GatewayOptions) -> crate::GatewayResult<GatewayH
         shutdown,
         task,
     })
+}
+
+/// Listener tasks belong to the daemon; accepted jobs belong to its job table.
+pub fn serve_listener(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<GatewayResult<()>> {
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<ConnectionId>(),
+        )
+        .with_graceful_shutdown(async move {
+            let _ = shutdown.wait_for(|stop| *stop).await;
+        })
+        .await
+        .map_err(Into::into)
+    })
+}
+
+pub async fn listener_router(
+    app: axum::Router,
+    access: GatewayAccess,
+    archive: ArchiveOptions,
+) -> GatewayResult<axum::Router> {
+    access.validate().await?;
+    let policy = archive::Policy::new(archive);
+    policy.prepare();
+    let app =
+        app.layer(provenance_layer::ProvenanceLayer)
+            .layer(axum::middleware::from_fn_with_state(
+                policy,
+                archive::record,
+            ));
+    #[cfg(feature = "otel")]
+    let app = app.layer(axum::middleware::from_fn(
+        hellas_rpc::telemetry::http::trace_request,
+    ));
+    Ok(app.layer(access::BearerLayer::new(access)))
 }
 
 fn finish_cleanup<T>(

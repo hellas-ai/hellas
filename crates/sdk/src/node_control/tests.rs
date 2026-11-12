@@ -2,6 +2,7 @@ use super::*;
 mod admission;
 mod authentication;
 mod authenticator;
+mod daemon;
 #[cfg(unix)]
 mod lifecycle;
 mod local;

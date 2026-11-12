@@ -39,6 +39,7 @@ impl NodeStore {
         self.configure(
             expected,
             serde_json::to_string(configuration).unwrap(),
+            Default::default(),
             configuration,
             now,
         )
@@ -187,6 +188,7 @@ async fn rejected_configuration_changes_nothing_in_memory_or_on_reopen() {
             .configure(
                 Revision(1),
                 "new document".into(),
+                Default::default(),
                 &candidate,
                 UnixMillis(1002)
             )
@@ -207,28 +209,61 @@ async fn rejected_configuration_changes_nothing_in_memory_or_on_reopen() {
 async fn document_and_authority_share_one_commit_and_checkpoint() {
     let directory = tempfile::tempdir().unwrap();
     let mut store = store(directory.path()).await;
+    let secrets = crate::model::grant::configuration::ConfigurationSecrets(
+        [(
+            "backend".into(),
+            [("key".into(), "private-api-key".into())].into(),
+        )]
+        .into(),
+    );
+    assert!(!format!("{secrets:?}").contains("private-api-key"));
     let configured = configuration(budget(3, vec![]), budget(2, vec![]));
     store
-        .configure(Revision(0), "first".into(), &configured, UnixMillis(1001))
+        .configure(
+            Revision(0),
+            "first".into(),
+            secrets.clone(),
+            &configured,
+            UnixMillis(1001),
+        )
         .await
         .unwrap();
+    let mut changed_secrets = secrets.clone();
+    changed_secrets
+        .0
+        .get_mut("backend")
+        .unwrap()
+        .insert("key".into(), "replacement".into());
     let changed = configuration(budget(9, vec![]), budget(5, vec![]));
     let before = store.state().clone();
     assert!(
         store
-            .configure(Revision(0), "stale".into(), &changed, UnixMillis(1002))
+            .configure(
+                Revision(0),
+                "stale".into(),
+                changed_secrets,
+                &changed,
+                UnixMillis(1002)
+            )
             .await
             .is_err()
     );
     assert_eq!(store.state(), &before);
     let frames = store.journal_len();
     store
-        .configure(Revision(1), "second".into(), &changed, UnixMillis(1002))
+        .configure(
+            Revision(1),
+            "second".into(),
+            secrets.clone(),
+            &changed,
+            UnixMillis(1002),
+        )
         .await
         .unwrap();
     assert_eq!(store.journal_len(), frames + 1);
     let committed = store.state().clone();
     assert_eq!(committed.configuration().unwrap().document, "second");
+    assert_eq!(committed.configuration().unwrap().secrets, secrets);
     assert_eq!(committed.configuration().unwrap().revision, Revision(2));
     assert_eq!(
         committed
@@ -259,7 +294,13 @@ async fn interrupted_configuration_reopens_as_one_complete_version() {
     let mut store = store(directory.path()).await;
     let initial = configuration(budget(3, vec![]), budget(2, vec![]));
     store
-        .configure(Revision(0), "old".into(), &initial, UnixMillis(1000))
+        .configure(
+            Revision(0),
+            "old".into(),
+            Default::default(),
+            &initial,
+            UnixMillis(1000),
+        )
         .await
         .unwrap();
     let before = store.state().clone();
@@ -277,6 +318,7 @@ async fn interrupted_configuration_reopens_as_one_complete_version() {
         let mut configuring = std::pin::pin!(store.configure(
             Revision(1),
             "new".into(),
+            Default::default(),
             &candidate,
             UnixMillis(1000)
         ));

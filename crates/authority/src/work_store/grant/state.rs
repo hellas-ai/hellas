@@ -59,7 +59,7 @@ pub struct ResourceHealth {
 /// It names the frame format, so a journal written under different semantics
 /// is refused at the boundary instead of being reinterpreted. Bump it with
 /// any change to [`Frame`] or [`Change`] that is not readable as written.
-pub(super) const JOURNAL_NAMESPACE: &str = "hellas.node.journal.v5";
+pub(super) const JOURNAL_NAMESPACE: &str = "hellas.node.journal.v6";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct Frame {
@@ -77,6 +77,7 @@ pub(super) enum Change {
     Configure {
         expected: Revision,
         document: String,
+        secrets: crate::model::grant::configuration::ConfigurationSecrets,
         configuration: crate::model::grant::configuration::NodeConfiguration,
     },
     Authority(AdministrationRecord),
@@ -322,6 +323,7 @@ impl State {
             Change::Configure {
                 expected,
                 document,
+                secrets,
                 configuration,
             } => {
                 if self
@@ -371,6 +373,7 @@ impl State {
                     Some(crate::model::grant::configuration::ConfigurationDocument {
                         revision: expected.next().ok_or(NodeStoreError::Malformed)?,
                         document: document.clone(),
+                        secrets: secrets.clone(),
                     });
             }
             Change::Authority(record) => {

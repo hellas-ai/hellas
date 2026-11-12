@@ -87,6 +87,7 @@ impl NodeStore {
         &mut self,
         expected: Revision,
         document: String,
+        secrets: crate::model::grant::configuration::ConfigurationSecrets,
         configuration: &crate::model::grant::configuration::NodeConfiguration,
         now: UnixMillis,
     ) -> Result<(), NodeStoreError> {
@@ -96,6 +97,7 @@ impl NodeStore {
             Change::Configure {
                 expected,
                 document,
+                secrets,
                 configuration: configuration.clone(),
             },
             true,

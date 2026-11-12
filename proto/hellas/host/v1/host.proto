@@ -11,6 +11,9 @@ service HostControl {
   rpc IssueCredential(IssueCredentialRequest) returns (IssueCredentialResponse);
   rpc RevokeCredential(RevokeCredentialRequest) returns (RevokeCredentialResponse);
   rpc WorkControl(WorkControlRequest) returns (WorkControlResponse);
+  rpc Configure(ConfigureRequest) returns (ConfigureResponse);
+  rpc Watch(WatchRequest) returns (stream WatchResponse);
+  rpc CancelJob(CancelJobRequest) returns (CancelJobResponse);
   rpc GetHostStatus(GetHostStatusRequest) returns (HostStatus);
   rpc ConfigureProvider(ConfigureProviderRequest) returns (HostStatus);
   rpc SetProviderState(SetProviderStateRequest) returns (HostStatus);
@@ -183,3 +186,24 @@ message EndpointMetadata {
   repeated string allowed_hosts = 3;
   repeated string keys = 4;
 }
+
+message ConfigureRequest {
+  bytes authorization = 1;
+  uint64 expected_revision = 2;
+  // Complete JSON document; credentials are accepted only as inputs.
+  bytes document = 3;
+}
+message ConfigureResponse { uint64 revision = 1; }
+message WatchRequest { bytes authorization = 1; }
+message WatchResponse {
+  // Initial redacted view, followed by ordered JSON events.
+  oneof update {
+    bytes snapshot = 1;
+    bytes event = 2;
+  }
+}
+message CancelJobRequest {
+  bytes authorization = 1;
+  uint64 id = 2;
+}
+message CancelJobResponse { bool cancelled = 1; }

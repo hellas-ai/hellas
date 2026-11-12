@@ -34,6 +34,17 @@ pub struct NodeConfiguration {
 pub struct ConfigurationDocument {
     pub revision: Revision,
     pub document: String,
+    /// Private restart data. Control replies return only `document`.
+    pub secrets: ConfigurationSecrets,
+}
+
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigurationSecrets(pub BTreeMap<String, BTreeMap<String, String>>);
+
+impl std::fmt::Debug for ConfigurationSecrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
 }
 
 impl NodeConfiguration {

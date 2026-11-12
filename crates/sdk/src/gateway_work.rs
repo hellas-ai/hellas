@@ -430,6 +430,11 @@ fn repair(https: &HttpsResource, body: &[u8]) -> Result<Vec<u8>, JobError> {
 #[derive(Clone)]
 #[expect(clippy::large_enum_variant, reason = "one per backend")]
 pub enum Backend {
+    /// One upstream endpoint under its own per-backend admission capacity.
+    Fetch {
+        execution: hellas_executor::ExecutorHandle,
+        policy: InvocationPolicy,
+    },
     /// Paid execution options and, after `quote`, the provider's terms.
     /// A saved job already carries its price and needs no new quote.
     Paid {
@@ -495,6 +500,9 @@ impl Backend {
     /// The one job `request` becomes under this target's terms.
     fn job(&self, request: &WorkRequest) -> Result<Job, WorkGatewayError> {
         let input = match self {
+            Self::Fetch { policy, .. } => {
+                request.admitted(policy, None, hellas_rpc::Assurance::ProducerSigned, false)
+            }
             Self::Paid {
                 options, policy, ..
             } => request.admitted(
@@ -543,6 +551,7 @@ impl Backend {
     )]
     pub fn executor(&self, job: &Job) -> Result<Executor, ExecutionError> {
         Ok(match self {
+            Self::Fetch { execution, policy } => Executor::Fetch(execution.clone(), policy.clone()),
             Self::Paid {
                 options,
                 endpoint,
@@ -579,6 +588,7 @@ impl Backend {
     /// The Fetch schemas and routes admitted by this backend, each once.
     pub fn fetch_routes(&self) -> Vec<(hellas_rpc::FetchSchema, FetchRoutePolicy)> {
         let policy = match self {
+            Self::Fetch { policy, .. } => Some(policy),
             Self::Paid { policy, .. } => policy.as_ref(),
             Self::Grant { policy, .. } => Some(&policy.invocation_policy),
             #[cfg(feature = "compute")]
@@ -722,37 +732,81 @@ struct Inner {
     slots: Arc<Semaphore>,
     capacity: usize,
     down: std::sync::atomic::AtomicBool,
+    retired: std::sync::atomic::AtomicBool,
 }
 impl ExecutorGateway {
     pub fn new(
         backends: std::collections::BTreeMap<String, BackendEntry>,
         signer: Arc<hellas_auth::ProducerSigningKey>,
     ) -> Arc<Self> {
-        let jobs = Arc::new(hellas_gateway::jobs::Jobs::default());
+        Self::prepare(
+            backends,
+            signer,
+            Arc::new(hellas_gateway::jobs::Jobs::default()),
+            None,
+            &Default::default(),
+        )
+    }
+
+    pub(crate) fn prepare(
+        backends: std::collections::BTreeMap<String, BackendEntry>,
+        signer: Arc<hellas_auth::ProducerSigningKey>,
+        jobs: Arc<hellas_gateway::jobs::Jobs>,
+        previous: Option<&Self>,
+        reuse: &std::collections::BTreeSet<String>,
+    ) -> Arc<Self> {
+        let mut resolved: std::collections::BTreeMap<_, _> = previous
+            .into_iter()
+            .flat_map(|previous| previous.backends.iter())
+            .filter(|(id, _)| reuse.contains(*id))
+            .map(|(id, inner)| (id.clone(), inner.clone()))
+            .collect();
+        resolved.extend(backends.into_iter().map(|(id, entry)| {
+            (
+                id.clone(),
+                Arc::new(Inner {
+                    id,
+                    jobs: jobs.clone(),
+                    target: entry.backend,
+                    evaluator: entry.evaluator,
+                    signer: signer.clone(),
+                    paid: tokio::sync::Mutex::new(None),
+                    grant: tokio::sync::Mutex::new(None),
+                    slots: Arc::new(Semaphore::new(entry.max_in_flight.get())),
+                    capacity: entry.max_in_flight.get(),
+                    down: Default::default(),
+                    retired: Default::default(),
+                }),
+            )
+        }));
         Arc::new(Self {
-            backends: backends
-                .into_iter()
-                .map(|(id, entry)| {
-                    (
-                        id.clone(),
-                        Arc::new(Inner {
-                            id,
-                            jobs: jobs.clone(),
-                            target: entry.backend,
-                            evaluator: entry.evaluator,
-                            signer: signer.clone(),
-                            paid: tokio::sync::Mutex::new(None),
-                            grant: tokio::sync::Mutex::new(None),
-                            slots: Arc::new(Semaphore::new(entry.max_in_flight.get())),
-                            capacity: entry.max_in_flight.get(),
-                            down: Default::default(),
-                        }),
-                    )
-                })
-                .collect(),
+            backends: resolved,
             jobs,
         })
     }
+
+    pub(crate) async fn retire(&self, next: &Self) -> Result<(), WorkShutdownError> {
+        let mut failure = None;
+        for (id, backend) in &self.backends {
+            if next
+                .backends
+                .get(id)
+                .is_some_and(|next| Arc::ptr_eq(backend, next))
+            {
+                continue;
+            }
+            backend
+                .retired
+                .store(true, std::sync::atomic::Ordering::Release);
+            if backend.slots.available_permits() == backend.capacity
+                && let Err(error) = backend.close_sessions().await
+            {
+                failure.get_or_insert(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
     fn request<E: GatewayEvent>(
         &self,
         id: &str,
@@ -786,6 +840,18 @@ impl ExecutorGateway {
     }
 }
 impl Inner {
+    async fn close_sessions(&self) -> Result<(), WorkShutdownError> {
+        if let Some(mut session) = self.grant.lock().await.take() {
+            session
+                .shutdown()
+                .await
+                .map_err(|error| WorkShutdownError::Recovery(Arc::new(error)))?;
+        }
+        if let Some(mut session) = self.paid.lock().await.take() {
+            session.shutdown().await;
+        }
+        Ok(())
+    }
     fn health(&self, down: bool) {
         self.jobs.change(|| {
             (self.down.swap(down, std::sync::atomic::Ordering::AcqRel) != down).then(|| {
@@ -808,43 +874,16 @@ impl Inner {
         job: Job,
         requester: Requester<E, WorkGatewayError>,
     ) -> Result<(), WorkGatewayError> {
-        use crate::execution::{AttemptError, Controls};
+        use crate::execution::AttemptError;
         let stop = requester.stop();
         let request = WorkRequest::Job(job.input().clone());
-        let controls = Controls {
-            deadline: None,
-            stop: Some(stop.clone()),
-            observers: requester.observers(),
-            deliver: Some(requester.delivery()),
-        };
-        let pre = |error: ExecutionError| AttemptError::PreProposal(Box::new(error));
         let run = async {
             match &self.target {
                 Backend::Paid { .. } => self.run_paid(&job, &stop, &requester).await,
                 Backend::Grant { .. } => self.run_grant(&request, &stop, &requester).await,
+                Backend::Fetch { .. } => self.run_here(&job, stop, &requester).await,
                 #[cfg(feature = "compute")]
-                Backend::Local { .. } => {
-                    let result = self
-                        .target
-                        .executor(&job)
-                        .map_err(|error| AttemptError::Committed(Box::new(error)))?
-                        .run(
-                            &job,
-                            &self.signer,
-                            None,
-                            stop,
-                            controls.observers,
-                            requester.delivery(),
-                        )
-                        .await;
-                    result.map_err(|error| {
-                        if matches!(error, ExecutionError::LocalAdmission(_)) {
-                            pre(error)
-                        } else {
-                            AttemptError::Committed(Box::new(error))
-                        }
-                    })
-                }
+                Backend::Local { .. } => self.run_here(&job, stop, &requester).await,
             }
         }
         .await;
@@ -878,18 +917,11 @@ impl Inner {
         };
         // Keep a healthy channel open. A failed channel closes after its last
         // accepted job; the next demand opens it and performs recovery once.
-        if self.down.load(std::sync::atomic::Ordering::Acquire)
+        if (self.down.load(std::sync::atomic::Ordering::Acquire)
+            || self.retired.load(std::sync::atomic::Ordering::Acquire))
             && self.slots.available_permits() + 1 == self.capacity
         {
-            if let Some(mut session) = self.grant.lock().await.take() {
-                session
-                    .shutdown()
-                    .await
-                    .map_err(|error| gateway_error(error.into()))?;
-            }
-            if let Some(mut session) = self.paid.lock().await.take() {
-                session.shutdown().await;
-            }
+            self.close_sessions().await.map_err(output_error)?;
         }
         if !matches!(&result, Err(WorkGatewayError::PreProposal(_))) {
             requester.job.finish(if result.is_ok() {
@@ -899,6 +931,32 @@ impl Inner {
             });
         }
         result
+    }
+    async fn run_here<E: GatewayEvent>(
+        &self,
+        job: &Job,
+        stop: crate::execution::Stop,
+        requester: &Requester<E, WorkGatewayError>,
+    ) -> Result<crate::execution::Completed, crate::execution::AttemptError> {
+        use crate::execution::AttemptError;
+        let result = self
+            .target
+            .executor(job)
+            .map_err(|error| AttemptError::PreProposal(Box::new(error)))?
+            .run(
+                job,
+                &self.signer,
+                None,
+                stop,
+                requester.observers(),
+                requester.delivery(),
+            )
+            .await;
+        result.map_err(|error| match error {
+            ExecutionError::LocalAdmission(_) => AttemptError::PreProposal(Box::new(error)),
+            ExecutionError::Stopped(stopped) => AttemptError::Stopped(stopped),
+            _ => AttemptError::Committed(Box::new(error)),
+        })
     }
     async fn run_paid<E: GatewayEvent>(
         &self,

@@ -54,7 +54,7 @@ impl WorkAdministration {
                     .configuration()
                     .map_or(Revision(0), |c| c.revision);
                 store
-                    .configure(expected, document, &configuration, now)
+                    .configure(expected, document, Default::default(), &configuration, now)
                     .await
             })
             .await;

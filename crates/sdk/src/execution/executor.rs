@@ -13,6 +13,10 @@ use hellas_auth::ProducerSigningKey;
 pub enum Executor {
     Paid(PaidExecution),
     Grant(GrantExecution),
+    Fetch(
+        hellas_executor::ExecutorHandle,
+        hellas_rpc::protocol::invocation::InvocationPolicy,
+    ),
     /// This machine, under the caller's own policy; nothing is tracked.
     #[cfg(feature = "compute")]
     Local(
@@ -66,6 +70,24 @@ impl Executor {
         match self {
             Self::Paid(target) => target.run(job, signer, stop, controls).await,
             Self::Grant(target) => target.run(job, stop, controls).await,
+            Self::Fetch(backend, policy) => {
+                let completed = super::local::run(
+                    &backend,
+                    job.input().content(),
+                    job.input(),
+                    &policy,
+                    signer,
+                    deadline,
+                    &stop,
+                    controls.observers,
+                )
+                .await?;
+                controls
+                    .deliver
+                    .map_or(Ok(()), |deliver| deliver(&completed))
+                    .map_err(ExecutionError::Delivery)?;
+                Ok(completed)
+            }
             #[cfg(feature = "compute")]
             Self::Local(target, policy) => {
                 let Controls {

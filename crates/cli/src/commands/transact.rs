@@ -624,6 +624,7 @@ impl ResolvedBackend {
         let policy = match &self.backend {
             Backend::Paid { policy, .. } => policy.clone(),
             Backend::Grant { policy, .. } => Some(policy.invocation_policy.clone()),
+            Backend::Fetch { policy, .. } => Some(policy.clone()),
             #[cfg(feature = "compute")]
             Backend::Local { .. } => None,
         };
@@ -673,6 +674,7 @@ impl ResolvedBackend {
                 execution.attempt = Some(attempt);
                 provider.to_string()
             }
+            Executor::Fetch(..) => hex::encode(context.producer.public_key().bytes()),
             #[cfg(feature = "compute")]
             Executor::Local(..) => hex::encode(context.producer.public_key().bytes()),
         };
@@ -682,7 +684,7 @@ impl ResolvedBackend {
     async fn close(self) -> super::CliResult<()> {
         match self.backend {
             Backend::Paid { options, .. } => options.content.close().await,
-            Backend::Grant { .. } => {}
+            Backend::Grant { .. } | Backend::Fetch { .. } => {}
             #[cfg(feature = "compute")]
             Backend::Local { execution, .. } => {
                 let stopped = match self.reload {

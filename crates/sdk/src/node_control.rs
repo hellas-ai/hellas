@@ -31,6 +31,7 @@ mod admission;
 pub mod bootstrap;
 pub mod configuration;
 mod content;
+mod daemon;
 pub mod host;
 pub use admission::RemoteControlAdmission;
 pub mod profile;
@@ -46,6 +47,7 @@ pub struct NodeControl {
     node: NodeCoordinator,
     work: Option<hellas_authority::grant_service::WorkAdministration>,
     host: Option<host::Runtime>,
+    core: Option<Arc<crate::daemon::Core>>,
     content: Option<hellas_store::content::DiskStore>,
     local_slots: Arc<Semaphore>,
     remote_capacity: Arc<RemoteCapacity>,
@@ -64,6 +66,7 @@ impl NodeControl {
             node,
             work: None,
             host: None,
+            core: None,
             content: None,
             local_slots: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             remote_capacity: Arc::new(RemoteCapacity {
@@ -73,6 +76,15 @@ impl NodeControl {
             }),
             remote_admission: RemoteControlAdmission::default(),
         }
+    }
+
+    /// The control service and daemon share the same authority writer.
+    pub fn with_core(mut self, core: Arc<crate::daemon::Core>) -> Result<Self, WireStatus> {
+        if !self.node.shares_writer(core.node()) {
+            return Err(unsupported());
+        }
+        self.core = Some(core);
+        Ok(self)
     }
 
     pub fn with_content_store(mut self, content: hellas_store::content::DiskStore) -> Self {
@@ -85,6 +97,7 @@ impl NodeControl {
             node: self.node.clone(),
             work: self.work.clone(),
             host: self.host.clone(),
+            core: self.core.clone(),
             content: self.content.clone(),
             session: Arc::new(session),
             binding,
@@ -421,6 +434,7 @@ struct ControlSession {
     node: NodeCoordinator,
     work: Option<hellas_authority::grant_service::WorkAdministration>,
     host: Option<host::Runtime>,
+    core: Option<Arc<crate::daemon::Core>>,
     content: Option<hellas_store::content::DiskStore>,
     session: Arc<AuthenticatedSession>,
     binding: Digest,
@@ -437,6 +451,19 @@ impl ControlSession {
 
 #[allow(refining_impl_trait)]
 impl HostControlHandler for ControlSession {
+    async fn configure(&self, request: ConfigureRequest) -> Result<ConfigureResponse, WireStatus> {
+        self.configure_daemon(request).await
+    }
+    async fn watch(
+        &self,
+        request: WatchRequest,
+    ) -> Result<hellas_rpc::call::ResponseStream<WatchResponse>, WireStatus> {
+        self.watch_daemon(request).await
+    }
+    async fn cancel_job(&self, request: CancelJobRequest) -> Result<CancelJobResponse, WireStatus> {
+        self.cancel_daemon_job(request).await
+    }
+
     async fn inspect_authority(
         &self,
         request: InspectAuthorityRequest,
