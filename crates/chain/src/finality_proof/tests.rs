@@ -125,8 +125,14 @@ fn snapshot(block: &HellasBlock, proof: Vec<u8>) -> LatestBlock {
 fn direct_finality_requires_the_envelope() {
     let (verifier, blocks, certificate, _) = fixture();
     assert!(FinalityProof::decode(&certificate).is_err());
-    let wrapped = encode(&certificate, &[]).unwrap();
+    let wrapped = FinalityProof::encode(&certificate, &[]).unwrap();
     assert_ne!(wrapped, certificate);
+    let decoded = FinalityProof::decode(&wrapped).unwrap();
+    assert_eq!(
+        decoded.certificate,
+        ConsensusVerifier::decode_finalization(&certificate).unwrap()
+    );
+    assert!(decoded.descendants.is_empty());
     verifier
         .verify_snapshot(&snapshot(&blocks[3], wrapped), &blocks[3].encode())
         .unwrap();
@@ -137,11 +143,27 @@ fn descendant_finality_verifies_with_full_and_light_consensus() {
     let (verifier, blocks, certificate, _) = fixture();
     verifier
         .verify_snapshot(
-            &snapshot(&blocks[3], encode(&certificate, &[]).unwrap()),
+            &snapshot(
+                &blocks[3],
+                FinalityProof::encode(&certificate, &[]).unwrap(),
+            ),
             &blocks[3].encode(),
         )
         .unwrap();
-    let encoded = encode(&certificate, &blocks[2..]).unwrap();
+    let encoded = FinalityProof::encode(&certificate, &blocks[2..]).unwrap();
+    let decoded = FinalityProof::decode(&encoded).unwrap();
+    assert_eq!(
+        decoded.certificate,
+        ConsensusVerifier::decode_finalization(&certificate).unwrap()
+    );
+    assert_eq!(decoded.descendants.len(), 2);
+    for (actual, expected) in decoded.descendants.iter().zip(&blocks[2..]) {
+        assert_eq!(actual.encode(), expected.encode());
+    }
+    assert_eq!(
+        FinalityProof::encode(&certificate, &decoded.descendants).unwrap(),
+        encoded
+    );
     let target = snapshot(&blocks[1], encoded.clone());
     verifier
         .verify_snapshot(&target, &blocks[1].encode())
@@ -160,12 +182,15 @@ fn descendant_finality_verifies_with_full_and_light_consensus() {
         snapshot(&blocks[0], encoded.clone()),
         snapshot(
             &blocks[1],
-            encode(&certificate, &[blocks[3].clone(), blocks[2].clone()]).unwrap(),
+            FinalityProof::encode(&certificate, &[blocks[3].clone(), blocks[2].clone()]).unwrap(),
         ),
-        snapshot(&blocks[1], encode(&certificate, &blocks[3..]).unwrap()),
         snapshot(
             &blocks[1],
-            encode(
+            FinalityProof::encode(&certificate, &blocks[3..]).unwrap(),
+        ),
+        snapshot(
+            &blocks[1],
+            FinalityProof::encode(
                 &certificate,
                 &[
                     blocks[2].clone().with_owner_root([9; 32]),
@@ -191,12 +216,24 @@ fn descendant_finality_verifies_with_full_and_light_consensus() {
     assert!(FinalityProof::decode(&encoded[..encoded.len() - 1]).is_err());
     assert!(FinalityProof::decode(&vec![0; MAX_FINALITY_PROOF_BYTES + 1]).is_err());
     assert!(
-        encode(
+        FinalityProof::encode(
             &certificate,
             &vec![blocks[2].clone(); MAX_FINALITY_DESCENDANTS + 1]
         )
         .is_err()
     );
+}
+
+#[test]
+fn encoder_rejects_oversized_certificate_and_total_bytes() {
+    assert!(FinalityProof::encode(&vec![0; MAX_CERTIFICATE_BYTES + 1], &[]).is_err());
+
+    // The length prefix counts toward the envelope's total-byte bound.
+    let mut bytes = vec![0; MAX_FINALITY_PROOF_BYTES - 5];
+    append_bytes(&mut bytes, &[0]).unwrap();
+    assert_eq!(bytes.len(), MAX_FINALITY_PROOF_BYTES);
+    assert!(append_bytes(&mut bytes, &[]).is_err());
+    assert_eq!(bytes.len(), MAX_FINALITY_PROOF_BYTES);
 }
 
 #[cfg(feature = "proof-verify")]
@@ -235,7 +272,7 @@ fn descendant_finality_uses_the_certified_height_trust_and_checks_each_epoch() {
         height: 1,
         payload: hex::encode(target.digest()),
         state_root: hex::encode(target.state_root()),
-        finalization: encode(&certificate, &blocks[2..]).unwrap(),
+        finalization: FinalityProof::encode(&certificate, &blocks[2..]).unwrap(),
         canonical_block: target.encode().to_vec(),
         observed_at_ms: 0,
         epoch: 1,
@@ -296,7 +333,7 @@ fn archive_reconstructs_descendant_finality_for_every_ancestor() {
         .unwrap();
         // Seed source history, then exercise production archive proof reconstruction. Marshal
         // archives heights 1 and 2 without certificates and height 3 with its certificate.
-        let encoded = encode(&certificate, &blocks[2..]).unwrap();
+        let encoded = FinalityProof::encode(&certificate, &blocks[2..]).unwrap();
         source
             .publish_proof(blocks[1].clone(), &encoded)
             .await
@@ -334,7 +371,10 @@ fn archive_reconstructs_descendant_finality_for_every_ancestor() {
 #[test]
 fn shared_threshold_certificates_cannot_cross_genesis_or_network() {
     let (verifier, blocks, certificate, identity) = fixture();
-    let snapshot = snapshot(blocks.last().unwrap(), encode(&certificate, &[]).unwrap());
+    let snapshot = snapshot(
+        blocks.last().unwrap(),
+        FinalityProof::encode(&certificate, &[]).unwrap(),
+    );
     verifier
         .verify_snapshot(&snapshot, &blocks.last().unwrap().encode())
         .unwrap();
@@ -364,7 +404,7 @@ fn shared_threshold_certificates_cannot_cross_genesis_or_network() {
 fn direct_certificate_rejects_forged_snapshot_height() {
     let (verifier, blocks, certificate, _) = fixture();
     let block = blocks.last().unwrap();
-    let mut snapshot = snapshot(block, encode(&certificate, &[]).unwrap());
+    let mut snapshot = snapshot(block, FinalityProof::encode(&certificate, &[]).unwrap());
     verifier
         .verify_snapshot(&snapshot, &block.encode())
         .unwrap();
@@ -380,7 +420,7 @@ fn direct_certificate_rejects_forged_snapshot_height() {
 fn direct_certificate_rejects_forged_snapshot_state_root() {
     let (verifier, blocks, certificate, _) = fixture();
     let block = blocks.last().unwrap();
-    let mut snapshot = snapshot(block, encode(&certificate, &[]).unwrap());
+    let mut snapshot = snapshot(block, FinalityProof::encode(&certificate, &[]).unwrap());
     verifier
         .verify_snapshot(&snapshot, &block.encode())
         .unwrap();

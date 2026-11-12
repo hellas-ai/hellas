@@ -100,6 +100,6 @@ pub(crate) fn finalization(fixture: &ConsensusFixture, block: &HellasBlock) -> F
 
 /// The single wire envelope (`finality_proof`) around [`finalization`].
 pub(crate) fn finality_envelope(fixture: &ConsensusFixture, block: &HellasBlock) -> Vec<u8> {
-    crate::finality_proof::encode(&finalization(fixture, block).encode(), &[])
+    crate::finality_proof::FinalityProof::encode(&finalization(fixture, block).encode(), &[])
         .expect("finality envelope")
 }
