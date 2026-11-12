@@ -423,6 +423,71 @@ async fn a_failed_job_returns_its_terminal_after_authentication() {
     );
 }
 
+/// A job whose signed result is a failure — an execution timeout — can never
+/// be paid for. Once the provider has released that result it ends the job,
+/// so its price moves from the open reservation to the lost totals at once
+/// instead of staying reserved until the payment deadline.
+#[tokio::test]
+async fn a_released_timeout_ends_the_job_and_reserves_nothing() {
+    fn timed_out(
+        request: &hellas_rpc::protocol::invocation::InvocationRequest,
+        _: &[u32],
+    ) -> Vec<OutputEventEnvelope> {
+        use hellas_rpc::protocol::invocation::output::{FailureReason, InvocationOutput, Outcome};
+        InvocationOutput {
+            outcome: Outcome::Failed(FailureReason::ExecutionTimeout),
+            artifacts: vec![],
+            metadata: hellas_rpc::JsonBytes(vec![]),
+        }
+        .sign(request, &provider_producer(), 1024)
+        .unwrap()
+    }
+    let client_root = temp();
+    let provider_root = temp();
+    let ready = ready();
+    let mut cs = store_at(client_root.path(), &ready, Role::Client, CURSOR).await;
+    let mut ps = store_at(provider_root.path(), &ready, Role::Provider, CURSOR).await;
+    let (id, _) = accept(&work_policy(), &mut [&mut cs, &mut ps], 1).await;
+    let service = WorkService::new(ProviderEndpoint::new(ready.clone(), ps, provider()).unwrap());
+    let backend = AnsweringBackend::with_transcript(timed_out);
+    assert!(matches!(
+        run_accepted_work(&service, &ready, &backend, id).await,
+        Ok(RunOutcome::Completed { .. })
+    ));
+    assert_eq!(
+        service.with_state(|s| s.jobs().len()).await.unwrap(),
+        1,
+        "an unreleased failure is still owed its delivery"
+    );
+    let mut endpoint = ClientEndpoint::new(ready.clone(), cs, client()).unwrap();
+    let (transport, server) = transport_pair();
+    let serving = serve(server, service.clone());
+    let delivered = fetch_result_stream(transport, &mut endpoint, &ready, id, |_| Ok(()))
+        .await
+        .unwrap();
+    assert_eq!(
+        delivered.result.outcome,
+        hellas_channel::model::work::ResultOutcome::Failed
+    );
+    serving.abort();
+    let _ = serving.await;
+    let (open, terminal, lost) = service
+        .with_state(|s| {
+            (
+                s.jobs().len(),
+                s.terminal_by_id(id).map(|t| t.outcome.clone()),
+                (s.ledger().lost_compute(), s.ledger().lost_delivery()),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(open, 0, "nothing stays reserved");
+    assert_eq!(terminal, Some(TerminalOutcome::Failed { code: 2 }));
+    assert_eq!(lost, (PRICE, PRICE));
+    close_client(endpoint).await;
+    close_service(&service).await;
+}
+
 #[tokio::test]
 async fn a_work_id_alone_releases_nothing() {
     let root = temp();

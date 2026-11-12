@@ -2460,6 +2460,12 @@ async fn finish(case: Box<Case>) {
     let bond = fresh.descriptor().bond_edge();
     fresh.shutdown().await;
     drop(fresh);
+    let stake_coins = |held: &[(CoinId, u64)]| held.iter().filter(|(_, v)| *v == 12).count();
+    let free_stake = stake_coins(&holdings(&devnet, owners[0].key()).await);
+    // The provider is down while the client settles, so only the client's
+    // own bond Timeout can return the stake.
+    let port = provider.port();
+    provider.shutdown().await;
     assert_eq!(
         sealing_while(
             &mut devnet,
@@ -2476,6 +2482,42 @@ async fn finish(case: Box<Case>) {
         .provider_payout,
         0
     );
+    wait_for_holdings(&mut devnet, owners[0].key(), |held| {
+        stake_coins(held) == free_stake + 1
+    })
+    .await;
+    provider = Provider::start(
+        root.path(),
+        config.clone(),
+        compute.clone(),
+        identity.clone(),
+        port,
+    )
+    .await;
+    fresh_args.provider_addrs = provider.endpoint.bound_sockets();
+    // With its settled channel's bond returned, the same client is granted a
+    // fresh channel straight away.
+    let mut reopened = sealing_while(
+        &mut devnet,
+        Duration::from_millis(100),
+        PaidWorkSession::open(
+            fresh_args.clone(),
+            endpoint.clone(),
+            keys[3].clone(),
+            agent_owner.clone(),
+            SessionOpenMode::Any,
+            SessionFundingOptions::default(),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_ne!(
+        reopened.descriptor().bond_edge(),
+        bond,
+        "the same client is granted a new channel"
+    );
+    reopened.shutdown().await;
+    drop(reopened);
     grant_composition(&provider, &secret, root.path()).await;
     provider.grants.drain().await.unwrap();
     provider.shutdown().await;

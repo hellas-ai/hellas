@@ -10,9 +10,9 @@
 
 use hellas_channel::work::WorkService;
 use hellas_channel::work_close::{
-    BlockSourceError, CatchUpError, CloseError, CloseProgress, TxSink,
+    BlockSourceError, CatchUpError, CloseError, CloseProgress, TxSink, due_bond_timeout,
 };
-use hellas_kernel::{Terms, Tx};
+use hellas_kernel::Tx;
 
 use crate::SubmitTxOutcome;
 use crate::domain::Transaction;
@@ -52,9 +52,6 @@ pub enum PaidWorkClockError {
     /// The connected transaction sink failed.
     #[error("the connected transaction sink failed: {0}")]
     Submission(#[source] BlockSourceError),
-    /// The retained work-bond shape had no deterministic timeout payout.
-    #[error("the mounted channel's embedded bond terms have no timeout payout")]
-    TimeoutUnavailable,
 }
 
 impl PaidWorkClockError {
@@ -106,8 +103,8 @@ impl From<QueryError> for BlockSourceError {
 ///
 /// # Errors
 ///
-/// Returns the failed journal drive, decision, or submission. A retained
-/// work-bond shape without a timeout payout is also refused.
+/// Returns the failed journal drive, decision, or submission, including
+/// [`CloseError::BondTimeoutUnavailable`] for a bond with no timeout payout.
 pub async fn advance_paid_work_clock<T>(
     service: &WorkService,
     snapshot: &WorkChannelSnapshot,
@@ -120,29 +117,18 @@ where
         .advance_close(&snapshot.observed_channel(), sink)
         .await
         .map_err(PaidWorkClockError::CloseDrive)?;
-    let (bond_edge, bond_terms, settled) = service
-        .with_state(|state| {
-            let payment_terms = state.channel().payment_terms();
-            (
-                payment_terms.bond_edge,
-                Terms::work_stake_bond(payment_terms.bond_terms.clone()),
-                state.close_settled().is_some(),
-            )
-        })
+    let tx = service
+        .with_state(|state| due_bond_timeout(state, &snapshot.observed_channel()))
         .await
-        .map_err(|error| PaidWorkClockError::Decision(CloseError::Endpoint(error)))?;
-    let bond_timeout = if snapshot.bond().is_some()
-        && (settled || snapshot.block().height >= bond_terms.timeout().get())
-    {
-        let tx = Tx::timeout_close(bond_edge, &bond_terms)
-            .ok_or(PaidWorkClockError::TimeoutUnavailable)?;
-        Some(
+        .map_err(|error| PaidWorkClockError::Decision(CloseError::Endpoint(error)))?
+        .map_err(PaidWorkClockError::Decision)?;
+    let bond_timeout = match tx {
+        Some(tx) => Some(
             sink.submit(tx)
                 .await
                 .map_err(PaidWorkClockError::Submission)?,
-        )
-    } else {
-        None
+        ),
+        None => None,
     };
     Ok(PaidWorkClockAdvance {
         close,

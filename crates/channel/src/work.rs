@@ -145,7 +145,7 @@ use crate::model::setup::{ObservedChannel, ReadyChannel, WorkSetupError};
 use crate::model::work::encode_kernel;
 use crate::model::work::{
     JobDeadlines, PaidJobAuthorizationV2, PaidJobResultV1, PaidWorkError, PaymentBindingV1,
-    PrivateRecord as _, delivery_request_digest, encode_transcript, next_payment,
+    PrivateRecord as _, ResultOutcome, delivery_request_digest, encode_transcript, next_payment,
     payment_binding_digest, result_digest, signing_hash, work_id,
 };
 use crate::work_close::{
@@ -348,13 +348,13 @@ impl From<WorkStoreError> for Refusal {
 /// and each has a test: a nested record rule, a bad client signature, a
 /// job already in flight, and a nonce this channel has already spent.
 ///
-/// `OverCredit` is reachable but not from a test here. This profile
-/// admits one job at a time, so the gate can only bite after earlier
-/// jobs have been run and lost, which takes a journal rather than a
-/// request. What it is on the wire — a decline, not a fault — is
-/// decided here; that it bites at all is
-/// `compute_credit_bounds_what_may_be_co_signed`'s, and that a channel
-/// which has reached its limit still *opens* is
+/// `OverCredit` is reachable but not from a test here: it bites once
+/// open reservations plus what earlier jobs lost reach a limit, which
+/// takes a journal rather than a request. What it is on the wire — a
+/// decline, not a fault — is decided here; that it bites at all is
+/// `compute_credit_bounds_what_may_be_co_signed`'s, that losses never
+/// refill it is `unpaid_endings_are_lost_and_never_refill_the_credit_limits`'s,
+/// and that a channel which has reached its limit still *opens* is
 /// `a_journal_accepted_a_record_at_a_time_reopens_whole`'s.
 ///
 /// The rest belong to steps this phase does not carry — a result, a
@@ -1258,17 +1258,16 @@ impl ProviderEndpoint {
         Ok(state.ledger().credited_cumulative())
     }
 
-    /// Ends the open job as this provider's own failure, releasing
-    /// what it still holds.
+    /// Ends the open job as this provider's own failure.
     ///
-    /// There is no reason to pass, and that is the point. The only
-    /// ending a caller here can ask for is the one that charges this
-    /// client nothing: a backend that faulted, or a transcript that is
-    /// not this job's, is the provider's side going wrong. The ending
-    /// that *does* charge a client — a deadline it signed and let pass
-    /// — is decided from finalized heights by `work_close::observe`
-    /// and nowhere else, so no local caller can reach it by choosing an
-    /// argument.
+    /// There is no reason to pass, and that is the point: a backend that
+    /// faulted, or a transcript that is not this job's, is the provider's
+    /// side going wrong, and the client is never asked to pay for it. Like
+    /// every unpaid ending of an accepted job, its price moves from the
+    /// open reservation to the channel's lost compute. The ending a client
+    /// could have prevented — a deadline it signed and let pass — is
+    /// decided from finalized heights by `work_close::observe` and nowhere
+    /// else.
     ///
     /// # Errors
     ///
@@ -1297,6 +1296,41 @@ impl ProviderEndpoint {
 /// because [`ProviderEndpoint::end_run`] is the one provider-chosen
 /// ending, and it is always the provider's own side going wrong.
 const PROVIDER_FAULT_CODE: u32 = 1;
+
+/// The failure code a provider records when it ends a job whose signed
+/// result is a failure, once that result has been released. A failed result
+/// can never be paid for, so holding the job open to its payment deadline
+/// would only keep its price reserved.
+const FAILED_RESULT_CODE: u32 = 2;
+
+impl ProviderEndpoint {
+    /// Ends a job whose released result is a signed failure. Any other job
+    /// is left as it is: a successful result is owed its payment, and an
+    /// unreleased one its delivery.
+    async fn end_failed_delivery(&mut self, work_id: Digest) -> Result<(), WorkStoreError> {
+        let failed = self.state().job_by_id(work_id).is_some_and(|job| {
+            job.phase() == JobPhase::Delivered
+                && job
+                    .result()
+                    .is_some_and(|(result, _)| result.outcome == ResultOutcome::Failed)
+        });
+        if failed {
+            self.close
+                .store
+                .commit(
+                    ChannelRecord::JobTerminated {
+                        work_id,
+                        outcome: TerminalOutcome::Failed {
+                            code: FAILED_RESULT_CODE,
+                        },
+                    },
+                    &Secp256k1Verifier::new(),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+}
 
 // ── Settling on chain ─────────────────────────────────────────────────
 
@@ -2688,6 +2722,15 @@ impl WorkService {
         result.and(cleanup)
     }
 
+    /// Ends a job once its released result is a signed failure.
+    pub(super) async fn end_failed_delivery(&self, work_id: Digest) -> Result<(), RunError> {
+        self.endpoint()
+            .await?
+            .end_failed_delivery(work_id)
+            .await
+            .map_err(RunError::Store)
+    }
+
     /// Releases one job's answer, or says why not.
     ///
     /// The exporter comes from `context`, which is the transport's own
@@ -3290,6 +3333,13 @@ impl ClientEndpoint {
     /// exists to punish — and the client is the party that would be
     /// punished for it.
     ///
+    /// A job this client holds no result for cannot be paid for once the
+    /// start is signed, so it ends first, as expired at the cursor — the
+    /// same ending a contest gives it. That is what lets a client close a
+    /// channel whose provider died mid-job instead of waiting out the
+    /// job's terminal deadline. A job holding a result is still the
+    /// client's to verify and pay, so it keeps the channel open.
+    ///
     /// Everything else is [`ProviderEndpoint::prepare_close`]'s: the
     /// journal takes the bytes before they are returned, a start that
     /// can still be included is offered again rather than replaced,
@@ -3297,13 +3347,22 @@ impl ClientEndpoint {
     ///
     /// # Errors
     ///
-    /// [`CloseError::Store`] when a job is still open, a contest is
-    /// already live, or the journal refuses the record, and the window
-    /// errors [`close_start`] raises.
+    /// [`CloseError::Store`] when a job holding a result is still open, a
+    /// contest is already live, or the journal refuses the record, and the
+    /// window errors [`close_start`] raises.
     pub async fn prepare_close(&mut self) -> Result<PaymentCloseStart, CloseError> {
-        let (height, _) = self.state().cursor();
+        let (height, payload) = self.state().cursor();
         if let Some(retained) = self.state().includable_close_start(height) {
             return Ok(retained.clone());
+        }
+        if self.state().jobs().all(|job| job.result().is_none()) {
+            crate::work_close::end_open_jobs(
+                &mut self.store,
+                height,
+                payload,
+                &Secp256k1Verifier::new(),
+            )
+            .await?;
         }
         let start = close_start(
             self.state().channel(),

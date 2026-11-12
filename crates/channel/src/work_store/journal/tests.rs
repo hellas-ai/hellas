@@ -271,6 +271,40 @@ async fn a_block_cursor_journal_is_refused_without_migration() {
     ));
 }
 
+/// A format-5 channel journal predates the loss totals in its checkpoint.
+/// It is refused by name — no migration, no reset, no panic — both when it is
+/// opened and when discovery inspects it.
+#[tokio::test]
+async fn a_channel_journal_without_loss_totals_is_refused_by_name() {
+    let directory = tempfile::tempdir().unwrap();
+    let location = StoreLocation::for_test(directory.path());
+    let channel = JournalId {
+        kind: JournalKind::Channel,
+        ..id()
+    };
+    let (mut journal, _) = Journal::open_latest(&location, "old", channel)
+        .await
+        .unwrap();
+    journal.append(b"format-5 record").await.unwrap();
+    journal.close().await;
+    let options = SqliteConnectOptions::new().filename(Journal::path(&location, "old"));
+    let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+    sqlx::raw_sql("UPDATE journal SET kind = 5")
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    connection.close().await.unwrap();
+    let opened = Journal::open_existing(&location, "old", channel).await;
+    let Err(error @ JournalError::UnknownKind { kind: 5, .. }) = opened else {
+        panic!("a format-5 journal opened: {:?}", opened.map(|_| ()));
+    };
+    assert!(error.to_string().contains("another version"), "{error}");
+    assert!(matches!(
+        Journal::inspect(&location, "old").await,
+        Err(JournalError::UnknownKind { kind: 5, .. })
+    ));
+}
+
 #[tokio::test]
 async fn failed_header_validation_releases_the_writer_before_returning() {
     let root = tempfile::tempdir().unwrap();
