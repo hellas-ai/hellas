@@ -8,9 +8,11 @@ async fn fleet_paid_startup_requires_exact_owner_approval_without_owner_key() {
     impl hellas_channel::work::WorkBackend for NoBackend {
         fn try_admit(
             &self,
-            domain: hellas_channel::work::admission::CapacityDomain,
+            backend: &hellas_channel::work::admission::BackendKey,
+            _caller: hellas_auth::PublicKey,
         ) -> Result<hellas_channel::work::admission::WorkPermit, hellas_channel::work::BackendFault>
         {
+            let domain = backend.domain();
             Err(hellas_channel::work::admission::AdmissionError::Unsupported(domain).into())
         }
     }

@@ -31,7 +31,7 @@ pub(crate) struct LocalIdentity {
     pub(crate) transport_key: SecretKey,
     pub(crate) node_key: ProducerSigningKey,
     pub(crate) enrollment: ProviderEnrollmentBundle,
-    open_identity: Arc<ProviderOpen<ProducerSigningKey>>,
+    open_identity: Arc<ProviderOpen>,
 }
 
 struct StoredIdentity {
@@ -61,7 +61,7 @@ impl PlatformRoot {
 }
 
 impl LocalIdentity {
-    pub(crate) fn open_identity(&self) -> Arc<ProviderOpen<ProducerSigningKey>> {
+    pub(crate) fn open_identity(&self) -> Arc<ProviderOpen> {
         self.open_identity.clone()
     }
 }
@@ -69,7 +69,7 @@ impl LocalIdentity {
 fn build_open_identity(
     node_key: &ProducerSigningKey,
     enrollment: &ProviderEnrollmentBundle,
-) -> anyhow::Result<Arc<ProviderOpen<ProducerSigningKey>>> {
+) -> anyhow::Result<Arc<ProviderOpen>> {
     Ok(Arc::new(ProviderOpen::new(
         Arc::new(node_key.clone()),
         enrollment.clone(),

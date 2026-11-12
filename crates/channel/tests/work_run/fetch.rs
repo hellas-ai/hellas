@@ -33,9 +33,11 @@ async fn fetch_streams_before_terminal_then_pays_once_with_metadata_only_journal
     impl WorkBackend for PausedFetch {
         fn try_admit(
             &self,
-            domain: hellas_channel::work::admission::CapacityDomain,
+            backend: &hellas_channel::work::admission::BackendKey,
+            _caller: hellas_auth::PublicKey,
         ) -> Result<hellas_channel::work::admission::WorkPermit, hellas_channel::work::BackendFault>
         {
+            let domain = backend.domain();
             Err(hellas_channel::work::admission::AdmissionError::Unsupported(domain).into())
         }
 
@@ -378,9 +380,11 @@ async fn paid_fetch_larger_than_a_wire_frame_streams_and_pays_without_disk_paylo
     impl WorkBackend for LargeFetch {
         fn try_admit(
             &self,
-            domain: hellas_channel::work::admission::CapacityDomain,
+            backend: &hellas_channel::work::admission::BackendKey,
+            _caller: hellas_auth::PublicKey,
         ) -> Result<hellas_channel::work::admission::WorkPermit, hellas_channel::work::BackendFault>
         {
+            let domain = backend.domain();
             Err(hellas_channel::work::admission::AdmissionError::Unsupported(domain).into())
         }
 
@@ -651,9 +655,11 @@ struct FetchBackend(AtomicUsize);
 impl WorkBackend for FetchBackend {
     fn try_admit(
         &self,
-        domain: hellas_channel::work::admission::CapacityDomain,
+        backend: &hellas_channel::work::admission::BackendKey,
+        _caller: hellas_auth::PublicKey,
     ) -> Result<hellas_channel::work::admission::WorkPermit, hellas_channel::work::BackendFault>
     {
+        let domain = backend.domain();
         Err(hellas_channel::work::admission::AdmissionError::Unsupported(domain).into())
     }
 

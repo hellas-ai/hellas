@@ -297,8 +297,10 @@ struct PaidBackend {
 impl WorkBackend for PaidBackend {
     fn try_admit(
         &self,
-        domain: hellas_channel::work::admission::CapacityDomain,
+        backend: &hellas_channel::work::admission::BackendKey,
+        _caller: hellas_auth::PublicKey,
     ) -> Result<hellas_channel::work::admission::WorkPermit, BackendFault> {
+        let domain = backend.domain();
         Err(hellas_channel::work::admission::AdmissionError::Unsupported(domain).into())
     }
     async fn execute(

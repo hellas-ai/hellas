@@ -1,6 +1,7 @@
 //! The gateway backend: every HTTP request becomes one job on the job
 //! commands' target, run by the same [`Executor`]. Admission, streamed
 //! output and shutdown are shared here.
+pub(crate) mod provider;
 use crate::execution::{ExecutionError, Executor};
 use crate::grant_client::GrantClientError;
 use crate::job::{Job, JobError, JobInput};

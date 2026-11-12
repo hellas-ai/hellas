@@ -4,8 +4,8 @@ use hellas_private::StoreLocation;
 use hellas_sdk::node_control::{configuration::*, host::*};
 use std::path::Path;
 
-pub(super) async fn start_host<R: hellas_attestation::RootProver + Send + Sync + 'static>(
-    mut provider: hellas_sdk::ProviderOptions<R>,
+pub(super) async fn start_host(
+    mut provider: hellas_sdk::ProviderOptions,
     grants: Option<hellas_sdk::grant_config::GrantConfig>,
     path: Option<PathBuf>,
     transport: Option<iroh::Endpoint>,

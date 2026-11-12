@@ -24,8 +24,10 @@ impl Default for Backend {
 impl WorkBackend for Backend {
     fn try_admit(
         &self,
-        domain: hellas_channel::work::admission::CapacityDomain,
+        backend: &hellas_channel::work::admission::BackendKey,
+        _caller: hellas_auth::PublicKey,
     ) -> Result<hellas_channel::work::admission::WorkPermit, BackendFault> {
+        let domain = backend.domain();
         Ok(hellas_channel::work::admission::WorkPermit::new(
             domain,
             self.1.clone().try_acquire_owned().map_err(|_| {
@@ -38,9 +40,10 @@ impl WorkBackend for Backend {
         input: hellas_channel::work::Admitted,
     ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_channel::work::BackendFault> {
         self.0.fetch_add(1, Ordering::SeqCst);
-        let domain = input.capacity_domain();
+        let backend = hellas_channel::work::admission::BackendKey::of(input.invocation())?;
+        let caller = input.invocation().request.runner_public_key;
         let (prepared, _, _, admission) = input
-            .reserve(async { self.try_admit(domain) })
+            .reserve(async { self.try_admit(&backend, caller) })
             .await?
             .into_parts_and_admission();
         let _running = admission.dispatch().await?;

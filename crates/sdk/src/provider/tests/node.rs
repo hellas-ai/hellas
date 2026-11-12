@@ -1173,7 +1173,7 @@ fn temp() -> tempfile::TempDir {
     }
 }
 
-fn test_remote_execution() -> Arc<ProviderOpen<ProducerSigningKey>> {
+fn test_remote_execution() -> Arc<ProviderOpen> {
     let (enrollment, producer) =
         crate::test_identity::enrollment(SecretKey::from_bytes(&[0x63; 32]).public());
     Arc::new(ProviderOpen::new(Arc::new(producer), enrollment, None).unwrap())
@@ -1422,9 +1422,11 @@ struct AnsweringPaidBackend {
 impl WorkBackend for AnsweringPaidBackend {
     fn try_admit(
         &self,
-        domain: hellas_channel::work::admission::CapacityDomain,
+        backend: &hellas_channel::work::admission::BackendKey,
+        _caller: hellas_auth::PublicKey,
     ) -> Result<hellas_channel::work::admission::WorkPermit, hellas_channel::work::BackendFault>
     {
+        let domain = backend.domain();
         Err(hellas_channel::work::admission::AdmissionError::Unsupported(domain).into())
     }
 
@@ -1472,9 +1474,11 @@ impl BlockingPaidBackend {
 impl WorkBackend for BlockingPaidBackend {
     fn try_admit(
         &self,
-        domain: hellas_channel::work::admission::CapacityDomain,
+        backend: &hellas_channel::work::admission::BackendKey,
+        _caller: hellas_auth::PublicKey,
     ) -> Result<hellas_channel::work::admission::WorkPermit, hellas_channel::work::BackendFault>
     {
+        let domain = backend.domain();
         Err(hellas_channel::work::admission::AdmissionError::Unsupported(domain).into())
     }
 
@@ -4334,9 +4338,7 @@ async fn provider_startup_preserves_explicit_allowances_and_machine_limits() {
 #[tokio::test]
 async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
     use {
-        hellas_authority::grant_service::GrantService,
-        hellas_channel::work::admission::CapacityDomain,
-        hellas_channel::work::admission::WorkPermit,
+        hellas_authority::grant_service::GrantService, hellas_channel::work::admission::WorkPermit,
     };
     use {
         hellas_authority::model::grant, hellas_authority::model::grant::budget::*,
@@ -4348,7 +4350,12 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
         slots: Arc<Semaphore>,
     }
     impl WorkBackend for Backend {
-        fn try_admit(&self, domain: CapacityDomain) -> Result<WorkPermit, BackendFault> {
+        fn try_admit(
+            &self,
+            backend: &hellas_channel::work::admission::BackendKey,
+            _caller: hellas_auth::PublicKey,
+        ) -> Result<WorkPermit, BackendFault> {
+            let domain = backend.domain();
             Ok(WorkPermit::new(
                 domain,
                 self.slots.clone().try_acquire_owned().map_err(|_| {
@@ -4361,9 +4368,10 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
             input: hellas_channel::work::Admitted,
         ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_channel::work::BackendFault>
         {
-            let domain = input.capacity_domain();
+            let backend = hellas_channel::work::admission::BackendKey::of(input.invocation())?;
+            let caller = input.invocation().request.runner_public_key;
             let (_, _, _, admission) = input
-                .reserve(async { self.try_admit(domain) })
+                .reserve(async { self.try_admit(&backend, caller) })
                 .await?
                 .into_parts_and_admission();
             let _running = admission.dispatch().await?;

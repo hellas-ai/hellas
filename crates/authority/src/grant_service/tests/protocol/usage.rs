@@ -117,10 +117,11 @@ async fn metered_https_health_requests_do_not_quarantine_generation() {
     impl hellas_channel::work::WorkBackend for BackendByRequest {
         fn try_admit(
             &self,
-            domain: hellas_channel::work::admission::CapacityDomain,
+            backend: &hellas_channel::work::admission::BackendKey,
+            _caller: hellas_auth::PublicKey,
         ) -> Result<hellas_channel::work::admission::WorkPermit, hellas_channel::work::BackendFault>
         {
-            hellas_channel::work::WorkBackend::try_admit(&self.health, domain)
+            hellas_channel::work::WorkBackend::try_admit(&self.health, backend, _caller)
         }
         async fn execute_stream(
             &self,

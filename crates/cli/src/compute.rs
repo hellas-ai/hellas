@@ -75,11 +75,8 @@ pub(crate) async fn local(
     hellas_sdk::execution::local::LocalExecution,
     crate::content_configuration::ContentReload,
 )> {
-    let mut executor = ExecutorSpawnConfig::new(
-        signer,
-        hellas_rpc::Assurance::ProducerSigned,
-        hellas_executor::FetchRouteRegistry::default(),
-    );
+    let mut executor =
+        ExecutorSpawnConfig::new(signer, hellas_executor::FetchRouteRegistry::default());
     let (content, reload) = prepare_content(home, native, &mut executor).await?;
     let backend = match hellas_executor::Executor::spawn_configured(executor).await {
         Ok(backend) => backend,
@@ -147,7 +144,6 @@ mod tests {
     fn executor() -> ExecutorSpawnConfig {
         ExecutorSpawnConfig::new(
             Arc::new(hellas_auth::ProducerSigningKey::from_secret_bytes([23; 32]).unwrap()),
-            hellas_rpc::Assurance::ProducerSigned,
             FetchRouteRegistry::default(),
         )
     }

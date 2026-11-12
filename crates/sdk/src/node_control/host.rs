@@ -846,8 +846,8 @@ async fn accept(
 
 /// Attach the normal provider to its existing authority before constructing the
 /// host factory. The factory receives that same writer on every restart.
-pub async fn prepare_provider<R: hellas_attestation::RootProver + Send + Sync + 'static>(
-    provider: &mut crate::ProviderOptions<R>,
+pub async fn prepare_provider(
+    provider: &mut crate::ProviderOptions,
     grants: Option<crate::grant_config::GrantConfig>,
 ) -> Result<Option<(NodeCoordinator, ProviderControl)>, HostError> {
     if provider.grants.is_some() {

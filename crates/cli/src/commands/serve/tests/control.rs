@@ -7,7 +7,6 @@ use hellas_authority::{
     test_support::{HANG_GUARD, common_node, ids},
 };
 use hellas_private::StoreLocation;
-use hellas_rpc::Assurance;
 use hellas_sdk::{grant_config::GrantConfig, node_control};
 use std::path::Path;
 const ROOT_GRANT: auth::GrantId = ids::ROOT_GRANT;
@@ -195,7 +194,6 @@ impl Daemon {
         let journal = grant_config.journal_root().to_path_buf();
         let mut executor = ExecutorSpawnConfig::new(
             Arc::new(provider_identity.node_key.clone()),
-            Assurance::ProducerSigned,
             FetchRouteRegistry::default(),
         );
         executor.queue_capacity = 4;

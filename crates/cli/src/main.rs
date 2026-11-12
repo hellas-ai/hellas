@@ -704,7 +704,6 @@ async fn async_main() {
                             producer_key: local_identity.node_key,
                             settlement_key,
                             open_identity,
-                            assurance,
                         })
                         .await
                     }

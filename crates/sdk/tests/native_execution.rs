@@ -60,7 +60,7 @@ use hellas_rpc::output::{OutputEvent, StopReason, TextChannel};
 use hellas_rpc::protocol::invocation::{
     self as invocation, Admission, InvocationPolicy, Limits, PreparedInvocation,
 };
-use hellas_rpc::{Assurance, ContentId, Retention, RootProof};
+use hellas_rpc::{Assurance, ContentId, Retention};
 use hellas_sdk::paid_client::{
     PaidWorkOptions, PaidWorkSession, SessionFundingOptions, SessionOpenMode, bind_paid_endpoint,
 };
@@ -555,14 +555,11 @@ impl FetchProjector for Projector {
 
 struct SoftwareRoot;
 impl RootProver for SoftwareRoot {
-    async fn prove_statement(&self, _: &[u8]) -> Result<RootProof, hellas_sdk::AttestationError> {
-        panic!("the software enrollment is already signed")
+    fn prove_statement<'a>(&'a self, _: &'a [u8]) -> hellas_attestation::RootProofFuture<'a> {
+        Box::pin(async move { panic!("the software enrollment is already signed") })
     }
-    async fn prove_open_binding(
-        &self,
-        _: Digest,
-    ) -> Result<RootProof, hellas_sdk::AttestationError> {
-        panic!("a software Open is signed by the producer key")
+    fn prove_open_binding<'a>(&'a self, _: Digest) -> hellas_attestation::RootProofFuture<'a> {
+        Box::pin(async move { panic!("a software Open is signed by the producer key") })
     }
 }
 

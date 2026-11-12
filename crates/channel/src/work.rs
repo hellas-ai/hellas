@@ -120,7 +120,7 @@ pub mod admission;
 mod admitted;
 pub use admitted::Admitted;
 mod stream;
-use admission::{AdmissionError, CapacityDomain, WorkAdmission, WorkPermit};
+use admission::{AdmissionError, WorkAdmission, WorkPermit};
 pub use stream::{PaidProgress, PaidResultStream, ProgressError, fetch_result_stream};
 
 mod content;
@@ -972,7 +972,9 @@ impl ProviderEndpoint {
             facts.limits,
             facts.capacity_domain,
             self.close.store.invocation_content(work_id)?,
-            WorkAdmission::payment(),
+            WorkAdmission::payment(hellas_auth::PublicKey::Secp256k1(
+                ready.channel().client_key().to_bytes(),
+            )),
         )));
 
         self.close
@@ -1740,7 +1742,11 @@ impl From<AdmissionError> for BackendFault {
 
 /// One application-neutral invocation seam after funding and resource admission.
 pub trait WorkBackend: Sync {
-    fn try_admit(&self, domain: CapacityDomain) -> Result<WorkPermit, BackendFault>;
+    fn try_admit(
+        &self,
+        backend: &admission::BackendKey,
+        caller: hellas_auth::PublicKey,
+    ) -> Result<WorkPermit, BackendFault>;
     fn execute(
         &self,
         input: Admitted<PreparedInvocation>,

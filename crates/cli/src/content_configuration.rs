@@ -367,7 +367,6 @@ mod tests {
             content: store.clone(),
             executor: hellas_executor::ExecutorSpawnConfig::new(
                 Arc::new(identity.node_key.clone()),
-                hellas_rpc::Assurance::ProducerSigned,
                 hellas_executor::FetchRouteRegistry::default(),
             ),
             grants: None,

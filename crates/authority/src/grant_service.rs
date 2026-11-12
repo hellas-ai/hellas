@@ -14,7 +14,7 @@ use hellas_auth::authority::UnixMillis;
 use hellas_auth::{Digest, ProducerSigningKey, PublicKey, Signature};
 use hellas_channel::job::WorkContext;
 use hellas_channel::model::work::{PrivateRecord, bound_result_digest, encode_transcript};
-use hellas_channel::work::admission::{CapacityDomain, WorkAdmission, WorkPermit};
+use hellas_channel::work::admission::{WorkAdmission, WorkPermit};
 use hellas_channel::work::{BackendFault, PaidProgress, PaidResultStream, WorkBackend};
 use hellas_rpc::OutputEventEnvelope;
 use hellas_rpc::pb::work::Refusable;
@@ -60,7 +60,9 @@ fn transcript_ram(events: &[OutputEventEnvelope]) -> usize {
         bytes.saturating_add(event_ram(event))
     })
 }
-type Admit = dyn Fn(CapacityDomain) -> Result<WorkPermit, BackendFault> + Send + Sync;
+type Admit = dyn Fn(&hellas_channel::work::admission::BackendKey, PublicKey) -> Result<WorkPermit, BackendFault>
+    + Send
+    + Sync;
 type Run = dyn Fn(
         PreparedInvocation,
         GrantPolicy,
@@ -309,7 +311,7 @@ impl GrantService {
                 tasks: BTreeMap::new(),
             })),
             signer,
-            admit: Arc::new(move |domain| capacity.try_admit(domain)),
+            admit: Arc::new(move |backend, caller| capacity.try_admit(backend, caller)),
             run,
             draining: Arc::new(tokio::sync::Mutex::new(())),
             addresses: Arc::new(addresses),
@@ -570,8 +572,12 @@ impl GrantService {
                     }
                 }
                 let domain = facts.capacity_domain;
-                let permit =
-                    (self.admit)(domain).map_err(|_| refused(GrantRefusalCode::QueueCapacity))?;
+                let permit = (self.admit)(
+                    &hellas_channel::work::admission::BackendKey::of(&input)
+                        .map_err(|_| refused(GrantRefusalCode::Malformed))?,
+                    PublicKey::Secp256k1(client.signer().to_bytes()),
+                )
+                .map_err(|_| refused(GrantRefusalCode::QueueCapacity))?;
                 if permit.domain() != domain {
                     return Err(refused(GrantRefusalCode::QueueCapacity));
                 }

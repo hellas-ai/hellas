@@ -1,7 +1,6 @@
 //! Real QUIC handshakes through a pausable UDP relay, using the production
 //! standalone provider accept loop and Node RPC dispatch.
 use super::super::*;
-use super::UnusedRoot;
 use hellas_rpc::pb::swarm::GetNodeInfoRequest;
 use hellas_rpc::services::node::NodeClientImpl;
 use iroh::EndpointAddr;
@@ -22,11 +21,7 @@ async fn provider_on(port: u16) -> (tempfile::TempDir, ProviderHandle) {
     let signer = Arc::new(signer);
     let handle = start_fetch_provider(ProviderOptions {
         content,
-        executor: ExecutorSpawnConfig::new(
-            signer.clone(),
-            Assurance::ProducerSigned,
-            FetchRouteRegistry::new(),
-        ),
+        executor: ExecutorSpawnConfig::new(signer.clone(), FetchRouteRegistry::new()),
         grants: None,
         port: Some(port),
         build: String::new(),
@@ -34,7 +29,7 @@ async fn provider_on(port: u16) -> (tempfile::TempDir, ProviderHandle) {
         discovery: false,
         work: None,
         secret_key,
-        open_identity: Arc::new(ProviderOpen::<UnusedRoot>::new(signer, enrollment, None).unwrap()),
+        open_identity: Arc::new(ProviderOpen::new(signer, enrollment, None).unwrap()),
     })
     .await
     .unwrap();
@@ -359,11 +354,7 @@ async fn standalone_grant_shutdown_releases_journal_and_identity_with_old_work_a
     drop(store);
     let options = ProviderOptions {
         content: content.clone(),
-        executor: ExecutorSpawnConfig::new(
-            signer.clone(),
-            Assurance::ProducerSigned,
-            FetchRouteRegistry::new(),
-        ),
+        executor: ExecutorSpawnConfig::new(signer.clone(), FetchRouteRegistry::new()),
         grants: Some(ProviderGrants {
             config: crate::GrantProviderOptions {
                 configuration: Default::default(),
@@ -379,9 +370,7 @@ async fn standalone_grant_shutdown_releases_journal_and_identity_with_old_work_a
         discovery: false,
         work: None,
         secret_key,
-        open_identity: Arc::new(
-            ProviderOpen::<UnusedRoot>::new(signer, enrollment.clone(), None).unwrap(),
-        ),
+        open_identity: Arc::new(ProviderOpen::new(signer, enrollment.clone(), None).unwrap()),
     };
     let handle = start_fetch_provider(options.clone()).await.unwrap();
     let service = handle

@@ -363,8 +363,10 @@ async fn a_failed_job_returns_its_terminal_after_authentication() {
     impl WorkBackend for FailingBackend {
         fn try_admit(
             &self,
-            domain: hellas_channel::work::admission::CapacityDomain,
+            backend: &hellas_channel::work::admission::BackendKey,
+            _caller: hellas_auth::PublicKey,
         ) -> Result<hellas_channel::work::admission::WorkPermit, BackendFault> {
+            let domain = backend.domain();
             Err(hellas_channel::work::admission::AdmissionError::Unsupported(domain).into())
         }
         async fn execute(&self, _: Admitted) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
@@ -723,8 +725,10 @@ async fn a_provider_signs_no_result_the_frame_would_not_carry() {
     impl WorkBackend for FetchBackend {
         fn try_admit(
             &self,
-            domain: hellas_channel::work::admission::CapacityDomain,
+            backend: &hellas_channel::work::admission::BackendKey,
+            _caller: hellas_auth::PublicKey,
         ) -> Result<hellas_channel::work::admission::WorkPermit, BackendFault> {
+            let domain = backend.domain();
             Err(hellas_channel::work::admission::AdmissionError::Unsupported(domain).into())
         }
         async fn execute(&self, input: Admitted) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
@@ -859,9 +863,11 @@ async fn live_prefix_precedes_terminal_and_reserves_delivery_credit() {
     impl WorkBackend for PausedBackend {
         fn try_admit(
             &self,
-            domain: hellas_channel::work::admission::CapacityDomain,
+            backend: &hellas_channel::work::admission::BackendKey,
+            _caller: hellas_auth::PublicKey,
         ) -> Result<hellas_channel::work::admission::WorkPermit, hellas_channel::work::BackendFault>
         {
+            let domain = backend.domain();
             Err(hellas_channel::work::admission::AdmissionError::Unsupported(domain).into())
         }
 
@@ -981,8 +987,10 @@ async fn one_channel_runs_fetch_then_compute_with_per_job_retention_and_durable_
     impl WorkBackend for Backend {
         fn try_admit(
             &self,
-            domain: hellas_channel::work::admission::CapacityDomain,
+            backend: &hellas_channel::work::admission::BackendKey,
+            _caller: hellas_auth::PublicKey,
         ) -> Result<hellas_channel::work::admission::WorkPermit, BackendFault> {
+            let domain = backend.domain();
             Err(hellas_channel::work::admission::AdmissionError::Unsupported(domain).into())
         }
         async fn execute(&self, input: Admitted) -> Result<Vec<OutputEventEnvelope>, BackendFault> {

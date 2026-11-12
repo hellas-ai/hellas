@@ -2,7 +2,7 @@ use super::*;
 use hellas_authority::model::grant::budget::*;
 use hellas_executor::{FetchProvider, FetchProviderFuture, PreparedFetchRequest};
 use hellas_private::StoreLocation;
-use hellas_rpc::{Assurance, RootProof};
+use hellas_rpc::Assurance;
 use hellas_sdk::{GrantProviderOptions, grant_client::UnpinnedOffer};
 use std::{
     num::NonZeroU64,
@@ -12,17 +12,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 struct UnusedRoot;
 impl RootProver for UnusedRoot {
-    async fn prove_statement(
-        &self,
-        _: &[u8],
-    ) -> Result<RootProof, hellas_attestation::AttestationError> {
-        panic!("software enrollment was already signed")
+    fn prove_statement<'a>(&'a self, _: &'a [u8]) -> hellas_attestation::RootProofFuture<'a> {
+        Box::pin(async move { panic!("software enrollment was already signed") })
     }
-    async fn prove_open_binding(
-        &self,
+    fn prove_open_binding<'a>(
+        &'a self,
         _: hellas_auth::Digest,
-    ) -> Result<RootProof, hellas_attestation::AttestationError> {
-        panic!("software Open must sign with the producer, not the root")
+    ) -> hellas_attestation::RootProofFuture<'a> {
+        Box::pin(async move { panic!("software Open must sign with the producer, not the root") })
     }
 }
 

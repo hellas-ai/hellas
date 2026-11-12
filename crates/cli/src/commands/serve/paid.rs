@@ -189,14 +189,20 @@ impl PaidWork {
         })
     }
 
-    pub(super) async fn start<R: hellas_attestation::RootProver + Send + Sync + 'static>(
+    pub(super) async fn start(
         &self,
-        mut provider: hellas_sdk::ProviderOptions<R>,
+        mut provider: hellas_sdk::ProviderOptions,
         grants: Option<hellas_sdk::grant_config::GrantConfig>,
         path: Option<PathBuf>,
     ) -> CliResult<hellas_sdk::node_control::host::HostHandle> {
         ensure!(
-            provider.executor.assurance == Assurance::ProducerSigned,
+            provider
+                .open_identity
+                .enrollment()
+                .genesis
+                .statement
+                .root_kind
+                == hellas_rpc::RootKind::Software,
             "paid startup requires producer-signed assurance"
         );
         let (work, _) = provider

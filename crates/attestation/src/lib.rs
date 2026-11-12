@@ -48,32 +48,25 @@ pub trait Attester {
 /// digest of a statement, while Apple App Attest signs SHA-256(statement).
 /// A confidential-open binding is already a protocol digest and must not be
 /// hashed a second time by this interface.
-pub trait RootProver {
-    fn prove_statement(
-        &self,
-        statement: &[u8],
-    ) -> impl Future<Output = Result<hellas_rpc::RootProof, AttestationError>> + Send;
+pub type RootProofFuture<'a> = std::pin::Pin<
+    Box<dyn Future<Output = Result<hellas_rpc::RootProof, AttestationError>> + Send + 'a>,
+>;
 
-    fn prove_open_binding(
-        &self,
-        binding: hellas_auth::Digest,
-    ) -> impl Future<Output = Result<hellas_rpc::RootProof, AttestationError>> + Send;
+pub trait RootProver: Send + Sync {
+    fn prove_statement<'a>(&'a self, statement: &'a [u8]) -> RootProofFuture<'a>;
+    fn prove_open_binding(&self, binding: hellas_auth::Digest) -> RootProofFuture<'_>;
 }
 
 impl RootProver for hellas_auth::ProducerSigningKey {
-    async fn prove_statement(
-        &self,
-        statement: &[u8],
-    ) -> Result<hellas_rpc::RootProof, AttestationError> {
-        self.prove_open_binding(Digest::hash(statement)).await
+    fn prove_statement<'a>(&'a self, statement: &'a [u8]) -> RootProofFuture<'a> {
+        Box::pin(async move { self.prove_open_binding(Digest::hash(statement)).await })
     }
-    async fn prove_open_binding(
-        &self,
-        binding: Digest,
-    ) -> Result<hellas_rpc::RootProof, AttestationError> {
-        self.sign_digest(binding)
-            .map(hellas_rpc::RootProof::Software)
-            .map_err(|_| AttestationError::Signature)
+    fn prove_open_binding<'a>(&'a self, binding: Digest) -> RootProofFuture<'a> {
+        Box::pin(async move {
+            self.sign_digest(binding)
+                .map(hellas_rpc::RootProof::Software)
+                .map_err(|_| AttestationError::Signature)
+        })
     }
 }
 

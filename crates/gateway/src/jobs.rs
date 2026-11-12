@@ -1,5 +1,6 @@
 //! Live requests, their reservations, cancellation and owned execution tasks.
 use crate::{WorkGatewayBusy, WorkShutdownError};
+use hellas_channel::work::admission::Cancellation;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -8,7 +9,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
-use tokio::sync::{broadcast, watch};
+use tokio::sync::broadcast;
 mod limits;
 pub use limits::RequestLimit;
 
@@ -175,7 +176,7 @@ impl Jobs {
             let job = Arc::new(Job {
                 id,
                 jobs: self.clone(),
-                stop: watch::channel(false).0,
+                stop: Cancellation::new(),
                 accepted: AtomicBool::new(false),
                 reservations: Mutex::new(Some(std::mem::take(&mut reservations))),
             });
@@ -236,7 +237,7 @@ impl Jobs {
         let Some(job) = entry.job.upgrade() else {
             return false;
         };
-        job.stop.send_replace(true);
+        job.stop.cancel();
         entry.info.state = State::Cancelling;
         let _ = self.events.send(Event::Job {
             job: entry.info.clone(),
@@ -279,7 +280,7 @@ impl Jobs {
 pub struct Job {
     id: u64,
     jobs: Arc<Jobs>,
-    stop: watch::Sender<bool>,
+    stop: Cancellation,
     accepted: AtomicBool,
     reservations: Mutex<Option<Vec<Box<dyn Reservation>>>>,
 }
@@ -288,10 +289,21 @@ impl Job {
         self.id
     }
     pub fn is_cancelled(&self) -> bool {
-        *self.stop.borrow()
+        self.stop.is_cancelled()
     }
     pub async fn cancelled(&self) {
-        let _ = self.stop.subscribe().wait_for(|stop| *stop).await;
+        self.stop.cancelled().await;
+    }
+    pub fn cancellation(&self) -> Cancellation {
+        self.stop.clone()
+    }
+    pub fn running(&self, backend: &str) {
+        self.update(|info| {
+            info.backend = Some(backend.into());
+            if info.state != State::Cancelling {
+                info.state = State::Running;
+            }
+        });
     }
     pub fn pre_proposal_failure(&self) {
         self.update(|info| {

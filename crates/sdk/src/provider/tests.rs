@@ -17,18 +17,15 @@ use tokio::time::{Duration, Instant};
 struct UnusedRoot;
 
 impl RootProver for UnusedRoot {
-    async fn prove_statement(
-        &self,
-        _: &[u8],
-    ) -> Result<RootProof, hellas_attestation::AttestationError> {
-        panic!("ALPN negotiation must not invoke attestation")
+    fn prove_statement<'a>(&'a self, _: &'a [u8]) -> hellas_attestation::RootProofFuture<'a> {
+        Box::pin(async move { panic!("ALPN negotiation must not invoke attestation") })
     }
 
-    async fn prove_open_binding(
-        &self,
+    fn prove_open_binding<'a>(
+        &'a self,
         _: hellas_auth::Digest,
-    ) -> Result<RootProof, hellas_attestation::AttestationError> {
-        panic!("ALPN negotiation must not invoke attestation")
+    ) -> hellas_attestation::RootProofFuture<'a> {
+        Box::pin(async move { panic!("ALPN negotiation must not invoke attestation") })
     }
 }
 

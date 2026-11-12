@@ -347,25 +347,9 @@ async fn public_content_is_served_by_the_host_without_a_running_provider() {
     store.close().await;
 }
 
-struct UnusedRoot;
-impl hellas_sdk::RootProver for UnusedRoot {
-    async fn prove_statement(
-        &self,
-        _: &[u8],
-    ) -> std::result::Result<hellas_rpc::RootProof, hellas_sdk::AttestationError> {
-        panic!("public content must not request attestation")
-    }
-    async fn prove_open_binding(
-        &self,
-        _: hellas_auth::Digest,
-    ) -> std::result::Result<hellas_rpc::RootProof, hellas_sdk::AttestationError> {
-        panic!("public content must not request attestation")
-    }
-}
-
 #[tokio::test]
 async fn an_open_public_watch_cannot_delay_standalone_provider_shutdown() {
-    use hellas_rpc::{Assurance, services::content::Content};
+    use hellas_rpc::services::content::Content;
     use hellas_wire::{ServiceMarker, iroh::IrohTransport};
     use std::sync::Arc;
     let root = tempfile::tempdir().unwrap();
@@ -375,11 +359,7 @@ async fn an_open_public_watch_cannot_delay_standalone_provider_shutdown() {
         hellas_channel::test_support::software_enrollment(2, *secret_key.public().as_bytes());
     let signer = Arc::new(hellas_auth::ProducerSigningKey::from_secret_bytes([2; 32]).unwrap());
     let provider = hellas_sdk::start_fetch_provider(hellas_sdk::ProviderOptions {
-        executor: hellas_executor::ExecutorSpawnConfig::new(
-            signer.clone(),
-            Assurance::ProducerSigned,
-            Default::default(),
-        ),
+        executor: hellas_executor::ExecutorSpawnConfig::new(signer.clone(), Default::default()),
         content: content.clone(),
         grants: None,
         port: Some(0),
@@ -388,9 +368,7 @@ async fn an_open_public_watch_cannot_delay_standalone_provider_shutdown() {
         discovery: false,
         work: None,
         secret_key,
-        open_identity: Arc::new(
-            hellas_sdk::ProviderOpen::<UnusedRoot>::new(signer, enrollment, None).unwrap(),
-        ),
+        open_identity: Arc::new(hellas_sdk::ProviderOpen::new(signer, enrollment, None).unwrap()),
     })
     .await
     .unwrap();

@@ -40,6 +40,7 @@ pub(crate) struct HostBuilder {
 pub(crate) struct Host {
     pub root: tempfile::TempDir,
     pub world: TestService,
+    pub content: hellas_store::content::DiskStore,
     pub backend: FakeProvider,
     pub application: Arc<ClientProfile>,
     pub allowance: GrantDef,
@@ -233,8 +234,9 @@ impl HostBuilder {
                     .build(),
             )
             .build()
-            .await
-            .serve(self.backend.clone());
+            .await;
+        let content = world.content.clone();
+        let world = world.serve(self.backend.clone());
         let secret = world.secret(FRIEND);
         let application = Arc::new(ClientProfile {
             authority: authority(),
@@ -245,6 +247,7 @@ impl HostBuilder {
         Host {
             root,
             world,
+            content,
             backend: self.backend,
             application,
             allowance,

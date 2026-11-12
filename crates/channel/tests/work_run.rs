@@ -216,9 +216,11 @@ impl CountingBackend {
 impl WorkBackend for CountingBackend {
     fn try_admit(
         &self,
-        domain: hellas_channel::work::admission::CapacityDomain,
+        backend: &hellas_channel::work::admission::BackendKey,
+        _caller: hellas_auth::PublicKey,
     ) -> Result<hellas_channel::work::admission::WorkPermit, hellas_channel::work::BackendFault>
     {
+        let domain = backend.domain();
         Err(hellas_channel::work::admission::AdmissionError::Unsupported(domain).into())
     }
 
@@ -305,8 +307,10 @@ async fn admitted_progress_sees_only_the_signed_output_prefix() {
     impl WorkBackend for EveryEvent {
         fn try_admit(
             &self,
-            domain: hellas_channel::work::admission::CapacityDomain,
+            backend: &hellas_channel::work::admission::BackendKey,
+            _caller: hellas_auth::PublicKey,
         ) -> Result<hellas_channel::work::admission::WorkPermit, BackendFault> {
+            let domain = backend.domain();
             Err(hellas_channel::work::admission::AdmissionError::Unsupported(domain).into())
         }
         async fn execute_stream(
@@ -339,7 +343,11 @@ async fn admitted_progress_sees_only_the_signed_output_prefix() {
             bundle(1),
             &work_policy(),
             hellas_channel::test_support::channel::program_content().await,
-            WorkAdmission::payment(),
+            WorkAdmission::payment(
+                hellas_auth::ProducerSigningKey::from_secret_bytes([1; 32])
+                    .unwrap()
+                    .public_key(),
+            ),
             progress,
         )
         .await

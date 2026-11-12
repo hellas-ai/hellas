@@ -8,9 +8,7 @@ use hellas_executor::{Executor, ExecutorSpawnConfig, FetchRouteRegistry};
 use hellas_rpc::open::OpenDispatcher;
 use hellas_rpc::pb::execute::{OpenRequest, OpenResponse, open_response};
 use hellas_rpc::signature_wire::signature_to_pb;
-use hellas_rpc::{
-    Assurance, OPEN_NONCE_LEN, ProviderEnrollmentBundle, RootProof, open_proof_binding,
-};
+use hellas_rpc::{OPEN_NONCE_LEN, ProviderEnrollmentBundle, RootProof, open_proof_binding};
 use hellas_wire::iroh::IrohTransport;
 use hellas_wire::{
     Dispatcher, ServiceMarker, StreamTransport, TransportContext, WireCode, WireStatus,
@@ -91,19 +89,15 @@ pub struct FetchProviderOptions<R> {
     pub paid_work: Option<PaidProviderOptions>,
 }
 
-impl<R> FetchProviderOptions<R> {
+impl<R: RootProver + 'static> FetchProviderOptions<R> {
     /// Validate Fetch-specific configuration before starting the shared native host.
-    pub async fn prepare(self) -> Result<ProviderOptions<R>, ProviderError> {
+    pub async fn prepare(self) -> Result<ProviderOptions, ProviderError> {
         let options = self;
         let has_paid_work = options.paid_work.is_some();
         let has_grants = options.grants.is_some();
         if !has_paid_work && !has_grants {
             return Err(ProviderError::FundingRequired);
         }
-        let assurance = match options.enrollment.genesis.statement.root_kind {
-            hellas_rpc::RootKind::Software => Assurance::ProducerSigned,
-            hellas_rpc::RootKind::SecureEnclave => Assurance::AppleAppAttest,
-        };
         if let Some(grants) = &options.grants {
             crate::grant_provider::ProviderResources::Fetch(&options.routes)
                 .validate(grants.configuration.resources())?;
@@ -123,8 +117,7 @@ impl<R> FetchProviderOptions<R> {
             })
             .transpose()?;
         let producer_key = Arc::new(options.identity.node_key().clone());
-        let mut executor_config =
-            ExecutorSpawnConfig::new(producer_key.clone(), assurance, options.routes);
+        let mut executor_config = ExecutorSpawnConfig::new(producer_key.clone(), options.routes);
         executor_config.fetch_max_in_flight = options.fetch_max_in_flight;
         executor_config.fetch_queue_capacity = options.fetch_queue_capacity;
         Ok(ProviderOptions {
@@ -212,7 +205,7 @@ impl ProviderGrants {
 
 /// Shared provider composition for Fetch, local evaluation and optional paid work.
 /// The caller owns discovery advertising and the executing chain node's lifetime.
-pub struct ProviderOptions<R> {
+pub struct ProviderOptions {
     pub executor: ExecutorSpawnConfig,
     pub content: hellas_store::content::DiskStore,
     pub grants: Option<ProviderGrants>,
@@ -222,10 +215,10 @@ pub struct ProviderOptions<R> {
     pub discovery: bool,
     pub work: Option<(WorkRunnerConfig, crate::work_config::WorkConfig)>,
     pub secret_key: iroh::SecretKey,
-    pub open_identity: Arc<ProviderOpen<R>>,
+    pub open_identity: Arc<ProviderOpen>,
 }
 
-impl<R> Clone for ProviderOptions<R> {
+impl Clone for ProviderOptions {
     fn clone(&self) -> Self {
         Self {
             executor: self.executor.clone(),
@@ -242,7 +235,7 @@ impl<R> Clone for ProviderOptions<R> {
     }
 }
 
-impl<R> ProviderOptions<R> {
+impl ProviderOptions {
     /// Select shared host ownership before starting any service or opening a journal.
     pub fn on_host(
         mut self,
@@ -296,7 +289,7 @@ pub(crate) fn bind_port(
 
 mod discovery;
 mod node;
-use node::NodeHandlerImpl;
+pub(crate) use node::NodeHandlerImpl;
 const MAX_RPC_IN_FLIGHT_PER_CONNECTION: usize = 16;
 
 enum IncomingConnection {
@@ -413,7 +406,7 @@ impl Drop for ProviderHandle {
     }
 }
 
-fn served_alpns(
+pub(crate) fn served_alpns(
     work_configured: bool,
     grants_configured: bool,
     remote_control: bool,
@@ -443,12 +436,9 @@ fn served_alpns(
     alpns
 }
 
-pub async fn start_fetch_provider<R>(
-    config: ProviderOptions<R>,
-) -> Result<ProviderHandle, ProviderError>
-where
-    R: RootProver + Send + Sync + 'static,
-{
+pub async fn start_fetch_provider(
+    config: ProviderOptions,
+) -> Result<ProviderHandle, ProviderError> {
     if let Some((work, _)) = &config.work
         && work.chain.home().durability() == hellas_private::Durability::Crash
     {
@@ -728,10 +718,10 @@ where
 /// Per-connection serve: each inbound substream is dispatched to the
 /// service selected by the connection's negotiated ALPN.
 #[allow(clippy::too_many_arguments)]
-async fn serve_connection<R: RootProver + Send + Sync + 'static>(
+pub(crate) async fn serve_connection(
     alpn: Vec<u8>,
     conn: Connection,
-    open_identity: Arc<ProviderOpen<R>>,
+    open_identity: Arc<ProviderOpen>,
     node_handler: NodeHandlerImpl,
     manager: PeerManager,
     setup: Option<MountedSetup>,
@@ -960,13 +950,13 @@ pub(crate) mod tests;
 
 /// The shared confidential-open proof handler. Software enrollment roots are
 /// discarded: the enrolled producer alone signs each live transport binding.
-pub struct ProviderOpen<R> {
+pub struct ProviderOpen {
     signer: Arc<hellas_auth::ProducerSigningKey>,
-    root: Option<Arc<R>>,
+    root: Option<Arc<dyn RootProver>>,
     pub(crate) enrollment: ProviderEnrollmentBundle,
 }
 
-impl<R> ProviderOpen<R> {
+impl ProviderOpen {
     pub fn enrollment(&self) -> &ProviderEnrollmentBundle {
         &self.enrollment
     }
@@ -974,7 +964,7 @@ impl<R> ProviderOpen<R> {
     pub fn new(
         signer: Arc<hellas_auth::ProducerSigningKey>,
         enrollment: ProviderEnrollmentBundle,
-        root: Option<Arc<R>>,
+        root: Option<Arc<dyn RootProver>>,
     ) -> Result<Self, ProviderError> {
         if enrollment.genesis.statement.producer_public_key != signer.public_key() {
             return Err(ProviderError::Identity);
@@ -991,7 +981,7 @@ impl<R> ProviderOpen<R> {
     }
 }
 
-impl<R> Clone for ProviderOpen<R> {
+impl Clone for ProviderOpen {
     fn clone(&self) -> Self {
         Self {
             signer: self.signer.clone(),
@@ -1001,10 +991,7 @@ impl<R> Clone for ProviderOpen<R> {
     }
 }
 
-impl<R> hellas_rpc::open::OpenHandler for ProviderOpen<R>
-where
-    R: RootProver + Send + Sync + 'static,
-{
+impl hellas_rpc::open::OpenHandler for ProviderOpen {
     async fn open(
         &self,
         request: OpenRequest,

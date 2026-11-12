@@ -1234,6 +1234,13 @@ impl WorkRunner {
     {
         let mut chain = None;
         loop {
+            if self.clocks.is_empty() {
+                tokio::select! {
+                    biased;
+                    _ = &mut stop => break,
+                    Some(clock) = self.adopt.recv() => self.clocks.push(clock),
+                }
+            }
             if chain.is_none() {
                 chain = tokio::select! {
                     biased;

@@ -128,12 +128,12 @@ pub(crate) async fn run(
         .commitment()
         .map_err(JobError::from)?
         .digest();
-    let domain = policy
-        .classify_manifest(&prepared.manifest().map_err(JobError::from)?)
-        .map_err(JobError::from)?
-        .capacity_domain;
     let permit = backend
-        .try_admit(domain)
+        .try_admit(
+            &hellas_channel::work::admission::BackendKey::of(&prepared)
+                .map_err(|error| ExecutionError::LocalAdmission(error.to_string()))?,
+            key,
+        )
         .map_err(|error| ExecutionError::LocalAdmission(error.to_string()))?;
     if let Some(accepted) = &observers.accepted {
         accepted(hellas_rpc::provenance::ExecutionProvenance {

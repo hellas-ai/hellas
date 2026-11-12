@@ -47,8 +47,7 @@ impl super::Backend {
         };
         let mut routes = FetchRouteRegistry::new();
         routes.register(FetchRoute::new(service, method), entry)?;
-        let mut config =
-            ExecutorSpawnConfig::new(signer, hellas_rpc::Assurance::ProducerSigned, routes);
+        let mut config = ExecutorSpawnConfig::new(signer, routes);
         config.fetch_max_in_flight = self.max_in_flight.get();
         config.fetch_queue_capacity = 0;
         Ok(Backend::Fetch {

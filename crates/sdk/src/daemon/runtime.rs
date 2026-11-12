@@ -15,6 +15,7 @@ use std::{
 };
 
 pub struct Options {
+    pub prover: Option<Arc<crate::ProviderOpen>>,
     pub home: hellas_private::StoreLocation,
     pub signer: Arc<hellas_auth::ProducerSigningKey>,
     pub transport: iroh::SecretKey,
@@ -240,7 +241,6 @@ impl Runtime {
                         .get_or_try_init(|| async {
                             let mut config = hellas_executor::ExecutorSpawnConfig::new(
                                 self.options.signer.clone(),
-                                hellas_rpc::Assurance::ProducerSigned,
                                 Default::default(),
                             );
                             config.gpu_config.backend = dialect;

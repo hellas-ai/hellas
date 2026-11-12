@@ -164,7 +164,12 @@ impl WorkBackend for Backend {
             queued.notified().await;
         }
         let running = admission
-            .reserve(domain, async { self.try_admit(domain) })
+            .reserve(domain, async {
+                self.try_admit(
+                    &crate::work::admission::BackendKey::of(&prepared)?,
+                    prepared.request.runner_public_key,
+                )
+            })
             .await?
             .dispatch()
             .await?;
@@ -286,7 +291,12 @@ impl WorkBackend for Backend {
         Ok(stream.finish(&output, 1024).unwrap())
     }
 
-    fn try_admit(&self, domain: CapacityDomain) -> Result<WorkPermit, BackendFault> {
+    fn try_admit(
+        &self,
+        backend: &crate::work::admission::BackendKey,
+        _caller: hellas_auth::PublicKey,
+    ) -> Result<WorkPermit, BackendFault> {
+        let domain = backend.domain();
         Ok(WorkPermit::new(
             domain,
             self.slots

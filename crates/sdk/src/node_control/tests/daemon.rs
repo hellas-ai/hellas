@@ -57,6 +57,7 @@ async fn fixture() -> Fixture {
 fn options(f: &Fixture) -> Options {
     let home = StoreLocation::for_test(&f.directory.path().join("runtime"));
     Options {
+        prover: None,
         chain: crate::test_support::chain_dir(
             home.as_ref(),
             hellas_channel::test_support::network(),
@@ -402,3 +403,5 @@ async fn removing_a_backend_preserves_its_accepted_request_and_routes_the_next_o
     })
     .await;
 }
+
+mod iroh;

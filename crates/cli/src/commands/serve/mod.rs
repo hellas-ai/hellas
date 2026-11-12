@@ -6,7 +6,6 @@ use hellas_executor::{
 };
 use hellas_kernel::Secp256k1Signer;
 use hellas_private::StoreLocation;
-use hellas_rpc::Assurance;
 use iroh::SecretKey;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -46,8 +45,7 @@ pub struct ServeOptions {
     /// paid-work configuration still had nothing to sign a settlement
     /// with.
     pub settlement_key: Secp256k1Signer,
-    pub open_identity: Arc<hellas_sdk::ProviderOpen<hellas_auth::ProducerSigningKey>>,
-    pub assurance: Assurance,
+    pub open_identity: Arc<hellas_sdk::ProviderOpen>,
 }
 
 pub fn validate_grant_resources(
@@ -107,11 +105,7 @@ pub async fn run(mut options: ServeOptions) -> CliResult<()> {
         Some(path) => load_fetch_config(path, &options.home)?,
         None => FetchRouteRegistry::default(),
     };
-    let mut executor = ExecutorSpawnConfig::new(
-        Arc::new(options.producer_key),
-        options.assurance,
-        fetch_routes,
-    );
+    let mut executor = ExecutorSpawnConfig::new(Arc::new(options.producer_key), fetch_routes);
     executor.queue_capacity = options.queue_size;
     executor.fetch_max_in_flight = options.fetch_max_in_flight;
     executor.fetch_queue_capacity = options.fetch_queue_size;

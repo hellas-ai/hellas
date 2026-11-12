@@ -1,9 +1,6 @@
 use super::*;
 use crate::test_support::{BODY, PRICE, PaidFixture};
-use hellas_channel::work::{
-    Admitted, BackendFault, WorkBackend,
-    admission::{CapacityDomain, WorkPermit},
-};
+use hellas_channel::work::{Admitted, BackendFault, WorkBackend, admission::WorkPermit};
 use hellas_channel::work_close::CloseChannel as _;
 use hellas_rpc::output::OutputEvent;
 use hellas_rpc::services::work::Work;
@@ -16,8 +13,12 @@ struct Controlled {
     gates: [Arc<Semaphore>; 3],
 }
 impl WorkBackend for Controlled {
-    fn try_admit(&self, domain: CapacityDomain) -> std::result::Result<WorkPermit, BackendFault> {
-        self.backend.try_admit(domain)
+    fn try_admit(
+        &self,
+        backend: &hellas_channel::work::admission::BackendKey,
+        _caller: hellas_auth::PublicKey,
+    ) -> std::result::Result<WorkPermit, BackendFault> {
+        self.backend.try_admit(backend, _caller)
     }
     async fn execute(
         &self,
@@ -28,9 +29,10 @@ impl WorkBackend for Controlled {
         self.gates[index].acquire().await.unwrap().forget();
         if index == 2 {
             use hellas_rpc::protocol::invocation::output::{FailureReason, OutputStream};
-            let domain = input.capacity_domain();
+            let backend = hellas_channel::work::admission::BackendKey::of(input.invocation())?;
+            let caller = input.invocation().request.runner_public_key;
             let (prepared, _, _, admission) = input
-                .reserve(async { self.try_admit(domain) })
+                .reserve(async { self.try_admit(&backend, caller) })
                 .await?
                 .into_parts_and_admission();
             let _running = admission.dispatch().await?;

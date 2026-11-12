@@ -838,8 +838,10 @@ impl AnsweringBackend {
 impl WorkBackend for AnsweringBackend {
     fn try_admit(
         &self,
-        domain: crate::work::admission::CapacityDomain,
+        backend: &crate::work::admission::BackendKey,
+        _caller: hellas_auth::PublicKey,
     ) -> Result<crate::work::admission::WorkPermit, BackendFault> {
+        let domain = backend.domain();
         Err(crate::work::admission::AdmissionError::Unsupported(domain).into())
     }
 

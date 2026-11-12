@@ -18,6 +18,7 @@ use tower::ServiceExt;
 type Task<T> =
     futures::future::Shared<futures::future::BoxFuture<'static, std::result::Result<T, String>>>;
 
+mod iroh_listener;
 mod runtime;
 pub use runtime::Options;
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -25,33 +26,39 @@ type Result<T> = std::result::Result<T, Error>;
 
 pub struct Core {
     runtime: runtime::Runtime,
-    snapshot: ArcSwap<Snapshot>,
+    pub(crate) snapshot: ArcSwap<Snapshot>,
     pub jobs: Arc<Jobs>,
     limit: Arc<RequestLimit>,
     configuring: Arc<tokio::sync::Mutex<()>>,
     commit: Mutex<Option<Task<Revision>>>,
-    listeners: Mutex<Vec<Arc<HttpListener>>>,
+    listeners: Mutex<Vec<Arc<BoundListener>>>,
     closed: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     pub(crate) after_commit:
         Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
 }
 
-struct Snapshot {
-    document: Document,
-    work: Arc<ExecutorGateway>,
+pub(crate) struct Snapshot {
+    pub(crate) document: Document,
+    pub(crate) work: Arc<ExecutorGateway>,
     routers: BTreeMap<String, Router>,
-    listeners: BTreeMap<String, Arc<HttpListener>>,
+    listeners: BTreeMap<String, Arc<BoundListener>>,
 }
 
-struct HttpListener {
-    bind: std::net::SocketAddr,
-    address: std::net::SocketAddr,
-    socket: Mutex<Option<tokio::net::TcpListener>>,
+struct BoundListener {
+    bound: Bound,
     stop: tokio::sync::watch::Sender<bool>,
     task: Mutex<Option<Task<()>>>,
 }
-impl Drop for HttpListener {
+enum Bound {
+    Http {
+        bind: std::net::SocketAddr,
+        address: std::net::SocketAddr,
+        socket: Mutex<Option<tokio::net::TcpListener>>,
+    },
+    Iroh(Arc<iroh_listener::Bound>),
+}
+impl Drop for BoundListener {
     fn drop(&mut self) {
         self.stop.send_replace(true);
     }
@@ -122,8 +129,39 @@ impl Core {
             .load()
             .listeners
             .iter()
-            .map(|(id, listener)| (id.clone(), listener.address))
+            .filter_map(|(id, listener)| match &listener.bound {
+                Bound::Http { address, .. } => Some((id.clone(), *address)),
+                Bound::Iroh(_) => None,
+            })
             .collect()
+    }
+
+    pub fn iroh_addresses(&self) -> BTreeMap<String, ::iroh::EndpointAddr> {
+        self.snapshot
+            .load()
+            .listeners
+            .iter()
+            .filter_map(|(id, listener)| match &listener.bound {
+                Bound::Iroh(bound) => Some((id.clone(), bound.endpoint.addr())),
+                Bound::Http { .. } => None,
+            })
+            .collect()
+    }
+
+    pub fn control(self: &Arc<Self>) -> Result<crate::node_control::NodeControl> {
+        let control = self
+            .snapshot
+            .load()
+            .listeners
+            .values()
+            .find_map(|listener| match &listener.bound {
+                Bound::Iroh(bound) => Some(bound.control()),
+                Bound::Http { .. } => None,
+            })
+            .unwrap_or_else(|| crate::node_control::NodeControl::new(self.node().clone()));
+        Ok(control
+            .with_content_store(self.runtime.options.content.clone())
+            .with_core(self.clone())?)
     }
 
     pub fn watch(&self) -> (View, tokio::sync::broadcast::Receiver<Event>) {
@@ -211,7 +249,7 @@ impl Core {
         task.await.map_err(Into::into)
     }
 
-    async fn prepare(&self, document: Document) -> Result<Arc<Snapshot>> {
+    async fn prepare(self: &Arc<Self>, document: Document) -> Result<Arc<Snapshot>> {
         document.validate().map_err(Error::from)?;
         let old = self.snapshot.load_full();
         let mut entries = BTreeMap::<String, BackendEntry>::new();
@@ -256,22 +294,38 @@ impl Core {
         let mut listeners = BTreeMap::new();
         let mut routers = BTreeMap::new();
         for (id, listener) in &document.listeners {
-            let Listener::Http { bind, zdr, .. } = listener else {
-                return Err("iroh listener preparation is not installed".into());
+            let reusable = old
+                .listeners
+                .get(id)
+                .filter(|old| match (&old.bound, listener) {
+                    (Bound::Http { bind: old, .. }, Listener::Http { bind, .. }) => old == bind,
+                    (Bound::Iroh(old), Listener::Iroh { port, .. }) => old.port == *port,
+                    _ => false,
+                });
+            let bound = match reusable {
+                Some(bound) => bound.clone(),
+                None => Arc::new(BoundListener {
+                    bound: match listener {
+                        Listener::Http { bind, .. } => {
+                            let socket = tokio::net::TcpListener::bind(bind).await?;
+                            Bound::Http {
+                                bind: *bind,
+                                address: socket.local_addr()?,
+                                socket: Mutex::new(Some(socket)),
+                            }
+                        }
+                        Listener::Iroh { port, .. } => Bound::Iroh(Arc::new(
+                            iroh_listener::Bound::prepare(self, id, *port).await?,
+                        )),
+                    },
+                    stop: tokio::sync::watch::channel(false).0,
+                    task: Mutex::new(None),
+                }),
             };
-            let bound =
-                if let Some(bound) = old.listeners.get(id).filter(|bound| bound.bind == *bind) {
-                    bound.clone()
-                } else {
-                    let socket = tokio::net::TcpListener::bind(bind).await?;
-                    Arc::new(HttpListener {
-                        bind: *bind,
-                        address: socket.local_addr()?,
-                        socket: Mutex::new(Some(socket)),
-                        stop: tokio::sync::watch::channel(false).0,
-                        task: Mutex::new(None),
-                    })
-                };
+            listeners.insert(id.clone(), bound);
+            let Listener::Http { zdr, .. } = listener else {
+                continue;
+            };
             let access = self
                 .runtime
                 .options
@@ -293,7 +347,6 @@ impl Core {
                 )
                 .await?,
             );
-            listeners.insert(id.clone(), bound);
         }
         Ok(Arc::new(Snapshot {
             document,
@@ -333,7 +386,7 @@ impl Core {
             match task.and_then(|task| task.now_or_never()) {
                 Some(result) => {
                     if let Err(error) = result {
-                        tracing::warn!(%error, "HTTP listener ended with an error");
+                        tracing::warn!(%error, "listener ended with an error");
                     }
                     false
                 }
@@ -341,35 +394,53 @@ impl Core {
             }
         });
         for (id, listener) in &next.listeners {
-            if let Some(socket) = listener
-                .socket
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take()
-            {
-                let core = Arc::downgrade(self);
-                let id = id.clone();
-                let router = Router::new().fallback(move |request: Request| {
-                    let core = core.clone();
+            let mut task = listener.task.lock().unwrap_or_else(|e| e.into_inner());
+            if task.is_some() {
+                continue;
+            }
+            let core = Arc::downgrade(self);
+            let handle = match &listener.bound {
+                Bound::Http { socket, .. } => {
+                    let socket = socket
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .take()
+                        .expect("unstarted HTTP listener owns its socket");
                     let id = id.clone();
-                    async move {
-                        let Some(core) = core.upgrade() else {
-                            return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
-                        };
-                        core.http(&id, request).await
-                    }
-                });
-                *listener.task.lock().unwrap_or_else(|e| e.into_inner()) = Some(
+                    let router = Router::new().fallback(move |request: Request| {
+                        let core = core.clone();
+                        let id = id.clone();
+                        async move {
+                            let Some(core) = core.upgrade() else {
+                                return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+                            };
+                            core.http(&id, request).await
+                        }
+                    });
                     hellas_gateway::serve_listener(socket, router, listener.stop.subscribe())
                         .map(|result| match result {
                             Ok(result) => result.map_err(|error| error.to_string()),
                             Err(error) => Err(error.to_string()),
                         })
                         .boxed()
-                        .shared(),
-                );
-                owned.push(listener.clone());
-            }
+                        .shared()
+                }
+                Bound::Iroh(bound) => {
+                    let bound = bound.clone();
+                    let stop = listener.stop.subscribe();
+                    tokio::spawn(async move {
+                        bound
+                            .serve(core, stop)
+                            .await
+                            .map_err(|error| error.to_string())
+                    })
+                    .map(|result| result.unwrap_or_else(|error| Err(error.to_string())))
+                    .boxed()
+                    .shared()
+                }
+            };
+            *task = Some(handle);
+            owned.push(listener.clone());
         }
         previous
     }
