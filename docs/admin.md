@@ -9,9 +9,11 @@ use by every command that acts for a principal. `--passkey FILE` (32 raw bytes
 or 64 hex digits) points at a key held outside the home instead, as services do
 with secrets under `/run`.
 
-Start a worker with `--program MANIFEST` for each Compute program it admits,
-plus `--content PATH` for the files those programs read. `hellas program PATH`
-prints the manifest of a converted Whisper package or a Qwen GGUF. That
+Start a worker with `--program PROGRAM` for each Compute program it admits,
+plus `--content PATH` for the files those programs read. `hellas program
+--backend EVALUATOR PATH` prints the id of a converted Whisper package or a Qwen
+GGUF rendered for the evaluator a GPU runtime registers, such as
+`hellas/catena-dfad87438018-hip`. That
 configures one `compute` resource with a machine/account budget; one job runs at
 a time. Use `--grant-config` instead for custom resources or budgets. A
 resource or paid terms may admit any program; compiling and running a program
@@ -394,7 +396,8 @@ ID before distributing it or retrying issuance.
 The receiving device runs jobs with it directly:
 
 ```sh
-hellas transcribe --model whisper-tiny --audio speech.wav --access me.access
+hellas transcribe --model whisper-tiny --audio speech.wav --access me.access \
+  --backend hellas/catena-dfad87438018-hip
 ```
 
 Every job command (`transcribe`, `text`, `image`, `run`, `fetch` and

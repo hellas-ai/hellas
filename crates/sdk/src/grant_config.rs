@@ -97,14 +97,14 @@ impl GrantConfig {
         }
     }
 
-    /// One generic Compute resource, `compute`, over the given programs, with
+    /// One generic Compute resource, `compute`, under the given admission, with
     /// fixed job bounds and one job at a time. Owners narrow it with
     /// `--grant-config`; nothing here knows what a program computes.
     pub fn compute(
         home: &StoreLocation,
-        programs: hellas_rpc::protocol::invocation::ComputePrograms,
+        admission: hellas_rpc::protocol::invocation::Admission,
     ) -> Result<Self, GrantConfigError> {
-        use hellas_rpc::protocol::invocation::{Admission, InvocationPolicy, Limits, compute};
+        use hellas_rpc::protocol::invocation::{InvocationPolicy, Limits};
         let account = ResourceId(hellas_auth::Digest::hash(b"hellas.compute.account.v1"));
         let policy = GrantPolicy {
             resource: ResourceId(hellas_auth::Digest::hash(b"hellas.compute.resource.v1")),
@@ -112,10 +112,7 @@ impl GrantConfig {
             revision: Revision(1),
             name: "compute".into(),
             invocation_policy: InvocationPolicy {
-                admissions: vec![Admission::Compute {
-                    evaluator: compute::EVALUATOR.into(),
-                    programs,
-                }],
+                admissions: vec![admission],
                 limits: Limits {
                     max_upload_bytes: 8 << 20,
                     max_output_bytes: 4 << 20,

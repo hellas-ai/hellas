@@ -140,9 +140,14 @@ impl TextState {
             return Err(crate::GatewayConfigError::MaxTokens.into());
         }
         let path = options.model.clone();
-        let text = ModelPackage::open(&path)
-            .await
-            .map_err(|error| crate::GatewayError::Presentation(error.into()))?;
+        let text = ModelPackage::open(
+            &path,
+            &work.evaluator().ok_or(crate::GatewayError::Presentation(
+                "Compute models need a renderer (evaluator id)".into(),
+            ))?,
+        )
+        .await
+        .map_err(|error| crate::GatewayError::Presentation(error.into()))?;
         let presentation = tokio::task::spawn_blocking(move || {
             TextPresentation::from_gguf(&path)
                 .map(|presentation| presentation.with_chat_template(Some(ChatTemplate::Qwen3)))

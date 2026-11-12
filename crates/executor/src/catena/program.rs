@@ -21,6 +21,7 @@ impl BoundProgram {
         content: &(LocalStore, Scope),
         prepared: &PreparedInvocation,
         limits: &Limits,
+        evaluator: &str,
     ) -> Result<(
         Environment,
         Vec<String>,
@@ -31,7 +32,7 @@ impl BoundProgram {
             return Err("compute content retention differs from the signed request".into());
         }
         let manifest = prepared.manifest()?;
-        if manifest.application().evaluator() != EVALUATOR
+        if manifest.application().evaluator() != evaluator
             || manifest.application().adaptor() != ADAPTOR
         {
             return Err("unsupported compute evaluator".into());
@@ -56,7 +57,7 @@ impl BoundProgram {
             hellas_channel::content::root(&content.0, &content.1, manifest.root()).await?
         };
         let environment = Environment::from_canonical_bytes(&root)?;
-        if environment.manifest()?.content_id() != manifest.content_id() {
+        if environment.manifest(evaluator)?.content_id() != manifest.content_id() {
             return Err("compute environment identity mismatch".into());
         }
         let plan = Plan::from_canonical_bytes(prepared.input.parameters.as_bytes())?;

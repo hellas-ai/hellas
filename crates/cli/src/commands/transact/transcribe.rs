@@ -24,12 +24,13 @@ pub struct TranscribeArgs {
 }
 
 pub async fn transcribe(args: TranscribeArgs, context: Context) -> super::super::CliResult<()> {
-    let package = ModelPackage::open(&args.model).await?;
     let samples = wav::decode(&super::super::read_bounded_regular_file(
         &args.audio,
         "WAV",
         wav::MAX_WAV_BYTES,
     )?)?;
+    let evaluator = args.target.renderer()?;
+    let package = ModelPackage::open(&args.model, &evaluator).await?;
     let rendered = package
         .render_job(&ModelRequest::Transcription {
             samples: &samples,
@@ -45,16 +46,7 @@ pub async fn transcribe(args: TranscribeArgs, context: Context) -> super::super:
         &context,
         args.pay,
         None,
-        async |price| {
-            Ok(Job::compute(
-                price,
-                rendered.environment,
-                rendered.plan,
-                rendered.inputs,
-                rendered.content,
-            )
-            .await?)
-        },
+        async |price| compute_job(price, evaluator, rendered).await,
         |_| args.output.clone(),
         |_, completed, _| {
             let ModelResponse::Transcription(transcription) = package.decode(&completed.output)?
@@ -75,7 +67,12 @@ mod tests {
     #[tokio::test]
     async fn whisper_plan_validates_against_the_compiled_bundle() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../client/src/model/whisper/mini");
-        let package = ModelPackage::open(&path).await.unwrap();
+        let package = ModelPackage::open(
+            &path,
+            &hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip),
+        )
+        .await
+        .unwrap();
         let mut job = package
             .render_job(&ModelRequest::Transcription {
                 samples: &[0.; 400],

@@ -778,6 +778,7 @@ async fn check_gateway_quote(
             settlement_key: settlement,
             owner,
         },
+        None,
         Arc::new(hellas_auth::ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap()),
     );
     let setups = async || {

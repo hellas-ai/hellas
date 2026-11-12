@@ -613,14 +613,16 @@ async fn cached_program_still_opens_current_pin_policy(warm_gpu: bool) {
             object: asset,
         }],
     };
-    let manifest = environment.manifest().unwrap();
+    let manifest = environment
+        .manifest(&super::evaluator(GpuDialect::Hip))
+        .unwrap();
     let root_bytes = environment.canonical_bytes().unwrap();
     let root_object = ContentRef::for_bytes(&root_bytes);
     let mut limits = limits();
     limits.max_upload_bytes = hellas_channel::content::DEFAULT_MAX_STAGING_BYTES;
     let policy = InvocationPolicy {
         admissions: vec![Admission::Compute {
-            evaluator: EVALUATOR.into(),
+            evaluator: super::evaluator(GpuDialect::Hip),
             programs: ComputePrograms::Any {},
         }],
         limits,
@@ -669,10 +671,14 @@ async fn cached_program_still_opens_current_pin_policy(warm_gpu: bool) {
         .await
         .unwrap();
     let content = (LocalStore::Job(job.clone()), job.scope().clone());
-    let (environment, sources, mut readers) =
-        super::program::BoundProgram::open(&content, &prepared, &limits)
-            .await
-            .unwrap();
+    let (environment, sources, mut readers) = super::program::BoundProgram::open(
+        &content,
+        &prepared,
+        &limits,
+        &super::evaluator(GpuDialect::Hip),
+    )
+    .await
+    .unwrap();
     let compiling = prepared.clone();
     let module = tokio::task::spawn_blocking(move || {
         super::program::BoundProgram::compile_cancellable(
@@ -718,10 +724,15 @@ async fn cached_program_still_opens_current_pin_policy(warm_gpu: bool) {
     )
     .await
     .unwrap();
-    let failure = super::program::BoundProgram::open(&content, &prepared, &limits)
-        .await
-        .err()
-        .unwrap();
+    let failure = super::program::BoundProgram::open(
+        &content,
+        &prepared,
+        &limits,
+        &super::evaluator(GpuDialect::Hip),
+    )
+    .await
+    .err()
+    .unwrap();
     assert!(
         failure.to_string().contains("missing compute asset"),
         "{failure}"
@@ -742,4 +753,72 @@ async fn a_warm_program_cache_cannot_bypass_removed_job_pin_policy() {
 #[ignore = "needs a HIP device; verifies a warm GPU asset cache against current pin policy"]
 async fn a_warm_gpu_asset_cache_cannot_bypass_removed_job_pin_policy() {
     cached_program_still_opens_current_pin_policy(true).await;
+}
+
+/// The executor runs only programs whose evaluator its GPU runtime registered,
+/// and refuses others before opening or compiling them.
+#[tokio::test]
+async fn an_executor_refuses_an_unregistered_evaluator() {
+    use hellas_rpc::{
+        Assurance, ContentRef, JsonBytes, Retention,
+        protocol::invocation::{
+            Admission, ComputePrograms, InvocationInput, InvocationPolicy, InvocationRequest,
+            PreparedInvocation,
+        },
+    };
+    use hellas_store::content::{LocalStore, MemoryStore, Reservations, Scope};
+    let environment = Environment {
+        sources: vec![ContentRef::for_bytes(SOURCE.as_bytes())],
+        assets: vec![],
+    };
+    let content = (
+        LocalStore::Memory(MemoryStore::new(Reservations::ram(1 << 20))),
+        Scope::Owner,
+    );
+    let registered = super::evaluator(GpuDialect::Hip);
+    let open = async |evaluator: &str| {
+        let manifest = environment.manifest(evaluator).unwrap();
+        let input = InvocationInput {
+            parameters: JsonBytes(counter().canonical_bytes().unwrap()),
+            artifacts: vec![],
+        };
+        let policy = InvocationPolicy {
+            admissions: vec![Admission::Compute {
+                evaluator: evaluator.into(),
+                programs: ComputePrograms::Any {},
+            }],
+            limits: limits(),
+        };
+        let prepared = PreparedInvocation::new(
+            InvocationRequest {
+                execution_environment: manifest.content_id(),
+                input: input.content_id().unwrap(),
+                runner_public_key: hellas_auth::ProducerSigningKey::generate().public_key(),
+                nonce: [1; 32],
+                assurance: Assurance::ProducerSigned,
+                retain: content.0.retention() == Retention::Retain,
+            },
+            &manifest,
+            input,
+            policy.canonical_bytes().unwrap(),
+        )
+        .unwrap();
+        super::program::BoundProgram::open(&content, &prepared, &limits(), &registered)
+            .await
+            .err()
+            .unwrap()
+            .to_string()
+    };
+    assert!(
+        open("hellas/unregistered")
+            .await
+            .contains("unsupported compute evaluator")
+    );
+    // The same program for the registered evaluator passes the check and only
+    // then misses its root in this empty store.
+    assert!(
+        !open(&registered)
+            .await
+            .contains("unsupported compute evaluator")
+    );
 }

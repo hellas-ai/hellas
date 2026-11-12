@@ -151,9 +151,16 @@ async fn folder_paths_cannot_follow_a_symlink_outside_or_inside_the_folder() {
 async fn compute_folder_round_trip_binds_environment_plan_and_price() {
     use hellas_channel::test_support::channel::{environment, plan, work_policy};
     let content = || hellas_channel::test_support::channel::program_content();
-    let job = Job::compute(20, environment(), plan(), vec![], content().await)
-        .await
-        .unwrap();
+    let job = Job::compute(
+        20,
+        hellas_channel::test_support::channel::evaluator(),
+        environment(),
+        plan(),
+        vec![],
+        content().await,
+    )
+    .await
+    .unwrap();
     let directory = tempfile::tempdir().unwrap();
     job.save(directory.path()).await.unwrap();
     let loaded = Job::load(directory.path()).await.unwrap();
@@ -165,15 +172,24 @@ async fn compute_folder_round_trip_binds_environment_plan_and_price() {
     assert_eq!(prepared.request.nonce, [7; 32]);
     assert_eq!(
         prepared.manifest().unwrap(),
-        environment().manifest().unwrap()
+        environment()
+            .manifest(&hellas_channel::test_support::channel::evaluator())
+            .unwrap()
     );
     assert_eq!(prepared.request.runner_public_key, runner());
     assert_ne!(
         job.digest(),
-        Job::compute(21, environment(), plan(), vec![], content().await)
-            .await
-            .unwrap()
-            .digest()
+        Job::compute(
+            21,
+            hellas_channel::test_support::channel::evaluator(),
+            environment(),
+            plan(),
+            vec![],
+            content().await
+        )
+        .await
+        .unwrap()
+        .digest()
     );
 }
 
@@ -208,6 +224,7 @@ async fn compute_folder_preserves_provider_held_assets_without_uploading_them() 
         .unwrap();
     let job = Job::compute(
         20,
+        hellas_channel::test_support::channel::evaluator(),
         environment,
         hellas_channel::test_support::channel::plan(),
         vec![],
@@ -274,6 +291,7 @@ async fn compute_folder_requires_sources_and_rejects_invalid_available_assets() 
             .unwrap();
         let job = Job::compute(
             20,
+            hellas_channel::test_support::channel::evaluator(),
             environment,
             hellas_channel::test_support::channel::plan(),
             vec![],
@@ -323,6 +341,7 @@ async fn large_compute_plan_folders_round_trip_with_bounded_documents() {
     };
     let job = Job::compute(
         20,
+        hellas_channel::test_support::channel::evaluator(),
         environment,
         plan,
         vec![],

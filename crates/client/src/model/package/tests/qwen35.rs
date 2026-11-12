@@ -108,12 +108,15 @@ fn fixture(moe: bool) -> tempfile::NamedTempFile {
 #[tokio::test]
 async fn dense_recurrent_model_renders_a_two_state_job() {
     let file = fixture(false);
-    let job = ModelPackage::open(file.path())
-        .await
-        .unwrap()
-        .text_job(&[2, 1], 2, &[])
-        .await
-        .unwrap();
+    let job = ModelPackage::open(
+        file.path(),
+        &crate::model::evaluator(crate::model::GpuDialect::Hip),
+    )
+    .await
+    .unwrap()
+    .text_job(&[2, 1], 2, &[])
+    .await
+    .unwrap();
     assert_eq!(
         job.plan.calls[0].bind,
         vec![Bind::Name("s0".into()), Bind::Name("s1".into())]
@@ -136,12 +139,15 @@ async fn dense_recurrent_model_renders_a_two_state_job() {
 #[tokio::test]
 async fn moe_model_binds_all_nine_declared_states() {
     let file = fixture(true);
-    let job = ModelPackage::open(file.path())
-        .await
-        .unwrap()
-        .text_job(&[2, 1], 2, &[])
-        .await
-        .unwrap();
+    let job = ModelPackage::open(
+        file.path(),
+        &crate::model::evaluator(crate::model::GpuDialect::Hip),
+    )
+    .await
+    .unwrap()
+    .text_job(&[2, 1], 2, &[])
+    .await
+    .unwrap();
     let states: Vec<_> = (0..9).map(|i| Bind::Name(format!("s{i}"))).collect();
     assert_eq!(job.plan.calls[0].bind, states);
     let step = job.plan.step.as_ref().unwrap();

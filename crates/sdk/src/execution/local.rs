@@ -22,14 +22,17 @@ pub fn policy(
     timeout: std::time::Duration,
 ) -> std::result::Result<InvocationPolicy, JobError> {
     let JobInput::Compute {
-        environment, plan, ..
+        evaluator,
+        environment,
+        plan,
+        ..
     } = input
     else {
         return Err(JobError::Invalid(
             "local execution runs Compute jobs".into(),
         ));
     };
-    let manifest = environment.manifest()?;
+    let manifest = environment.manifest(evaluator)?;
     Ok(InvocationPolicy {
         admissions: vec![hellas_rpc::protocol::invocation::Admission::Compute {
             evaluator: manifest.application().evaluator().into(),
