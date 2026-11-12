@@ -355,17 +355,20 @@ packages still build without metrics or OTLP export by default.
 ## Embedding
 
 The CLI runs every gateway request through `hellas_sdk::ExecutorGateway`: one
-`GatewayTarget` (`Paid`, `Grant` or `Local`), each request one job through the
-same `Executor` as the job commands. `ExecutorGateway::new(target, signer)`
-takes a paid target's quoted policy, endpoint, settlement key and
-`Arc<ClientOwner>`; construct the owner with the principal authenticator, the
+`Backend` (`Paid`, `Grant` or `Local`), shared with the job commands. Each
+request is one job through the same `Executor`.
+`ExecutorGateway::new(backend, evaluator, signer)` takes the backend and the
+evaluator id to render Compute jobs for. A paid backend holds its endpoint,
+settlement key and `Arc<ClientOwner>`; call `Backend::quote` to set its policy
+and exact price before serving requests. Construct the owner with the principal authenticator, the
 identity's settlement key and a private funding directory. To serve it over
 HTTP, pass it to `hellas_sdk::serve_gateway` with `GatewayServeOptions`:
 listener, authentication and archive policy, and the presentations to add
 (models, HTTPS routes). A Responses route the provider seals is served too.
 Shutting down the returned handle drains accepted work. A host using the
 gateway without HTTP must call its `WorkExecutionBackend::drain` method when
-shutting down.
+shutting down. Wrapped child processes are owned by the CLI's `--wrap` command;
+the SDK listener has no child-process lifecycle.
 
 Tracking and recovery behavior is described in
 [Tracked native execution](jobs.md#tracked-native-execution).

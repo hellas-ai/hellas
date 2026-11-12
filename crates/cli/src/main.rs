@@ -237,7 +237,7 @@ enum Commands {
         /// Host interface to bind. Every request requires bearer authentication.
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
-        /// Port to listen on. Omit to try 8080 with fallback to an OS-assigned port.
+        /// Port to listen on (default: 8080). Fail if the port is unavailable.
         #[arg(long)]
         port: Option<u16>,
         #[cfg(feature = "otel")]
