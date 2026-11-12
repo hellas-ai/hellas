@@ -296,9 +296,9 @@ enum Commands {
     Program {
         #[arg(value_name = "PATH")]
         model: PathBuf,
-        /// GPU runtime the program is compiled for: auto, hip, or cuda.
-        #[arg(long, default_value = "auto", value_parser = parsers::parse_gpu_backend)]
-        backend: hellas_client::model::GpuDialect,
+        /// The registered renderer (evaluator id) the program is compiled for.
+        #[arg(long, value_name = "EVALUATOR")]
+        backend: String,
     },
     /// Transcribe one WAV with a client-rendered Whisper job.
     Transcribe(commands::transact::TranscribeArgs),
@@ -544,13 +544,10 @@ async fn async_main() {
             return;
         }
         Commands::Program { model, backend } => {
-            let result = hellas_client::model::ModelPackage::open(
-                &model,
-                &hellas_client::model::evaluator(backend),
-            )
-            .await
-            .and_then(|package| package.program())
-            .map(|program| println!("{program}"));
+            let result = hellas_client::model::ModelPackage::open(&model, &backend)
+                .await
+                .and_then(|package| package.program())
+                .map(|program| println!("{program}"));
             tracer_provider.shutdown();
             if let Err(error) = result {
                 eprintln!("error: {error:#}");

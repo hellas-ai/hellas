@@ -632,6 +632,7 @@ fn execution_helpers_choose_payment_or_an_imported_offer() {
         assert_eq!(parse(&["--local"]).is_ok(), cfg!(feature = "compute"));
         assert!(parse(&["--local", "--access", "box.access"]).is_err());
         assert!(parse(&["--local", "--provider", &provider]).is_err());
+        assert!(parse(&["--local", "--backend", "renderer"]).is_err());
     }
 }
 

@@ -143,7 +143,7 @@ impl TextState {
         let text = ModelPackage::open(
             &path,
             &work.evaluator().ok_or(crate::GatewayError::Presentation(
-                "the work source runs no Compute".into(),
+                "Compute models need a renderer (evaluator id)".into(),
             ))?,
         )
         .await

@@ -33,7 +33,8 @@ and an optional `[fetch]` section. `any` admits any program of that compute id,
 which hands anyone who can submit jobs roughly root on the host, so `serve`
 refuses it unless `--knowingly-unsafe` acknowledges that. To restrict Compute to
 reviewed programs, use `[compute]` with a nonempty `only` list of program ids;
-`hellas program PATH` prints the id of a converted Whisper package or a Qwen GGUF. These bind the rendered code and asset hashes;
+`hellas program --backend EVALUATOR PATH` prints the id of a converted Whisper
+package or a Qwen GGUF rendered for that renderer. These bind the rendered code and asset hashes;
 request inputs and plans still vary within the configured limits. Omit
 `[compute]` to disable Compute. The same explicit `programs` selection applies
 to Compute admissions in owner-issued grant policies.
@@ -85,11 +86,14 @@ the machine; stop the completed demo worker to release its GPU allocations.
 
 ```sh
 hellas faucet
-hellas transcribe --model whisper-tiny --audio speech.wav --pay 20 --provider ENROLLMENT_ID@NODE_ID
+hellas transcribe --model whisper-tiny --audio speech.wav --pay 20 --provider ENROLLMENT_ID@NODE_ID \
+  --backend hellas/catena-dfad87438018-hip
 hellas transact --settle --provider ENROLLMENT_ID@NODE_ID
 ```
 
-`--pay MAX` asks the provider for a quote first, refuses it above `MAX`, and only
+The client renders the program for `--backend`, the renderer the provider's GPU
+runtime registers, before anything else; a provider refuses a program for an
+evaluator it did not register. `--pay MAX` asks the provider for a quote first, refuses it above `MAX`, and only
 then builds and signs the job at exactly the quoted price. `transcribe`,
 `text`, `image`, `run`, `fetch` and `gateway` take the same flags; a saved
 `transact --job DIR` keeps its own signed price. The first job opens a channel
@@ -194,13 +198,15 @@ compatible chain revision.
 
 ## Paid gateway
 
-`hellas gateway --model qwen3.gguf --pay 20 --provider ENROLLMENT_ID@NODE_ID`
-asks the provider for its quote once, then renders each request as one job and
+`hellas gateway --model qwen3.gguf --pay 20 --provider ENROLLMENT_ID@NODE_ID
+--backend hellas/catena-dfad87438018-hip` asks the provider for its quote once,
+then renders each request for that renderer as one job and
 pays for it on the provider's channel, one request at a time. A converted
 Whisper package as `--model` serves `/v1/audio/transcriptions`:
 
 ```sh
-hellas gateway --model whisper-tiny --pay 20 --provider ENROLLMENT_ID@NODE_ID &
+hellas gateway --model whisper-tiny --pay 20 --provider ENROLLMENT_ID@NODE_ID \
+  --backend hellas/catena-dfad87438018-hip &
 curl http://127.0.0.1:8080/v1/audio/transcriptions \
   -H "Authorization: Bearer $(cat ~/.hellas/gateway/bearer)" \
   -F model=whisper-tiny -F file=@speech.wav -F language=en -F response_format=json

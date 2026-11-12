@@ -36,7 +36,9 @@ pub async fn image(args: ImageArgs, context: Context) -> super::super::CliResult
         steps: args.steps,
     };
     request.validate()?;
-    let package = std::sync::OnceLock::new();
+    let evaluator = args.target.renderer()?;
+    let package = ModelPackage::open(&args.model, &evaluator).await?;
+    let rendered = package.render_job(&ModelRequest::Image(request)).await?;
     let mut target = args.target;
     target.models = vec![args.model.clone()];
     run_quoted(
@@ -45,19 +47,10 @@ pub async fn image(args: ImageArgs, context: Context) -> super::super::CliResult
         &context,
         args.pay,
         None,
-        async |price, evaluator| {
-            let opened = ModelPackage::open(&args.model, &evaluator).await?;
-            let opened = package.get_or_init(|| opened);
-            let rendered = opened.render_job(&ModelRequest::Image(request)).await?;
-            compute_job(price, evaluator, rendered).await
-        },
+        async |price| compute_job(price, evaluator, rendered).await,
         |directory| Some(directory.join("result")),
         |_, completed, _| {
-            let ModelResponse::Image(image) = package
-                .get()
-                .expect("the job was rendered")
-                .decode(&completed.output)?
-            else {
+            let ModelResponse::Image(image) = package.decode(&completed.output)? else {
                 bail!("expected image");
             };
             std::fs::write(&args.output, image.png(args.width, args.height)?)?;

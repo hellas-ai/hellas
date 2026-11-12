@@ -22,7 +22,7 @@ pub(crate) struct ServeArgs {
 #[derive(Args, Debug)]
 pub(crate) struct GpuArgs {
     /// GPU runtime: auto, hip, or cuda.
-    #[arg(long = "gpu-backend", default_value = "auto", value_parser = crate::parsers::parse_gpu_backend)]
+    #[arg(long = "gpu-backend", default_value = "auto", value_parser = parse_gpu_backend)]
     pub(crate) gpu_backend: hellas_executor::GpuDialect,
     /// Maximum programs retained in a GPU worker session.
     #[arg(long = "gpu-session-programs", default_value_t = hellas_executor::DEFAULT_GPU_SESSION_PROGRAMS, value_parser = crate::parsers::parse_positive_usize)]
@@ -33,13 +33,6 @@ pub(crate) struct GpuArgs {
 }
 
 impl ServeArgs {
-    /// The evaluator id this node's GPU runtime registers; none without `compute`.
-    pub(crate) fn evaluator(&self) -> Option<String> {
-        #[cfg(feature = "compute")]
-        return Some(hellas_executor::catena::evaluator(self.gpu.gpu_backend));
-        #[cfg(not(feature = "compute"))]
-        None
-    }
     pub(crate) fn configure(
         self,
         executor: &mut ExecutorSpawnConfig,
@@ -55,6 +48,18 @@ impl ServeArgs {
         #[cfg(not(feature = "compute"))]
         let _ = executor;
         crate::content_configuration::ContentConfiguration::load(self.content_config, self.content)
+    }
+}
+
+#[cfg(feature = "compute")]
+fn parse_gpu_backend(value: &str) -> Result<hellas_executor::GpuDialect, String> {
+    use hellas_executor::GpuDialect;
+    match value {
+        "hip" => Ok(GpuDialect::Hip),
+        "cuda" => Ok(GpuDialect::Cuda),
+        "auto" if std::path::Path::new("/dev/nvidiactl").exists() => Ok(GpuDialect::Cuda),
+        "auto" => Ok(GpuDialect::Hip),
+        _ => Err("GPU runtime must be auto, hip, or cuda".into()),
     }
 }
 

@@ -164,11 +164,16 @@ pub(super) struct TargetArgs {
     /// Run on this machine's executor under your own limits; nothing is
     /// paid, granted or tracked.
     #[cfg(feature = "compute")]
-    #[arg(long, conflicts_with_all = ["access", "provider", "settle", "buy_again", "validators", "addresses", "acceptance_blocks", "terminal_blocks", "payment_blocks", "trust_store"])]
+    #[arg(long, conflicts_with_all = ["access", "provider", "backend", "settle", "buy_again", "validators", "addresses", "acceptance_blocks", "terminal_blocks", "payment_blocks", "trust_store"])]
     local: bool,
     #[cfg(feature = "compute")]
     #[command(flatten)]
     native: crate::compute::ServeArgs,
+    /// The registered renderer (evaluator id) remote jobs are rendered for,
+    /// as `hellas program --backend` takes; local jobs render for this
+    /// machine's GPU runtime.
+    #[arg(long, value_name = "EVALUATOR")]
+    backend: Option<String>,
     /// The model files or packages a helper or the gateway renders jobs
     /// from; local execution reads the jobs' weights from them.
     #[arg(skip)]
@@ -500,6 +505,23 @@ enum Target {
 }
 
 impl TargetArgs {
+    /// The evaluator id jobs for this target are rendered for.
+    fn evaluator(&self) -> Option<String> {
+        #[cfg(feature = "compute")]
+        if self.local {
+            return Some(hellas_executor::catena::evaluator(
+                self.native.gpu.gpu_backend,
+            ));
+        }
+        self.backend.clone()
+    }
+
+    /// The evaluator a rendered job names, which remote work must select.
+    fn renderer(&self) -> super::CliResult<String> {
+        self.evaluator()
+            .context("remote jobs name their renderer with --backend EVALUATOR")
+    }
+
     /// `pay` is the most a paid job may cost; free targets take 0.
     async fn resolve(
         self,
@@ -581,26 +603,6 @@ impl Target {
     /// The terms a job built for this target must satisfy, if it has any,
     /// and the price it charges: a paid provider quotes first, at most the
     /// `--pay` ceiling, and the job is then built at exactly that price.
-    /// The evaluator id jobs for this target are rendered for: the local
-    /// runtime's registered id, or what the quoted or granted Compute
-    /// admission names.
-    fn evaluator(
-        &self,
-        policy: Option<&hellas_rpc::protocol::invocation::InvocationPolicy>,
-    ) -> super::CliResult<String> {
-        #[cfg(feature = "compute")]
-        if let Target::Local { native, .. } = self {
-            return native
-                .as_ref()
-                .and_then(crate::compute::ServeArgs::evaluator)
-                .context("local execution has no GPU runtime");
-        }
-        policy
-            .and_then(|policy| policy.compute_evaluator())
-            .map(Into::into)
-            .context("the target admits no Compute program")
-    }
-
     async fn quote(
         &mut self,
         client: &ClientArgs,
@@ -808,6 +810,7 @@ pub async fn gateway(
         pay,
         mut target,
     } = args;
+    let evaluator = target.evaluator();
     target.models = models;
     ensure!(
         !client.settle && !client.buy_again && target.attempt.is_none(),
@@ -827,6 +830,7 @@ pub async fn gateway(
             let gateway = target.gateway(&client, &context, policy).await?;
             serve(ExecutorGateway::new(
                 gateway,
+                evaluator,
                 Arc::new(context.producer.clone()),
             ))
             .await
@@ -884,7 +888,7 @@ async fn run_quoted(
     context: &Context,
     pay: Option<u64>,
     save: Option<PathBuf>,
-    build: impl AsyncFnOnce(u64, String) -> super::CliResult<Job>,
+    build: impl AsyncFnOnce(u64) -> super::CliResult<Job>,
     evidence: impl FnOnce(&Path) -> Option<PathBuf>,
     present: impl FnOnce(&Job, &Completed, &str) -> super::CliResult<()> + Send,
 ) -> super::CliResult<()> {
@@ -895,8 +899,8 @@ async fn run_quoted(
         )
         .await?;
         let result = async {
-            let (policy, price) = within(deadline, target.quote(client, context)).await?;
-            let job = build(price, target.evaluator(policy.as_ref())?).await?;
+            let (_, price) = within(deadline, target.quote(client, context)).await?;
+            let job = build(price).await?;
             let directory = save.unwrap_or_else(|| {
                 client
                     .root(context)

@@ -149,15 +149,6 @@ pub struct InvocationPolicy {
     pub limits: Limits,
 }
 impl InvocationPolicy {
-    /// The evaluator id the policy's Compute admission runs programs for.
-    pub fn compute_evaluator(&self) -> Option<&str> {
-        self.admissions
-            .iter()
-            .find_map(|admission| match admission {
-                Admission::Compute { evaluator, .. } => Some(evaluator.as_str()),
-                Admission::Fetch { .. } => None,
-            })
-    }
     /// Whether this policy admits Compute programs nobody configured.
     pub fn admits_any_program(&self) -> bool {
         self.admissions.iter().any(|admission| {

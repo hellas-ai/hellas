@@ -7,19 +7,6 @@ use hellas_presentation::{ChatMessage, ChatTemplate, TextPresentation};
 pub struct TextArgs {
     #[command(flatten)]
     client: ClientArgs,
-    #[command(flatten)]
-    request: TextRequest,
-    /// Pay the provider named by --provider its quoted price per job, at most MAX.
-    #[arg(long, value_name = "MAX", requires = "provider", conflicts_with = "access", value_parser = clap::value_parser!(u64).range(1..))]
-    pay: Option<u64>,
-    #[command(flatten)]
-    target: TargetArgs,
-    #[arg(short = 'o', long, value_name = "DIR")]
-    output: Option<PathBuf>,
-}
-
-#[derive(Debug, Args)]
-struct TextRequest {
     /// Qwen3 GGUF; the provider holds the same weights.
     #[arg(long, value_name = "FILE")]
     model: PathBuf,
@@ -29,26 +16,29 @@ struct TextRequest {
     system: Option<String>,
     #[arg(long, default_value_t = 256, value_parser = clap::value_parser!(u64).range(1..))]
     max_tokens: u64,
+    /// Pay the provider named by --provider its quoted price per job, at most MAX.
+    #[arg(long, value_name = "MAX", requires = "provider", conflicts_with = "access", value_parser = clap::value_parser!(u64).range(1..))]
+    pay: Option<u64>,
+    #[command(flatten)]
+    target: TargetArgs,
+    #[arg(short = 'o', long, value_name = "DIR")]
+    output: Option<PathBuf>,
 }
 
 pub async fn text(args: TextArgs, context: Context) -> super::super::CliResult<()> {
-    let prepared = std::sync::OnceLock::new();
+    let evaluator = args.target.renderer()?;
+    let (package, presentation, rendered) = prepare(&args, &evaluator).await?;
     let mut target = args.target;
-    target.models = vec![args.request.model.clone()];
+    target.models = vec![args.model.clone()];
     run_quoted(
         &args.client,
         target,
         &context,
         args.pay,
         None,
-        async |price, evaluator| {
-            let (package, presentation, rendered) = prepare(&args.request, &evaluator).await?;
-            let _ = prepared.set((package, presentation));
-            compute_job(price, evaluator, rendered).await
-        },
+        async |price| compute_job(price, evaluator, rendered).await,
         |_| args.output.clone(),
         |_, completed, _| {
-            let (package, presentation) = prepared.get().expect("the job was rendered");
             let ModelResponse::Tokens(tokens) = package.decode(&completed.output)? else {
                 bail!("expected generated tokens");
             };
@@ -61,7 +51,7 @@ pub async fn text(args: TextArgs, context: Context) -> super::super::CliResult<(
 }
 
 async fn prepare(
-    args: &TextRequest,
+    args: &TextArgs,
     evaluator: &str,
 ) -> anyhow::Result<(
     ModelPackage,
@@ -111,6 +101,7 @@ mod tests {
         let model = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../client/src/model/package/mini-qwen3.gguf");
         let model = model.display().to_string();
+        let evaluator = hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip);
         let parse = |system: &[&str]| {
             let mut argv = vec![
                 "hellas",
@@ -123,6 +114,8 @@ mod tests {
                 "3",
                 "--access",
                 "box.access",
+                "--backend",
+                &evaluator,
             ];
             argv.extend(system);
             let crate::Commands::Text(args) = crate::Cli::try_parse_from(argv).unwrap().command
@@ -131,18 +124,9 @@ mod tests {
             };
             args
         };
-        let (_, presentation, job) = prepare(
-            &parse(&[]).request,
-            &hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip),
-        )
-        .await
-        .unwrap();
-        let (_, _, with_system) = prepare(
-            &parse(&["--system", "be brief"]).request,
-            &hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip),
-        )
-        .await
-        .unwrap();
+        let render = async |args: TextArgs| prepare(&args, &args.target.renderer()?).await;
+        let (_, presentation, job) = render(parse(&[])).await.unwrap();
+        let (_, _, with_system) = render(parse(&["--system", "be brief"])).await.unwrap();
         assert_ne!(job.inputs, with_system.inputs);
         let (plan, inputs) = (job.plan, job.inputs);
         assert_eq!(plan.step.as_ref().unwrap().stop.max_steps, 3);

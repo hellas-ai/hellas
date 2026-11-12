@@ -606,18 +606,6 @@ pub enum GatewayTarget {
 }
 
 impl GatewayTarget {
-    /// The evaluator id this target runs programs for: what its Compute
-    /// admission names, or the local runtime's registered id.
-    pub fn evaluator(&self) -> Option<String> {
-        match self {
-            Self::Paid { policy, .. } => policy.compute_evaluator().map(Into::into),
-            Self::Grant { policy, .. } => {
-                policy.invocation_policy.compute_evaluator().map(Into::into)
-            }
-            #[cfg(feature = "compute")]
-            Self::Local { execution, .. } => Some(execution.backend.evaluator()),
-        }
-    }
     /// The endpoint requests reach their provider through, if remote.
     pub fn endpoint(&self) -> Option<&iroh::Endpoint> {
         match self {
@@ -870,16 +858,23 @@ pub struct ExecutorGateway {
 
 struct Inner {
     target: GatewayTarget,
+    evaluator: Option<String>,
     signer: Arc<hellas_auth::ProducerSigningKey>,
     serial: tokio::sync::Mutex<()>,
 }
 
 impl ExecutorGateway {
+    /// `evaluator` is the renderer Compute requests are rendered for, if any;
     /// `signer` signs paid and local proposals: the caller's device key.
-    pub fn new(target: GatewayTarget, signer: Arc<hellas_auth::ProducerSigningKey>) -> Arc<Self> {
+    pub fn new(
+        target: GatewayTarget,
+        evaluator: Option<String>,
+        signer: Arc<hellas_auth::ProducerSigningKey>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             inner: Arc::new(Inner {
                 target,
+                evaluator,
                 signer,
                 serial: tokio::sync::Mutex::new(()),
             }),
@@ -947,7 +942,7 @@ impl Inner {
 
 impl WorkExecutionBackend for ExecutorGateway {
     fn evaluator(&self) -> Option<String> {
-        self.inner.target.evaluator()
+        self.inner.evaluator.clone()
     }
     fn fetch_routes(&self) -> Vec<hellas_gateway::FetchRoute> {
         self.inner.target.fetch_routes().unwrap_or_default()
@@ -962,11 +957,7 @@ impl WorkExecutionBackend for ExecutorGateway {
         &self,
         job: hellas_client::model::ComputeJob,
     ) -> Result<WorkOutputStream<ComputeEvent>, WorkGatewayError> {
-        let evaluator = self
-            .inner
-            .target
-            .evaluator()
-            .ok_or(WorkGatewayError::Unsupported)?;
+        let evaluator = self.evaluator().ok_or(WorkGatewayError::Unsupported)?;
         self.request(WorkRequest::Job(JobInput::Compute {
             evaluator,
             environment: job.environment,

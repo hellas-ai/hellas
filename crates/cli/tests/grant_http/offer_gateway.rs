@@ -1339,6 +1339,7 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
     std::fs::write(&invalid_source, b"invalid Hex source").unwrap();
     let invalid_dir = root.join("invalid-compute-job");
     let failed_result = root.join("failed-compute-result");
+    let evaluator = hellas_channel::test_support::channel::evaluator();
     let failed_args = [
         "run",
         "--source",
@@ -1349,6 +1350,8 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
         "u64",
         "--access",
         string(&bundle),
+        "--backend",
+        &evaluator,
         "--save-job",
         string(&invalid_dir),
         "--output",

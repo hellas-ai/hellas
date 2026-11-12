@@ -142,11 +142,6 @@ impl Executor {
     }
 }
 impl ExecutorHandle {
-    /// The evaluator id this executor's GPU runtime registered.
-    #[cfg(feature = "compute")]
-    pub fn evaluator(&self) -> String {
-        catena::evaluator(self.inner.config.gpu_config.backend)
-    }
     fn capacity(&self, domain: CapacityDomain) -> Result<Arc<Semaphore>, BackendFault> {
         match domain {
             CapacityDomain::Fetch => Ok(self.inner.fetch_capacity.clone()),

@@ -29,7 +29,15 @@ pub async fn transcribe(args: TranscribeArgs, context: Context) -> super::super:
         "WAV",
         wav::MAX_WAV_BYTES,
     )?)?;
-    let package = std::sync::OnceLock::new();
+    let evaluator = args.target.renderer()?;
+    let package = ModelPackage::open(&args.model, &evaluator).await?;
+    let rendered = package
+        .render_job(&ModelRequest::Transcription {
+            samples: &samples,
+            language: args.language.as_deref(),
+            max_new_tokens: args.max_tokens,
+        })
+        .await?;
     let mut target = args.target;
     target.models = vec![args.model.clone()];
     run_quoted(
@@ -38,24 +46,10 @@ pub async fn transcribe(args: TranscribeArgs, context: Context) -> super::super:
         &context,
         args.pay,
         None,
-        async |price, evaluator| {
-            let opened = ModelPackage::open(&args.model, &evaluator).await?;
-            let opened = package.get_or_init(|| opened);
-            let rendered = opened
-                .render_job(&ModelRequest::Transcription {
-                    samples: &samples,
-                    language: args.language.as_deref(),
-                    max_new_tokens: args.max_tokens,
-                })
-                .await?;
-            compute_job(price, evaluator, rendered).await
-        },
+        async |price| compute_job(price, evaluator, rendered).await,
         |_| args.output.clone(),
         |_, completed, _| {
-            let ModelResponse::Transcription(transcription) = package
-                .get()
-                .expect("the job was rendered")
-                .decode(&completed.output)?
+            let ModelResponse::Transcription(transcription) = package.decode(&completed.output)?
             else {
                 bail!("expected transcription");
             };

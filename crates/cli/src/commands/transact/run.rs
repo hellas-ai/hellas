@@ -156,13 +156,14 @@ impl Program {
 }
 
 pub async fn run(args: RunArgs, context: Context) -> super::super::CliResult<()> {
+    let evaluator = args.target.renderer()?;
     super::run_quoted(
         &args.client,
         args.target,
         &context,
         args.pay,
         args.save_job.clone(),
-        async |price, evaluator| args.program.job(price, evaluator).await,
+        async |price| args.program.job(price, evaluator).await,
         |_| args.output.clone(),
         |job, completed, provider| {
             super::present_job(job, completed, provider, args.output.as_deref())

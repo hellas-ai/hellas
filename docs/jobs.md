@@ -38,6 +38,12 @@ hellas transcribe --model ./whisper-tiny --audio speech.wav --local
 hellas text --model ./qwen3.gguf --prompt 'Why is the sky blue?' --local
 ```
 
+A Compute job names the evaluator its program is rendered for. Remote Compute
+commands render for `--backend EVALUATOR`, the id the provider's GPU runtime
+registers (such as `hellas/catena-dfad87438018-hip`), before they ask for a
+quote; the provider refuses a program for an evaluator it did not register.
+`--local` renders for this machine's GPU runtime.
+
 `hellas text --model FILE.gguf --prompt TEXT [--system TEXT] [--max-tokens N]`
 renders one Qwen3 chat turn with the GGUF's tokenizer, runs it as a Compute job
 and prints the decoded reply.
@@ -55,7 +61,8 @@ Signing keys and funding/channel recovery journals remain durable.
 ```sh
 hellas faucet
 hellas run --provider ENROLLMENT_ID@NODE_ID --source counter.hex --entry advance \
-  --arg u64:2 --arg u64:3 --returns u64 --pay 20 --save-job ./add
+  --arg u64:2 --arg u64:3 --returns u64 --backend hellas/catena-dfad87438018-hip \
+  --pay 20 --save-job ./add
 hellas transact --job ./add --provider ENROLLMENT_ID@NODE_ID@127.0.0.1:9000 -o ./result
 hellas fetch https://example.com/data --provider ENROLLMENT_ID@NODE_ID --pay 20 \
   --contract http --spki-sha256 LEAF_SPKI_SHA256 --save-job ./request -o ./response
@@ -242,7 +249,7 @@ the selected hardware and step count.
 ```sh
 hellas image --provider ENROLLMENT_ID@NODE_ID --model klein \
   --prompt 'a small red fox' --seed 42 --width 512 --height 512 --steps 4 \
-  --pay 20 -o fox.png
+  --backend hellas/catena-dfad87438018-hip --pay 20 -o fox.png
 ```
 
 `image` saves the job before purchase, writes the PNG to `-o` (default
