@@ -324,14 +324,15 @@ async fn removing_a_backend_preserves_its_accepted_request_and_routes_the_next_o
                 expires: UnixMillis(u64::MAX),
                 label: None,
             };
-            let path = f.directory.path().join(format!("{id}.access"));
-            bundle.save(&path).unwrap();
             document.backends.insert(
                 id.into(),
                 Backend {
                     max_in_flight: std::num::NonZeroUsize::MIN,
                     kind: BackendKind::Grant {
-                        access: path,
+                        access: Some(base64::Engine::encode(
+                            &base64::engine::general_purpose::STANDARD,
+                            bundle.encode().unwrap(),
+                        )),
                         resource: None,
                         evaluator: None,
                         trust: None,
@@ -403,6 +404,18 @@ async fn removing_a_backend_preserves_its_accepted_request_and_routes_the_next_o
         providers[0].0.backend.finish.release();
         held.await.unwrap();
         core.shutdown().await.unwrap();
+        let mut opts = options(&f);
+        opts.signer = Arc::new(FRIEND.node_key());
+        opts.owner = Some(Arc::new(FRIEND.passkey()));
+        let restored = Core::restore(opts).await.unwrap();
+        let view = restored.watch().0;
+        assert_eq!(view.document.revision, Revision(2));
+        assert_eq!(view.backends.len(), 1);
+        assert!(matches!(
+            &view.document.backends["second"].kind,
+            BackendKind::Grant { access: None, .. }
+        ));
+        restored.shutdown().await.unwrap();
         connection.close(0u32.into(), b"test finished");
         let _ = served.await.unwrap();
         for (_, remote) in providers {

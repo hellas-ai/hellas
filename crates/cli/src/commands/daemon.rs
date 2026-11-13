@@ -193,6 +193,8 @@ impl ModelContext {
             "model must match exactly one resource offered by {destination}; remote Compute uses PATH@CONTACT"
         );
         let (policy, evaluator) = matches.pop().unwrap();
+        let access =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bundle.encode()?);
         let id = format!("{destination}-{}", &policy.resource.to_string()[..12]);
         document
             .backends
@@ -200,7 +202,7 @@ impl ModelContext {
             .or_insert_with(|| Backend {
                 max_in_flight: std::num::NonZeroUsize::new(8).unwrap(),
                 kind: BackendKind::Grant {
-                    access: path,
+                    access: Some(access),
                     resource: Some(policy.resource),
                     evaluator,
                     trust,
@@ -319,7 +321,7 @@ pub async fn apply(document: &mut Document, edit: Edit, context: &ModelContext) 
                     continue;
                 }
                 route.backends.retain(|id| {
-                    let selected = destination.is_none_or(|destination| id == destination || document.backends.get(id).is_some_and(|backend| matches!(&backend.kind, BackendKind::Grant { access, .. } if access.parent().and_then(Path::file_name).and_then(|name| name.to_str()) == Some(destination))));
+                    let selected = destination.is_none_or(|destination| id == destination || document.backends.get(id).is_some_and(|backend| matches!(&backend.kind, BackendKind::Grant { resource: Some(resource), .. } if *id == format!("{destination}-{}", &resource.to_string()[..12]))));
                     removed |= selected;
                     !selected
                 });

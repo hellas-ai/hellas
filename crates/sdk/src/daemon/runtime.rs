@@ -150,9 +150,15 @@ impl Runtime {
             } => {
                 let principal = self.principal()?;
                 let holder = NodeKey::from_public_key(self.options.signer.public_key())?;
-                let (offers, application) =
-                    crate::access_bundle::AccessBundle::load(access, &principal, &holder)?
-                        .into_parts();
+                let (offers, application) = crate::access_bundle::AccessBundle::decode(
+                    &base64::Engine::decode(
+                        &base64::engine::general_purpose::STANDARD,
+                        access.as_deref().ok_or("missing grant access")?,
+                    )?,
+                    &principal,
+                    &holder,
+                )?
+                .into_parts();
                 let (offer, policy) = {
                     let mut selected = offers.iter().flat_map(|offer| {
                         offer.offer().grant.policies.iter().map(move |policy: &hellas_authority::model::grant::records::GrantPolicy| (offer, policy))

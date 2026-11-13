@@ -174,15 +174,16 @@ async fn both_listeners_keep_admitted_backends_when_fetch_configuration_changes(
             expires: UnixMillis(u64::MAX),
             label: None,
         };
-        let path = consumer_fixture.directory.path().join("provider.access");
-        bundle.save(&path).unwrap();
         let mut document = Document::default();
         document.backends.insert(
             "friend".into(),
             Backend {
                 max_in_flight: std::num::NonZeroUsize::new(2).unwrap(),
                 kind: BackendKind::Grant {
-                    access: path,
+                    access: Some(base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        bundle.encode().unwrap(),
+                    )),
                     resource: None,
                     evaluator: None,
                     trust: None,

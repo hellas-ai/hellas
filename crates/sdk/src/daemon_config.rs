@@ -55,7 +55,9 @@ pub enum BackendKind {
         content: Vec<PathBuf>,
     },
     Grant {
-        access: PathBuf,
+        /// Base64 access bundle, supplied once and retained privately in the journal.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        access: Option<String>,
         #[serde(default)]
         resource: Option<ResourceId>,
         #[serde(default)]
@@ -177,6 +179,7 @@ impl Document {
     fn secrets(&mut self, mut visit: impl FnMut(&str, &str, &mut Option<String>)) {
         for (id, backend) in &mut self.backends {
             match &mut backend.kind {
+                BackendKind::Grant { access, .. } => visit(id, "access", access),
                 BackendKind::Fetch {
                     upstream: Upstream::Http { credentials, .. },
                     ..

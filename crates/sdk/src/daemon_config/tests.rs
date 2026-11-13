@@ -48,7 +48,7 @@ fn iroh_only_accepts_local_and_fetch_backends() {
     );
     for kind in [
         BackendKind::Grant {
-            access: "offer.json".into(),
+            access: None,
             resource: None,
             evaluator: None,
             trust: None,
@@ -140,7 +140,7 @@ fn direct_http_fetch_is_allowed_and_iroh_fetch_keys_must_be_unique() {
 
 #[test]
 fn keys_are_inputs_and_only_omitted_keys_in_existing_entries_are_retained() {
-    let document: Document = serde_json::from_value(serde_json::json!({
+    let mut document: Document = serde_json::from_value(serde_json::json!({
         "listeners": {}, "backends": {
             "http": { "kind": "fetch", "service": "https", "method": "request", "max_in_flight": 2,
                 "upstream": { "kind": "http", "allowed_hosts": ["example.org"], "credentials": {
@@ -152,16 +152,33 @@ fn keys_are_inputs_and_only_omitted_keys_in_existing_entries_are_retained() {
             }
         }
     })).unwrap();
+    document.backends.insert(
+        "grant".into(),
+        Backend {
+            max_in_flight: std::num::NonZeroUsize::MIN,
+            kind: BackendKind::Grant {
+                access: Some("private-grant-credential".into()),
+                resource: None,
+                evaluator: None,
+                trust: None,
+            },
+        },
+    );
     let input = serde_json::to_string(&document).unwrap();
     assert!(input.contains("first-key") && input.contains("second-key"));
     let (mut redacted, secrets) = document.redacted();
     let echo = serde_json::to_string(&redacted).unwrap();
-    assert!(!echo.contains("first-key") && !echo.contains("second-key"));
+    assert!(
+        !echo.contains("first-key")
+            && !echo.contains("second-key")
+            && !echo.contains("private-grant-credential")
+    );
     redacted.restore_secrets(&secrets);
     assert_eq!(serde_json::to_string(&redacted).unwrap(), input);
 
     let (mut changed, _) = document.redacted();
     changed.backends.remove("http");
+    changed.backends.remove("grant");
     let BackendKind::Fetch {
         upstream: Upstream::OpenaiResponses { secret },
         ..

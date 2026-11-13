@@ -1360,6 +1360,7 @@ impl WorkRunner {
     }
 
     async fn unmount_all(&self) -> Result<(), MountError> {
+        self.work_mount.stop_pending();
         let offers = match self.setup_mount.1.get() {
             Some(offers) => offers.shutdown().await,
             None => Ok(()),

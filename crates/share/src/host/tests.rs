@@ -559,7 +559,7 @@ async fn controlled_gateway(
             hellas_sdk::daemon_config::Backend {
                 max_in_flight: std::num::NonZeroUsize::new(2).unwrap(),
                 kind: BackendKind::Grant {
-                    access: root.join("unused-test-offer"),
+                    access: None,
                     resource: None,
                     evaluator: None,
                     trust: None,
