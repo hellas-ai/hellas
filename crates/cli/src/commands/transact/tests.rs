@@ -207,6 +207,14 @@ fn fetch_args(extra: &[&str]) -> FetchArgs {
 }
 
 #[test]
+fn fetch_selects_a_provider_credential_without_copying_its_secret() {
+    let request = fetch_args(&["--credential", "api"]).request().unwrap();
+    assert_eq!(request.credential.as_deref(), Some("api"));
+    assert!(request.headers.is_empty());
+    assert_eq!(fetch_args(&[]).request().unwrap().credential, None);
+}
+
+#[test]
 fn provider_is_named_only_by_its_enrollment_and_node() {
     let id = provider();
     let p: Provider = id.parse().unwrap();

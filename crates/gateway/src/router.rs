@@ -3,7 +3,9 @@ use crate::{
     GatewayResult, Presentation, Route, WorkExecutionBackend, affinity::Hints, path_error,
     route::RouteExecution, routing::Routing,
 };
-use axum::{Router, body::Body, extract::Request, http::StatusCode, response::Response};
+use axum::{
+    Json, Router, body::Body, extract::Request, http::StatusCode, response::Response, routing::get,
+};
 use hellas_client::model::ModelPackage;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -67,6 +69,18 @@ pub async fn with_models(
     models: &Models,
 ) -> GatewayResult<(Router, BTreeMap<String, String>)> {
     let routing = Routing::new(routes, work.clone(), memory)?;
+    let model_ids: BTreeSet<_> = routing
+        .routes
+        .iter()
+        .flat_map(Route::keys)
+        .filter_map(|(_, _, model)| model)
+        .collect();
+    let discovery = serde_json::json!({
+        "object": "list",
+        "data": model_ids.into_iter().map(|id| serde_json::json!({
+            "id": id, "object": "model", "created": 0, "owned_by": "hellas"
+        })).collect::<Vec<_>>()
+    });
     let mut presentations = Vec::new();
     let mut errors = BTreeMap::new();
     for route in &routing.routes {
@@ -145,6 +159,7 @@ pub async fn with_models(
     }
     Ok((
         Router::new()
+            .route("/v1/models", get(move || async move { Json(discovery) }))
             .fallback(move |request| {
                 dispatch(
                     routing.clone(),

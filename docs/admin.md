@@ -87,9 +87,9 @@ table is full.
 
 `issue-credential` takes an Auth `GrantSpec` scope, bounded by the issuer's explicit
 credential-issuance ceiling, and a `--holder` file: the JSON `CredentialHolder` of
-the device that will hold it, `{"Node":[1,[...]]}`: that device's node key with
-the secp256k1 curve tag. (`hellas share` takes the holder from the contact string
-instead.) Issuing creates no grant: the recipient also needs current
+the device that will hold it, `{"Node":"secp256k1:COMPRESSEDHEX"}`: that device's node key as
+66 hexadecimal digits after the curve prefix. (`hellas share` takes the holder
+from the contact string instead.) Issuing creates no grant: the recipient also needs current
 grants for the requested operations. The client prepares the credential using the
 authenticated session generation and saves its secret in a new private file before
 submitting the verifier and ID. The secret never crosses the issuance RPC. After
@@ -287,8 +287,8 @@ The profile has these fields. Unknown fields are refused.
 
 | Field | Value |
 | --- | --- |
-| `authority` | This node's provisioned `AuthorityId`, serialized as a 32-byte JSON array. |
-| `authorization` | The selected `GrantId`, serialized as a 16-byte JSON array. |
+| `authority` | This node's provisioned `AuthorityId`, serialized as a 64-digit hexadecimal JSON string. |
+| `authorization` | The selected `GrantId`, serialized as a 32-digit hexadecimal JSON string. |
 | `credential` | Path to the private application credential file. |
 | `local` | For local connections, an object with `certificate` (DER certificate path) and `server_name` (certificate DNS name). Omit for remote-only profiles. |
 
@@ -308,14 +308,13 @@ checks peer ownership. Both carriers require the application credential and a
 passkey or node-key proof bound to the live connection. Revocation applies to an
 existing authenticated connection too.
 
-Remote control is off by default. To enable it, set `remote_control_peers` in the
-grant configuration to the operator-approved client endpoint keys (at most 128
-distinct iroh endpoint IDs). The client uses its node's transport key
-(`identity show-node-id`); compare it out of band. Admission is checked during the
-QUIC handshake and again before application authentication. An admitted endpoint
-still needs its application credential, session proof and operation grant. Unlisted
-peers cannot enroll through this listener. Use local control when the CLI and the
-running node share the same transport identity.
+The CLI daemon enables credential-gated remote control after pairing. Each caller
+still needs its application credential, session proof and operation grant. The
+client normally uses its node's transport key (`identity show-node-id`). When
+administering the daemon in the same home, it creates a separate temporary
+transport endpoint; the credential holder remains the home's node key.
+Embedded hosts can instead restrict `RemoteControlAdmission` to a set of approved
+transport peers or disable remote control.
 
 Local and remote control each have 16 connection slots. Authentication must finish
 within five seconds; authenticated sessions close after 30 seconds without another
@@ -396,7 +395,7 @@ The receiving device runs jobs with it directly:
 
 ```sh
 hellas transcribe --model whisper-tiny --audio speech.wav --access me.access \
-  --backend hellas/catena-dfad87438018-hip
+  --backend hellas/catena-f47ade17aa5f-hip
 ```
 
 Every job command (`transcribe`, `text`, `image`, `run`, `fetch` and
@@ -466,9 +465,14 @@ clock; after a legitimate large adjustment or long suspend, verify UTC and resta
 Work inspection and standing queries calculate current windows without writing clock
 ticks. Existing spending and reservations are preserved.
 
+Journal paths are relative to `--home`; an absolute path is also accepted.
+For recovery, set `REVISION` to the authority revision returned by
+`admin inspect-offline` after stopping the daemon. The JSON files and passkey
+below are the independently prepared administrator, credential scope and holder.
+
 ```sh
-hellas --home node-home --passkey operator.passkey admin bootstrap --journal node-home/provider/authority --root-grant 01010101010101010101010101010101 --administrator administrator.json --credential-scope application-scope.json --holder holder.json --credential-out operator.credential
-hellas --home node-home --passkey operator.passkey admin recover --journal node-home/provider/authority --expected-revision REVISION --administrator administrator.json --credential-scope application-scope.json --holder holder.json --credential-out recovered.credential
+hellas --home node-home --passkey operator.passkey admin bootstrap --journal provider/authority --root-grant 01010101010101010101010101010101 --administrator administrator.json --credential-scope application-scope.json --holder holder.json --credential-out operator.credential
+hellas --home node-home --passkey operator.passkey admin recover --journal provider/authority --expected-revision "$REVISION" --administrator administrator.json --credential-scope application-scope.json --holder holder.json --credential-out recovered.credential
 ```
 
 Bootstrap can also issue a bearer for an HTTP gateway: `--bearer-scope` names its
@@ -558,16 +562,20 @@ store is published atomically and refuses another bootstrap after success.
 
 The normal host keeps that endpoint and authority alive across provider restarts.
 Use `admin` (with `--profile <home>/nodes/NAME/profile.json` when several
-nodes are paired) for status, capacity, authority and Work administration. `admin configure-provider FILE` applies a typed, revision-checked
-upstream mutation. Adding a new key requires a daily application session; replacing
-or removing a key and changing endpoints require a passkey session. Status exposes
-endpoint metadata and key names, never key material. Configuration is validated
-and staged before a running provider stops. Rejected revision, input, mount or
-read-only requests leave its state unchanged. Valid configuration while stopped
-or failed preserves that state. For a running provider, a failed restart restores
-the prior configuration and keys and reports failed until
-`admin set-provider-state --enabled true` explicitly starts it again. A rollback
-I/O failure is reported as a failure, never as successful recovery.
+nodes are paired) for status, capacity, authority and Work administration.
+Configure an upstream with `backend add` and publish its model with `route add`:
+
+```sh
+hellas backend add upstream https://api.openai.com/v1 --key-file upstream.key
+hellas route add gpt-5@upstream
+hellas routes
+```
+
+The key file contains the upstream API key. Configuration is one validated,
+revision-checked `Configure` operation; a rejected edit leaves the previous
+document unchanged. Route status exposes backend availability and errors without
+printing key material. Remove a route with `hellas route rm gpt-5@upstream`
+and remove its backend with `hellas backend rm upstream`.
 
 Share execution with `hellas share`; the recipient passes the access file to
 job commands. Import it with `pair FILE --name CONTACT` for gateway
@@ -627,8 +635,8 @@ execution authority and settlement obligations.
 `admin inspect QUERY.json` reads authority metadata through the selected profile.
 Queries are `{"Grants":{"after":null}}`, `{"Credentials":{"after":null}}`,
 `{"Grant":{"id":ID}}`, or `{"Credential":{"id":ID}}`. IDs use the same JSON
-representation as grant commands (16-byte arrays). A page contains at most eight
-records; pass its `next` ID as `after` for the next page. Stop when `next` is null.
+representation as grant commands (32-digit hexadecimal strings). A page contains
+at most eight records; pass its `next` ID as `after` for the next page. Stop when `next` is null.
 Every reply includes the authority revision, generation and root grant. If the
 revision changes between pages, restart enumeration before making decisions from
 that combined view.

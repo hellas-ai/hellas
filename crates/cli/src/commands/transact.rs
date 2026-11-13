@@ -198,6 +198,9 @@ pub struct FetchArgs {
     /// Request body, as @FILE.
     #[arg(long)]
     data: Option<String>,
+    /// Provider-side credential selector (for example, `api` for a shared upstream).
+    #[arg(long, value_name = "NAME")]
+    credential: Option<String>,
     #[arg(long)]
     max_response_bytes: Option<u32>,
     /// The Fetch contract this request must run under: `http`, the HTTPS
@@ -1090,7 +1093,7 @@ impl FetchArgs {
                 roots,
                 spki_sha256: self.spki_sha256.clone(),
             },
-            credential: None,
+            credential: self.credential.clone(),
             max_response_bytes: self
                 .max_response_bytes
                 .unwrap_or(hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES),

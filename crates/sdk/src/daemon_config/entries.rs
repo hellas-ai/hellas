@@ -50,40 +50,33 @@ impl Document {
         let routes = api
             .allowed_paths
             .iter()
-            .map(|upstream_path| {
-                let suffix = upstream_path
-                    .rsplit_once("/v1/")
-                    .ok_or("model API needs a /v1/ path")?
-                    .1;
-                Ok(Route {
-                    backends: vec![id.into()],
-                    presentation: Presentation::Http {
-                        targets: [(
-                            id.into(),
-                            HttpTarget {
-                                service: service.clone(),
-                                method: method.clone(),
-                                route: HttpRoute {
-                                    path: format!("/v1/{suffix}"),
-                                    method: "POST".into(),
-                                    url: format!("{origin}{upstream_path}"),
-                                    credential: Some("api".into()),
-                                    tls: HttpTls {
-                                        roots: api.trust_roots.clone(),
-                                        spki_sha256: vec![],
-                                    },
-                                    headers: vec![],
-                                    max_response_bytes:
-                                        hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES,
-                                    models: Some(vec![model.into()]),
+            .map(|upstream_path| Route {
+                backends: vec![id.into()],
+                presentation: Presentation::Http {
+                    targets: [(
+                        id.into(),
+                        HttpTarget {
+                            service: service.clone(),
+                            method: method.clone(),
+                            route: HttpRoute {
+                                path: crate::gateway_work::http_route_path(upstream_path).into(),
+                                method: "POST".into(),
+                                url: format!("{origin}{upstream_path}"),
+                                credential: Some("api".into()),
+                                tls: HttpTls {
+                                    roots: api.trust_roots.clone(),
+                                    spki_sha256: vec![],
                                 },
+                                headers: vec![],
+                                max_response_bytes: hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES,
+                                models: Some(vec![model.into()]),
                             },
-                        )]
-                        .into(),
-                    },
-                })
+                        },
+                    )]
+                    .into(),
+                },
             })
-            .collect::<Result<Vec<_>, crate::daemon::Error>>()?;
+            .collect::<Vec<_>>();
         for route in routes {
             self.add_route(route)?;
         }

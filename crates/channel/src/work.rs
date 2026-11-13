@@ -670,7 +670,8 @@ impl ProviderEndpoint {
         request: &AcceptWorkRequest,
         execution: Option<AcceptExecution>,
     ) -> AcceptWorkResponse {
-        acceptance_response(self.decide(request, execution).await)
+        let ready = self.admitting().cloned();
+        acceptance_response(self.decide(request, execution, ready).await)
     }
 
     fn authenticate_proposal(
@@ -740,6 +741,7 @@ impl ProviderEndpoint {
         &mut self,
         request: &AcceptWorkRequest,
         execution: Option<AcceptExecution>,
+        ready: Result<ReadyChannel, EndpointError>,
     ) -> Result<(Digest, Sig), Refusal> {
         let (authorization, client_signature, work_id) = self.authenticate_proposal(request)?;
         if let Some(retained) = self.prior_acceptance(&authorization, work_id)? {
@@ -749,10 +751,8 @@ impl ProviderEndpoint {
         if !self.accepting {
             return Err(Refusal::new(WorkRefusal::NotReady, "provider is draining"));
         }
-        let ready = self
-            .admitting()
-            .map_err(|error| Refusal::new(endpoint_refusal(error), error.to_string()))?
-            .clone();
+        let ready =
+            ready.map_err(|error| Refusal::new(endpoint_refusal(error), error.to_string()))?;
         if self.state().close_prepared().is_some()
             || self.state().close_opened().is_some()
             || self.state().close_settled().is_some()
@@ -821,6 +821,7 @@ impl ProviderEndpoint {
                 prepare(
                     &bundle,
                     hellas_auth::PublicKey::Secp256k1(ready.channel().client_key().to_bytes()),
+                    ready.clone(),
                 )
             })
             .transpose()
@@ -1944,6 +1945,7 @@ pub type AcceptExecution = Box<
     dyn FnOnce(
             &PreparedInvocation,
             hellas_auth::PublicKey,
+            ReadyChannel,
         ) -> Result<Box<dyn FnOnce(Digest) + Send>, BackendFault>
         + Send,
 >;
@@ -2694,13 +2696,63 @@ impl WorkService {
         request: &AcceptWorkRequest,
         execution: Option<AcceptExecution>,
     ) -> AcceptWorkResponse {
-        let result = match self.endpoint.lock_owned().await {
+        self.accept_inner(request, execution, false).await
+    }
+
+    /// Keep the original authenticated proposal pending while certified progress
+    /// is unavailable. Readiness and acceptance share the actual journal writer.
+    pub async fn accept_when_ready(
+        &self,
+        request: &AcceptWorkRequest,
+        execution: Option<AcceptExecution>,
+    ) -> AcceptWorkResponse {
+        self.accept_inner(request, execution, true).await
+    }
+
+    async fn accept_inner(
+        &self,
+        request: &AcceptWorkRequest,
+        execution: Option<AcceptExecution>,
+        wait_fresh: bool,
+    ) -> AcceptWorkResponse {
+        let (endpoint, ready) = loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let endpoint = self.endpoint.lock_owned().await;
+            let ready = endpoint
+                .as_ref()
+                .map_err(|_| EndpointError::Poisoned)
+                .and_then(|endpoint| endpoint.admitting().cloned());
+            let waiting = wait_fresh
+                && matches!(ready, Err(EndpointError::ObservationStale))
+                && endpoint.as_ref().is_ok_and(|endpoint| {
+                    endpoint.accepting
+                        && !endpoint.state().is_closing()
+                        && matches!(
+                            endpoint
+                                .authenticate_proposal(request)
+                                .and_then(|(authorization, _, work)| endpoint
+                                    .prior_acceptance(&authorization, work)),
+                            Ok(None)
+                        )
+                });
+            if !waiting {
+                break (endpoint, ready);
+            }
+            drop(endpoint);
+            changed.await;
+        };
+        let result = match endpoint {
             Ok(mut endpoint) => {
                 let (request, changed) = (request.clone(), self.changed.clone());
                 // Acceptance, publication and RAM transfer retain the writer even
                 // when the RPC drops its response after a journal append started.
                 tokio::spawn(async move {
-                    let response = endpoint.accept(&request, execution).await;
+                    // Use the readiness captured under this same writer; neither
+                    // observer suspension nor task scheduling can split admission.
+                    let response =
+                        acceptance_response(endpoint.decide(&request, execution, ready).await);
                     changed.notify_waiters();
                     response
                 })

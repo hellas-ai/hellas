@@ -104,9 +104,13 @@ impl Assets {
             let (old, _) = state.entries.remove(&victim).unwrap();
             state.used -= old.memory.byte_len();
         }
-        let words = asset_words(reader, object)?;
+        let mut memory = MemOwn::allocate(usize::try_from(padded)?, self.dialect)?;
+        stream_asset(reader, object, |offset, bytes| {
+            memory.write_bytes(offset, bytes)?;
+            Ok(())
+        })?;
         let resident = Arc::new(Resident {
-            memory: MemOwn::from_u16_slice(&words, self.dialect)?,
+            memory,
             bytes: object.bytes(),
         });
         state.used += padded;
@@ -115,44 +119,39 @@ impl Assets {
     }
 }
 
-fn asset_words(reader: VerifiedReader, object: ContentRef) -> Result<Vec<u16>> {
-    let len = usize::try_from(object.bytes())?;
-    let count = len.checked_add(1).ok_or("asset length overflow")? / 2;
-    let mut words = Vec::new();
-    words.try_reserve_exact(count)?;
-    words.resize(count, 0u16);
-    // Initialized u16 storage accepts arbitrary bytes; the final padding byte remains zero.
-    let bytes = unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), len) };
-    let mut reader = reader;
-    reader.read_exact(bytes)?;
-    if reader.read(&mut [0])? != 0 || ContentRef::for_bytes(bytes) != object {
+// Model size does not change the host staging allocation. Device memory stays
+// private until the bytes copied into it pass the content and length checks.
+const ASSET_STAGING_BYTES: usize = 8 << 20;
+
+fn stream_asset(
+    mut reader: impl Read,
+    object: ContentRef,
+    mut write: impl FnMut(u64, &[u8]) -> Result<()>,
+) -> Result<()> {
+    let mut staging = vec![0; object.bytes().min(ASSET_STAGING_BYTES as u64) as usize];
+    let mut hasher = hellas_xet::XetFileHasher::new();
+    let mut offset = 0;
+    while offset < object.bytes() {
+        let count = (object.bytes() - offset).min(staging.len() as u64) as usize;
+        let bytes = &mut staging[..count];
+        reader.read_exact(bytes)?;
+        hasher.update(bytes);
+        write(offset, bytes)?;
+        offset += count as u64;
+    }
+    if reader.read(&mut [0])? != 0
+        || ContentId::from_bytes(hasher.finalize().into_bytes()) != object.id()
+    {
         return Err("verified asset changed while reading".into());
     }
-    Ok(words)
+    if !object.bytes().is_multiple_of(2) {
+        write(object.bytes(), &[0])?;
+    }
+    Ok(())
 }
 
 pub fn upload(bytes: &[u8], dialect: GpuDialect) -> Result<MemOwn> {
-    let mut words = Vec::new();
-    words.try_reserve_exact(bytes.len().div_ceil(2))?;
-    for pair in bytes.chunks(2) {
-        words.push(u16::from_ne_bytes([pair[0], *pair.get(1).unwrap_or(&0)]));
-    }
-    let memory = MemOwn::from_u16_slice(&words, dialect)?;
-    if bytes.len().is_multiple_of(2) {
-        return Ok(memory);
-    }
-    // Input ownership has an exact byte length; its allocation may have one padding byte.
-    let ptr = memory.as_ptr();
-    let mut memory = std::mem::ManuallyDrop::new(memory);
-    match unsafe { MemOwn::from_raw_parts(ptr, bytes.len() as u64, dialect) } {
-        Ok(exact) => Ok(exact),
-        Err(error) => {
-            unsafe {
-                std::mem::ManuallyDrop::drop(&mut memory);
-            }
-            Err(error.into())
-        }
-    }
+    Ok(MemOwn::from_bytes(bytes, dialect)?)
 }
 
 #[cfg(test)]
@@ -166,15 +165,73 @@ mod tests {
     fn ram_assets_preserve_exact_bytes_and_private_padding() {
         let bytes = [0x11, 0x22, 0x33];
         let object = ContentRef::for_bytes(&bytes);
-        let words = asset_words(reader(&bytes), object).unwrap();
-        assert_eq!(words.len(), 2);
-        assert_eq!(words[0].to_ne_bytes(), [0x11, 0x22]);
-        assert_eq!(words[1].to_ne_bytes(), [0x33, 0]);
-        assert!(asset_words(reader(&bytes), ContentRef::new(object.id(), 4)).is_err());
-        assert!(asset_words(reader(&[0x44, 0x22, 0x33]), object).is_err());
+        let mut uploaded = Vec::new();
+        stream_asset(reader(&bytes), object, |offset, chunk| {
+            assert_eq!(offset as usize, uploaded.len());
+            uploaded.extend_from_slice(chunk);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(uploaded, [0x11, 0x22, 0x33, 0]);
+        assert!(
+            stream_asset(reader(&bytes), ContentRef::new(object.id(), 4), |_, _| Ok(
+                ()
+            ))
+            .is_err()
+        );
+        assert!(
+            stream_asset(
+                reader(&bytes),
+                ContentRef::for_bytes(&bytes[..2]),
+                |_, _| Ok(())
+            )
+            .is_err()
+        );
+        assert!(stream_asset(reader(&[0x44, 0x22, 0x33]), object, |_, _| Ok(())).is_err());
     }
+    #[test]
+    fn large_assets_stream_with_bounded_reads_and_uploads() {
+        struct BoundedReader<'a>(&'a [u8]);
+        impl Read for BoundedReader<'_> {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                assert!(bytes.len() <= ASSET_STAGING_BYTES);
+                self.0.read(bytes)
+            }
+        }
+        let bytes = (0..ASSET_STAGING_BYTES * 2 + 17)
+            .map(|i| i as u8)
+            .collect::<Vec<_>>();
+        let mut uploaded = 0;
+        stream_asset(
+            BoundedReader(&bytes),
+            ContentRef::for_bytes(&bytes),
+            |offset, chunk| {
+                assert_eq!(offset, uploaded);
+                assert!(chunk.len() <= ASSET_STAGING_BYTES);
+                if offset < bytes.len() as u64 {
+                    assert_eq!(
+                        chunk,
+                        &bytes[offset as usize..offset as usize + chunk.len()]
+                    );
+                } else {
+                    assert_eq!(chunk, [0]);
+                }
+                uploaded += chunk.len() as u64;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(uploaded, bytes.len() as u64 + 1);
+        assert!(
+            stream_asset(reader(b"x"), ContentRef::for_bytes(b"x"), |_, _| Err(
+                "upload failed".into()
+            ))
+            .is_err()
+        );
+    }
+
     #[tokio::test]
-    async fn file_mutation_after_verified_open_is_rejected_before_gpu_upload() {
+    async fn file_mutation_after_verified_open_is_rejected_before_residency() {
         use hellas_store::content::{
             ContentStore, DiskStore, IndexMode, LocalStore, Reservations, Scope,
         };
@@ -214,8 +271,31 @@ mod tests {
             .unwrap()
             .unwrap();
         std::fs::write(&path, b"modified").unwrap();
-        assert!(asset_words(handle, object).is_err());
+        assert!(stream_asset(handle, object, |_, _| Ok(())).is_err());
         node.close().await;
+    }
+
+    #[test]
+    #[ignore = "requires a HIP device"]
+    fn hip_uploads_preserve_bytes_and_enforce_ranges() {
+        let dialect = GpuDialect::Hip;
+        let mut memory = MemOwn::from_bytes(&[1, 2, 3, 4], dialect).unwrap();
+        memory.write_bytes(1, &[5, 6]).unwrap();
+        memory.write_bytes(4, &[]).unwrap();
+        assert!(memory.write_bytes(4, &[7]).is_err());
+        assert!(memory.write_bytes(u64::MAX, &[7]).is_err());
+        assert!(memory.write_bytes(5, &[]).is_err());
+        assert_eq!(memory.try_to_u16_vec().unwrap(), [0x0501, 0x0406]);
+        let bytes = [0x11, 0x22, 0x33];
+        let assets = Assets::new(4, dialect);
+        let resident = assets
+            .pin(reader(&bytes), ContentRef::for_bytes(&bytes))
+            .unwrap();
+        assert_eq!(
+            resident.memory().try_to_u16_vec().unwrap(),
+            [0x2211, 0x0033]
+        );
+        assert_eq!(upload(&bytes, dialect).unwrap().byte_len(), 3);
     }
 
     #[test]

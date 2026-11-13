@@ -1440,15 +1440,15 @@ fn compute_evaluator_matches_locked_catena_revision() {
         .filter(|package| package.lines().any(|line| line == "name = \"catena-lang\""));
     let package = packages.next().expect("catena-lang is locked");
     assert!(packages.next().is_none(), "multiple catena-lang revisions");
-    let revision = package
+    let source = package
         .lines()
         .find_map(|line| {
-            line.strip_prefix(
-                "source = \"git+https://github.com/hellas-ai/catena-lang.git?branch=master#",
-            )
-            .and_then(|source| source.strip_suffix('"'))
+            line.strip_prefix("source = \"git+https://github.com/hellas-ai/catena-lang.git?rev=")
+                .and_then(|source| source.strip_suffix('"'))
         })
-        .expect("catena-lang is pinned to upstream master");
+        .expect("catena-lang is pinned to an exact upstream revision");
+    let (pin, revision) = source.split_once('#').expect("locked Git revision");
+    assert_eq!(pin, revision, "manifest pin must match the locked commit");
     assert_eq!(revision.len(), 40);
     assert!(revision.bytes().all(|byte| byte.is_ascii_hexdigit()));
     assert_eq!(

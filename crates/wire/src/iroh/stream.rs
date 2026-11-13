@@ -414,6 +414,12 @@ impl FuturesStream for IrohRecvHalf {
                         "iroh stream ended without End frame",
                     ))));
                 }
+                Err(iroh::endpoint::ReadError::ConnectionLost(
+                    iroh::endpoint::ConnectionError::ApplicationClosed(close),
+                )) if close.error_code == u32::from(WireCode::PermissionDenied.as_u8()).into() => {
+                    this.abort(WireCode::PermissionDenied, "connection authorization ended");
+                    return Poll::Ready(None);
+                }
                 Err(error) => {
                     this.abort(WireCode::Internal, "iroh receive error");
                     return Poll::Ready(Some(Err(std::io::Error::other(format!(

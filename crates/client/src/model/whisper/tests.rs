@@ -3,8 +3,12 @@ use crate::model::{ModelPackage, ModelRequest, ModelResponse};
 use hellas_rpc::{JsonBytes, protocol::invocation::output::Outcome};
 
 fn checkpoint(dir: &Path) {
+    checkpoint_with_mels(dir, 80);
+}
+
+fn checkpoint_with_mels(dir: &Path, num_mel_bins: usize) {
     std::fs::create_dir_all(dir).unwrap();
-    std::fs::write(dir.join("config.json"), r#"{"model_type":"whisper","d_model":2,"num_mel_bins":80,"encoder_layers":1,"decoder_layers":1,"encoder_attention_heads":1,"decoder_attention_heads":1,"encoder_ffn_dim":4,"decoder_ffn_dim":4,"max_source_positions":1500,"max_target_positions":8,"vocab_size":8,"decoder_start_token_id":4,"eos_token_id":3,"activation_function":"gelu"}"#).unwrap();
+    std::fs::write(dir.join("config.json"), format!(r#"{{"model_type":"whisper","d_model":2,"num_mel_bins":{num_mel_bins},"encoder_layers":1,"decoder_layers":1,"encoder_attention_heads":1,"decoder_attention_heads":1,"encoder_ffn_dim":4,"decoder_ffn_dim":4,"max_source_positions":1500,"max_target_positions":8,"vocab_size":8,"decoder_start_token_id":4,"eos_token_id":3,"activation_function":"gelu"}}"#)).unwrap();
     std::fs::write(dir.join("generation_config.json"), r#"{"lang_to_id":{"<|en|>":5},"task_to_id":{"transcribe":6},"no_timestamps_token_id":7,"suppress_tokens":[2],"begin_suppress_tokens":[0,3]}"#).unwrap();
     std::fs::write(dir.join("tokenizer.json"), r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"hi":0,"there":1,"[UNK]":2,"eos":3,"sot":4,"en":5,"task":6,"no":7},"unk_token":"[UNK]"}}"#).unwrap();
     let config = Config::read(dir).unwrap();
@@ -13,7 +17,17 @@ fn checkpoint(dir: &Path) {
         .enumerate()
         .map(|(i, (name, shape))| {
             let elements: usize = shape.iter().product();
-            let (dtype, bytes) = if i % 2 == 0 {
+            let (dtype, bytes) = if num_mel_bins == 128 && i == 0 {
+                (
+                    safetensors::Dtype::F16,
+                    (0..elements)
+                        .flat_map(|n| {
+                            [0u16, 0x8000, 0x0001, 0x0400, 0x3c00, 0x7c00, 0x7e00][n % 7]
+                                .to_le_bytes()
+                        })
+                        .collect(),
+                )
+            } else if i % 2 == 0 {
                 (
                     safetensors::Dtype::F32,
                     (0..elements)
@@ -184,7 +198,10 @@ async fn converted_asset_and_program_are_stable_and_ship_with_every_job() {
         );
         assert_eq!(
             *job.inputs.iter().find(|a| a.name == "features").unwrap(),
-            floats("features", &audio::log_mel(&[0.; 400]).unwrap())
+            floats(
+                "features",
+                &audio::log_mel(&[0.; 400], cfg.num_mel_bins).unwrap()
+            )
         );
     }
 }
@@ -269,5 +286,47 @@ async fn decode_validates_the_result_header_and_decodes_client_side() {
             })
             .await
             .is_err()
+    );
+}
+
+#[tokio::test]
+async fn mel_count_from_metadata_controls_conversion_and_features() {
+    let root = tempfile::tempdir().unwrap();
+    let checkpoint_dir = root.path().join("checkpoint");
+    checkpoint_with_mels(&checkpoint_dir, 128);
+    let converted = root.path().join("converted");
+    let object = convert_whisper(&checkpoint_dir, &converted).unwrap();
+    let converted_bytes = std::fs::read(converted.join(WEIGHTS_FILE)).unwrap();
+    let expected: Vec<_> = [0u16, 0x8000, 0x3380, 0x3880, 0x3f80, 0x7f80, 0x7fc0]
+        .into_iter()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    assert_eq!(&converted_bytes[..expected.len()], expected);
+    let cfg = Config::read(&converted).unwrap();
+    assert_eq!(tensors(&cfg)[0].1, [cfg.d_model, 128, 3]);
+    assert_eq!(
+        views(&cfg).unwrap()[0].1,
+        (cfg.d_model * 128 * 3 * 2) as u64
+    );
+    let model = ModelPackage::open(
+        &converted,
+        &crate::model::evaluator(crate::model::GpuDialect::Hip),
+    )
+    .await
+    .unwrap();
+    let job = model
+        .render_job(&ModelRequest::Transcription {
+            samples: &[0.; 400],
+            language: Some("en"),
+            max_new_tokens: 4,
+        })
+        .await
+        .unwrap();
+    assert_eq!(job.environment.assets[0].object, object);
+    let features = job.inputs.iter().find(|a| a.name == "features").unwrap();
+    assert_eq!(features.bytes.as_bytes().len(), 3000 * 128 * 4);
+    assert_eq!(
+        *features,
+        floats("features", &audio::log_mel(&[0.; 400], 128).unwrap())
     );
 }

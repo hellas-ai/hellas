@@ -66,10 +66,11 @@ hellas serve
 ```
 
 A new node prints one `hellas-invite:` line and waits for its owner. In another
-shell on that machine, claim it and add the packages already stored there:
+shell on that machine, set `INVITE` to that full line, claim the node and add
+the packages already stored there:
 
 ```sh
-hellas pair hellas-invite:… --name mine
+hellas pair "$INVITE" --name mine
 hellas route add "$PWD/whisper-tiny"
 hellas route add "$PWD/qwen3.gguf"
 hellas routes
@@ -79,11 +80,14 @@ Each edit is one atomic configuration change. The daemon restores the saved
 configuration after restart. It publishes bounded resources for the packages;
 sharing uses the existing authority and allowance commands.
 
-Your friend runs `hellas contact` and sends you their contact. Give that
-contact ten requests for a day and send them the resulting access bundle:
+Your friend runs `hellas contact` and sends you their contact. Set
+`FRIEND_CONTACT` to that full contact string. Give that
+contact ten requests to the `qwen3` resource for a day and send them the
+resulting access bundle. Select the resource explicitly when the node serves
+several packages; `hellas routes` lists their names:
 
 ```sh
-hellas share --to hellas-contact:… --limit requests:total:10 --expires 1d --out friend.access
+hellas share --to "$FRIEND_CONTACT" --resource qwen3 --limit requests:total:10 --expires 1d --out friend.access
 ```
 
 Your friend imports it under a contact name and renders requests from their
@@ -111,7 +115,7 @@ Or use a friend's access bundle and their GPU evaluator:
 
 ```sh
 hellas transcribe --model whisper-tiny --audio speech.wav --access friend.access \
-  --backend hellas/catena-dfad87438018-hip
+  --backend hellas/catena-f47ade17aa5f-hip
 ```
 
 A paid job uses devnet coins and checks the quoted price before signing:
@@ -119,7 +123,7 @@ A paid job uses devnet coins and checks the quoted price before signing:
 ```sh
 hellas faucet
 hellas transcribe --model whisper-tiny --audio speech.wav --pay 20 \
-  --provider "$DEVNET_PROVIDER" --backend hellas/catena-dfad87438018-hip
+  --provider "$DEVNET_PROVIDER" --backend hellas/catena-f47ade17aa5f-hip
 ```
 
 `--local` is available in GPU builds. NVIDIA providers use the CUDA evaluator.

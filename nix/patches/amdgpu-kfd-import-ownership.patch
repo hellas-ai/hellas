@@ -1,0 +1,77 @@
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+@@ -2025,7 +2025,8 @@
+ 
+ 	/* Free the BO*/
+ 	drm_vma_node_revoke(&mem->bo->tbo.base.vma_node, drm_priv);
+-	drm_gem_handle_delete(adev->kfd.client.file, mem->gem_handle);
++	if (!is_imported)
++		drm_gem_handle_delete(adev->kfd.client.file, mem->gem_handle);
+ 	if (mem->dmabuf) {
+ 		dma_buf_put(mem->dmabuf);
+ 		mem->dmabuf = NULL;
+@@ -2473,6 +2474,9 @@
+ 
+ err_remove_mem:
+ 	remove_kgd_mem_from_kfd_bo_list(*mem, avm->process_info);
++	amdgpu_sync_free(&(*mem)->sync);
++	mutex_destroy(&(*mem)->lock);
++	dma_buf_put(dma_buf);
+ 	drm_vma_node_revoke(&obj->vma_node, drm_priv);
+ err_free_mem:
+ 	kfree(*mem);
+@@ -2484,33 +2488,31 @@
+ 					 struct kgd_mem **mem, uint64_t *size,
+ 					 uint64_t *mmap_offset)
+ {
++	struct dma_buf *dma_buf;
+ 	struct drm_gem_object *obj;
+-	uint32_t handle;
+ 	int ret;
+ 
+-	ret = drm_gem_prime_fd_to_handle(&adev->ddev, adev->kfd.client.file, fd,
+-					 &handle);
++	dma_buf = dma_buf_get(fd);
++	if (IS_ERR(dma_buf))
++		return PTR_ERR(dma_buf);
++
++	/* Each import owns an object reference. PRIME's handle cache would
++	 * reuse the exporter's non-reference-counted handle in the shared
++	 * KFD client, so closing either allocation would invalidate the other.
++	 */
++	obj = amdgpu_gem_prime_import(&adev->ddev, dma_buf);
++	if (IS_ERR(obj)) {
++		ret = PTR_ERR(obj);
++		goto out_put_dmabuf;
++	}
++
++	ret = import_obj_create(adev, dma_buf, obj, va, drm_priv, mem, size,
++			       mmap_offset);
+ 	if (ret)
+-		return ret;
+-	obj = drm_gem_object_lookup(adev->kfd.client.file, handle);
+-	if (!obj) {
+-		ret = -EINVAL;
+-		goto err_release_handle;
+-	}
+-
+-	ret = import_obj_create(adev, obj->dma_buf, obj, va, drm_priv, mem, size,
+-				mmap_offset);
+-	if (ret)
+-		goto err_put_obj;
+-
+-	(*mem)->gem_handle = handle;
+-
+-	return 0;
+-
+-err_put_obj:
+-	drm_gem_object_put(obj);
+-err_release_handle:
+-	drm_gem_handle_delete(adev->kfd.client.file, handle);
++		drm_gem_object_put(obj);
++
++out_put_dmabuf:
++	dma_buf_put(dma_buf);
+ 	return ret;
+ }
+ 

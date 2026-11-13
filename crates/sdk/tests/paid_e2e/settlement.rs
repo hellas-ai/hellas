@@ -965,6 +965,49 @@ fn cli_settles_paid_channel_without_provider() {
                 receipt.client_returned + receipt.provider_payout,
                 CLIENT_FUNDING
             );
+            // Spending a certified payout cannot reopen an already settled channel.
+            let chain = case.devnet.validator_light_client(0);
+            let client_coin = hellas_kernel::Payout::new(
+                CLIENT_OWNER.key().into_kernel(),
+                receipt.client_returned,
+            )
+            .id(receipt.payment_edge, 1);
+            let plan = hellas_sdk::coin_owner::OwnerReshape::prepare(
+                &chain,
+                case.devnet.network(),
+                CLIENT_OWNER.key().into_kernel(),
+                &[client_coin],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            chain
+                .submit_tx(hellas_chain::domain::Transaction::Kernel(
+                    plan.clone()
+                        .authorize(CLIENT_OWNER.authorize(plan.payload_hash()))
+                        .unwrap(),
+                ))
+                .await
+                .unwrap();
+            case.devnet.seal().await;
+            assert!(
+                chain
+                    .get_objects(vec![hellas_chain::domain::ObjectKey::Coin(client_coin)])
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .coin(client_coin)
+                    .unwrap()
+                    .is_none()
+            );
+            let repeated = command.output().await.unwrap();
+            assert!(
+                repeated.status.success(),
+                "{}",
+                String::from_utf8_lossy(&repeated.stderr)
+            );
+            assert!(String::from_utf8_lossy(&repeated.stdout).contains("settled 0 channels"));
             case.endpoint.close().await;
             case.relays.shutdown().await;
             case.devnet.shutdown().await;

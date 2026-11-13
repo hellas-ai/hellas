@@ -24,7 +24,7 @@ use hellas_rpc::call::{WithTrailer, with_trailer as wt};
 use hellas_rpc::pb::work::{
     AcceptWorkRequest, AcceptWorkResponse, AdmitCertificateRequest, AdmitCertificateResponse,
     ExchangeSetupRequest, ExchangeSetupResponse, FundingKind, GetStandingRequest,
-    GetStandingResponse, StreamResultRequest, WorkRefusalCode, WorkRefused, WorkRoute,
+    GetStandingResponse, StreamResultRequest, WorkRoute,
 };
 use hellas_rpc::services::work::WorkHandler;
 use hellas_rpc::services::work_setup::WorkSetupHandler;
@@ -232,9 +232,9 @@ impl AcceptedWorkDriver {
         }
     }
 
-    fn admission(&self, service: WorkService, ready: ReadyChannel) -> AcceptExecution {
+    fn admission(&self, service: WorkService) -> AcceptExecution {
         let driver = self.clone();
-        Box::new(move |input, caller| {
+        Box::new(move |input, caller, ready| {
             let permit = (driver.reserve)(&BackendKey::of(input)?, caller)?;
             Ok(Box::new(move |work| {
                 driver.spawn(service, ready, work, Some(permit))
@@ -331,25 +331,11 @@ impl WorkHandler for MountedWorkService {
         request: AcceptWorkRequest,
         _context: TransportContext,
     ) -> Result<impl Into<WithTrailer<AcceptWorkResponse>> + Send, WireStatus> {
-        if let Some(response) = self.service.precheck_acceptance(&request).await {
-            return Ok(response);
-        }
-        let ready = match self.service.readiness().await {
-            Ok(ready) => ready,
-            Err(error) => {
-                debug!(%error, "channel observer is not ready for acceptance");
-                return Ok(AcceptWorkResponse::refused(WorkRefused {
-                    grant: None,
-                    code: WorkRefusalCode::NotReady as i32,
-                    reason: error.to_string(),
-                }));
-            }
-        };
         let execution = self
             .driver
             .as_ref()
-            .map(|driver| driver.admission(self.service.clone(), ready));
-        let response = self.service.accept(&request, execution).await;
+            .map(|driver| driver.admission(self.service.clone()));
+        let response = self.service.accept_when_ready(&request, execution).await;
         Ok(response)
     }
 
@@ -1489,6 +1475,155 @@ mod tests {
     use super::*;
     use crate::test_support::{PaidFixture, accept_uploaded};
     use hellas_channel::work_store::JobPhase;
+
+    #[tokio::test]
+    async fn stale_observation_keeps_the_original_proposal_waiting_for_finalized_progress() {
+        use hellas_channel::model::work::{PaidJobAuthorizationV2, PrivateRecord as _, work_id};
+        use hellas_channel::work::ClientChannel as _;
+        let fixture = PaidFixture::new();
+        let service = fixture.provider().await;
+        let mut client = fixture.client().await;
+        let request = client
+            .propose(
+                &fixture.proposal(),
+                &hellas_channel::test_support::channel::program_content().await,
+                None,
+            )
+            .await
+            .unwrap();
+        let authorization = PaidJobAuthorizationV2::decode(&request.authorization).unwrap();
+        let id = work_id(fixture.ready.channel(), &authorization);
+        service.observe_ready(fixture.ready.clone()).await.unwrap();
+        service.suspend().await.unwrap();
+        let (wire, _upload) =
+            crate::test_support::upload_paid_input(&fixture, &service, &client, &request).await;
+        let mounted = MountedWorkService {
+            service: service.clone(),
+            driver: None,
+        };
+        let mut acceptance = Box::pin(wt(
+            mounted.accept_work(wire.clone(), TransportContext::default())
+        ));
+        assert!(
+            futures::poll!(&mut acceptance).is_pending(),
+            "stale observation must not abandon the signed proposal"
+        );
+        assert!(matches!(
+            service.observe_ready(fixture.ready.clone()).await,
+            Err(hellas_channel::work::EndpointError::ObservationStale)
+        ));
+        assert!(futures::poll!(&mut acceptance).is_pending());
+        assert_eq!(
+            client
+                .with_state(|state| state.job_by_id(id).unwrap().phase())
+                .await
+                .unwrap(),
+            JobPhase::HalfSigned
+        );
+        let observed = fixture.observed(2, hellas_kernel::PendingSlot::Absent);
+        service
+            .advance_close(&observed, &hellas_channel::test_support::channel::NullSink)
+            .await
+            .unwrap();
+        service
+            .observe_ready(fixture.descriptor.check_ready(&observed).unwrap())
+            .await
+            .unwrap();
+        let response = acceptance.await.unwrap().response;
+        assert_eq!(
+            client
+                .client()
+                .await
+                .unwrap()
+                .accepted(&response)
+                .await
+                .unwrap(),
+            id
+        );
+        assert_eq!(
+            service
+                .with_state(|state| state.jobs().count())
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            client
+                .with_state(|state| state.proposal_nonce_high_water())
+                .await
+                .unwrap(),
+            authorization.proposal_nonce
+        );
+        service.suspend().await.unwrap();
+        let duplicate = wt(mounted.accept_work(wire, TransportContext::default()))
+            .await
+            .unwrap()
+            .response;
+        assert_eq!(response, duplicate);
+    }
+
+    #[tokio::test]
+    async fn waiting_proposals_end_on_denial_shutdown_or_expiry_without_acceptance() {
+        for end in ["denied", "stopped", "quiesced", "expired"] {
+            let fixture = PaidFixture::new();
+            let service = fixture.provider().await;
+            let mut client = fixture.client().await;
+            let request = client
+                .propose(
+                    &fixture.proposal(),
+                    &hellas_channel::test_support::channel::program_content().await,
+                    None,
+                )
+                .await
+                .unwrap();
+            service.observe_ready(fixture.ready.clone()).await.unwrap();
+            service.suspend().await.unwrap();
+            let mounted = MountedWorkService {
+                service: service.clone(),
+                driver: None,
+            };
+            let mut waiting =
+                Box::pin(wt(mounted.accept_work(request, TransportContext::default())));
+            assert!(futures::poll!(&mut waiting).is_pending());
+            match end {
+                "denied" => service.observe_unavailable(2).await.unwrap(),
+                "stopped" => service.stop().await.unwrap(),
+                "quiesced" => service.quiesce().await.unwrap(),
+                "expired" => {
+                    let deadline = client
+                        .with_state(|state| {
+                            state
+                                .jobs()
+                                .next()
+                                .unwrap()
+                                .authorization()
+                                .acceptance_deadline
+                        })
+                        .await
+                        .unwrap();
+                    let observed =
+                        fixture.observed(deadline + 1, hellas_kernel::PendingSlot::Absent);
+                    service
+                        .advance_close(&observed, &hellas_channel::test_support::channel::NullSink)
+                        .await
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let response = waiting.await.unwrap().response;
+            assert!(matches!(
+                response.outcome,
+                Some(hellas_rpc::pb::work::accept_work_response::Outcome::Refused(_))
+            ));
+            assert_eq!(
+                service
+                    .with_state(|state| state.jobs().count())
+                    .await
+                    .unwrap(),
+                0
+            );
+        }
+    }
 
     /// Every durable acceptance is dispatched after a restart, not only
     /// a lone one. The running gate is the duplicate-execution barrier;

@@ -557,7 +557,7 @@ mod tests {
         let refusal = service
             .accept(
                 &wire,
-                Some(Box::new(|_, _| {
+                Some(Box::new(|_, _, _| {
                     Err(admission::AdmissionError::Capacity.into())
                 })),
             )
@@ -575,7 +575,7 @@ mod tests {
         let capacity = Arc::new(tokio::sync::Semaphore::new(1));
         let reserved = capacity.clone();
         let (started, executed) = tokio::sync::oneshot::channel();
-        let execution: super::AcceptExecution = Box::new(move |input, caller| {
+        let execution: super::AcceptExecution = Box::new(move |input, caller, _ready| {
             assert_eq!(
                 caller,
                 hellas_auth::PublicKey::Secp256k1(fixture::client().party_key().to_bytes())

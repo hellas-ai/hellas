@@ -512,6 +512,49 @@ async fn approved_offer_streams_from_the_private_ca_upstream() {
     host.stop().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn generic_fetch_uses_the_granted_provider_credential() {
+    let host = OfferHost::start().await;
+    let access = host.access().await;
+    let root = host.root().join("upstream.der");
+    std::fs::write(&root, STANDARD.decode(&host.https.root_der).unwrap()).unwrap();
+    let body = host.root().join("request.json");
+    std::fs::write(
+        &body,
+        json!({"model":"m","messages":[],"max_tokens":8,"stream":false}).to_string(),
+    )
+    .unwrap();
+    let url = format!("{}/v1/chat/completions", host.https.origin);
+    let data = format!("@{}", body.display());
+    let mut arguments = vec![
+        "fetch",
+        &url,
+        "--contract",
+        "http",
+        "-X",
+        "POST",
+        "-H",
+        "Content-Type: application/json",
+        "--data",
+        &data,
+        "--tls-root",
+        string(&root),
+        "--max-response-bytes",
+        "65536",
+        "--access",
+        string(&access),
+    ];
+    let refused = host.client.output(&arguments).await;
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("HTTPS credential mismatch"));
+    assert_eq!(host.https.calls.load(Ordering::SeqCst), 0);
+    arguments.extend(["--credential", "glm-account"]);
+    let result: Value = serde_json::from_str(&host.client.run(&arguments).await).unwrap();
+    assert_eq!(result["choices"][0]["message"]["content"], "hello");
+    assert_eq!(host.https.calls.load(Ordering::SeqCst), 1);
+    host.stop().await;
+}
+
 #[cfg(feature = "otel")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn metrics_scrape_observes_gateway_and_serve_work() {

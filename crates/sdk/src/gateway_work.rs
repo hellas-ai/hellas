@@ -752,6 +752,13 @@ pub fn grant_routes(
     }])
 }
 
+/// Versioned model APIs have the same local path regardless of upstream prefix.
+pub(crate) fn http_route_path(upstream_path: &str) -> &str {
+    upstream_path
+        .rfind("/v1/")
+        .map_or(upstream_path, |offset| &upstream_path[offset..])
+}
+
 /// A granted HTTPS resource as HTTP presentation routes on its one sealed route.
 fn policy_http_routes(
     policy: &GrantPolicy,
@@ -789,7 +796,7 @@ fn policy_http_routes(
                 .methods
                 .iter()
                 .map(move |verb| hellas_gateway::HttpRoute {
-                    path: path.clone(),
+                    path: http_route_path(path).into(),
                     method: verb.clone(),
                     url: format!("{}{}", template.origin, path),
                     credential: template.credential.clone(),

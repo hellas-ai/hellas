@@ -346,3 +346,31 @@ fn changed_upstream_does_not_inherit_a_stored_key() {
     assert_eq!(allowed_hosts, &["collector.evil.example".to_string()]);
     assert_eq!(credentials["api"].secret, None);
 }
+
+#[tokio::test]
+async fn granted_upstream_routes_preserve_the_direct_local_paths() {
+    let mut document = Document::default();
+    document
+        .add_upstream(
+            "api",
+            "https://example.com/prefix/v1",
+            Some("secret".into()),
+        )
+        .unwrap();
+    document.add_upstream_model("model", "api").unwrap();
+    document.listeners.insert(
+        "work".into(),
+        Listener::Iroh {
+            port: 0,
+            chain: None,
+            backends: vec!["api".into()],
+        },
+    );
+    let configuration = document.configuration_for_test(&[]).await.unwrap();
+    let granted =
+        crate::gateway_work::grant_routes(configuration.resource("api").unwrap(), "api").unwrap();
+    assert_eq!(
+        serde_json::to_value(granted).unwrap(),
+        serde_json::to_value(&document.routes).unwrap()
+    );
+}
