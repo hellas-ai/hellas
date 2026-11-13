@@ -669,8 +669,9 @@ async fn repaired_resources_are_usable_through_the_gateway() {
     for _ in 0..2 {
         fixture.result(None).await.unwrap();
     }
-    // The result that quarantines the resource also ends its delivery.
-    assert_err!(fixture.result(None).await, WorkGatewayError::Denied(_));
+    // Quarantine cancels this job's delivery; cancellation may reach the
+    // transport before its typed refusal. The next request must be Forbidden.
+    assert!(fixture.result(None).await.is_err());
     let http = fixture.http().await;
     assert_eq!(http.status().await, reqwest::StatusCode::FORBIDDEN);
     let WorkControlReply::Resource {
@@ -687,6 +688,7 @@ async fn repaired_resources_are_usable_through_the_gateway() {
     };
     assert!(quarantined);
     let calls = fixture.host.backend.calls.load(Ordering::SeqCst);
+    assert_eq!(calls, 3);
     fixture
         .command(WorkControlCommand::RepairResource {
             policy: "chat".into(),

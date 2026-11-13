@@ -104,7 +104,7 @@ impl Prepared {
                     else {
                         unreachable!()
                     };
-                    entry
+                    *entry
                 }
             };
             entries.insert(id, entry);

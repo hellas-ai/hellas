@@ -45,7 +45,7 @@ pub(super) struct Runtime {
 }
 
 pub(super) enum PreparedBackend {
-    Ready(BackendEntry),
+    Ready(Box<BackendEntry>),
     Paid {
         options: Box<crate::paid_client::PaidWorkOptions>,
         endpoint: iroh::Endpoint,
@@ -55,7 +55,7 @@ pub(super) enum PreparedBackend {
 }
 impl PreparedBackend {
     pub fn ready(entry: BackendEntry) -> Self {
-        Self::Ready(entry)
+        Self::Ready(Box::new(entry))
     }
     pub fn unavailable(configured: &crate::daemon_config::Backend, reason: String) -> Self {
         let evaluator = match &configured.kind {
@@ -106,7 +106,7 @@ impl PreparedBackend {
     }
     pub async fn activate(self, runtime: &Runtime) -> Result<BackendEntry> {
         match self {
-            Self::Ready(entry) => Ok(entry),
+            Self::Ready(entry) => Ok(*entry),
             Self::Paid {
                 mut options,
                 endpoint,
@@ -433,7 +433,7 @@ impl Runtime {
                 }
             }
         };
-        Ok(PreparedBackend::Ready(BackendEntry {
+        Ok(PreparedBackend::ready(BackendEntry {
             backend,
             evaluator,
             max_in_flight: configured.max_in_flight,
