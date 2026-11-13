@@ -297,15 +297,19 @@ impl OfferAllocator {
             let bundle = state
                 .bundle()
                 .ok_or_else(|| unavailable("offer journal has no proposal"))?;
+            let funding = state.funding_coins();
             let snapshot = chain
                 .work_channel_snapshot(WorkChannelQuery {
                     bond_edge: bundle.bond_edge(),
                     payment_edge: bundle.payment_edge(),
-                    funding: state.funding_coins(),
+                    funding: funding.clone(),
                 })
                 .await
                 .map_err(unavailable)?
                 .ok_or_else(|| unavailable("finalized offer snapshot unavailable"))?;
+            let live_funding = snapshot
+                .live_funding_of(&funding)
+                .ok_or_else(|| unavailable("offer snapshot funding differs"))?;
             let released = matches!(
                 state.end(),
                 Some(
@@ -317,7 +321,16 @@ impl OfferAllocator {
             );
             let live = snapshot.bond().is_some()
                 || snapshot.payment().is_some()
-                || (!released && snapshot.block().height < bundle.bond_terms().timeout.get());
+                // The provider may have missed the entire channel lifetime.
+                // An unposted bond can still open only while its inputs survive.
+                || (!released
+                    && snapshot.block().height < bundle.bond_terms().timeout.get()
+                    && bundle
+                        .bond_funding()
+                        .maker()
+                        .iter()
+                        .chain(bundle.bond_funding().taker())
+                        .all(|coin| live_funding.contains(coin)));
             if live {
                 open += 1;
                 reserved.extend(bundle.bond_funding().maker().iter().copied());
