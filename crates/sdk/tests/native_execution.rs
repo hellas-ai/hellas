@@ -1104,7 +1104,6 @@ async fn paid_fixture(runtime: commonware_runtime::tokio::Context) -> PaidScenar
     let options = PaidWorkOptions {
         content: fresh_client_content(&root.path().join("client-store")).await,
         config: client_config,
-        journal_kind: hellas_sdk::paid_client::PaidJournalKind::Client,
         provider: provider_address,
         provider_addrs,
         assurance: Assurance::ProducerSigned,

@@ -54,18 +54,10 @@ use std::sync::Arc;
 
 use crate::work_config::WorkConfig;
 
-/// Client purchases and gateway pools own distinct journal layouts.
-#[derive(Clone, Copy, Debug)]
-pub enum PaidJournalKind {
-    Client,
-    Gateway,
-}
-
 /// Options shared by all jobs on a paid channel.
 #[derive(Clone)]
 pub struct PaidWorkOptions {
     pub config: WorkConfig,
-    pub journal_kind: PaidJournalKind,
     pub content: hellas_store::content::DiskStore,
     /// Every connection must present exactly this enrollment and node.
     pub provider: hellas_client::ProviderAddress,
@@ -171,23 +163,11 @@ async fn within<T>(
     }
 }
 
-impl PaidJournalKind {
-    pub fn journal_root(
-        self,
-        chain: &hellas_chain::chain_dir::ChainDir,
-        provider: hellas_client::ProviderAddress,
-    ) -> StoreLocation {
-        match self {
-            Self::Client => chain.client_journals(&provider.to_string()),
-            Self::Gateway => chain.gateway(&provider.node.to_string()),
-        }
-    }
-}
-
 impl PaidWorkOptions {
     pub fn journal_root(&self) -> StoreLocation {
-        self.journal_kind
-            .journal_root(&self.config.chain, self.provider)
+        self.config
+            .chain
+            .client_journals(&self.provider.to_string())
     }
 
     /// Reject impossible deadlines and collateral before connecting or signing.

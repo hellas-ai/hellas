@@ -200,7 +200,6 @@ async fn insufficient_quoted_collateral_is_rejected_before_a_bond_request_or_jou
     let args = PaidWorkOptions {
         content: hellas_authority::test_support::content_store(fixture.root.path()).await,
         config,
-        journal_kind: PaidJournalKind::Client,
         provider,
         provider_addrs: vec![],
         assurance: Assurance::ProducerSigned,

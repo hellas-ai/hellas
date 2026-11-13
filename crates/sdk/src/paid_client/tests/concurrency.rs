@@ -132,7 +132,6 @@ async fn paid_concurrency(cancel: bool) {
             args: PaidWorkOptions {
                 content,
                 config: fixture.config.clone(),
-                journal_kind: PaidJournalKind::Client,
                 provider: crate::test_support::address(server.id()),
                 provider_addrs: server.bound_sockets(),
                 apple_trust: None,

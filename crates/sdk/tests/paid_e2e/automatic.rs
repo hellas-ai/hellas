@@ -2278,7 +2278,6 @@ async fn finish(case: Box<Case>) {
     let options = PaidWorkOptions {
         content: fresh_client_content(&root.path().join("client-store")).await,
         config: config.clone(),
-        journal_kind: hellas_sdk::paid_client::PaidJournalKind::Client,
         provider: hellas_client::ProviderAddress::of(&provider.enrollment).unwrap(),
         provider_addrs: provider.endpoint.bound_sockets(),
         assurance: Assurance::ProducerSigned,

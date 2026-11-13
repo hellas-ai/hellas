@@ -90,10 +90,6 @@ impl ChainDir {
     pub fn provider_journals(&self) -> StoreLocation {
         self.provider().child("channels")
     }
-    /// `provider` is the canonical display form of a typed endpoint ID.
-    pub fn gateway(&self, provider: &str) -> StoreLocation {
-        self.root.child("gateway").child(provider)
-    }
     pub fn indexer(&self) -> StoreLocation {
         self.root.child("indexer")
     }
@@ -181,7 +177,6 @@ mod tests {
                 chain.node(),
                 chain.client_journals("client"),
                 chain.provider_journals(),
-                chain.gateway("provider"),
                 chain.indexer(),
                 chain.validator(),
             ] {

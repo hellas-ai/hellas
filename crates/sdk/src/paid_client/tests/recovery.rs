@@ -262,7 +262,6 @@ async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
                 args: PaidWorkOptions {
                     content,
                     config: fixture.config.clone(),
-                    journal_kind: crate::paid_client::PaidJournalKind::Client,
                     provider: crate::test_support::address(server.id()),
                     provider_addrs: server.bound_sockets(),
                     apple_trust: None,

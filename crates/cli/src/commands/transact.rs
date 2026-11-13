@@ -14,7 +14,7 @@ use hellas_sdk::{
     },
     grant_client::{GrantSessionOptions, UnpinnedOffer},
     job::{Job, JobInput},
-    paid_client::{PaidJournalKind, PaidWorkOptions, bind_paid_endpoint},
+    paid_client::{PaidWorkOptions, bind_paid_endpoint},
     transact::PaidAttemptPath,
 };
 use std::{
@@ -346,7 +346,6 @@ impl ClientArgs {
         };
         Ok(PaidWorkOptions {
             content,
-            journal_kind: PaidJournalKind::Client,
             config,
             provider: provider.address,
             provider_addrs: provider

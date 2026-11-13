@@ -50,15 +50,6 @@ pub async fn open_client_content(chain: &ChainDir) -> Result<DiskStore, ChainHom
     .await
 }
 
-/// Open one provider's gateway content store and recover its journals before cleanup.
-pub async fn open_gateway_content(
-    chain: &ChainDir,
-    provider: hellas_client::ProviderAddress,
-) -> Result<DiskStore, ChainHomeError> {
-    let root = crate::paid_client::PaidJournalKind::Gateway.journal_root(chain, provider);
-    open_content(root.child("content"), chain, vec![root]).await
-}
-
 async fn open_content(
     location: StoreLocation,
     chain: &ChainDir,

@@ -280,7 +280,6 @@ impl Runtime {
                 let apple_trust = self.trust(trust)?;
                 let options = crate::paid_client::PaidWorkOptions {
                     content,
-                    journal_kind: crate::paid_client::PaidJournalKind::Client,
                     config: crate::work_config::WorkConfig::from_chain_dir(chain)?,
                     provider,
                     provider_addrs: vec![],
