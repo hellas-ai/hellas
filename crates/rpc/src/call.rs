@@ -681,6 +681,7 @@ impl<R> WithTrailer<R> {
 pub struct ResponseStream<R> {
     inner: Pin<Box<dyn futures_core::Stream<Item = Result<R, WireStatus>> + Send>>,
     authority: Option<hellas_wire::WriteAuthority>,
+    refusal: Option<fn(&R) -> bool>,
 }
 impl<R> ResponseStream<R> {
     pub fn new(
@@ -689,7 +690,14 @@ impl<R> ResponseStream<R> {
         Self {
             inner: Box::pin(stream),
             authority: None,
+            refusal: None,
         }
+    }
+    /// Identify public terminal refusals, which carry no result or private
+    /// metadata and must reach the peer even after delivery rights end.
+    pub fn with_refusal(mut self, refusal: fn(&R) -> bool) -> Self {
+        self.refusal = Some(refusal);
+        self
     }
     pub fn with_write_authority(mut self, authority: hellas_wire::WriteAuthority) -> Self {
         self.authority = Some(authority);
@@ -1113,6 +1121,13 @@ async fn write_streaming_response<S: SendHalf, R: Message>(
         response
             .encode(&mut buf)
             .map_err(|error| TransportError::Protocol(format!("prost encode: {error}")))?;
+        if responses.refusal.is_some_and(|refusal| refusal(&response)) {
+            send.refuse(buf.freeze())
+                .await
+                .map_err(|error| TransportError::Io(format!("refusal: {error}")))?;
+            call.finish(WireCode::Ok);
+            return Ok(());
+        }
         send.send_body(buf.freeze())
             .await
             .map_err(|error| TransportError::Io(format!("send: {error}")))?;

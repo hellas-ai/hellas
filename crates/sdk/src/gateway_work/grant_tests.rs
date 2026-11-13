@@ -669,9 +669,10 @@ async fn repaired_resources_are_usable_through_the_gateway() {
     for _ in 0..2 {
         fixture.result(None).await.unwrap();
     }
-    // Quarantine cancels this job's delivery; cancellation may reach the
-    // transport before its typed refusal. The next request must be Forbidden.
-    assert!(fixture.result(None).await.is_err());
+    assert_err!(fixture.result(None).await, WorkGatewayError::Denied(error)
+        if matches!(error.downcast_ref::<crate::grant_client::GrantClientError>(),
+            Some(crate::grant_client::GrantClientError::Refused { code: hellas_rpc::pb::work::GrantRefusalCode::Quarantined, .. })));
+    assert!(!fixture.gateway.backends()[0].down);
     let http = fixture.http().await;
     assert_eq!(http.status().await, reqwest::StatusCode::FORBIDDEN);
     let WorkControlReply::Resource {
@@ -697,6 +698,24 @@ async fn repaired_resources_are_usable_through_the_gateway() {
         .await;
     assert_eq!(http.status().await, reqwest::StatusCode::OK);
     assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst) - calls, 1);
+    http.server.shutdown().await.unwrap();
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn quarantine_triggering_request_is_http_forbidden_and_keeps_the_channel_up() {
+    let fixture = Fixture::builder()
+        .without_usage()
+        .with_budget(100)
+        .build()
+        .await;
+    for _ in 0..2 {
+        fixture.result(None).await.unwrap();
+    }
+    let http = fixture.http().await;
+    assert_eq!(http.status().await, reqwest::StatusCode::FORBIDDEN);
+    assert!(!fixture.gateway.backends()[0].down);
+    assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 3);
     http.server.shutdown().await.unwrap();
     fixture.shutdown().await;
 }

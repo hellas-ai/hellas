@@ -1252,7 +1252,17 @@ impl hellas_rpc::services::work::WorkHandler for GrantWork {
         Ok(self
             .service
             .stream_binding(futures::future::ready(Ok(delivery.clone())))
-            .with_write_authority(self.service.delivery_authority(delivery)))
+            .with_write_authority(self.service.delivery_authority(delivery))
+            .with_refusal(|event| {
+                let Some(work_stream_event::Outcome::Refused(refusal)) = &event.outcome else {
+                    return false;
+                };
+                refusal
+                    .grant
+                    .as_ref()
+                    .and_then(|grant| GrantRefusalCode::try_from(grant.code).ok())
+                    .is_some_and(|code| *refusal == refused(code))
+            }))
     }
     async fn admit_certificate(
         &self,
