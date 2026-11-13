@@ -217,3 +217,48 @@ async fn signed_offer_rejects_changed_policy_funding_enrollment_and_addresses() 
         }
     }
 }
+
+#[tokio::test]
+async fn unfinished_offer_with_spent_funding_is_not_reused_after_settlement() {
+    use hellas_chain::{LatestBlock, WorkChannelQuery, WorkChannelSnapshot};
+    let root = tempfile::tempdir().unwrap();
+    let options = options(root.path());
+    let offered = planned(&options, &[])
+        .unwrap()
+        .journal(&std::sync::atomic::AtomicBool::new(false))
+        .await
+        .unwrap();
+    let store = open_provider_journal(&options.journal_root, options.network, offered.bond_edge)
+        .await
+        .unwrap();
+    let state = store.state();
+    assert!(state.end().is_none());
+    assert!(state.origin().is_none());
+    let funding = state.funding_coins();
+    let snapshot = |live| {
+        WorkChannelSnapshot::new(
+            WorkChannelQuery {
+                bond_edge: state.bond_edge(),
+                payment_edge: state.payment_edge(),
+                funding: funding.clone(),
+            },
+            LatestBlock {
+                height: 100,
+                payload: [0; 32].into(),
+                state_root: [0; 32].into(),
+                finalization: vec![],
+            },
+            0,
+            None,
+            None,
+            [None; 2],
+            None,
+            live,
+        )
+    };
+    // An unanswered offer still reserves its unspent stake before its horizon.
+    assert!(offer_is_live(state, &snapshot(funding.clone())).unwrap());
+    // The provider missed completion before stopping. Both edges have since
+    // settled, and the old funding is spent, though the offer horizon is future.
+    assert!(!offer_is_live(state, &snapshot(BTreeSet::new())).unwrap());
+}
