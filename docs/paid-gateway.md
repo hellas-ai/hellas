@@ -6,81 +6,55 @@ re-run the job, so this shows who answered, not that the answer is correct.
 
 ## Sell
 
-Fund the home's principal, then serve paid terms:
+Start `hellas serve`, pair its invite, and configure the local packages or
+Fetch backends it may execute. Routing uses `backend` and `route` verbs; paid
+terms are a separate owner-approved policy in the same authority.
 
 ```sh
 hellas faucet
-hellas serve --knowingly-unsafe --paid-work-config docs/examples/faucet-provider.toml --content whisper-tiny
+hellas serve
+# In another shell, pair the printed invite, then configure a package:
+hellas pair hellas-invite:… --name mine
+hellas route add /srv/models/whisper-tiny
+hellas admin work docs/examples/faucet-provider.json
 ```
 
-`serve` prints the provider address, `Provider: ENROLLMENT_ID@NODE_ID`: the
-content ID of the provider's enrollment and the node it binds. Buyers learn it
-out of band, and every paid connection must present exactly that enrollment.
-The example charges 20 per job, ten jobs per channel, and stops execution after
-90 seconds. `--content PATH` serves the converted weights the jobs name; the
-provider never converts or renders anything.
+Run the example from the repository root with the paired owner's passkey
+(`--passkey PATH`, or the owner's configured key). With several paired nodes,
+select this node using `hellas admin --profile "$HOME/.hellas/nodes/mine/profile.json"
+work docs/examples/faucet-provider.json`.
 
-The provider keeps its paid policy in its node authority. A provider started
-with `serve --paid-work-config FILE` has its principal (the home's
-`principal.key`, or `--passkey`) approve exactly that file's terms at startup,
-unless the authority already holds them, and delegate the stake its offers
-bond. Paid work is sold only with this file; nothing has a built-in
-default. [`faucet-provider.toml`](examples/faucet-provider.toml) is a complete
-example: price, jobs per channel, channel credit, offer bounds, upload/output
-limits, maximum steps, the execution limit, `[compute]` with `any` set to a compute
-id (the evaluator a GPU runtime registers, such as `hellas/catena-dfad87438018-hip`)
-and an optional `[fetch]` section. `any` admits any program of that compute id,
-which hands anyone who can submit jobs roughly root on the host, so `serve`
-refuses it unless `--knowingly-unsafe` acknowledges that. To restrict Compute to
-reviewed programs, use `[compute]` with a nonempty `only` list of program ids;
-`hellas program --backend EVALUATOR PATH` prints the id of a converted Whisper
-package or a Qwen GGUF rendered for that renderer. These bind the rendered code and asset hashes;
-request inputs and plans still vary within the configured limits. Omit
-`[compute]` to disable Compute. The same explicit `programs` selection applies
-to Compute admissions in owner-issued grant policies.
+The JSON is a complete `WorkControlCommand`: `SetPaidPolicy` contains
+`expected_revision` and `policy`. The first approval expects revision 0 and
+returns `{"PaidPolicyChanged":{"revision":1}}`. For later approvals, copy the
+file and set `expected_revision` to the last returned revision. Stale revisions
+and daily node-key sessions cannot change paid terms.
 
-Restarts with the same
-file change nothing. A lower stake cap is refused before changing policy if no
-already-delegated coin fits it; use the explicit owner `chain delegate --split`
-path to reshape unused stake first. The saved `admin.json` profile beside the
-provider identity works with the passkey administration commands.
+The policy's `invocation_policy` names the evaluator shown by `hellas routes`.
+Change the example's HIP evaluator if the provider uses another runtime. Its
+`programs: {"mode":"any"}` allows arbitrary programs for that evaluator;
+restrict it to `{"mode":"only","manifests":["CONTENT_ID"]}` to allow only
+specific program manifests. Those programs run with the provider process's
+filesystem and device access. The example sells Compute only; Fetch requires
+an explicit Fetch admission in the same policy.
 
-For an existing fleet daemon, keep the owner key on the administration machine.
-Approve the same TOML file remotely with its owner profile:
-
-```sh
-hellas admin --profile node-admin.json --node NODE_ID --address HOST:31145 \
-  set-paid-policy --terms paid.toml --expected-revision 0
-```
-
-Then start the initialized daemon with `serve --grant-config node.json
---paid-work-config paid.toml`, without a principal key. It checks the
-stored policy matches exactly and cannot approve changed terms itself. Use the
-current policy revision for subsequent approvals. A stale revision or a node-key
-session cannot change paid terms.
+`payment_policy` sets price and block margins; `channel_policy` limits credit;
+`offers` bounds automatic funding. At price 20 and 10 jobs per channel, capacity
+is 200. The example adds omission collateral 201 and uses zero close fees, so
+`expected_payment_values.value` is 401 and `reserve` is 0. Keep these amounts
+consistent when changing the price or channel size. Existing channels retain
+their signed terms.
 
 Stake must belong to the authority owner and be delegated to the daemon's
-settlement key. From the owner's machine, use `chain delegate --coin COIN_ID
---node SETTLEMENT_KEY --split 12` with the owner's principal key, the independently
-pinned `--chain` or `--chain-config` selection and `--rpc` endpoint. Use the stake value configured in
-`offers.max_stake_per_client`; the example uses 12. `hellas faucet` funds the
-owner on the devnet. These commands print submission status and resulting coin IDs; submission is
-not finalization. Check finalized coin state before relying on the funding.
+settlement key. Use `chain delegate --coin COIN_ID --node SETTLEMENT_KEY
+--split AMOUNT` with the owner's key and independently pinned chain. Check
+finalized coin state before relying on funding. Retain the daemon's home and
+all channel journals across restarts.
 
-The first paid daemon startup synchronizes authenticated devnet state before
-serving requests. This can take several minutes. Retain its `--home` directory across restarts; the CLI reports the wait. Chain state is stored under `<home>/chains/<full consensus digest>/`. Buyers
-likewise retain their home's wallet and channel state through settlement.
-
-The Qwen3 BF16 program's HIP kernels require a supported gfx11 target, including
-the Strix Halo gfx1151 used in the demo. A gfx1010 GPU can run a scalar smoke
-test but cannot compile this model's native packed BF16 operations. Check the
-model on the target GPU before offering paid inference.
-
-Strix Halo shares system memory with the GPU. An idle worker can retain model
-weights, and `--gpu-session-asset-bytes` bounds that cache, not all GPU or process
-memory. A systemd memory limit alone does not reserve headroom for another GPU
-service. Avoid retaining demo models alongside a GLM deployment that can fill
-the machine; stop the completed demo worker to release its GPU allocations.
+The provider address combines its enrollment ID and transport node ID. Buyers
+pin that enrollment; native programs run with the provider user's permissions.
+Only admit programs you trust. A policy admitting arbitrary programs grants
+those callers the same filesystem and device access as the provider process.
 
 ## Buy
 
@@ -104,7 +78,7 @@ transaction and payment journals, and prints decoded text.
 Paid CLI jobs default to 300 admission blocks, 3000 execution/delivery blocks,
 and 600 payment blocks. Override these with `--acceptance-blocks`,
 `--terminal-blocks`, and `--payment-blocks`; they count finalized blocks, not
-seconds. `gateway --pay` takes the same flags and defaults. The provider's
+seconds. The provider's
 bond lifetime must cover all three windows plus channel setup. `--timeout`
 separately limits the caller's wall-clock wait; it does not extend signed deadlines.
 
@@ -116,7 +90,7 @@ memory metering. Before paying, the client checks that each result is signed
 by the provider and matches this job; Hellas does not re-run it.
 
 Compute terms should allow at least 4 MiB of upload for Whisper. The faucet
-example uses `max_upload_bytes = 4194304`; provider and grant limits are explicit
+example uses `"max_upload_bytes": 4194304`; provider and grant limits are explicit
 terms, with no implicit runtime default. Whisper ships roughly 0.47–0.85 MB of
 rendered program, 960,000 bytes of log-mel features, and three F32 vocabulary
 masks (622,380 bytes for a 51,865-token model). The allowance also covers input
@@ -196,46 +170,20 @@ The provider verifies the buyer's delegated funding and retains the
 first authenticated peer with its offer. All participants must use the same
 compatible chain revision.
 
-## Paid gateway
+## Paid HTTP backends
 
-`hellas gateway --model qwen3.gguf --pay 20 --provider ENROLLMENT_ID@NODE_ID
---backend hellas/catena-dfad87438018-hip` asks the provider for its quote once,
-then renders each request for that renderer as one job and
-pays for it on the provider's channel, one request at a time. A converted
-Whisper package as `--model` serves `/v1/audio/transcriptions`:
+Embedding applications can put a `Paid` backend and model/HTTP routes in a
+`daemon_config::Document`, then run `daemon::Core`. Each backend names its
+provider, maximum price, evaluator and optional approved trust policy. Several
+requests share its channel within the configured capacity; proposals serialize
+only the channel negotiation, and collection and settlement remain owned by
+each job. The stateless CLI exposes local models, grants and upstreams.
 
-```sh
-hellas gateway --model whisper-tiny --pay 20 --provider ENROLLMENT_ID@NODE_ID \
-  --backend hellas/catena-dfad87438018-hip &
-curl http://127.0.0.1:8080/v1/audio/transcriptions \
-  -H "Authorization: Bearer $(cat ~/.hellas/gateway/bearer)" \
-  -F model=whisper-tiny -F file=@speech.wav -F language=en -F response_format=json
-```
-
-The route accepts mono/stereo WAV up to 30 seconds and 32 MiB, resamples 8–192 kHz
-audio to 16 kHz on the client, and returns `{"text":"..."}` or plain text with
-`response_format=text`. Language is optional; the program detects it when omitted.
-`--default-max-tokens` bounds transcription tokens and must fit the model's decoder.
-The audio route has its own body limit, including archival and multipart model
-splitting. Ordinary JSON routes retain their existing limit. HTTP format options
-and multipart fields are validated before submitting work.
-Responses identify the accepted job and provider in `x-hellas-commitment-bin` and
-`x-hellas-provider`. JSON includes the signed transcript in its `hellas` object;
-plain text carries it in the `x-hellas-transcript` trailer (HTTP/1.1 clients must
-send `TE: trailers` to receive trailers). For response formats that trail the
-evidence instead of embedding it, a transcript whose base64 encoding exceeds
-8 KiB is not delivered to the HTTP caller at all: `x-hellas-transcript` is
-omitted and `x-hellas-transcript-digest` names its lowercase hex SHA-256
-instead. The digest identifies the canonical signed bytes so a caller who
-obtains them out of band can verify them; the gateway does not retain or serve
-those bytes, so no HTTP request can retrieve an oversized transcript.
-
-With `--http-fetch-config`, the gateway carries HTTP Fetch requests on the same
-channel. The provider's paid policy must select the HTTP Fetch manifest and a
+HTTP Fetch routes use the same paid channels. The provider's paid policy must select the HTTP Fetch manifest and a
 matching Fetch route policy; see [HTTP routing](http-gateway.md).
 
 Each text job fixes the rendered program, the GGUF weights, the prompt tokens
-and the token budget (`max_tokens`, else `--default-max-tokens`), cut to what
+and the token budget (`max_tokens`, else the presentation default), cut to what
 the quoted or granted terms allow. The provider's step loop feeds each emitted
 token back until that budget; a spent budget ends the response with the API's
 length stop. The payment terms fix the price per job. Model presentation (the
@@ -288,17 +236,13 @@ or verified delivery retain their credit reservation until the payment deadline;
 recovery skips them and never submits them anew. Disconnecting an
 HTTP client cancels work that has not yet been proposed. Once a signed proposal
 may have reached a provider, collection and payment continue despite disconnects.
-A gateway admits at most 32 queued or running requests; further requests are
-refused and may be retried. SIGTERM and wrapped-command failures drain
+Each backend bounds its queued and running requests with `max_in_flight`.
+A full backend refuses new work; other eligible backends can take an unproposed request. SIGTERM and wrapped-command failures drain
 outstanding operations. An operation that reaches its deadline retains its
 journal for recovery, as does abrupt process termination.
 
-A loopback gateway keeps its own authority and bearer under its home. A
-non-loopback listener requires `--allow-remote` and an explicitly provisioned
-`--gateway-profile` ([HTTP authority and scoped credential](admin.md#http-gateway-authority));
-use a trusted network or a TLS reverse proxy. The NixOS options are
-`services.hellas.gateway.pay` with `provider`, `models`, `home` (containing
-client journals), and `gatewayProfile` with `allowRemote`.
+All HTTP requests require a scoped gateway bearer. See [HTTP authority](admin.md#http-gateway-authority)
+and the [HTTP gateway guide](http-gateway.md) for stateless and persistent services.
 
 ## Request traces
 
@@ -356,18 +300,12 @@ packages still build without metrics or OTLP export by default.
 
 ## Embedding
 
-The CLI runs every gateway request through `hellas_sdk::ExecutorGateway`: one
-`GatewayTarget` (`Paid`, `Grant` or `Local`), each request one job through the
-same `Executor` as the job commands. `ExecutorGateway::new(target, signer)`
-takes a paid target's quoted policy, endpoint, settlement key and
-`Arc<ClientOwner>`; construct the owner with the principal authenticator, the
-identity's settlement key and a private funding directory. To serve it over
-HTTP, pass it to `hellas_sdk::serve_gateway` with `GatewayServeOptions`:
-listener, authentication and archive policy, and the presentations to add
-(models, HTTPS routes). A Responses route the provider seals is served too.
-Shutting down the returned handle drains accepted work. A host using the
-gateway without HTTP must call its `WorkExecutionBackend::drain` method when
-shutting down.
+The CLI and Gate use `hellas_sdk::daemon::Core` with one complete document.
+Backends are `Local`, `Fetch`, `Grant` or `Paid`; routes select ordered backend
+IDs. `Configure` prepares and commits a replacement document atomically.
+`Watch` reports the document, health and in-flight jobs; `CancelJob` retains
+accepted remote settlement duties. Call `Core::shutdown` before closing the
+host's content and authority stores. Wrapped children belong to the CLI.
 
 Tracking and recovery behavior is described in
 [Tracked native execution](jobs.md#tracked-native-execution).

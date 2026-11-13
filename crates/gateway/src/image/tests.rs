@@ -1,4 +1,5 @@
 use super::*;
+use crate::WorkExecutionBackend;
 use crate::{ComputeEvent, WorkEvent};
 use axum::body::Body;
 use base64::Engine as _;
@@ -18,21 +19,21 @@ struct Fake {
     calls: AtomicUsize,
     fail: bool,
     missing: bool,
-    timeout: Option<std::time::Duration>,
     delay: Option<std::time::Duration>,
     started: tokio::sync::Notify,
 }
 impl WorkExecutionBackend for Fake {
-    fn evaluator(&self) -> Option<String> {
-        Some(hellas_client::model::evaluator(
-            hellas_client::model::GpuDialect::Hip,
-        ))
-    }
-    fn timeout(&self) -> Option<std::time::Duration> {
-        self.timeout
+    fn backends(&self) -> Vec<crate::BackendInfo> {
+        crate::test_support::backend({
+            Some(hellas_client::model::evaluator(
+                hellas_client::model::GpuDialect::Hip,
+            ))
+        })
     }
     fn run(
         &self,
+        _backend: &str,
+        _request_job: Arc<crate::jobs::Job>,
         job: hellas_client::model::ComputeJob,
     ) -> Result<crate::WorkOutputStream<ComputeEvent>, crate::WorkGatewayError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
@@ -93,18 +94,18 @@ impl WorkExecutionBackend for Fake {
         Box::pin(async { Ok(()) })
     }
 }
-async fn app(fake: Arc<Fake>) -> Router {
-    let work: Arc<dyn WorkExecutionBackend> = fake;
-    crate::compose::router(
-        &crate::Presentations {
-            models: vec![crate::ModelOptions::Flux(ImageOptions {
-                model: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../client/src/model/flux/fixture"),
-                model_name: "klein".into(),
-            })],
-            ..Default::default()
-        },
-        &work,
+async fn app(work: Arc<Fake>) -> Router {
+    crate::router::router(
+        vec![crate::test_support::route(crate::Presentation::Model {
+            modality: hellas_client::model::ModelKind::Image,
+            model: "klein".into(),
+            package: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../client/src/model/flux/fixture"),
+            max_tokens: 128,
+        })],
+        work,
+        Arc::new(crate::jobs::Jobs::default()),
+        Default::default(),
     )
     .await
     .unwrap()
@@ -159,50 +160,6 @@ async fn image_route_returns_png_and_signed_evidence_from_one_job() {
         b"signed image transcript"
     );
     assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
-}
-
-#[tokio::test]
-async fn expired_image_preparation_never_submits_work() {
-    let fake = Arc::new(Fake {
-        timeout: Some(std::time::Duration::ZERO),
-        ..Default::default()
-    });
-    let response = app(fake.clone())
-        .await
-        .oneshot(request(body()))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
-    assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
-}
-
-#[tokio::test]
-async fn image_waits_without_a_deadline_and_honors_an_explicit_budget() {
-    for timeout in [None, Some(std::time::Duration::from_secs(5))] {
-        let fake = Arc::new(Fake {
-            timeout,
-            delay: Some(std::time::Duration::from_secs(600)),
-            ..Default::default()
-        });
-        let app = app(fake.clone()).await;
-        let response = tokio::spawn(app.oneshot(request(body())));
-        fake.started.notified().await;
-        tokio::time::pause();
-        let response = response.await.unwrap().unwrap();
-        tokio::time::resume();
-        assert_eq!(
-            response.status(),
-            if timeout.is_some() {
-                StatusCode::GATEWAY_TIMEOUT
-            } else {
-                StatusCode::OK
-            }
-        );
-        assert_eq!(
-            response.headers()[hellas_rpc::provenance::COMMITMENT_KEY],
-            "ab".repeat(32)
-        );
-    }
 }
 
 #[tokio::test]

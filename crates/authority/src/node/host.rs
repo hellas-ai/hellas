@@ -1,4 +1,4 @@
-//! The first checked host read and Work setting. No transport or owner shortcuts.
+//! Checked host operations and trusted in-process startup configuration.
 use super::*;
 use crate::model::grant::budget::{BudgetNode, Limit};
 use crate::operations::Operation;
@@ -7,10 +7,9 @@ use hellas_auth::hash_tuple;
 use std::num::NonZeroU16;
 
 pub const HOST_STATUS: &str = "host.status";
-pub const HOST_PROVIDER_CONFIGURE: &str = "host.provider.configure";
+pub const HOST_CONFIGURE: &str = "host.configure";
+pub const HOST_CANCEL_JOB: &str = "host.job.cancel";
 pub const HOST_PROVIDER_BIND: &str = "host.provider.bind";
-pub const HOST_GATEWAY_CONFIGURE: &str = "host.gateway.configure";
-pub const HOST_GATEWAY_ACCESS: &str = "host.gateway.access";
 pub use hellas_auth::authority::GATEWAY_INVOKE;
 
 pub fn host_resource(authority: AuthorityId) -> ResourceId {
@@ -47,6 +46,126 @@ pub struct NodeStatus {
 }
 
 impl NodeCoordinator {
+    /// Trusted in-process restart data; the public watch returns its redacted document.
+    pub async fn configuration(
+        &self,
+    ) -> Result<Option<crate::model::grant::configuration::ConfigurationDocument>, NodeStoreError>
+    {
+        let (store, _) = self.lock().await?;
+        Ok(store.state().configuration().cloned())
+    }
+
+    /// Trusted restart view of the authority terms already committed with the document.
+    pub async fn resource_configuration(
+        &self,
+    ) -> Result<crate::model::grant::configuration::NodeConfiguration, NodeStoreError> {
+        use crate::model::grant::configuration::{ConfiguredBudget, NodeConfiguration};
+        let (store, _) = self.lock().await?;
+        let state = store.state();
+        let budget = |node: BudgetNode| -> Result<Option<ConfiguredBudget>, NodeStoreError> {
+            state
+                .ledger()
+                .node(node.key())
+                .map(|node| {
+                    let spec = node.spec();
+                    Ok(ConfiguredBudget {
+                        limits: crate::work_store::grant::ledger::limits(spec).to_vec(),
+                        max_in_flight: NonZeroU16::new(
+                            crate::work_store::grant::ledger::concurrent(spec),
+                        )
+                        .ok_or(NodeStoreError::Malformed)?,
+                    })
+                })
+                .transpose()
+        };
+        let resources: Vec<_> = state.catalogue().cloned().collect();
+        let accounts = resources
+            .iter()
+            .map(|policy| {
+                Ok((
+                    policy.account,
+                    budget(BudgetNode::Account(policy.account))?
+                        .ok_or(NodeStoreError::Malformed)?,
+                ))
+            })
+            .collect::<Result<_, NodeStoreError>>()?;
+        Ok(NodeConfiguration::new(
+            budget(BudgetNode::Machine)?,
+            accounts,
+            resources,
+        )?)
+    }
+
+    /// Apply trusted process startup options before exposing control transports.
+    /// Remote callers must use `configure`, which requires permission and step-up.
+    pub async fn configure_startup(
+        &self,
+        document: crate::model::grant::configuration::ConfigurationDocument,
+        configuration: &crate::model::grant::configuration::NodeConfiguration,
+    ) -> Result<(), NodeStoreError> {
+        let _changed = ChangeNotification(self.changed.clone());
+        let (mut store, now) = self.lock().await?;
+        store
+            .configure(
+                document.revision,
+                document.document,
+                document.secrets,
+                configuration,
+                now,
+            )
+            .await
+    }
+
+    /// Reject unauthorized candidates before any runtime preparation.
+    pub async fn authorize_configure(
+        &self,
+        caller: &AuthenticatedCaller,
+        authorization: GrantId,
+    ) -> Result<(), NodeStoreError> {
+        self.checked(caller, authorization, HOST_CONFIGURE, async |store, now| {
+            let authority = store.state().authority();
+            authority.authorize_caller(
+                caller,
+                authorization,
+                &Operation::named(HOST_CONFIGURE)?.permission(authority.authority(), None)?,
+                now,
+            )?;
+            caller.session().step_up().map_err(Into::into)
+        })
+        .await
+    }
+
+    /// The whole daemon change has one authority check and one durable frame.
+    pub async fn configure(
+        &self,
+        caller: &AuthenticatedCaller,
+        authorization: GrantId,
+        document: crate::model::grant::configuration::ConfigurationDocument,
+        configuration: &crate::model::grant::configuration::NodeConfiguration,
+    ) -> Result<(), NodeStoreError> {
+        let _changed = ChangeNotification(self.changed.clone());
+        self.checked(caller, authorization, HOST_CONFIGURE, async |store, now| {
+            let authority = store.state().authority();
+            authority.authorize_caller(
+                caller,
+                authorization,
+                &Operation::named(HOST_CONFIGURE)?.permission(authority.authority(), None)?,
+                now,
+            )?;
+            caller.session().step_up()?;
+            store
+                .configure(
+                    document.revision,
+                    document.document,
+                    document.secrets,
+                    configuration,
+                    now,
+                )
+                .await
+        })
+        .await
+    }
+
     /// HTTP admission accepts only a bearer credential restricted to this
     /// operation. An administrator credential must never become an HTTP bearer.
     pub async fn authorize_gateway(
@@ -148,10 +267,7 @@ impl NodeCoordinator {
         operation: &'static str,
         action: impl FnOnce(NodeStatus) -> T,
     ) -> Result<T, NodeStoreError> {
-        if !matches!(
-            operation,
-            HOST_STATUS | HOST_PROVIDER_CONFIGURE | HOST_GATEWAY_CONFIGURE | HOST_GATEWAY_ACCESS
-        ) {
+        if !matches!(operation, HOST_STATUS | HOST_CANCEL_JOB) {
             return Err(AuthorityError::Denied.into());
         }
         self.checked(caller, authorization, operation, async |store, now| {

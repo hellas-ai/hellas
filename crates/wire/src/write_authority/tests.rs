@@ -235,3 +235,43 @@ async fn mux_revocation_wakes_credit_waiters_and_drops_their_queued_body() {
         crate::WireCode::PermissionDenied
     );
 }
+
+#[cfg(all(feature = "mux", not(target_family = "wasm")))]
+#[tokio::test]
+async fn mux_delivers_a_public_terminal_refusal_after_authority_ends() {
+    use crate::framed::LengthDelimitedMessagePipe;
+    use crate::mux::{MessagePipe, MuxConfig, MuxTransport, Role, decode_keyed_frame};
+    use crate::{SendHalf, Stream, StreamTransport};
+    let (local, remote) = tokio::io::duplex(512);
+    let transport = MuxTransport::spawn::<8, _, _>(
+        Role::Client,
+        crate::DefaultClock,
+        MuxConfig {
+            stream_window: 1024,
+        },
+        LengthDelimitedMessagePipe::new(local, 512).unwrap(),
+        Default::default(),
+    );
+    let mut remote = LengthDelimitedMessagePipe::new(remote, 512).unwrap();
+    let stream = transport.open(7, Default::default()).await.unwrap();
+    remote.recv_message().await.unwrap().unwrap();
+    let (mut send, _recv) = stream.split();
+    let gate = Gate::default();
+    send.set_write_authority(gate.authority()).unwrap();
+    send.send_body(bytes::Bytes::from_static(b"accepted"))
+        .await
+        .unwrap();
+    remote.recv_message().await.unwrap().unwrap();
+    gate.revoke();
+    send.refuse(bytes::Bytes::from_static(b"refused"))
+        .await
+        .unwrap();
+    let body = remote.recv_message().await.unwrap().unwrap();
+    assert!(
+        matches!(decode_keyed_frame(&body).unwrap().frame, crate::Frame::Body(bytes) if bytes == "refused")
+    );
+    let end = remote.recv_message().await.unwrap().unwrap();
+    assert!(
+        matches!(decode_keyed_frame(&end).unwrap().frame, crate::Frame::End(end) if end.trailer.status == crate::WireCode::Ok && end.trailer.message.is_empty() && end.trailer.metadata.is_empty())
+    );
+}

@@ -31,7 +31,14 @@ async fn signed_model_and_settings_limits_reject_before_client_signing_and_provi
         wrong_price.pricing_revision = revision;
         assert_err!(
             client
-                .propose(&offer, wrong_price, &valid_input, &principal(1).1, now)
+                .propose(
+                    &offer,
+                    wrong_price,
+                    &valid_input,
+                    &principal(1).1,
+                    now,
+                    None
+                )
                 .await,
             NodeStoreError::Grant(GrantError::OutOfScope)
         );
@@ -68,7 +75,7 @@ async fn signed_model_and_settings_limits_reject_before_client_signing_and_provi
         a.input_content = hellas_rpc::ContentRef::for_bytes(&input.canonical_bytes().unwrap());
         a.prepared_input_digest = hellas_channel::job::bound_prepared_input_digest(network(), a.channel_id.0, &input).unwrap();
         a.request_commitment = input.request.commitment().unwrap();
-        assert_err!(client.propose(&offer, a, &input, &principal(1).1, now).await, NodeStoreError::Resource(error) if error == expected);
+        assert_err!(client.propose(&offer, a, &input, &principal(1).1, now, None).await, NodeStoreError::Resource(error) if error == expected);
         assert_eq!(client.next_nonce().unwrap(), 1);
         assert!(client.book().pending_proposal().is_none());
         let signature = principal(1).1.sign_digest(grant_work_id(network(), &a)).unwrap();
@@ -77,7 +84,7 @@ async fn signed_model_and_settings_limits_reject_before_client_signing_and_provi
         assert_eq!(store.state(), &original);
     }
     let signature = client
-        .propose(&offer, template, &valid_input, &principal(1).1, now)
+        .propose(&offer, template, &valid_input, &principal(1).1, now, None)
         .await
         .unwrap();
     accept(
@@ -99,6 +106,7 @@ async fn signed_model_and_settings_limits_reject_before_client_signing_and_provi
     let mut changed = policy();
     changed.revision.0 += 1;
     changed.responses.as_mut().unwrap().max_output_tokens = 4;
+    changed.config_change = ConfigChange::Release;
     store
         .configure_resource(changed.clone(), now)
         .await
@@ -339,7 +347,7 @@ async fn same_work_policy_uses_the_selected_resources_https_bounds() {
         .unwrap();
 }
 
-async fn rename_resource(node: &mut TestNode) -> GrantPolicy {
+async fn rename_resource(node: &mut TestNode, config_change: ConfigChange) -> GrantPolicy {
     let mut changed = node
         .store
         .state()
@@ -348,6 +356,7 @@ async fn rename_resource(node: &mut TestNode) -> GrantPolicy {
         .clone();
     changed.revision.0 += 1;
     changed.name = "renamed".into();
+    changed.config_change = config_change;
     node.store
         .configure_resource(changed.clone(), node.clock.now())
         .await
@@ -365,7 +374,7 @@ async fn resource_revision_releases_queued_work() {
         .await
         .unwrap();
 
-    rename_resource(&mut node).await;
+    rename_resource(&mut node, ConfigChange::Release).await;
 
     assert_eq!(
         node.store
@@ -404,7 +413,7 @@ async fn resource_revision_releases_queued_work() {
 async fn a_resource_revision_cannot_be_reused() {
     let directory = tempfile::tempdir().unwrap();
     let mut node = work_node(directory.path()).build().await;
-    let changed = rename_resource(&mut node).await;
+    let changed = rename_resource(&mut node, ConfigChange::Release).await;
     let expected = changed.revision;
     let before = node.snapshot();
     assert_err!(node.store.configure_resource(changed, node.clock.now()).await,
@@ -439,7 +448,7 @@ async fn checkpoints_bind_every_policy_copy_to_its_account() {
     node.dispatch(FRIEND, ids::FRIEND_GRANT, &request)
         .await
         .unwrap();
-    let changed = rename_resource(&mut node).await;
+    let changed = rename_resource(&mut node, ConfigChange::Release).await;
     let mut terms = node.store.state().grant(ids::ALLOWANCE).unwrap().clone();
     terms.revision.0 += 1;
     terms.policies = vec![changed];
@@ -465,3 +474,50 @@ async fn checkpoints_bind_every_policy_copy_to_its_account() {
 }
 
 use hellas_channel::test_support::test_responses_contract;
+
+#[tokio::test]
+async fn keep_retains_accepted_terms_but_refuses_stale_new_proposals() {
+    use {crate::test_support::ids, hellas_channel::test_support::actors::FRIEND};
+    let directory = tempfile::tempdir().unwrap();
+    let mut node = work_node(directory.path()).build().await;
+    let queued = node.proposal(FRIEND, ids::ALLOWANCE, 1);
+    node.accept(FRIEND, ids::FRIEND_GRANT, &queued)
+        .await
+        .unwrap();
+    let accepted = node
+        .store
+        .state()
+        .policy_for(&queued.authorization)
+        .unwrap()
+        .clone();
+    assert_eq!(accepted.config_change, ConfigChange::Keep);
+    rename_resource(&mut node, ConfigChange::Keep).await;
+    assert_eq!(
+        node.store
+            .state()
+            .policy_for(&queued.authorization)
+            .unwrap(),
+        &accepted
+    );
+    node.dispatch(FRIEND, ids::FRIEND_GRANT, &queued)
+        .await
+        .unwrap();
+    let stale = node.proposal(FRIEND, ids::ALLOWANCE, 2);
+    assert_err!(
+        node.accept(FRIEND, ids::FRIEND_GRANT, &stale).await,
+        NodeStoreError::Grant(GrantError::OutOfScope)
+    );
+    node.store.rotate().await.unwrap();
+    let node = node.reopen().await;
+    node.store
+        .state()
+        .check_resource(&queued.authorization)
+        .unwrap();
+    assert_eq!(
+        node.store
+            .state()
+            .policy_for(&queued.authorization)
+            .unwrap(),
+        &accepted
+    );
+}

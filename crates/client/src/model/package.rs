@@ -25,7 +25,8 @@ pub struct ModelPackage {
 }
 
 /// What a model path serves, from its layout alone.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ModelKind {
     /// A Qwen GGUF file.
     Text,
@@ -82,6 +83,44 @@ impl ModelPackage {
     /// A Qwen GGUF, or a converted Whisper or Flux package directory, rendering
     /// programs with the renderer registered under `evaluator`.
     pub async fn open(path: &Path, evaluator: &str) -> Result<Self> {
+        Self::open_with_weights(path, evaluator, None).await
+    }
+
+    /// Open each distinct renderer once, sharing the one weight-file digest.
+    pub async fn open_many(
+        path: &Path,
+        evaluators: impl IntoIterator<Item = String>,
+    ) -> Result<std::collections::BTreeMap<String, Arc<Self>>> {
+        let evaluators: std::collections::BTreeSet<_> = evaluators.into_iter().collect();
+        for evaluator in &evaluators {
+            super::renderer(evaluator)?;
+        }
+        let weights = match ModelKind::of(path) {
+            ModelKind::Text => Some(path.to_owned()),
+            ModelKind::Transcription => Some(path.join(super::whisper::WEIGHTS_FILE)),
+            ModelKind::Image => None,
+        };
+        let weights = match weights {
+            Some(path) => Some(
+                tokio::task::spawn_blocking(move || hellas_store::content::file_content(&path))
+                    .await??,
+            ),
+            None => None,
+        };
+        let mut packages = std::collections::BTreeMap::new();
+        for evaluator in evaluators {
+            let package = Self::open_with_weights(path, &evaluator, weights).await?;
+            packages.insert(evaluator, Arc::new(package));
+        }
+        Ok(packages)
+    }
+
+    /// Load a renderer using weights already inspected by the content store.
+    pub async fn open_with_weights(
+        path: &Path,
+        evaluator: &str,
+        weights: Option<hellas_rpc::ContentRef>,
+    ) -> Result<Self> {
         let dialect = super::renderer(evaluator)?;
         Ok(Self {
             evaluator: evaluator.into(),
@@ -91,9 +130,11 @@ impl ModelPackage {
                     tokio::task::spawn_blocking(move || Flux::open(&path, dialect)).await??
                 })),
                 ModelKind::Transcription => {
-                    Family::Whisper(Arc::new(Whisper::open(path, dialect).await?))
+                    Family::Whisper(Arc::new(Whisper::open(path, dialect, weights).await?))
                 }
-                ModelKind::Text => Family::Qwen3(Arc::new(Qwen3::open(path, dialect).await?)),
+                ModelKind::Text => {
+                    Family::Qwen3(Arc::new(Qwen3::open(path, dialect, weights).await?))
+                }
             },
         })
     }

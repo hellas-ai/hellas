@@ -110,8 +110,17 @@ async fn checked_services_audit_reads_and_final_refusals_without_request_content
         .unwrap();
     let before = node.status(&admin.caller, root).await.unwrap();
     assert_err!(
-        node.host_action(&caller, root, crate::node::HOST_PROVIDER_CONFIGURE, |_| ())
-            .await,
+        node.configure(
+            &caller,
+            root,
+            crate::model::grant::configuration::ConfigurationDocument {
+                revision: hellas_auth::authority::Revision(0),
+                document: "{}".into(),
+                secrets: Default::default()
+            },
+            &Default::default()
+        )
+        .await,
         crate::work_store::grant::NodeStoreError::Authority(AuthorityError::Denied)
     );
     assert_err!(
@@ -135,7 +144,7 @@ async fn checked_services_audit_reads_and_final_refusals_without_request_content
     );
     assert_eq!(node.status(&admin.caller, root).await.unwrap(), before);
     for action in [
-        crate::node::HOST_PROVIDER_CONFIGURE,
+        crate::node::HOST_CONFIGURE,
         crate::work_store::grant::WORK_BUDGET_CONFIGURE,
     ] {
         let event = events.last(action, "denied");

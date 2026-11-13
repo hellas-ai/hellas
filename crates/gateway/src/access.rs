@@ -6,8 +6,6 @@ use hellas_auth::authority::{CredentialId, CredentialSecret, GrantId};
 use hellas_authority::node::NodeCoordinator;
 use std::{
     fmt,
-    io::Write,
-    net::SocketAddr,
     sync::Arc,
     task::{Context, Poll},
 };
@@ -38,8 +36,9 @@ impl GatewayAccess {
         Ok(access)
     }
 
-    pub fn shares_writer(&self, node: &NodeCoordinator) -> bool {
-        self.node.shares_writer(node)
+    #[cfg(test)]
+    pub(crate) fn node(&self) -> NodeCoordinator {
+        self.node.clone()
     }
 
     /// The gateway's own credential, under its configured grant.
@@ -51,22 +50,6 @@ impl GatewayAccess {
             .map_err(Into::into)
     }
 
-    async fn authenticate(
-        &self,
-        credential: &CredentialSecret,
-    ) -> Result<(), hellas_authority::work_store::grant::NodeStoreError> {
-        let caller = self.node.authenticate(credential).await?;
-        if self
-            .node
-            .authorize_gateway(&caller, self.authorization)
-            .await
-            .is_ok()
-        {
-            return Ok(());
-        }
-        self.node.authorize_gateway_bearer(&caller).await.map(drop)
-    }
-
     /// Secret material for an explicitly authorized control response or child.
     pub fn bearer(&self) -> String {
         format!(
@@ -75,55 +58,39 @@ impl GatewayAccess {
             hellas_rpc::provenance::encode_hex(self.credential.expose_secret())
         )
     }
+}
 
-    pub(crate) fn announce(&self) {
-        let terminal = if cfg!(windows) { "CONOUT$" } else { "/dev/tty" };
-        // Never fall back to stdout/stderr, which are routinely captured.
-        match std::fs::OpenOptions::new().write(true).open(terminal) {
-            Ok(mut tty) => {
-                if let Err(error) = writeln!(
-                    tty,
-                    "gateway bearer: Authorization: Bearer {}",
-                    self.bearer()
-                ) {
-                    warn!(%error, "gateway credential could not be written to the controlling terminal");
-                }
-            }
-            Err(error) => warn!(%error, "gateway credential not shown: no controlling terminal"),
-        }
+async fn authorizes(node: &NodeCoordinator, headers: &HeaderMap) -> Option<crate::jobs::Origin> {
+    let mut values = headers.get_all(header::AUTHORIZATION).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
     }
-
-    async fn authorizes(&self, headers: &HeaderMap) -> bool {
-        let mut values = headers.get_all(header::AUTHORIZATION).iter();
-        let Some(value) = values.next() else {
-            return false;
-        };
-        if values.next().is_some() {
-            return false;
-        }
-        let value = value.as_bytes();
-        let Some((scheme, text)) = value.split_at_checked(7) else {
-            return false;
-        };
-        if !scheme.eq_ignore_ascii_case(b"bearer ") {
-            return false;
-        }
-        let Ok(text) = std::str::from_utf8(text) else {
-            return false;
-        };
-        let Ok(bytes) = hellas_auth::hex::parse_lower::<48>(text) else {
-            return false;
-        };
-        let Ok(id) = CredentialId::try_from(&bytes[..16]) else {
-            return false;
-        };
-        let Ok(secret) = bytes[16..].try_into() else {
-            return false;
-        };
-        self.authenticate(&CredentialSecret::from_parts(id, secret))
-            .await
-            .is_ok()
+    let value = value.as_bytes();
+    let (scheme, text) = value.split_at_checked(7)?;
+    if !scheme.eq_ignore_ascii_case(b"bearer ") {
+        return None;
     }
+    let Ok(text) = std::str::from_utf8(text) else {
+        return None;
+    };
+    let Ok(bytes) = hellas_auth::hex::parse_lower::<48>(text) else {
+        return None;
+    };
+    let Ok(id) = CredentialId::try_from(&bytes[..16]) else {
+        return None;
+    };
+    let Ok(secret) = bytes[16..].try_into() else {
+        return None;
+    };
+    let caller = node
+        .authenticate(&CredentialSecret::from_parts(id, secret))
+        .await
+        .ok()?;
+    node.authorize_gateway_bearer(&caller).await.ok()?;
+    Some(crate::jobs::Origin::Http {
+        credential: id.to_string(),
+    })
 }
 impl fmt::Debug for GatewayAccess {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -133,11 +100,11 @@ impl fmt::Debug for GatewayAccess {
 
 #[derive(Clone)]
 pub(crate) struct BearerLayer {
-    access: GatewayAccess,
+    node: NodeCoordinator,
 }
 impl BearerLayer {
-    pub(crate) fn new(access: GatewayAccess) -> Self {
-        Self { access }
+    pub(crate) fn new(node: NodeCoordinator) -> Self {
+        Self { node }
     }
 }
 impl<S> Layer<S> for BearerLayer {
@@ -145,14 +112,14 @@ impl<S> Layer<S> for BearerLayer {
     fn layer(&self, inner: S) -> Self::Service {
         BearerService {
             inner,
-            access: self.access.clone(),
+            node: self.node.clone(),
         }
     }
 }
 #[derive(Clone)]
 pub(crate) struct BearerService<S> {
     inner: S,
-    access: GatewayAccess,
+    node: NodeCoordinator,
 }
 impl<S, B> Service<Request<B>> for BearerService<S>
 where
@@ -167,13 +134,14 @@ where
         self.inner.poll_ready(cx)
     }
     fn call(&mut self, mut request: Request<B>) -> Self::Future {
-        let access = self.access.clone();
+        let node = self.node.clone();
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
         Box::pin(async move {
-            if !access.authorizes(request.headers()).await {
+            let Some(origin) = authorizes(&node, request.headers()).await else {
                 return Ok(unauthorized(request.uri().path()));
-            }
+            };
+            request.extensions_mut().insert(origin);
             // This credential belongs to local HTTP admission, never upstream.
             request.headers_mut().remove(header::AUTHORIZATION);
             inner.call(request).await
@@ -191,31 +159,6 @@ fn unauthorized(path: &str) -> Response<Body> {
         header::HeaderValue::from_static("Bearer"),
     );
     response
-}
-
-pub(crate) async fn bind_addr(
-    host: &str,
-    port: u16,
-    allow_remote: bool,
-) -> crate::GatewayResult<SocketAddr> {
-    let resolved: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|source| crate::GatewayError::Resolve {
-            host: host.into(),
-            port,
-            source,
-        })?
-        .collect();
-    let Some(first) = resolved.first().copied() else {
-        return Err(crate::GatewayError::NoAddress {
-            host: host.into(),
-            port,
-        });
-    };
-    if !(allow_remote || resolved.iter().all(|addr| addr.ip().is_loopback())) {
-        return Err(crate::GatewayConfigError::RemoteBinding.into());
-    }
-    Ok(first)
 }
 
 #[cfg(test)]

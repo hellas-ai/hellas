@@ -216,9 +216,11 @@ impl CountingBackend {
 impl WorkBackend for CountingBackend {
     fn try_admit(
         &self,
-        domain: hellas_channel::work::admission::CapacityDomain,
+        backend: &hellas_channel::work::admission::BackendKey,
+        _caller: hellas_auth::PublicKey,
     ) -> Result<hellas_channel::work::admission::WorkPermit, hellas_channel::work::BackendFault>
     {
+        let domain = backend.domain();
         Err(hellas_channel::work::admission::AdmissionError::Unsupported(domain).into())
     }
 
@@ -305,8 +307,10 @@ async fn admitted_progress_sees_only_the_signed_output_prefix() {
     impl WorkBackend for EveryEvent {
         fn try_admit(
             &self,
-            domain: hellas_channel::work::admission::CapacityDomain,
+            backend: &hellas_channel::work::admission::BackendKey,
+            _caller: hellas_auth::PublicKey,
         ) -> Result<hellas_channel::work::admission::WorkPermit, BackendFault> {
+            let domain = backend.domain();
             Err(hellas_channel::work::admission::AdmissionError::Unsupported(domain).into())
         }
         async fn execute_stream(
@@ -339,7 +343,11 @@ async fn admitted_progress_sees_only_the_signed_output_prefix() {
             bundle(1),
             &work_policy(),
             hellas_channel::test_support::channel::program_content().await,
-            WorkAdmission::payment(),
+            WorkAdmission::payment(
+                hellas_auth::ProducerSigningKey::from_secret_bytes([1; 32])
+                    .unwrap()
+                    .public_key(),
+            ),
             progress,
         )
         .await
@@ -364,7 +372,7 @@ async fn one_accepted_job_reaches_the_backend_once() {
         let id = accept(&mut store, 1).await;
         let service = serving(store);
 
-        let outcome = run_accepted_work(&service, &ready(), &backend, id).await;
+        let outcome = run_accepted_work(&service, &ready(), &backend, id, None).await;
         let RunOutcome::Completed { result, signature } = expect_outcome(outcome) else {
             panic!("the first run invokes and completes");
         };
@@ -372,7 +380,7 @@ async fn one_accepted_job_reaches_the_backend_once() {
         assert_eq!(result.work_id, id);
 
         // The retry: the same answer, and no second invocation.
-        let again = expect_outcome(run_accepted_work(&service, &ready(), &backend, id).await);
+        let again = expect_outcome(run_accepted_work(&service, &ready(), &backend, id, None).await);
         assert_eq!(
             again,
             RunOutcome::Ready { result, signature },
@@ -385,7 +393,7 @@ async fn one_accepted_job_reaches_the_backend_once() {
 
     // Replay in a new endpoint over the same files.
     let service = serving(store_at(dir.path(), CURSOR).await);
-    let recovered = expect_outcome(run_accepted_work(&service, &ready(), &backend, id).await);
+    let recovered = expect_outcome(run_accepted_work(&service, &ready(), &backend, id, None).await);
     assert!(
         matches!(recovered, RunOutcome::Ready { .. }),
         "unexpected outcome: {recovered:?}",
@@ -408,7 +416,7 @@ async fn a_result_is_on_the_disk_before_its_signature_is_returned() {
 
     let RunOutcome::Completed {
         result, signature, ..
-    } = expect_outcome(run_accepted_work(&service, &ready(), &backend, id).await)
+    } = expect_outcome(run_accepted_work(&service, &ready(), &backend, id, None).await)
     else {
         panic!("the run completes");
     };
@@ -453,7 +461,7 @@ async fn a_marker_a_process_did_not_come_back_from_is_indeterminate() {
     };
 
     let service = serving(store_at(dir.path(), CURSOR).await);
-    let outcome = expect_outcome(run_accepted_work(&service, &ready(), &backend, id).await);
+    let outcome = expect_outcome(run_accepted_work(&service, &ready(), &backend, id, None).await);
     assert_eq!(outcome, RunOutcome::Indeterminate);
     assert_eq!(backend.calls(), 0, "recovery never invokes");
     assert_eq!(
@@ -537,7 +545,7 @@ async fn a_restart_runs_the_job_that_was_accepted() {
     let service = serving(store_at(dir.path(), CURSOR).await);
     let backend = CountingBackend::new(Answer::Transcript);
     let RunOutcome::Completed { result, .. } =
-        expect_outcome(run_accepted_work(&service, &ready(), &backend, id).await)
+        expect_outcome(run_accepted_work(&service, &ready(), &backend, id, None).await)
     else {
         panic!("the accepted job runs after a restart");
     };
@@ -565,7 +573,7 @@ async fn the_last_height_the_margins_fit_is_the_last_that_may_run() {
         advance(&mut store, height).await;
         let service = serving(store);
         let backend = CountingBackend::new(Answer::Transcript);
-        let outcome = run_accepted_work(&service, &ready_at(height), &backend, id).await;
+        let outcome = run_accepted_work(&service, &ready_at(height), &backend, id, None).await;
 
         if may_run {
             assert!(
@@ -610,7 +618,7 @@ async fn a_job_that_was_never_co_signed_does_not_run() {
     let service = serving(store);
     let backend = CountingBackend::new(Answer::Transcript);
 
-    let outcome = run_accepted_work(&service, &ready(), &backend, id).await;
+    let outcome = run_accepted_work(&service, &ready(), &backend, id, None).await;
     assert!(
         matches!(
             outcome,
@@ -646,7 +654,7 @@ async fn a_job_that_was_never_co_signed_does_not_run() {
     let service = serving(store);
     assert!(
         matches!(
-            run_accepted_work(&service, &ready(), &backend, id).await,
+            run_accepted_work(&service, &ready(), &backend, id, None).await,
             Ok(RunOutcome::Completed { .. })
         ),
         "the same job co-signed runs",
@@ -664,7 +672,7 @@ async fn a_run_named_for_another_job_finds_nothing() {
 
     let other = work_id(ready().channel(), &authorization(2));
     assert_ne!(other, id);
-    let outcome = run_accepted_work(&service, &ready(), &backend, other).await;
+    let outcome = run_accepted_work(&service, &ready(), &backend, other, None).await;
     assert!(
         matches!(outcome, Err(RunError::NoSuchJob)),
         "unexpected outcome: {outcome:?}",
@@ -711,7 +719,7 @@ async fn a_backend_fault_is_not_the_clients_debt() {
     let service = serving(store);
     let backend = CountingBackend::new(Answer::Fault("the weights did not load"));
 
-    let outcome = run_accepted_work(&service, &ready(), &backend, id).await;
+    let outcome = run_accepted_work(&service, &ready(), &backend, id, None).await;
     let Err(RunError::Backend(fault)) = outcome else {
         panic!("unexpected outcome: {outcome:?}");
     };
@@ -747,7 +755,7 @@ async fn a_backend_that_answers_the_wrong_question_signs_nothing() {
         let service = serving(store);
         let backend = CountingBackend::new(answer);
 
-        let outcome = run_accepted_work(&service, &ready(), &backend, id).await;
+        let outcome = run_accepted_work(&service, &ready(), &backend, id, None).await;
         assert!(
             matches!(outcome, Err(RunError::Transcript(_))),
             "unexpected outcome: {outcome:?}",

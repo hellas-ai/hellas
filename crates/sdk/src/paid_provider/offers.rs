@@ -26,36 +26,38 @@ use std::collections::BTreeSet;
 /// The chain an offer allocator reads: dialled when first needed and kept
 /// while it answers.
 pub(super) struct OfferChain {
-    config: crate::work_config::WorkConfig,
-    client: tokio::sync::Mutex<Option<RemoteLightClient>>,
+    client: tokio::sync::Mutex<(
+        tokio::sync::watch::Receiver<WorkSettings>,
+        Option<RemoteLightClient>,
+    )>,
 }
 
 impl OfferChain {
-    pub(super) fn new(config: crate::work_config::WorkConfig) -> Self {
+    pub(super) fn new(settings: tokio::sync::watch::Receiver<WorkSettings>) -> Self {
         Self {
-            config,
-            client: tokio::sync::Mutex::new(None),
+            client: tokio::sync::Mutex::new((settings, None)),
         }
     }
 
     async fn client(&self) -> Result<RemoteLightClient, hellas_chain::QueryError> {
         let mut held = self.client.lock().await;
-        if let Some(client) = held.as_ref() {
+        if held.0.has_changed().unwrap_or(false) {
+            held.1 = None;
+        }
+        let config = held.0.borrow_and_update().chain.clone();
+        if let Some(client) = held.1.as_ref() {
             return Ok(client.clone());
         }
-        let client = crate::client_chain::connect_at(
-            &self.config,
-            hellas_channel::work::MAX_CERTIFIED_AGE,
-            0,
-        )
-        .await?;
-        *held = Some(client.clone());
+        let client =
+            crate::client_chain::connect_at(&config, hellas_channel::work::MAX_CERTIFIED_AGE, 0)
+                .await?;
+        held.1 = Some(client.clone());
         Ok(client)
     }
 
     /// Drops a client whose read failed, so the next offer dials afresh.
     async fn forget(&self) {
-        self.client.lock().await.take();
+        self.client.lock().await.1.take();
     }
 }
 
@@ -65,7 +67,7 @@ pub(super) struct OfferAllocator {
     pub chain: OfferChain,
     pub authority: hellas_authority::node::NodeCoordinator,
     pub provider: hellas_rpc::ProviderEnrollmentBundle,
-    pub addresses: Vec<String>,
+    pub settings: tokio::sync::watch::Receiver<WorkSettings>,
     pub registry: Arc<tokio::sync::Mutex<BTreeMap<EdgeId, SetupService>>>,
     pub adopt: tokio::sync::mpsc::Sender<SetupClock>,
     pub mount: MountedSetup,
@@ -432,6 +434,7 @@ impl OfferAllocator {
             .checked_add(current.policy.offers.bond_lifetime_blocks)
             .ok_or_else(invalid)?;
         let adoption = self.adopt.try_reserve().map_err(unavailable)?;
+        let addresses = self.settings.borrow().addresses.clone();
         let provisioned = provision_offer(
             ProvisionOptions {
                 network: self.config.network(),
@@ -445,7 +448,7 @@ impl OfferAllocator {
                 ),
                 settlement_key: self.config.settlement_key.clone(),
                 provider: self.provider.clone(),
-                addresses: self.addresses.clone(),
+                addresses,
                 client_principal: hellas_auth::authority::PrincipalId::from_public_key(
                     hellas_auth::PublicKey::P256(principal),
                 )
@@ -472,11 +475,9 @@ impl OfferAllocator {
         )
         .await
         .map_err(unavailable)?;
-        let clock = WorkRunner::adopt_setup(&self.config, store, mount).map_err(unavailable)?;
-        let Driven::Setup { service, .. } = &clock.driven else {
-            unreachable!()
-        };
-        registry.insert(provisioned.bond_edge, service.clone());
+        let (clock, service, _) =
+            WorkRunner::adopt_setup(&self.config, store, mount).map_err(unavailable)?;
+        registry.insert(provisioned.bond_edge, service);
         adoption.send(clock);
         if self.adopt.is_closed() {
             return Err(unavailable("paid observer stopped"));

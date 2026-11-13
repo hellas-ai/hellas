@@ -235,13 +235,13 @@ hellas convert-flux black-forest-labs/FLUX.2-klein-4B@COMMIT -o klein
 The converter validates the checkpoint and creates three ordinary provider
 assets (`text.bin`, `denoise.bin`, `vae.bin`), plus client metadata and a
 tokenizer. Text norms and VAE weights use F32; other weights use BF16, matching
-catena-models. A provider serves the package with `serve --content klein`, or
-through Jobs pins in a `--content-config` file; see the
+catena-models. A provider adds the package with `route add /absolute/path/klein`, or
+uses Jobs pins in its content store; see the
 [content store guide](../crates/store/README.md). An image program depends on
 each request's size and steps, so `hellas program` prints no manifest for it: a
 provider admits image jobs only through paid terms or grants that admit those
-exact programs, or that admit any program and are served with
-`--knowingly-unsafe`.
+exact programs, or explicitly admit arbitrary programs. Sharing the latter
+requires `share --knowingly-unsafe`.
 The client needs the package's JSON files; it does not upload the weights.
 For 512×512 images, the provider must admit a 3 MiB output; allow 2 MiB of
 uploads for the program, token IDs and noise. Set its execution budget for
@@ -317,10 +317,11 @@ selects the trusted adaptor, fixed official endpoint, no-redirect HTTP driver,
 and response projector as one unit. A configuration cannot supply a URL or
 claim a different adaptor identity.
 
-A provider route file contains a `routes` array. Each route has `service`,
-`method`, `destination` and optional `capabilities` (model and output limits).
-The former `callers` field is rejected; the mounted Work channel authorizes jobs.
-Use `serve --fetch-config FILE --paid-work-config FILE` to sell it.
+A provider's daemon document contains Fetch backend entries with a service,
+method, upstream and write-only credentials. `backend add` and `route add`
+create OpenAI-compatible HTTP entries; embedding applications can also select
+a sealed Responses backend. Work authorization comes from the mounted grant
+or paid channel. There is no separate Fetch configuration file.
 See [paid Work](../crates/channel/README.md) for channel configuration and
 [HTTPS Fetch](../crates/providers/HTTPS.md) for provider credentials and egress.
 

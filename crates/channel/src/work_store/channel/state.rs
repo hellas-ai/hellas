@@ -1723,7 +1723,7 @@ impl Channel<PaymentFunding> {
     /// Reserves this job's price against the payment edge's funded
     /// capacity. A payment moves an open job's reservation into the
     /// credited total; an expiry releases it.
-    fn check_capacity(&self, price: u64) -> Result<(), ChannelStateError> {
+    pub(crate) fn check_capacity(&self, price: u64) -> Result<(), ChannelStateError> {
         let reserved = self.reserved(|_| true);
         let used = self.ledger.credited_cumulative();
         reserve(

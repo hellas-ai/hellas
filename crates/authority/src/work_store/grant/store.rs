@@ -496,7 +496,7 @@ impl NodeStore {
         if candidate.apply(&frame, false)? == Applied::Redundant {
             return Ok(());
         }
-        let record = encode(&frame);
+        let record = encode(&frame)?;
         let open = candidate
             .channels
             .values()
@@ -505,7 +505,7 @@ impl NodeStore {
         // Every committed state must still fit a rotation after its open jobs
         // finish. Serializing the whole state to prove it would make each
         // commit O(state), so that runs only when the bound cannot.
-        let len = record.as_ref().map_or(usize::MAX, Vec::len);
+        let len = record.len();
         let bound =
             self.checkpoint_bound.admit(
                 growth(&frame, len),
@@ -532,7 +532,7 @@ impl NodeStore {
             // A rotation refused before writing leaves the reserved tail usable.
             // A failed write poisons the journal, so append still refuses that case.
         }
-        self.journal.append(&record?).await?;
+        self.journal.append(&record).await?;
         self.state = candidate;
         self.checkpoint_bound.commit(bound);
         self.refresh_executions(frame.now);

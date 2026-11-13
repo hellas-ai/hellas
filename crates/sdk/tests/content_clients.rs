@@ -1,5 +1,4 @@
 //! Native/remote client cutover through the actual generic Content upload path.
-use hellas_auth::ProducerSigningKey;
 use hellas_authority::test_support as common;
 use hellas_channel::test_support::principal;
 use hellas_rpc::protocol::invocation::{PreparedInvocation, compute};
@@ -82,12 +81,8 @@ async fn serve_work(
         .map(ToString::to_string)
         .collect();
     let router = hellas_sdk::work_router::WorkRouter::grants(f.service.clone());
-    let proof = hellas_sdk::ProviderOpen::<ProducerSigningKey>::new(
-        Arc::new(principal(2).1),
-        f.enrollment.clone(),
-        None,
-    )
-    .unwrap();
+    let proof = hellas_sdk::ProviderOpen::new(Arc::new(principal(2).1), f.enrollment.clone(), None)
+        .unwrap();
     let endpoint = server.clone();
     let serving = tokio::spawn(async move {
         let mut connections = tokio::task::JoinSet::new();

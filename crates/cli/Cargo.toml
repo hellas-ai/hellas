@@ -90,13 +90,11 @@ iroh = { workspace = true, features = ["tls-ring"] }
 iroh-metrics = { version = "1", default-features = false, features = [
     "metrics",
 ], optional = true }
-notify = "8.2"
 opentelemetry = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 opentelemetry-prometheus = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
 prometheus = { workspace = true, optional = true }
-qrcode = { version = "0.14", default-features = false }
 rand.workspace = true
 rcgen = "0.14"
 reqwest.workspace = true
@@ -104,7 +102,6 @@ serde.workspace = true
 serde_ipld_dagcbor.workspace = true
 serde_json.workspace = true
 tempfile = { workspace = true }
-thiserror.workspace = true
 tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true

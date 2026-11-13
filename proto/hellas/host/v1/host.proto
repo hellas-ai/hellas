@@ -11,11 +11,10 @@ service HostControl {
   rpc IssueCredential(IssueCredentialRequest) returns (IssueCredentialResponse);
   rpc RevokeCredential(RevokeCredentialRequest) returns (RevokeCredentialResponse);
   rpc WorkControl(WorkControlRequest) returns (WorkControlResponse);
+  rpc Configure(ConfigureRequest) returns (ConfigureResponse);
+  rpc Watch(WatchRequest) returns (stream WatchResponse);
+  rpc CancelJob(CancelJobRequest) returns (CancelJobResponse);
   rpc GetHostStatus(GetHostStatusRequest) returns (HostStatus);
-  rpc ConfigureProvider(ConfigureProviderRequest) returns (HostStatus);
-  rpc SetProviderState(SetProviderStateRequest) returns (HostStatus);
-  rpc SetGatewayState(SetGatewayStateRequest) returns (HostStatus);
-  rpc GetGatewayAccess(GetGatewayAccessRequest) returns (GatewayAccess);
   // One-time binding of the provider enrollment for an authority bootstrapped
   // without one. Rebinding the bound enrollment succeeds; any other is refused.
   rpc BindProvider(BindProviderRequest) returns (BindProviderResponse);
@@ -29,18 +28,6 @@ message MachineCapacity {
   bytes limits = 3;
 }
 
-message SetProviderStateRequest {
-  bool enabled = 1;
-  bytes authorization = 2;
-}
-
-message SetGatewayStateRequest {
-  bool enabled = 1;
-  bytes authorization = 2;
-}
-
-message GetGatewayAccessRequest { bytes authorization = 1; }
-
 message BindProviderRequest {
   bytes authorization = 1;
   // Canonical ProviderEnrollmentBundle bytes.
@@ -49,16 +36,6 @@ message BindProviderRequest {
 message BindProviderResponse {
   // Content ID of the bound enrollment, as pinned by requester trust policies.
   bytes provider_genesis = 1;
-}
-
-enum RuntimeState {
-  // An omitted state means stopped; preserve the host protocol's zero value.
-  // buf:lint:ignore ENUM_ZERO_VALUE_SUFFIX
-  RUNTIME_STATE_STOPPED = 0;
-  RUNTIME_STATE_STARTING = 1;
-  RUNTIME_STATE_RUNNING = 2;
-  RUNTIME_STATE_STOPPING = 3;
-  RUNTIME_STATE_FAILED = 4;
 }
 
 enum AttestationState {
@@ -80,29 +57,13 @@ message IdentityStatus {
   string caller_public_key = 5;
 }
 
-message ServiceStatus {
-  RuntimeState state = 1;
-  string detail = 2;
-}
-
 message HostStatus {
   string version = 1;
   IdentityStatus identity = 2;
-  ServiceStatus provider = 3;
-  ServiceStatus gateway = 4;
-  string endpoint = 5;
-  bytes authority = 6;
-  uint64 authority_revision = 7;
-  uint64 generation = 8;
-  bool provider_configured = 9;
-  MachineCapacity machine = 10;
-  // Canonical metadata only: revision, endpoints, and key names.
-  ProviderMetadata provider_configuration = 11;
-}
-
-message GatewayAccess {
-  string address = 1;
-  string bearer = 2;
+  bytes authority = 3;
+  uint64 authority_revision = 4;
+  uint64 generation = 5;
+  MachineCapacity machine = 6;
 }
 
 message GrantControlRequest { bytes command = 1; }
@@ -142,44 +103,23 @@ message InspectAuthorityResponse {
   bytes reply = 1;
 }
 
-message ConfigureProviderRequest {
+message ConfigureRequest {
   bytes authorization = 1;
-  ProviderUpdate update = 2;
+  uint64 expected_revision = 2;
+  // Complete JSON document; credentials are accepted only as inputs.
+  bytes document = 3;
 }
-
-message ProviderUpdate {
-  uint64 expected_revision = 1;
-  oneof change {
-    UpstreamEndpoint set_endpoint = 2;
-    UpstreamRoute remove_endpoint = 3;
-    UpstreamKey add_key = 4;
-    UpstreamKey replace_key = 5;
-    UpstreamKeyId remove_key = 6;
+message ConfigureResponse { uint64 revision = 1; }
+message WatchRequest { bytes authorization = 1; }
+message WatchResponse {
+  // Initial redacted view, followed by ordered JSON events.
+  oneof update {
+    bytes snapshot = 1;
+    bytes event = 2;
   }
 }
-message UpstreamRoute { string service = 1; string method = 2; }
-message UpstreamKeyId { string service = 1; string method = 2; string key = 3; }
-message UpstreamEndpoint {
-  string service = 1;
-  string method = 2;
-  repeated string allowed_hosts = 3;
-  bool allow_private_addresses = 4;
+message CancelJobRequest {
+  bytes authorization = 1;
+  uint64 id = 2;
 }
-message UpstreamKey {
-  string service = 1;
-  string method = 2;
-  string key = 3;
-  repeated string allowed_origins = 4;
-  repeated string allowed_paths = 5;
-  repeated string allowed_methods = 6;
-  string header_name = 7;
-  string prefix = 8;
-  string secret = 9;
-}
-message ProviderMetadata { uint64 revision = 1; repeated EndpointMetadata endpoints = 2; }
-message EndpointMetadata {
-  string service = 1;
-  string method = 2;
-  repeated string allowed_hosts = 3;
-  repeated string keys = 4;
-}
+message CancelJobResponse { bool cancelled = 1; }

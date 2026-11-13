@@ -59,6 +59,9 @@ impl<I> Admitted<I> {
 }
 
 impl<I, A> Admitted<I, A> {
+    pub const fn admission(&self) -> &A {
+        &self.admission
+    }
     pub const fn invocation(&self) -> &I {
         &self.input
     }

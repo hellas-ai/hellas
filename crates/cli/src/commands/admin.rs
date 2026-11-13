@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 mod node;
 mod owner_scope;
 pub(super) use node::{connect_local, connect_remote};
-pub use node::{gateway_profile, inspect_offline, pair, run, share};
+pub use node::{daemon, gateway_authority, inspect_offline, pair, run, share};
 pub(crate) const CONTROL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Each paired node's profile is `<home>/nodes/NAME/profile.json`.
@@ -67,6 +67,9 @@ pub struct AdminArgs {
 /// contact and resource revises that one share.
 #[derive(clap::Args)]
 pub struct ShareArgs {
+    /// Acknowledge sharing a resource that permits arbitrary Compute programs.
+    #[arg(long)]
+    pub knowingly_unsafe: bool,
     /// The `hellas-contact:...` string the contact sent you.
     #[arg(long, value_name = "CONTACT")]
     pub to: String,
@@ -130,23 +133,6 @@ pub enum AdminCommand {
     },
     /// Read private node status using the profile's selected grant.
     Status,
-    /// Approve exact paid terms for a daemon whose owner key stays on this machine.
-    SetPaidPolicy {
-        #[arg(long)]
-        terms: PathBuf,
-        #[arg(long)]
-        expected_revision: u64,
-        /// The provider's Fetch routes, if its paid policy admits Fetch.
-        #[arg(long)]
-        fetch_config: Option<PathBuf>,
-    },
-    /// Apply a typed upstream update; endpoint changes and key replacement/removal require --passkey.
-    ConfigureProvider { command: PathBuf },
-    /// Start or stop the provider through the normal host lifecycle.
-    SetProviderState {
-        #[arg(long, action = clap::ArgAction::Set)]
-        enabled: bool,
-    },
     /// Bind the provider enrollment of an authority bootstrapped without one.
     BindProvider {
         /// Canonical provider enrollment bytes.

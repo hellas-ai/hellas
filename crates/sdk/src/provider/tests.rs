@@ -1,12 +1,13 @@
+use crate::NodeIdentity;
+use crate::daemon::testing::Daemon;
 use hellas_private::StoreLocation;
+use iroh::{Endpoint, endpoint::presets};
 mod handshakes;
 pub(crate) mod host;
 pub(crate) mod node;
 use super::*;
 use bytes::Bytes;
 use futures::StreamExt as _;
-use hellas_executor::FetchRoute;
-use hellas_executor::{FetchRouteEntry, FetchRoutePolicy};
 use hellas_rpc::pb::work::{StreamResultRequest, WorkStreamEvent};
 use hellas_rpc::services::work::StreamResult;
 use hellas_wire::mux::{MessagePipe, MuxConfig, MuxTransport, Role};
@@ -17,18 +18,15 @@ use tokio::time::{Duration, Instant};
 struct UnusedRoot;
 
 impl RootProver for UnusedRoot {
-    async fn prove_statement(
-        &self,
-        _: &[u8],
-    ) -> Result<RootProof, hellas_attestation::AttestationError> {
-        panic!("ALPN negotiation must not invoke attestation")
+    fn prove_statement<'a>(&'a self, _: &'a [u8]) -> hellas_attestation::RootProofFuture<'a> {
+        Box::pin(async move { panic!("ALPN negotiation must not invoke attestation") })
     }
 
-    async fn prove_open_binding(
-        &self,
+    fn prove_open_binding<'a>(
+        &'a self,
         _: hellas_auth::Digest,
-    ) -> Result<RootProof, hellas_attestation::AttestationError> {
-        panic!("ALPN negotiation must not invoke attestation")
+    ) -> hellas_attestation::RootProofFuture<'a> {
+        Box::pin(async move { panic!("ALPN negotiation must not invoke attestation") })
     }
 }
 
@@ -37,55 +35,15 @@ async fn paid_provider_advertises_work_services_and_serves_no_chain_sync() {
     tokio::time::timeout(Duration::from_secs(30), async {
         let fixture = crate::test_support::PaidFixture::new();
         let identity = NodeIdentity::from_secret_bytes([4; 32], [2; 32]).unwrap();
-        let (enrollment, _) = crate::test_support::enrollment(identity.transport_key().public());
-        let mut routes = FetchRouteRegistry::new();
-        routes
-            .register(
-                FetchRoute::new("openai", "responses"),
-                FetchRouteEntry::new(
-                    Arc::new(ProbeRoute),
-                    Arc::new(ProbeRoute),
-                    FetchRoutePolicy::default(),
-                )
-                .unwrap(),
-            )
-            .unwrap();
         let root = Arc::new(UnusedRoot);
-        let state = fixture.root.path().join("state");
-        let location = StoreLocation::for_test(&state);
-        drop(
-            crate::test_node::bootstrap_node(
-                &crate::grant_config::GrantConfig::journal_dir(&location),
-                hellas_authority::model::grant::grant_network(),
-                Some(enrollment.clone()),
-                hellas_auth::authority::UnixMillis::now().unwrap(),
-            )
-            .await
-            .unwrap(),
-        );
-        let provider = start_fetch_provider(
-            FetchProviderOptions {
-                port: Some(0),
-                identity,
-                enrollment,
-                root: root.clone(),
-                content: hellas_channel::test_support::channel::content_store(&state).await,
-                home: location,
-                routes,
-                fetch_max_in_flight: 1,
-                fetch_queue_capacity: 1,
-                paid_work: Some(crate::PaidProviderOptions::new(fixture.config)),
-                grants: Some(crate::GrantProviderOptions {
-                    configuration: Default::default(),
-                    max_job_millis: std::num::NonZeroU64::new(5000).unwrap(),
-                }),
-            }
-            .prepare()
-            .await
-            .unwrap(),
+        let provider = daemon(
+            fixture.root.path(),
+            0,
+            identity.transport_key(),
+            Some(root.clone()),
+            Some(fixture.config.chain),
         )
-        .await
-        .unwrap();
+        .await;
         assert_eq!(
             Arc::strong_count(&root),
             1,
@@ -259,109 +217,6 @@ async fn paid_stream_outlives_the_idle_limit_but_idle_connections_close() {
     serving.await.unwrap().unwrap_err();
 }
 
-// This test only negotiates ALPNs; no upstream implementation is needed.
-struct ProbeRoute;
-impl hellas_executor::FetchProvider for ProbeRoute {
-    fn execution_environment(&self) -> hellas_rpc::ContentId {
-        test_responses_contract().manifest_id()
-    }
-    fn run(
-        &self,
-        _: hellas_executor::PreparedFetchRequest,
-    ) -> hellas_executor::FetchProviderFuture<'_> {
-        Box::pin(async { panic!("ALPN probe must not execute upstream work") })
-    }
-}
-impl hellas_executor::FetchAdaptorFactory for ProbeRoute {
-    fn execution_environment(&self) -> hellas_rpc::ContentId {
-        test_responses_contract().manifest_id()
-    }
-    fn create(
-        &self,
-        _: &hellas_executor::FetchCall,
-    ) -> Result<hellas_executor::FetchAdaptorSession, hellas_executor::FetchAdaptorError> {
-        panic!("ALPN probe must not prepare upstream work")
-    }
-}
-
-use hellas_channel::test_support::test_responses_contract;
-
-#[test]
-fn work_and_content_are_advertised_with_the_configured_control_services() {
-    use hellas_rpc::services::content::Content;
-    assert_eq!(
-        served_alpns(false, false, false),
-        [Node::ALPN.as_bytes(), Content::ALPN.as_bytes()]
-    );
-    assert_eq!(
-        served_alpns(false, true, false),
-        [
-            Node::ALPN.as_bytes(),
-            Content::ALPN.as_bytes(),
-            Work::ALPN.as_bytes()
-        ]
-    );
-    assert_eq!(
-        served_alpns(false, true, true),
-        [
-            Node::ALPN.as_bytes(),
-            Content::ALPN.as_bytes(),
-            Work::ALPN.as_bytes(),
-            hellas_rpc::services::host_control::HostControl::ALPN.as_bytes()
-        ]
-    );
-    assert_eq!(
-        served_alpns(true, true, true).len(),
-        served_alpns(true, false, false).len() + 1
-    );
-    assert_eq!(
-        served_alpns(true, false, false),
-        [
-            Node::ALPN.as_bytes(),
-            Content::ALPN.as_bytes(),
-            WorkSetup::ALPN.as_bytes(),
-            Work::ALPN.as_bytes()
-        ]
-    );
-}
-
-#[tokio::test]
-async fn invalid_resources_are_rejected_before_opening_a_journal() {
-    use crate::grant_provider::{GrantProviderError, ProviderResources};
-    use hellas_authority::work_store::grant::NodeStoreError;
-    let root = tempfile::tempdir().unwrap();
-    let provider =
-        crate::test_identity::enrollment(iroh::SecretKey::from_bytes(&[3; 32]).public()).0;
-    let location = StoreLocation::for_test(&root.path().join("provider"));
-    let mut options = ProviderGrants {
-        config: crate::GrantProviderOptions {
-            configuration: hellas_authority::test_support::common_node::configuration(vec![
-                hellas_authority::test_support::policy(),
-            ]),
-            max_job_millis: std::num::NonZeroU64::MIN,
-        },
-        authority: ProviderAuthority::Journal { root: location },
-    };
-    let routes = FetchRouteRegistry::default();
-    assert!(matches!(
-        options
-            .open(ProviderResources::Fetch(&routes), &provider,)
-            .await,
-        Err(ProviderError::GrantConfig(
-            GrantProviderError::MissingRoute(_)
-        ))
-    ));
-    assert!(!root.path().join("provider").exists());
-    options.config.configuration = Default::default();
-    assert!(matches!(
-        options
-            .open(ProviderResources::Fetch(&routes), &provider,)
-            .await,
-        Err(ProviderError::NodeStore(NodeStoreError::Uninitialized))
-    ));
-    assert!(!root.path().join("provider").exists());
-}
-
 #[tokio::test(start_paused = true)]
 async fn cheap_streams_cannot_extend_the_connection_lifetime() {
     let (client, server) = mux_pair();
@@ -419,4 +274,78 @@ async fn a_connection_without_a_first_stream_is_reaped() {
         "no-stream connections release their slot on idle timeout"
     );
     serving.await.unwrap().unwrap_err();
+}
+
+async fn daemon(
+    root: &std::path::Path,
+    port: u16,
+    transport: iroh::SecretKey,
+    prover: Option<Arc<dyn RootProver>>,
+    chain: Option<hellas_chain::chain_dir::ChainDir>,
+) -> Daemon {
+    use crate::daemon_config::{Document, Listener};
+    use hellas_authority::work_store::grant::{NodeStore, NodeStoreError};
+    let home = StoreLocation::for_test(root);
+    let journal = home.child("authority");
+    let (enrollment, signer) = crate::test_identity::enrollment(transport.public());
+    let now = hellas_auth::authority::UnixMillis::now().unwrap();
+    let store = match NodeStore::open(
+        &journal,
+        hellas_authority::model::grant::grant_network(),
+        Some(enrollment.clone()),
+        now,
+    )
+    .await
+    {
+        Ok(store) => store,
+        Err(NodeStoreError::Uninitialized) => crate::test_node::bootstrap_node(
+            &journal,
+            hellas_authority::model::grant::grant_network(),
+            Some(enrollment.clone()),
+            now,
+        )
+        .await
+        .unwrap(),
+        Err(error) => panic!("{error}"),
+    };
+    let node = hellas_authority::node::NodeCoordinator::new(
+        store,
+        Arc::new(|| hellas_auth::authority::UnixMillis::now().unwrap()),
+    );
+    let signer = Arc::new(signer);
+    Daemon::open(
+        crate::daemon::Options {
+            discovery: false,
+            endpoint: None,
+            remote_control: Default::default(),
+            prover,
+            chain: chain.unwrap_or_else(|| {
+                crate::test_support::chain_dir(root, hellas_channel::test_support::network())
+            }),
+            home,
+            transport,
+            settlement: hellas_kernel::Secp256k1Signer::from_secret_scalar(
+                signer.to_secret_bytes(),
+            )
+            .unwrap(),
+            signer,
+            owner: None,
+            node,
+            content: hellas_authority::test_support::content_store(&root.join("content")).await,
+        },
+        Document {
+            listeners: [(
+                "work".into(),
+                Listener::Iroh {
+                    chain: None,
+                    port,
+                    backends: vec![],
+                },
+            )]
+            .into(),
+            ..Default::default()
+        },
+        Default::default(),
+    )
+    .await
 }

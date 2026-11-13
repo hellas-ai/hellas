@@ -245,12 +245,19 @@ pub(super) async fn fund_offer(
             _ => return Err(PaidClientError::InputMismatch("expected funded offer")),
         }
     };
-    if offer.offer().payment_funding != funding
-        || offer.offer().provider.content_id() != args.provider.enrollment
-        || offer.offer().policy != quote.policy
-        || offer.offer().omission_bond != quote.omission_bond
-    {
-        return Err(PaidClientError::InputMismatch("offer differs from quote"));
+    if offer.offer().payment_funding != funding {
+        return Err(PaidClientError::InputMismatch("approved payment funding"));
+    }
+    if offer.offer().provider.content_id() != args.provider.enrollment {
+        return Err(PaidClientError::InputMismatch(
+            "approved provider enrollment",
+        ));
+    }
+    if offer.offer().policy != quote.policy {
+        return Err(PaidClientError::InputMismatch("quoted policy"));
+    }
+    if offer.offer().omission_bond != quote.omission_bond {
+        return Err(PaidClientError::InputMismatch("quoted omission bond"));
     }
     Ok(offer)
 }

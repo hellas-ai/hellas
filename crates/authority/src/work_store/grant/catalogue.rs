@@ -9,7 +9,11 @@ use hellas_auth::authority::{ResourceId, Revision};
 
 impl State {
     pub fn catalogue(&self) -> impl Iterator<Item = &GrantPolicy> {
-        self.catalogue.values()
+        self.catalogue.values().filter(|policy| {
+            self.resources
+                .get(&policy.resource)
+                .is_some_and(|health| health.configured)
+        })
     }
 
     pub fn resource(&self, id: ResourceId) -> Option<&GrantPolicy> {
@@ -63,6 +67,14 @@ impl State {
         let pool = super::ledger::definition(&self.ledger, BudgetNode::Pool(pool))
             .ok_or(GrantError::OutOfScope)?;
         for policy in &grant.policies {
+            if current
+                && !self
+                    .resources
+                    .get(&policy.resource)
+                    .is_some_and(|health| health.configured)
+            {
+                return Err(GrantError::OutOfScope.into());
+            }
             let configured = self
                 .resource(policy.resource)
                 .ok_or(GrantError::OutOfScope)?;
@@ -80,10 +92,33 @@ impl State {
         Ok(())
     }
 
-    /// Used at admission, dispatch, execution progress and each delivery write.
+    /// New proposals require the current policy. Admitted work may retain its
+    /// recorded terms; grant authority, deadlines and health are checked separately.
     pub(crate) fn check_resource(&self, a: &GrantJobAuthorizationV1) -> Result<(), NodeStoreError> {
+        if self
+            .resources
+            .get(&a.resource_id)
+            .is_some_and(|health| health.quarantined)
+        {
+            return Err(GrantError::Quarantined.into());
+        }
         let accepted = self.policy_for(a)?;
-        if self.resource(a.resource_id) != Some(accepted)
+        let current = self.resource(a.resource_id).ok_or(GrantError::OutOfScope)?;
+        let work = crate::model::grant::grant_work_id(self.network, a);
+        let admitted = self.admission(a.channel_id, work).is_some();
+        if admitted
+            && current.config_change == crate::model::grant::records::ConfigChange::Keep
+            && self
+                .grant(a.grant_id)
+                .is_some_and(|g| g.policies.iter().any(|p| p.resource == a.resource_id))
+        {
+            return Ok(());
+        }
+        if !self
+            .resources
+            .get(&a.resource_id)
+            .is_some_and(|health| health.configured)
+            || current != accepted
             || self
                 .grant(a.grant_id)
                 .is_none_or(|g| !g.policies.contains(accepted))

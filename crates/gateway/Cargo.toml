@@ -9,6 +9,7 @@ documentation.workspace = true
 
 [features]
 default = []
+test-support = []
 otel = [
     "hellas-rpc/otel",
     "hellas-rpc/http-tracing",
@@ -23,6 +24,7 @@ base64.workspace = true
 flate2 = "1"
 futures = { workspace = true }
 hellas-adaptors.workspace = true
+hellas-admission.workspace = true
 hellas-auth.workspace = true
 hellas-authority.workspace = true
 hellas-channel.workspace = true
@@ -34,7 +36,6 @@ hellas-wire = { workspace = true, features = ["iroh"] }
 http-body = "1"
 http-body-util = "0.1"
 httpdate = "1"
-iroh.workspace = true
 libc = "0.2"
 opentelemetry = { workspace = true, optional = true }
 rand.workspace = true

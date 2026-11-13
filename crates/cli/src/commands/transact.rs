@@ -6,16 +6,17 @@ use hellas_auth::authority::{NodeKey, ResourceId, UnixMillis};
 use hellas_kernel::Secp256k1Signer;
 use hellas_private::StoreLocation;
 use hellas_rpc::Assurance;
+use hellas_sdk::BackendState;
 use hellas_sdk::{
+    Backend,
     execution::{
         Completed, ExecutionAttempt, ExecutionError, ExecutionTarget, ExecutionTerms, Executor,
-        GrantExecution, PaidExecution, RequestStopped,
+        RequestStopped,
     },
     grant_client::{GrantSessionOptions, UnpinnedOffer},
     job::{Job, JobInput},
-    paid_client::{PaidJournalKind, PaidWorkOptions, bind_paid_endpoint, request_paid_quote},
+    paid_client::{PaidWorkOptions, bind_paid_endpoint},
     transact::PaidAttemptPath,
-    {ExecutorGateway, GatewayTarget},
 };
 use std::{
     io::Write as _,
@@ -168,7 +169,7 @@ pub(super) struct TargetArgs {
     local: bool,
     #[cfg(feature = "compute")]
     #[command(flatten)]
-    native: crate::compute::ServeArgs,
+    native: crate::compute::LocalArgs,
     /// The registered renderer (evaluator id) remote jobs are rendered for,
     /// as `hellas program --backend` takes; local jobs render for this
     /// machine's GPU runtime.
@@ -346,7 +347,6 @@ impl ClientArgs {
         };
         Ok(PaidWorkOptions {
             content,
-            journal_kind: PaidJournalKind::Client,
             config,
             provider: provider.address,
             provider_addrs: provider
@@ -482,26 +482,19 @@ async fn within<T>(
     }
 }
 
-/// Where one job runs: paid under `--provider`, under `--access`'s grant, or
-/// on this machine.
-#[expect(clippy::large_enum_variant, reason = "one per command")]
-enum Target {
-    Paid(PaidWorkOptions),
-    Grant {
-        options: GrantSessionOptions,
-        policy: hellas_authority::model::grant::records::GrantPolicy,
-        attempt: Option<PathBuf>,
-    },
-    #[cfg(feature = "compute")]
-    Local {
-        native: Option<crate::compute::ServeArgs>,
-        models: Vec<PathBuf>,
-        timeout: Duration,
-        opened: Option<(
-            hellas_store::content::DiskStore,
-            crate::content_configuration::ContentReload,
-        )>,
-    },
+/// A resolved backend and the command-owned attempt.
+struct ResolvedBackend {
+    backend: Backend,
+    attempt: Option<PathBuf>,
+}
+
+impl From<Backend> for ResolvedBackend {
+    fn from(backend: Backend) -> Self {
+        Self {
+            backend,
+            attempt: None,
+        }
+    }
 }
 
 impl TargetArgs {
@@ -510,7 +503,10 @@ impl TargetArgs {
         #[cfg(feature = "compute")]
         if self.local {
             return Some(hellas_executor::catena::evaluator(
-                self.native.gpu.gpu_backend,
+                self.native
+                    .gpu
+                    .evaluator
+                    .unwrap_or_else(hellas_executor::catena::default_gpu),
             ));
         }
         self.backend.clone()
@@ -529,16 +525,21 @@ impl TargetArgs {
         context: &Context,
         pay: u64,
         assurance: Assurance,
-    ) -> super::CliResult<Target> {
+    ) -> super::CliResult<ResolvedBackend> {
         #[cfg(feature = "compute")]
         if self.local {
             ensure!(pay == 0, "local work is not paid; drop --pay");
-            return Ok(Target::Local {
-                native: Some(self.native),
-                models: self.models,
-                // Bounded by the command deadline; the evaluator needs a limit.
-                timeout: client.timeout.unwrap_or(Duration::from_secs(86_400)),
-                opened: None,
+            let mut native = self.native;
+            native.content.extend(self.models);
+            let execution =
+                crate::compute::local(&context.home, native, Arc::new(context.producer.clone()))
+                    .await?;
+            return Ok(ResolvedBackend {
+                backend: Backend::local(
+                    execution,
+                    client.timeout.unwrap_or(Duration::from_secs(86_400)),
+                ),
+                attempt: None,
             });
         }
         let Some(access) = self.access.as_deref() else {
@@ -546,7 +547,14 @@ impl TargetArgs {
                 pay > 0,
                 "paid execution requires --pay MAX; select --access for grant work"
             );
-            return Ok(Target::Paid(client.options(context, pay, assurance).await?));
+            return Ok(Backend::paid(
+                None,
+                client.options(context, pay, assurance).await?,
+                context.paid_endpoint().await?,
+                context.settlement.clone(),
+                client.owner(context)?,
+            )
+            .into());
         };
         let principal = super::contributions::principal(context.owner()?)?;
         let holder = NodeKey::from_public_key(context.producer.public_key())?;
@@ -584,8 +592,9 @@ impl TargetArgs {
         };
         let target = UnpinnedOffer::decode(&offer.encode()?, UnixMillis(0))?.pin(&trust)?;
         let policy = select_policy(&offer.offer().grant.policies, self.resource)?.clone();
-        Ok(Target::Grant {
-            options: GrantSessionOptions {
+        let mut resolved = ResolvedBackend::from(Backend::grant(
+            policy,
+            GrantSessionOptions {
                 target,
                 principal,
                 signer: Arc::new(context.producer.clone()),
@@ -593,70 +602,45 @@ impl TargetArgs {
                 journal_root: super::contributions::client_journal_root(&context.home, &principal)?,
                 control_timeout: Duration::from_secs(90),
             },
-            policy,
-            attempt: self.attempt,
-        })
+            hellas_sdk::grant_client::GrantTransport::Remote(context.grant_endpoint().await?),
+        ));
+        resolved.attempt = self.attempt;
+        Ok(resolved)
     }
 }
 
-impl Target {
-    /// The terms a job built for this target must satisfy, if it has any,
-    /// and the price it charges: a paid provider quotes first, at most the
-    /// `--pay` ceiling, and the job is then built at exactly that price.
+impl ResolvedBackend {
     async fn quote(
         &mut self,
-        client: &ClientArgs,
-        context: &Context,
     ) -> super::CliResult<(
         Option<hellas_rpc::protocol::invocation::InvocationPolicy>,
         u64,
     )> {
-        Ok(match self {
-            Target::Paid(options) => {
-                let quote = request_paid_quote(
-                    options,
-                    &context.paid_endpoint().await?,
-                    &context.settlement,
-                    client.owner(context)?.principal(),
-                )
-                .await?;
-                options.expected_price = quote.policy.payment_policy.fixed_price;
-                (Some(quote.policy.invocation_policy), options.expected_price)
-            }
-            Target::Grant { policy, .. } => (Some(policy.invocation_policy.clone()), 0),
-            #[cfg(feature = "compute")]
-            Target::Local { .. } => (None, 0),
-        })
+        let price = self.backend.quote().await?;
+        let policy = self.backend.policy().cloned();
+        Ok((policy, price))
     }
 
-    /// Open `job`'s attempt on this target. The endpoint stays the command's.
+    /// Commands add their durable attempt to the same executor gateways use.
     async fn executor(
-        &mut self,
+        &self,
         client: &ClientArgs,
         context: &Context,
         job: &Job,
     ) -> super::CliResult<(Executor, String)> {
-        Ok(match self {
-            Target::Paid(options) => {
-                let owner = client.owner(context)?;
-                (
-                    Executor::Paid(PaidExecution {
-                        options: options.clone(),
-                        endpoint: context.paid_endpoint().await?,
-                        settlement_key: context.settlement.clone(),
-                        attempt: Some(client.purchase(context, job, options, &owner)?),
-                        owner,
-                        funding: Default::default(),
-                        settle: client.settle,
-                    }),
-                    options.provider.to_string(),
-                )
+        let mut executor = Executor::new(self.backend.clone());
+        let provider = match &executor.backend.state {
+            BackendState::Unavailable(error) => anyhow::bail!("{error}"),
+            BackendState::Paid(paid) => {
+                let hellas_sdk::PaidBackend { options, owner, .. } = paid.as_ref();
+                executor.attempt = Some(client.purchase(context, job, options, owner)?);
+                executor.settle = client.settle;
+                options.provider.to_string()
             }
-            Target::Grant {
-                options,
-                policy,
-                attempt,
-            } => {
+            BackendState::Grant(grant) => {
+                let hellas_sdk::GrantBackend {
+                    options, policy, ..
+                } = grant.as_ref();
                 job.input().admits(&policy.invocation_policy, false)?;
                 let offer = options.target.offer();
                 let provider = hellas_sdk::client::ProviderAddress::of(&offer.provider)?;
@@ -668,7 +652,7 @@ impl Target {
                     .join(offer.grant.id.to_string())
                     .join(format!("{}.json", job.digest()));
                 let mut attempt = ExecutionAttempt::open(
-                    attempt.as_deref().unwrap_or(&default_attempt),
+                    self.attempt.as_deref().unwrap_or(&default_attempt),
                     job.input(),
                     ExecutionTerms::Grant {
                         resource: policy.resource,
@@ -678,167 +662,24 @@ impl Target {
                     network: offer.network,
                     provider,
                 })?;
-                (
-                    Executor::Grant(GrantExecution {
-                        options: options.clone(),
-                        transport: hellas_sdk::grant_client::GrantTransport::Remote(
-                            context.grant_endpoint().await?,
-                        ),
-                        resource: policy.resource,
-                        attempt: Some(attempt),
-                    }),
-                    provider.to_string(),
-                )
+                executor.attempt = Some(attempt);
+                provider.to_string()
             }
-            #[cfg(feature = "compute")]
-            Target::Local { timeout, .. } => {
-                let policy = hellas_sdk::execution::local::policy(job.input(), *timeout)?;
-                (
-                    Executor::Local(self.open_local(context).await?, policy),
-                    hex::encode(context.producer.public_key().bytes()),
-                )
+            BackendState::Fetch { .. } | BackendState::Local { .. } => {
+                hex::encode(context.producer.public_key().bytes())
             }
-        })
-    }
-
-    /// This machine's executor, opened once; its content closes with the target.
-    #[cfg(feature = "compute")]
-    async fn open_local(
-        &mut self,
-        context: &Context,
-    ) -> super::CliResult<hellas_sdk::execution::local::LocalExecution> {
-        let Target::Local {
-            native,
-            models,
-            opened,
-            ..
-        } = self
-        else {
-            bail!("not a local target");
         };
-        let mut native = native.take().context("local target is already open")?;
-        // Jobs read their weights from the models they were rendered from.
-        native.content.extend(models.iter().cloned());
-        let (execution, reload) =
-            crate::compute::local(&context.home, native, Arc::new(context.producer.clone()))
-                .await?;
-        *opened = Some((execution.content.clone(), reload));
-        Ok(execution)
-    }
-
-    /// The gateway's target: every request runs as one untracked job here,
-    /// under `policy`, the terms [`Target::quote`] returned.
-    async fn gateway(
-        &mut self,
-        client: &ClientArgs,
-        context: &Context,
-        policy: Option<hellas_rpc::protocol::invocation::InvocationPolicy>,
-    ) -> super::CliResult<GatewayTarget> {
-        Ok(match self {
-            Target::Paid(options) => GatewayTarget::Paid {
-                options: options.clone(),
-                policy: policy.context("a paid provider quotes its terms")?,
-                endpoint: context.paid_endpoint().await?,
-                settlement_key: context.settlement.clone(),
-                owner: client.owner(context)?,
-            },
-            Target::Grant {
-                options, policy, ..
-            } => GatewayTarget::Grant {
-                options: options.clone(),
-                transport: hellas_sdk::grant_client::GrantTransport::Remote(
-                    context.grant_endpoint().await?,
-                ),
-                policy: policy.clone(),
-            },
-            #[cfg(feature = "compute")]
-            Target::Local { timeout, .. } => {
-                let timeout = *timeout;
-                GatewayTarget::Local {
-                    execution: self.open_local(context).await?,
-                    timeout,
-                }
-            }
-        })
+        Ok((executor, provider))
     }
 
     async fn close(self) -> super::CliResult<()> {
-        match self {
-            Target::Paid(options) => options.content.close().await,
-            Target::Grant { .. } => {}
-            #[cfg(feature = "compute")]
-            Target::Local { opened, .. } => {
-                if let Some((content, reload)) = opened {
-                    let stopped = reload.shutdown().await;
-                    content.close().await;
-                    stopped?;
-                }
-            }
+        match self.backend.state {
+            BackendState::Paid(paid) => paid.options.content.close().await,
+            BackendState::Local { execution, .. } => execution.content.close().await,
+            BackendState::Unavailable(_) | BackendState::Fetch { .. } | BackendState::Grant(_) => {}
         }
         Ok(())
     }
-}
-
-/// `hellas gateway`'s models, and its execution flags: the job commands' own.
-#[derive(Debug, Args)]
-pub struct GatewayArgs {
-    /// A model the routes render jobs from, named after its file or
-    /// directory: a Qwen GGUF serves the text routes, a converted Whisper
-    /// package /v1/audio/transcriptions and a converted Flux package
-    /// /v1/images/generations. Providers must hold the same weights.
-    #[arg(long = "model", value_name = "PATH")]
-    pub(crate) models: Vec<PathBuf>,
-    #[command(flatten)]
-    client: ClientArgs,
-    /// Pay the provider named by --provider its quoted price per request, at most MAX.
-    #[arg(long, value_name = "MAX", requires = "provider", conflicts_with = "access", value_parser = clap::value_parser!(u64).range(1..))]
-    pay: Option<u64>,
-    #[command(flatten)]
-    target: TargetArgs,
-}
-
-/// Open the gateway's target as a job command opens its own and `serve`
-/// HTTP with it. The endpoints and content it opened close however it ends.
-pub async fn gateway(
-    args: GatewayArgs,
-    context: Context,
-    serve: impl AsyncFnOnce(Arc<ExecutorGateway>) -> super::CliResult<()>,
-) -> super::CliResult<()> {
-    let GatewayArgs {
-        models,
-        client,
-        pay,
-        mut target,
-    } = args;
-    let evaluator = target.evaluator();
-    target.models = models;
-    ensure!(
-        !client.settle && !client.buy_again && target.attempt.is_none(),
-        "gateway requests are not tracked attempts: drop --settle, --buy-again and --attempt"
-    );
-    bounded(&context, None, async |_| {
-        let mut target = target
-            .resolve(
-                &client,
-                &context,
-                pay.unwrap_or(0),
-                Assurance::ProducerSigned,
-            )
-            .await?;
-        let result = async {
-            let (policy, _) = target.quote(&client, &context).await?;
-            let gateway = target.gateway(&client, &context, policy).await?;
-            serve(ExecutorGateway::new(
-                gateway,
-                evaluator,
-                Arc::new(context.producer.clone()),
-            ))
-            .await
-        }
-        .await;
-        result.and(target.close().await)
-    })
-    .await
 }
 
 fn select_policy(
@@ -899,7 +740,7 @@ async fn run_quoted(
         )
         .await?;
         let result = async {
-            let (_, price) = within(deadline, target.quote(client, context)).await?;
+            let (_, price) = within(deadline, target.quote()).await?;
             let job = build(price).await?;
             let directory = save.unwrap_or_else(|| {
                 client
@@ -962,7 +803,7 @@ async fn run_job(
 async fn execute(
     client: &ClientArgs,
     context: &Context,
-    target: &mut Target,
+    target: &mut ResolvedBackend,
     job: &Job,
     deadline: Option<tokio::time::Instant>,
     evidence: Option<&Path>,
@@ -1061,7 +902,7 @@ pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
         )
         .await?;
         let result = async {
-            let (policy, price) = within(deadline, target.quote(&args.client, &context)).await?;
+            let (policy, price) = within(deadline, target.quote()).await?;
             let policy = policy
                 .context("local execution runs Compute jobs; Fetch needs --provider or --access")?;
             let admission = policy

@@ -495,13 +495,20 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-        let mut config = ExecutorSpawnConfig::new(key.clone(), Assurance::ProducerSigned, routes);
+        let mut config = ExecutorSpawnConfig::new(key.clone(), routes);
         config.fetch_max_in_flight = 1;
         let executor = Executor::spawn_configured(config).await.unwrap();
         let (entered, started) = tokio::sync::oneshot::channel();
         let entered = std::sync::Mutex::new(Some(entered));
         let running = executor.clone();
-        let input = ticket(prepare(&policy), WorkAdmission::payment());
+        let input = ticket(
+            prepare(&policy),
+            WorkAdmission::payment(
+                hellas_auth::ProducerSigningKey::from_secret_bytes([1; 32])
+                    .unwrap()
+                    .public_key(),
+            ),
+        );
         let first = tokio::spawn(async move {
             running
                 .execute_stream(
@@ -533,7 +540,13 @@ mod tests {
             let observed = dispatched.clone();
             let cancel = Cancellation::new();
             let admission = WorkAdmission::grant(
-                executor.try_admit(CapacityDomain::Fetch).unwrap(),
+                executor
+                    .try_admit(
+                        &hellas_channel::work::admission::BackendKey::of(&prepare(&policy))
+                            .unwrap(),
+                        prepare(&policy).request.runner_public_key,
+                    )
+                    .unwrap(),
                 std::time::Instant::now()
                     + if revoked {
                         std::time::Duration::from_secs(30)
@@ -606,7 +619,11 @@ mod tests {
                         hellas_store::content::LocalStore::Disk(missing_store),
                         hellas_store::content::Scope::Owner,
                     ),
-                    WorkAdmission::payment(),
+                    WorkAdmission::payment(
+                        hellas_auth::ProducerSigningKey::from_secret_bytes([1; 32])
+                            .unwrap()
+                            .public_key(),
+                    ),
                 ),
                 Arc::new(move |_| {
                     observed.fetch_add(1, Ordering::SeqCst);
@@ -672,19 +689,23 @@ mod tests {
                         .unwrap(),
                 )
                 .unwrap();
-            let executor = Executor::spawn_configured(ExecutorSpawnConfig::new(
-                key.clone(),
-                Assurance::ProducerSigned,
-                routes,
-            ))
-            .await
-            .unwrap();
+            let executor =
+                Executor::spawn_configured(ExecutorSpawnConfig::new(key.clone(), routes))
+                    .await
+                    .unwrap();
             let input = prepare(&policy);
             let published = Arc::new(AtomicUsize::new(0));
             let observed = published.clone();
             let events = executor
                 .execute_stream(
-                    ticket(input.clone(), WorkAdmission::payment()),
+                    ticket(
+                        input.clone(),
+                        WorkAdmission::payment(
+                            hellas_auth::ProducerSigningKey::from_secret_bytes([1; 32])
+                                .unwrap()
+                                .public_key(),
+                        ),
+                    ),
                     Arc::new(move |_| {
                         observed.fetch_add(1, Ordering::SeqCst);
                         Ok(())
@@ -763,16 +784,20 @@ mod tests {
                             .unwrap(),
                     )
                     .unwrap();
-                let executor = Executor::spawn_configured(ExecutorSpawnConfig::new(
-                    key.clone(),
-                    Assurance::ProducerSigned,
-                    routes,
-                ))
-                .await
-                .unwrap();
+                let executor =
+                    Executor::spawn_configured(ExecutorSpawnConfig::new(key.clone(), routes))
+                        .await
+                        .unwrap();
                 let input = prepare(&policy);
                 let events = executor
-                    .execute(ticket(input.clone(), WorkAdmission::payment()))
+                    .execute(ticket(
+                        input.clone(),
+                        WorkAdmission::payment(
+                            hellas_auth::ProducerSigningKey::from_secret_bytes([1; 32])
+                                .unwrap()
+                                .public_key(),
+                        ),
+                    ))
                     .await
                     .unwrap();
                 let verified = input

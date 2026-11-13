@@ -18,11 +18,6 @@
     ;
 })
 // (import ./e2e.nix {
-  inherit
-    self
-    pkgs
-    lib
-    ;
-  package = package.override { otel = true; };
+  inherit pkgs lib;
   validatorPackage = validatorPackage.override { otel = true; };
 })

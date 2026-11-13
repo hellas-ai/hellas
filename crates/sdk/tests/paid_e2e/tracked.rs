@@ -274,14 +274,14 @@ async fn fund(case: &mut PaidScenario<()>) {
     session.shutdown().await;
 }
 
-/// The command lifecycle through `Executor::Paid`: an attempt that fails
+/// The command lifecycle through the paid backend: an attempt that fails
 /// before spending stays unbound and the same attempt then succeeds; a
 /// rerun delivers the retained result without proposing again; and a
 /// settlement that cannot finalize still ends at the command deadline,
 /// after delivery and its report.
 #[test]
 fn executor_retries_unspent_attempts_replays_and_bounds_settlement() {
-    use hellas_sdk::execution::{Executor, PaidExecution, stop_on};
+    use hellas_sdk::execution::{Executor, stop_on};
     run(|runtime| {
         Box::pin(async move {
             let mut case = paid_fixture(runtime).await;
@@ -289,19 +289,20 @@ fn executor_retries_unspent_attempts_replays_and_bounds_settlement() {
             let path = paid_path(&case, &job, "executor");
             let signer = ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap();
             let delivered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let executor = |attempt, max_funding, settle| {
-                Executor::Paid(PaidExecution {
-                    options: case.options.clone(),
-                    endpoint: case.endpoint.clone(),
-                    settlement_key: client_settlement(),
-                    owner: case.owner.clone(),
-                    funding: SessionFundingOptions {
-                        max_funding,
-                        approval: None,
-                    },
-                    attempt: Some(attempt),
-                    settle,
-                })
+            let executor = |attempt, max_funding, settle| Executor {
+                backend: hellas_sdk::Backend::paid(
+                    None,
+                    case.options.clone(),
+                    case.endpoint.clone(),
+                    client_settlement(),
+                    case.owner.clone(),
+                ),
+                funding: SessionFundingOptions {
+                    max_funding,
+                    approval: None,
+                },
+                attempt: Some(attempt),
+                settle,
             };
             let deliver = || -> hellas_sdk::execution::Delivery<'static> {
                 let delivered = delivered.clone();

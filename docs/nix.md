@@ -16,65 +16,44 @@ nix develop .#rocm --no-write-lock-file  # AMD
 nix develop .#cuda --no-write-lock-file  # NVIDIA
 ```
 
-Catena selects a runtime inside an isolated worker. Use `serve
---gpu-backend auto|hip|cuda` to choose one; `auto` chooses CUDA on a NixOS NVIDIA
-host and HIP otherwise.
+Catena runs inside an isolated worker. Local daemon backends select CUDA when
+an NVIDIA device is present and HIP otherwise. The NixOS module supplies the
+matching toolchain and device access.
 
-The NixOS module provisions the matching toolchain and device access:
-
-```nix
-services.hellas = {
-  enable = true;
-  workConfigFile = "/srv/hellas/paid-work.toml"; # passed as --paid-work-config
-  passkey = "/srv/hellas/owner.passkey";
-  gpuBackend = "cuda"; # or "hip" / "auto"
-  content = {
-    lower = [ "/srv/hellas/content" ];
-    index = "resume";
-    # Add config/* pin declarations using the IDs and lengths from store index.
-  };
-};
-```
-
-Keep models and compiler artifacts outside `/nix/store`; they are runtime data.
-
-The gateway service takes the same choices as `hellas gateway`: `models`, and
-one of `access` (an access file), `pay` with `provider`, or `local`. Remote
-models render for `backend`, the provider's registered renderer:
+A declarative HTTP deployment runs the stateless gateway with flags:
 
 ```nix
 services.hellas.gateway = {
   enable = true;
-  models = [ "/srv/hellas/models/qwen3.gguf" ];
-  access = "/run/secrets/friend.access";
-  backend = "hellas/catena-dfad87438018-hip";
+  models = [ "/srv/models/qwen3.gguf" "gpt-5@openrouter" ];
+  upstreams.openrouter = {
+    url = "https://openrouter.ai/api";
+    keyFile = "/run/secrets/openrouter.key";
+  };
 };
 ```
 
-A loopback gateway keeps its own authority and bearer under its home, in
-`gateway/bearer`. `allowRemote` requires `gatewayProfile`, an explicitly
-provisioned authority (see [HTTP gateway authority](admin.md#http-gateway-authority)).
+The module renders `--model`, `--upstream` and `--bind` arguments. It never
+writes a routing file or invokes stateful backend/route verbs. Model packages
+and API key files remain runtime paths outside the Nix store. Provision private
+files for the service user; do not interpolate Nix paths or call
+`builtins.readFile` on secrets. The gateway keeps its HTTP bearer in memory;
+use `gateway.extraArgs = [ "--wrap" "COMMAND" ];` to pass it to a child.
 
-Fetch providers likewise use runtime files: set `fetchConfigFile` to the JSON
-configuration path and `environmentFile` to a systemd environment file holding
-provider-local secrets such as `OPENAI_API_KEY`. Do not put either file in a
-Nix expression or in the store. In particular, never interpolate the file as a
-Nix path and never use `builtins.readFile` on it: both operations expose its
-contents during evaluation, before any module assertion or runtime validation
-can protect it. Paid Fetch uses metadata-only journals; see
-[provider retention](../crates/channel/README.md).
+For a persistent node, enable `services.hellas.enable`. Pair the node's invite,
+then manage its journaled document with `hellas backend`, `hellas route` and
+`hellas routes`. These edits are operator actions, not NixOS reload commands.
+The home, chain selection, passkey, metrics and environment remain module
+options; routing belongs to the daemon document.
 
-On Darwin, the Home Manager launch agent remains network-only but supports the
-same runtime-secret boundary:
+Home Manager can run the stateful service on Darwin:
 
 ```nix
 programs.hellas = {
   enable = true;
   serve = {
     enable = true;
-    workConfigFile = "/Users/alice/.config/hellas/paid-work.toml";
     passkey = "/Users/alice/.config/hellas/owner.passkey";
-    fetchConfigFile = "/Users/alice/.config/hellas/fetch.json";
     environmentFile = "/Users/alice/.config/hellas/provider.env";
   };
 };
@@ -131,20 +110,18 @@ $(nix build .#docker-hip --print-out-paths) | docker load
 # NVIDIA with a configured CDI device specification:
 docker run --rm --device nvidia.com/gpu=all \
   -v hellas-state:/var/lib/hellas -v /srv/hellas/content:/content:ro \
-  -v /srv/hellas/content.toml:/etc/hellas-content.toml:ro \
-  ghcr.io/hellas-ai/hellas:cuda --content-config /etc/hellas-content.toml
+  ghcr.io/hellas-ai/hellas:cuda
 
 # AMD:
 docker run --rm --device /dev/kfd --device /dev/dri \
   -v hellas-state:/var/lib/hellas -v /srv/hellas/content:/content:ro \
-  -v /srv/hellas/content.toml:/etc/hellas-content.toml:ro \
-  ghcr.io/hellas-ai/hellas:hip --content-config /etc/hellas-content.toml
+  ghcr.io/hellas-ai/hellas:hip
 ```
 
-The mounted content file should name `/content` as its lower and declare the
-Jobs pins needed by the workload. Both GPU images default to `serve` with their matching backend. The host supplies
-the GPU driver and model content stays on runtime volumes. Published images are
-the Hydra-built artifacts of a commit whose CLI and GPU releases both passed.
+Both images start `serve`. Pair the invite, then add model routes using paths
+inside the container. The host supplies the GPU driver; model packages stay
+on runtime volumes. For a stateless container, override the entrypoint with
+`hellas` and run `gateway --model /content/PACKAGE`.
 
 A GPU asset owner uploads verified weights once and execution workers receive
 them as read-only views over GPU IPC. Worker replacement retains weights; asset

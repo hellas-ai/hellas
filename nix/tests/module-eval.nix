@@ -5,32 +5,12 @@
   package,
 }:
 let
-  # Exercise the exported module with unmodified nixpkgs. Importing the
-  # module must not require consumers to install the Hellas overlay first.
-  plainPkgs = import pkgs.path {
-    system = pkgs.stdenv.hostPlatform.system;
-  };
-  cudaPkgs = import pkgs.path {
-    system = pkgs.stdenv.hostPlatform.system;
-    config.allowUnfree = true;
-  };
-  darwinPkgs = import pkgs.path {
-    system = "aarch64-darwin";
-  };
+  plainPkgs = import pkgs.path { system = pkgs.stdenv.hostPlatform.system; };
   hellasModule = import ../modules/hellas.nix { inherit self; };
   runtimeEnvironmentWrapper = hellasModule.mkRuntimeEnvironmentWrapper pkgs;
-  runtimeEnvironmentStoreFile = pkgs.writeText "hellas-runtime-environment-store-fixture" ''
-    STORE_FIXTURE=must-not-load
-  '';
-  repeatedSlashStoreDir = lib.concatStringsSep "//" (lib.splitString "/" builtins.storeDir);
-  repeatedSlashStorePath = "${repeatedSlashStoreDir}/provider.env";
-  dotStorePath = "/.${builtins.storeDir}/./provider.env";
-  dotDotStorePath = "/run/hellas/../..${builtins.storeDir}/provider.env";
-  contextualRuntimePath = builtins.appendContext "/run/hellas/contextual.env" (
-    builtins.getContext "${package}"
-  );
-  evalGatewayWithServe =
-    serve: gateway:
+  runtimeEnvironmentStoreFile = pkgs.writeText "hellas-runtime-environment-store-fixture" "TOKEN=store-secret";
+  eval =
+    settings:
     import (pkgs.path + "/nixos/lib/eval-config.nix") {
       system = pkgs.stdenv.hostPlatform.system;
       modules = [
@@ -40,102 +20,47 @@ let
           system.stateVersion = "26.05";
           services.hellas = {
             inherit package;
-            gateway = {
-              enable = true;
-              access = "/run/hellas/friend.access";
-              models = [ "/srv/hellas/test.gguf" ];
-            }
-            // gateway;
           }
-          // serve;
+          // settings;
         }
       ];
     };
-  evalGateway = evalGatewayWithServe { };
-  runtimeStoreAssertion =
-    evaluation:
-    lib.findFirst (
-      assertion: lib.hasInfix "must be runtime data outside the Nix store" assertion.message
-    ) (throw "missing runtime-data store assertion") evaluation.config.assertions;
-  environmentStoreAssertion =
-    evaluation:
-    lib.findFirst (
-      assertion: lib.hasInfix "services.hellas.environment string values must not" assertion.message
-    ) (throw "missing environment store assertion") evaluation.config.assertions;
-  serveExtraArgsAssertion =
-    evaluation:
-    lib.findFirst (
-      assertion: lib.hasInfix "services.hellas.extraArgs may not override" assertion.message
-    ) (throw "missing serve extraArgs assertion") evaluation.config.assertions;
-  providerAssuranceAssertion =
-    evaluation:
-    lib.findFirst (
-      assertion: lib.hasInfix "cannot serve apple-app-attest assurance" assertion.message
-    ) (throw "missing provider assurance assertion") evaluation.config.assertions;
-  gatewayExtraArgsAssertion =
-    evaluation:
-    lib.findFirst (
-      assertion: lib.hasInfix "services.hellas.gateway.extraArgs may not override" assertion.message
-    ) (throw "missing gateway extraArgs assertion") evaluation.config.assertions;
-  metricsFeatureAssertion =
-    evaluation:
-    lib.findFirst (
-      assertion: lib.hasInfix "metrics ports require otel.enable" assertion.message
-    ) (throw "missing metrics feature assertion") evaluation.config.assertions;
-  trustPairAssertion =
-    evaluation:
-    lib.findFirst (
-      assertion: lib.hasInfix "trustStore and trustPolicy" assertion.message
-    ) (throw "missing Apple trust pair assertion") evaluation.config.assertions;
-  fundingAssertion =
-    evaluation:
-    lib.findFirst (
-      assertion: lib.hasInfix "services.hellas.gateway execution requires exactly one" assertion.message
-    ) (throw "missing gateway funding assertion") evaluation.config.assertions;
-  payProviderAssertion =
-    evaluation:
-    lib.findFirst (
-      assertion: lib.hasInfix "services.hellas.gateway.pay and provider" assertion.message
-    ) (throw "missing gateway pay/provider assertion") evaluation.config.assertions;
-  allowRemoteAssertion =
-    evaluation:
-    lib.findFirst (
-      assertion: lib.hasInfix "services.hellas.gateway.allowRemote requires" assertion.message
-    ) (throw "missing gateway allowRemote assertion") evaluation.config.assertions;
-  gatewayContentLocalAssertion =
-    evaluation:
-    lib.findFirst (
-      assertion: lib.hasInfix "services.hellas.gateway.content requires local" assertion.message
-    ) (throw "missing gateway content assertion") evaluation.config.assertions;
-  memoryHeadroomAssertion =
-    evaluation:
-    lib.findFirst (
-      assertion: lib.hasInfix "memoryMaxBytes must exceed gpuSessionAssetBytes" assertion.message
-    ) (throw "missing provider memory-headroom assertion") evaluation.config.assertions;
-  writableRootAssertion =
-    evaluation:
-    lib.findFirst (
-      assertion:
-      !assertion.assertion
-      && lib.hasInfix "must not expose the filesystem root as writable" assertion.message
-    ) (throw "missing writable-root assertion") evaluation.config.assertions;
-  evalProvider =
-    provider:
-    import (pkgs.path + "/nixos/lib/eval-config.nix") {
-      system = pkgs.stdenv.hostPlatform.system;
-      modules = [
-        self.nixosModules.default
-        {
-          nixpkgs.pkgs = if (provider.gpuBackend or null) == "cuda" then cudaPkgs else plainPkgs;
-          system.stateVersion = "26.05";
-          services.hellas = {
-            enable = true;
-            inherit package;
-          }
-          // provider;
-        }
-      ];
+  evalProvider = settings: eval ({ enable = true; } // settings);
+  evalGateway =
+    settings:
+    eval {
+      gateway = {
+        enable = true;
+        models = [
+          "/srv/models/qwen.gguf"
+          "flux@friend"
+          "gpt-5@upstream"
+        ];
+        upstreams.upstream = {
+          url = "https://api.example.com/v1";
+          keyFile = "/run/secrets/upstream.key";
+        };
+      }
+      // settings;
     };
+  assertion =
+    text: evaluation:
+    (lib.findFirst (
+      item: lib.hasInfix text item.message
+    ) (throw "missing module assertion: ${text}") evaluation.config.assertions).assertion;
+  defaultProviderService = (evalProvider { }).config.systemd.services.hellas;
+  gateway = (evalGateway { }).config.systemd.services.hellas-gateway;
+  remote = (evalGateway { models = [ "gpt-5@upstream" ]; }).config.systemd.services.hellas-gateway;
+  custom = (evalGateway { home = "/srv/gateway-state"; }).config.systemd.services.hellas-gateway;
+  metrics =
+    (eval {
+      otel.enable = true;
+      gateway = {
+        enable = true;
+        models = [ "gpt-5@upstream" ];
+        metricsPort = 9401;
+      };
+    }).config.systemd.services.hellas-gateway;
   validatorPackageFixture =
     (pkgs.writeShellScriptBin "hellas" ''
       set -eu
@@ -269,828 +194,83 @@ let
     if matched == null then throw "validator ExecStart has no config" else builtins.head matched;
   paidWorkValidatorServices = paidWorkValidators.config.systemd.services;
   validatorConfig2 = validatorConfigPath paidWorkValidatorServices."hellas-validator-devnet-node2";
-  evalHomeManagerWith =
-    homeManagerPkgs: configuration:
-    lib.evalModules {
-      specialArgs = {
-        inherit self;
-        pkgs = homeManagerPkgs;
-      };
-      modules = [
-        ({ lib, ... }: {
-          options = {
-            assertions = lib.mkOption {
-              type = lib.types.listOf lib.types.anything;
-              default = [ ];
-            };
-            home = {
-              packages = lib.mkOption {
-                type = lib.types.listOf lib.types.anything;
-                default = [ ];
-              };
-              sessionVariables = lib.mkOption {
-                type = lib.types.attrsOf lib.types.anything;
-                default = { };
-              };
-              homeDirectory = lib.mkOption {
-                type = lib.types.str;
-                default = "/home/hellas";
-              };
-            };
-            # This intentionally small schema stub checks the module's launchd
-            # value shape and option merging. It is not Home Manager's launchd
-            # implementation and does not constitute a native Darwin test.
-            launchd.agents = lib.mkOption {
-              type = lib.types.attrsOf (
-                lib.types.submodule {
-                  options = {
-                    enable = lib.mkOption {
-                      type = lib.types.bool;
-                      default = false;
-                    };
-                    config = lib.mkOption {
-                      type = lib.types.attrsOf lib.types.anything;
-                      default = { };
-                    };
-                  };
-                }
-              );
-              default = { };
-            };
-          };
-        })
-        self.homeManagerModules.default
-        configuration
-      ];
-    };
-  evalHomeManager = evalHomeManagerWith plainPkgs;
-  evalDarwinHomeManager = evalHomeManagerWith darwinPkgs;
-  homeManagerPlatformAssertion =
-    evaluation:
-    lib.findFirst (
-      assertion: lib.hasInfix "programs.hellas.serve is only supported on darwin" assertion.message
-    ) (throw "missing Home Manager platform assertion") evaluation.config.assertions;
-  homeManagerCatenaAssertion =
-    evaluation:
-    lib.findFirst (
-      assertion: lib.hasInfix "Local Catena execution is not supported" assertion.message
-    ) (throw "missing Home Manager Catena assertion") evaluation.config.assertions;
-  homeManagerRuntimeStoreAssertion =
-    evaluation:
-    lib.findFirst (
-      assertion: lib.hasInfix "programs.hellas.serve content" assertion.message
-    ) (throw "missing Home Manager runtime-data store assertion") evaluation.config.assertions;
-  homeManagerEnvironmentStoreAssertion =
-    evaluation:
-    lib.findFirst (
-      assertion: lib.hasInfix "programs.hellas.environment string values" assertion.message
-    ) (throw "missing Home Manager environment store assertion") evaluation.config.assertions;
-  homeManagerExtraArgsAssertion =
-    evaluation:
-    lib.findFirst (
-      assertion: lib.hasInfix "programs.hellas.serve.extraArgs may not override" assertion.message
-    ) (throw "missing Home Manager serve extraArgs assertion") evaluation.config.assertions;
-  evalDarwinServe =
-    serve:
-    evalDarwinHomeManager {
-      home.homeDirectory = "/Users/hellas";
-      programs.hellas = {
-        inherit package;
-        serve = {
-          enable = true;
-        }
-        // serve;
-      };
-    };
-  discoveryGateway = evalGateway { };
-  nativeGatewayWithoutModel = evalGateway { models = [ ]; };
-  storePathGateway = evalGateway {
-    environmentFile = "${builtins.storeDir}/secret.env";
-  };
-  storePathIdentityGateway = evalGateway {
-    home = "${builtins.storeDir}/hellas";
-  };
-  storePathModelGateway = evalGateway {
-    models = [ "${builtins.storeDir}/model.gguf" ];
-  };
-  storePathIdentityProvider = evalProvider {
-    home = "${builtins.storeDir}/hellas";
-  };
-  storePathContentProvider = evalProvider {
-    content.lower = [ "${builtins.storeDir}/model.hex" ];
-  };
-  defaultIdentityProvider = evalProvider { };
-  customHomeProvider = evalProvider { home = "/srv/hellas-home"; };
-  customHomeGateway = evalGateway { home = "/srv/hellas-gateway-home"; };
-  storePathWorkConfig = evalProvider {
-    workConfigFile = "${builtins.storeDir}/work.toml";
-  };
-  storePathFetchConfig = evalProvider {
-    fetchConfigFile = "${builtins.storeDir}/fetch.json";
-  };
-  storePathProviderEnvironmentFile = evalProvider {
-    environmentFile = "${builtins.storeDir}/provider.env";
-  };
-  rootJournalGateway = evalGateway {
-    home = "/";
-  };
-  unsafeServeExtraArgs = evalProvider {
-    extraArgs = [ "--content-config=${builtins.storeDir}/content.toml" ];
-  };
-  unsafeServeAssuranceArgs = evalProvider {
-    extraArgs = [ "--assurance=producer-signed" ];
-  };
-  unsafeGatewayExtraArgs = evalGateway {
-    extraArgs = [ "--model=${builtins.storeDir}/model.gguf" ];
-  };
-  harmlessExtraArgs = evalProvider {
-    extraArgs = [ "--no-discovery" ];
-  };
-  unsupportedProviderApple = evalProvider {
-    assurance = "apple-app-attest";
-  };
-  incompleteTrust = evalGateway {
-    trustPolicy = "provider";
-  };
-  noTargetGateway = evalGateway { access = null; };
-  twoTargetGateway = evalGateway { local = true; };
-  payGateway = evalGateway {
-    access = null;
-    pay = 20;
-    provider = "provider-id";
-  };
-  payWithoutProviderGateway = evalGateway {
-    access = null;
-    pay = 20;
-  };
-  remoteWithoutProfileGateway = evalGateway { allowRemote = true; };
-  contentWithoutLocalGateway = evalGateway {
-    content.lower = [ "/var/lib/hellas-gateway/models" ];
-  };
-  localGateway = evalGateway {
-    access = null;
-    local = true;
-  };
-  localHipGateway = evalGatewayWithServe { gpuBackend = "hip"; } {
-    access = null;
-    local = true;
-  };
-  managedGatewayContent = evalGateway {
-    access = null;
-    local = true;
-    authorityJournal = "/var/lib/hellas-gateway/http-authority";
-    content.lower = [ "/var/lib/hellas-gateway/models" ];
-    passkey = "/run/hellas/principal.passkey";
-  };
-  gatewayLowerOverGrantData = evalGateway {
-    access = null;
-    local = true;
-    content.lower = [ "/var/lib/hellas-gateway/.hellas/grants" ];
-  };
-  gatewayLowerOverAuthority = evalGateway {
-    access = null;
-    local = true;
-    authorityJournal = "/var/lib/hellas-gateway/authority";
-    content.lower = [ "/var/lib/hellas-gateway/authority/models" ];
-  };
-  gatewayLowerOverUpper = evalGateway {
-    access = null;
-    local = true;
-    content.upper = "/var/lib/hellas-gateway/store";
-    content.lower = [ "/var/lib/hellas-gateway/store/models" ];
-  };
-  gatewayContentDisjointAssertion =
-    evaluation:
-    lib.findFirst (
-      assertion: lib.hasInfix "content.lower must be disjoint" assertion.message
-    ) (throw "missing gateway content disjointness assertion") evaluation.config.assertions;
-  pairingHipProvider = evalProvider {
-    gpuBackend = "hip";
-  };
-  cudaProvider = evalProvider {
-    workConfigFile = "/run/hellas/work.toml";
-    gpuBackend = "cuda";
-  };
-  hipProvider = evalProvider {
-    workConfigFile = "/run/hellas/work.toml";
-    gpuBackend = "hip";
-  };
-  anyProgramProvider = evalProvider {
-    workConfigFile = "/run/hellas/work.toml";
-    knowinglyUnsafe = true;
-  };
-  grantOnlyHipProvider = evalProvider {
-    content.lower = [ "/srv/hellas/grant-content" ];
-    grantConfigFile = "/run/hellas/grant.json";
-    gpuBackend = "hip";
-  };
-  maxGpuSessionAssetBytes = evalProvider {
-    gpuSessionAssetBytes = 4398046511104;
-  };
-  insufficientMemoryHeadroom = evalProvider {
-    gpuSessionAssetBytes = 1073741824;
-    memoryMaxBytes = 1073741824;
-  };
-  insufficientDefaultMemoryHeadroom = evalProvider {
-    # Equal to the CLI's effective 128 GiB session-asset default: there is no
-    # room left for the runtime, compiler, or generation state.
-    memoryMaxBytes = 137438953472;
-  };
-  managedContentProvider = evalProvider {
-    content.lower = [ "/var/lib/hellas/content" ];
-  };
-  oversizedGpuSessionAssetBytes =
-    builtins.tryEval
-      (evalProvider {
-        gpuSessionAssetBytes = 4398046511105;
-      }).config.systemd.services.hellas.serviceConfig.ExecStart;
-  oversizedDefaultMaxTokens =
-    builtins.tryEval
-      (evalGateway {
-        defaultMaxTokens = 4294967296;
-      }).config.systemd.services.hellas-gateway.serviceConfig.ExecStart;
-  environmentPathEvaluation =
-    builtins.tryEval
-      (evalProvider {
-        environment.MODEL_FILE = ../../README.md;
-      }).config.systemd.services.hellas.environment.MODEL_FILE;
-  interpolatedEnvironmentPath = evalProvider {
-    environment.MODEL_FILE = "${../../README.md}";
-  };
-  embeddedStoreEnvironmentString = evalProvider {
-    environment.MODEL_URI = "file://${builtins.storeDir}/model.hex";
-  };
-  contextualEnvironmentString = evalProvider {
-    environment.RUNTIME_DATA = contextualRuntimePath;
-  };
-  dotFileUriEnvironmentString = evalProvider {
-    environment.RUNTIME_DATA = "file:///nix/./store/runtime-data";
-  };
-  repeatedSlashFileUriEnvironmentString = evalProvider {
-    environment.RUNTIME_DATA = "file:////nix//store/runtime-data";
-  };
-  percentFileUriEnvironmentString = evalProvider {
-    environment.RUNTIME_DATA = "file:///nix/%73tore/runtime-data";
-  };
-  paddedFileUriEnvironmentString = evalProvider {
-    environment.RUNTIME_DATA = "  file:///nix/%73tore/runtime-data";
-  };
-  controlFileUriEnvironmentString = evalProvider {
-    environment.RUNTIME_DATA = "fi\tle:///nix/%73tore/runtime-data";
-  };
-  ordinaryHttpsEnvironmentString = evalProvider {
-    environment.API_ENDPOINT = "https://api.example.test/v1/responses";
-  };
-  scalarEnvironment = evalProvider {
-    environment = {
-      TEST_BOOLEAN = true;
-      TEST_INTEGER = 7;
-    };
-  };
-  homeManagerLinuxServe = evalHomeManager {
-    programs.hellas = {
-      inherit package;
-      serve.enable = true;
-    };
-  };
-  homeManagerDarwinServe = evalDarwinServe {
-    home = "/Users/hellas/Library/Application Support/Hellas";
-    environmentFile = "/Users/hellas/.config/hellas/provider.env";
-    fetchConfigFile = "/Users/hellas/.config/hellas/fetch.json";
-    assurance = "apple-app-attest";
-  };
-  homeManagerDarwinService = homeManagerDarwinServe.config.launchd.agents.hellas;
-  homeManagerDarwinProgramArguments = homeManagerDarwinService.config.ProgramArguments;
-  homeManagerDarwinDirect = evalDarwinServe { };
-  homeManagerDarwinStoreIdentity = evalDarwinServe {
-    home = "${builtins.storeDir}/hellas";
-  };
-  homeManagerDarwinStoreContent = evalDarwinServe {
-    content.lower = [ "${builtins.storeDir}/model.hex" ];
-  };
-  homeManagerDarwinStoreWorkConfig = evalDarwinServe {
-    workConfigFile = "${builtins.storeDir}/work.toml";
-  };
-  homeManagerDarwinStoreFetchConfig = evalDarwinServe {
-    fetchConfigFile = "${builtins.storeDir}/fetch.json";
-  };
-  homeManagerDarwinStoreEnvironmentFile = evalDarwinServe {
-    environmentFile = "${builtins.storeDir}/provider.env";
-  };
-  homeManagerDarwinRepeatedSlashStoreEnvironmentFile = evalDarwinServe {
-    environmentFile = repeatedSlashStorePath;
-  };
-  homeManagerDarwinDotStoreEnvironmentFile = evalDarwinServe {
-    environmentFile = dotStorePath;
-  };
-  homeManagerDarwinDotDotStoreEnvironmentFile = evalDarwinServe {
-    environmentFile = dotDotStorePath;
-  };
-  homeManagerDarwinContextualEnvironmentFile = evalDarwinServe {
-    environmentFile = contextualRuntimePath;
-  };
-  homeManagerDarwinStoreEnvironment = evalDarwinHomeManager {
-    programs.hellas = {
-      enable = true;
-      inherit package;
-      environment.RUNTIME_DATA = "${builtins.storeDir}/runtime-data";
-    };
-  };
-  homeManagerDarwinPaddedFileUriEnvironment = evalDarwinHomeManager {
-    programs.hellas = {
-      enable = true;
-      inherit package;
-      environment.RUNTIME_DATA = "  file:///nix/%73tore/runtime-data";
-    };
-  };
-  homeManagerDarwinControlFileUriEnvironment = evalDarwinHomeManager {
-    programs.hellas = {
-      enable = true;
-      inherit package;
-      environment.RUNTIME_DATA = "fi\tle:///nix/%73tore/runtime-data";
-    };
-  };
-  homeManagerDarwinUnsafeAssuranceArgs = evalDarwinServe {
-    extraArgs = [ "--assurance=producer-signed" ];
-  };
-  homeManagerDarwinContent = evalDarwinServe {
-    content.lower = [ "/Users/hellas/models" ];
-  };
-  homeManagerDarwinLocalCatena = evalDarwinServe {
-    gpuBackend = "hip";
-  };
-  homeManagerRelativeEnvironmentFile = builtins.tryEval (
-    builtins.deepSeq
-      (evalDarwinServe { environmentFile = "relative.env"; }).config.launchd.agents.hellas
-      true
-  );
-  homeManagerNixPathEnvironmentFile = builtins.tryEval (
-    builtins.deepSeq
-      (evalDarwinServe { environmentFile = ../../README.md; }).config.launchd.agents.hellas
-      true
-  );
-  evaluated = import (pkgs.path + "/nixos/lib/eval-config.nix") {
-    system = pkgs.stdenv.hostPlatform.system;
-    modules = [
-      self.nixosModules.default
-      {
-        nixpkgs.pkgs = plainPkgs;
-        system.stateVersion = "26.05";
-        services.hellas = {
-          enable = true;
-          inherit package;
-          # An operator explicitly enables arbitrary locally satisfiable
-          # Evaluate work, including restart from an already-populated index.
-          home = "/var/lib/hellas/.hellas-v3";
-          durability = "power";
-          content = {
-            lower = [ "/srv/hellas/content" ];
-            upper = "/srv/hellas-upper";
-            index = "require";
-            capacity = "1GiB";
-            policy.on_miss = "refuse";
-          };
-          gpuSessionAssetBytes = 1073741824;
-          memoryMaxBytes = 2147483648;
-          workConfigFile = "/run/hellas/work.toml";
-          passkey = "/run/hellas/owner.passkey";
-          otel.enable = true;
-          metricsPort = 9400;
-          metricsAddress = "0.0.0.0";
-          queueSize = 0;
-          fetchConfigFile = "/run/hellas/fetch.json";
-          environmentFile = "/run/hellas/provider.env";
-          gateway = {
-            enable = true;
-            gatewayProfile = "/run/hellas/gateway-profile.json";
-            access = "/run/hellas/friend.access";
-            backend = "hellas/catena-dfad87438018-hip";
-            models = [ "/srv/hellas/qwen3.gguf" ];
-            passkey = "/run/hellas/principal.passkey";
-            metricsPort = 9401;
-            metricsAddress = "::1";
-            defaultMaxTokens = 4294967295;
-            trustPolicy = "provider";
-            trustStore = "/var/lib/hellas-gateway/trust";
-            responsesOverrides = {
-              store = false;
-            };
-            responsesModels = [
-              "gpt-x"
-              "gpt-y"
-            ];
-            environmentFile = "/run/hellas/gateway.env";
-          };
-        };
-      }
-    ];
-  };
-  service = evaluated.config.systemd.services.hellas;
-  defaultProviderService = defaultIdentityProvider.config.systemd.services.hellas;
-  managedContentProviderService = managedContentProvider.config.systemd.services.hellas;
-  gatewayService = evaluated.config.systemd.services.hellas-gateway;
-  providerContentFile =
-    lib.findFirst (arg: lib.hasSuffix "-hellas-content.toml" (toString arg))
-      (throw "provider lacks content declaration")
-      (
-        hellasModule.mkServeArgs {
-          inherit lib pkgs;
-          serve = evaluated.config.services.hellas;
-          inherit (evaluated.config.services.hellas) otel;
-        }
-      );
-
 in
 {
   provider-content-eval =
-    assert lib.hasInfix "--chain devnet"
-      (evalProvider { chain = "devnet"; }).config.systemd.services.hellas.serviceConfig.ExecStart;
-    assert lib.hasInfix "--chain-config /run/hellas/chain.json"
-      (evalProvider { chainConfig = "/run/hellas/chain.json"; })
-      .config.systemd.services.hellas.serviceConfig.ExecStart;
-    assert lib.elem "/run/hellas/chain.json"
-      (evalProvider { chainConfig = "/run/hellas/chain.json"; })
-      .config.systemd.services.hellas.unitConfig.RequiresMountsFor;
-    assert lib.hasInfix "--chain devnet"
-      (evalGateway { chain = "devnet"; }).config.systemd.services.hellas-gateway.serviceConfig.ExecStart;
-    assert lib.hasInfix "--chain-config /run/hellas/chain.json"
-      (evalGateway { chainConfig = "/run/hellas/chain.json"; })
-      .config.systemd.services.hellas-gateway.serviceConfig.ExecStart;
-    assert lib.any
-      (item: !item.assertion && lib.hasInfix "chain and chainConfig are mutually exclusive" item.message)
-      (evalProvider {
-        chain = "devnet";
-        chainConfig = "/run/hellas/chain.json";
-      }).config.assertions;
-    assert lib.hasInfix "--chain-config /run/hellas/chain.json"
-      (evalValidators {
-        chainConfig = "/run/hellas/chain.json";
-        networkId = "hellas-custom-1";
-      }).config.systemd.services.hellas-validator-devnet-node0.serviceConfig.ExecStart;
-    assert lib.elem "/run/hellas/chain.json"
-      (evalValidators { chainConfig = "/run/hellas/chain.json"; })
-      .config.systemd.services.hellas-validator-devnet-node0.unitConfig.RequiresMountsFor;
-    assert defaultProviderService.serviceConfig.WorkingDirectory == "/var/lib/hellas";
-    assert gatewayService.serviceConfig.WorkingDirectory == "/var/lib/hellas-gateway";
-    assert service.environment ? ROCM_PATH;
-    assert service.environment ? HIP_PATH;
-    assert service.environment.TMPDIR == "/run/hellas";
-    assert service.path != [ ];
-    assert service.serviceConfig.RuntimeDirectory == "hellas";
-    assert service.serviceConfig.RuntimeDirectoryMode == "0700";
-    assert service.serviceConfig.CacheDirectory == "hellas";
-    # The logical resident-asset cap must never lower the driver's memlock
-    # permission. The cgroup ceiling is the whole-unit containment boundary.
-    assert service.serviceConfig.LimitMEMLOCK == "infinity";
-    assert service.serviceConfig.MemoryMax == "2147483648";
-    assert service.serviceConfig.MemorySwapMax == 0;
-    assert service.serviceConfig.OOMPolicy == "kill";
+    assert lib.hasInfix "serve --port" defaultProviderService.serviceConfig.ExecStart;
+    assert !(lib.hasInfix "--model" defaultProviderService.serviceConfig.ExecStart);
+    assert lib.hasInfix "gateway --bind 127.0.0.1:8080" gateway.serviceConfig.ExecStart;
+    assert lib.hasInfix "--model /srv/models/qwen.gguf --model flux@friend --model gpt-5@upstream"
+      gateway.serviceConfig.ExecStart;
+    assert lib.hasInfix (lib.escapeShellArgs [
+      "--upstream"
+      "upstream=https://api.example.com/v1,key-file=/run/secrets/upstream.key"
+    ]) gateway.serviceConfig.ExecStart;
+    assert lib.hasInfix "--bearer-file /run/hellas-gateway/bearer" gateway.serviceConfig.ExecStart;
+    assert !(lib.hasInfix "--config" gateway.serviceConfig.ExecStart);
+    assert !(lib.hasInfix "--local" gateway.serviceConfig.ExecStart);
+    assert lib.hasInfix "--metrics-port 9401 --metrics-addr 127.0.0.1" metrics.serviceConfig.ExecStart;
+    assert gateway.serviceConfig.ReadOnlyPaths == [ "/srv/models/qwen.gguf" ];
+    assert lib.elem "/run/secrets/upstream.key" gateway.unitConfig.RequiresMountsFor;
+    assert custom.serviceConfig.ReadWritePaths == [ "/srv/gateway-state" ];
+    assert gateway.serviceConfig.RuntimeDirectoryMode == "0700";
+    assert gateway.serviceConfig.StateDirectoryMode == "0700";
+    assert gateway.serviceConfig.UMask == "0077";
+    assert gateway.serviceConfig ? LimitMEMLOCK;
+    assert !(remote.serviceConfig ? LimitMEMLOCK);
     assert
-      service.serviceConfig.SupplementaryGroups == [
-        "render"
-        "video"
-      ];
-    assert lib.elem "/dev/kfd rw" service.serviceConfig.DeviceAllow;
-    assert lib.elem "char-drm rw" service.serviceConfig.DeviceAllow;
-    assert !(defaultProviderService.environment ? ROCM_PATH);
-    assert !(defaultProviderService.environment ? HIP_PATH);
-    assert !(lib.elem pkgs.rocmPackages.clang defaultProviderService.path);
-    assert !(lib.elem pkgs.rocmPackages.hipcc defaultProviderService.path);
-    assert !(defaultProviderService.serviceConfig ? SupplementaryGroups);
-    assert !(defaultProviderService.serviceConfig ? DeviceAllow);
-    assert !(managedContentProviderService.environment ? ROCM_PATH);
-    assert !(managedContentProviderService.environment ? HIP_PATH);
-    assert !(lib.elem pkgs.rocmPackages.clang managedContentProviderService.path);
-    assert !(lib.elem pkgs.rocmPackages.hipcc managedContentProviderService.path);
-    assert !(managedContentProviderService.serviceConfig ? SupplementaryGroups);
-    assert !(managedContentProviderService.serviceConfig ? DeviceAllow);
-    assert !(managedContentProviderService.serviceConfig ? LimitMEMLOCK);
-    assert lib.hasInfix "--home /var/lib/hellas/.hellas-v3" service.serviceConfig.ExecStart;
-    assert lib.hasInfix "--home /var/lib/hellas/.hellas"
-      defaultIdentityProvider.config.systemd.services.hellas.serviceConfig.ExecStart;
-    assert lib.hasInfix "--home /srv/hellas-home"
-      customHomeProvider.config.systemd.services.hellas.serviceConfig.ExecStart;
-    assert lib.elem "/srv/hellas-home"
-      customHomeProvider.config.systemd.services.hellas.serviceConfig.ReadWritePaths;
-    assert lib.elem "/srv/hellas-home"
-      customHomeProvider.config.systemd.services.hellas.unitConfig.RequiresMountsFor;
-    assert lib.hasInfix "--home /srv/hellas-gateway-home"
-      customHomeGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart;
-    assert lib.elem "/srv/hellas-gateway-home"
-      customHomeGateway.config.systemd.services.hellas-gateway.serviceConfig.ReadWritePaths;
-    assert lib.elem "/srv/hellas-gateway-home"
-      customHomeGateway.config.systemd.services.hellas-gateway.unitConfig.RequiresMountsFor;
-    assert lib.hasInfix "--queue-size 0" service.serviceConfig.ExecStart;
-    assert lib.hasInfix "--durability power" service.serviceConfig.ExecStart;
-    assert lib.hasInfix "--durability crash" defaultProviderService.serviceConfig.ExecStart;
-    assert lib.hasInfix
-      "--content-config ${builtins.unsafeDiscardStringContext (toString providerContentFile)}"
-      service.serviceConfig.ExecStart;
-    assert lib.hasInfix "--assurance producer-signed" service.serviceConfig.ExecStart;
-    assert lib.all (path: lib.elem path service.unitConfig.RequiresMountsFor) [
-      "/var/lib/hellas/.hellas-v3"
-      "/srv/hellas/content"
-      "/srv/hellas-upper"
-      "/run/hellas/work.toml"
-      "/run/hellas/fetch.json"
-      "/run/hellas/provider.env"
-    ];
+      !(assertion "must name at least one" (evalGateway {
+        models = [ ];
+      }));
     assert
-      service.serviceConfig.ReadWritePaths == [
-        "/srv/hellas-upper"
-      ];
-    assert service.serviceConfig.ReadOnlyPaths == [ "/srv/hellas/content" ];
+      !(assertion "absolute runtime paths" (evalGateway {
+        models = [ "relative.gguf" ];
+      }));
     assert
-      managedContentProviderService.serviceConfig.ReadOnlyPaths == [
-        "/var/lib/hellas/content"
-      ];
-    assert !(managedContentProviderService.serviceConfig ? ReadWritePaths);
-    assert service.serviceConfig.EnvironmentFile == "/run/hellas/provider.env";
-    assert lib.hasInfix "--paid-work-config /run/hellas/work.toml" service.serviceConfig.ExecStart;
-    assert lib.hasInfix "--passkey /run/hellas/owner.passkey" service.serviceConfig.ExecStart;
-    assert lib.elem "/run/hellas/owner.passkey" service.unitConfig.RequiresMountsFor;
-    assert lib.hasInfix "--fetch-config /run/hellas/fetch.json" service.serviceConfig.ExecStart;
+      !(assertion "fixed port" (evalGateway {
+        port = 0;
+        openFirewall = true;
+      }));
     assert
-      !(metricsFeatureAssertion (evalProvider {
-        metricsPort = 9400;
-      })).assertion;
+      !(assertion "runtime data outside" (evalGateway {
+        models = [ "${builtins.storeDir}/model.gguf" ];
+      }));
     assert
-      !(metricsFeatureAssertion (evalGateway {
+      !(assertion "runtime data outside" (evalGateway {
+        upstreams.upstream = {
+          url = "https://example.com";
+          keyFile = "${builtins.storeDir}/key";
+        };
+      }));
+    assert
+      !(assertion "gateway writable journal paths" (evalGateway {
+        home = "/";
+      }));
+    assert
+      !(assertion "services.hellas.gateway.extraArgs" (evalGateway {
+        extraArgs = [ "--model=/run/model" ];
+      }));
+    assert
+      !(assertion "services.hellas.extraArgs" (evalProvider {
+        extraArgs = [ "--home=/run/home" ];
+      }));
+    assert
+      !(assertion "metrics ports require" (evalGateway {
         metricsPort = 9401;
-      })).assertion;
-    assert
-      !(lib.hasInfix "--metrics-"
-        (evalProvider { metricsPort = 9400; }).config.systemd.services.hellas.serviceConfig.ExecStart
-      );
-    assert
-      !(lib.hasInfix "--metrics-"
-        (evalGateway { metricsPort = 9401; }).config.systemd.services.hellas-gateway.serviceConfig.ExecStart
-      );
-    assert lib.hasInfix "--metrics-port 9400" service.serviceConfig.ExecStart;
-    assert lib.hasInfix "--metrics-addr 0.0.0.0" service.serviceConfig.ExecStart;
-    assert lib.hasInfix "--metrics-addr ::1" gatewayService.serviceConfig.ExecStart;
-    assert (evalGateway { }).config.services.hellas.gateway.metricsAddress == "127.0.0.1";
-    assert (evalProvider { }).config.services.hellas.metricsAddress == "127.0.0.1";
-    assert lib.all
-      (
-        args:
-        !(serveExtraArgsAssertion (evalProvider {
-          extraArgs = args;
-        })).assertion
-        && !(gatewayExtraArgsAssertion (evalGateway {
-          extraArgs = args;
-        })).assertion
-      )
-      [
-        [
-          "--metrics-addr"
-          "0.0.0.0"
-        ]
-        [ "--metrics-addr=0.0.0.0" ]
-      ];
-    assert lib.hasInfix "--metrics-port 9401" gatewayService.serviceConfig.ExecStart;
-    assert
-      !(lib.hasInfix "--metrics-port"
-        (evalGateway { }).config.systemd.services.hellas-gateway.serviceConfig.ExecStart
-      );
-    assert lib.all
-      (
-        args:
-        !(gatewayExtraArgsAssertion (evalGateway {
-          extraArgs = args;
-        })).assertion
-      )
-      [
-        [
-          "--metrics-port"
-          "9402"
-        ]
-        [ "--metrics-port=9402" ]
-      ];
-    assert lib.hasInfix "--responses-model gpt-x,gpt-y" gatewayService.serviceConfig.ExecStart;
-    assert lib.hasInfix "--responses-overrides" gatewayService.serviceConfig.ExecStart;
-    assert lib.hasInfix "--gateway-profile /run/hellas/gateway-profile.json"
-      gatewayService.serviceConfig.ExecStart;
-    assert lib.elem "/run/hellas/gateway-profile.json" gatewayService.unitConfig.RequiresMountsFor;
-    assert lib.hasInfix "--passkey /run/hellas/principal.passkey"
-      gatewayService.serviceConfig.ExecStart;
-    assert lib.elem "/run/hellas/principal.passkey" gatewayService.unitConfig.RequiresMountsFor;
-    assert lib.hasInfix "--default-max-tokens 4294967295" gatewayService.serviceConfig.ExecStart;
-    assert lib.hasInfix "--model /srv/hellas/qwen3.gguf" gatewayService.serviceConfig.ExecStart;
-    assert lib.hasInfix "--access /run/hellas/friend.access" gatewayService.serviceConfig.ExecStart;
-    assert lib.hasInfix "--backend hellas/catena-dfad87438018-hip"
-      gatewayService.serviceConfig.ExecStart;
-    assert lib.elem "/run/hellas/friend.access" gatewayService.unitConfig.RequiresMountsFor;
-    assert lib.hasInfix "--trust-policy provider" gatewayService.serviceConfig.ExecStart;
-    assert lib.hasInfix "--trust-store /var/lib/hellas-gateway/trust"
-      gatewayService.serviceConfig.ExecStart;
-    assert lib.elem "/run/hellas/gateway.env" gatewayService.unitConfig.RequiresMountsFor;
-    assert gatewayService.serviceConfig.EnvironmentFile == "/run/hellas/gateway.env";
-    assert !(runtimeStoreAssertion storePathGateway).assertion;
-    assert !(runtimeStoreAssertion storePathIdentityGateway).assertion;
-    assert !(runtimeStoreAssertion storePathModelGateway).assertion;
-    assert !(runtimeStoreAssertion storePathIdentityProvider).assertion;
-    assert !(runtimeStoreAssertion storePathContentProvider).assertion;
-    assert !(runtimeStoreAssertion storePathWorkConfig).assertion;
-    assert !(runtimeStoreAssertion storePathFetchConfig).assertion;
-    assert !(runtimeStoreAssertion storePathProviderEnvironmentFile).assertion;
-    assert !(serveExtraArgsAssertion unsafeServeExtraArgs).assertion;
-    assert !(serveExtraArgsAssertion unsafeServeAssuranceArgs).assertion;
-    assert !(gatewayExtraArgsAssertion unsafeGatewayExtraArgs).assertion;
-    assert (serveExtraArgsAssertion harmlessExtraArgs).assertion;
-    assert !(providerAssuranceAssertion unsupportedProviderApple).assertion;
-    assert !(trustPairAssertion incompleteTrust).assertion;
-    assert (fundingAssertion discoveryGateway).assertion;
-    assert !(fundingAssertion noTargetGateway).assertion;
-    assert !(fundingAssertion twoTargetGateway).assertion;
-    assert (payProviderAssertion payGateway).assertion;
-    assert !(payProviderAssertion payWithoutProviderGateway).assertion;
-    assert lib.hasInfix "--pay 20 --provider provider-id"
-      payGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart;
-    assert
-      !(lib.hasInfix "--access" payGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart);
-    assert !(allowRemoteAssertion remoteWithoutProfileGateway).assertion;
-    assert !(gatewayContentLocalAssertion contentWithoutLocalGateway).assertion;
-    assert (gatewayContentLocalAssertion managedGatewayContent).assertion;
-    assert lib.hasInfix " --local"
-      localGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart;
-    assert
-      !(lib.hasInfix "--access" localGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart);
-    assert lib.hasInfix " --local"
-      localHipGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart;
-    assert localHipGateway.config.systemd.services.hellas-gateway.environment ? ROCM_PATH;
-    assert localHipGateway.config.systemd.services.hellas-gateway.environment ? HIP_PATH;
-    assert !(localHipGateway.config.systemd.services.hellas-gateway.environment ? CUDA_PATH);
-    assert localHipGateway.config.systemd.services.hellas-gateway.path != [ ];
-    assert
-      localHipGateway.config.systemd.services.hellas-gateway.serviceConfig.SupplementaryGroups == [
-        "render"
-        "video"
-      ];
-    assert lib.elem "/dev/kfd rw"
-      localHipGateway.config.systemd.services.hellas-gateway.serviceConfig.DeviceAllow;
-    assert lib.elem "char-drm rw"
-      localHipGateway.config.systemd.services.hellas-gateway.serviceConfig.DeviceAllow;
-    assert
-      localHipGateway.config.systemd.services.hellas-gateway.serviceConfig.LimitMEMLOCK == "infinity";
-    assert (gatewayContentDisjointAssertion managedGatewayContent).assertion;
-    assert
-      managedGatewayContent.config.systemd.services.hellas-gateway.serviceConfig.ReadOnlyPaths
-      == [ "/var/lib/hellas-gateway/models" ];
-    assert
-      !(managedGatewayContent.config.systemd.services.hellas-gateway.serviceConfig ? ReadWritePaths);
-    assert !(gatewayContentDisjointAssertion gatewayLowerOverGrantData).assertion;
-    assert !(gatewayContentDisjointAssertion gatewayLowerOverAuthority).assertion;
-    assert !(gatewayContentDisjointAssertion gatewayLowerOverUpper).assertion;
-    assert !(discoveryGateway.config.systemd.services.hellas-gateway.environment ? ROCM_PATH);
-    assert !(discoveryGateway.config.systemd.services.hellas-gateway.serviceConfig ? LimitMEMLOCK);
-    assert !(memoryHeadroomAssertion insufficientMemoryHeadroom).assertion;
-    assert !(memoryHeadroomAssertion insufficientDefaultMemoryHeadroom).assertion;
-    assert !(writableRootAssertion rootJournalGateway).assertion;
-    assert lib.hasInfix "--gpu-session-asset-bytes 4398046511104"
-      maxGpuSessionAssetBytes.config.systemd.services.hellas.serviceConfig.ExecStart;
-    assert lib.hasInfix "--gpu-backend cuda"
-      cudaProvider.config.systemd.services.hellas.serviceConfig.ExecStart;
-    assert cudaProvider.config.systemd.services.hellas.environment ? CUDA_PATH;
-    assert !(cudaProvider.config.systemd.services.hellas.environment ? ROCM_PATH);
-    assert builtins.elem "char-nvidia-uvm rw"
-      cudaProvider.config.systemd.services.hellas.serviceConfig.DeviceAllow;
-    assert lib.hasInfix "--gpu-backend hip"
-      hipProvider.config.systemd.services.hellas.serviceConfig.ExecStart;
-    assert hipProvider.config.systemd.services.hellas.environment ? ROCM_PATH;
-    assert !(hipProvider.config.systemd.services.hellas.environment ? CUDA_PATH);
-    assert lib.hasInfix "--knowingly-unsafe"
-      anyProgramProvider.config.systemd.services.hellas.serviceConfig.ExecStart;
-    assert
-      !(lib.hasInfix "--knowingly-unsafe" hipProvider.config.systemd.services.hellas.serviceConfig.ExecStart);
-    assert lib.hasInfix "--grant-config /run/hellas/grant.json"
-      grantOnlyHipProvider.config.systemd.services.hellas.serviceConfig.ExecStart;
-    assert grantOnlyHipProvider.config.systemd.services.hellas.environment ? ROCM_PATH;
-    assert grantOnlyHipProvider.config.systemd.services.hellas.path != [ ];
-    assert
-      grantOnlyHipProvider.config.systemd.services.hellas.serviceConfig.SupplementaryGroups == [
-        "render"
-        "video"
-      ];
-    assert lib.elem "/dev/kfd rw"
-      grantOnlyHipProvider.config.systemd.services.hellas.serviceConfig.DeviceAllow;
-    assert grantOnlyHipProvider.config.systemd.services.hellas.serviceConfig.LimitMEMLOCK == "infinity";
-    assert lib.elem "/run/hellas/grant.json"
-      grantOnlyHipProvider.config.systemd.services.hellas.unitConfig.RequiresMountsFor;
-    assert
-      !(lib.hasInfix "--paid-work-config" pairingHipProvider.config.systemd.services.hellas.serviceConfig.ExecStart);
-    assert
-      !(lib.hasInfix "--grant-config" pairingHipProvider.config.systemd.services.hellas.serviceConfig.ExecStart);
-    assert pairingHipProvider.config.systemd.services.hellas.environment ? ROCM_PATH;
-    assert pairingHipProvider.config.systemd.services.hellas.path != [ ];
-    assert
-      pairingHipProvider.config.systemd.services.hellas.serviceConfig.SupplementaryGroups == [
-        "render"
-        "video"
-      ];
-    assert lib.elem "/dev/kfd rw"
-      pairingHipProvider.config.systemd.services.hellas.serviceConfig.DeviceAllow;
-    assert pairingHipProvider.config.systemd.services.hellas.serviceConfig.LimitMEMLOCK == "infinity";
-    assert !oversizedGpuSessionAssetBytes.success;
-    assert !oversizedDefaultMaxTokens.success;
-    assert !environmentPathEvaluation.success;
-    assert !(environmentStoreAssertion interpolatedEnvironmentPath).assertion;
-    assert !(environmentStoreAssertion embeddedStoreEnvironmentString).assertion;
-    assert builtins.hasContext contextualRuntimePath;
-    assert !(environmentStoreAssertion contextualEnvironmentString).assertion;
-    assert !(environmentStoreAssertion dotFileUriEnvironmentString).assertion;
-    assert !(environmentStoreAssertion repeatedSlashFileUriEnvironmentString).assertion;
-    assert !(environmentStoreAssertion percentFileUriEnvironmentString).assertion;
-    assert !(environmentStoreAssertion paddedFileUriEnvironmentString).assertion;
-    assert !(environmentStoreAssertion controlFileUriEnvironmentString).assertion;
-    assert (environmentStoreAssertion ordinaryHttpsEnvironmentString).assertion;
-    assert !(hellasModule.runtimeStringIsOutsideStore lib "file://${builtins.storeDir}/model.hex");
-    assert !(hellasModule.runtimeStringIsOutsideStore lib "file:///nix/./store/model.hex");
-    assert !(hellasModule.runtimeStringIsOutsideStore lib "file:////nix//store/model.hex");
-    assert !(hellasModule.runtimeStringIsOutsideStore lib "file:///nix/%73tore/model.hex");
-    assert !(hellasModule.runtimeStringIsOutsideStore lib "  file:///nix/%73tore/model.hex");
-    assert !(hellasModule.runtimeStringIsOutsideStore lib "fi\tle:///nix/%73tore/model.hex");
-    assert !(hellasModule.runtimeStringIsOutsideStore lib "fil\ne:///nix/%73tore/model.hex");
-    assert !(hellasModule.runtimeStringIsOutsideStore lib "file\r:///nix/%73tore/model.hex");
-    assert hellasModule.runtimeStringIsOutsideStore lib "https://api.example.test/v1/responses";
-    assert hellasModule.runtimePathIsOutsideStore lib "/run/hellas/provider.env";
-    assert !(hellasModule.runtimePathIsOutsideStore lib "relative.env");
-    assert !(hellasModule.runtimePathIsOutsideStore lib repeatedSlashStorePath);
-    assert !(hellasModule.runtimePathIsOutsideStore lib dotStorePath);
-    assert !(hellasModule.runtimePathIsOutsideStore lib dotDotStorePath);
-    assert !(hellasModule.runtimePathIsOutsideStore lib contextualRuntimePath);
-    assert
-      scalarEnvironment.config.systemd.services.hellas.environment.TEST_BOOLEAN == builtins.toString true;
-    assert scalarEnvironment.config.systemd.services.hellas.environment.TEST_INTEGER == "7";
-    assert !(homeManagerPlatformAssertion homeManagerLinuxServe).assertion;
-    assert homeManagerLinuxServe.config.programs.hellas.serve.home == "/home/hellas/.hellas";
-    assert homeManagerDarwinService.enable;
-    assert lib.hasSuffix "-hellas-runtime-environment" (
-      builtins.head homeManagerDarwinProgramArguments
-    );
-    assert
-      builtins.tail homeManagerDarwinProgramArguments == [
-        "/Users/hellas/.config/hellas/provider.env"
-        "${package}/bin/hellas"
-        "serve"
-        "--home"
-        "/Users/hellas/Library/Application Support/Hellas"
-        "--durability"
-        "crash"
-        "--port"
-        "31145"
-        "--assurance"
-        "apple-app-attest"
-        "--fetch-config"
-        "/Users/hellas/.config/hellas/fetch.json"
-      ];
-    assert !(homeManagerDarwinService.config ? EnvironmentFile);
-    assert homeManagerDarwinService.config.EnvironmentVariables == { HOME = "/Users/hellas"; };
-    assert
-      homeManagerDarwinDirect.config.launchd.agents.hellas.config.ProgramArguments == [
-        "${package}/bin/hellas"
-        "serve"
-        "--home"
-        "/Users/hellas/.hellas"
-        "--durability"
-        "crash"
-        "--port"
-        "31145"
-        "--assurance"
-        "producer-signed"
-      ];
-    assert (homeManagerCatenaAssertion homeManagerDarwinServe).assertion;
-    assert (homeManagerRuntimeStoreAssertion homeManagerDarwinServe).assertion;
-    assert !(homeManagerRuntimeStoreAssertion homeManagerDarwinStoreIdentity).assertion;
-    assert !(homeManagerRuntimeStoreAssertion homeManagerDarwinStoreContent).assertion;
-    assert !(homeManagerRuntimeStoreAssertion homeManagerDarwinStoreWorkConfig).assertion;
-    assert !(homeManagerRuntimeStoreAssertion homeManagerDarwinStoreFetchConfig).assertion;
-    assert !(homeManagerRuntimeStoreAssertion homeManagerDarwinStoreEnvironmentFile).assertion;
-    assert
-      !(homeManagerRuntimeStoreAssertion homeManagerDarwinRepeatedSlashStoreEnvironmentFile).assertion;
-    assert !(homeManagerRuntimeStoreAssertion homeManagerDarwinDotStoreEnvironmentFile).assertion;
-    assert !(homeManagerRuntimeStoreAssertion homeManagerDarwinDotDotStoreEnvironmentFile).assertion;
-    assert !(homeManagerRuntimeStoreAssertion homeManagerDarwinContextualEnvironmentFile).assertion;
-    assert !(homeManagerEnvironmentStoreAssertion homeManagerDarwinStoreEnvironment).assertion;
-    assert !(homeManagerEnvironmentStoreAssertion homeManagerDarwinPaddedFileUriEnvironment).assertion;
-    assert !(homeManagerEnvironmentStoreAssertion homeManagerDarwinControlFileUriEnvironment).assertion;
-    assert !(homeManagerExtraArgsAssertion homeManagerDarwinUnsafeAssuranceArgs).assertion;
-    assert !(homeManagerCatenaAssertion homeManagerDarwinLocalCatena).assertion;
-    assert (homeManagerCatenaAssertion homeManagerDarwinContent).assertion;
-    assert !homeManagerRelativeEnvironmentFile.success;
-    assert !homeManagerNixPathEnvironmentFile.success;
-    assert
-      !(lib.hasInfix "--model" nativeGatewayWithoutModel.config.systemd.services.hellas-gateway.serviceConfig.ExecStart);
-    pkgs.runCommand "hellas-provider-content-module-eval" { nativeBuildInputs = [ pkgs.python3 ]; } ''
-      python3 - ${providerContentFile} <<'PYCONTENT'
-      import sys, tomllib
-      with open(sys.argv[1], "rb") as source:
-          declaration = tomllib.load(source)
-      assert declaration == {"content": {
-          "upper": "/srv/hellas-upper", "lower": ["/srv/hellas/content"],
-          "index": "require", "capacity": "1GiB", "policy": {"on_miss": "refuse"}
-      }}, declaration
-      PYCONTENT
+      }));
+    assert lib.all (path: !(hellasModule.runtimePathIsOutsideStore lib path)) [
+      "${builtins.storeDir}/secret"
+      "/.${builtins.storeDir}/secret"
+      "/run/../..${builtins.storeDir}/secret"
+      (builtins.appendContext "/run/secrets/key" (builtins.getContext (toString package)))
+    ];
+    assert lib.all (value: !(hellasModule.runtimeStringIsOutsideStore lib value)) [
+      "file:/run/key"
+      " FILE:/run/key"
+      "fi\tle:/run/key"
+      "${builtins.storeDir}/secret"
+    ];
+    pkgs.runCommand "hellas-daemon-module-eval" { } ''
       umask 077
       environment_file="$PWD/provider.env"
       printf '%s\n' \

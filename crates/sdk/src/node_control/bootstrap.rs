@@ -78,7 +78,7 @@ impl Invitation {
     }
 }
 
-/// The caller transfers the already-bound normal node endpoint into HostHandle
+/// The caller transfers the already-bound normal node endpoint into the daemon
 /// after success, preserving its pin and direct addresses without rebinding.
 /// The store itself decides whether initialization is allowed; no receipt file
 /// can reset an existing authority. Accepted writes finish despite disconnection.
@@ -243,6 +243,36 @@ pub async fn connect(
         return Err(denied());
     }
     Ok(())
+}
+
+/// Bind the normal node transport once, before pairing or service startup.
+pub async fn bind_transport(
+    key: iroh::SecretKey,
+    port: Option<u16>,
+    admission: RemoteControlAdmission,
+) -> Result<iroh::Endpoint, crate::provider::ProviderError> {
+    let mut builder = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+        .secret_key(key)
+        .hooks(admission)
+        .alpns(transport_alpns());
+    if let Some(port) = port {
+        builder = crate::provider::bind_port(builder, port)?;
+    }
+    Ok(builder.bind().await?)
+}
+
+fn transport_alpns() -> Vec<Vec<u8>> {
+    vec![
+        hellas_rpc::services::node::Node::ALPN.as_bytes().to_vec(),
+        hellas_rpc::services::content::Content::ALPN
+            .as_bytes()
+            .to_vec(),
+        hellas_rpc::services::work::Work::ALPN.as_bytes().to_vec(),
+        hellas_rpc::services::work_setup::WorkSetup::ALPN
+            .as_bytes()
+            .to_vec(),
+        HostControl::ALPN.as_bytes().to_vec(),
+    ]
 }
 
 #[cfg(test)]

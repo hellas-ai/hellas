@@ -1,5 +1,5 @@
 //! Image preparation and PNG encoding stay on the caller's side of Compute.
-use super::{GatewayError, GatewayResult, ImageOptions, WorkExecutionBackend, json_error};
+use super::{GatewayError, GatewayResult, json_error, route::RouteExecution};
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, State, rejection::JsonRejection},
@@ -11,29 +11,21 @@ use hellas_adaptors::openai::{
     error_json,
     images::{self, ImageGeneration},
 };
-use hellas_client::model::{ModelPackage, ModelRequest, ModelResponse, flux::ImageRequest};
+use hellas_client::model::{ModelRequest, ModelResponse, flux::ImageRequest};
 use std::sync::Arc;
 
 pub(super) const PATH: &str = "/v1/images/generations";
 pub(super) const MAX_REQUEST_BYTES: usize = 64 << 10;
 struct ImageState {
-    package: Arc<ModelPackage>,
     name: String,
-    work: Arc<dyn WorkExecutionBackend>,
+    work: Arc<RouteExecution>,
 }
-pub(super) async fn router(
-    options: &ImageOptions,
-    work: Arc<dyn WorkExecutionBackend>,
-) -> GatewayResult<Router> {
-    let path = options.model.clone();
-    let package = ModelPackage::open(
-        &path,
-        &work.evaluator().ok_or(crate::GatewayError::Presentation(
-            "Compute models need a renderer (evaluator id)".into(),
-        ))?,
-    )
-    .await
-    .map_err(|error| GatewayError::Presentation(error.into()))?;
+pub(super) async fn router(model_name: String, work: Arc<RouteExecution>) -> GatewayResult<Router> {
+    let package = work
+        .packages
+        .values()
+        .next()
+        .ok_or_else(|| GatewayError::Presentation("image route needs a renderer".into()))?;
     if !package.is_image() {
         return Err(GatewayError::Presentation(
             "image route requires a Flux model".into(),
@@ -43,13 +35,13 @@ pub(super) async fn router(
         .route(PATH, post(handle))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(Arc::new(ImageState {
-            package: Arc::new(package),
-            name: options.model_name.clone(),
+            name: model_name,
             work,
         })))
 }
 async fn handle(
     State(state): State<Arc<ImageState>>,
+    axum::Extension(mut selection): axum::Extension<crate::routing::Selection>,
     request: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Response {
     let request = match request {
@@ -73,38 +65,24 @@ async fn handle(
     if let Err(error) = image_request(&request).validate() {
         return json_error(StatusCode::BAD_REQUEST, error.to_string());
     }
-    let deadline = state
+    let (package, stream) = match state
         .work
-        .timeout()
-        .map(|timeout| tokio::time::Instant::now() + timeout);
-    let package = state.package.clone();
-    let prepared = async move {
-        package
-            .render_job(&ModelRequest::Image(image_request(&request)))
-            .await
+        .compute(
+            &mut selection,
+            &ModelRequest::Image(image_request(&request)),
+        )
+        .await
+    {
+        Ok(prepared) => prepared,
+        Err(error) => return crate::work_error(error),
     };
-    let job = match crate::before_deadline(deadline, prepared).await {
-        Ok(Ok(job)) => job,
-        Ok(Err(error)) => return json_error(StatusCode::BAD_REQUEST, error.to_string()),
-        Err(_) => return json_error(StatusCode::GATEWAY_TIMEOUT, "image preparation timed out"),
-    };
-    if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
-        return json_error(StatusCode::GATEWAY_TIMEOUT, "image preparation timed out");
-    }
     let crate::compute::Completion {
         output,
         accepted,
         transcript,
-    } = crate::compute::collect(
-        state.work.as_ref(),
-        job,
-        deadline,
-        "image generation timed out",
-    )
-    .await;
+    } = crate::compute::collect(stream).await;
     let (status, body) = match output {
         Ok(output) => {
-            let package = state.package.clone();
             let png = tokio::task::spawn_blocking(
                 move || -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
                     let ModelResponse::Image(image) = package.decode(&output)? else {
@@ -113,19 +91,15 @@ async fn handle(
                     image.png(width, height).map_err(Into::into)
                 },
             );
-            match crate::before_deadline(deadline, png).await {
-                Ok(Ok(Ok(png))) => (
+            match png.await {
+                Ok(Ok(png)) => (
                     StatusCode::OK,
                     images::render(&png, crate::now_unix() as u64),
                 ),
-                Ok(Ok(Err(error))) => (StatusCode::BAD_GATEWAY, error_json(error.to_string())),
-                Ok(Err(error)) => (
+                Ok(Err(error)) => (StatusCode::BAD_GATEWAY, error_json(error.to_string())),
+                Err(error) => (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     error_json(error.to_string()),
-                ),
-                Err(_) => (
-                    StatusCode::GATEWAY_TIMEOUT,
-                    error_json("image encoding timed out"),
                 ),
             }
         }

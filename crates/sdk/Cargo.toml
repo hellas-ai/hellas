@@ -14,10 +14,13 @@ integration-tests = []
 compute = ["hellas-executor/compute"]
 
 [dependencies]
+arc-swap = "1"
 async-stream = { workspace = true }
+axum.workspace = true
 base64 = { workspace = true }
 futures = { workspace = true }
 futures-core = { workspace = true }
+hellas-adaptors.workspace = true
 hellas-attestation = { workspace = true, features = ["apple-app-attest"] }
 hellas-auth = { workspace = true }
 hellas-authority = { workspace = true }
@@ -69,6 +72,7 @@ tempfile = { workspace = true }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "sync"] }
 toml.workspace = true
+tower = { version = "0.5", features = ["util"] }
 tracing = { workspace = true }
 url = { version = "2" }
 zeroize = { version = "1.9" }
@@ -86,6 +90,7 @@ hellas-chain = { workspace = true, features = ["test-support"] }
 hellas-channel = { workspace = true, features = ["test-support"] }
 # Provider fixtures run Compute in this test binary's Catena child.
 hellas-executor = { workspace = true, features = ["compute"] }
+hellas-gateway = { workspace = true, features = ["test-support"] }
 libloading = "0.9"
 rcgen = "0.14"
 reqwest = { workspace = true, features = ["json"] }

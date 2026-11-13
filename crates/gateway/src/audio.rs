@@ -2,7 +2,7 @@
 //! `hellas_adaptors::openai::audio_transcriptions`, and decoded through one
 //! Compute job.
 use super::backend::provenance::json_response;
-use super::{AudioOptions, GatewayError, GatewayResult, WorkExecutionBackend, json_error};
+use super::{GatewayError, GatewayResult, json_error, route::RouteExecution};
 use axum::{
     Router,
     extract::{DefaultBodyLimit, FromRequest, Multipart, Request, State},
@@ -11,41 +11,38 @@ use axum::{
     routing::post,
 };
 use hellas_adaptors::openai::audio_transcriptions::TranscriptionForm;
-use hellas_client::model::{ModelPackage, ModelRequest, ModelResponse, wav};
+use hellas_client::model::{ModelRequest, ModelResponse, wav};
 use std::sync::Arc;
 pub(super) const PATH: &str = "/v1/audio/transcriptions";
 pub(super) const MAX_REQUEST_BYTES: usize = wav::MAX_WAV_BYTES + (64 << 10);
 
 struct AudioState {
-    package: Arc<ModelPackage>,
-    options: AudioOptions,
-    work: Arc<dyn WorkExecutionBackend>,
+    model_name: String,
+    max_tokens: usize,
+    work: Arc<RouteExecution>,
 }
 pub(super) async fn router(
-    options: &AudioOptions,
-    work: Arc<dyn WorkExecutionBackend>,
+    model_name: String,
+    max_tokens: usize,
+    work: Arc<RouteExecution>,
 ) -> GatewayResult<Router> {
-    if options.default_max_tokens == 0 {
+    if max_tokens == 0 {
         return Err(super::GatewayConfigError::MaxTokens.into());
     }
-    let path = options.model.clone();
-    let package = ModelPackage::open(
-        &path,
-        &work.evaluator().ok_or(crate::GatewayError::Presentation(
-            "Compute models need a renderer (evaluator id)".into(),
-        ))?,
-    )
-    .await
-    .map_err(|error| GatewayError::Presentation(error.into()))?;
+    let package = work
+        .packages
+        .values()
+        .next()
+        .ok_or_else(|| GatewayError::Presentation("audio route needs a renderer".into()))?;
     let capacity = package
         .transcription_capacity()
         .ok_or_else(|| GatewayError::Presentation("audio route requires a Whisper model".into()))?;
-    if options.default_max_tokens > capacity {
+    if max_tokens > capacity {
         return Err(super::GatewayConfigError::MaxTokens.into());
     }
     let state = Arc::new(AudioState {
-        package: Arc::new(package),
-        options: options.clone(),
+        model_name,
+        max_tokens,
         work,
     });
     Ok(Router::new()
@@ -73,7 +70,11 @@ pub(super) async fn multipart_model(request: Request) -> Result<String, Box<Resp
     Ok(form.model().map_err(crate::request_error)?.to_owned())
 }
 
-async fn handle(State(state): State<Arc<AudioState>>, mut form: Multipart) -> Response {
+async fn handle(
+    State(state): State<Arc<AudioState>>,
+    axum::Extension(mut selection): axum::Extension<crate::routing::Selection>,
+    mut form: Multipart,
+) -> Response {
     let mut fields = TranscriptionForm::default();
     while let Some(field) = match form.next_field().await {
         Ok(field) => field,
@@ -94,56 +95,37 @@ async fn handle(State(state): State<Arc<AudioState>>, mut form: Multipart) -> Re
             return crate::request_error(error);
         }
     }
-    let (file, language, text) = match fields.finish(&state.options.model_name) {
+    let (file, language, text) = match fields.finish(&state.model_name) {
         Ok(fields) => fields,
         Err(error) => return crate::request_error(error),
     };
-    let deadline = state
+    let samples = match tokio::task::spawn_blocking(move || wav::decode(&file)).await {
+        Ok(Ok(samples)) => samples,
+        Ok(Err(error)) => return json_error(StatusCode::BAD_REQUEST, error.to_string()),
+        Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    };
+    let (package, stream) = match state
         .work
-        .timeout()
-        .map(|timeout| tokio::time::Instant::now() + timeout);
-    let package = state.package.clone();
-    let max_new_tokens = state.options.default_max_tokens;
-    let job = match crate::before_deadline(deadline, async move {
-        let samples = tokio::task::spawn_blocking(move || wav::decode(&file)).await??;
-        package
-            .render_job(&ModelRequest::Transcription {
+        .compute(
+            &mut selection,
+            &ModelRequest::Transcription {
                 samples: &samples,
                 language: language.as_deref(),
-                max_new_tokens,
-            })
-            .await
-    })
-    .await
+                max_new_tokens: state.max_tokens,
+            },
+        )
+        .await
     {
-        Ok(Ok(job)) => job,
-        Ok(Err(error)) => return json_error(StatusCode::BAD_REQUEST, error.to_string()),
-        Err(_) => {
-            return json_error(
-                StatusCode::GATEWAY_TIMEOUT,
-                "transcription preparation timed out",
-            );
-        }
+        Ok(prepared) => prepared,
+        Err(error) => return crate::work_error(error),
     };
-    if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
-        return json_error(
-            StatusCode::GATEWAY_TIMEOUT,
-            "transcription preparation timed out",
-        );
-    }
     let crate::compute::Completion {
         output,
         accepted,
         transcript,
-    } = crate::compute::collect(
-        state.work.as_ref(),
-        job,
-        deadline,
-        "transcription timed out",
-    )
-    .await;
+    } = crate::compute::collect(stream).await;
     let mut response = match output {
-        Ok(output) => match state.package.decode(&output) {
+        Ok(output) => match package.decode(&output) {
             Ok(ModelResponse::Transcription(result)) if text => {
                 text_response(result.text, transcript.as_deref())
             }

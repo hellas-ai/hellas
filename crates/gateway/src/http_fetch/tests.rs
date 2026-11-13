@@ -1,11 +1,8 @@
 use super::config::{HttpRoute, public_tls};
-use super::routing::retry_delay;
 use super::*;
+use crate::WorkExecutionBackend;
 use hellas_rpc::provenance::ExecutionProvenance;
-use std::{
-    collections::BTreeMap,
-    time::{Duration, SystemTime},
-};
+use std::time::Duration;
 
 #[tokio::test]
 async fn http_uses_the_paid_backend_and_waits_for_its_payment_completion() {
@@ -14,31 +11,30 @@ async fn http_uses_the_paid_backend_and_waits_for_its_payment_completion() {
         requests: AtomicUsize,
         drained: AtomicBool,
         ack: Arc<tokio::sync::Notify>,
-        provider: iroh::EndpointId,
+
         busy: bool,
     }
     impl WorkExecutionBackend for Paid {
-        fn fetch_routes(&self) -> Vec<crate::FetchRoute> {
-            vec![crate::FetchRoute {
-                resource: None,
-                channel: None,
-                provider: self.provider,
-                schema: hellas_rpc::FetchSchema::HttpV1,
-                sealed: Some(("http".into(), "request".into())),
-            }]
+        fn backends(&self) -> Vec<crate::BackendInfo> {
+            crate::test_support::backend(None)
         }
+
         fn run(
             &self,
+            _backend: &str,
+            _request_job: Arc<crate::jobs::Job>,
             _: hellas_client::model::ComputeJob,
         ) -> Result<crate::WorkOutputStream<crate::ComputeEvent>, crate::WorkGatewayError> {
             unreachable!("HTTP must use Fetch")
         }
         fn fetch(
             &self,
+            _backend: &str,
+            _request_job: Arc<crate::jobs::Job>,
             request: WorkFetchRequest,
         ) -> Result<crate::WorkFetchStream, crate::WorkGatewayError> {
             self.requests.fetch_add(1, Ordering::Relaxed);
-            assert_eq!(request.provider, self.provider);
+
             assert_eq!((&*request.service, &*request.method), ("http", "request"));
             let http = hellas_rpc::http_fetch::HttpFetchRequest::decode(&request.body).unwrap();
             assert_eq!(http.url, "https://example.com/v1/responses?x=%2F&x=y");
@@ -65,40 +61,26 @@ async fn http_uses_the_paid_backend_and_waits_for_its_payment_completion() {
         }
     }
     for busy in [false, true] {
-        let provider = iroh::SecretKey::from_bytes(&[12; 32]).public();
         let paid = Arc::new(Paid {
             requests: AtomicUsize::new(0),
             drained: AtomicBool::new(false),
             ack: Arc::default(),
-            provider,
             busy,
         });
-        let config: HttpGatewayConfig = serde_json::from_value(serde_json::json!({
-            "service":"http", "method":"request", "routes":[{
-                "path":"/v1/responses", "method":"POST", "url":"https://example.com/v1/responses", "credential":"account"
-            }]
-        })).unwrap();
+        let config = vec![http("/v1/responses", None, Some("account"))];
         let archive = tempfile::tempdir().unwrap();
         let fixture = crate::access::tests::Fixture::new().await;
-        let handle = crate::start(crate::GatewayOptions {
-            server: crate::ServerOptions {
-                archive: crate::ArchiveOptions {
-                    directory: archive.path().into(),
-                    zdr: true,
-                },
-                host: "127.0.0.1".into(),
-                port: Some(0),
-                access: fixture.access,
-                allow_remote: false,
-                wrap: None,
-                wrap_args: Vec::new(),
+        let handle = crate::test_support::server::serve(
+            fixture.access.node(),
+            fixture.access.bearer(),
+            crate::ArchiveOptions {
+                directory: archive.path().into(),
+                zdr: true,
             },
-            work: paid.clone(),
-            presentations: crate::Presentations {
-                http: Some(config),
-                ..Default::default()
-            },
-        })
+            paid.clone(),
+            Arc::new(crate::jobs::Jobs::default()),
+            config,
+        )
         .await
         .unwrap();
         let client = reqwest::Client::new();
@@ -194,20 +176,6 @@ fn forward_only_protocol_headers_and_keep_retry_and_quota_metadata() {
     assert_eq!(response.len(), 3);
     assert_eq!(response["retry-after"], "3");
     assert_eq!(response["x-ratelimit-remaining-tokens"], "0");
-    assert_eq!(retry_delay(&response), Duration::from_secs(3));
-}
-
-#[test]
-fn retry_after_supports_dates_and_has_a_nonzero_fallback() {
-    assert_eq!(retry_delay(&HeaderMap::new()), Duration::from_secs(1));
-    for value in ["invalid", "0", "-2"] {
-        let headers =
-            HeaderMap::from_iter([("retry-after".parse().unwrap(), value.parse().unwrap())]);
-        assert_eq!(retry_delay(&headers), Duration::from_secs(1));
-    }
-    let date = httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(60));
-    let headers = HeaderMap::from_iter([("retry-after".parse().unwrap(), date.parse().unwrap())]);
-    assert!((59..=60).contains(&retry_delay(&headers).as_secs()));
 }
 
 #[test]
@@ -217,21 +185,15 @@ fn credentials_and_hop_headers_cannot_be_configured_as_static_headers() {
         .copied()
         .chain(["host", "connection"])
     {
-        let config = HttpGatewayConfig {
-            service: Some("http".into()),
-            method: Some("request".into()),
-            max_in_flight: 2,
-            backends: BTreeMap::new(),
-            routes: vec![HttpRoute {
-                max_response_bytes: hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES,
-                path: "/v1/messages".into(),
-                method: "POST".into(),
-                url: "https://example.com/v1/messages".into(),
-                credential: Some("account".into()),
-                tls: public_tls(),
-                headers: vec![(name.into(), "secret".into())],
-                models: None,
-            }],
+        let config = HttpRoute {
+            max_response_bytes: hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES,
+            path: "/v1/messages".into(),
+            method: "POST".into(),
+            url: "https://example.com/v1/messages".into(),
+            credential: Some("account".into()),
+            tls: public_tls(),
+            headers: vec![(name.into(), "secret".into())],
+            models: None,
         };
         assert!(config.validate().is_err());
     }
@@ -279,139 +241,21 @@ fn extension_headers_and_duplicates_survive_but_connection_tokens_do_not() {
     assert_eq!(response["location"], "/next");
 }
 
-#[test]
-fn a_provider_sealing_several_https_routes_needs_the_route_named() {
-    struct Sealed(iroh::EndpointId);
-    impl WorkExecutionBackend for Sealed {
-        fn fetch_routes(&self) -> Vec<crate::FetchRoute> {
-            ["a", "b"]
-                .into_iter()
-                .map(|method| crate::FetchRoute {
-                    resource: None,
-                    channel: None,
-                    provider: self.0,
-                    schema: hellas_rpc::FetchSchema::HttpV1,
-                    sealed: Some(("http".into(), method.into())),
-                })
-                .collect()
-        }
-        fn drain(&self) -> futures::future::BoxFuture<'_, Result<(), crate::WorkShutdownError>> {
-            Box::pin(async { Ok(()) })
-        }
-    }
-    let work = Arc::new(Sealed(iroh::SecretKey::from_bytes(&[13; 32]).public()));
-    let config = |route: serde_json::Value| -> HttpGatewayConfig {
-        let mut value = serde_json::json!({"routes": [{
-            "path": "/v1/responses", "method": "POST", "url": "https://example.com/v1/responses"
-        }]});
-        value
-            .as_object_mut()
-            .unwrap()
-            .extend(route.as_object().unwrap().clone());
-        serde_json::from_value(value).unwrap()
-    };
-    assert!(matches!(
-        router(config(serde_json::json!({})), work.clone()),
-        Err(crate::GatewayError::Config(
-            crate::GatewayConfigError::AmbiguousFetchRoute(_)
-        ))
-    ));
-    assert!(
-        router(
-            config(serde_json::json!({"service": "http", "method": "b"})),
-            work.clone()
-        )
-        .is_ok()
-    );
-    assert!(matches!(
-        router(
-            config(serde_json::json!({"service": "http", "method": "c"})),
-            work
-        ),
-        Err(crate::GatewayError::Config(
-            crate::GatewayConfigError::FetchRouteMismatch(_)
-        ))
-    ));
-}
-
-#[test]
-fn resource_selection_resolves_same_provider_routes_independently() {
-    let provider = iroh::SecretKey::from_bytes(&[13; 32]).public();
-    let first = hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"first"));
-    let second = hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"second"));
-    let channel = hellas_channel::model::grant::ChannelId(hellas_auth::Digest::hash(b"channel"));
-    let routes = vec![
-        crate::FetchRoute {
-            provider,
-            resource: Some(first),
-            channel: Some(channel),
-            schema: hellas_rpc::FetchSchema::HttpV1,
-            sealed: Some(("http".into(), "first".into())),
-        },
-        crate::FetchRoute {
-            provider,
-            resource: Some(second),
-            channel: Some(channel),
-            schema: hellas_rpc::FetchSchema::HttpV1,
-            sealed: Some(("other".into(), "second".into())),
-        },
-    ];
-    let config: HttpGatewayConfig = serde_json::from_value(serde_json::json!({"routes": [{
-        "path": "/v1/test", "method": "POST", "url": "https://example.test/v1/test"
-    }]}))
-    .unwrap();
-    let mut routing = routing::Routing::new(&config, &[provider]).unwrap();
-    let backend = &mut routing.backends[0];
-    assert!(matches!(
-        fetch_route(&routes, backend, None),
-        Err(crate::GatewayConfigError::AmbiguousFetchRoute(_))
-    ));
-    backend.resource = Some(first);
-    backend.channel = Some(channel);
-    assert_eq!(
-        fetch_route(&routes, backend, None).unwrap(),
-        ("http".into(), "first".into())
-    );
-    backend.resource = Some(second);
-    assert_eq!(
-        fetch_route(&routes, backend, None).unwrap(),
-        ("other".into(), "second".into())
-    );
-    assert!(fetch_route(&routes, backend, Some(&("http".into(), "first".into()))).is_err());
-    let mut wrong_schema = routes.clone();
-    wrong_schema[0].schema = hellas_rpc::FetchSchema::StatelessResponsesV1;
-    let http_routes: Vec<_> = wrong_schema
-        .into_iter()
-        .filter(|route| route.schema == hellas_rpc::FetchSchema::HttpV1)
-        .collect();
-    backend.resource = Some(first);
-    assert!(matches!(
-        fetch_route(&http_routes, backend, None),
-        Err(crate::GatewayConfigError::MissingFetchRoute(_))
-    ));
-}
-
-/// A provider that accepts the request, answers with `status` and the given
-/// body, and signs `transcript`.
 struct Proxied {
-    provider: iroh::EndpointId,
     status: u16,
     body: Option<&'static str>,
     transcript: Vec<u8>,
 }
 
 impl WorkExecutionBackend for Proxied {
-    fn fetch_routes(&self) -> Vec<crate::FetchRoute> {
-        vec![crate::FetchRoute {
-            resource: None,
-            channel: None,
-            provider: self.provider,
-            schema: hellas_rpc::FetchSchema::HttpV1,
-            sealed: Some(("http".into(), "request".into())),
-        }]
+    fn backends(&self) -> Vec<crate::BackendInfo> {
+        crate::test_support::backend(None)
     }
+
     fn fetch(
         &self,
+        _backend: &str,
+        _request_job: Arc<crate::jobs::Job>,
         _: WorkFetchRequest,
     ) -> Result<crate::WorkFetchStream, crate::WorkGatewayError> {
         let mut events = vec![
@@ -472,34 +316,21 @@ async fn exchange(address: std::net::SocketAddr, bearer: &str) -> String {
 
 /// A gateway serving the HTTP Fetch presentation, with archiving enabled so
 /// trailers must pass through it too. The directory stays alive with the test.
-async fn proxy(paid: Arc<Proxied>) -> (crate::GatewayHandle, tempfile::TempDir) {
-    let config: HttpGatewayConfig = serde_json::from_value(serde_json::json!({
-        "service": "http", "method": "request", "routes": [{
-            "path": "/v1/responses", "method": "POST", "url": "https://example.com/v1/responses"
-        }]
-    }))
-    .unwrap();
+async fn proxy(paid: Arc<Proxied>) -> (crate::test_support::server::Server, tempfile::TempDir) {
+    let config = vec![http("/v1/responses", None, None)];
     let archive = tempfile::tempdir().unwrap();
     let fixture = crate::access::tests::Fixture::new().await;
-    let handle = crate::start(crate::GatewayOptions {
-        server: crate::ServerOptions {
-            archive: crate::ArchiveOptions {
-                directory: archive.path().into(),
-                zdr: false,
-            },
-            host: "127.0.0.1".into(),
-            port: Some(0),
-            access: fixture.access,
-            allow_remote: false,
-            wrap: None,
-            wrap_args: Vec::new(),
+    let handle = crate::test_support::server::serve(
+        fixture.access.node(),
+        fixture.access.bearer(),
+        crate::ArchiveOptions {
+            directory: archive.path().into(),
+            zdr: false,
         },
-        work: paid,
-        presentations: crate::Presentations {
-            http: Some(config),
-            ..Default::default()
-        },
-    })
+        paid,
+        Arc::new(crate::jobs::Jobs::default()),
+        config,
+    )
     .await
     .unwrap();
     (handle, archive)
@@ -516,7 +347,6 @@ async fn https_responses_carry_provenance_in_headers_and_the_transcript_in_trail
     let provider = format!("secp256k1:{}", "02".repeat(33));
     for (status, body) in [(200, Some("streamed body")), (204, None)] {
         let paid = Arc::new(Proxied {
-            provider: iroh::SecretKey::from_bytes(&[12; 32]).public(),
             status,
             body,
             transcript: transcript.clone(),
@@ -576,7 +406,6 @@ async fn oversized_transcripts_are_named_by_digest_instead_of_inlined() {
     let digest = encode_hex(&digest);
     for (status, body) in [(200, Some("streamed body")), (204, None)] {
         let paid = Arc::new(Proxied {
-            provider: iroh::SecretKey::from_bytes(&[12; 32]).public(),
             status,
             body,
             transcript: transcript.clone(),
@@ -614,23 +443,17 @@ async fn oversized_transcripts_are_named_by_digest_instead_of_inlined() {
 }
 
 struct ContinuationBackend {
-    provider: iroh::EndpointId,
     calls: std::sync::atomic::AtomicUsize,
-    resource: Option<hellas_auth::authority::ResourceId>,
-    channel: Option<hellas_channel::model::grant::ChannelId>,
 }
 impl WorkExecutionBackend for ContinuationBackend {
-    fn fetch_routes(&self) -> Vec<crate::FetchRoute> {
-        vec![crate::FetchRoute {
-            resource: self.resource,
-            channel: self.channel,
-            provider: self.provider,
-            schema: hellas_rpc::FetchSchema::HttpV1,
-            sealed: Some(("http".into(), "request".into())),
-        }]
+    fn backends(&self) -> Vec<crate::BackendInfo> {
+        crate::test_support::backend(None)
     }
+
     fn fetch(
         &self,
+        _backend: &str,
+        _request_job: Arc<crate::jobs::Job>,
         _: WorkFetchRequest,
     ) -> Result<crate::WorkFetchStream, crate::WorkGatewayError> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -652,18 +475,16 @@ impl WorkExecutionBackend for ContinuationBackend {
 #[tokio::test]
 async fn signed_single_route_registers_response_for_followup() {
     use tower::ServiceExt;
-    let work = Arc::new(ContinuationBackend {
-        provider: iroh::SecretKey::from_bytes(&[19; 32]).public(),
-        calls: 0.into(),
-        resource: None,
-        channel: None,
-    });
-    let config: HttpGatewayConfig = serde_json::from_value(serde_json::json!({
-        "service":"http", "method":"request", "routes":[{
-            "path":"/v1/responses", "method":"POST", "url":"https://example.com/v1/responses", "models":["m"]
-        }]
-    })).unwrap();
-    let (app, _) = router(config, work.clone()).unwrap();
+    let work = Arc::new(ContinuationBackend { calls: 0.into() });
+    let config = vec![http("/v1/responses", Some(vec!["m".into()]), None)];
+    let app = crate::router::router(
+        config,
+        work.clone(),
+        Arc::new(crate::jobs::Jobs::default()),
+        Default::default(),
+    )
+    .await
+    .unwrap();
     for body in [
         r#"{"model":"m"}"#,
         r#"{"model":"m","previous_response_id":"resp_1"}"#,
@@ -689,23 +510,19 @@ async fn signed_single_route_registers_response_for_followup() {
 #[tokio::test]
 async fn duplicate_session_header_never_discards_an_unknown_continuation() {
     use tower::ServiceExt;
-    let resource = hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"resource"));
-    let channel = hellas_channel::model::grant::ChannelId(hellas_auth::Digest::hash(b"channel"));
-    let work = Arc::new(ContinuationBackend {
-        provider: iroh::SecretKey::from_bytes(&[20; 32]).public(),
-        calls: 0.into(),
-        resource: Some(resource),
-        channel: Some(channel),
-    });
-    let config: HttpGatewayConfig = serde_json::from_value(serde_json::json!({
-        "backends":{"one":{"models":[], "provider":work.provider, "resource":resource, "channel":channel, "routes":[{
-            "path":"/v1/responses", "method":"POST", "url":"https://example.com/v1/responses"
-        }, {
-            "path":"/v1/audio/transcriptions", "method":"POST", "url":"https://example.com/v1/audio/transcriptions"
-        }]}}
-    }))
+    let work = Arc::new(ContinuationBackend { calls: 0.into() });
+    let config = vec![
+        http("/v1/responses", None, None),
+        http("/v1/audio/transcriptions", None, None),
+    ];
+    let app = crate::router::router(
+        config,
+        work.clone(),
+        Arc::new(crate::jobs::Jobs::default()),
+        Default::default(),
+    )
+    .await
     .unwrap();
-    let (app, _) = router(config, work.clone()).unwrap();
     let response = app
         .clone()
         .oneshot(
@@ -765,4 +582,119 @@ async fn duplicate_session_header_never_discards_an_unknown_continuation() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(work.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+fn http(path: &str, models: Option<Vec<String>>, credential: Option<&str>) -> crate::Route {
+    crate::test_support::route(crate::Presentation::Http {
+        targets: ["test"]
+            .into_iter()
+            .map(|id| {
+                (
+                    id.into(),
+                    crate::HttpTarget {
+                        service: "http".into(),
+                        method: "request".into(),
+                        route: HttpRoute {
+                            path: path.into(),
+                            method: "POST".into(),
+                            url: format!("https://example.com{path}"),
+                            credential: credential.map(str::to_owned),
+                            tls: public_tls(),
+                            headers: vec![],
+                            max_response_bytes: hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES,
+                            models: models.clone(),
+                        },
+                    },
+                )
+            })
+            .collect(),
+    })
+}
+
+#[tokio::test]
+async fn failover_uses_each_backends_own_destination_and_credential() {
+    use tower::ServiceExt;
+    struct Targets(std::sync::Mutex<Vec<String>>);
+    impl crate::WorkExecutionBackend for Targets {
+        fn backends(&self) -> Vec<crate::BackendInfo> {
+            ["first", "second"]
+                .map(|id| crate::BackendInfo {
+                    instance: 1,
+                    id: id.into(),
+                    evaluator: None,
+                    max_in_flight: 2,
+                    in_flight: 0,
+                    down: false,
+                    error: None,
+                })
+                .into()
+        }
+        fn fetch(
+            &self,
+            id: &str,
+            job: Arc<crate::jobs::Job>,
+            request: WorkFetchRequest,
+        ) -> Result<crate::WorkFetchStream, crate::WorkGatewayError> {
+            self.0.lock().unwrap().push(id.into());
+            assert_eq!(request.service, id);
+            let upstream: hellas_rpc::http_fetch::HttpFetchRequest =
+                serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(
+                upstream.url,
+                format!("https://{id}.example/v1/responses?stream=true")
+            );
+            assert_eq!(upstream.credential.as_deref(), Some(id));
+            assert!(
+                !upstream
+                    .headers
+                    .iter()
+                    .any(|(name, _)| name == "authorization")
+            );
+            if id == "first" {
+                return Err(crate::WorkGatewayError::PreProposal(Box::new(
+                    crate::WorkGatewayBusy.into(),
+                )));
+            }
+            ContinuationBackend { calls: 0.into() }.fetch(id, job, request)
+        }
+        fn drain(&self) -> futures::future::BoxFuture<'_, Result<(), crate::WorkShutdownError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+    let mut route = http("/v1/responses", Some(vec!["m".into()]), None);
+    let crate::Presentation::Http { targets } = &mut route.presentation else {
+        unreachable!()
+    };
+    let original = targets.remove("test").unwrap();
+    for id in ["first", "second"] {
+        let mut target = original.clone();
+        target.service = id.into();
+        target.route.url = format!("https://{id}.example/v1/responses");
+        target.route.credential = Some(id.into());
+        targets.insert(id.into(), target);
+    }
+    route.backends = vec!["first".into(), "second".into()];
+    let work = Arc::new(Targets(Default::default()));
+    let app = crate::router::router(
+        vec![route],
+        work.clone(),
+        Arc::new(crate::jobs::Jobs::default()),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    let response = app
+        .oneshot(
+            axum::http::Request::post("/v1/responses?stream=true")
+                .header("authorization", "Bearer client-only")
+                .body(Body::from(r#"{"model":"m"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    assert_eq!(*work.0.lock().unwrap(), ["first", "second"]);
 }

@@ -1,4 +1,5 @@
 use super::*;
+use crate::WorkExecutionBackend;
 use crate::{
     ComputeEvent, WorkEvent, WorkFetchStream, WorkGatewayError, WorkOutputStream, WorkShutdownError,
 };
@@ -15,8 +16,16 @@ struct RecordedFetch {
 }
 
 impl WorkExecutionBackend for RecordedFetch {
-    fn fetch(&self, request: WorkFetchRequest) -> Result<WorkFetchStream, WorkGatewayError> {
-        assert_eq!(request.provider, provider());
+    fn backends(&self) -> Vec<crate::BackendInfo> {
+        crate::test_support::backend(None)
+    }
+
+    fn fetch(
+        &self,
+        _backend: &str,
+        _request_job: Arc<crate::jobs::Job>,
+        request: WorkFetchRequest,
+    ) -> Result<WorkFetchStream, WorkGatewayError> {
         assert_eq!(request.service, "openai");
         assert_eq!(request.method, "responses");
         assert_eq!(
@@ -31,6 +40,8 @@ impl WorkExecutionBackend for RecordedFetch {
 
     fn run(
         &self,
+        _backend: &str,
+        _request_job: Arc<crate::jobs::Job>,
         _: hellas_client::model::ComputeJob,
     ) -> Result<WorkOutputStream<ComputeEvent>, WorkGatewayError> {
         Err(WorkGatewayError::Unsupported)
@@ -39,10 +50,6 @@ impl WorkExecutionBackend for RecordedFetch {
     fn drain(&self) -> futures::future::BoxFuture<'_, Result<(), WorkShutdownError>> {
         Box::pin(async { Ok(()) })
     }
-}
-
-fn provider() -> iroh::EndpointId {
-    iroh::SecretKey::from_bytes(&[9; 32]).public()
 }
 
 fn text(delta: &str, channel: TextChannel) -> OutputEvent {
@@ -71,14 +78,13 @@ async fn fixture(name: &str, request: Value, events: Vec<OutputEvent>, expected:
         calls: AtomicUsize::new(0),
     });
     let backend = FetchBackend {
-        work: work.clone(),
-        options: crate::ResponsesFetch {
-            provider: provider(),
+        state: Arc::new(ResponsesState {
+            work: crate::test_support::execution(work.clone(), presentation()).await,
             service: "openai".into(),
             method: "responses".into(),
             overrides: serde_json::Map::new(),
-            models: Vec::new(),
-        },
+        }),
+        selection: crate::test_support::selection(work.clone()),
     };
     // Pin only rendering metadata; compare the actual SSE body without
     // parsing, normalizing, or reserializing any event bytes.
@@ -190,16 +196,14 @@ async fn responses_carry_provenance_at_start_and_end() {
             ],
             calls: AtomicUsize::new(0),
         });
-        let app = router(
-            crate::ResponsesFetch {
-                provider: provider(),
-                service: "openai".into(),
-                method: "responses".into(),
-                overrides: serde_json::Map::new(),
-                models: Vec::new(),
-            },
+        let app = crate::router::router(
+            vec![crate::test_support::route(presentation())],
             work,
+            Arc::new(crate::jobs::Jobs::default()),
+            Default::default(),
         )
+        .await
+        .unwrap()
         .layer(crate::provenance_layer::ProvenanceLayer);
         let response = app
             .oneshot(
@@ -232,5 +236,14 @@ async fn responses_carry_provenance_at_start_and_end() {
         let last = events.last().unwrap();
         assert_eq!(last["type"], "response.completed");
         assert_eq!(last["response"]["hellas"], end);
+    }
+}
+
+fn presentation() -> crate::Presentation {
+    crate::Presentation::Responses {
+        service: "openai".into(),
+        method: "responses".into(),
+        models: vec![],
+        overrides: Default::default(),
     }
 }

@@ -27,6 +27,16 @@ impl FilesystemAssertionCounterStore {
         self.directory
             .join(format!("{}{suffix}", hex::encode(public_key)))
     }
+    fn read(&self, public_key: &[u8; 33]) -> Result<u32, AttestationError> {
+        match hellas_private::read_bounded_regular_file(&self.path(public_key, ".counter"), 4) {
+            Ok(stored) => match stored.as_slice() {
+                [a, b, c, d] => Ok(u32::from_be_bytes([*a, *b, *c, *d])),
+                _ => Err(AttestationError::State),
+            },
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(0),
+            Err(_) => Err(AttestationError::State),
+        }
+    }
 }
 
 impl AssertionCounterStore for FilesystemAssertionCounterStore {
@@ -37,14 +47,7 @@ impl AssertionCounterStore for FilesystemAssertionCounterStore {
         let path = self.path(public_key, ".counter");
         let lock = hellas_private::open_lock_beside(&path).map_err(|_| AttestationError::State)?;
         fs::File::lock(&lock).map_err(|_| AttestationError::State)?;
-        let previous = match hellas_private::read_bounded_regular_file(&path, 4) {
-            Ok(stored) => match stored.as_slice() {
-                [a, b, c, d] => u32::from_be_bytes([*a, *b, *c, *d]),
-                _ => return Err(AttestationError::State),
-            },
-            Err(error) if error.kind() == ErrorKind::NotFound => 0,
-            Err(_) => return Err(AttestationError::State),
-        };
+        let previous = self.read(public_key)?;
         if counter <= previous {
             return Err(AttestationError::Counter);
         }

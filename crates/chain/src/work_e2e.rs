@@ -764,6 +764,7 @@ async fn run_one_paid_job(opened: &mut Opened) -> u64 {
         &mut opened.client,
         &proposal,
         &hellas_channel::test_support::channel::program_content().await,
+        None,
     )
     .await
     .expect("the provider accepts the proposed job");
@@ -775,7 +776,7 @@ async fn run_one_paid_job(opened: &mut Opened) -> u64 {
         "acceptance runs no backend",
     );
 
-    let outcome = run_accepted_work(&opened.service, &opened.ready, &backend, work_id).await;
+    let outcome = run_accepted_work(&opened.service, &opened.ready, &backend, work_id, None).await;
     assert!(
         matches!(outcome, Ok(RunOutcome::Completed { .. })),
         "the accepted job completes: {outcome:?}",

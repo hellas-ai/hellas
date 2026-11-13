@@ -1,69 +1,55 @@
+pub mod jobs;
 #[macro_use]
 extern crate tracing;
 
 mod access;
+mod affinity;
+mod route;
+mod routing;
 pub use access::GatewayAccess;
+pub use route::{HttpTarget, Presentation, Route};
+pub use routing::RoutingState;
 mod archive;
 mod audio;
 mod backend;
-mod compose;
 mod compute;
 mod dispatch;
 mod error;
+pub mod router;
 pub use error::{GatewayConfigError, GatewayError, GatewayResult};
 mod http_fetch;
 mod image;
 mod provenance_layer;
 mod responses_fetch;
 mod state;
-mod wrap;
 
-use axum::Router;
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use futures::Stream;
 use hellas_adaptors::BackendError;
 use hellas_auth::authority::UnixMillis;
-use iroh::EndpointId;
 use serde::Serialize;
-use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::convert::Infallible;
-use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use archive::ArchiveOptions;
 pub use hellas_rpc::compute_event::ComputeEvent;
-pub use http_fetch::{HttpBackend, HttpGatewayConfig, HttpRoute, RoutingError};
+pub use http_fetch::{HttpRoute, RoutingError};
 
-const DEFAULT_HTTP_PORT: u16 = 8080;
-
-/// A Fetch pinned to one funded provider by the HTTP account router.
+/// A Fetch run under the selected backend's policy.
+#[derive(Clone)]
 pub struct WorkFetchRequest {
-    pub provider: EndpointId,
-    pub resource: Option<hellas_auth::authority::ResourceId>,
-    pub channel: Option<hellas_channel::model::grant::ChannelId>,
     pub service: String,
     pub method: String,
     pub body: Vec<u8>,
 }
 
-/// One Fetch a work source can run: the provider, the contract schema, and
-/// the route the provider's policy seals, if it seals one.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FetchRoute {
-    pub provider: EndpointId,
-    pub resource: Option<hellas_auth::authority::ResourceId>,
-    pub channel: Option<hellas_channel::model::grant::ChannelId>,
-    pub schema: hellas_rpc::FetchSchema,
-    /// `None` for an open Fetch, whose route the caller names.
-    pub sealed: Option<(String, String)>,
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum WorkGatewayError {
+    #[error("{0}")]
+    PreProposal(Box<WorkGatewayError>),
     #[error("request does not match its resource: {0}")]
     Rejected(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("grant access refused: {0}")]
@@ -72,8 +58,6 @@ pub enum WorkGatewayError {
     Quota(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("Work backend does not support this application")]
     Unsupported,
-    #[error("provider {0} has no HTTP Fetch resource")]
-    Provider(EndpointId),
     #[error(transparent)]
     Busy(#[from] WorkGatewayBusy),
     #[error("provider is unreachable: {0}")]
@@ -89,9 +73,10 @@ impl From<WorkGatewayError> for BackendError {
     fn from(error: WorkGatewayError) -> Self {
         let message = error.to_string();
         match error {
-            WorkGatewayError::Rejected(_)
-            | WorkGatewayError::Unsupported
-            | WorkGatewayError::Provider(_) => BackendError::Rejected(message),
+            WorkGatewayError::PreProposal(error) => Self::from(*error),
+            WorkGatewayError::Rejected(_) | WorkGatewayError::Unsupported => {
+                BackendError::Rejected(message)
+            }
             WorkGatewayError::Denied(_) => BackendError::Denied(message),
             WorkGatewayError::Quota(_) => BackendError::Quota(message),
             WorkGatewayError::Busy(_) => BackendError::Busy(message),
@@ -164,17 +149,29 @@ pub enum WorkShutdownError {
     Recovery(#[source] Arc<dyn std::error::Error + Send + Sync>),
 }
 
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
+pub struct BackendInfo {
+    pub id: String,
+    pub instance: u64,
+    pub evaluator: Option<String>,
+    pub max_in_flight: usize,
+    pub in_flight: usize,
+    pub down: bool,
+    pub error: Option<String>,
+}
+
 /// The source every presentation runs its jobs on.
 pub trait WorkExecutionBackend: Send + Sync {
-    /// The Fetches this source can run, for presentations that pin one.
-    fn fetch_routes(&self) -> Vec<FetchRoute> {
-        Vec::new()
-    }
-
+    fn backends(&self) -> Vec<BackendInfo>;
     /// The provider's acceptance, authenticated prefixes, the signed
     /// transcript, then durable completion. After proposal the backend owns
     /// collection and funding obligations across disconnects.
-    fn fetch(&self, _request: WorkFetchRequest) -> Result<WorkFetchStream, WorkGatewayError> {
+    fn fetch(
+        &self,
+        _backend: &str,
+        _request_job: Arc<jobs::Job>,
+        _request: WorkFetchRequest,
+    ) -> Result<WorkFetchStream, WorkGatewayError> {
         Err(WorkGatewayError::Unsupported)
     }
 
@@ -183,25 +180,19 @@ pub trait WorkExecutionBackend: Send + Sync {
     /// proposed work across requester disconnects.
     fn run(
         &self,
+        _backend: &str,
+        _request_job: Arc<jobs::Job>,
         _job: hellas_client::model::ComputeJob,
     ) -> Result<WorkOutputStream<ComputeEvent>, WorkGatewayError> {
         Err(WorkGatewayError::Unsupported)
     }
 
-    /// The evaluator id the source runs Compute programs for, if it runs any.
-    fn evaluator(&self) -> Option<String> {
-        None
-    }
-
-    /// An explicit end-to-end budget, including queued time, if the source has one.
-    fn timeout(&self) -> Option<std::time::Duration> {
-        None
-    }
-
-    /// The most steps one Compute job may take under this source's terms,
-    /// if they bound it.
-    fn max_steps(&self) -> Option<u64> {
-        None
+    /// The selected backend's Compute step bound, resolved before rendering.
+    fn max_steps<'a>(
+        &'a self,
+        _backend: &'a str,
+    ) -> futures::future::BoxFuture<'a, Result<Option<u64>, WorkGatewayError>> {
+        Box::pin(async { Ok(None) })
     }
 
     /// Finish accepted work and its funding obligations during graceful shutdown.
@@ -229,396 +220,40 @@ impl
     }
 }
 
-/// Where and to whom the gateway listens, and what it keeps.
-#[derive(Clone)]
-pub struct ServerOptions {
-    /// Provisioned Auth credential and the host authority that admits HTTP requests.
-    pub access: GatewayAccess,
-    pub archive: ArchiveOptions,
-    /// Permit a non-loopback listener.
-    pub allow_remote: bool,
-    pub host: String,
-    pub port: Option<u16>,
-    pub wrap: Option<String>,
-    pub wrap_args: Vec<String>,
+/// Listener tasks belong to the daemon; accepted jobs belong to its job table.
+pub async fn serve_listener(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> GatewayResult<()> {
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<ConnectionId>(),
+    )
+    .with_graceful_shutdown(async move {
+        let _ = shutdown.wait_for(|stop| *stop).await;
+    })
+    .await
+    .map_err(Into::into)
 }
 
-/// One gateway: HTTP presentations over one work source.
-pub struct GatewayOptions {
-    pub server: ServerOptions,
-    pub work: Arc<dyn WorkExecutionBackend>,
-    pub presentations: Presentations,
-}
-
-/// The HTTP surfaces a gateway offers. A path served by several of them is
-/// split by the request's model; an overlap is a startup error.
-#[derive(Clone, Default)]
-pub struct Presentations {
-    /// OpenAI chat, completions and Responses, and Anthropic messages,
-    /// rendered locally into Compute text jobs.
-    pub models: Vec<ModelOptions>,
-    /// OpenAI Responses forwarded as a Fetch to one sealed route.
-    pub responses: Option<ResponsesFetch>,
-    /// Exact HTTP routes forwarded as HTTPS Fetches, with account routing.
-    pub http: Option<HttpGatewayConfig>,
-}
-
-#[derive(Clone)]
-pub enum ModelOptions {
-    Text(TextOptions),
-    Whisper(AudioOptions),
-    Flux(ImageOptions),
-}
-
-impl ModelOptions {
-    /// The routes a model path serves, by its layout, under the name of its
-    /// file or directory.
-    pub fn at(model: PathBuf, default_max_tokens: u32) -> Self {
-        use hellas_client::model::ModelKind;
-        let name = |path: &std::path::Path, stem: bool| {
-            let name = if stem {
-                path.file_stem()
-            } else {
-                path.file_name()
-            };
-            name.map_or_else(String::new, |name| name.to_string_lossy().into_owned())
-        };
-        match ModelKind::of(&model) {
-            ModelKind::Text => Self::Text(TextOptions {
-                model_name: name(&model, true),
-                model,
-                default_max_tokens,
-            }),
-            ModelKind::Transcription => Self::Whisper(AudioOptions {
-                model_name: name(&model, false),
-                model,
-                default_max_tokens: default_max_tokens as usize,
-            }),
-            ModelKind::Image => Self::Flux(ImageOptions {
-                model_name: name(&model, false),
-                model,
-            }),
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct ImageOptions {
-    /// Converted Flux2 Klein package metadata and tokenizer.
-    pub model: PathBuf,
-    pub model_name: String,
-}
-
-#[derive(Clone)]
-pub struct AudioOptions {
-    /// Converted Whisper package directory, used only by the client.
-    pub model: PathBuf,
-    pub model_name: String,
-    pub default_max_tokens: usize,
-}
-
-#[derive(Clone)]
-pub struct TextOptions {
-    /// Qwen GGUF whose rendered program, weights, tokenizer and chat format serve the
-    /// text routes; providers must already hold the file.
-    pub model: PathBuf,
-    /// The model name these routes answer to where several presentations
-    /// share them; responses name the model the request names.
-    pub model_name: String,
-    pub default_max_tokens: u32,
-}
-
-#[derive(Clone)]
-pub struct ResponsesFetch {
-    pub provider: EndpointId,
-    pub service: String,
-    pub method: String,
-    /// Merged into every request body before signing.
-    pub overrides: JsonMap<String, JsonValue>,
-    /// Models these routes answer to; empty means any.
-    pub models: Vec<String>,
-}
-
-impl ResponsesFetch {
-    /// The one sealed Responses route among `routes`, if there is one.
-    pub fn from_routes(
-        routes: &[FetchRoute],
-        overrides: JsonMap<String, JsonValue>,
-        models: Vec<String>,
-    ) -> GatewayResult<Option<Self>> {
-        let mut sealed = routes.iter().filter_map(|route| match &route.sealed {
-            Some((service, method))
-                if route.schema == hellas_rpc::FetchSchema::StatelessResponsesV1 =>
-            {
-                Some((route.provider, service, method))
-            }
-            _ => None,
-        });
-        let Some((provider, service, method)) = sealed.next() else {
-            return Ok(None);
-        };
-        if sealed.next().is_some() {
-            return Err(GatewayConfigError::AmbiguousResponses.into());
-        }
-        Ok(Some(Self {
-            provider,
-            service: service.clone(),
-            method: method.clone(),
-            overrides,
-            models,
-        }))
-    }
-}
-
-/// A running authenticated HTTP gateway owned by its embedding process.
-pub struct GatewayHandle {
-    address: SocketAddr,
-    bearer: String,
-    shutdown: tokio::sync::watch::Sender<bool>,
-    task: tokio::task::JoinHandle<crate::GatewayResult<()>>,
-}
-
-impl GatewayHandle {
-    pub const fn address(&self) -> SocketAddr {
-        self.address
-    }
-
-    /// Return the provisioned credential for an explicit local UI/control
-    /// surface. The value is never included in `Debug` or logs.
-    pub fn bearer(&self) -> &str {
-        &self.bearer
-    }
-
-    pub fn request_shutdown(&self) {
-        self.shutdown.send_replace(true);
-    }
-
-    pub fn is_finished(&self) -> bool {
-        self.task.is_finished()
-    }
-
-    pub async fn shutdown(mut self) -> crate::GatewayResult<()> {
-        self.request_shutdown();
-        (&mut self.task)
-            .await
-            .map_err(GatewayError::Task)
-            .and_then(|result| result)
-    }
-}
-
-impl Drop for GatewayHandle {
-    fn drop(&mut self) {
-        self.shutdown.send_replace(true);
-    }
-}
-
-/// Start a gateway without installing process signal handlers. A failed
-/// start still drains the work source.
-pub async fn start(options: GatewayOptions) -> crate::GatewayResult<GatewayHandle> {
-    let work = options.work.clone();
-    let result = start_gateway(options).await;
-    if result.is_err() {
-        return finish_cleanup(result, work.drain().await);
-    }
-    result
-}
-
-async fn start_gateway(options: GatewayOptions) -> crate::GatewayResult<GatewayHandle> {
-    let GatewayOptions {
-        server,
-        work,
-        presentations,
-    } = options;
-    let listener = bind_gateway(&server.host, server.port, server.allow_remote).await?;
-    let bearer = server.access.clone();
-    bearer.validate().await?;
-    let archive_policy = archive::Policy::new(server.archive.clone());
-    archive_policy.prepare();
-
-    let app = compose::router(&presentations, &work).await?;
-    // Every route reaches a work source, so every route is behind the
-    // provisioned Auth credential. The layer goes on last, which in axum
-    // puts it outermost: a request without the credential is answered
-    // before a handler, the provenance layer, or the source sees it.
+pub async fn listener_router(
+    app: axum::Router,
+    node: hellas_authority::node::NodeCoordinator,
+    archive: ArchiveOptions,
+) -> GatewayResult<axum::Router> {
+    let policy = archive::Policy::new(archive);
     let app =
         app.layer(provenance_layer::ProvenanceLayer)
             .layer(axum::middleware::from_fn_with_state(
-                archive_policy,
+                policy,
                 archive::record,
             ));
     #[cfg(feature = "otel")]
     let app = app.layer(axum::middleware::from_fn(
         hellas_rpc::telemetry::http::trace_request,
     ));
-    let app = app.layer(access::BearerLayer::new(bearer.clone()));
-    if let Some(timeout) = work.timeout() {
-        info!("timeout: {}s", timeout.as_secs());
-    }
-
-    launch_gateway(
-        app,
-        listener,
-        bearer,
-        server.wrap.as_deref(),
-        &server.wrap_args,
-        work,
-    )
-    .await
-}
-
-async fn launch_gateway(
-    app: Router,
-    listener: tokio::net::TcpListener,
-    bearer: GatewayAccess,
-    wrap_command: Option<&str>,
-    wrap_args: &[String],
-    work: Arc<dyn WorkExecutionBackend>,
-) -> crate::GatewayResult<GatewayHandle> {
-    let bound_addr = listener.local_addr()?;
-    info!("gateway listening on {bound_addr}");
-    bearer.announce();
-
-    let wrap_child = if let Some(command) = wrap_command {
-        let base = format!("http://{bound_addr}");
-        info!("wrapping `{command}` with gateway base {base}");
-        Some(wrap::spawn(command, wrap_args, &base, &bearer.bearer())?)
-    } else {
-        None
-    };
-
-    let bearer_value = bearer.bearer();
-    let (shutdown, mut server_shutdown) = tokio::sync::watch::channel(false);
-    let server = std::future::IntoFuture::into_future(
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<ConnectionId>(),
-        )
-        .with_graceful_shutdown(async move {
-            let _ = server_shutdown.wait_for(|stopped| *stopped).await;
-        }),
-    );
-
-    let task_shutdown = shutdown.clone();
-    let task = tokio::spawn(async move {
-        let result = async {
-            match wrap_child {
-                Some(mut child) => {
-                    tokio::pin!(server);
-                    tokio::select! {
-                        res = &mut server => {
-                            // Gateway stopped or errored; kill_on_drop tears the
-                            // wrapped child down too.
-                            res?;
-                        }
-                        status = child.wait() => {
-                            let status = status?;
-                            task_shutdown.send_replace(true);
-                            server.await?;
-                            if !status.success() {
-                                return Err(GatewayError::WrappedCommand(status));
-                            }
-                        }
-                    }
-                }
-                None => {
-                    server.await?;
-                }
-            }
-            Ok(())
-        }
-        .await;
-        finish_cleanup(result, work.drain().await)
-    });
-
-    Ok(GatewayHandle {
-        address: bound_addr,
-        bearer: bearer_value,
-        shutdown,
-        task,
-    })
-}
-
-fn finish_cleanup<T>(
-    result: GatewayResult<T>,
-    drained: Result<(), WorkShutdownError>,
-) -> GatewayResult<T> {
-    match (result, drained) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Ok(_), Err(error)) => Err(error.into()),
-        (Err(error), Ok(())) => Err(error),
-        (Err(primary), Err(cleanup)) => Err(GatewayError::Cleanup {
-            primary: Box::new(primary),
-            cleanup,
-        }),
-    }
-}
-
-/// Wait for a process signal or wrapped child, then join every gateway listener.
-pub async fn wait_for_shutdown(mut handle: GatewayHandle) -> crate::GatewayResult<()> {
-    tokio::select! {
-        signal = shutdown_signal() => {
-            handle.request_shutdown();
-            let stopped = (&mut handle.task).await.map_err(GatewayError::Task).and_then(|result| result);
-            signal.and(stopped)
-        }
-        result = &mut handle.task => {
-            result.map_err(GatewayError::Task).and_then(|result| result)
-        }
-    }
-}
-
-async fn shutdown_signal() -> crate::GatewayResult<()> {
-    #[cfg(unix)]
-    {
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => result?,
-            _ = terminate.recv() => {},
-        }
-    }
-    #[cfg(not(unix))]
-    tokio::signal::ctrl_c().await?;
-    Ok(())
-}
-
-/// Bind the configured gateway interface. All inference routes require
-/// bearer authentication. With `--port`, fail on conflict (the user asked for that
-/// exact port). Without it, try 8080 first and fall back to an
-/// OS-assigned port on EADDRINUSE so a stray dev gateway doesn't block a
-/// fresh one.
-async fn bind_gateway(
-    host: &str,
-    port: Option<u16>,
-    allow_remote: bool,
-) -> crate::GatewayResult<tokio::net::TcpListener> {
-    if let Some(p) = port {
-        let addr = access::bind_addr(host, p, allow_remote).await?;
-        return tokio::net::TcpListener::bind(addr)
-            .await
-            .map_err(|source| GatewayError::Bind {
-                address: addr,
-                source,
-            });
-    }
-    let preferred = access::bind_addr(host, DEFAULT_HTTP_PORT, allow_remote).await?;
-    match tokio::net::TcpListener::bind(preferred).await {
-        Ok(listener) => Ok(listener),
-        Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
-            let fallback = SocketAddr::new(preferred.ip(), 0);
-            info!("failed to bind {preferred}; attempting to bind {fallback}");
-            tokio::net::TcpListener::bind(fallback)
-                .await
-                .map_err(|source| GatewayError::Bind {
-                    address: fallback,
-                    source,
-                })
-        }
-        Err(err) => Err(GatewayError::Bind {
-            address: preferred,
-            source: err,
-        }),
-    }
+    Ok(app.layer(access::BearerLayer::new(node)))
 }
 
 /// A refusal or failure in the OpenAI error shape.
@@ -676,32 +311,13 @@ fn now_unix() -> i64 {
     (UnixMillis::now().unwrap_or_default().0 / 1_000) as i64
 }
 
-/// Wait without a client deadline unless the work source explicitly supplies one.
-async fn before_deadline<F: std::future::Future>(
-    deadline: Option<tokio::time::Instant>,
-    future: F,
-) -> Result<F::Output, tokio::time::error::Elapsed> {
-    match deadline {
-        Some(deadline) => tokio::time::timeout_at(deadline, future).await,
-        None => Ok(future.await),
-    }
+fn work_error(error: WorkGatewayError) -> Response {
+    let error: BackendError = error.into();
+    json_error(backend_status(&error), error.to_string())
 }
 
 #[cfg(test)]
-mod paid_shutdown_tests {
-    use super::*;
+mod test_support;
 
-    #[test]
-    fn cleanup_errors_reach_the_caller_and_preserve_the_primary_failure() {
-        assert!(matches!(
-            finish_cleanup(Ok(()), Err(WorkShutdownError::Poisoned)),
-            Err(GatewayError::Shutdown(WorkShutdownError::Poisoned))
-        ));
-        let primary = GatewayError::Io(std::io::Error::other("injected server failure"));
-        let error =
-            finish_cleanup::<()>(Err(primary), Err(WorkShutdownError::Poisoned)).unwrap_err();
-        assert!(
-            matches!(error, GatewayError::Cleanup { primary, cleanup: WorkShutdownError::Poisoned } if matches!(*primary, GatewayError::Io(_)))
-        );
-    }
-}
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_server;

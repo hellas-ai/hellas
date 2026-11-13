@@ -67,7 +67,12 @@ impl HostCompute {
     }
 }
 impl WorkBackend for HostCompute {
-    fn try_admit(&self, domain: CapacityDomain) -> Result<WorkPermit, BackendFault> {
+    fn try_admit(
+        &self,
+        backend: &hellas_channel::work::admission::BackendKey,
+        _caller: hellas_auth::PublicKey,
+    ) -> Result<WorkPermit, BackendFault> {
+        let domain = backend.domain();
         if domain != CapacityDomain::Gpu {
             return Err(
                 hellas_channel::work::admission::AdmissionError::Unsupported(domain).into(),
@@ -92,7 +97,10 @@ impl WorkBackend for HostCompute {
         let (prepared, limits, content, admission) = input.into_parts_and_admission();
         let _running = admission
             .reserve(CapacityDomain::Gpu, async {
-                self.try_admit(CapacityDomain::Gpu)
+                self.try_admit(
+                    &hellas_channel::work::admission::BackendKey::of(&prepared)?,
+                    prepared.request.runner_public_key,
+                )
             })
             .await?
             .dispatch()
@@ -419,7 +427,6 @@ impl Provider {
         .unwrap();
         let admin = hellas_authority::grant_service::WorkAdministration::new(
             grants.clone(),
-            hellas_authority::test_support::common_node::configuration(composition_policies()),
             std::num::NonZeroU64::new(5000).unwrap(),
         );
         let endpoint = Endpoint::builder(presets::Minimal)
@@ -475,10 +482,7 @@ impl Provider {
             funding_requests: funding_requests.clone(),
         };
         let router = WorkRouter::both(work, grants.clone());
-        let open = Arc::new(
-            hellas_sdk::ProviderOpen::<ProducerSigningKey>::new(key, enrollment.clone(), None)
-                .unwrap(),
-        );
+        let open = Arc::new(hellas_sdk::ProviderOpen::new(key, enrollment.clone(), None).unwrap());
         let server = endpoint.clone();
         let serving = tokio::spawn(async move {
             let mut connections = tokio::task::JoinSet::new();
@@ -2274,7 +2278,6 @@ async fn finish(case: Box<Case>) {
     let options = PaidWorkOptions {
         content: fresh_client_content(&root.path().join("client-store")).await,
         config: config.clone(),
-        journal_kind: hellas_sdk::paid_client::PaidJournalKind::Client,
         provider: hellas_client::ProviderAddress::of(&provider.enrollment).unwrap(),
         provider_addrs: provider.endpoint.bound_sockets(),
         assurance: Assurance::ProducerSigned,

@@ -239,6 +239,7 @@ impl GrantClientStore {
         input: &PreparedInvocation,
         signer: &ProducerSigningKey,
         now: UnixMillis,
+        proposed: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<Signature, NodeStoreError> {
         let now = now.max(self.now());
         let verified = SignedOffer::decode(&offer.encode()?, now)?;
@@ -292,6 +293,9 @@ impl GrantClientStore {
         let signature = signer
             .sign_digest(grant_work_id(self.context.network, a))
             .map_err(|_| GrantError::Signature)?;
+        if let Some(proposed) = proposed {
+            proposed.store(true, std::sync::atomic::Ordering::Release);
+        }
         self.commit(
             now,
             Change::Proposed {

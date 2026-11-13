@@ -25,13 +25,8 @@ let
   serveRuntimePaths = [
     cfg.serve.home
   ]
-  ++ (cfg.serve.content.lower or [ ])
-  ++ lib.optional (cfg.serve.content ? upper) cfg.serve.content.upper
-  ++ lib.optional (cfg.serve.workConfigFile != null) cfg.serve.workConfigFile
   ++ lib.optional (cfg.serve.chainConfig != null) cfg.serve.chainConfig
-  ++ lib.optional (cfg.serve.grantConfigFile != null) cfg.serve.grantConfigFile
   ++ lib.optional (cfg.serve.passkey != null) cfg.serve.passkey
-  ++ lib.optional (cfg.serve.fetchConfigFile != null) cfg.serve.fetchConfigFile
   ++ lib.optional (cfg.serve.environmentFile != null) cfg.serve.environmentFile;
 
   baseEnv =
@@ -44,7 +39,7 @@ let
     "${cfg.package}/bin/hellas"
   ]
   ++ hellas.mkServeArgs {
-    inherit lib pkgs;
+    inherit lib;
     inherit (cfg) serve otel;
   };
   serveProgramArguments =
@@ -124,22 +119,15 @@ in
     # Surface a clear assertion on Linux rather than a "no such option" error
     # when the user enables `programs.hellas.serve` on the wrong platform.
     (mkIf cfg.serve.enable {
-      assertions =
-        optionals (!isDarwin) [
-          {
-            assertion = false;
-            message = ''
-              programs.hellas.serve is only supported on darwin (HM launchd).
-              On Linux, use the NixOS module `services.hellas` instead.
-            '';
-          }
-        ]
-        ++ optionals isDarwin [
-          {
-            assertion = !hellas.catenaConfigured cfg.serve;
-            message = "Local Catena execution is not supported by the Darwin Home Manager daemon.";
-          }
-        ];
+      assertions = optionals (!isDarwin) [
+        {
+          assertion = false;
+          message = ''
+            programs.hellas.serve is only supported on darwin (HM launchd).
+            On Linux, use the NixOS module `services.hellas` instead.
+          '';
+        }
+      ];
     })
 
     (mkIf (cfg.enable || cfg.serve.enable) {

@@ -102,7 +102,7 @@ fn router(access: GatewayAccess) -> Router {
                 "reached"
             }),
         )
-        .layer(BearerLayer::new(access))
+        .layer(BearerLayer::new(access.node()))
 }
 async fn status(router: &Router, token: Option<&str>) -> StatusCode {
     let mut request = Request::builder().uri("/invoke");
@@ -244,16 +244,6 @@ async fn http_admission_consults_current_authority() {
         assert_eq!(status(&app, Some(&token)).await, StatusCode::UNAUTHORIZED);
     }
 }
-#[tokio::test]
-async fn listening_remotely_requires_explicit_opt_in() {
-    bind_addr("127.0.0.1", 0, false).await.unwrap();
-    assert_err!(
-        bind_addr("0.0.0.0", 0, false).await,
-        crate::GatewayError::Config(crate::GatewayConfigError::RemoteBinding)
-    );
-    bind_addr("0.0.0.0", 0, true).await.unwrap();
-}
-
 #[tokio::test]
 async fn administrator_credentials_cannot_be_exposed_as_http_bearers() {
     let fixture = Fixture::new().await;

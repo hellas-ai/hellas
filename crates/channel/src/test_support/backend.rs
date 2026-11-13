@@ -118,6 +118,7 @@ pub struct Backend {
     pub cancelled: Arc<Notify>,
     pub stop_on_cancel: bool,
     pub reply: Reply,
+    pub usage: Option<Usage>,
     pub inspect: Option<fn(&FetchInput)>,
     pub inspect_content: Option<ContentInspection>,
     pub signer: Arc<hellas_auth::ProducerSigningKey>,
@@ -135,6 +136,7 @@ impl Default for Backend {
             cancelled: Arc::new(Notify::new()),
             stop_on_cancel: false,
             reply: Reply::text("private-grant-result", 1),
+            usage: None,
             inspect: None,
             inspect_content: None,
             signer: Arc::new(principal(2).1),
@@ -162,7 +164,12 @@ impl WorkBackend for Backend {
             queued.notified().await;
         }
         let running = admission
-            .reserve(domain, async { self.try_admit(domain) })
+            .reserve(domain, async {
+                self.try_admit(
+                    &crate::work::admission::BackendKey::of(&prepared)?,
+                    prepared.request.runner_public_key,
+                )
+            })
             .await?
             .dispatch()
             .await?;
@@ -263,7 +270,7 @@ impl WorkBackend for Backend {
                 &payloads,
                 &encode_fetch_terminal_payload(&OutputEvent::Finished {
                     stop_reason: StopReason::EndOfText,
-                    usage: None,
+                    usage: self.usage,
                 })
                 .unwrap(),
             )
@@ -284,7 +291,12 @@ impl WorkBackend for Backend {
         Ok(stream.finish(&output, 1024).unwrap())
     }
 
-    fn try_admit(&self, domain: CapacityDomain) -> Result<WorkPermit, BackendFault> {
+    fn try_admit(
+        &self,
+        backend: &crate::work::admission::BackendKey,
+        _caller: hellas_auth::PublicKey,
+    ) -> Result<WorkPermit, BackendFault> {
+        let domain = backend.domain();
         Ok(WorkPermit::new(
             domain,
             self.slots

@@ -1,5 +1,3 @@
-use std::{net::SocketAddr, process::ExitStatus};
-
 pub type GatewayResult<T> = Result<T, GatewayError>;
 
 #[derive(Debug, thiserror::Error)]
@@ -10,38 +8,12 @@ pub enum GatewayError {
     Work(#[from] crate::WorkGatewayError),
     #[error(transparent)]
     Shutdown(#[from] crate::WorkShutdownError),
-    #[error("{primary}; cleanup also failed: {cleanup}")]
-    Cleanup {
-        #[source]
-        primary: Box<GatewayError>,
-        cleanup: crate::WorkShutdownError,
-    },
     #[error(transparent)]
     Authority(#[from] hellas_authority::work_store::grant::NodeStoreError),
     #[error("gateway task failed")]
     Task(#[from] tokio::task::JoinError),
     #[error("gateway I/O failed")]
     Io(#[from] std::io::Error),
-    #[error("failed to bind gateway on {address}")]
-    Bind {
-        address: SocketAddr,
-        source: std::io::Error,
-    },
-    #[error("failed to resolve gateway bind address {host}:{port}")]
-    Resolve {
-        host: String,
-        port: u16,
-        source: std::io::Error,
-    },
-    #[error("gateway bind address {host}:{port} resolved to no address")]
-    NoAddress { host: String, port: u16 },
-    #[error("failed to spawn {command}")]
-    Spawn {
-        command: String,
-        source: std::io::Error,
-    },
-    #[error("wrapped command exited with status {0}")]
-    WrappedCommand(ExitStatus),
     #[error("model presentation failed: {0}")]
     Presentation(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error(transparent)]
@@ -58,22 +30,8 @@ pub enum GatewayError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum GatewayConfigError {
-    #[error("configure either HTTP backends or opaque routes")]
-    RouteMode,
-    #[error("invalid HTTP concurrency limit")]
-    HttpConcurrency,
-    #[error("too many HTTP backends")]
-    BackendCount,
-    #[error("invalid backend name")]
-    BackendName,
-    #[error("backend needs explicit model names")]
+    #[error("invalid backend model names")]
     ModelNames,
-    #[error("invalid backend concurrency limit")]
-    BackendConcurrency,
-    #[error("set the credential on the backend, not its routes")]
-    BackendCredential,
-    #[error("HTTP backend needs at least one route")]
-    EmptyRoutes,
     #[error("HTTP routes must be exact paths")]
     RoutePath,
     #[error("duplicate HTTP route")]
@@ -82,18 +40,6 @@ pub enum GatewayConfigError {
     CredentialAlias,
     #[error("default maximum tokens must be positive and fit the model capacity")]
     MaxTokens,
-    #[error("non-loopback gateway binding requires --allow-remote")]
-    RemoteBinding,
     #[error("the gateway serves no presentation")]
     NoPresentation,
-    #[error("{0} is served by several presentations without distinct model names")]
-    RouteConflict(String),
-    #[error("several sealed Responses routes; select one resource")]
-    AmbiguousResponses,
-    #[error("backend {0} has no HTTPS Fetch route on its provider")]
-    MissingFetchRoute(String),
-    #[error("backend {0} names a Fetch route its provider's policy does not seal")]
-    FetchRouteMismatch(String),
-    #[error("backend {0}'s provider seals several HTTPS routes; name one with service and method")]
-    AmbiguousFetchRoute(String),
 }

@@ -1,11 +1,12 @@
 //! The gateway backend: every HTTP request becomes one job on the job
 //! commands' target, run by the same [`Executor`]. Admission, streamed
 //! output and shutdown are shared here.
-use crate::execution::{ExecutionError, Executor, RequestStopped};
+pub(crate) mod provider;
+use crate::execution::{ExecutionError, Executor};
 use crate::grant_client::GrantClientError;
 use crate::job::{Job, JobError, JobInput};
 use futures::{future::BoxFuture, stream::BoxStream};
-use hellas_authority::model::grant::records::{GrantPolicy, grant_transport};
+use hellas_authority::model::grant::records::GrantPolicy;
 use hellas_authority::model::grant::resource::HttpsResource;
 use hellas_gateway::{
     ComputeEvent, WorkEvent, WorkExecutionBackend, WorkFetchRequest, WorkGatewayBusy,
@@ -118,88 +119,6 @@ pub fn response_stream<E: Send + 'static, X: Send + 'static>(
     })
 }
 
-/// Owns accepted tasks until their futures physically terminate. Drain polls the
-/// handles in place so dropping a drain future cannot detach unfinished work.
-#[derive(Default)]
-pub struct WorkTasks {
-    state: std::sync::Mutex<TaskState>,
-    draining: tokio::sync::Mutex<()>,
-}
-#[derive(Default)]
-struct TaskState {
-    closed: bool,
-    tasks: Vec<tokio::task::JoinHandle<()>>,
-    failure: Option<Arc<tokio::task::JoinError>>,
-}
-impl TaskState {
-    fn poll(&mut self, cx: &mut std::task::Context<'_>, finished_only: bool) {
-        use std::{future::Future as _, pin::Pin, task::Poll};
-        let failure = &mut self.failure;
-        self.tasks.retain_mut(|task| {
-            if finished_only && !task.is_finished() {
-                return true;
-            }
-            match Pin::new(task).poll(cx) {
-                Poll::Pending => true,
-                Poll::Ready(Ok(())) => false,
-                Poll::Ready(Err(error)) => {
-                    failure.get_or_insert_with(|| Arc::new(error));
-                    false
-                }
-            }
-        });
-    }
-}
-impl WorkTasks {
-    pub fn spawn(
-        &self,
-        future: impl std::future::Future<Output = ()> + Send + 'static,
-    ) -> Result<(), hellas_gateway::WorkGatewayBusy> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| hellas_gateway::WorkGatewayBusy)?;
-        if state.closed {
-            return Err(hellas_gateway::WorkGatewayBusy);
-        }
-        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
-        state.poll(&mut cx, true);
-        state.tasks.push(tokio::spawn(future));
-        Ok(())
-    }
-
-    pub fn close(&self) {
-        match self.state.lock() {
-            Ok(mut state) => state.closed = true,
-            Err(error) => error.into_inner().closed = true,
-        }
-    }
-
-    pub async fn drain(&self) -> Result<(), hellas_gateway::WorkShutdownError> {
-        use hellas_gateway::WorkShutdownError;
-        self.close();
-        let _draining = self.draining.lock().await;
-        std::future::poll_fn(|cx| {
-            let (mut state, poisoned) = match self.state.lock() {
-                Ok(state) => (state, false),
-                Err(error) => (error.into_inner(), true),
-            };
-            state.poll(cx, false);
-            if !state.tasks.is_empty() {
-                return std::task::Poll::Pending;
-            }
-            std::task::Poll::Ready(if let Some(error) = &state.failure {
-                Err(WorkShutdownError::Task(error.clone()))
-            } else if poisoned {
-                Err(WorkShutdownError::Poisoned)
-            } else {
-                Ok(())
-            })
-        })
-        .await
-    }
-}
-
 /// Gateway events derived from one invocation's signed output.
 pub trait GatewayEvent: serde::Serialize + Send + Sized + 'static {
     fn prefix(chunk: ArtifactChunk, pending: &mut Vec<u8>) -> Result<Vec<Self>, WorkGatewayError>;
@@ -281,6 +200,7 @@ pub type RequestStream<E, X> = BoxStream<'static, Result<WorkEvent<E>, X>>;
 
 /// The listening side of one accepted request.
 pub struct Requester<E, X> {
+    job: Arc<hellas_gateway::jobs::Job>,
     sender: mpsc::Sender<BufferedEvent<WorkEvent<E>, X>>,
     overflow: watch::Sender<bool>,
     budget: Arc<Semaphore>,
@@ -288,6 +208,7 @@ pub struct Requester<E, X> {
 impl<E, X> Clone for Requester<E, X> {
     fn clone(&self) -> Self {
         Self {
+            job: self.job.clone(),
             sender: self.sender.clone(),
             overflow: self.overflow.clone(),
             budget: self.budget.clone(),
@@ -295,29 +216,36 @@ impl<E, X> Clone for Requester<E, X> {
     }
 }
 impl<E: GatewayEvent, X: std::fmt::Display + Send + 'static> Requester<E, X> {
-    pub(crate) fn new() -> (Self, RequestStream<E, X>)
+    pub(crate) fn new(job: Arc<hellas_gateway::jobs::Job>) -> (Self, RequestStream<E, X>)
     where
         X: From<WorkGatewayError>,
     {
         let (sender, receiver) = mpsc::channel(OUTPUT_BUFFER_EVENTS);
         let (overflow, overflow_receiver) = watch::channel(false);
         let requester = Self {
+            job: job.clone(),
             sender,
             overflow,
             budget: Arc::new(Semaphore::new(OUTPUT_BUFFER_BYTES)),
         };
         (
             requester,
-            response_stream(receiver, overflow_receiver, || {
-                X::from(WorkGatewayError::Execution(Box::new(
-                    std::io::Error::other(
-                        "gateway output consumer is too slow; accepted work continues",
-                    ),
-                )))
-            }),
+            Box::pin(futures::StreamExt::take_until(
+                response_stream(receiver, overflow_receiver, || {
+                    X::from(WorkGatewayError::Execution(Box::new(
+                        std::io::Error::other(
+                            "gateway output consumer is too slow; accepted work continues",
+                        ),
+                    )))
+                }),
+                async move { job.cancelled().await },
+            )),
         )
     }
     pub(crate) fn emit(&self, event: Result<WorkEvent<E>, X>) {
+        if self.job.is_cancelled() {
+            return;
+        }
         // The signed transcript is one mandatory evidence record whose size is
         // fixed by the job's authorised spool, not by how fast the consumer
         // reads. Charging it against the slow-consumer byte budget made a
@@ -353,7 +281,10 @@ impl<E: GatewayEvent, X: std::fmt::Display + Send + 'static> Requester<E, X> {
     /// Reports the provider's acceptance as it happens, before any output.
     pub(crate) fn accepted(&self) -> crate::transact::Accepted {
         let requester = self.clone();
-        Arc::new(move |provenance| requester.emit(Ok(WorkEvent::Accepted(provenance))))
+        Arc::new(move |provenance| {
+            requester.job.accepted();
+            requester.emit(Ok(WorkEvent::Accepted(provenance)));
+        })
     }
     /// Signed prefixes, decoded and delivered as they arrive.
     pub(crate) fn progress(&self) -> hellas_channel::work::PaidProgress {
@@ -379,7 +310,10 @@ impl<E: GatewayEvent, X: std::fmt::Display + Send + 'static> Requester<E, X> {
     /// Disconnecting stops a request only before its proposal.
     pub(crate) fn stop(&self) -> crate::execution::Stop {
         let sender = self.sender.clone();
-        crate::execution::stop_on(async move { sender.closed().await })
+        let job = self.job.clone();
+        crate::execution::stop_on(async move {
+            tokio::select! { _ = sender.closed() => {}, _ = job.cancelled() => {} }
+        })
     }
     pub(crate) fn observers(&self) -> crate::execution::ExecutionObservers {
         crate::execution::ExecutionObservers {
@@ -406,23 +340,15 @@ impl<E: GatewayEvent, X: std::fmt::Display + Send + 'static> Requester<E, X> {
 }
 
 /// What HTTP asks for, before any source has matched it to a policy.
+#[expect(clippy::large_enum_variant, reason = "one owned input per request")]
 pub enum WorkRequest {
-    /// Pinned to one provider by the HTTP account router; the contract comes
-    /// from the admitting policy.
+    /// The contract comes from the admitting policy.
     Fetch(WorkFetchRequest),
     /// A complete input; any admitting provider may run it.
     Job(JobInput),
 }
 
 impl WorkRequest {
-    /// The provider this request must run on, if it names one.
-    pub fn pinned(&self) -> Option<iroh::EndpointId> {
-        match self {
-            WorkRequest::Fetch(request) => Some(request.provider),
-            WorkRequest::Job(_) => None,
-        }
-    }
-
     /// The one input `policy` admits for this request. A Fetch tries each
     /// Fetch contract of `policy`; an HTTPS body is first repaired under
     /// `https`, a complete HTTPS job's body too. Two admitting contracts are
@@ -501,289 +427,329 @@ fn repair(https: &HttpsResource, body: &[u8]) -> Result<Vec<u8>, JobError> {
     Ok(serde_json::to_vec(&http)?)
 }
 
-/// The Fetch routes `policy` admits on `provider`, each once.
-pub(crate) fn fetch_routes<'a>(
-    provider: iroh::EndpointId,
-    policies: impl IntoIterator<Item = &'a InvocationPolicy>,
-) -> Vec<hellas_gateway::FetchRoute> {
-    use hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy;
-    let mut routes = Vec::new();
-    for policy in policies {
-        for admission in &policy.admissions {
-            let Admission::Fetch { admission } = admission else {
-                continue;
-            };
-            let route = hellas_gateway::FetchRoute {
-                resource: None,
-                channel: None,
-                provider,
-                schema: admission.contract.schema(),
-                sealed: match &admission.route {
-                    FetchRoutePolicy::SealedRoute { service, method } => {
-                        Some((service.clone(), method.clone()))
-                    }
-                    FetchRoutePolicy::OpenFetch { .. } => None,
-                },
-            };
-            if !routes.contains(&route) {
-                routes.push(route);
-            }
-        }
-    }
-    routes
-}
-
-/// What a gateway serves beyond what its work source admits.
+/// A runtime backend and its shared scheduling state.
 #[derive(Clone)]
-pub struct GatewayServeOptions {
-    pub server: hellas_gateway::ServerOptions,
-    pub models: Vec<hellas_gateway::ModelOptions>,
-    pub http: Option<hellas_gateway::HttpGatewayConfig>,
-    /// Merged into Responses requests sent as a Fetch.
-    pub responses_overrides: serde_json::Map<String, serde_json::Value>,
-    /// Models the Responses Fetch answers to; empty means any.
-    pub responses_models: Vec<String>,
+pub struct Backend {
+    id: String,
+    instance: u64,
+    jobs: Arc<hellas_gateway::jobs::Jobs>,
+    evaluator: Option<String>,
+    slots: Arc<Semaphore>,
+    capacity: usize,
+    down: Arc<std::sync::atomic::AtomicBool>,
+    error: Arc<std::sync::Mutex<Option<String>>>,
+    pub state: BackendState,
 }
 
-/// Serve `work` with the caller's presentations, plus Responses when the
-/// source seals exactly one Responses route. A failed start drains `work`.
-pub async fn serve_gateway(
-    work: Arc<dyn WorkExecutionBackend>,
-    options: GatewayServeOptions,
-) -> hellas_gateway::GatewayResult<hellas_gateway::GatewayHandle> {
-    let responses = match hellas_gateway::ResponsesFetch::from_routes(
-        &work.fetch_routes(),
-        options.responses_overrides,
-        options.responses_models,
-    ) {
-        Ok(responses) => responses,
-        Err(error) => {
-            return match work.drain().await {
-                Ok(()) => Err(error),
-                Err(cleanup) => Err(hellas_gateway::GatewayError::Cleanup {
-                    primary: Box::new(error),
-                    cleanup,
-                }),
-            };
-        }
-    };
-    hellas_gateway::start(hellas_gateway::GatewayOptions {
-        server: options.server,
-        work,
-        presentations: hellas_gateway::Presentations {
-            models: options.models,
-            responses,
-            http: options.http,
-        },
-    })
-    .await
-}
-
-/// Where every request of one gateway runs: the job commands' targets.
-#[expect(clippy::large_enum_variant, reason = "one per gateway")]
-pub enum GatewayTarget {
-    /// The provider's quoted terms, asked once when the gateway starts;
-    /// `options.expected_price` is the quoted price.
-    Paid {
-        options: crate::paid_client::PaidWorkOptions,
-        policy: InvocationPolicy,
-        endpoint: iroh::Endpoint,
-        settlement_key: hellas_kernel::Secp256k1Signer,
-        owner: Arc<crate::client_owner::ClientOwner>,
-    },
-    /// One granted resource of an access file.
-    Grant {
-        options: crate::grant_client::GrantSessionOptions,
-        transport: crate::grant_client::GrantTransport,
-        policy: GrantPolicy,
-    },
-    /// This machine, under the caller's own limits.
-    #[cfg(feature = "compute")]
+#[derive(Clone)]
+pub enum BackendState {
+    Unavailable(String),
     Local {
         execution: crate::execution::local::LocalExecution,
         timeout: std::time::Duration,
     },
+    Fetch {
+        execution: hellas_executor::ExecutorHandle,
+        policy: InvocationPolicy,
+    },
+    Grant(Box<GrantBackend>),
+    Paid(Box<PaidBackend>),
 }
 
-impl GatewayTarget {
+#[derive(Clone)]
+pub struct PaidBackend {
+    /// Absent until quoted; saved jobs already carry their policy.
+    pub(crate) policy: Option<InvocationPolicy>,
+    quote: Arc<tokio::sync::OnceCell<crate::paid_client::PaidQuote>>,
+    pub options: crate::paid_client::PaidWorkOptions,
+    pub endpoint: iroh::Endpoint,
+    pub settlement_key: hellas_kernel::Secp256k1Signer,
+    pub owner: Arc<crate::client_owner::ClientOwner>,
+    pub(crate) session: Arc<tokio::sync::Mutex<Option<crate::paid_client::PaidWorkSession>>>,
+    active: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl PaidBackend {
+    async fn quote(
+        &self,
+    ) -> Result<&crate::paid_client::PaidQuote, crate::paid_client::PaidClientError> {
+        self.quote
+            .get_or_try_init(|| {
+                crate::paid_client::request_paid_quote(
+                    &self.options,
+                    &self.endpoint,
+                    &self.settlement_key,
+                    self.owner.principal(),
+                )
+            })
+            .await
+    }
+
+    async fn terms(&self) -> Result<(InvocationPolicy, u64), crate::paid_client::PaidClientError> {
+        match &self.policy {
+            Some(policy) => Ok((policy.clone(), self.options.expected_price)),
+            None => {
+                let quote = self.quote().await?;
+                Ok((
+                    quote.policy.invocation_policy.clone(),
+                    quote.policy.payment_policy.fixed_price,
+                ))
+            }
+        }
+    }
+}
+#[derive(Clone)]
+pub struct GrantBackend {
+    pub options: crate::grant_client::GrantSessionOptions,
+    pub transport: crate::grant_client::GrantTransport,
+    pub policy: GrantPolicy,
+    pub(crate) channel: Arc<GrantChannel>,
+}
+
+#[derive(Default)]
+pub(crate) struct GrantChannel {
+    session: tokio::sync::Mutex<Option<crate::grant_client::GrantSession>>,
+    active: Arc<std::sync::atomic::AtomicUsize>,
+    members: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    retired: std::sync::atomic::AtomicBool,
+    down: Arc<std::sync::atomic::AtomicBool>,
+    error: Arc<std::sync::Mutex<Option<String>>>,
+}
+type GrantChannels = std::collections::BTreeMap<hellas_auth::Digest, std::sync::Weak<GrantChannel>>;
+struct SessionUse(Arc<std::sync::atomic::AtomicUsize>);
+impl Drop for SessionUse {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+impl GrantBackend {
+    fn channel_id(&self) -> Option<hellas_authority::model::grant::ChannelId> {
+        Some(
+            self.options
+                .target
+                .offer()
+                .channel(hellas_authority::model::grant::ChannelClient {
+                    principal: self.options.principal,
+                    node: hellas_auth::authority::NodeKey::from_public_key(
+                        self.options.signer.public_key(),
+                    )
+                    .ok()?,
+                }),
+        )
+    }
+}
+
+impl Backend {
+    fn new(state: BackendState) -> Self {
+        Self {
+            id: String::new(),
+            instance: 0,
+            jobs: Default::default(),
+            evaluator: None,
+            slots: Arc::new(Semaphore::new(1)),
+            capacity: 1,
+            down: Default::default(),
+            error: Default::default(),
+            state,
+        }
+    }
+    pub(crate) fn unavailable(reason: String) -> Self {
+        let backend = Self::new(BackendState::Unavailable(reason.clone()));
+        backend
+            .down
+            .store(true, std::sync::atomic::Ordering::Release);
+        *backend.error.lock().unwrap() = Some(reason);
+        backend
+    }
+    pub(crate) fn error(&self) -> Option<String> {
+        self.error.lock().unwrap().clone()
+    }
+    pub fn paid(
+        policy: Option<InvocationPolicy>,
+        options: crate::paid_client::PaidWorkOptions,
+        endpoint: iroh::Endpoint,
+        settlement_key: hellas_kernel::Secp256k1Signer,
+        owner: Arc<crate::client_owner::ClientOwner>,
+    ) -> Self {
+        Self::new(BackendState::Paid(Box::new(PaidBackend {
+            policy,
+            quote: Default::default(),
+            options,
+            endpoint,
+            settlement_key,
+            owner,
+            session: Default::default(),
+            active: Default::default(),
+        })))
+    }
+    pub fn grant(
+        policy: GrantPolicy,
+        options: crate::grant_client::GrantSessionOptions,
+        transport: crate::grant_client::GrantTransport,
+    ) -> Self {
+        Self::new(BackendState::Grant(Box::new(GrantBackend {
+            options,
+            transport,
+            policy,
+            channel: Default::default(),
+        })))
+    }
+    pub fn local(
+        execution: crate::execution::local::LocalExecution,
+        timeout: std::time::Duration,
+    ) -> Self {
+        Self::new(BackendState::Local { execution, timeout })
+    }
+    pub fn fetch(execution: hellas_executor::ExecutorHandle, policy: InvocationPolicy) -> Self {
+        Self::new(BackendState::Fetch { execution, policy })
+    }
+    pub fn policy(&self) -> Option<&InvocationPolicy> {
+        match &self.state {
+            BackendState::Unavailable(_) | BackendState::Local { .. } => None,
+            BackendState::Fetch { policy, .. } => Some(policy),
+            BackendState::Grant(grant) => Some(&grant.policy.invocation_policy),
+            BackendState::Paid(paid) => paid.policy.as_ref(),
+        }
+    }
     /// The endpoint requests reach their provider through, if remote.
     pub fn endpoint(&self) -> Option<&iroh::Endpoint> {
-        match self {
-            Self::Paid { endpoint, .. }
-            | Self::Grant {
-                transport: crate::grant_client::GrantTransport::Remote(endpoint),
-                ..
-            } => Some(endpoint),
-            _ => None,
+        match &self.state {
+            BackendState::Paid(paid) => Some(&paid.endpoint),
+            BackendState::Grant(grant) => match &grant.transport {
+                crate::grant_client::GrantTransport::Remote(endpoint) => Some(endpoint),
+                crate::grant_client::GrantTransport::Local(_) => None,
+            },
+            BackendState::Unavailable(_)
+            | BackendState::Local { .. }
+            | BackendState::Fetch { .. } => None,
         }
     }
 
-    /// The provider every request runs on; none for this machine.
-    fn provider(&self) -> Result<Option<iroh::EndpointId>, WorkGatewayError> {
-        Ok(match self {
-            Self::Paid { options, .. } => Some(options.provider.node),
-            Self::Grant { options, .. } => Some(
-                iroh::EndpointId::from_bytes(
-                    &grant_transport(&options.target.offer().provider).map_err(execution)?,
-                )
-                .map_err(execution)?,
-            ),
-            #[cfg(feature = "compute")]
-            Self::Local { .. } => None,
-        })
+    /// Quote paid work before rendering a job. Saved jobs already carry their
+    /// price and can execute without requesting another quote.
+    pub async fn quote(&mut self) -> Result<u64, crate::paid_client::PaidClientError> {
+        let BackendState::Paid(paid) = &mut self.state else {
+            return Ok(0);
+        };
+        let quote = paid.quote().await?.clone();
+        paid.options.expected_price = quote.policy.payment_policy.fixed_price;
+        paid.policy = Some(quote.policy.invocation_policy);
+        Ok(paid.options.expected_price)
     }
 
     /// The one job `request` becomes under this target's terms.
-    fn job(&self, request: &WorkRequest) -> Result<Job, WorkGatewayError> {
-        if let Some(provider) = request.pinned()
-            && self.provider()? != Some(provider)
-        {
-            return Err(WorkGatewayError::Provider(provider));
-        }
-        let input = match self {
-            Self::Paid {
-                options, policy, ..
-            } => {
-                if matches!(request, WorkRequest::Fetch(fetch) if fetch.resource.is_some() || fetch.channel.is_some())
-                {
-                    return Err(rejected(std::io::Error::other(
-                        "paid work has no grant resource selector",
-                    )));
-                }
-                request.admitted(policy, None, options.assurance, true)
+    fn job(&self, request: &WorkRequest) -> Result<Job, ExecutionError> {
+        use hellas_rpc::Assurance::ProducerSigned;
+        let local_policy;
+        let (policy, https, assurance, price, paid) = match &self.state {
+            BackendState::Unavailable(error) => {
+                return Err(std::io::Error::other(error.clone()).into());
             }
-            Self::Grant {
-                options, policy, ..
-            } => {
-                if let WorkRequest::Fetch(fetch) = request
-                    && (fetch.resource.is_some() != fetch.channel.is_some()
-                        || fetch.resource.is_some_and(|id| id != policy.resource)
-                        || fetch.channel.is_some_and(|id| Some(id) != channel(options)))
-                {
-                    return Err(rejected(std::io::Error::other(
-                        "the request names another granted resource",
-                    )));
-                }
-                request.admitted(
-                    &policy.invocation_policy,
-                    policy.https.as_ref(),
-                    options.target.trust().required_assurance,
-                    false,
-                )
+            BackendState::Local { timeout, .. } => {
+                let WorkRequest::Job(input) = request else {
+                    return Err(
+                        JobError::Invalid("local backend needs a Compute job".into()).into(),
+                    );
+                };
+                local_policy = crate::execution::local::policy(input, *timeout)?;
+                (&local_policy, None, ProducerSigned, 0, false)
             }
-            #[cfg(feature = "compute")]
-            Self::Local { timeout, .. } => match request {
-                WorkRequest::Job(input) => {
-                    crate::execution::local::policy(input, *timeout).and_then(|policy| {
-                        request.admitted(&policy, None, hellas_rpc::Assurance::ProducerSigned, false)
-                    })
-                }
-                WorkRequest::Fetch(_) => return Err(WorkGatewayError::Unsupported),
-            },
-        }
-        .map_err(rejected)?;
-        let price = match self {
-            Self::Paid { options, .. } => options.expected_price,
-            _ => 0,
-        };
-        Job::from_input(price, input).map_err(rejected)
-    }
-
-    /// An untracked run of one job: the gateway process finishes what it proposes.
-    #[cfg_attr(
-        not(feature = "compute"),
-        expect(
-            unused_variables,
-            reason = "only local runs size their terms to the job"
-        )
-    )]
-    fn executor(&self, job: &Job) -> Result<Executor, ExecutionError> {
-        Ok(match self {
-            Self::Paid {
-                options,
-                endpoint,
-                settlement_key,
-                owner,
-                ..
-            } => Executor::Paid(crate::execution::PaidExecution {
-                options: options.clone(),
-                endpoint: endpoint.clone(),
-                settlement_key: settlement_key.clone(),
-                owner: owner.clone(),
-                funding: Default::default(),
-                attempt: None,
-                settle: false,
-            }),
-            Self::Grant {
-                options,
-                transport,
-                policy,
-            } => Executor::Grant(crate::execution::GrantExecution {
-                options: options.clone(),
-                transport: transport.clone(),
-                resource: policy.resource,
-                attempt: None,
-            }),
-            #[cfg(feature = "compute")]
-            Self::Local { execution, timeout } => Executor::Local(
-                execution.clone(),
-                crate::execution::local::policy(job.input(), *timeout)?,
+            BackendState::Fetch { policy, .. } => (policy, None, ProducerSigned, 0, false),
+            BackendState::Grant(grant) => (
+                &grant.policy.invocation_policy,
+                grant.policy.https.as_ref(),
+                grant.options.target.trust().required_assurance,
+                0,
+                false,
             ),
-        })
-    }
-
-    /// The most steps one Compute job may take: the quoted terms of a paid
-    /// provider, the granted resource's, none on this machine.
-    pub fn max_steps(&self) -> Option<u64> {
-        match self {
-            Self::Paid { policy, .. } => Some(policy.limits.step_bound()),
-            Self::Grant { policy, .. } => Some(policy.invocation_policy.limits.step_bound()),
-            #[cfg(feature = "compute")]
-            Self::Local { .. } => None,
-        }
-    }
-
-    /// The Fetch routes this target admits.
-    pub fn fetch_routes(&self) -> Result<Vec<hellas_gateway::FetchRoute>, WorkGatewayError> {
-        let Some(provider) = self.provider()? else {
-            return Ok(Vec::new());
+            BackendState::Paid(paid) => (
+                paid.policy.as_ref().ok_or(ExecutionError::Identity)?,
+                None,
+                paid.options.assurance,
+                paid.options.expected_price,
+                true,
+            ),
         };
-        Ok(match self {
-            Self::Paid { policy, .. } => fetch_routes(provider, [policy]),
-            Self::Grant {
-                options, policy, ..
-            } => fetch_routes(provider, [&policy.invocation_policy])
-                .into_iter()
-                .map(|mut route| {
-                    route.resource = Some(policy.resource);
-                    route.channel = channel(options);
-                    route
-                })
-                .collect(),
-            #[cfg(feature = "compute")]
-            Self::Local { .. } => Vec::new(),
-        })
+        let input = request.admitted(policy, https, assurance, paid)?;
+        Ok(Job::from_input(price, input)?)
     }
 
-    /// The HTTP routes a granted HTTPS resource presents, if it has one.
-    pub fn http_config(
-        &self,
-    ) -> Result<Option<hellas_gateway::HttpGatewayConfig>, WorkGatewayError> {
-        let Self::Grant { policy, .. } = self else {
-            return Ok(None);
-        };
-        if policy.https.is_none() {
-            return Ok(None);
+    /// The Fetch schemas and routes admitted by this backend, each once.
+    pub fn fetch_routes(&self) -> Vec<(hellas_rpc::FetchSchema, FetchRoutePolicy)> {
+        let policy = self.policy();
+        let mut routes = Vec::new();
+        if let Some(policy) = policy {
+            for admission in &policy.admissions {
+                if let Admission::Fetch { admission } = admission {
+                    let route = (admission.contract.schema(), admission.route.clone());
+                    if !routes.contains(&route) {
+                        routes.push(route);
+                    }
+                }
+            }
         }
+        routes
+    }
+}
+
+pub fn grant_routes(
+    policy: &GrantPolicy,
+    id: &str,
+) -> Result<Vec<hellas_gateway::Route>, WorkGatewayError> {
+    if policy.https.is_some() {
         let (service, method, routes) = policy_http_routes(policy)?;
-        Ok(Some(hellas_gateway::HttpGatewayConfig {
-            service: Some(service),
-            method: Some(method),
-            backends: Default::default(),
-            max_in_flight: 32,
-            routes,
-        }))
+        return Ok(routes
+            .into_iter()
+            .map(|route| hellas_gateway::Route {
+                backends: vec![id.into()],
+                presentation: hellas_gateway::Presentation::Http {
+                    targets: [(
+                        id.into(),
+                        hellas_gateway::HttpTarget {
+                            service: service.clone(),
+                            method: method.clone(),
+                            route,
+                        },
+                    )]
+                    .into(),
+                },
+            })
+            .collect());
     }
+    let Some(resource) = &policy.responses else {
+        return Ok(vec![]);
+    };
+    let routes: Vec<_> = policy
+        .invocation_policy
+        .admissions
+        .iter()
+        .filter_map(|admission| match admission {
+            Admission::Fetch { admission } => {
+                Some((admission.contract.schema(), admission.route.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    let mut sealed = routes.iter().filter_map(|(schema, route)| match route {
+        FetchRoutePolicy::SealedRoute { service, method }
+            if *schema == hellas_rpc::FetchSchema::StatelessResponsesV1 =>
+        {
+            Some((service, method))
+        }
+        _ => None,
+    });
+    let (service, method) = sealed.next().ok_or(WorkGatewayError::Unsupported)?;
+    if sealed.next().is_some() {
+        return Err(WorkGatewayError::Unsupported);
+    }
+    Ok(vec![hellas_gateway::Route {
+        backends: vec![id.into()],
+        presentation: hellas_gateway::Presentation::Responses {
+            service: service.clone(),
+            method: method.clone(),
+            models: vec![resource.model.clone()],
+            overrides: Default::default(),
+        },
+    }])
 }
 
 /// A granted HTTPS resource as HTTP presentation routes on its one sealed route.
@@ -841,155 +807,630 @@ fn policy_http_routes(
     Ok((service.clone(), method.clone(), routes))
 }
 
-/// The grant channel this device opens with the offer.
-fn channel(
-    options: &crate::grant_client::GrantSessionOptions,
-) -> Option<hellas_channel::model::grant::ChannelId> {
-    let node =
-        hellas_auth::authority::NodeKey::from_public_key(options.signer.public_key()).ok()?;
-    Some(
-        options
-            .target
-            .offer()
-            .channel(hellas_channel::model::grant::ChannelClient {
-                principal: options.principal,
-                node,
-            }),
-    )
+/// A configured execution destination. Ids are scoped to one daemon document.
+pub struct BackendEntry {
+    pub backend: Backend,
+    pub evaluator: Option<String>,
+    pub max_in_flight: std::num::NonZeroUsize,
 }
 
-/// The gateway backend: one [`Executor`] run per request, one at a time,
-/// since a channel journal, a funding wallet and a machine each have one owner.
-/// It owns its target's endpoint and closes it when it drains.
 pub struct ExecutorGateway {
-    inner: Arc<Inner>,
-    admission: Arc<Semaphore>,
-    tasks: WorkTasks,
-}
-
-struct Inner {
-    target: GatewayTarget,
-    evaluator: Option<String>,
+    backends: std::collections::BTreeMap<String, Arc<Backend>>,
     signer: Arc<hellas_auth::ProducerSigningKey>,
-    serial: tokio::sync::Mutex<()>,
+    pub jobs: Arc<hellas_gateway::jobs::Jobs>,
+    grants: Arc<std::sync::Mutex<GrantChannels>>,
 }
-
 impl ExecutorGateway {
-    /// `evaluator` is the renderer Compute requests are rendered for, if any;
-    /// `signer` signs paid and local proposals: the caller's device key.
+    pub fn backend(&self, id: &str) -> Option<&Backend> {
+        self.backends.get(id).map(AsRef::as_ref)
+    }
+
     pub fn new(
-        target: GatewayTarget,
-        evaluator: Option<String>,
+        backends: std::collections::BTreeMap<String, BackendEntry>,
         signer: Arc<hellas_auth::ProducerSigningKey>,
     ) -> Arc<Self> {
+        Self::prepare(
+            backends,
+            signer,
+            Arc::new(hellas_gateway::jobs::Jobs::default()),
+            None,
+            &Default::default(),
+        )
+    }
+
+    pub(crate) fn prepare(
+        backends: std::collections::BTreeMap<String, BackendEntry>,
+        signer: Arc<hellas_auth::ProducerSigningKey>,
+        jobs: Arc<hellas_gateway::jobs::Jobs>,
+        previous: Option<&Self>,
+        reuse: &std::collections::BTreeSet<String>,
+    ) -> Arc<Self> {
+        Self::prepare_identified(backends, signer, jobs, previous, reuse, &[])
+    }
+
+    pub(crate) fn prepare_identified(
+        backends: std::collections::BTreeMap<String, BackendEntry>,
+        signer: Arc<hellas_auth::ProducerSigningKey>,
+        jobs: Arc<hellas_gateway::jobs::Jobs>,
+        previous: Option<&Self>,
+        reuse: &std::collections::BTreeSet<String>,
+        identities: &[hellas_gateway::BackendInfo],
+    ) -> Arc<Self> {
+        let grants: Arc<std::sync::Mutex<GrantChannels>> =
+            previous.map_or_else(Default::default, |old| old.grants.clone());
+        let mut channels = grants.lock().unwrap();
+        channels.retain(|_, channel| channel.strong_count() > 0);
+        let mut resolved: std::collections::BTreeMap<_, _> = previous
+            .into_iter()
+            .flat_map(|previous| previous.backends.iter())
+            .filter(|(id, _)| reuse.contains(*id))
+            .map(|(id, inner)| (id.clone(), inner.clone()))
+            .collect();
+        resolved.extend(backends.into_iter().map(|(id, entry)| {
+            let mut backend = entry.backend;
+            backend.id = id.clone();
+            backend.instance = identities
+                .iter()
+                .find(|info| info.id == id)
+                .map_or_else(rand::random, |info| info.instance);
+            backend.jobs = jobs.clone();
+            backend.evaluator = entry.evaluator;
+            backend.capacity = entry.max_in_flight.get();
+            backend.slots = match previous
+                .and_then(|previous| previous.backends.get(&id))
+                .filter(|old| old.instance == backend.instance)
+            {
+                Some(old) => {
+                    assert_eq!(
+                        old.capacity, backend.capacity,
+                        "an instance keeps its capacity"
+                    );
+                    old.slots.clone()
+                }
+                None => Arc::new(Semaphore::new(backend.capacity)),
+            };
+            if let BackendState::Grant(grant) = &mut backend.state {
+                if let Some(id) = grant.channel_id() {
+                    let retained = channels.entry(id.0).or_default();
+                    if let Some(channel) = retained.upgrade() {
+                        grant.channel = channel;
+                    } else {
+                        *retained = Arc::downgrade(&grant.channel);
+                    }
+                }
+                grant
+                    .channel
+                    .retired
+                    .store(false, std::sync::atomic::Ordering::Release);
+                backend.down = grant.channel.down.clone();
+                backend.error = grant.channel.error.clone();
+            }
+            (id, Arc::new(backend))
+        }));
+        for channel in channels.values().filter_map(std::sync::Weak::upgrade) {
+            channel.members.lock().unwrap().clear();
+        }
+        for (id, backend) in &resolved {
+            if let BackendState::Grant(grant) = &backend.state {
+                grant.channel.members.lock().unwrap().insert(id.clone());
+            }
+        }
+        drop(channels);
         Arc::new(Self {
-            inner: Arc::new(Inner {
-                target,
-                evaluator,
-                signer,
-                serial: tokio::sync::Mutex::new(()),
-            }),
-            admission: Arc::new(Semaphore::new(32)),
-            tasks: WorkTasks::default(),
+            backends: resolved,
+            signer,
+            jobs,
+            grants,
         })
     }
 
-    pub fn target(&self) -> &GatewayTarget {
-        &self.inner.target
+    pub(crate) async fn retire(&self, next: &Self) -> Result<(), WorkShutdownError> {
+        let mut failure = None;
+        for (id, backend) in &self.backends {
+            if next
+                .backends
+                .get(id)
+                .is_some_and(|next| next.instance == backend.instance)
+            {
+                continue;
+            }
+            backend.slots.close();
+            if let BackendState::Grant(grant) = &backend.state {
+                let retained = next.backends.values().any(|next| {
+                    matches!(&next.state,
+                    BackendState::Grant(other) if Arc::ptr_eq(&grant.channel, &other.channel))
+                });
+                grant
+                    .channel
+                    .retired
+                    .store(!retained, std::sync::atomic::Ordering::Release);
+            }
+            if let Err(error) = backend.close_sessions().await {
+                failure.get_or_insert(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
     }
 
     fn request<E: GatewayEvent>(
         &self,
+        id: &str,
+        request_job: Arc<hellas_gateway::jobs::Job>,
         request: WorkRequest,
     ) -> Result<WorkOutputStream<E>, WorkGatewayError> {
-        let permit = self
-            .admission
+        let inner = self
+            .backends
+            .get(id)
+            .ok_or(WorkGatewayError::Unsupported)?
+            .clone();
+        let permit = inner
+            .slots
             .clone()
             .try_acquire_owned()
-            .map_err(|_| WorkGatewayBusy)?;
-        let job = self.inner.target.job(&request)?;
-        let (requester, stream) = Requester::<E, WorkGatewayError>::new();
-        let inner = self.inner.clone();
-        self.tasks.spawn(async move {
-            let _permit = permit;
-            if let Err(error) = inner.run(job, requester.clone()).await {
-                requester.emit(Err(error));
-            }
-        })?;
+            .map_err(|_| WorkGatewayError::PreProposal(Box::new(WorkGatewayBusy.into())))?;
+        let session_use = inner.use_session();
+        let (requester, stream) = Requester::<E, WorkGatewayError>::new(request_job.clone());
+        let signer = self.signer.clone();
+        request_job
+            .spawn(id, async move {
+                let _permit = permit;
+                if let Err(error) = inner
+                    .run(request, requester.clone(), &signer, session_use)
+                    .await
+                {
+                    requester.emit(Err(error));
+                }
+            })
+            .map_err(|error| WorkGatewayError::PreProposal(Box::new(error.into())))?;
         Ok(stream)
     }
 }
+impl Backend {
+    async fn close_sessions(&self) -> Result<(), WorkShutdownError> {
+        match &self.state {
+            BackendState::Grant(target) => {
+                use std::sync::atomic::Ordering;
+                if !(target.channel.retired.load(Ordering::Acquire)
+                    || target.channel.down.load(Ordering::Acquire))
+                    || target.channel.active.load(Ordering::Acquire) != 0
+                {
+                    return Ok(());
+                }
+                let mut session = target.channel.session.lock().await;
+                if (target.channel.retired.load(Ordering::Acquire)
+                    || target.channel.down.load(Ordering::Acquire))
+                    && target.channel.active.load(Ordering::Acquire) == 0
+                    && let Some(mut session) = session.take()
+                {
+                    session
+                        .shutdown()
+                        .await
+                        .map_err(|error| WorkShutdownError::Recovery(Arc::new(error)))?;
+                }
+            }
+            BackendState::Paid(target) => {
+                let mut session = target.session.lock().await;
+                if (self.down.load(std::sync::atomic::Ordering::Acquire) || self.slots.is_closed())
+                    && target.active.load(std::sync::atomic::Ordering::Acquire) == 0
+                    && let Some(mut session) = session.take()
+                {
+                    session.shutdown().await;
+                }
+            }
+            BackendState::Unavailable(_)
+            | BackendState::Local { .. }
+            | BackendState::Fetch { .. } => {}
+        }
+        Ok(())
+    }
+    fn use_session(&self) -> Option<SessionUse> {
+        let active = match &self.state {
+            BackendState::Paid(paid) => &paid.active,
+            BackendState::Grant(grant) => &grant.channel.active,
+            _ => return None,
+        };
+        active.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Some(SessionUse(active.clone()))
+    }
 
-impl Inner {
-    /// A request that disconnects while queued never starts.
+    fn health(&self, error: Option<String>) {
+        self.jobs.change(|| {
+            let down = error.is_some();
+            let mut stored = self.error.lock().unwrap();
+            if *stored == error {
+                return Vec::new();
+            }
+            *stored = error.clone();
+            self.down.store(down, std::sync::atomic::Ordering::Release);
+            let ids = match &self.state {
+                BackendState::Grant(grant) => grant
+                    .channel
+                    .members
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .cloned()
+                    .collect(),
+                _ => vec![self.id.clone()],
+            };
+            ids.into_iter()
+                .map(|id| hellas_gateway::jobs::Event::Backend {
+                    id,
+                    down,
+                    reason: error.clone().unwrap_or_else(|| "session opened".into()),
+                })
+                .collect()
+        });
+    }
+
     async fn run<E: GatewayEvent>(
         &self,
-        job: Job,
+        request: WorkRequest,
         requester: Requester<E, WorkGatewayError>,
+        signer: &hellas_auth::ProducerSigningKey,
+        session_use: Option<SessionUse>,
     ) -> Result<(), WorkGatewayError> {
+        use crate::execution::AttemptError;
         let stop = requester.stop();
-        let Ok(_serial) =
-            crate::execution::before_proposal(None, &stop, None, self.serial.lock()).await
-        else {
-            return Ok(());
+        let run = match &self.state {
+            BackendState::Unavailable(error) => Err(AttemptError::PreProposal(Box::new(
+                ExecutionError::Local(error.clone()),
+            ))),
+            BackendState::Paid(target) => {
+                self.run_paid(target, &request, &stop, &requester, signer)
+                    .await
+            }
+            BackendState::Grant(target) => {
+                self.run_grant(target, &request, &stop, &requester).await
+            }
+            BackendState::Fetch { .. } | BackendState::Local { .. } => match self.job(&request) {
+                Ok(job) => self.run_here(&job, stop, &requester, signer).await,
+                Err(error) => Err(AttemptError::PreProposal(Box::new(error))),
+            },
         };
-        let executor = self.target.executor(&job).map_err(gateway_error)?;
-        let run = executor
+        let result = match run {
+            Ok(_) => Ok(()),
+            Err(AttemptError::PreProposal(error)) => {
+                requester.job.pre_proposal_failure();
+                if backend_failed(&error) {
+                    self.health(Some(error.to_string()));
+                }
+                Err(WorkGatewayError::PreProposal(Box::new(gateway_error(
+                    *error,
+                ))))
+            }
+            Err(AttemptError::Committed(error)) => {
+                if backend_failed(&error)
+                    && !matches!(
+                        &*error,
+                        ExecutionError::Grant(GrantClientError::Refused { .. })
+                    )
+                {
+                    self.health(Some(error.to_string()));
+                }
+                Err(gateway_error(*error))
+            }
+            Err(AttemptError::Stopped(crate::execution::RequestStopped::Disconnected)) => {
+                requester.job.stopped();
+                Ok(())
+            }
+            Err(AttemptError::Stopped(error)) => Err(gateway_error(error.into())),
+        };
+        drop(session_use);
+        // Session ownership ends before the task releases its scheduling permit.
+        finish_job(&requester.job, result, self.close_sessions().await)
+    }
+
+    async fn run_here<E: GatewayEvent>(
+        &self,
+        job: &Job,
+        stop: crate::execution::Stop,
+        requester: &Requester<E, WorkGatewayError>,
+        signer: &hellas_auth::ProducerSigningKey,
+    ) -> Result<crate::execution::Completed, crate::execution::AttemptError> {
+        use crate::execution::AttemptError;
+        let result = Executor::new(self.clone())
             .run(
-                &job,
-                &self.signer,
+                job,
+                signer,
                 None,
                 stop,
                 requester.observers(),
                 requester.delivery(),
             )
             .await;
-        match run {
-            Ok(_) | Err(ExecutionError::Stopped(RequestStopped::Disconnected)) => Ok(()),
-            Err(error) => Err(gateway_error(error)),
+        result.map_err(|error| match error {
+            ExecutionError::LocalAdmission(_) => AttemptError::PreProposal(Box::new(error)),
+            ExecutionError::Stopped(stopped) => AttemptError::Stopped(stopped),
+            _ => AttemptError::Committed(Box::new(error)),
+        })
+    }
+    async fn run_paid<E: GatewayEvent>(
+        &self,
+        target: &PaidBackend,
+        request: &WorkRequest,
+        stop: &crate::execution::Stop,
+        requester: &Requester<E, WorkGatewayError>,
+        signer: &hellas_auth::ProducerSigningKey,
+    ) -> Result<crate::execution::Completed, crate::execution::AttemptError> {
+        use crate::execution::{AttemptError, PaidOpen, before_proposal, open_paid_session};
+        use std::sync::atomic::Ordering;
+        let pre = |error: ExecutionError| AttemptError::PreProposal(Box::new(error));
+        let committed = |error: ExecutionError| AttemptError::Committed(Box::new(error));
+        let PaidBackend {
+            options,
+            endpoint,
+            settlement_key,
+            owner,
+            ..
+        } = target;
+        let mut guard = before_proposal(None, stop, None, target.session.lock()).await?;
+        if self.down.load(Ordering::Acquire) && guard.is_some() {
+            return Err(pre(ExecutionError::RecoveryRequired));
         }
+        if guard.is_none() {
+            let opened = before_proposal(
+                None,
+                stop,
+                None,
+                Box::pin(async {
+                    let (policy, price) = target.terms().await?;
+                    let input = request.admitted(&policy, None, options.assurance, true)?;
+                    let job = Job::from_input(price, input)?;
+                    let mut options = options.clone();
+                    options.expected_price = price;
+                    let mut session = open_paid_session(
+                        options,
+                        endpoint.clone(),
+                        settlement_key.clone(),
+                        owner.clone(),
+                        Default::default(),
+                        PaidOpen::Job(&job, target.quote.get()),
+                        None,
+                    )
+                    .await?;
+                    session
+                        .run(None, &crate::paid_client::empty_content(), true, None)
+                        .await?;
+                    Ok::<_, ExecutionError>(session)
+                }),
+            )
+            .await?
+            .map_err(pre)?;
+            *guard = Some(opened);
+            self.health(None);
+        }
+        let session = guard
+            .as_mut()
+            .ok_or_else(|| pre(ExecutionError::Identity))?;
+        let price = session.descriptor().payment_policy().fixed_price;
+        drop(guard);
+        let proposed = requester.job.proposal();
+        let completed = crate::execution::run_paid(
+            crate::execution::SessionSource::Shared(&target.session),
+            request,
+            price,
+            signer,
+            (None, stop, requester.observers(), &proposed),
+            None,
+        )
+        .await?;
+        requester.delivery()(&completed)
+            .map_err(|error| committed(ExecutionError::Delivery(error)))?;
+        Ok(completed)
+    }
+
+    async fn run_grant<E: GatewayEvent>(
+        &self,
+        target: &GrantBackend,
+        request: &WorkRequest,
+        stop: &crate::execution::Stop,
+        requester: &Requester<E, WorkGatewayError>,
+    ) -> Result<crate::execution::Completed, crate::execution::AttemptError> {
+        use crate::execution::{AttemptError, before_proposal};
+        let pre = |error: ExecutionError| AttemptError::PreProposal(Box::new(error));
+        let committed = |error: ExecutionError| AttemptError::Committed(Box::new(error));
+        let GrantBackend {
+            options,
+            transport,
+            policy,
+            ..
+        } = target;
+        let mut guard = before_proposal(None, stop, None, target.channel.session.lock()).await?;
+        if guard
+            .as_ref()
+            .is_some_and(|session| !session.reusable_with(options))
+        {
+            if target
+                .channel
+                .active
+                .load(std::sync::atomic::Ordering::Acquire)
+                > 1
+            {
+                return Err(pre(ExecutionError::RecoveryRequired));
+            }
+            if let Some(mut session) = guard.take() {
+                session
+                    .shutdown()
+                    .await
+                    .map_err(|error| pre(error.into()))?;
+            }
+        }
+        if self.down.load(std::sync::atomic::Ordering::Acquire) && guard.is_some() {
+            return Err(pre(ExecutionError::RecoveryRequired));
+        }
+        if guard.is_none() {
+            let opened = before_proposal(None, stop, None, async {
+                let mut session =
+                    crate::grant_client::GrantSession::open(options.clone(), transport.clone())
+                        .await?;
+                session.recover().await?;
+                Ok::<_, crate::grant_client::GrantClientError>(session)
+            })
+            .await?
+            .map_err(|error| pre(error.into()))?;
+            *guard = Some(opened);
+            self.health(None);
+        }
+        drop(guard);
+        let proposed = requester.job.proposal();
+        let completed = crate::execution::run_grant(
+            crate::execution::SessionSource::Shared(&target.channel.session),
+            request,
+            policy.resource,
+            (None, stop, requester.observers(), &proposed),
+            None,
+        )
+        .await?;
+        requester.delivery()(&completed)
+            .map_err(|error| committed(ExecutionError::Delivery(error)))?;
+        Ok(completed)
     }
 }
+fn finish_job(
+    job: &hellas_gateway::jobs::Job,
+    result: Result<(), WorkGatewayError>,
+    closed: Result<(), WorkShutdownError>,
+) -> Result<(), WorkGatewayError> {
+    if let Err(error) = closed {
+        tracing::warn!(%error, "session close retains recovery obligations");
+    }
+    if !matches!(&result, Err(WorkGatewayError::PreProposal(_))) {
+        job.finish(if result.is_ok() {
+            hellas_gateway::jobs::Outcome::Completed
+        } else {
+            hellas_gateway::jobs::Outcome::Failed
+        });
+    }
+    result
+}
 
+fn backend_failed(error: &ExecutionError) -> bool {
+    use crate::grant_client::GrantClientError as G;
+    use crate::paid_client::PaidClientError as P;
+    use hellas_channel::work::{DeliverError, ProposeError};
+    use hellas_channel::work_store::WorkStoreError;
+    match error {
+        ExecutionError::Paid(error)
+        | ExecutionError::Transaction(crate::transact::TransactError::Client(error)) => matches!(
+            error,
+            P::Connect { .. }
+                | P::OfferUnavailable { .. }
+                | P::OfferRefused(_)
+                | P::SetupEnded(_)
+                | P::Endpoint(_)
+                | P::ProviderIdentityPoisoned
+                | P::Store(_)
+                | P::Client(_)
+                | P::Payment(_)
+                | P::Timeout { .. }
+                | P::Propose(
+                    ProposeError::Transport(_)
+                        | ProposeError::Endpoint(_)
+                        | ProposeError::Conflict
+                        | ProposeError::Store(WorkStoreError::Journal(_))
+                )
+                | P::Deliver(DeliverError::Transport(_))
+        ),
+        ExecutionError::RecoveryRequired | ExecutionError::Io(_) => true,
+        ExecutionError::Grant(error) => matches!(
+            error,
+            G::RecoveryRequired | G::Timeout | G::Wire(_) | G::Client(_) | G::Refused { .. }
+        ),
+        _ => false,
+    }
+}
 impl WorkExecutionBackend for ExecutorGateway {
-    fn evaluator(&self) -> Option<String> {
-        self.inner.evaluator.clone()
+    fn backends(&self) -> Vec<hellas_gateway::BackendInfo> {
+        self.backends
+            .iter()
+            .map(|(id, backend)| hellas_gateway::BackendInfo {
+                id: id.clone(),
+                instance: backend.instance,
+                evaluator: backend.evaluator.clone(),
+                max_in_flight: backend.capacity,
+                in_flight: backend.capacity - backend.slots.available_permits(),
+                down: backend.down.load(std::sync::atomic::Ordering::Acquire),
+                error: backend.error(),
+            })
+            .collect()
     }
-    fn fetch_routes(&self) -> Vec<hellas_gateway::FetchRoute> {
-        self.inner.target.fetch_routes().unwrap_or_default()
-    }
-    fn max_steps(&self) -> Option<u64> {
-        self.inner.target.max_steps()
+    fn max_steps<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> futures::future::BoxFuture<'a, Result<Option<u64>, WorkGatewayError>> {
+        Box::pin(async move {
+            let backend = self.backends.get(id).ok_or(WorkGatewayError::Unsupported)?;
+            if let BackendState::Paid(paid) = &backend.state {
+                if let Some(session) = paid.session.lock().await.as_ref() {
+                    return Ok(Some(
+                        session.descriptor().invocation_policy().limits.step_bound(),
+                    ));
+                }
+                return match paid.terms().await {
+                    Ok((policy, _)) => Ok(Some(policy.limits.step_bound())),
+                    Err(error) => {
+                        let error = ExecutionError::Paid(error);
+                        if backend_failed(&error) {
+                            backend.health(Some(error.to_string()));
+                        }
+                        Err(WorkGatewayError::PreProposal(Box::new(gateway_error(
+                            error,
+                        ))))
+                    }
+                };
+            }
+            Ok(backend.policy().map(|policy| policy.limits.step_bound()))
+        })
     }
     fn fetch(
         &self,
+        backend: &str,
+        request_job: Arc<hellas_gateway::jobs::Job>,
         request: WorkFetchRequest,
     ) -> Result<WorkOutputStream<OutputEvent>, WorkGatewayError> {
-        self.request(WorkRequest::Fetch(request))
+        self.request(backend, request_job, WorkRequest::Fetch(request))
     }
     fn run(
         &self,
+        backend: &str,
+        request_job: Arc<hellas_gateway::jobs::Job>,
         job: hellas_client::model::ComputeJob,
     ) -> Result<WorkOutputStream<ComputeEvent>, WorkGatewayError> {
-        let evaluator = self.evaluator().ok_or(WorkGatewayError::Unsupported)?;
-        self.request(WorkRequest::Job(JobInput::Compute {
-            evaluator,
-            environment: job.environment,
-            plan: job.plan,
-            inputs: job.inputs,
-            content: Arc::new(job.content),
-        }))
+        let evaluator = self
+            .backends
+            .get(backend)
+            .and_then(|b| b.evaluator.clone())
+            .ok_or(WorkGatewayError::Unsupported)?;
+        self.request(
+            backend,
+            request_job,
+            WorkRequest::Job(JobInput::Compute {
+                evaluator,
+                environment: job.environment,
+                plan: job.plan,
+                inputs: job.inputs,
+                content: Arc::new(job.content),
+            }),
+        )
     }
-    /// Finishes accepted work, then closes the target's endpoint.
     fn drain(&self) -> BoxFuture<'_, Result<(), WorkShutdownError>> {
-        self.admission.close();
-        self.tasks.close();
+        for backend in self.backends.values() {
+            backend.slots.close();
+            if let BackendState::Grant(grant) = &backend.state {
+                grant
+                    .channel
+                    .retired
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+        self.jobs.close();
         Box::pin(async move {
-            let drained = self.tasks.drain().await;
-            if let Some(endpoint) = self.inner.target.endpoint()
-                && !endpoint.is_closed()
-            {
-                endpoint.close().await;
+            let mut drained = self.jobs.drain().await;
+            for backend in self.backends.values() {
+                if let Err(error) = backend.close_sessions().await {
+                    drained = drained.and(Err(error));
+                }
             }
             drained
         })
@@ -1007,6 +1448,8 @@ fn rejected(e: impl std::error::Error + Send + Sync + 'static) -> WorkGatewayErr
 fn gateway_error(error: ExecutionError) -> WorkGatewayError {
     match error {
         ExecutionError::Grant(error) => grant_error(error),
+        #[cfg(feature = "compute")]
+        ExecutionError::LocalAdmission(_) => WorkGatewayBusy.into(),
         ExecutionError::Job(error) => rejected(error),
         ExecutionError::Identity => rejected(ExecutionError::Identity),
         ExecutionError::Stopped(error) => WorkGatewayError::Timeout(Box::new(error)),
@@ -1089,74 +1532,6 @@ fn grant_error(e: GrantClientError) -> WorkGatewayError {
     reason = "inventory class A/B/C: test timing fixtures pending their rollout"
 )]
 mod grant_tests;
-
-#[cfg(test)]
-mod task_tests {
-    use super::WorkTasks;
-    use hellas_gateway::WorkShutdownError;
-    use tokio::sync::oneshot;
-
-    #[tokio::test]
-    async fn cancelled_drain_keeps_tasks_even_when_state_is_poisoned() {
-        for poison in [false, true] {
-            let tasks = WorkTasks::default();
-            let (release, released) = oneshot::channel();
-            let (finished, completed) = oneshot::channel();
-            tasks
-                .spawn(async move {
-                    released.await.unwrap();
-                    finished.send(()).unwrap();
-                })
-                .unwrap();
-            if poison {
-                assert!(
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let _state = tasks.state.lock().unwrap();
-                        panic!("inject poisoned task state");
-                    }))
-                    .is_err()
-                );
-            }
-            {
-                let mut first = std::pin::pin!(tasks.drain());
-                assert!(futures::poll!(&mut first).is_pending());
-            }
-            assert!(tasks.spawn(async {}).is_err());
-            let mut second = std::pin::pin!(tasks.drain());
-            assert!(futures::poll!(&mut second).is_pending());
-            release.send(()).unwrap();
-            let result = second.await;
-            completed.await.unwrap();
-            if poison {
-                assert!(matches!(result, Err(WorkShutdownError::Poisoned)));
-            } else {
-                result.unwrap();
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn task_panic_is_reported_after_other_work_finishes() {
-        let tasks = WorkTasks::default();
-        tasks
-            .spawn(async {
-                panic!("inject gateway task panic");
-            })
-            .unwrap();
-        let (release, released) = oneshot::channel();
-        tasks
-            .spawn(async {
-                released.await.unwrap();
-            })
-            .unwrap();
-        let mut draining = std::pin::pin!(tasks.drain());
-        assert!(futures::poll!(&mut draining).is_pending());
-        tokio::task::yield_now().await;
-        assert!(futures::poll!(&mut draining).is_pending());
-        release.send(()).unwrap();
-        assert!(matches!(draining.await, Err(WorkShutdownError::Task(error)) if error.is_panic()));
-    }
-}
 
 #[cfg(test)]
 mod output_tests {
@@ -1286,8 +1661,101 @@ mod output_tests {
     }
 
     #[tokio::test]
+    async fn preserving_an_instance_keeps_its_in_flight_capacity() {
+        let entry = || BackendEntry {
+            backend: Backend::unavailable("model unavailable".into()),
+            evaluator: None,
+            max_in_flight: std::num::NonZeroUsize::new(2).unwrap(),
+        };
+        let gateway = ExecutorGateway::new(
+            [("local".into(), entry())].into(),
+            Arc::new(hellas_auth::ProducerSigningKey::from_secret_bytes([1; 32]).unwrap()),
+        );
+        let first = gateway.backends["local"]
+            .slots
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let second = gateway.backends["local"]
+            .slots
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let next = ExecutorGateway::prepare_identified(
+            [("local".into(), entry())].into(),
+            gateway.signer.clone(),
+            gateway.jobs.clone(),
+            Some(&gateway),
+            &Default::default(),
+            &gateway.backends(),
+        );
+        gateway.retire(&next).await.unwrap();
+        assert_eq!(next.backends()[0].in_flight, 2);
+        assert!(!next.backends["local"].slots.is_closed());
+        drop((first, second));
+        assert_eq!(next.backends()[0].in_flight, 0);
+        next.drain().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_failure_preserves_a_delivered_result_and_finishes_the_job() {
+        let jobs = Arc::new(hellas_gateway::jobs::Jobs::default());
+        let job = crate::test_support::request_job(&jobs);
+        job.accepted();
+        let (_, mut events) = jobs.watch(|_| ());
+        assert!(finish_job(&job, Ok(()), Err(WorkShutdownError::Poisoned)).is_ok());
+        assert!(jobs.watch(|jobs| jobs).0.is_empty());
+        assert!(
+            matches!(events.try_recv().unwrap(), hellas_gateway::jobs::Event::Job { job } if job.outcome == Some(hellas_gateway::jobs::Outcome::Completed))
+        );
+        jobs.drain().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn completed_paid_users_close_even_before_their_permits_drop() {
+        let (_fixture, backend, endpoint, _validator) =
+            crate::paid_client::tests::concurrency::cached_paid_backend().await;
+        let gateway = ExecutorGateway::new(
+            [(
+                "paid".into(),
+                BackendEntry {
+                    backend,
+                    evaluator: None,
+                    max_in_flight: std::num::NonZeroUsize::new(2).unwrap(),
+                },
+            )]
+            .into(),
+            Arc::new(hellas_auth::ProducerSigningKey::from_secret_bytes([1; 32]).unwrap()),
+        );
+        let backend = gateway.backend("paid").unwrap();
+        let first = backend.slots.clone().acquire_owned().await.unwrap();
+        let second = backend.slots.clone().acquire_owned().await.unwrap();
+        // Completed users may still own their scheduling permits until their task returns.
+        let next = ExecutorGateway::prepare(
+            Default::default(),
+            gateway.signer.clone(),
+            gateway.jobs.clone(),
+            Some(&gateway),
+            &Default::default(),
+        );
+        gateway.retire(&next).await.unwrap();
+        let BackendState::Paid(paid) = &backend.state else {
+            unreachable!()
+        };
+        assert!(
+            paid.session.lock().await.is_none(),
+            "retired session must close once no user remains"
+        );
+        drop((first, second));
+        gateway.drain().await.unwrap();
+        endpoint.close().await;
+    }
+
+    #[tokio::test]
     async fn buffered_reconnect_burst_is_delivered_and_releases_byte_budget() {
-        let (requester, mut response) = TestRequester::new();
+        let (requester, mut response) = TestRequester::new(crate::test_support::job());
         let budget = requester.budget.clone();
         // Retained output can arrive in one burst before HTTP gets a poll.
         for position in 0..128 {
@@ -1305,7 +1773,7 @@ mod output_tests {
 
     #[tokio::test]
     async fn a_transcript_larger_than_the_output_budget_is_delivered() {
-        let (requester, mut response) = TestRequester::new();
+        let (requester, mut response) = TestRequester::new(crate::test_support::job());
         // A job may be authorised to spool more evidence than the whole
         // slow-consumer queue holds. That evidence is mandatory and already
         // resident, so it must not be charged against the reader's budget;
@@ -1331,7 +1799,7 @@ mod output_tests {
 
     #[tokio::test]
     async fn slow_reader_gets_an_error_without_blocking_payment() {
-        let (requester, mut response) = TestRequester::new();
+        let (requester, mut response) = TestRequester::new(crate::test_support::job());
         // A stalled reader cannot retain more than the byte budget, and the
         // synchronous producer callback still returns without waiting on it.
         let half = OUTPUT_BUFFER_BYTES / 2 - OUTPUT_EVENT_OVERHEAD - text("").bytes();

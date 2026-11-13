@@ -9,9 +9,8 @@ use hellas_auth::Digest;
 use hellas_chain::work_blocks::advance_paid_work_clock;
 use hellas_chain::{FinalizedWorkView, WorkBlocks, WorkChannelQuery, WorkChannelSnapshot};
 use hellas_channel::model::setup::{ProviderChannelPolicy, ReadyChannel, WorkChannelDescriptor};
-use hellas_channel::model::work::{
-    PaidJobAuthorizationV2, PrivateRecord as _, work_id as accepted_work_id,
-};
+use hellas_channel::work::admission::{BackendKey, WorkPermit};
+use hellas_channel::work::{AcceptExecution, BackendFault};
 use hellas_channel::work::{
     CloseEndpoint, MAX_CERTIFIED_AGE, POLL, RunError, RunOutcome, SETUP_POLL, WorkBackend,
     WorkService, check_certified_age, run_accepted_work,
@@ -26,7 +25,6 @@ use hellas_rpc::pb::work::{
     AcceptWorkRequest, AcceptWorkResponse, AdmitCertificateRequest, AdmitCertificateResponse,
     ExchangeSetupRequest, ExchangeSetupResponse, FundingKind, GetStandingRequest,
     GetStandingResponse, StreamResultRequest, WorkRefusalCode, WorkRefused, WorkRoute,
-    accept_work_response,
 };
 use hellas_rpc::services::work::WorkHandler;
 use hellas_rpc::services::work_setup::WorkSetupHandler;
@@ -101,6 +99,7 @@ impl WorkRunnerConfig {
 
 /// Owns the observer through graceful shutdown, including cancellation of the caller.
 pub struct WorkWatcher {
+    settings: tokio::sync::watch::Sender<WorkSettings>,
     stop: Option<oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<Result<(), MountError>>,
 }
@@ -109,8 +108,14 @@ impl WorkWatcher {
         let (stop, stopped) = oneshot::channel();
         Self {
             stop: Some(stop),
+            settings: runner.settings.clone(),
             task: tokio::spawn(runner.run(stopped)),
         }
+    }
+
+    pub(crate) fn configure(&self, chain: crate::work_config::WorkConfig, addresses: Vec<String>) {
+        self.settings
+            .send_replace(WorkSettings { chain, addresses });
     }
 
     pub async fn shutdown(&mut self) -> Result<(), PaidProviderError> {
@@ -171,6 +176,8 @@ pub struct MountedWork {
     mounted: Arc<Mutex<MountedChannels>>,
     changes: Arc<tokio::sync::Mutex<()>>,
     driver: Option<AcceptedWorkDriver>,
+    setups: Arc<std::sync::OnceLock<MountedSetup>>,
+    mounted_changed: tokio::sync::watch::Sender<bool>,
 }
 
 impl Default for MountedWork {
@@ -179,19 +186,32 @@ impl Default for MountedWork {
             mounted: Arc::new(Mutex::new(BTreeMap::new())),
             changes: Arc::new(tokio::sync::Mutex::new(())),
             driver: None,
+            setups: Default::default(),
+            mounted_changed: tokio::sync::watch::channel(true).0,
         }
     }
 }
 
 /// Type-erased runner for an accepted job.
-type RunAcceptedWork = dyn Fn(WorkService, ReadyChannel, Digest) -> BoxFuture<'static, Result<RunOutcome, RunError>>
+type RunAcceptedWork = dyn Fn(
+        WorkService,
+        ReadyChannel,
+        Digest,
+        Option<WorkPermit>,
+    ) -> BoxFuture<'static, Result<RunOutcome, RunError>>
     + Send
     + Sync;
 
-/// Runs accepted jobs detached from requests and the clock; provider shutdown
-/// aborts them, which cancels their backend work (including compilation).
+type ReserveWork =
+    dyn Fn(&BackendKey, hellas_auth::PublicKey) -> Result<WorkPermit, BackendFault> + Send + Sync;
+
+/// Owns each accepted execution independently of requests and clock observations.
 #[derive(Clone)]
-struct AcceptedWorkDriver(Arc<RunAcceptedWork>, Arc<Mutex<tokio::task::JoinSet<()>>>);
+struct AcceptedWorkDriver {
+    run: Arc<RunAcceptedWork>,
+    reserve: Arc<ReserveWork>,
+    tasks: Arc<Mutex<BTreeMap<Digest, tokio::task::JoinHandle<()>>>>,
+}
 
 impl AcceptedWorkDriver {
     fn new<B>(backend: B) -> Self
@@ -199,66 +219,94 @@ impl AcceptedWorkDriver {
         B: WorkBackend + Send + Sync + 'static,
     {
         let backend = Arc::new(backend);
-        Self(
-            Arc::new(move |service, ready, work_id| {
+        let reserve = backend.clone();
+        Self {
+            run: Arc::new(move |service, ready, work_id, permit| {
                 let backend = Arc::clone(&backend);
                 Box::pin(async move {
-                    run_accepted_work(&service, &ready, backend.as_ref(), work_id).await
+                    run_accepted_work(&service, &ready, backend.as_ref(), work_id, permit).await
                 })
             }),
-            Default::default(),
-        )
+            reserve: Arc::new(move |key, caller| reserve.try_admit(key, caller)),
+            tasks: Default::default(),
+        }
     }
 
-    /// Aborts every accepted job and waits until each has been dropped.
+    fn admission(&self, service: WorkService, ready: ReadyChannel) -> AcceptExecution {
+        let driver = self.clone();
+        Box::new(move |input, caller| {
+            let permit = (driver.reserve)(&BackendKey::of(input)?, caller)?;
+            Ok(Box::new(move |work| {
+                driver.spawn(service, ready, work, Some(permit))
+            }))
+        })
+    }
+
+    /// Keep execution owners in the driver even if the draining caller disconnects.
     async fn shutdown(&self) {
-        let mut tasks = match self.1.lock() {
-            Ok(mut tasks) => std::mem::take(&mut *tasks),
-            Err(error) => std::mem::take(&mut *error.into_inner()),
-        };
-        tasks.shutdown().await;
+        use std::{future::Future as _, pin::Pin, task::Poll};
+        futures::future::poll_fn(|cx| {
+            let mut tasks = self.tasks.lock().unwrap_or_else(|error| error.into_inner());
+            tasks.retain(|_, task| Pin::new(task).poll(cx).is_pending());
+            if tasks.is_empty() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
     }
 
-    /// Starts one accepted job without lending its lifetime to either the
-    /// request path or the close clock.
-    fn spawn(&self, service: WorkService, ready: ReadyChannel, work_id: Digest) {
-        let running = (self.0)(service, ready, work_id);
+    fn spawn(
+        &self,
+        service: WorkService,
+        ready: ReadyChannel,
+        work_id: Digest,
+        permit: Option<WorkPermit>,
+    ) {
+        let running = (self.run)(service, ready, work_id, permit);
         let span = hellas_rpc::request_span!(target: "hellas_request", "paid.provider.execute", hellas.work.id = ?work_id, otel.status_code = tracing::field::Empty);
-        let mut tasks = match self.1.lock() {
+        let mut tasks = match self.tasks.lock() {
             Ok(tasks) => tasks,
             Err(error) => error.into_inner(),
         };
-        while tasks.try_join_next().is_some() {}
-        tasks.spawn(tracing::Instrument::instrument(
-            async move {
-                match running.await {
-                    Ok(RunOutcome::Completed { .. }) => {
-                        debug!(?work_id, "the accepted paid job completed")
+        tasks.retain(|_, task| !task.is_finished());
+        if tasks.contains_key(&work_id) {
+            return;
+        }
+        tasks.insert(
+            work_id,
+            tokio::spawn(tracing::Instrument::instrument(
+                async move {
+                    match running.await {
+                        Ok(RunOutcome::Completed { .. }) => {
+                            debug!(?work_id, "the accepted paid job completed")
+                        }
+                        Ok(RunOutcome::Ready { .. }) => {
+                            debug!(?work_id, "the accepted paid job was already complete")
+                        }
+                        Ok(RunOutcome::Running) => {
+                            debug!(?work_id, "the accepted paid job was already running")
+                        }
+                        Ok(RunOutcome::Indeterminate) => {
+                            warn!(
+                                ?work_id,
+                                "the accepted paid job is indeterminate after restart"
+                            )
+                        }
+                        // `run_accepted_work` has already made backend and
+                        // transcript faults terminal before returning them. The
+                        // remaining errors have no node-local terminal policy;
+                        // keep the exact failure visible to the operator.
+                        Err(error) => {
+                            tracing::Span::current().record("otel.status_code", "ERROR");
+                            warn!(?work_id, %error, "the accepted paid job did not complete");
+                        }
                     }
-                    Ok(RunOutcome::Ready { .. }) => {
-                        debug!(?work_id, "the accepted paid job was already complete")
-                    }
-                    Ok(RunOutcome::Running) => {
-                        debug!(?work_id, "the accepted paid job was already running")
-                    }
-                    Ok(RunOutcome::Indeterminate) => {
-                        warn!(
-                            ?work_id,
-                            "the accepted paid job is indeterminate after restart"
-                        )
-                    }
-                    // `run_accepted_work` has already made backend and
-                    // transcript faults terminal before returning them. The
-                    // remaining errors have no node-local terminal policy;
-                    // keep the exact failure visible to the operator.
-                    Err(error) => {
-                        tracing::Span::current().record("otel.status_code", "ERROR");
-                        warn!(?work_id, %error, "the accepted paid job did not complete");
-                    }
-                }
-            },
-            span,
-        ));
+                },
+                span,
+            )),
+        );
     }
 }
 
@@ -297,35 +345,11 @@ impl WorkHandler for MountedWorkService {
                 }));
             }
         };
-        // Derive the id from the request while the accepted response
-        // is still only a possibility. The response carries only the
-        // provider signature, and consulting `state.jobs().next()` after it
-        // leaves would race the clock terminalizing that same job.
-        let work_id = self
-            .service
-            .with_state(|state| {
-                PaidJobAuthorizationV2::decode(&request.authorization)
-                    .ok()
-                    .map(|authorization| accepted_work_id(state.channel(), &authorization))
-            })
-            .await
-            .ok()
-            .flatten();
-        let response = self.service.accept(&request).await;
-        if matches!(
-            response.outcome.as_ref(),
-            Some(accept_work_response::Outcome::Accepted(_))
-        ) {
-            match (self.driver.as_ref(), work_id) {
-                (Some(driver), Some(work_id)) => {
-                    driver.spawn(self.service.clone(), ready, work_id);
-                }
-                (None, Some(work_id)) => {
-                    warn!(?work_id, "accepted paid work has no execution backend")
-                }
-                (_, None) => warn!("accepted paid work has no mounted job to execute"),
-            }
-        }
+        let execution = self
+            .driver
+            .as_ref()
+            .map(|driver| driver.admission(self.service.clone(), ready));
+        let response = self.service.accept(&request, execution).await;
         Ok(response)
     }
 
@@ -376,7 +400,8 @@ impl MountedWork {
         let request =
             AcceptWorkRequest::decode(opening.signed_opening.as_slice()).map_err(|_| denied())?;
         let service = self
-            .handler(&context, request.route.as_ref())
+            .wait_handler(&context, request.route.as_ref())
+            .await
             .map_err(|_| denied())?
             .ok_or_else(denied)?;
         service
@@ -396,6 +421,7 @@ impl MountedWork {
             mounted: Arc::new(Mutex::new(BTreeMap::new())),
             changes: Arc::new(tokio::sync::Mutex::new(())),
             driver: Some(AcceptedWorkDriver::new(backend)),
+            ..Self::default()
         }
     }
 
@@ -444,6 +470,63 @@ impl MountedWork {
             .and_then(|(owner, mounted)| (*owner == peer).then(|| mounted.clone())))
     }
 
+    /// A signed setup may finalize on the client before this clock mounts it.
+    /// Only that authenticated peer's already-countersigned channel may wait.
+    /// Unknown channels are refused immediately; no proposal is sent twice.
+    pub async fn wait_handler(
+        &self,
+        context: &TransportContext,
+        route: Option<&WorkRoute>,
+    ) -> Result<Option<MountedWorkService>, MountError> {
+        let mut changed = self.mounted_changed.subscribe();
+        loop {
+            if !*changed.borrow_and_update() {
+                return Ok(None);
+            }
+            let mounted = self.handler(context, route)?;
+            let pending = match (self.setups.get(), context.vouched_peer(), route) {
+                (Some(setups), Some(peer), Some(route)) => {
+                    let peer = PeerId::from_bytes(peer.0);
+                    let services: Vec<_> = setups
+                        .0
+                        .lock()
+                        .map_err(|_| MountError::Poisoned)?
+                        .iter()
+                        .filter(|((owner, _), _)| *owner == peer)
+                        .map(|(_, service)| service.clone())
+                        .collect();
+                    let mut pending = false;
+                    for service in services {
+                        if let Ok(state) = service.state().await {
+                            pending |= matches!(
+                                state.end(),
+                                None | Some(hellas_channel::work_store::setup::SetupEnd::Complete)
+                            ) && state.close_descriptor().is_some_and(|descriptor| {
+                                descriptor.channel().id().as_bytes() == route.channel_id.as_slice()
+                            });
+                        }
+                    }
+                    pending
+                }
+                _ => false,
+            };
+            if !pending {
+                // Mounting can have completed while the setup was read.
+                return self.handler(context, route);
+            }
+            if let Some(service) = mounted
+                && service.service.readiness().await.is_ok()
+            {
+                return Ok(Some(service));
+            }
+            changed.changed().await.map_err(|_| MountError::Poisoned)?;
+        }
+    }
+
+    pub(crate) fn stop_pending(&self) {
+        self.mounted_changed.send_replace(false);
+    }
+
     /// Returns a specific local payment service for journal inspection.
     pub fn service(
         &self,
@@ -455,7 +538,7 @@ impl MountedWork {
             .map(|mounted| mounted.service))
     }
 
-    /// Stops admission and waits out journal writes before aborting accepted jobs.
+    /// Stops admission, finishes accepted work, then closes the journals.
     /// Cancellation retains the mounts so shutdown can resume.
     pub async fn clear_all(&self) -> Result<(), MountError> {
         let _changes = self.changes.lock().await;
@@ -472,23 +555,18 @@ impl MountedWork {
             )
         };
         for service in &channels {
-            service.stop().await?;
+            service.quiesce().await?;
         }
         use hellas_channel::work_close::CloseChannel as _;
         let mut drivers = channels
             .iter()
             .map(WorkService::drive)
             .collect::<Result<Vec<_>, _>>()?;
-        {
-            // Hold every journal writer while aborting; queued writers are
-            // cancelled before these guards are released.
-            let mut writers = Vec::new();
-            for driver in &mut drivers {
-                writers.push(driver.store().await.map_err(|_| MountError::Poisoned)?);
-            }
-            if let Some(driver) = &self.driver {
-                driver.shutdown().await;
-            }
+        if let Some(driver) = &self.driver {
+            driver.shutdown().await;
+        }
+        for service in &channels {
+            service.stop().await?;
         }
         for driver in &mut drivers {
             let closed = async {
@@ -636,7 +714,7 @@ impl WorkHandler for MountedWork {
         request: AcceptWorkRequest,
         context: TransportContext,
     ) -> Result<impl Into<WithTrailer<AcceptWorkResponse>> + Send, WireStatus> {
-        match self.handler(&context, request.route.as_ref())? {
+        match self.wait_handler(&context, request.route.as_ref()).await? {
             Some(service) => wt(service.accept_work(request, context)).await,
             None => wt(UnmountedWork.accept_work(request, context)).await,
         }
@@ -730,7 +808,7 @@ impl DrivenChannel {
         let driver = self.driver.as_ref().ok_or(PaidProviderError::NoBackend)?;
         let ready = self.service.readiness().await?;
         for work_id in work_ids {
-            driver.spawn(self.service.clone(), ready.clone(), work_id);
+            driver.spawn(self.service.clone(), ready.clone(), work_id, None);
         }
         Ok(true)
     }
@@ -880,11 +958,6 @@ impl SetupClock {
                                 return true;
                             }
                         };
-                        if let Some(peer) = self.route_peer
-                            && let Err(error) = setup_mount.clear(peer, self.bond_edge).await
-                        {
-                            warn!(%error, "setup could not be unmounted");
-                        }
                         if let Err(error) = self
                             .take_mount(store, signer, &policy, work_mount, origin)
                             .await
@@ -898,7 +971,7 @@ impl SetupClock {
                         // The read that completed the setup is the channel's
                         // own first read: admit from it now rather than a poll
                         // later, while the buyer is waiting on its first job.
-                        match &self.driven {
+                        let answered = match &self.driven {
                             Driven::Channel(channel) => {
                                 let (answered, busy) =
                                     drive_channel(channel, snapshot, sink, &bond).await;
@@ -906,7 +979,13 @@ impl SetupClock {
                                 answered
                             }
                             _ => true,
+                        };
+                        if let Some(peer) = self.route_peer
+                            && let Err(error) = setup_mount.clear(peer, self.bond_edge).await
+                        {
+                            warn!(%error, "setup could not be unmounted");
                         }
+                        answered
                     }
                     Ok(SetupAdvance { progress, .. }) => {
                         if matches!(
@@ -1079,16 +1158,10 @@ impl WorkRunner {
                 .map(|store| (store, origin)),
                 _ => None,
             };
-            let mut clock = Self::adopt_setup(&config, store, &setup_mount)?;
-            if let Driven::Setup { service, .. } = &clock.driven {
-                registry.insert(setup.bond_edge, service.clone());
-            }
+            let (mut clock, service, policy) = Self::adopt_setup(&config, store, &setup_mount)?;
+            registry.insert(setup.bond_edge, service);
             if let Some((store, origin)) = recovered {
                 unmatched.remove(&ChannelStore::journal_key(store.state().channel()));
-                let policy = match &clock.driven {
-                    Driven::Setup { policy, .. } => policy.clone(),
-                    _ => unreachable!(),
-                };
                 clock
                     .take_mount(store, &config.settlement_key, &policy, &work_mount, origin)
                     .await?;
@@ -1101,6 +1174,10 @@ impl WorkRunner {
         if let Some((_, path)) = unmatched.into_iter().next() {
             return Err(PaidProviderError::UnmatchedChannel { path });
         }
+        work_mount
+            .setups
+            .set(setup_mount.clone())
+            .map_err(|_| MountError::Poisoned)?;
         let (sender, adopt) = tokio::sync::mpsc::channel(16);
         Ok(Self {
             signer: config.settlement_key.clone(),
@@ -1118,7 +1195,7 @@ impl WorkRunner {
         config: &WorkRunnerConfig,
         mut store: SetupStore,
         setup_mount: &MountedSetup,
-    ) -> Result<SetupClock, PaidProviderError> {
+    ) -> Result<(SetupClock, SetupService, Box<ProviderChannelPolicy>), PaidProviderError> {
         let (peer, offer) = store
             .state()
             .offer()
@@ -1140,12 +1217,19 @@ impl WorkRunner {
             PaymentAdmission::Admits(policy.clone()),
         ));
         setup_mount.mount(peer, bond_edge, &service)?;
-        Ok(SetupClock {
-            busy: false,
-            bond_edge,
-            route_peer: Some(peer),
-            driven: Driven::Setup { service, policy },
-        })
+        Ok((
+            SetupClock {
+                busy: false,
+                bond_edge,
+                route_peer: Some(peer),
+                driven: Driven::Setup {
+                    service: service.clone(),
+                    policy: policy.clone(),
+                },
+            },
+            service,
+            policy,
+        ))
     }
 
     /// One poll: every journal's read in as few proof reads as the key
@@ -1192,7 +1276,7 @@ impl WorkRunner {
             let Some(clock) = self.clocks.get_mut(*index) else {
                 continue;
             };
-            if !clock
+            let answered = clock
                 .tick(
                     question,
                     &snapshot,
@@ -1202,8 +1286,9 @@ impl WorkRunner {
                     &self.setup_mount,
                 )
                 .instrument(hellas_rpc::request_span!(target: "hellas_request", parent: None, "paid.channel.observe", hellas.channel.role = "provider"))
-                .await
-            {
+                .await;
+            self.work_mount.mounted_changed.send_modify(|_| {});
+            if !answered {
                 // The source failed: stop here and let the loop redial
                 // rather than wait it out once per journal.
                 return false;
@@ -1239,6 +1324,13 @@ impl WorkRunner {
     {
         let mut chain = None;
         loop {
+            if self.clocks.is_empty() {
+                tokio::select! {
+                    biased;
+                    _ = &mut stop => break,
+                    Some(clock) = self.adopt.recv() => self.clocks.push(clock),
+                }
+            }
             if chain.is_none() {
                 chain = tokio::select! {
                     biased;
@@ -1281,6 +1373,7 @@ impl WorkRunner {
     }
 
     async fn unmount_all(&self) -> Result<(), MountError> {
+        self.work_mount.stop_pending();
         let offers = match self.setup_mount.1.get() {
             Some(offers) => offers.shutdown().await,
             None => Ok(()),
@@ -1298,15 +1391,16 @@ impl WorkRunner {
         provider: hellas_rpc::ProviderEnrollmentBundle,
         addresses: Vec<String>,
     ) -> ChainWorkRunner {
+        let (settings, current) = tokio::sync::watch::channel(WorkSettings { chain, addresses });
         self.setup_mount
             .1
             .set(AutomaticOffers::spawn(OfferAllocator {
                 needs_restart: Default::default(),
                 config: self.config.clone(),
-                chain: offers::OfferChain::new(chain.clone()),
+                chain: offers::OfferChain::new(current.clone()),
                 authority,
                 provider,
-                addresses,
+                settings: current,
                 registry: Arc::new(tokio::sync::Mutex::new(self.registry.clone())),
                 adopt: self.sender.clone(),
                 mount: MountedSetup(
@@ -1318,7 +1412,7 @@ impl WorkRunner {
             .unwrap_or_else(|_| panic!("offer service already installed"));
         ChainWorkRunner {
             runner: self,
-            chain,
+            settings,
         }
     }
 }
@@ -1347,20 +1441,30 @@ impl<S: TxSink + Sync> TxSink for BoundedSink<'_, S> {
 }
 
 /// A provider clock bound to remote, proof-checked reads of its chain.
+#[derive(Clone)]
+struct WorkSettings {
+    chain: crate::work_config::WorkConfig,
+    addresses: Vec<String>,
+}
 pub struct ChainWorkRunner {
     runner: WorkRunner,
-    chain: crate::work_config::WorkConfig,
+    settings: tokio::sync::watch::Sender<WorkSettings>,
 }
 
 impl ChainWorkRunner {
     /// Runs the clock until `stop`, dialling the next configured validator
     /// whenever a read fails or is too old to act on.
     pub async fn run(self, stop: oneshot::Receiver<()>) -> Result<(), MountError> {
-        let config = Mutex::new(self.chain);
+        let config = Mutex::new(self.settings.borrow().chain.clone());
+        let current = Mutex::new(self.settings.subscribe());
         self.runner
             .run_over(stop, || {
                 let config = match config.lock() {
                     Ok(mut config) => {
+                        let mut current = current.lock().unwrap_or_else(|error| error.into_inner());
+                        if current.has_changed().unwrap_or(false) {
+                            *config = current.borrow_and_update().chain.clone();
+                        }
                         config.chain.rotate_validators();
                         config.clone()
                     }
@@ -1401,6 +1505,7 @@ mod tests {
                 .propose(
                     &fixture.proposal(),
                     &hellas_channel::test_support::channel::program_content().await,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -1427,16 +1532,17 @@ mod tests {
         );
 
         let (seen, mut dispatched) = tokio::sync::mpsc::unbounded_channel();
-        let driver = AcceptedWorkDriver(
-            Arc::new(move |_service, _ready, work_id| {
+        let driver = AcceptedWorkDriver {
+            run: Arc::new(move |_service, _ready, work_id, _permit| {
                 let seen = seen.clone();
                 Box::pin(async move {
                     seen.send(work_id).unwrap();
                     Ok(RunOutcome::Running)
                 })
             }),
-            Default::default(),
-        );
+            reserve: Arc::new(|_, _| panic!("recovery does not reserve new acceptance")),
+            tasks: Default::default(),
+        };
         let channel = DrivenChannel {
             service,
             descriptor: Some(fixture.descriptor.clone()),

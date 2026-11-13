@@ -37,7 +37,7 @@ pub enum ChainProfileError {
 }
 
 /// Complete authenticated chain input, including the genesis document.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CustomChainFile {
     pub trust: TrustDocument,

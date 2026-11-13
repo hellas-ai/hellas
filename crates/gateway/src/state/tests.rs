@@ -1,4 +1,5 @@
 use super::*;
+use crate::WorkExecutionBackend;
 
 /// The tiny Qwen3 GGUF the client text package tests render.
 fn text_model() -> std::path::PathBuf {
@@ -8,12 +9,18 @@ fn text_model() -> std::path::PathBuf {
 
 async fn open(work: Arc<dyn WorkExecutionBackend>) -> TextState {
     TextState::open(
-        &crate::TextOptions {
-            model: text_model(),
-            model_name: "mini-qwen3".into(),
-            default_max_tokens: 128,
-        },
-        work,
+        text_model(),
+        128,
+        crate::test_support::execution(
+            work,
+            crate::Presentation::Model {
+                modality: hellas_client::model::ModelKind::Text,
+                model: "mini-qwen3".into(),
+                package: text_model(),
+                max_tokens: 128,
+            },
+        )
+        .await,
     )
     .await
     .unwrap()
@@ -31,13 +38,17 @@ async fn authenticated_prefixes_arrive_before_the_paid_terminal() {
         payment_ack: Arc<tokio::sync::Notify>,
     }
     impl WorkExecutionBackend for Paid {
-        fn evaluator(&self) -> Option<String> {
-            Some(hellas_client::model::evaluator(
-                hellas_client::model::GpuDialect::Hip,
-            ))
+        fn backends(&self) -> Vec<crate::BackendInfo> {
+            crate::test_support::backend({
+                Some(hellas_client::model::evaluator(
+                    hellas_client::model::GpuDialect::Hip,
+                ))
+            })
         }
         fn run(
             &self,
+            _backend: &str,
+            _request_job: Arc<crate::jobs::Job>,
             job: hellas_client::model::ComputeJob,
         ) -> Result<crate::WorkOutputStream<ComputeEvent>, crate::WorkGatewayError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -82,7 +93,15 @@ async fn authenticated_prefixes_arrive_before_the_paid_terminal() {
         payment_ack: payment_ack.clone(),
     }))
     .await;
-    let mut live = state.prepare_ids(vec![0], 1, None).await.unwrap();
+    let mut live = state
+        .prepare_ids(
+            vec![0],
+            1,
+            None,
+            &mut crate::test_support::selection(state.execution.work.clone()),
+        )
+        .await
+        .unwrap();
     let prefix = live.prepared.next().await.unwrap().unwrap();
     assert!(matches!(
         prefix,
@@ -106,19 +125,20 @@ async fn authenticated_prefixes_arrive_before_the_paid_terminal() {
 }
 
 #[tokio::test]
-async fn paid_capacity_is_a_retryable_error_and_uses_the_pool_deadline() {
+async fn paid_capacity_is_a_retryable_error() {
     struct Busy;
     impl crate::WorkExecutionBackend for Busy {
-        fn evaluator(&self) -> Option<String> {
-            Some(hellas_client::model::evaluator(
-                hellas_client::model::GpuDialect::Hip,
-            ))
-        }
-        fn timeout(&self) -> Option<Duration> {
-            Some(Duration::from_secs(17))
+        fn backends(&self) -> Vec<crate::BackendInfo> {
+            crate::test_support::backend({
+                Some(hellas_client::model::evaluator(
+                    hellas_client::model::GpuDialect::Hip,
+                ))
+            })
         }
         fn run(
             &self,
+            _backend: &str,
+            _request_job: Arc<crate::jobs::Job>,
             _: hellas_client::model::ComputeJob,
         ) -> Result<crate::WorkOutputStream<crate::ComputeEvent>, crate::WorkGatewayError> {
             Err(crate::WorkGatewayBusy.into())
@@ -128,9 +148,13 @@ async fn paid_capacity_is_a_retryable_error_and_uses_the_pool_deadline() {
         }
     }
     let state = open(Arc::new(Busy)).await;
-    assert_eq!(state.inference_timeout, Some(Duration::from_secs(17)));
     let error = state
-        .prepare_ids(vec![0], 1, None)
+        .prepare_ids(
+            vec![0],
+            1,
+            None,
+            &mut crate::test_support::selection(state.execution.work.clone()),
+        )
         .await
         .err()
         .expect("busy backend must reject admission");
@@ -148,13 +172,17 @@ struct Accepting {
 }
 
 impl WorkExecutionBackend for Accepting {
-    fn evaluator(&self) -> Option<String> {
-        Some(hellas_client::model::evaluator(
-            hellas_client::model::GpuDialect::Hip,
-        ))
+    fn backends(&self) -> Vec<crate::BackendInfo> {
+        crate::test_support::backend({
+            Some(hellas_client::model::evaluator(
+                hellas_client::model::GpuDialect::Hip,
+            ))
+        })
     }
     fn run(
         &self,
+        _backend: &str,
+        _request_job: Arc<crate::jobs::Job>,
         _: hellas_client::model::ComputeJob,
     ) -> Result<crate::WorkOutputStream<ComputeEvent>, crate::WorkGatewayError> {
         use crate::WorkEvent;
@@ -228,7 +256,7 @@ async fn text_routes_carry_provenance_at_start_and_end() {
         }))
         .await,
     );
-    let app = super::router(state).layer(crate::provenance_layer::ProvenanceLayer);
+    let app = test_router(state).layer(crate::provenance_layer::ProvenanceLayer);
     let user = json!([{"role": "user", "content": "hi"}]);
     let routes = [
         (
@@ -328,17 +356,26 @@ struct Capturing {
 }
 
 impl WorkExecutionBackend for Capturing {
-    fn evaluator(&self) -> Option<String> {
-        Some(hellas_client::model::evaluator(
-            hellas_client::model::GpuDialect::Hip,
-        ))
+    fn backends(&self) -> Vec<crate::BackendInfo> {
+        crate::test_support::backend({
+            Some(hellas_client::model::evaluator(
+                hellas_client::model::GpuDialect::Hip,
+            ))
+        })
     }
     fn run(
         &self,
+        _backend: &str,
+        _request_job: Arc<crate::jobs::Job>,
         job: hellas_client::model::ComputeJob,
     ) -> Result<crate::WorkOutputStream<ComputeEvent>, crate::WorkGatewayError> {
         self.jobs.lock().unwrap().push(job);
-        Ok(Box::pin(futures::stream::empty()))
+        Ok(Box::pin(futures::stream::iter([Ok(
+            crate::WorkEvent::Accepted(ExecutionProvenance {
+                commitment_id: [1; 32],
+                provider: hellas_auth::PublicKey::Secp256k1([2; 33]),
+            }),
+        )])))
     }
 
     fn drain(&self) -> futures::future::BoxFuture<'_, Result<(), crate::WorkShutdownError>> {
@@ -368,7 +405,13 @@ async fn responses_string_input_matches_a_user_message_array() {
             )
             .unwrap();
         let request = adaptor.to_execution_request(&parsed).unwrap();
-        state.prepare_wire_execution(&request).await.unwrap();
+        state
+            .prepare_wire_execution(
+                &request,
+                &mut crate::test_support::selection(state.execution.work.clone()),
+            )
+            .await
+            .unwrap();
     };
     prepare(json!("hi")).await;
     prepare(json!([{"role": "user", "content": "hi"}])).await;
@@ -407,8 +450,14 @@ async fn generation_controls_are_honoured_or_rejected() {
             .unwrap();
         adaptor.to_execution_request(&parsed).unwrap()
     };
-    let prepare =
-        async |request: &WireExecutionRequest| state.prepare_wire_execution(request).await;
+    let prepare = async |request: &WireExecutionRequest| {
+        state
+            .prepare_wire_execution(
+                request,
+                &mut crate::test_support::selection(state.execution.work.clone()),
+            )
+            .await
+    };
 
     // Native execution decodes greedily: temperature 0 is what it does.
     prepare(&chat(json!({
@@ -483,7 +532,7 @@ async fn custom_stop_sequences_are_rejected_before_any_output() {
         jobs: std::sync::Mutex::new(Vec::new()),
     });
     let state = Arc::new(open(work.clone()).await);
-    let response = super::router(state)
+    let response = test_router(state)
         .oneshot(
             axum::http::Request::post("/v1/chat/completions")
                 .header("content-type", "application/json")
@@ -539,19 +588,22 @@ async fn structured_output_is_rejected_before_native_execution() {
         adaptor.to_execution_request(&parsed).unwrap()
     };
     let error = state
-        .prepare_wire_execution(&request(json!({
-            "model": "m",
-            "messages": [{"role": "user", "content": "hello"}],
-            "max_tokens": 1,
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "answer",
-                    "schema": {"type": "object", "properties": {"answer": {"type": "string"}}},
-                    "strict": true
+        .prepare_wire_execution(
+            &request(json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 1,
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "answer",
+                        "schema": {"type": "object", "properties": {"answer": {"type": "string"}}},
+                        "strict": true
+                    }
                 }
-            }
-        })))
+            })),
+            &mut crate::test_support::selection(state.execution.work.clone()),
+        )
         .await
         .err()
         .expect("a strict schema must be rejected");
@@ -559,11 +611,14 @@ async fn structured_output_is_rejected_before_native_execution() {
     assert!(error.to_string().contains("json_schema"), "{error}");
 
     state
-        .prepare_wire_execution(&request(json!({
-            "model": "m",
-            "messages": [{"role": "user", "content": "hello"}],
-            "max_tokens": 1
-        })))
+        .prepare_wire_execution(
+            &request(json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 1
+            })),
+            &mut crate::test_support::selection(state.execution.work.clone()),
+        )
         .await
         .unwrap();
     assert_eq!(work.jobs.lock().unwrap().len(), 1);
@@ -620,7 +675,7 @@ async fn anthropic_controls_are_rejected_before_submitting_a_job() {
     let work = Arc::new(Capturing {
         jobs: std::sync::Mutex::new(Vec::new()),
     });
-    let router = super::router(Arc::new(open(work.clone()).await));
+    let router = test_router(Arc::new(open(work.clone()).await));
     for (field, value) in [
         ("temperature", json!(0.4)),
         ("top_p", json!(0.8)),
@@ -648,6 +703,11 @@ async fn anthropic_controls_are_rejected_before_submitting_a_job() {
     assert!(work.jobs.lock().unwrap().is_empty());
 }
 
+fn test_router(state: Arc<TextState>) -> Router {
+    let selection = crate::test_support::selection(state.execution.work.clone());
+    super::router(state).layer(axum::Extension(selection))
+}
+
 /// A budget beyond the work source's terms is cut to them rather than
 /// refused, and the job stops at that bound as at any token budget.
 #[tokio::test]
@@ -657,17 +717,22 @@ async fn output_budgets_are_cut_to_the_terms() {
 
     struct Bounded(Capturing);
     impl WorkExecutionBackend for Bounded {
-        fn evaluator(&self) -> Option<String> {
-            self.0.evaluator()
+        fn backends(&self) -> Vec<crate::BackendInfo> {
+            self.0.backends()
         }
-        fn max_steps(&self) -> Option<u64> {
-            Some(3)
+        fn max_steps<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> futures::future::BoxFuture<'a, Result<Option<u64>, crate::WorkGatewayError>> {
+            Box::pin(async { Ok(Some(3)) })
         }
         fn run(
             &self,
+            backend: &str,
+            request_job: Arc<crate::jobs::Job>,
             job: hellas_client::model::ComputeJob,
         ) -> Result<crate::WorkOutputStream<ComputeEvent>, crate::WorkGatewayError> {
-            self.0.run(job)
+            self.0.run(backend, request_job, job)
         }
         fn drain(&self) -> futures::future::BoxFuture<'_, Result<(), crate::WorkShutdownError>> {
             self.0.drain()
@@ -690,7 +755,10 @@ async fn output_budgets_are_cut_to_the_terms() {
             )
             .unwrap();
         state
-            .prepare_wire_execution(&adaptor.to_execution_request(&parsed).unwrap())
+            .prepare_wire_execution(
+                &adaptor.to_execution_request(&parsed).unwrap(),
+                &mut crate::test_support::selection(work.clone()),
+            )
             .await
             .unwrap();
     }
@@ -817,7 +885,7 @@ async fn sampled_temperatures_are_refused_by_name() {
     let work = Arc::new(Capturing {
         jobs: std::sync::Mutex::new(Vec::new()),
     });
-    let response = super::router(Arc::new(open(work.clone()).await))
+    let response = test_router(Arc::new(open(work.clone()).await))
         .oneshot(
             axum::http::Request::post("/v1/responses")
                 .header("content-type", "application/json")
@@ -863,16 +931,22 @@ async fn opencode_session_creates_a_job() {
     let file = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(file.path(), model).unwrap();
     let state = TextState::open(
-        &crate::TextOptions {
-            model: file.path().to_owned(),
-            model_name: "mini-qwen3".into(),
-            default_max_tokens: 128,
-        },
-        work.clone(),
+        file.path().to_owned(),
+        128,
+        crate::test_support::execution(
+            work.clone(),
+            crate::Presentation::Model {
+                modality: hellas_client::model::ModelKind::Text,
+                model: "mini-qwen3".into(),
+                package: file.path().to_owned(),
+                max_tokens: 128,
+            },
+        )
+        .await,
     )
     .await
     .unwrap();
-    let response = super::router(Arc::new(state))
+    let response = test_router(Arc::new(state))
         .oneshot(
             axum::http::Request::post("/v1/responses")
                 .header("content-type", "application/json")
@@ -893,4 +967,97 @@ async fn opencode_session_creates_a_job() {
     assert_eq!(jobs.len(), 1, "{}", String::from_utf8_lossy(&bytes));
     assert!(!jobs[0].inputs[0].bytes.as_bytes().is_empty());
     assert_eq!(jobs[0].plan.step.as_ref().unwrap().stop.max_steps, 128);
+}
+
+#[tokio::test]
+async fn failover_renders_against_the_selected_backends_token_bound() {
+    use hellas_adaptors::{RawRequest, WireAdaptor, anthropic::AnthropicMessagesAdaptor};
+    struct Work(Capturing);
+    impl WorkExecutionBackend for Work {
+        fn backends(&self) -> Vec<crate::BackendInfo> {
+            ["first", "second"]
+                .into_iter()
+                .map(|id| {
+                    let mut backend = self.0.backends().remove(0);
+                    backend.id = id.into();
+                    backend
+                })
+                .collect()
+        }
+        fn max_steps<'a>(
+            &'a self,
+            id: &'a str,
+        ) -> futures::future::BoxFuture<'a, Result<Option<u64>, crate::WorkGatewayError>> {
+            Box::pin(async move { Ok(Some(if id == "first" { 5 } else { 2 })) })
+        }
+        fn run(
+            &self,
+            id: &str,
+            request: Arc<crate::jobs::Job>,
+            job: hellas_client::model::ComputeJob,
+        ) -> Result<crate::WorkOutputStream<ComputeEvent>, crate::WorkGatewayError> {
+            let stream = self.0.run(id, request, job)?;
+            if id == "first" {
+                Err(crate::WorkGatewayError::PreProposal(Box::new(
+                    crate::WorkGatewayError::Busy(crate::WorkGatewayBusy),
+                )))
+            } else {
+                Ok(stream)
+            }
+        }
+        fn drain(&self) -> futures::future::BoxFuture<'_, Result<(), crate::WorkShutdownError>> {
+            self.0.drain()
+        }
+    }
+    let work = Arc::new(Work(Capturing {
+        jobs: Default::default(),
+    }));
+    let state = open(work.clone()).await;
+    let routing = crate::routing::Routing::new(
+        vec![crate::Route {
+            backends: vec!["first".into(), "second".into()],
+            presentation: crate::Presentation::Responses {
+                service: "test".into(),
+                method: "test".into(),
+                models: vec![],
+                overrides: Default::default(),
+            },
+        }],
+        work.clone(),
+        Default::default(),
+    )
+    .unwrap();
+    let (_, mut selection) = routing
+        .select(
+            crate::responses_fetch::PATH,
+            "POST",
+            Default::default(),
+            None,
+            crate::test_support::job(),
+        )
+        .unwrap();
+    let adaptor = AnthropicMessagesAdaptor;
+    let parsed = adaptor
+        .parse(
+            RawRequest::from_value(serde_json::json!({
+                "model": "m", "max_tokens": 128_000, "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    state
+        .prepare_wire_execution(
+            &adaptor.to_execution_request(&parsed).unwrap(),
+            &mut selection,
+        )
+        .await
+        .unwrap();
+    let jobs = work.0.jobs.lock().unwrap();
+    assert_eq!(
+        jobs.iter()
+            .map(|job| job.plan.step.as_ref().unwrap().stop.max_steps)
+            .collect::<Vec<_>>(),
+        [5, 2]
+    );
+    assert_eq!(selection.backend.as_deref(), Some("second"));
 }

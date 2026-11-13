@@ -1,11 +1,53 @@
 //! Capacity follows an invocation from queue admission through worker teardown.
 use super::BackendFault;
-use std::{future::Future, time::Instant};
+use std::{future::Future, sync::Arc, time::Instant};
 use tokio::sync::OwnedSemaphorePermit;
 mod cancellation;
 pub use cancellation::{CancelOnFailure, Cancellation};
 
 pub use hellas_rpc::protocol::invocation::CapacityDomain;
+
+/// The exact execution destination named by an already validated invocation.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BackendKey {
+    Compute(String),
+    Fetch { service: String, method: String },
+}
+impl BackendKey {
+    pub fn of(
+        input: &hellas_rpc::protocol::invocation::PreparedInvocation,
+    ) -> Result<Self, BackendFault> {
+        let manifest = input.manifest().map_err(BackendFault::caused_by)?;
+        if manifest.application().adaptor() == hellas_rpc::protocol::invocation::compute::ADAPTOR {
+            return Ok(Self::Compute(manifest.application().evaluator().into()));
+        }
+        let artifact = input
+            .input
+            .artifacts
+            .iter()
+            .find(|artifact| {
+                artifact.name == hellas_rpc::protocol::invocation::fetch::REQUEST_EVENTS
+                    && artifact.format
+                        == hellas_rpc::protocol::invocation::fetch::REQUEST_EVENTS_FORMAT
+            })
+            .ok_or(AdmissionError::Unsupported(CapacityDomain::Fetch))?;
+        let events: Vec<hellas_rpc::InputEventEnvelope> =
+            hellas_rpc::protocol::value::decode_canonical_dag_cbor(artifact.bytes.as_bytes())
+                .map_err(BackendFault::caused_by)?;
+        let input =
+            hellas_rpc::fetch::verify_input_events(&events).map_err(BackendFault::caused_by)?;
+        Ok(Self::Fetch {
+            service: input.service,
+            method: input.method,
+        })
+    }
+    pub fn domain(&self) -> CapacityDomain {
+        match self {
+            Self::Compute(_) => CapacityDomain::Gpu,
+            Self::Fetch { .. } => CapacityDomain::Fetch,
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum AdmissionError {
@@ -26,20 +68,51 @@ pub enum AdmissionError {
     Cancelled,
 }
 
+/// Execution selected at admission, retained through physical worker teardown.
+type Execute = dyn Fn(
+        super::Admitted,
+        super::PaidProgress,
+    ) -> futures::future::BoxFuture<
+        'static,
+        Result<Vec<hellas_rpc::OutputEventEnvelope>, BackendFault>,
+    > + Send
+    + Sync;
+pub struct ReservedExecution {
+    pub execute: Box<Execute>,
+}
+impl std::fmt::Debug for ReservedExecution {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReservedExecution")
+    }
+}
+
 #[derive(Debug)]
 pub struct WorkPermit {
     domain: CapacityDomain,
     _permit: OwnedSemaphorePermit,
+    backend: Option<Arc<ReservedExecution>>,
+    stop: Option<Cancellation>,
 }
 impl WorkPermit {
     pub fn new(domain: CapacityDomain, permit: OwnedSemaphorePermit) -> Self {
         Self {
             domain,
             _permit: permit,
+            backend: None,
+            stop: None,
         }
     }
     pub fn domain(&self) -> CapacityDomain {
         self.domain
+    }
+    /// Retain the selected backend through physical worker teardown, even after a config swap.
+    pub fn retaining(mut self, backend: Arc<ReservedExecution>) -> Self {
+        self.backend = Some(backend);
+        self
+    }
+    pub fn cancellable(mut self, stop: Cancellation) -> Self {
+        self.stop = Some(stop);
+        self
     }
 }
 
@@ -51,13 +124,30 @@ pub struct WorkAdmission(Authorization);
 
 #[derive(Debug)]
 enum Authorization {
-    Payment,
-    Grant(AdmittedWork),
+    Payment(hellas_auth::PublicKey),
+    Reserved(AdmittedWork),
 }
 
 impl WorkAdmission {
-    pub fn payment() -> Self {
-        Self(Authorization::Payment)
+    pub fn payment(caller: hellas_auth::PublicKey) -> Self {
+        Self(Authorization::Payment(caller))
+    }
+
+    pub fn caller(&self) -> Option<hellas_auth::PublicKey> {
+        match self.0 {
+            Authorization::Payment(caller) => Some(caller),
+            Authorization::Reserved(_) => None,
+        }
+    }
+    pub fn backend(&self) -> Option<Arc<ReservedExecution>> {
+        match &self.0 {
+            Authorization::Reserved(admitted) => admitted.permit.backend.clone(),
+            Authorization::Payment(_) => None,
+        }
+    }
+
+    pub fn reserved(permit: WorkPermit) -> Self {
+        Self(Authorization::Reserved(AdmittedWork::payment(permit)))
     }
 
     pub fn grant(
@@ -66,7 +156,7 @@ impl WorkAdmission {
         cancellation: Cancellation,
         dispatch: impl Future<Output = Result<(), BackendFault>> + Send + 'static,
     ) -> Self {
-        Self(Authorization::Grant(AdmittedWork {
+        Self(Authorization::Reserved(AdmittedWork {
             permit,
             funding: Funding::Grant {
                 deadline,
@@ -84,8 +174,8 @@ impl WorkAdmission {
         payment: impl Future<Output = Result<WorkPermit, BackendFault>>,
     ) -> Result<AdmittedWork, BackendFault> {
         let admitted = match self.0 {
-            Authorization::Payment => AdmittedWork::payment(payment.await?),
-            Authorization::Grant(admitted) => admitted,
+            Authorization::Payment(_) => AdmittedWork::payment(payment.await?),
+            Authorization::Reserved(admitted) => admitted,
         };
         if admitted.permit.domain != domain {
             return Err(AdmissionError::WrongDomain {
@@ -142,16 +232,20 @@ impl AdmittedWork {
             Funding::Payment => None,
             Funding::Grant { cancellation, .. } => Some(cancellation.clone()),
         };
-        async move {
-            match cancellation {
-                None => std::future::pending().await,
-                Some(cancellation) => cancellation.cancelled().await,
-            }
-        }
+        let stop = self.permit.stop.clone();
+        async move { cancelled(cancellation, stop).await }
     }
 
     /// Durably authorize dispatch before any backend preparation or execution.
     pub async fn dispatch(self) -> Result<RunningWork, BackendFault> {
+        if self
+            .permit
+            .stop
+            .as_ref()
+            .is_some_and(Cancellation::is_cancelled)
+        {
+            return Err(AdmissionError::Cancelled.into());
+        }
         let started = Instant::now();
         let (deadline, cancellation) = match self.funding {
             Funding::Payment => (None, None),
@@ -207,16 +301,18 @@ impl RunningWork {
     /// Wait for authority cancellation without releasing physical ownership.
     /// Paid work retains its settlement duty and has no grant cancellation signal.
     pub async fn cancelled(&self) {
-        match &self.cancellation {
-            Some(cancellation) => cancellation.cancelled().await,
-            None => std::future::pending().await,
-        }
+        cancelled(self.cancellation.clone(), self._permit.stop.clone()).await;
     }
     pub fn check_active(&self) -> Result<(), BackendFault> {
         if self
             .cancellation
             .as_ref()
             .is_some_and(Cancellation::is_cancelled)
+            || self
+                ._permit
+                .stop
+                .as_ref()
+                .is_some_and(Cancellation::is_cancelled)
         {
             return Err(AdmissionError::Cancelled.into());
         }
@@ -229,6 +325,16 @@ impl RunningWork {
             Ok(())
         }
     }
+}
+
+async fn cancelled(authority: Option<Cancellation>, operator: Option<Cancellation>) {
+    let wait = |cancellation: Option<Cancellation>| async move {
+        match cancellation {
+            Some(cancellation) => cancellation.cancelled().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! { () = wait(authority) => {}, () = wait(operator) => {} }
 }
 
 #[cfg(test)]
@@ -252,15 +358,19 @@ mod tests {
     #[tokio::test]
     async fn payment_waits_for_capacity_and_holds_it_until_execution_ends() {
         let capacity = Arc::new(Semaphore::new(0));
-        let mut waiting = std::pin::pin!(WorkAdmission::payment().reserve(
-            CapacityDomain::Fetch,
-            async {
+        let mut waiting = std::pin::pin!(
+            WorkAdmission::payment(
+                hellas_auth::ProducerSigningKey::from_secret_bytes([1; 32])
+                    .unwrap()
+                    .public_key()
+            )
+            .reserve(CapacityDomain::Fetch, async {
                 Ok(WorkPermit::new(
                     CapacityDomain::Fetch,
                     capacity.clone().acquire_owned().await.unwrap(),
                 ))
-            }
-        ));
+            })
+        );
         assert!(matches!(futures::poll!(&mut waiting), Poll::Pending));
         capacity.add_permits(1);
         let admitted = waiting.await.unwrap();
@@ -437,16 +547,61 @@ mod tests {
     #[tokio::test]
     async fn the_wrong_capacity_domain_is_refused_and_released() {
         let capacity = Arc::new(Semaphore::new(1));
-        let error = WorkAdmission::payment()
-            .reserve(CapacityDomain::Gpu, async {
-                Ok(permit(&capacity, CapacityDomain::Fetch))
-            })
-            .await
-            .unwrap_err();
+        let error = WorkAdmission::payment(
+            hellas_auth::ProducerSigningKey::from_secret_bytes([1; 32])
+                .unwrap()
+                .public_key(),
+        )
+        .reserve(CapacityDomain::Gpu, async {
+            Ok(permit(&capacity, CapacityDomain::Fetch))
+        })
+        .await
+        .unwrap_err();
         assert!(matches!(
             error.source().unwrap().downcast_ref::<AdmissionError>(),
             Some(AdmissionError::WrongDomain { .. })
         ));
         assert_eq!(capacity.available_permits(), 1);
+    }
+    #[tokio::test]
+    async fn operator_cancellation_retains_the_selected_backend_until_teardown() {
+        for dispatched in [false, true] {
+            let capacity = Arc::new(Semaphore::new(1));
+            let backend = Arc::new(42u64);
+            let retained = Arc::downgrade(&backend);
+            let stop = Cancellation::new();
+            let admitted = WorkAdmission::reserved(
+                permit(&capacity, CapacityDomain::Fetch)
+                    .retaining(Arc::new(ReservedExecution {
+                        execute: Box::new(move |_, _| {
+                            let backend = backend.clone();
+                            Box::pin(async move {
+                                drop(backend);
+                                Ok(vec![])
+                            })
+                        }),
+                    }))
+                    .cancellable(stop.clone()),
+            )
+            .reserve(CapacityDomain::Fetch, async { panic!("reserved twice") })
+            .await
+            .unwrap();
+            if dispatched {
+                let running = admitted.dispatch().await.unwrap();
+                stop.cancel();
+                running.cancelled().await;
+                assert!(running.check_active().is_err());
+                assert!(retained.upgrade().is_some());
+                assert_eq!(capacity.available_permits(), 0);
+                drop(running);
+            } else {
+                stop.cancel();
+                admitted.cancelled().await;
+                assert!(retained.upgrade().is_some());
+                assert!(admitted.dispatch().await.is_err());
+            }
+            assert!(retained.upgrade().is_none());
+            assert_eq!(capacity.available_permits(), 1);
+        }
     }
 }

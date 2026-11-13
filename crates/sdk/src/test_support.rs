@@ -481,7 +481,7 @@ pub async fn accept_uploaded(
     })
     .await
     .expect("fresh positive acceptance completes its content upload");
-    let response = service.accept(&wire).await;
+    let response = service.accept(&wire, None).await;
     connection.cancel();
     tokio::time::timeout(hellas_channel::test_support::HANG_GUARD, async {
         while service.content_upload_count().await.unwrap() != 0 {
@@ -529,3 +529,39 @@ pub async fn upload_frames(
         }
     }
 }
+
+/// A one-backend daemon fixture; production callers supply the document's map.
+pub fn gateway(
+    backend: crate::Backend,
+    evaluator: Option<String>,
+    signer: std::sync::Arc<hellas_auth::ProducerSigningKey>,
+) -> std::sync::Arc<crate::ExecutorGateway> {
+    crate::ExecutorGateway::new(
+        [(
+            "test".into(),
+            crate::BackendEntry {
+                backend,
+                evaluator,
+                max_in_flight: std::num::NonZeroUsize::new(32).unwrap(),
+            },
+        )]
+        .into(),
+        signer,
+    )
+}
+
+pub fn job() -> std::sync::Arc<hellas_gateway::jobs::Job> {
+    request_job(&std::sync::Arc::new(hellas_gateway::jobs::Jobs::default()))
+}
+pub fn request_job(
+    jobs: &std::sync::Arc<hellas_gateway::jobs::Jobs>,
+) -> std::sync::Arc<hellas_gateway::jobs::Job> {
+    jobs.admit(&hellas_gateway::jobs::Request {
+        origin: hellas_gateway::jobs::Origin::Local,
+        method: "POST".into(),
+        path: "/test".into(),
+    })
+    .unwrap()
+}
+
+pub(crate) use hellas_gateway::test_server as server;

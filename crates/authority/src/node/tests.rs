@@ -256,7 +256,7 @@ fn host_scope(actor: Actor) -> GrantSpec {
         (HOST_STATUS, host_resource(spec.authority)),
         (HOST_PROVIDER_BIND, host_resource(spec.authority)),
         (GATEWAY_INVOKE, host_resource(spec.authority)),
-        (HOST_PROVIDER_CONFIGURE, host_resource(spec.authority)),
+        (HOST_CONFIGURE, host_resource(spec.authority)),
     ] {
         let operation = OperationId::new(op).unwrap();
         spec.permissions.insert(Permission {
@@ -404,14 +404,7 @@ async fn host_reads_require_their_own_operation() {
     let root = crate::test_support::session(&node, &secret).await;
     let (reader, _) =
         application(&node, &root, ids::OPERATOR_GRANT, OPERATOR, &[HOST_STATUS]).await;
-    let (writer, _) = application(
-        &node,
-        &root,
-        ids::FRIEND_GRANT,
-        FRIEND,
-        &[HOST_PROVIDER_CONFIGURE],
-    )
-    .await;
+    let (writer, _) = application(&node, &root, ids::FRIEND_GRANT, FRIEND, &[HOST_CONFIGURE]).await;
 
     node.status(&reader, ids::OPERATOR_GRANT).await.unwrap();
     assert_err!(
@@ -419,13 +412,7 @@ async fn host_reads_require_their_own_operation() {
         NodeStoreError::Authority(AuthorityError::Denied)
     );
     assert_err!(
-        node.host_action(
-            &reader,
-            ids::OPERATOR_GRANT,
-            HOST_PROVIDER_CONFIGURE,
-            |_| ()
-        )
-        .await,
+        configure(&node, &reader, ids::OPERATOR_GRANT).await,
         NodeStoreError::Authority(AuthorityError::Denied)
     );
 }
@@ -466,18 +453,13 @@ async fn queued_setting_and_revocation_use_the_same_writer_order() {
         &root,
         ids::OPERATOR_GRANT,
         OPERATOR,
-        &[HOST_PROVIDER_CONFIGURE],
+        &[HOST_CONFIGURE],
     )
     .await;
     let held = node.store.lock().await.unwrap();
     let mut revoke =
         Box::pin(node.revoke_credential(&root, ids::ROOT_GRANT, app_secret.id(), Revision(1)));
-    let mut setting = Box::pin(node.host_action(
-        &writer,
-        ids::OPERATOR_GRANT,
-        HOST_PROVIDER_CONFIGURE,
-        |_| (),
-    ));
+    let mut setting = Box::pin(configure(&node, &writer, ids::OPERATOR_GRANT));
     assert!(futures::poll!(&mut revoke).is_pending());
     assert!(futures::poll!(&mut setting).is_pending());
     drop(held);
@@ -487,14 +469,16 @@ async fn queued_setting_and_revocation_use_the_same_writer_order() {
         changed,
         NodeStoreError::Authority(AuthorityError::Credential)
     );
-    let (writer, _) = application(
-        &node,
-        &root,
-        ids::FRIEND_GRANT,
-        FRIEND,
-        &[HOST_PROVIDER_CONFIGURE],
-    )
-    .await;
+    let (daily, secret) =
+        application(&node, &root, ids::FRIEND_GRANT, FRIEND, &[HOST_CONFIGURE]).await;
+    assert_err!(
+        configure(&node, &daily, ids::FRIEND_GRANT).await,
+        NodeStoreError::Authority(AuthorityError::StepUp)
+    );
+    let writer = node
+        .authenticate_session(&secret, SessionKey::Passkey(&FRIEND.passkey()))
+        .await
+        .unwrap();
     let held = node.store.lock().await.unwrap();
     // Grant revisions are authority-wide, not per grant.
     let expected = held
@@ -503,8 +487,7 @@ async fn queued_setting_and_revocation_use_the_same_writer_order() {
         .grant(ids::FRIEND_GRANT)
         .unwrap()
         .revision();
-    let mut setting =
-        Box::pin(node.host_action(&writer, ids::FRIEND_GRANT, HOST_PROVIDER_CONFIGURE, |_| ()));
+    let mut setting = Box::pin(configure(&node, &writer, ids::FRIEND_GRANT));
     let mut revoke = Box::pin(node.grant(
         &root,
         GrantCommand::Revoke {
@@ -520,8 +503,7 @@ async fn queued_setting_and_revocation_use_the_same_writer_order() {
     changed.unwrap();
     revoked.unwrap();
     assert_err!(
-        node.host_action(&writer, ids::FRIEND_GRANT, HOST_PROVIDER_CONFIGURE, |_| ())
-            .await,
+        configure(&node, &writer, ids::FRIEND_GRANT).await,
         NodeStoreError::Authority(AuthorityError::Revoked)
     );
 }
@@ -607,14 +589,11 @@ async fn configured_machine_changes_reach_work_admission() {
             max_in_flight: std::num::NonZeroU16::new(max_in_flight).unwrap(),
             limits: vec![],
         };
-        crate::grant_service::WorkAdministration::new(
-            world.service.clone(),
-            common::common_node::configuration_with(machine, policies.clone()),
-            std::num::NonZeroU64::new(20 * 60_000).unwrap(),
+        common::common_node::apply_configuration(
+            &world.service.node(),
+            &common::common_node::configuration_with(machine, policies.clone()),
         )
-        .reconcile()
-        .await
-        .unwrap();
+        .await;
     };
     let work = world.work(FRIEND, ids::FRIEND_GRANT).await;
     let first = world.proposal(FRIEND, ids::ALLOWANCE, 1).await;
@@ -661,10 +640,13 @@ async fn runtime_budget_commands_cannot_replace_the_configured_tree() {
         .serve(common::common_node::NoBackend);
     let admin = crate::grant_service::WorkAdministration::new(
         world.service.clone(),
-        common::common_node::configuration(vec![common::policy()]),
         std::num::NonZeroU64::new(60_000).unwrap(),
     );
-    admin.reconcile().await.unwrap();
+    common::common_node::apply_configuration(
+        &world.service.node(),
+        &common::common_node::configuration(vec![common::policy()]),
+    )
+    .await;
     let root = world.administrator(common::actors::ROOT).await;
     let [account, pool, subject] = common::common_node::budgets(
         common::common_node::POOL,
@@ -697,4 +679,22 @@ async fn runtime_budget_commands_cannot_replace_the_configured_tree() {
             .await
             .unwrap();
     }
+}
+
+async fn configure(
+    node: &NodeCoordinator,
+    caller: &AuthenticatedCaller,
+    authorization: GrantId,
+) -> Result<(), NodeStoreError> {
+    node.configure(
+        caller,
+        authorization,
+        crate::model::grant::configuration::ConfigurationDocument {
+            revision: Revision(0),
+            document: "{}".into(),
+            secrets: Default::default(),
+        },
+        &Default::default(),
+    )
+    .await
 }

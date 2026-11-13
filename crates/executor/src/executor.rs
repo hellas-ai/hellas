@@ -10,7 +10,7 @@ use hellas_channel::work::{
     admission::{AdmissionError, CapacityDomain, RunningWork, WorkPermit},
 };
 use hellas_rpc::{
-    Assurance, OutputEventEnvelope,
+    OutputEventEnvelope,
     protocol::invocation::{
         Admission, InvocationPolicy, Limits, PreparedInvocation, fetch,
         output::{FailureReason, OutputStream},
@@ -49,7 +49,6 @@ pub struct ExecutorSpawnConfig {
     #[cfg(feature = "otel")]
     pub metrics: Arc<ExecutorMetrics>,
     pub producer_key: Arc<ProducerSigningKey>,
-    pub assurance: Assurance,
     pub fetch_routes: FetchRouteRegistry,
     pub fetch_max_in_flight: usize,
     pub fetch_queue_capacity: usize,
@@ -57,17 +56,12 @@ pub struct ExecutorSpawnConfig {
     pub gpu_config: GpuConfig,
 }
 impl ExecutorSpawnConfig {
-    pub fn new(
-        producer_key: Arc<ProducerSigningKey>,
-        assurance: Assurance,
-        fetch_routes: FetchRouteRegistry,
-    ) -> Self {
+    pub fn new(producer_key: Arc<ProducerSigningKey>, fetch_routes: FetchRouteRegistry) -> Self {
         Self {
             queue_capacity: hellas_rpc::DEFAULT_EXECUTION_QUEUE_CAPACITY,
             #[cfg(feature = "otel")]
             metrics: Arc::new(ExecutorMetrics::default()),
             producer_key,
-            assurance,
             fetch_routes,
             fetch_max_in_flight: hellas_rpc::DEFAULT_FETCH_MAX_IN_FLIGHT,
             fetch_queue_capacity: hellas_rpc::DEFAULT_FETCH_QUEUE_CAPACITY,
@@ -142,6 +136,18 @@ impl Executor {
     }
 }
 impl ExecutorHandle {
+    pub async fn reserve(
+        &self,
+        backend: &hellas_channel::work::admission::BackendKey,
+    ) -> Result<WorkPermit, BackendFault> {
+        let domain = backend.domain();
+        let permit = self
+            .capacity(domain)?
+            .acquire_owned()
+            .await
+            .map_err(|_| AdmissionError::Closed)?;
+        Ok(WorkPermit::new(domain, permit))
+    }
     fn capacity(&self, domain: CapacityDomain) -> Result<Arc<Semaphore>, BackendFault> {
         match domain {
             CapacityDomain::Fetch => Ok(self.inner.fetch_capacity.clone()),
@@ -189,11 +195,9 @@ impl ExecutorHandle {
             })
             .await?;
         let (prepared, limits, content, admission) = input.into_parts_and_admission();
-        if prepared.request.assurance != self.inner.config.assurance
-            || prepared.request.runner_public_key != self.inner.config.producer_key.public_key()
-        {
+        if prepared.request.runner_public_key != self.inner.config.producer_key.public_key() {
             return Err(BackendFault::caused_by(ExecutorError::PolicyDenied(
-                "invocation names a different provider or assurance".into(),
+                "invocation names a different provider".into(),
             )));
         }
         let active = match domain {
@@ -565,7 +569,12 @@ impl ExecutorHandle {
     }
 }
 impl WorkBackend for ExecutorHandle {
-    fn try_admit(&self, domain: CapacityDomain) -> Result<WorkPermit, BackendFault> {
+    fn try_admit(
+        &self,
+        backend: &hellas_channel::work::admission::BackendKey,
+        _caller: hellas_auth::PublicKey,
+    ) -> Result<WorkPermit, BackendFault> {
+        let domain = backend.domain();
         let permit = self
             .capacity(domain)?
             .try_acquire_owned()
@@ -615,11 +624,7 @@ mod content_tests {
         .await
         .unwrap();
         let key = Arc::new(ProducerSigningKey::generate());
-        let mut config = ExecutorSpawnConfig::new(
-            key.clone(),
-            Assurance::ProducerSigned,
-            FetchRouteRegistry::new(),
-        );
+        let mut config = ExecutorSpawnConfig::new(key.clone(), FetchRouteRegistry::new());
         config.queue_capacity = 0;
         let executor = Executor::spawn_configured(config).await.unwrap();
         let mut prepared = fixture::bundle(1);
@@ -654,7 +659,11 @@ mod content_tests {
                     fixture::work_policy().limits,
                     CapacityDomain::Gpu,
                     (LocalStore::Disk(node), scope),
-                    hellas_channel::work::admission::WorkAdmission::payment(),
+                    hellas_channel::work::admission::WorkAdmission::payment(
+                        hellas_auth::ProducerSigningKey::from_secret_bytes([1; 32])
+                            .unwrap()
+                            .public_key(),
+                    ),
                 ))
                 .await
         });

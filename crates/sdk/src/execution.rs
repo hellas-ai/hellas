@@ -10,11 +10,11 @@ use hellas_channel::work::PaidProgress;
 use hellas_kernel::NetworkId;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 mod executor;
-pub use executor::{Executor, GrantExecution, PaidExecution};
-#[cfg(feature = "compute")]
+pub use executor::Executor;
 pub mod local;
 
 /// Format tag of a persisted grant attempt record.
@@ -53,9 +53,10 @@ pub enum ExecutionError {
     Terminal,
     #[error("delivery failed: {0}")]
     Delivery(Box<dyn std::error::Error + Send + Sync>),
-    #[cfg(feature = "compute")]
     #[error("local execution failed: {0}")]
     Local(String),
+    #[error("local admission refused: {0}")]
+    LocalAdmission(String),
     #[error(transparent)]
     Stopped(#[from] RequestStopped),
     #[error(transparent)]
@@ -496,7 +497,7 @@ pub(crate) async fn before_proposal<T>(
 /// What a paid session is opened for. Only a job may fund a new channel.
 pub enum PaidOpen<'a> {
     Retained,
-    Job(&'a Job),
+    Job(&'a Job, Option<&'a crate::paid_client::PaidQuote>),
     /// A tracked job: its target binds at the funding boundary, after quote
     /// and preflight. A bound attempt reopens its retained channel only.
     Attempt(&'a Job, &'a mut ExecutionAttempt),
@@ -515,9 +516,9 @@ pub async fn open_paid_session(
     connection_timeout: Option<std::time::Duration>,
 ) -> Result<PaidWorkSession> {
     let PaidOpen::Attempt(job, attempt) = open else {
-        let (job, allow_funding) = match open {
-            PaidOpen::Job(job) => (Some(job), true),
-            _ => (None, false),
+        let (job, quote, allow_funding) = match open {
+            PaidOpen::Job(job, quote) => (Some(job), quote.cloned(), true),
+            _ => (None, None, false),
         };
         return Ok(Box::pin(PaidWorkSession::open_inner(
             options,
@@ -527,6 +528,7 @@ pub async fn open_paid_session(
             crate::paid_client::OpenIntent {
                 job: job.map(|job| Box::new(job.clone())),
                 allow_funding,
+                quote,
                 before_open: None,
             },
             connection_timeout,
@@ -563,6 +565,7 @@ pub async fn open_paid_session(
         crate::paid_client::OpenIntent {
             job: fresh.then(|| Box::new(job.clone())),
             allow_funding: fresh,
+            quote: None,
             before_open: Some(Box::new(|| {
                 purchase.bind_target(target)?;
                 *newly_bound = false;
@@ -575,7 +578,8 @@ pub async fn open_paid_session(
     .await?;
     let descriptor = session.descriptor();
     let AttemptRecord::Paid(purchase) = &mut attempt.record else {
-        unreachable!("checked above");
+        session.shutdown().await;
+        return Err(ExecutionError::Identity);
     };
     if let Err(error) = purchase.ensure_channel(descriptor.channel().id(), descriptor.bond_edge()) {
         session.shutdown().await;
@@ -708,24 +712,25 @@ impl ExecutionSession<'_> {
             };
             attempt.matches(input, terms).map_err(pre)?;
         }
+        let proposed = Arc::new(AtomicBool::new(false));
         let completed = match (self, terms) {
             (Self::Paid(session), ExecutionTerms::Paid { price }) => {
                 run_paid(
-                    session,
+                    SessionSource::Direct(session),
                     request,
                     price,
                     signer,
-                    (deadline, &stop, observers),
+                    (deadline, &stop, observers, &proposed),
                     attempt.as_deref_mut(),
                 )
                 .await?
             }
             (Self::Grant(session), ExecutionTerms::Grant { resource }) => {
                 run_grant(
-                    session,
+                    SessionSource::Direct(session),
                     request,
                     resource,
-                    (deadline, &stop, observers),
+                    (deadline, &stop, observers, &proposed),
                     attempt.as_deref_mut(),
                 )
                 .await?
@@ -742,22 +747,62 @@ impl ExecutionSession<'_> {
     }
 }
 
-type RunControls<'a> = (Option<tokio::time::Instant>, &'a Stop, ExecutionObservers);
+/// A command borrows its session; a gateway releases the proposal lock while
+/// collecting output, then takes it again for the accounting transition.
+pub(crate) enum SessionSource<'a, S> {
+    Direct(&'a mut S),
+    Shared(&'a tokio::sync::Mutex<Option<S>>),
+}
+enum SessionBorrow<'a, S> {
+    Direct(&'a mut S),
+    Shared(tokio::sync::MutexGuard<'a, Option<S>>),
+}
+impl<S> SessionSource<'_, S> {
+    async fn borrow(&mut self) -> SessionBorrow<'_, S> {
+        match self {
+            Self::Direct(session) => SessionBorrow::Direct(session),
+            Self::Shared(session) => SessionBorrow::Shared(session.lock().await),
+        }
+    }
+}
+impl<S> SessionBorrow<'_, S> {
+    fn get(&mut self) -> Result<&mut S> {
+        match self {
+            Self::Direct(session) => Ok(session),
+            Self::Shared(session) => session.as_mut().ok_or(ExecutionError::Identity),
+        }
+    }
+}
 
-async fn run_paid(
-    session: &mut PaidWorkSession,
+type RunControls<'a> = (
+    Option<tokio::time::Instant>,
+    &'a Stop,
+    ExecutionObservers,
+    &'a Arc<AtomicBool>,
+);
+
+pub(crate) async fn run_paid(
+    mut source: SessionSource<'_, PaidWorkSession>,
     request: &WorkRequest,
     price: u64,
     signer: &ProducerSigningKey,
-    (deadline, stop, observers): RunControls<'_>,
+    (deadline, stop, observers, proposed): RunControls<'_>,
     mut attempt: Option<&mut ExecutionAttempt>,
 ) -> Attempted<Completed> {
-    let WorkRequest::Job(input) = request else {
-        return Err(pre(ExecutionError::Identity));
-    };
-    let job = Job::from_input(price, input.clone()).map_err(pre)?;
+    let recover = matches!(source, SessionSource::Direct(_));
+    let mut held = before_proposal(deadline, stop, None, source.borrow()).await?;
+    let session = held.get().map_err(pre)?;
+    let input = request
+        .admitted(
+            session.descriptor().invocation_policy(),
+            None,
+            session.assurance(),
+            true,
+        )
+        .map_err(pre)?;
+    let job = Job::from_input(price, input).map_err(pre)?;
     let tracked = attempt.is_some();
-    let purchase = match attempt.as_deref_mut() {
+    let mut purchase = match attempt.as_deref_mut() {
         Some(attempt) => {
             let purchase = attempt.paid_on(session).map_err(pre)?;
             if purchase.has_proposal_intent() {
@@ -770,7 +815,7 @@ async fn run_paid(
     // An untracked request first resumes the channel's retained work; it
     // never proposes this request, so its failure leaves fallback open. A
     // tracked attempt recovers only itself.
-    if !tracked && session.needs_recovery() {
+    if recover && !tracked && session.needs_recovery() {
         let bound = tokio::time::Instant::now() + PAID_RECOVERY_TIMEOUT;
         let deadline = Some(deadline.map_or(bound, |deadline| deadline.min(bound)));
         before_proposal(
@@ -787,25 +832,11 @@ async fn run_paid(
         .with_state(|state| state.proposal_nonce_high_water())
         .await
         .map_err(pre)?;
-    let proposed = AtomicBool::new(false);
     let result = before_proposal(
         deadline,
         stop,
-        Some(&proposed),
-        crate::transact::transact(
-            session,
-            &job,
-            signer,
-            crate::transact::TransactionOptions {
-                purchase,
-                // A request is always a new purchase; recovery never searches
-                // for a matching old job here.
-                new_purchase: true,
-                progress: observers.progress,
-                accepted: observers.accepted,
-                proposed: Some(&proposed),
-            },
-        ),
+        Some(proposed),
+        session.propose_job(&job, signer, proposed, purchase.as_deref_mut()),
     )
     .await?;
     let result = match result {
@@ -815,7 +846,9 @@ async fn run_paid(
                 &error,
                 crate::transact::TransactError::Client(
                     crate::paid_client::PaidClientError::Propose(
-                        hellas_channel::work::ProposeError::Store(_)
+                        hellas_channel::work::ProposeError::Store(
+                            hellas_channel::work_store::WorkStoreError::Journal(_)
+                        )
                     )
                 )
             );
@@ -832,19 +865,26 @@ async fn run_paid(
             );
         }
     };
-    let completed = Completed {
-        work_id: result.work_id,
-        output: result.output.clone(),
-        transcript: result.transcript.clone(),
-        provider_key: result.provider_key,
-        paid: Some(PaidReceipt {
-            price: result.job_price,
-            channel_id: result.channel_id,
-            bond_edge: result.bond_edge,
-            settled: None,
-        }),
-        live: Some(ExecutionResult::Paid(Box::new(result))),
-    };
+    drop(held);
+    let collected = within(
+        deadline,
+        result.collect(
+            observers.progress.as_ref(),
+            observers.accepted.as_ref(),
+            purchase.as_deref_mut(),
+        ),
+    )
+    .await?
+    .map_err(committed)?;
+    let mut held = within(deadline, source.borrow()).await?;
+    let result = within(deadline, held.get().map_err(committed)?.pay(collected))
+        .await?
+        .map_err(committed)?;
+    if let Some(purchase) = purchase {
+        purchase.paid(result.work_id).map_err(committed)?;
+    }
+    drop(held);
+    let completed = paid_completed(result);
     if let Some(attempt) = attempt {
         attempt
             .complete(
@@ -863,14 +903,33 @@ async fn run_paid(
     Ok(completed)
 }
 
-async fn run_grant(
-    session: &mut crate::grant_client::GrantSession,
+pub(crate) fn paid_completed(result: crate::paid_client::PaidWorkResult) -> Completed {
+    Completed {
+        work_id: result.work_id,
+        output: result.output.clone(),
+        transcript: result.transcript.clone(),
+        provider_key: result.provider_key,
+        paid: Some(PaidReceipt {
+            price: result.job_price,
+            channel_id: result.channel_id,
+            bond_edge: result.bond_edge,
+            settled: None,
+        }),
+        live: Some(ExecutionResult::Paid(Box::new(result))),
+    }
+}
+
+pub(crate) async fn run_grant(
+    mut source: SessionSource<'_, crate::grant_client::GrantSession>,
     request: &WorkRequest,
     resource: ResourceId,
-    (deadline, stop, observers): RunControls<'_>,
+    (deadline, stop, observers, proposed): RunControls<'_>,
     mut attempt: Option<&mut ExecutionAttempt>,
 ) -> Attempted<Completed> {
-    let mut tracker = match attempt.as_deref_mut() {
+    let recover = matches!(source, SessionSource::Direct(_));
+    let mut held = before_proposal(deadline, stop, None, source.borrow()).await?;
+    let session = held.get().map_err(pre)?;
+    let tracker = match attempt.as_deref_mut() {
         Some(attempt) => {
             let tracker = attempt.grant_on(session).map_err(pre)?;
             if tracker.record.work.is_some() {
@@ -881,77 +940,63 @@ async fn run_grant(
         None => None,
     };
     let assurance = session.assurance();
-    let mut retried = false;
-    let result = loop {
-        before_proposal(deadline, stop, None, async {
+    before_proposal(deadline, stop, None, async {
+        if recover {
             session.recover().await?;
-            session.refresh().await
-        })
-        .await?
-        .map_err(pre)?;
-        // Re-admit the original request under the refreshed resource terms.
-        let policy = session
-            .offer()
-            .offer()
-            .grant
-            .policies
-            .iter()
-            .find(|policy| policy.resource == resource)
-            .ok_or(pre(ExecutionError::Identity))?;
-        let input = request
-            .admitted(
-                &policy.invocation_policy,
-                policy.https.as_ref(),
-                assurance,
-                false,
-            )
-            .map_err(pre)?;
-        let prepared =
-            prepare_grant_input(&input, policy, session.offer(), session.execution_signer())
-                .map_err(pre)?;
-        let proposed = AtomicBool::new(false);
-        let content = input.content();
-        let result = before_proposal(
-            deadline,
-            stop,
-            Some(&proposed),
-            session.run_resource(
-                resource,
-                prepared,
-                &content,
-                ExecutionObservers {
-                    progress: observers.progress.clone(),
-                    accepted: observers.accepted.clone(),
-                },
-                Some(&proposed),
-                tracker.as_deref_mut(),
-            ),
-        )
-        .await?;
-        match result {
-            // Refused before acceptance with nothing pending: admit again once.
-            Err(crate::grant_client::GrantClientError::AdmissionExpired) if !retried => {
-                retried = true;
-            }
-            Err(error)
-                if !proposed.load(Ordering::Acquire)
-                    && session.store().book().pending_proposal().is_none() =>
-            {
-                return Err(pre(error));
-            }
-            result => break result.map_err(committed)?,
         }
-    };
+        session.refresh().await
+    })
+    .await?
+    .map_err(pre)?;
+    // Re-admit the original request under the refreshed resource terms.
+    let policy = session
+        .offer()
+        .offer()
+        .grant
+        .policies
+        .iter()
+        .find(|policy| policy.resource == resource)
+        .ok_or(pre(ExecutionError::Identity))?;
+    let input = request
+        .admitted(
+            &policy.invocation_policy,
+            policy.https.as_ref(),
+            assurance,
+            false,
+        )
+        .map_err(pre)?;
+    let prepared = prepare_grant_input(&input, policy, session.offer(), session.execution_signer())
+        .map_err(pre)?;
+    let content = input.content();
+    let result = before_proposal(
+        deadline,
+        stop,
+        Some(proposed),
+        session.propose_resource(resource, prepared, &content, Some(proposed), tracker),
+    )
+    .await?;
+    let result = result.map_err(|error| {
+        if !proposed.load(Ordering::Acquire) && session.store().book().pending_proposal().is_none()
+        {
+            pre(error)
+        } else {
+            committed(error)
+        }
+    })?;
+    drop(held);
+    let collected = within(
+        deadline,
+        result.collect(observers.progress, observers.accepted),
+    )
+    .await?
+    .map_err(committed)?;
+    let mut held = within(deadline, source.borrow()).await?;
+    let result = within(deadline, held.get().map_err(committed)?.complete(collected))
+        .await?
+        .map_err(committed)?;
+    drop(held);
     let finished = result.result.outcome == hellas_channel::model::work::ResultOutcome::Finished;
-    let completed = Completed {
-        work_id: result.work_id,
-        transcript: hellas_channel::model::work::encode_transcript(&result.events)
-            .map_err(|_| committed(ExecutionError::Identity))?,
-        output: result.output.clone(),
-        provider_key: result.provider_key,
-        paid: None,
-        live: Some(ExecutionResult::Grant(Box::new(result))),
-    };
+    let completed = grant_completed(result)?;
     if let Some(attempt) = attempt {
         attempt
             .complete(
@@ -964,6 +1009,20 @@ async fn run_grant(
             .map_err(committed)?;
     }
     Ok(completed)
+}
+
+pub(crate) fn grant_completed(
+    result: crate::grant_client::GrantWorkResult,
+) -> Attempted<Completed> {
+    Ok(Completed {
+        work_id: result.work_id,
+        transcript: hellas_channel::model::work::encode_transcript(&result.events)
+            .map_err(|_| committed(ExecutionError::Identity))?,
+        output: result.output.clone(),
+        provider_key: result.provider_key,
+        paid: None,
+        live: Some(ExecutionResult::Grant(Box::new(result))),
+    })
 }
 
 #[derive(Serialize, Deserialize)]

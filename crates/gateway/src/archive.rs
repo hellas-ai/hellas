@@ -37,6 +37,7 @@ impl Policy {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn prepare(&self) {
         if !self.options.zdr
             && let Err(error) = prepare(&self.options.directory)
@@ -88,7 +89,7 @@ pub(crate) async fn record(
     };
     let (parts, body) = request.into_parts();
     let body =
-        match axum::body::to_bytes(body, super::compose::request_limit(parts.uri.path())).await {
+        match axum::body::to_bytes(body, super::router::request_limit(parts.uri.path())).await {
             Ok(body) => body,
             Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
         };
@@ -121,7 +122,7 @@ pub(crate) async fn record(
         let decoded = if multipart_audio && identity {
             std::borrow::Cow::Borrowed(body.as_ref())
         } else {
-            match super::http_fetch::affinity::decoded_body(&parts.headers, &body) {
+            match super::affinity::decoded_body(&parts.headers, &body) {
                 Ok(decoded) => decoded,
                 Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
             }

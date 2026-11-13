@@ -5,15 +5,15 @@ use std::path::Path;
 
 pub mod admin;
 pub mod chain;
-pub(crate) mod codex_auth;
 pub mod contributions;
 pub mod convert;
 pub mod faucet;
 
+mod bootstrap;
+pub mod daemon;
 pub mod identity;
 pub mod monitor;
 pub mod rpc;
-pub mod serve;
 pub mod store;
 pub mod transact;
 pub mod trust;

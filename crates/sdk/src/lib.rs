@@ -22,17 +22,11 @@ pub use hellas_client as client;
 pub use iroh;
 mod remote;
 pub use hellas_gateway as gateway;
-pub mod grant_provider;
 mod provider;
-pub use grant_provider::GrantProviderOptions;
 pub use hellas_executor::{FetchRoute, FetchRouteEntry, FetchRoutePolicy, FetchRouteRegistry};
 pub use hellas_kernel as kernel;
 pub use hellas_providers::HttpProviderConfig;
-pub use provider::PaidProviderOptions;
-pub use provider::{
-    FetchProviderOptions, ProviderAuthority, ProviderControl, ProviderError, ProviderGrants,
-    ProviderHandle, ProviderOpen, ProviderOptions, start_fetch_provider,
-};
+pub use provider::{ProviderError, ProviderOpen};
 pub use remote::NodeIdentity;
 
 pub mod local {
@@ -58,16 +52,15 @@ pub mod grant_client;
 pub mod access_bundle;
 mod application_handshake;
 pub mod contact;
-pub mod grant_config;
 pub mod node_control;
 
+pub mod daemon;
+pub mod daemon_config;
 mod gateway_work;
 pub use gateway_work::{
-    ExecutorGateway, GatewayServeOptions, GatewayTarget, WorkRequest, serve_gateway,
+    Backend, BackendEntry, BackendState, ExecutorGateway, GrantBackend, PaidBackend, WorkRequest,
+    grant_routes,
 };
-
-mod resource_config;
-pub use resource_config::ResourceConfigError;
 
 #[cfg(test)]
 mod test_identity;

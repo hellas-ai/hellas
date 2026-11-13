@@ -1,6 +1,6 @@
 use super::*;
 use crate::{ComputeEvent, WorkEvent};
-use crate::{ModelOptions, Presentations, WorkGatewayError, WorkOutputStream, WorkShutdownError};
+use crate::{WorkExecutionBackend, WorkGatewayError, WorkOutputStream, WorkShutdownError};
 use axum::body::Body;
 use hellas_rpc::{
     JsonBytes,
@@ -16,23 +16,23 @@ use tower::ServiceExt;
 #[derive(Default)]
 struct Fake {
     calls: AtomicUsize,
-    timeout: Option<std::time::Duration>,
     delay: Option<std::time::Duration>,
     started: tokio::sync::Notify,
     provenance: Option<(hellas_rpc::provenance::ExecutionProvenance, Vec<u8>)>,
     invalid_output: Option<Outcome>,
 }
 impl WorkExecutionBackend for Fake {
-    fn evaluator(&self) -> Option<String> {
-        Some(hellas_client::model::evaluator(
-            hellas_client::model::GpuDialect::Hip,
-        ))
-    }
-    fn timeout(&self) -> Option<std::time::Duration> {
-        self.timeout
+    fn backends(&self) -> Vec<crate::BackendInfo> {
+        crate::test_support::backend({
+            Some(hellas_client::model::evaluator(
+                hellas_client::model::GpuDialect::Hip,
+            ))
+        })
     }
     fn run(
         &self,
+        _backend: &str,
+        _request_job: Arc<crate::jobs::Job>,
         job: hellas_client::model::ComputeJob,
     ) -> Result<WorkOutputStream<ComputeEvent>, WorkGatewayError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
@@ -113,22 +113,21 @@ impl WorkExecutionBackend for Fake {
         Box::pin(async { Ok(()) })
     }
 }
-fn options(name: &str) -> ModelOptions {
-    ModelOptions::Whisper(AudioOptions {
-        model: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+fn options(name: &str) -> crate::Route {
+    crate::test_support::route(crate::Presentation::Model {
+        modality: hellas_client::model::ModelKind::Transcription,
+        model: name.into(),
+        package: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../client/src/model/whisper/mini"),
-        model_name: name.into(),
-        default_max_tokens: 4,
+        max_tokens: 4,
     })
 }
 async fn app(names: &[&str], work: Arc<Fake>) -> Router {
-    let work: Arc<dyn WorkExecutionBackend> = work;
-    crate::compose::router(
-        &Presentations {
-            models: names.iter().map(|n| options(n)).collect(),
-            ..Default::default()
-        },
-        &work,
+    crate::router::router(
+        names.iter().map(|n| options(n)).collect(),
+        work,
+        Arc::new(crate::jobs::Jobs::default()),
+        Default::default(),
     )
     .await
     .unwrap()
@@ -372,58 +371,22 @@ async fn malformed_audio_and_unsupported_options_never_reach_work() {
 
 #[tokio::test]
 async fn invalid_family_and_capacity_are_startup_errors() {
-    let ModelOptions::Whisper(mut options) = options("tiny") else {
+    let mut route = options("tiny");
+    let crate::Presentation::Model { max_tokens, .. } = &mut route.presentation else {
         unreachable!()
     };
-    options.default_max_tokens = 5;
-    assert!(router(&options, Arc::new(Fake::default())).await.is_err());
-    options.default_max_tokens = 1;
-    options.model = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../client/src/model/package/mini-qwen3.gguf");
-    assert!(router(&options, Arc::new(Fake::default())).await.is_err());
-}
-#[tokio::test]
-async fn expired_preparation_never_submits_work() {
-    let fake = Arc::new(Fake {
-        calls: AtomicUsize::new(0),
-        timeout: Some(std::time::Duration::ZERO),
-        ..Default::default()
-    });
-    let app = app(&["tiny"], fake.clone()).await;
-    let response = app
-        .oneshot(request(&[("model", b"tiny"), ("file", &wav(16000, 400))]))
+    *max_tokens = 5;
+    assert!(
+        crate::router::router(
+            vec![route],
+            Arc::new(Fake::default()),
+            Arc::new(crate::jobs::Jobs::default()),
+            Default::default()
+        )
         .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
-    assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
+        .is_err()
+    );
 }
-
-#[tokio::test]
-async fn audio_waits_without_a_client_deadline_but_keeps_explicit_budgets() {
-    for timeout in [None, Some(std::time::Duration::from_secs(5))] {
-        let fake = Arc::new(Fake {
-            timeout,
-            delay: Some(std::time::Duration::from_secs(600)),
-            ..Default::default()
-        });
-        let app = app(&["tiny"], fake.clone()).await;
-        let response =
-            tokio::spawn(app.oneshot(request(&[("model", b"tiny"), ("file", &wav(16000, 160))])));
-        fake.started.notified().await;
-        tokio::time::pause();
-        let response = response.await.unwrap().unwrap();
-        tokio::time::resume();
-        assert_eq!(
-            response.status(),
-            if timeout.is_some() {
-                StatusCode::GATEWAY_TIMEOUT
-            } else {
-                StatusCode::OK
-            }
-        );
-    }
-}
-
 #[tokio::test]
 async fn zdr_accepts_large_valid_multipart_wav() {
     let fake = Arc::new(Fake::default());

@@ -69,7 +69,6 @@ mod tests {
             presentation: Arc::new(
                 hellas_presentation::TextPresentation::from_gguf(&path).unwrap(),
             ),
-            deadline: Some(tokio::time::Instant::now() + std::time::Duration::from_secs(5)),
         });
         tokio::pin!(stream);
         let mut text = String::new();

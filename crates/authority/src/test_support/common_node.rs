@@ -201,18 +201,6 @@ pub struct WorkAdmin {
     policies: Vec<crate::model::grant::records::GrantPolicy>,
 }
 impl WorkAdmin {
-    fn configured(
-        grants: crate::grant_service::GrantService,
-        machine: &crate::model::grant::configuration::ConfiguredBudget,
-        policies: &[crate::model::grant::records::GrantPolicy],
-    ) -> crate::grant_service::WorkAdministration {
-        crate::grant_service::WorkAdministration::new(
-            grants,
-            configuration_with(machine.clone(), policies.to_vec()),
-            // Longer than one Work session, as deployed allowances may be.
-            std::num::NonZeroU64::new(20 * 60_000).unwrap(),
-        )
-    }
     pub async fn budgets(
         &self,
         pool: PoolId,
@@ -253,8 +241,11 @@ impl WorkAdmin {
             max_in_flight: std::num::NonZeroU16::new(concurrent).unwrap(),
             limits,
         };
-        self.service = Self::configured(self.grants.clone(), &self.machine, &self.policies);
-        self.service.reconcile().await.unwrap();
+        apply_configuration(
+            &self.grants.node(),
+            &configuration_with(self.machine.clone(), self.policies.clone()),
+        )
+        .await;
     }
 
     pub async fn create(&self, definition: crate::model::grant::records::GrantDef) {
@@ -289,8 +280,15 @@ impl WorkAdmin {
             .root_grant();
         let caller = super::session(&node, secret).await;
         let machine = unlimited();
-        let configured = Self::configured(service.clone(), &machine, &policies);
-        configured.reconcile().await.unwrap();
+        apply_configuration(
+            &node,
+            &configuration_with(machine.clone(), policies.clone()),
+        )
+        .await;
+        let configured = crate::grant_service::WorkAdministration::new(
+            service.clone(),
+            std::num::NonZeroU64::new(20 * 60_000).unwrap(),
+        );
         Self {
             root,
             service: configured,
@@ -357,9 +355,11 @@ pub fn allowance(
 impl hellas_channel::work::WorkBackend for NoBackend {
     fn try_admit(
         &self,
-        domain: hellas_channel::work::admission::CapacityDomain,
+        backend: &hellas_channel::work::admission::BackendKey,
+        _caller: hellas_auth::PublicKey,
     ) -> Result<hellas_channel::work::admission::WorkPermit, hellas_channel::work::BackendFault>
     {
+        let domain = backend.domain();
         Err(hellas_channel::work::admission::AdmissionError::Unsupported(domain).into())
     }
 }
@@ -402,4 +402,26 @@ pub async fn provision(
     NodeStore::open(&location, network, Some(provider), now)
         .await
         .unwrap()
+}
+
+/// Exercise the single configuration journal frame without a transport fixture.
+pub async fn apply_configuration(
+    node: &crate::node::NodeCoordinator,
+    configuration: &crate::model::grant::configuration::NodeConfiguration,
+) {
+    let mut store = node.writer().await.unwrap();
+    let revision = store
+        .state()
+        .configuration()
+        .map_or(auth::Revision(0), |stored| stored.revision);
+    store
+        .configure(
+            revision,
+            "{}".into(),
+            Default::default(),
+            configuration,
+            (node.clock)(),
+        )
+        .await
+        .unwrap();
 }

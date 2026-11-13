@@ -20,11 +20,31 @@ pub struct ConfiguredBudget {
 /// A validated node configuration. Serving resources requires a machine
 /// budget; every resource's account is declared, and every declared account is
 /// used. The default serves nothing and configures no budgets.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeConfiguration {
     machine: Option<ConfiguredBudget>,
     accounts: BTreeMap<ResourceId, ConfiguredBudget>,
     resources: Vec<GrantPolicy>,
+}
+
+/// The daemon's redacted document, committed with its authority configuration.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigurationDocument {
+    pub revision: Revision,
+    pub document: String,
+    /// Private restart data. Control replies return only `document`.
+    pub secrets: ConfigurationSecrets,
+}
+
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigurationSecrets(pub BTreeMap<String, BTreeMap<String, String>>);
+
+impl std::fmt::Debug for ConfigurationSecrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
 }
 
 impl NodeConfiguration {
@@ -33,6 +53,21 @@ impl NodeConfiguration {
         accounts: BTreeMap<ResourceId, ConfiguredBudget>,
         resources: Vec<GrantPolicy>,
     ) -> Result<Self, GrantError> {
+        let configuration = Self {
+            machine,
+            accounts,
+            resources,
+        };
+        configuration.validate()?;
+        Ok(configuration)
+    }
+
+    pub fn validate(&self) -> Result<(), GrantError> {
+        let Self {
+            machine,
+            accounts,
+            resources,
+        } = self;
         let mut names = std::collections::BTreeSet::new();
         let mut ids = std::collections::BTreeSet::new();
         if resources.len() > MAX_WORK_POLICIES
@@ -43,19 +78,15 @@ impl NodeConfiguration {
             || (machine.is_none() && !resources.is_empty())
             || resources.iter().any(|p| !accounts.contains_key(&p.account))
             || accounts
-                .keys()
-                .any(|account| !resources.iter().any(|p| p.account == *account))
+                .iter()
+                .any(|(account, _)| !resources.iter().any(|p| p.account == *account))
         {
             return Err(GrantError::Limits);
         }
-        for policy in &resources {
+        for policy in resources {
             policy.validate()?;
         }
-        Ok(Self {
-            machine,
-            accounts,
-            resources,
-        })
+        Ok(())
     }
 
     pub fn machine(&self) -> Option<&ConfiguredBudget> {
@@ -70,14 +101,22 @@ impl NodeConfiguration {
         self.resources.iter().find(|p| p.name == name)
     }
 
-    /// The account definitions to apply, given each account's current one.
-    pub fn account_changes(
+    /// The budget definitions to apply, given each node's current one.
+    pub fn budget_changes(
         &self,
         current: impl Fn(BudgetNode) -> Option<BudgetDef>,
     ) -> Result<Vec<BudgetDef>, GrantError> {
         let mut changes = Vec::new();
-        for (account, budget) in &self.accounts {
-            let node = BudgetNode::Account(*account);
+        for (node, budget) in self
+            .machine
+            .iter()
+            .map(|budget| (BudgetNode::Machine, budget))
+            .chain(
+                self.accounts
+                    .iter()
+                    .map(|(id, budget)| (BudgetNode::Account(*id), budget)),
+            )
+        {
             let revision = match current(node) {
                 None => Revision(1),
                 Some(old)
@@ -89,7 +128,7 @@ impl NodeConfiguration {
             };
             changes.push(BudgetDef {
                 node,
-                parent: Some(BudgetNode::Machine),
+                parent: (node != BudgetNode::Machine).then_some(BudgetNode::Machine),
                 revision,
                 limits: budget.limits.clone(),
                 max_in_flight: budget.max_in_flight,

@@ -120,7 +120,7 @@ pub mod admission;
 mod admitted;
 pub use admitted::Admitted;
 mod stream;
-use admission::{AdmissionError, CapacityDomain, WorkAdmission, WorkPermit};
+use admission::{AdmissionError, WorkAdmission, WorkPermit};
 pub use stream::{PaidProgress, PaidResultStream, ProgressError, fetch_result_stream};
 
 mod content;
@@ -537,6 +537,7 @@ pub struct ProviderEndpoint {
     close: CloseEndpoint,
     ready: Option<ReadyChannel>,
     observation: Option<Observation>,
+    accepting: bool,
 }
 
 impl CloseEndpoint {
@@ -579,6 +580,7 @@ impl ProviderEndpoint {
             close: CloseEndpoint { store, signer },
             ready: Some(ready),
             observation: None,
+            accepting: true,
         })
     }
 
@@ -593,6 +595,7 @@ impl ProviderEndpoint {
             close,
             ready: None,
             observation: None,
+            accepting: true,
         }
     }
 
@@ -662,8 +665,12 @@ impl ProviderEndpoint {
     /// the deadlines still allow. A crash after the second commit and
     /// before the answer reaches the client leaves an accepted job, and
     /// the retry returns the retained signature.
-    pub async fn accept(&mut self, request: &AcceptWorkRequest) -> AcceptWorkResponse {
-        acceptance_response(self.decide(request).await)
+    pub async fn accept(
+        &mut self,
+        request: &AcceptWorkRequest,
+        execution: Option<AcceptExecution>,
+    ) -> AcceptWorkResponse {
+        acceptance_response(self.decide(request, execution).await)
     }
 
     fn authenticate_proposal(
@@ -729,11 +736,18 @@ impl ProviderEndpoint {
         Ok(None)
     }
 
-    async fn decide(&mut self, request: &AcceptWorkRequest) -> Result<(Digest, Sig), Refusal> {
+    async fn decide(
+        &mut self,
+        request: &AcceptWorkRequest,
+        execution: Option<AcceptExecution>,
+    ) -> Result<(Digest, Sig), Refusal> {
         let (authorization, client_signature, work_id) = self.authenticate_proposal(request)?;
         if let Some(retained) = self.prior_acceptance(&authorization, work_id)? {
             self.close.store.reconcile_content(false).await?;
             return Ok((work_id, retained));
+        }
+        if !self.accepting {
+            return Err(Refusal::new(WorkRefusal::NotReady, "provider is draining"));
         }
         let ready = self
             .admitting()
@@ -800,6 +814,17 @@ impl ProviderEndpoint {
         {
             return Err(content_refusal(hellas_store::content::Error::Missing));
         }
+        // Reserve the exact backend before either acceptance frame. The returned
+        // execution owner is transferred while this writer is still held.
+        let accepted = execution
+            .map(|prepare| {
+                prepare(
+                    &bundle,
+                    hellas_auth::PublicKey::Secp256k1(ready.channel().client_key().to_bytes()),
+                )
+            })
+            .transpose()
+            .map_err(|error| Refusal::new(WorkRefusal::Declined, error.to_string()))?;
         if authorization.retention == hellas_rpc::Retention::Retain {
             let facts =
                 crate::job::check_paid_input(ready.channel(), &authorization, policy, &bundle)?;
@@ -851,6 +876,9 @@ impl ProviderEndpoint {
                 .accept_work(&scope)
                 .await
                 .map_err(content_refusal)?;
+        }
+        if let Some(accepted) = accepted {
+            accepted(work_id);
         }
         Ok((work_id, signature))
     }
@@ -972,7 +1000,9 @@ impl ProviderEndpoint {
             facts.limits,
             facts.capacity_domain,
             self.close.store.invocation_content(work_id)?,
-            WorkAdmission::payment(),
+            WorkAdmission::payment(hellas_auth::PublicKey::Secp256k1(
+                ready.channel().client_key().to_bytes(),
+            )),
         )));
 
         self.close
@@ -1740,7 +1770,11 @@ impl From<AdmissionError> for BackendFault {
 
 /// One application-neutral invocation seam after funding and resource admission.
 pub trait WorkBackend: Sync {
-    fn try_admit(&self, domain: CapacityDomain) -> Result<WorkPermit, BackendFault>;
+    fn try_admit(
+        &self,
+        backend: &admission::BackendKey,
+        caller: hellas_auth::PublicKey,
+    ) -> Result<WorkPermit, BackendFault>;
     fn execute(
         &self,
         input: Admitted<PreparedInvocation>,
@@ -1904,6 +1938,16 @@ pub enum RunError {
     Store(#[from] WorkStoreError),
 }
 
+/// Reserve execution after input validation, then start it after durable acceptance.
+/// Both callbacks run under the same journal writer, owned by the acceptance task.
+pub type AcceptExecution = Box<
+    dyn FnOnce(
+            &PreparedInvocation,
+            hellas_auth::PublicKey,
+        ) -> Result<Box<dyn FnOnce(Digest) + Send>, BackendFault>
+        + Send,
+>;
+
 /// Runs one accepted job on a real backend, at most once, ever.
 ///
 /// The order, and the whole of why it is this order: the running marker
@@ -1934,6 +1978,7 @@ pub async fn run_accepted_work<B>(
     ready: &ReadyChannel,
     backend: &B,
     work_id: Digest,
+    permit: Option<WorkPermit>,
 ) -> Result<RunOutcome, RunError>
 where
     B: WorkBackend + Sync,
@@ -1946,6 +1991,19 @@ where
         RunAdmission::Ready { result, signature } => {
             return Ok(RunOutcome::Ready { result, signature });
         }
+    };
+    let input = if let Some(permit) = permit {
+        let domain = input.capacity_domain();
+        let (input, limits, content, _) = input.into_parts_and_admission();
+        Admitted::new(
+            input,
+            limits,
+            domain,
+            content,
+            WorkAdmission::reserved(permit),
+        )
+    } else {
+        input
     };
     let facts = ready
         .invocation_policy()
@@ -2420,6 +2478,13 @@ impl WorkService {
             .await
     }
 
+    /// Stop new acceptances while admitted execution and delivery retain their policy.
+    pub async fn quiesce(&self) -> Result<(), EndpointError> {
+        self.endpoint().await?.accepting = false;
+        self.changed.notify_waiters();
+        Ok(())
+    }
+
     /// Ends admission and delivery while retaining the journal and close duties.
     pub async fn stop(&self) -> Result<(), EndpointError> {
         let mut endpoint = self.endpoint().await?;
@@ -2437,7 +2502,7 @@ impl WorkService {
     /// Reads current local admission; no chain I/O is performed.
     pub async fn readiness(&self) -> Result<ReadyChannel, EndpointError> {
         let endpoint = self.endpoint().await?;
-        if endpoint.state().is_closing() {
+        if !endpoint.accepting || endpoint.state().is_closing() {
             return Err(EndpointError::NotAdmitting);
         }
         endpoint.admitting().cloned()
@@ -2624,14 +2689,18 @@ impl WorkService {
     }
 
     /// Answers one proposal, or says the endpoint is unreachable.
-    pub async fn accept(&self, request: &AcceptWorkRequest) -> AcceptWorkResponse {
+    pub async fn accept(
+        &self,
+        request: &AcceptWorkRequest,
+        execution: Option<AcceptExecution>,
+    ) -> AcceptWorkResponse {
         let result = match self.endpoint.lock_owned().await {
             Ok(mut endpoint) => {
                 let (request, changed) = (request.clone(), self.changed.clone());
                 // Acceptance, publication and RAM transfer retain the writer even
                 // when the RPC drops its response after a journal append started.
                 tokio::spawn(async move {
-                    let response = endpoint.accept(&request).await;
+                    let response = endpoint.accept(&request, execution).await;
                     changed.notify_waiters();
                     response
                 })
@@ -2849,7 +2918,7 @@ impl WorkHandler for WorkService {
         _context: TransportContext,
     ) -> Result<impl Into<hellas_rpc::call::WithTrailer<AcceptWorkResponse>> + Send, WireStatus>
     {
-        Ok(self.accept(&request).await)
+        Ok(self.accept(&request, None).await)
     }
 
     async fn stream_result(
@@ -3039,6 +3108,7 @@ impl ClientEndpoint {
             hellas_store::content::Scope,
         ),
         cancellation: &admission::Cancellation,
+        proposed: Option<&AtomicBool>,
     ) -> Result<AcceptWorkRequest, ProposeError> {
         self.store.check_authority()?;
         if let Some(observation) = &self.observation {
@@ -3071,6 +3141,9 @@ impl ClientEndpoint {
         }
 
         if let Some(id) = retry {
+            if let Some(proposed) = proposed {
+                proposed.store(true, Ordering::Release);
+            }
             return self.resume_proposal(id).await;
         }
 
@@ -3108,6 +3181,9 @@ impl ClientEndpoint {
             authorization.terminal_deadline,
             authorization.payment_deadline,
         )?;
+        self.state()
+            .check_capacity(authorization.price)
+            .map_err(WorkStoreError::from)?;
         let prepared_input = proposal
             .prepared_input
             .canonical_bytes()
@@ -3121,6 +3197,9 @@ impl ClientEndpoint {
                 .await?;
             if cancellation.is_cancelled() {
                 return Err(ProposeError::Content(hellas_store::content::Error::Denied));
+            }
+            if let Some(proposed) = proposed {
+                proposed.store(true, Ordering::Release);
             }
             let signature = self.signer.sign(signing_hash(work_id));
             self.store
@@ -3161,7 +3240,7 @@ impl ClientEndpoint {
             hellas_store::content::Scope,
         ),
     ) -> Result<AcceptWorkRequest, ProposeError> {
-        self.propose_owned(proposal, content, &admission::Cancellation::new())
+        self.propose_owned(proposal, content, &admission::Cancellation::new(), None)
             .await
     }
 
@@ -3710,13 +3789,14 @@ pub async fn propose_work<T>(
         hellas_store::content::LocalStore,
         hellas_store::content::Scope,
     ),
+    proposed: Option<Arc<AtomicBool>>,
 ) -> Result<Digest, ProposeError>
 where
     T: StreamTransport + Clone + Send + Sync,
     T::Error: std::error::Error + Send + Sync + 'static,
     T::Stream: 'static,
 {
-    let request = endpoint.propose(proposal, content).await?;
+    let request = endpoint.propose(proposal, content, proposed).await?;
     content::transfer_proposal(transport, endpoint, request, content).await
 }
 

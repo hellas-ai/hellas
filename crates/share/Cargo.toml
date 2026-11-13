@@ -17,16 +17,17 @@ hellas-providers.workspace = true
 hellas-rpc = { workspace = true, features = ["fetch", "work"] }
 hellas-sdk.workspace = true
 hellas-store.workspace = true
-thiserror.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
 futures.workspace = true
 hellas-attestation.workspace = true
 hellas-authority = { workspace = true, features = ["test-support"] }
+hellas-chain = { workspace = true, features = ["chain-dir"] }
 hellas-channel = { workspace = true, features = ["test-support"] }
 hellas-kernel.workspace = true
 hellas-providers = { workspace = true, features = ["test-support"] }
+hellas-sdk = { workspace = true, features = ["integration-tests"] }
 iroh.workspace = true
 rcgen = "0.14"
 reqwest = { workspace = true, features = ["json"] }

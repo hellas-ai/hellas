@@ -146,22 +146,6 @@ pub mod services {
     include!(concat!(env!("OUT_DIR"), "/hellas_rpc_services.rs"));
 }
 
-#[cfg(feature = "host-control")]
-impl core::fmt::Debug for host::UpstreamKey {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("UpstreamKey")
-            .field("service", &self.service)
-            .field("method", &self.method)
-            .field("key", &self.key)
-            .finish_non_exhaustive()
-    }
-}
-
-/// Pinned wire IDs, end-to-end: proto file → descriptor walk → canonical
-/// schema encoding → truncated Xet hash. If one of these assertions fails,
-/// either the canonical encoding or the proto definition changed — both
-/// rotate the ID, and deployed nodes will refuse this build's calls on
-/// the affected methods. Update a pin only as a deliberate protocol break.
 #[cfg(test)]
 mod id_pins {
     #[allow(unused_imports)]
@@ -205,15 +189,10 @@ mod id_pins {
     #[test]
     fn host_control_ids_are_stable() {
         use super::services::host_control::{
-            BindProvider, ConfigureProvider, GetGatewayAccess, GrantControl, HostControl,
-            IssueCredential, RevokeCredential, SetGatewayState, SetProviderState, WorkControl,
+            BindProvider, GrantControl, HostControl, IssueCredential, RevokeCredential, WorkControl,
         };
-        // Machine capacity left the service: the node's configuration owns it.
-        assert_eq!(<HostControl as ServiceMarker>::SERVICE_ID, 0xd18c_677a);
-        assert_eq!(<ConfigureProvider as MethodMarker>::METHOD_ID, 0x689e_9aaa);
-        assert_eq!(<SetProviderState as MethodMarker>::METHOD_ID, 0xd9b2_bce2);
-        assert_eq!(<SetGatewayState as MethodMarker>::METHOD_ID, 0x6c32_7cb7);
-        assert_eq!(<GetGatewayAccess as MethodMarker>::METHOD_ID, 0xce7f_5d32);
+        // Configure, Watch and CancelJob replace the service-specific host controls.
+        assert_eq!(<HostControl as ServiceMarker>::SERVICE_ID, 0xc822b1df);
         assert_eq!(<GrantControl as MethodMarker>::METHOD_ID, 0xc0e0_b21c);
         assert_eq!(<WorkControl as MethodMarker>::METHOD_ID, 0x995d_0334);
         assert_eq!(<IssueCredential as MethodMarker>::METHOD_ID, 0xf445_91c2);

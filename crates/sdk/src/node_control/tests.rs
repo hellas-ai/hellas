@@ -2,8 +2,7 @@ use super::*;
 mod admission;
 mod authentication;
 mod authenticator;
-#[cfg(unix)]
-mod lifecycle;
+mod daemon;
 mod local;
 mod remote;
 mod sessions;
@@ -35,15 +34,7 @@ fn scope(actor: Actor) -> GrantSpec {
         &[
             (HOST_STATUS, host_resource(authority)),
             (
-                hellas_authority::node::HOST_PROVIDER_CONFIGURE,
-                host_resource(authority),
-            ),
-            (
-                hellas_authority::node::HOST_GATEWAY_CONFIGURE,
-                host_resource(authority),
-            ),
-            (
-                hellas_authority::node::HOST_GATEWAY_ACCESS,
+                hellas_authority::node::HOST_CONFIGURE,
                 host_resource(authority),
             ),
             (

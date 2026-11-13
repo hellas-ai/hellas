@@ -247,10 +247,10 @@ async fn accepted_policy_history_survives_current_policy_changes() {
         .configure_resource(changed, node.clock.now())
         .await
         .unwrap();
-    assert_err!(
-        node.store.state().check_resource(&request.authorization),
-        NodeStoreError::Grant(GrantError::OutOfScope)
-    );
+    node.store
+        .state()
+        .check_resource(&request.authorization)
+        .unwrap();
     assert_eq!(
         node.store
             .state()

@@ -33,9 +33,11 @@ async fn fetch_streams_before_terminal_then_pays_once_with_metadata_only_journal
     impl WorkBackend for PausedFetch {
         fn try_admit(
             &self,
-            domain: hellas_channel::work::admission::CapacityDomain,
+            backend: &hellas_channel::work::admission::BackendKey,
+            _caller: hellas_auth::PublicKey,
         ) -> Result<hellas_channel::work::admission::WorkPermit, hellas_channel::work::BackendFault>
         {
+            let domain = backend.domain();
             Err(hellas_channel::work::admission::AdmissionError::Unsupported(domain).into())
         }
 
@@ -64,6 +66,7 @@ async fn fetch_streams_before_terminal_then_pays_once_with_metadata_only_journal
             .propose(
                 &proposal,
                 &hellas_channel::test_support::channel::program_content().await,
+                None,
             )
             .await
             .unwrap();
@@ -76,9 +79,9 @@ async fn fetch_streams_before_terminal_then_pays_once_with_metadata_only_journal
         let worker = {
             let service = service.clone();
             let backend = PausedFetch(release.clone());
-            tokio::spawn(
-                async move { run_accepted_work(&service, &fetch_ready(), &backend, id).await },
-            )
+            tokio::spawn(async move {
+                run_accepted_work(&service, &fetch_ready(), &backend, id, None).await
+            })
         };
         let (transport, server) = transport::transport_pair();
         let serving = {
@@ -182,6 +185,7 @@ async fn invalid_paid_authorizations_never_invoke_fetch() {
             .propose(
                 &proposal(),
                 &hellas_channel::test_support::channel::program_content().await,
+                None,
             )
             .await
             .unwrap();
@@ -205,7 +209,7 @@ async fn invalid_paid_authorizations_never_invoke_fetch() {
         ));
         let backend = FetchBackend::default();
         assert!(matches!(
-            run_accepted_work(&service, &fetch_ready(), &backend, id).await,
+            run_accepted_work(&service, &fetch_ready(), &backend, id, None).await,
             Err(RunError::NoSuchJob)
         ));
         assert_eq!(backend.0.load(Ordering::SeqCst), 0);
@@ -376,9 +380,11 @@ async fn paid_fetch_larger_than_a_wire_frame_streams_and_pays_without_disk_paylo
     impl WorkBackend for LargeFetch {
         fn try_admit(
             &self,
-            domain: hellas_channel::work::admission::CapacityDomain,
+            backend: &hellas_channel::work::admission::BackendKey,
+            _caller: hellas_auth::PublicKey,
         ) -> Result<hellas_channel::work::admission::WorkPermit, hellas_channel::work::BackendFault>
         {
+            let domain = backend.domain();
             Err(hellas_channel::work::admission::AdmissionError::Unsupported(domain).into())
         }
 
@@ -438,6 +444,7 @@ async fn paid_fetch_larger_than_a_wire_frame_streams_and_pays_without_disk_paylo
                 deadlines: deadlines(),
             },
             &hellas_channel::test_support::channel::program_content().await,
+            None,
         )
         .await
         .unwrap();
@@ -446,7 +453,7 @@ async fn paid_fetch_larger_than_a_wire_frame_streams_and_pays_without_disk_paylo
         client.client().await.unwrap().accepted(&response).await
     }
     .unwrap();
-    run_accepted_work(&service, &ready, &LargeFetch, id)
+    run_accepted_work(&service, &ready, &LargeFetch, id, None)
         .await
         .unwrap();
     let (transport, server) = transport::transport_pair();
@@ -514,6 +521,7 @@ async fn streamed_fetch_cannot_pay_without_a_complete_authenticated_terminal() {
             .propose(
                 &proposal,
                 &hellas_channel::test_support::channel::program_content().await,
+                None,
             )
             .await
             .unwrap();
@@ -522,7 +530,7 @@ async fn streamed_fetch_cannot_pay_without_a_complete_authenticated_terminal() {
             client.client().await.unwrap().accepted(&response).await
         }
         .unwrap();
-        run_accepted_work(&service, &fetch_ready(), &FetchBackend::default(), id)
+        run_accepted_work(&service, &fetch_ready(), &FetchBackend::default(), id, None)
             .await
             .unwrap();
         let exporter = [0x5e; 32];
@@ -647,9 +655,11 @@ struct FetchBackend(AtomicUsize);
 impl WorkBackend for FetchBackend {
     fn try_admit(
         &self,
-        domain: hellas_channel::work::admission::CapacityDomain,
+        backend: &hellas_channel::work::admission::BackendKey,
+        _caller: hellas_auth::PublicKey,
     ) -> Result<hellas_channel::work::admission::WorkPermit, hellas_channel::work::BackendFault>
     {
+        let domain = backend.domain();
         Err(hellas_channel::work::admission::AdmissionError::Unsupported(domain).into())
     }
 
@@ -703,6 +713,7 @@ async fn fetch_is_run_delivered_and_paid_without_provider_disk_bodies() {
         .propose(
             &proposal,
             &hellas_channel::test_support::channel::program_content().await,
+            None,
         )
         .await
         .unwrap();
@@ -713,7 +724,7 @@ async fn fetch_is_run_delivered_and_paid_without_provider_disk_bodies() {
     .unwrap();
     assert_no_bodies(provider_dir.path());
     assert!(matches!(
-        run_accepted_work(&service, &fetch_ready(), &backend, id)
+        run_accepted_work(&service, &fetch_ready(), &backend, id, None)
             .await
             .unwrap(),
         RunOutcome::Completed { .. }
@@ -818,6 +829,7 @@ async fn restarting_an_accepted_fetch_never_reinvokes_from_a_missing_payload() {
         .propose(
             &proposal(),
             &hellas_channel::test_support::channel::program_content().await,
+            None,
         )
         .await
         .unwrap();
@@ -830,7 +842,7 @@ async fn restarting_an_accepted_fetch_never_reinvokes_from_a_missing_payload() {
     drop(service_before);
     let backend = FetchBackend::default();
     let recovered = service(provider_dir.path()).await;
-    let outcome = run_accepted_work(&recovered, &fetch_ready(), &backend, id)
+    let outcome = run_accepted_work(&recovered, &fetch_ready(), &backend, id, None)
         .await
         .unwrap();
     assert_eq!(outcome, RunOutcome::Indeterminate);
@@ -851,7 +863,8 @@ async fn fetch_refuses_payload_journals_and_retention_requests() {
         client
             .propose(
                 &retained,
-                &hellas_channel::test_support::channel::program_content().await
+                &hellas_channel::test_support::channel::program_content().await,
+                None
             )
             .await
             .is_err()
@@ -880,7 +893,7 @@ async fn fetch_refuses_payload_journals_and_retention_requests() {
     };
     let service = service(provider_dir.path()).await;
     assert!(matches!(
-        service.accept(&request).await.outcome,
+        service.accept(&request, None).await.outcome,
         Some(hellas_rpc::pb::work::accept_work_response::Outcome::Refused(_))
     ));
     assert_no_bodies(provider_dir.path());
@@ -910,6 +923,7 @@ async fn fetch_output_limits_include_terminal_and_bad_results_are_never_payable(
         .propose(
             &proposal(),
             &hellas_channel::test_support::channel::program_content().await,
+            None,
         )
         .await
         .unwrap();
@@ -988,6 +1002,7 @@ async fn app_attest_paid_fetch_uses_the_signed_scheme_without_disk_payloads() {
         .propose(
             &proposal,
             &hellas_channel::test_support::channel::program_content().await,
+            None,
         )
         .await
         .unwrap();
@@ -998,7 +1013,7 @@ async fn app_attest_paid_fetch_uses_the_signed_scheme_without_disk_payloads() {
     .unwrap();
     let backend = FetchBackend::default();
     assert!(matches!(
-        run_accepted_work(&service, &fetch_ready(), &backend, id)
+        run_accepted_work(&service, &fetch_ready(), &backend, id, None)
             .await
             .unwrap(),
         RunOutcome::Completed { .. }
@@ -1052,7 +1067,7 @@ async fn the_generic_proposal_helper_ignores_unneeded_cached_root_openings_for_f
         let content = (LocalStore::Memory(memory), Scope::Owner);
         let (transport, server) = transport::transport_pair();
         let serving = hellas_channel::test_support::channel::serve_work(server, service.clone());
-        let id = propose_work(transport, &mut client, &proposal(), &content)
+        let id = propose_work(transport, &mut client, &proposal(), &content, None)
             .await
             .unwrap();
         assert_eq!(

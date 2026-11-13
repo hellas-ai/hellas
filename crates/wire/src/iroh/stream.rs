@@ -239,6 +239,12 @@ impl crate::transport::SendHalf for IrohSendHalf {
         self.write_framed(Frame::Body(payload)).await
     }
 
+    async fn refuse(&mut self, payload: Bytes) -> std::io::Result<()> {
+        self.authority = None;
+        self.send_body(payload).await?;
+        self.close_send(None).await
+    }
+
     async fn close_send(&mut self, trailer: Option<Trailer>) -> Result<(), Self::Error> {
         let trailer = trailer.unwrap_or_default();
         self.write_framed(Frame::End(EndFrame {

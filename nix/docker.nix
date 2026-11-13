@@ -26,10 +26,6 @@ let
     "serve"
     "--port"
     "31145"
-  ]
-  ++ pkgs.lib.optionals gpu [
-    "--gpu-backend"
-    backend
   ];
 
   gpu = backend != "network";

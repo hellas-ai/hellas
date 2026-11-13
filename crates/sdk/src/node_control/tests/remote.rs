@@ -73,7 +73,7 @@ async fn remote_status_matches_the_native_writer() {
     assert_eq!(status.authority, native.authority.0.as_bytes());
     assert_eq!(status.generation, native.generation);
     assert_eq!(status.authority_revision, native.authority_revision.0);
-    assert!(status.provider_configured);
+    assert!(status.identity.is_some());
     assert_eq!(
         status.machine.unwrap().max_in_flight,
         u32::from(native.machine.unwrap().max_in_flight.get())

@@ -554,6 +554,39 @@ mod tests {
         )
         .await
         .unwrap();
+        let refusal = service
+            .accept(
+                &wire,
+                Some(Box::new(|_, _| {
+                    Err(admission::AdmissionError::Capacity.into())
+                })),
+            )
+            .await;
+        assert!(matches!(
+            refusal.outcome,
+            Some(hellas_rpc::pb::work::accept_work_response::Outcome::Refused(_))
+        ));
+        assert!(
+            service
+                .with_state(|state| state.jobs().next().is_none())
+                .await
+                .unwrap()
+        );
+        let capacity = Arc::new(tokio::sync::Semaphore::new(1));
+        let reserved = capacity.clone();
+        let (started, executed) = tokio::sync::oneshot::channel();
+        let execution: super::AcceptExecution = Box::new(move |input, caller| {
+            assert_eq!(
+                caller,
+                hellas_auth::PublicKey::Secp256k1(fixture::client().party_key().to_bytes())
+            );
+            let key = admission::BackendKey::of(input)?;
+            let permit =
+                admission::WorkPermit::new(key.domain(), reserved.try_acquire_owned().unwrap());
+            Ok(Box::new(move |work| {
+                started.send((work, permit)).unwrap();
+            }))
+        });
         let (entered, release) = service
             .endpoint()
             .await
@@ -563,11 +596,17 @@ mod tests {
             .pause_next_statement_for_test()
             .await;
         let (accepting, proposal) = (service.clone(), wire.clone());
-        let caller = tokio::spawn(async move { accepting.accept(&proposal).await });
+        let caller =
+            tokio::spawn(async move { accepting.accept(&proposal, Some(execution)).await });
         tokio::time::timeout(crate::test_support::HANG_GUARD, entered)
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(
+            capacity.available_permits(),
+            0,
+            "reserved before the first journal frame"
+        );
         caller.abort();
         let _ = caller.await;
         connection.cancel();
@@ -576,10 +615,19 @@ mod tests {
             "the owned transition retains staged bytes while the real SQLite worker waits"
         );
         release.send(()).unwrap();
-        let response = tokio::time::timeout(crate::test_support::HANG_GUARD, service.accept(&wire))
-            .await
-            .unwrap();
+        let response =
+            tokio::time::timeout(crate::test_support::HANG_GUARD, service.accept(&wire, None))
+                .await
+                .unwrap();
         let work = client.accepted(&response).await.unwrap();
+        let (executed, permit) = executed.await.unwrap();
+        assert_eq!(
+            executed, work,
+            "the accepted owner survives the dropped RPC"
+        );
+        drop(permit);
+        assert_eq!(capacity.available_permits(), 1);
+
         assert_eq!(
             node.ram_pool().held(),
             0,
@@ -699,7 +747,7 @@ mod tests {
             input.canonical_bytes().unwrap().into(),
         )
         .await;
-        let reply = provider.accept(&request).await;
+        let reply = provider.accept(&request, None).await;
         let work = client.accepted(&reply).await.unwrap();
         provider.begin_run(work, &ready).await.unwrap();
         let transcript = output::InvocationOutput {
@@ -848,7 +896,7 @@ mod tests {
                 input.canonical_bytes().unwrap().into(),
             )
             .await;
-            let reply = provider.accept(&proposal).await;
+            let reply = provider.accept(&proposal, None).await;
             ids.push(client.accepted(&reply).await.unwrap());
         }
         provider.begin_run(ids[0], &ready).await.unwrap();
@@ -1267,6 +1315,7 @@ mod tests {
                     deadlines: fixture::deadlines(),
                 },
                 &fixture::program_content().await,
+                None,
             )
             .await
             .unwrap();

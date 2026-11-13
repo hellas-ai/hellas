@@ -96,6 +96,15 @@ pub fn verify_provider(provider: &ProviderEnrollmentBundle) -> Result<(), GrantE
     .map_err(|_| GrantError::Signature)
 }
 
+/// Whether a resource revision preserves work already admitted under its old terms.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigChange {
+    #[default]
+    Keep,
+    Release,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GrantPolicy {
@@ -103,6 +112,8 @@ pub struct GrantPolicy {
     pub account: hellas_auth::authority::ResourceId,
     pub revision: Revision,
     pub name: String,
+    #[serde(default)]
+    pub config_change: ConfigChange,
     #[serde(with = "policy_bytes")]
     pub invocation_policy: InvocationPolicy,
     pub https: Option<super::resource::HttpsResource>,
@@ -110,6 +121,22 @@ pub struct GrantPolicy {
     pub pricing: super::pricing::Pricing,
 }
 impl GrantPolicy {
+    pub(crate) fn changed(&self, previous: Option<&Self>) -> Result<Option<Self>, GrantError> {
+        let mut next = self.clone();
+        if let Some(old) = previous {
+            next.revision = old.revision;
+            next.pricing.revision = old.pricing.revision;
+            if next.pricing != old.pricing {
+                next.pricing.revision = old.pricing.revision.next().ok_or(GrantError::Limits)?;
+            }
+            if next == *old {
+                return Ok(None);
+            }
+            next.revision = old.revision.next().ok_or(GrantError::Limits)?;
+        }
+        Ok(Some(next))
+    }
+
     pub fn validate(&self) -> Result<(), GrantError> {
         if self.revision.0 == 0 || self.name.is_empty() || self.name.len() > 64 {
             return Err(GrantError::Malformed);

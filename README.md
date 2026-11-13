@@ -27,127 +27,108 @@ curl -fLo qwen3.gguf https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/5096
 curl -fLo speech.wav https://raw.githubusercontent.com/ggml-org/whisper.cpp/b0a11594aec50892a02cd8d129eee2dfe93a8bb8/samples/jfk.wav
 ```
 
-## 1. Try it: no GPU, no account
+## 1. Start an HTTP endpoint
 
-Get devnet coins, then pay the public devnet provider to transcribe the
-recording. `DEVNET_PROVIDER` is that provider's address. It runs only the
-programs it was configured with, and it quotes its price before you sign
-anything. `--pay 20` is the most you accept per job. Your client renders the
-program for the provider's GPU before it asks for a quote: `--backend` names
-that renderer, the evaluator id the provider's GPU runtime registers (here an
-AMD GPU's):
+On a GPU machine, one command serves both packages. Qwen uses GGUF; Whisper
+and Flux use the directories produced by their converters. Hellas detects the
+kind and prints each model, API path and backend at startup.
 
 ```sh
-hellas faucet
-hellas transcribe --model whisper-tiny --audio speech.wav --pay 20 --provider "$DEVNET_PROVIDER" \
-  --backend hellas/catena-dfad87438018-hip
+hellas gateway --model ./qwen3.gguf --model ./whisper-tiny --wrap claude
 ```
 
-It prints the transcript, "And so my fellow Americans, ask not what your
-country can do for you…". Your first command creates your identity under
-`~/.hellas`. Your first paid job opens a payment channel, and later jobs reuse
-it.
+`--wrap` gives the child its OpenAI and Anthropic URLs and a private bearer,
+then drains the gateway when the child exits. Without `--wrap`, the gateway
+runs in the foreground and prints its URL and bearer to the terminal. For
+headless use, `--bearer-file PATH` writes the bearer atomically with mode 0600;
+without a wrapper, file or terminal, startup fails. Routing configuration is
+not saved, and each start creates a new bearer.
 
-## 2. Share your GPU with a friend
-
-On your GPU machine, start a node that serves the converted weights and admits
-the two programs that read them. `hellas program` prints a program's ID for a
-renderer:
+An upstream works without a GPU. The key file is read at startup:
 
 ```sh
-docker run -d --name hellas --network host --device /dev/kfd --device /dev/dri \
-  -v hellas:/var/lib/hellas -v "$PWD:/models:ro" ghcr.io/hellas-ai/hellas:hip \
-  --content /models/whisper-tiny --program "$(hellas program --backend hellas/catena-dfad87438018-hip whisper-tiny)" \
-  --content /models/qwen3.gguf --program "$(hellas program --backend hellas/catena-dfad87438018-hip qwen3.gguf)"
-docker logs hellas
+hellas gateway \
+  --upstream openrouter=https://openrouter.ai/api,key-file="$HOME/or.key" \
+  --model gpt-5@openrouter --wrap claude
 ```
 
-A new node has no owner yet. It prints one `hellas-invite:` line and waits.
-Claim it with that line. NVIDIA hosts use the `:cuda` image with
-`--device nvidia.com/gpu=all` and the `hellas/catena-dfad87438018-cuda` renderer
-instead.
+Repeat `--model NAME@a --model NAME@b` to specify failover order. Several
+models and backends can serve requests concurrently. A request can change
+backends only before a proposal; an accepted job is never replayed on another
+backend. See the [HTTP gateway guide](docs/http-gateway.md).
+
+## 2. Share your GPU
+
+Start the persistent daemon on the GPU machine:
 
 ```sh
-hellas pair hellas-invite:…
+hellas serve
 ```
 
-Your friend prints their contact and sends it to you:
+A new node prints one `hellas-invite:` line and waits for its owner. In another
+shell on that machine, claim it and add the packages already stored there:
 
 ```sh
-hellas contact
+hellas pair hellas-invite:… --name mine
+hellas route add "$PWD/whisper-tiny"
+hellas route add "$PWD/qwen3.gguf"
+hellas routes
 ```
 
-Give that contact ten requests for a day, and send them `friend.access`:
+Each edit is one atomic configuration change. The daemon restores the saved
+configuration after restart. It publishes bounded resources for the packages;
+sharing uses the existing authority and allowance commands.
+
+Your friend runs `hellas contact` and sends you their contact. Give that
+contact ten requests for a day and send them the resulting access bundle:
 
 ```sh
 hellas share --to hellas-contact:… --limit requests:total:10 --expires 1d --out friend.access
 ```
 
-Your friend runs jobs on your GPU with it, rendered for your GPU's runtime:
+Your friend imports it under a contact name and renders requests from their
+own copy of the same package:
+
+```sh
+hellas pair friend.access --name alice
+hellas gateway --model ./qwen3.gguf@alice --wrap claude
+```
+
+Each native job runs in its own process group. This contains crashes and
+execution timeouts; it is not a security sandbox. Programs can access the
+provider user's files and devices. Only grant execution to people whose
+programs you trust. See [node administration](docs/admin.md).
+
+## 3. Run a single job
+
+The same packages work with the job commands. On your GPU:
+
+```sh
+hellas transcribe --model whisper-tiny --audio speech.wav --local
+```
+
+Or use a friend's access bundle and their GPU evaluator:
 
 ```sh
 hellas transcribe --model whisper-tiny --audio speech.wav --access friend.access \
   --backend hellas/catena-dfad87438018-hip
 ```
 
-The node runs one job at a time and refuses programs it was not configured
-with, including programs rendered for a GPU runtime it does not run. Each job runs in its own process group, which contains crashes and
-timeouts. This is not a sandbox: a program can reach whatever the node's user
-can reach, and nothing meters GPU memory. Compiling a new program has no time
-limit; a node's first job of each program pays for it. A grant or paid-terms
-configuration can admit any program instead. That hands anyone who can submit
-jobs roughly root on your machine, so `serve` refuses it unless you also pass
-`--knowingly-unsafe`.
-
-## 3. Run it yourself
-
-The GPU image runs the same job on your own GPU, with no network:
+A paid job uses devnet coins and checks the quoted price before signing:
 
 ```sh
-docker run --rm --device /dev/kfd --device /dev/dri -v "$PWD:/work" -w /work \
-  --entrypoint hellas ghcr.io/hellas-ai/hellas:hip \
-  transcribe --model whisper-tiny --audio speech.wav --local
+hellas faucet
+hellas transcribe --model whisper-tiny --audio speech.wav --pay 20 \
+  --provider "$DEVNET_PROVIDER" --backend hellas/catena-dfad87438018-hip
 ```
 
-`--local` exists only in GPU builds; it renders for this machine's GPU runtime,
-so it takes no `--backend`. `hellas text --model qwen3.gguf --prompt …` and
-`hellas run` take the same `--pay`, `--access`, `--backend` and `--local`. See
-[jobs](docs/jobs.md).
-
-## 4. An OpenAI-compatible endpoint
-
-`hellas gateway` serves OpenAI and Anthropic routes on localhost. It renders
-every request into a job and runs it the way you choose, here on your
-friend's GPU:
-
-```sh
-hellas gateway --model qwen3.gguf --access friend.access --backend hellas/catena-dfad87438018-hip &
-curl -s localhost:8080/v1/chat/completions -H "authorization: Bearer $(cat ~/.hellas/gateway/bearer)" \
-  -H 'content-type: application/json' -d '{"model":"qwen3","messages":[{"role":"user","content":"Hi"}]}'
-```
-
-The gateway keeps its own bearer in `~/.hellas/gateway/bearer`, so a web page
-you visit cannot spend your access. `--pay MAX --provider ID` and `--local`
-work here too; models render for `--backend`, or locally for this machine. See the [HTTP gateway guide](docs/http-gateway.md).
-
-## 5. Drive a coding agent
-
-A home runs one gateway at a time, so stop the one from the previous section
-first (Ctrl-C). `--wrap` starts the agent with its OpenAI and Anthropic base URLs
-and token pointed at the gateway, and stops the gateway when the agent exits:
-
-```sh
-hellas gateway --model qwen3.gguf --access friend.access --backend hellas/catena-dfad87438018-hip --wrap claude
-```
+`--local` is available in GPU builds. NVIDIA providers use the CUDA evaluator.
+See [jobs](docs/jobs.md) for text, image, Fetch and prepared-program commands.
 
 ## More
 
-- [Jobs](docs/jobs.md): job folders, `run`, `transact`, signed HTTPS Fetch and
-  what each application proves.
-- [Node administration](docs/admin.md): sharing, renewal, revocation and the
-  owner's authority.
-- [Selling on the devnet](docs/paid-gateway.md): paid terms, stake and
-  channels.
+- [HTTP gateway](docs/http-gateway.md): models, upstreams, sessions and cancellation.
+- [Node administration](docs/admin.md): sharing, renewal, revocation and authority.
+- [Selling on the devnet](docs/paid-gateway.md): paid terms, stake and channels.
 - [Chain](docs/chain.md): querying the devnet and running validators.
-- [Nix, Docker and NixOS](docs/nix.md): builds, the module, images, metrics
-  and development checks.
+- [Nix, Docker and NixOS](docs/nix.md): builds, modules, images and development checks.

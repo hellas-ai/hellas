@@ -7,12 +7,12 @@ use tracing::info;
 #[derive(Default)]
 pub struct MetricsBundle {
     pub registry: prometheus::Registry,
-    iroh: Option<tokio::sync::watch::Receiver<Option<iroh::Endpoint>>>,
+    core: std::sync::Weak<hellas_sdk::daemon::Core>,
 }
 
 impl MetricsBundle {
-    pub fn with_iroh(mut self, iroh: tokio::sync::watch::Receiver<Option<iroh::Endpoint>>) -> Self {
-        self.iroh = Some(iroh);
+    pub fn with_core(mut self, core: &Arc<hellas_sdk::daemon::Core>) -> Self {
+        self.core = Arc::downgrade(core);
         self
     }
 }
@@ -65,11 +65,11 @@ fn encode_metrics(bundle: &MetricsBundle) -> anyhow::Result<String> {
 }
 
 fn append_iroh_metrics(buf: &mut String, bundle: &MetricsBundle) -> std::fmt::Result {
-    let Some(iroh) = bundle.iroh.as_ref() else {
+    let Some(core) = bundle.core.upgrade() else {
         return Ok(());
     };
     let mut registry = iroh_metrics::Registry::default();
-    if let Some(endpoint) = iroh.borrow().as_ref() {
+    for endpoint in core.transport_endpoints() {
         registry.register_all_prefixed(endpoint.metrics());
     }
     let mut encoded = String::new();

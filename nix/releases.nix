@@ -97,7 +97,6 @@ let
         };
       vms = lib.optionals x86 [
         "basic"
-        "discovery-monitor"
         "provider-content-eval"
       ];
     };

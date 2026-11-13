@@ -14,7 +14,7 @@ use hellas_auth::authority::UnixMillis;
 use hellas_auth::{Digest, ProducerSigningKey, PublicKey, Signature};
 use hellas_channel::job::WorkContext;
 use hellas_channel::model::work::{PrivateRecord, bound_result_digest, encode_transcript};
-use hellas_channel::work::admission::{CapacityDomain, WorkAdmission, WorkPermit};
+use hellas_channel::work::admission::{WorkAdmission, WorkPermit};
 use hellas_channel::work::{BackendFault, PaidProgress, PaidResultStream, WorkBackend};
 use hellas_rpc::OutputEventEnvelope;
 use hellas_rpc::pb::work::Refusable;
@@ -60,7 +60,9 @@ fn transcript_ram(events: &[OutputEventEnvelope]) -> usize {
         bytes.saturating_add(event_ram(event))
     })
 }
-type Admit = dyn Fn(CapacityDomain) -> Result<WorkPermit, BackendFault> + Send + Sync;
+type Admit = dyn Fn(&hellas_channel::work::admission::BackendKey, PublicKey) -> Result<WorkPermit, BackendFault>
+    + Send
+    + Sync;
 type Run = dyn Fn(
         PreparedInvocation,
         GrantPolicy,
@@ -309,7 +311,7 @@ impl GrantService {
                 tasks: BTreeMap::new(),
             })),
             signer,
-            admit: Arc::new(move |domain| capacity.try_admit(domain)),
+            admit: Arc::new(move |backend, caller| capacity.try_admit(backend, caller)),
             run,
             draining: Arc::new(tokio::sync::Mutex::new(())),
             addresses: Arc::new(addresses),
@@ -570,8 +572,12 @@ impl GrantService {
                     }
                 }
                 let domain = facts.capacity_domain;
-                let permit =
-                    (self.admit)(domain).map_err(|_| refused(GrantRefusalCode::QueueCapacity))?;
+                let permit = (self.admit)(
+                    &hellas_channel::work::admission::BackendKey::of(&input)
+                        .map_err(|_| refused(GrantRefusalCode::Malformed))?,
+                    PublicKey::Secp256k1(client.signer().to_bytes()),
+                )
+                .map_err(|_| refused(GrantRefusalCode::QueueCapacity))?;
                 if permit.domain() != domain {
                     return Err(refused(GrantRefusalCode::QueueCapacity));
                 }
@@ -1093,47 +1099,19 @@ impl GrantService {
             }
         }
     }
-    /// Cancel queued grants, then keep execution owners alive until physical
-    /// completion. No endpoint or journal is dropped ahead of these duties.
+    /// Stop admission and finish accepted work before releasing its journal.
     pub async fn drain(&self) -> Result<(), NodeStoreError> {
         let _draining = self.draining.lock().await;
         {
+            // Wait for an acceptance already holding the writer before closing admission.
             let store = self.node.store.lock().await;
-            let accepted = {
-                let mut held = self.lock_for_shutdown();
-                held.reap();
-                if matches!(held.status, ServiceStatus::Serving) {
-                    held.status = ServiceStatus::Draining;
-                    held.contents.clear();
-                }
-                match &store {
-                    Ok(store) if held.status.check().is_ok() => held
-                        .live
-                        .iter()
-                        .filter_map(|(id, live)| {
-                            store
-                                .state()
-                                .channel(live.authorization.channel_id)?
-                                .job_book()
-                                .job_by_id(*id)
-                                .filter(|job| job.phase() == JobPhase::Accepted)
-                                .map(|_| (live.authorization.channel_id, *id))
-                        })
-                        .collect::<Vec<_>>(),
-                    Err(_) => {
-                        held.fail(NodeStoreError::WriterPoisoned);
-                        Vec::new()
-                    }
-                    _ => Vec::new(),
-                }
-            };
-            if let Ok(mut store) = store {
-                for (channel, id) in accepted {
-                    if let Err(error) = store.release(channel, id, (self.node.clock)()).await {
-                        self.lock_for_shutdown().fail(error);
-                        break;
-                    }
-                }
+            let mut held = self.lock_for_shutdown();
+            held.reap();
+            if store.is_err() {
+                held.fail(NodeStoreError::WriterPoisoned);
+            } else if matches!(held.status, ServiceStatus::Serving) {
+                held.status = ServiceStatus::Draining;
+                held.contents.clear();
             }
         }
         self.node.changed.notify_waiters();
@@ -1274,7 +1252,17 @@ impl hellas_rpc::services::work::WorkHandler for GrantWork {
         Ok(self
             .service
             .stream_binding(futures::future::ready(Ok(delivery.clone())))
-            .with_write_authority(self.service.delivery_authority(delivery)))
+            .with_write_authority(self.service.delivery_authority(delivery))
+            .with_refusal(|event| {
+                let Some(work_stream_event::Outcome::Refused(refusal)) = &event.outcome else {
+                    return false;
+                };
+                refusal
+                    .grant
+                    .as_ref()
+                    .and_then(|grant| GrantRefusalCode::try_from(grant.code).ok())
+                    .is_some_and(|code| *refusal == refused(code))
+            }))
     }
     async fn admit_certificate(
         &self,

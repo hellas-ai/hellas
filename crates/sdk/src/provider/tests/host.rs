@@ -19,6 +19,15 @@ pub(crate) fn provider_enrollment() -> hellas_rpc::ProviderEnrollmentBundle {
     )
 }
 
+fn transport_enrollment(key: &iroh::SecretKey) -> hellas_rpc::ProviderEnrollmentBundle {
+    work::enrollment(
+        &PROVIDER.node_key(),
+        &PROVIDER.node_key(),
+        *key.public().as_bytes(),
+        [5; 32],
+    )
+}
+
 pub(crate) use work::backend::Backend as FakeProvider;
 const GATEWAY_ACCESS: GrantId = GrantId([104; 16]);
 
@@ -26,19 +35,23 @@ pub(crate) struct HostBuilder {
     allowance: Allowance,
     capacity: Capacity,
     backend: FakeProvider,
+    transport_key: iroh::SecretKey,
 }
 pub(crate) struct Host {
     pub root: tempfile::TempDir,
     pub world: TestService,
+    pub content: hellas_store::content::DiskStore,
     pub backend: FakeProvider,
     pub application: Arc<ClientProfile>,
     pub allowance: GrantDef,
+    transport_key: iroh::SecretKey,
 }
 impl Host {
     pub fn builder() -> HostBuilder {
         HostBuilder {
             allowance: Allowance::responses(ids::ALLOWANCE, FRIEND),
             capacity: Capacity::new(4),
+            transport_key: iroh::SecretKey::from_bytes(&[5; 32]),
             backend: FakeProvider {
                 signer: Arc::new(PROVIDER.node_key()),
                 finish: work::backend::Completion::Immediate,
@@ -46,8 +59,11 @@ impl Host {
             },
         }
     }
+    fn enrollment(&self) -> hellas_rpc::ProviderEnrollmentBundle {
+        transport_enrollment(&self.transport_key)
+    }
     pub fn options(&self, addresses: Vec<String>) -> GrantSessionOptions {
-        let provider = provider_enrollment();
+        let provider = self.enrollment();
         let signed = SignedOffer::sign(
             Offer {
                 network: network(),
@@ -112,56 +128,35 @@ impl Host {
             .await
             .unwrap()
     }
-    pub async fn responses_options(&self, addresses: Vec<String>) -> GrantGateway {
-        GrantGateway {
-            serve: crate::GatewayServeOptions {
-                server: hellas_gateway::ServerOptions {
-                    access: self.gateway_access().await,
-                    archive: hellas_gateway::ArchiveOptions {
-                        directory: self.root.path().join("archive"),
-                        zdr: true,
-                    },
-                    host: "127.0.0.1".into(),
-                    port: Some(0),
-                    allow_remote: false,
-                    wrap: None,
-                    wrap_args: vec![],
-                },
-                models: Vec::new(),
-                http: None,
-                responses_overrides: Default::default(),
-                responses_models: Vec::new(),
-            },
-            session: self.options(addresses),
-        }
-    }
     /// The real provider dispatch loop, with a deterministic backend and pinned proof.
     pub async fn remote(&self) -> RemoteHost {
+        self.remote_at("127.0.0.1:0".parse().unwrap()).await
+    }
+    pub async fn remote_at(&self, address: std::net::SocketAddr) -> RemoteHost {
         use hellas_rpc::services::work::Work;
         use hellas_wire::{ServiceMarker, iroh::IrohTransport};
         let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
-            .secret_key(iroh::SecretKey::from_bytes(&[5; 32]))
+            .secret_key(self.transport_key.clone())
             .alpns(vec![Work::ALPN.as_bytes().to_vec()])
-            .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+            .bind_addr(address)
             .unwrap()
             .bind()
             .await
             .unwrap();
         let listener = endpoint.clone();
+        let enrollment = self.enrollment();
         let router = crate::work_router::WorkRouter::grants(self.world.service.clone());
         let task = tokio::spawn(async move {
             let mut connections = tokio::task::JoinSet::new();
             while let Some(incoming) = listener.accept().await {
                 let router = router.clone();
+                let enrollment = enrollment.clone();
                 connections.spawn(async move {
                     let transport = Arc::new(IrohTransport::new(incoming.await.unwrap()));
                     if let Ok(server) = router
                         .accept_iroh(
                             &transport,
-                            crate::test_identity::OpenProof(
-                                provider_enrollment(),
-                                PROVIDER.node_key(),
-                            ),
+                            crate::test_identity::OpenProof(enrollment, PROVIDER.node_key()),
                         )
                         .await
                     {
@@ -182,6 +177,10 @@ impl Host {
     }
 }
 impl HostBuilder {
+    pub fn with_transport_key(mut self, key: u8) -> Self {
+        self.transport_key = iroh::SecretKey::from_bytes(&[key; 32]);
+        self
+    }
     pub fn with_allowance(mut self, allowance: Allowance) -> Self {
         self.allowance = allowance;
         self
@@ -202,7 +201,7 @@ impl HostBuilder {
         let clock = TestClock::default();
         let world = Node::bootstrap(&root.path().join("provider"))
             .with_clock(clock.clone())
-            .with_provider(provider_enrollment())
+            .with_provider(transport_enrollment(&self.transport_key))
             .with_capacity(self.capacity)
             .with_allowance(self.allowance)
             .with_grant(
@@ -220,8 +219,9 @@ impl HostBuilder {
                     .build(),
             )
             .build()
-            .await
-            .serve(self.backend.clone());
+            .await;
+        let content = world.content.clone();
+        let world = world.serve(self.backend.clone());
         let secret = world.secret(FRIEND);
         let application = Arc::new(ClientProfile {
             authority: authority(),
@@ -232,9 +232,11 @@ impl HostBuilder {
         Host {
             root,
             world,
+            content,
             backend: self.backend,
             application,
             allowance,
+            transport_key: self.transport_key,
         }
     }
 }
@@ -253,39 +255,5 @@ impl RemoteHost {
     pub async fn shutdown(self) {
         self.endpoint.close().await;
         self.task.await.unwrap();
-    }
-}
-
-/// A grant gateway the host starts: each start binds its own endpoint.
-#[derive(Clone)]
-pub struct GrantGateway {
-    pub serve: crate::GatewayServeOptions,
-    pub session: crate::grant_client::GrantSessionOptions,
-}
-impl GrantGateway {
-    /// The host supplies the access it validated; the configured access is replaced.
-    pub fn into_factory(self, key: iroh::SecretKey) -> crate::node_control::host::GatewayFactory {
-        std::sync::Arc::new(move |access| {
-            let (mut options, key) = (self.clone(), key.clone());
-            options.serve.server.access = access;
-            Box::pin(async move {
-                let endpoint = crate::grant_client::bind_endpoint(key).await?;
-                let signer = options.session.signer.clone();
-                let target = crate::GatewayTarget::Grant {
-                    policy: options.session.target.offer().grant.policies[0].clone(),
-                    options: options.session,
-                    transport: crate::grant_client::GrantTransport::Remote(endpoint),
-                };
-                if options.serve.http.is_none() {
-                    options.serve.http = target.http_config()?;
-                }
-                let work = crate::ExecutorGateway::new(
-                    target,
-                    Some(hellas_channel::test_support::channel::evaluator()),
-                    signer,
-                );
-                Ok(crate::serve_gateway(work, options.serve).await?)
-            })
-        })
     }
 }

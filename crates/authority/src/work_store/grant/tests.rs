@@ -201,7 +201,7 @@ async fn client_pending_proposal_survives_restart_and_never_journals_bodies() {
     .unwrap();
     assert_eq!(
         client
-            .propose(&offer, a, &input, &principal(1).1, UnixMillis(1_000))
+            .propose(&offer, a, &input, &principal(1).1, UnixMillis(1_000), None)
             .await
             .unwrap(),
         sig
@@ -296,7 +296,7 @@ async fn client_replays_its_journal_after_a_cancelled_append() {
     .await
     .unwrap();
     client
-        .propose(&offer, a, &input, &principal(1).1, UnixMillis(1_000))
+        .propose(&offer, a, &input, &principal(1).1, UnixMillis(1_000), None)
         .await
         .unwrap();
     let work = grant_work_id(network(), &a);
@@ -354,7 +354,7 @@ async fn client_refusal_cannot_clear_an_unanswered_proposal() {
     .await
     .unwrap();
     client
-        .propose(&offer, a, &input, &principal(1).1, UnixMillis(1_000))
+        .propose(&offer, a, &input, &principal(1).1, UnixMillis(1_000), None)
         .await
         .unwrap();
     let id = grant_work_id(network(), &a);

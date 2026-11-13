@@ -29,9 +29,8 @@ use tokio::{sync::Semaphore, time::Instant};
 use crate::application_handshake as handshake;
 mod admission;
 pub mod bootstrap;
-pub mod configuration;
 mod content;
-pub mod host;
+mod daemon;
 pub use admission::RemoteControlAdmission;
 pub mod profile;
 const MAX_CONNECTIONS: usize = 16;
@@ -45,7 +44,7 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct NodeControl {
     node: NodeCoordinator,
     work: Option<hellas_authority::grant_service::WorkAdministration>,
-    host: Option<host::Runtime>,
+    core: Option<Weak<crate::daemon::Core>>,
     content: Option<hellas_store::content::DiskStore>,
     local_slots: Arc<Semaphore>,
     remote_capacity: Arc<RemoteCapacity>,
@@ -63,7 +62,7 @@ impl NodeControl {
         Self {
             node,
             work: None,
-            host: None,
+            core: None,
             content: None,
             local_slots: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             remote_capacity: Arc::new(RemoteCapacity {
@@ -75,6 +74,15 @@ impl NodeControl {
         }
     }
 
+    /// The control service and daemon share the same authority writer.
+    pub fn with_core(mut self, core: Arc<crate::daemon::Core>) -> Result<Self, WireStatus> {
+        if !self.node.shares_writer(core.node()) {
+            return Err(unsupported());
+        }
+        self.core = Some(Arc::downgrade(&core));
+        Ok(self)
+    }
+
     pub fn with_content_store(mut self, content: hellas_store::content::DiskStore) -> Self {
         self.content = Some(content);
         self
@@ -84,35 +92,12 @@ impl NodeControl {
         ControlSession {
             node: self.node.clone(),
             work: self.work.clone(),
-            host: self.host.clone(),
+            core: self.core.clone(),
             content: self.content.clone(),
             session: Arc::new(session),
             binding,
             failed: tokio::sync::watch::channel(None).0,
         }
-    }
-
-    pub(crate) fn provider_ingress(
-        &self,
-    ) -> Result<
-        Option<(
-            iroh::Endpoint,
-            tokio::sync::mpsc::Receiver<crate::transport_admission::AdmittedConnection>,
-        )>,
-        WireStatus,
-    > {
-        self.host
-            .as_ref()
-            .map(host::Runtime::provider_ingress)
-            .transpose()
-            .map(Option::flatten)
-    }
-
-    pub(crate) fn node(&self) -> NodeCoordinator {
-        self.node.clone()
-    }
-    pub(crate) fn remote_admission(&self) -> RemoteControlAdmission {
-        self.remote_admission.clone()
     }
 
     /// Compose Work control and authentication from one writer, never two node handles.
@@ -420,7 +405,7 @@ impl Drop for CloseConnection {
 struct ControlSession {
     node: NodeCoordinator,
     work: Option<hellas_authority::grant_service::WorkAdministration>,
-    host: Option<host::Runtime>,
+    core: Option<Weak<crate::daemon::Core>>,
     content: Option<hellas_store::content::DiskStore>,
     session: Arc<AuthenticatedSession>,
     binding: Digest,
@@ -437,6 +422,19 @@ impl ControlSession {
 
 #[allow(refining_impl_trait)]
 impl HostControlHandler for ControlSession {
+    async fn configure(&self, request: ConfigureRequest) -> Result<ConfigureResponse, WireStatus> {
+        self.configure_daemon(request).await
+    }
+    async fn watch(
+        &self,
+        request: WatchRequest,
+    ) -> Result<hellas_rpc::call::ResponseStream<WatchResponse>, WireStatus> {
+        self.watch_daemon(request).await
+    }
+    async fn cancel_job(&self, request: CancelJobRequest) -> Result<CancelJobResponse, WireStatus> {
+        self.cancel_daemon_job(request).await
+    }
+
     async fn inspect_authority(
         &self,
         request: InspectAuthorityRequest,
@@ -496,14 +494,11 @@ impl HostControlHandler for ControlSession {
         if request.command.len() > MAX_COMMAND_BYTES {
             return Err(invalid());
         }
-        let work = self
-            .host
-            .as_ref()
-            .map(host::Runtime::work)
-            .transpose()?
-            .flatten()
-            .or_else(|| self.work.clone())
-            .ok_or_else(unsupported)?;
+        let work = match self.core.as_ref().and_then(Weak::upgrade) {
+            Some(core) => core.administration(),
+            None => self.work.clone(),
+        }
+        .ok_or_else(unsupported)?;
         let command = decode_bounded(&request.command, MAX_COMMAND_BYTES).map_err(|_| invalid())?;
         let result = work
             .execute(caller, grant_id(&request.authorization)?, command)
@@ -560,102 +555,6 @@ impl HostControlHandler for ControlSession {
         })
     }
 
-    async fn configure_provider(
-        &self,
-        request: ConfigureProviderRequest,
-    ) -> Result<HostStatus, WireStatus> {
-        let authorization = grant_id(&request.authorization)?;
-        let update = request
-            .update
-            .filter(|update| update.change.is_some())
-            .ok_or_else(invalid)?;
-        let caller = self.caller().await?;
-        let receiver = self
-            .node
-            .host_action(
-                caller,
-                authorization,
-                hellas_authority::node::HOST_PROVIDER_CONFIGURE,
-                |_| {
-                    if configuration::requires_passkey(&update) {
-                        caller.session().step_up().map_err(|_| denied())?;
-                    }
-                    self.host
-                        .as_ref()
-                        .ok_or_else(unsupported)?
-                        .configure(update)
-                },
-            )
-            .await
-            .map_err(node_error)??;
-        receiver.await.map_err(|_| unavailable())??;
-        self.node
-            .host_action(
-                self.caller().await?,
-                authorization,
-                hellas_authority::node::HOST_PROVIDER_CONFIGURE,
-                |status| self.status_reply(status),
-            )
-            .await
-            .map_err(node_error)?
-    }
-    async fn set_provider_state(
-        &self,
-        request: SetProviderStateRequest,
-    ) -> Result<HostStatus, WireStatus> {
-        self.set_state(
-            &request.authorization,
-            host::Service::Provider,
-            request.enabled,
-        )
-        .await
-    }
-    async fn set_gateway_state(
-        &self,
-        request: SetGatewayStateRequest,
-    ) -> Result<HostStatus, WireStatus> {
-        self.set_state(
-            &request.authorization,
-            host::Service::Gateway,
-            request.enabled,
-        )
-        .await
-    }
-    async fn get_gateway_access(
-        &self,
-        request: GetGatewayAccessRequest,
-    ) -> Result<GatewayAccess, WireStatus> {
-        let authorization = grant_id(&request.authorization)?;
-        let (access, address) = self
-            .node
-            .host_action(
-                self.caller().await?,
-                authorization,
-                hellas_authority::node::HOST_GATEWAY_ACCESS,
-                |_| self.host.as_ref().ok_or_else(unsupported)?.access(),
-            )
-            .await
-            .map_err(node_error)??;
-        access.validate().await.map_err(|_| {
-            WireStatus::new(
-                WireCode::FailedPrecondition,
-                "gateway credential is not current",
-            )
-        })?;
-        self.node
-            .host_action(
-                self.caller().await?,
-                authorization,
-                hellas_authority::node::HOST_GATEWAY_ACCESS,
-                |_| GatewayAccess {
-                    address,
-                    bearer: access.bearer(),
-                },
-            )
-            .await
-            .map_err(node_error)
-    }
-
     async fn bind_provider(
         &self,
         request: BindProviderRequest,
@@ -695,54 +594,40 @@ impl ControlSession {
         &self,
         status: hellas_authority::node::NodeStatus,
     ) -> Result<HostStatus, WireStatus> {
-        let mut reply = HostStatus {
+        let reply = HostStatus {
             version: env!("CARGO_PKG_VERSION").into(),
             authority: status.authority.0.as_bytes().to_vec(),
             authority_revision: status.authority_revision.0,
             generation: status.generation,
-            provider_configured: status.provider.is_some(),
-            identity: status
-                .provider
-                .as_ref()
-                .map(host::identity_status)
-                .transpose()?,
+            identity: status.provider.as_ref().map(identity_status).transpose()?,
             machine: status.machine.map(capacity).transpose()?,
-            ..Default::default()
         };
-        if let Some(host) = &self.host {
-            host.decorate(&mut reply)?;
-        }
         Ok(reply)
     }
-    async fn set_state(
-        &self,
-        authorization: &[u8],
-        service: host::Service,
-        enabled: bool,
-    ) -> Result<HostStatus, WireStatus> {
-        let authorization = grant_id(authorization)?;
-        let operation = match service {
-            host::Service::Provider => hellas_authority::node::HOST_PROVIDER_CONFIGURE,
-            host::Service::Gateway => hellas_authority::node::HOST_GATEWAY_CONFIGURE,
-        };
-        let receiver = self
-            .node
-            .host_action(self.caller().await?, authorization, operation, |_| {
-                self.host
-                    .as_ref()
-                    .ok_or_else(unsupported)?
-                    .enqueue(service, enabled)
-            })
-            .await
-            .map_err(node_error)??;
-        receiver.await.map_err(|_| unavailable())??;
-        self.node
-            .host_action(self.caller().await?, authorization, operation, |status| {
-                self.status_reply(status)
-            })
-            .await
-            .map_err(node_error)?
-    }
+}
+
+fn identity_status(
+    enrollment: &hellas_rpc::ProviderEnrollmentBundle,
+) -> Result<IdentityStatus, WireStatus> {
+    let node = hellas_authority::model::grant::records::grant_transport(enrollment)
+        .ok()
+        .and_then(|key| iroh::EndpointId::from_bytes(&key).ok())
+        .ok_or_else(unavailable)?;
+    Ok(IdentityStatus {
+        producer_id: hex::encode(
+            hellas_auth::ProducerId::from_public_key(
+                &enrollment.genesis.statement.producer_public_key,
+            )
+            .as_bytes(),
+        ),
+        caller_public_key: hex::encode(enrollment.genesis.statement.producer_public_key.bytes()),
+        node_id: node.to_string(),
+        attestation: match enrollment.genesis.statement.root_kind {
+            hellas_rpc::RootKind::Software => AttestationState::Software,
+            hellas_rpc::RootKind::SecureEnclave => AttestationState::AppleAppAttest,
+        } as i32,
+        detail: String::new(),
+    })
 }
 
 fn grant_id(bytes: &[u8]) -> Result<GrantId, WireStatus> {

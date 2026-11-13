@@ -7,7 +7,7 @@ use hellas_rpc::{
     SignedProviderGenesis,
 };
 use hellas_rpc::{PlatformEnrollment, ProviderEnrollmentBundle};
-use hellas_sdk::{FilesystemAssertionCounterStore, ProviderOpen};
+use hellas_sdk::FilesystemAssertionCounterStore;
 use iroh::SecretKey;
 use std::fs;
 use std::io::{ErrorKind, Write};
@@ -31,7 +31,6 @@ pub(crate) struct LocalIdentity {
     pub(crate) transport_key: SecretKey,
     pub(crate) node_key: ProducerSigningKey,
     pub(crate) enrollment: ProviderEnrollmentBundle,
-    open_identity: Arc<ProviderOpen<ProducerSigningKey>>,
 }
 
 struct StoredIdentity {
@@ -58,23 +57,6 @@ impl PlatformRoot {
             )),
         }
     }
-}
-
-impl LocalIdentity {
-    pub(crate) fn open_identity(&self) -> Arc<ProviderOpen<ProducerSigningKey>> {
-        self.open_identity.clone()
-    }
-}
-
-fn build_open_identity(
-    node_key: &ProducerSigningKey,
-    enrollment: &ProviderEnrollmentBundle,
-) -> anyhow::Result<Arc<ProviderOpen<ProducerSigningKey>>> {
-    Ok(Arc::new(ProviderOpen::new(
-        Arc::new(node_key.clone()),
-        enrollment.clone(),
-        None,
-    )?))
 }
 
 pub(crate) fn load_or_create(path: &Path) -> anyhow::Result<LocalIdentity> {
@@ -137,12 +119,10 @@ fn create(path: &Path) -> anyhow::Result<LocalIdentity> {
         transport_key: transport_key.to_bytes(),
         enrollment: enrollment.clone(),
     };
-    let open_identity = build_open_identity(&node_key, &enrollment)?;
     let identity = LocalIdentity {
         transport_key,
         node_key,
         enrollment,
-        open_identity,
     };
     if !persist(path, &stored)? {
         return load_existing(path);
@@ -194,12 +174,10 @@ fn materialize(stored: &StoredIdentity) -> anyhow::Result<LocalIdentity> {
     if enrollment != stored.enrollment {
         bail!("stored provider enrollment does not match the persisted keys");
     }
-    let open_identity = build_open_identity(&node_key, &enrollment)?;
     Ok(LocalIdentity {
         transport_key,
         node_key,
         enrollment,
-        open_identity,
     })
 }
 

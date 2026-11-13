@@ -16,22 +16,21 @@ pub(super) fn text_events(
         let mut tools = prepared.chat.take().unwrap_or_else(hellas_presentation::chat::ChatTurn::plain);
         let stream_provenance = prepared.provenance.clone();
         let mut transcript = None;
-        let deadline = prepared.deadline();
         let inner = generation_stream(prepared);
         tokio::pin!(inner);
 
         loop {
-            match crate::before_deadline(deadline, inner.next()).await {
-                Ok(Some(Ok(GenerationEvent::Transcript(signed)))) => transcript = Some(signed),
-                Ok(Some(Ok(GenerationEvent::Delta(delta)))) => {
+            match inner.next().await {
+                Some(Ok(GenerationEvent::Transcript(signed))) => transcript = Some(signed),
+                Some(Ok(GenerationEvent::Delta(delta))) => {
                     for event in tools.feed(&delta).map_err(|error| BackendError::Output(error.to_string()))? { yield event.into(); }
                 }
-                Ok(Some(Ok(GenerationEvent::Done(TextCompletion {
+                Some(Ok(GenerationEvent::Done(TextCompletion {
                     output_tokens,
                     stop_reason,
                     text_artifact,
                     ..
-                })))) => {
+                }))) => {
                     info!(
                         %text_artifact,
                         provenance = ?stream_provenance,
@@ -49,19 +48,14 @@ pub(super) fn text_events(
                     }.into();
                     return;
                 }
-                Ok(Some(Err(err))) => Err(err)?,
-                Ok(None) => Err(BackendError::failed("execution stream ended without terminal outcome"))?,
-                Err(_) => Err(BackendError::failed("inference timed out"))?,
+                Some(Err(err)) => Err(err)?,
+                None => Err(BackendError::failed("execution stream ended without terminal outcome"))?,
             }
         }
     }
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "inventory class A/B/C: test timing fixtures pending their rollout"
-)]
 mod tests {
     use super::*;
     use crate::ComputeEvent;
@@ -70,99 +64,6 @@ mod tests {
         compute::{RunMetadata, StopReason},
         output::{InvocationOutput, Outcome},
     };
-
-    #[tokio::test(start_paused = true)]
-    async fn paid_acceptance_and_output_share_one_absolute_deadline() {
-        let start = tokio::time::Instant::now();
-        let mut prepared = PreparedGeneration {
-            chat: None,
-            prepared: Box::pin(async_stream::stream! {
-                tokio::time::sleep(std::time::Duration::from_secs(4)).await;
-                yield Ok(crate::WorkEvent::Accepted(hellas_rpc::provenance::ExecutionProvenance {
-                    commitment_id: [1; 32], provider: hellas_auth::ProducerSigningKey::from_secret_bytes([7;32]).unwrap().public_key(),
-                }));
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                yield Err(crate::WorkGatewayError::Unsupported);
-            }),
-            provenance: None,
-            prompt_tokens: 1,
-            presentation: std::sync::Arc::new(
-                hellas_presentation::TextPresentation::from_gguf(
-                    &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                        .join("../client/src/model/package/mini-qwen3.gguf"),
-                )
-                .unwrap(),
-            ),
-            deadline: Some(start + std::time::Duration::from_secs(5)),
-        };
-        prepared.accept().await.unwrap();
-        assert!(prepared.provenance.is_some());
-        let events = text_events(prepared).collect::<Vec<_>>().await;
-        assert!(
-            events
-                .last()
-                .unwrap()
-                .as_ref()
-                .unwrap_err()
-                .to_string()
-                .contains("inference timed out")
-        );
-        assert_eq!(start.elapsed(), std::time::Duration::from_secs(5));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn text_waits_without_a_client_deadline_but_keeps_explicit_budgets() {
-        for timeout in [None, Some(std::time::Duration::from_secs(5))] {
-            let prepared = PreparedGeneration {
-                chat: None,
-                prepared: Box::pin(async_stream::try_stream! {
-                    tokio::time::sleep(std::time::Duration::from_secs(600)).await;
-                    yield ComputeEvent::Output(hellas_rpc::protocol::invocation::output::ArtifactChunk {
-                        name: "emitted".into(),
-                        format: "catena.u64le.v1".into(),
-                        offset: 0,
-                        bytes: hellas_rpc::JsonBytes(0u64.to_le_bytes().to_vec()),
-                    });
-                    yield ComputeEvent::Done {
-                        output: InvocationOutput {
-                            outcome: Outcome::Succeeded,
-                            artifacts: vec![Artifact::new("emitted", "catena.u64le.v1", 0u64.to_le_bytes().to_vec())],
-                            metadata: hellas_rpc::JsonBytes(hellas_rpc::canonical_dag_cbor(&RunMetadata { steps: 1, stop: Some(StopReason::MaxSteps) }).unwrap()),
-                        },
-                        provider: hellas_auth::ProducerSigningKey::from_secret_bytes([7;32]).unwrap().public_key(),
-                    };
-                }.map(|event: Result<_, crate::WorkGatewayError>| event.map(crate::WorkEvent::Output))),
-                provenance: None,
-                prompt_tokens: 1,
-                presentation: std::sync::Arc::new(
-                    hellas_presentation::TextPresentation::from_gguf(
-                        &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                            .join("../client/src/model/package/mini-qwen3.gguf"),
-                    )
-                    .unwrap(),
-                ),
-                deadline: timeout.map(|timeout| tokio::time::Instant::now() + timeout),
-            };
-            let events = text_events(prepared).collect::<Vec<_>>().await;
-            if timeout.is_some() {
-                assert!(
-                    events
-                        .last()
-                        .unwrap()
-                        .as_ref()
-                        .unwrap_err()
-                        .to_string()
-                        .contains("inference timed out")
-                );
-            } else {
-                assert!(matches!(
-                    events.last(),
-                    Some(Ok(BackendEvent::Output(OutputEvent::Finished { .. })))
-                ));
-            }
-        }
-    }
-
     /// Output that breaks the turn's tool contract is the model's, and the
     /// same request repeats it: it is reported as unusable, not as a failure
     /// a retry could cure.
@@ -212,7 +113,6 @@ mod tests {
             provenance: None,
             prompt_tokens: 1,
             presentation,
-            deadline: None,
         };
         let events = text_events(prepared).collect::<Vec<_>>().await;
         let error = events.last().unwrap().as_ref().unwrap_err();

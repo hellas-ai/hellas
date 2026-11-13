@@ -20,26 +20,41 @@ fn gateway_waits_for_slow_funding_finality() {
             .await
             .unwrap();
             let gateway = hellas_sdk::ExecutorGateway::new(
-                hellas_sdk::GatewayTarget::Paid {
-                    options: case.options.clone(),
-                    policy: quote.policy.invocation_policy,
-                    endpoint: case.endpoint.clone(),
-                    settlement_key: client_settlement(),
-                    owner: case.owner.clone(),
-                },
-                None,
+                [(
+                    "test".into(),
+                    hellas_sdk::BackendEntry {
+                        backend: hellas_sdk::Backend::paid(
+                            Some(quote.policy.invocation_policy),
+                            case.options.clone(),
+                            case.endpoint.clone(),
+                            client_settlement(),
+                            case.owner.clone(),
+                        ),
+                        evaluator: None,
+                        max_in_flight: std::num::NonZeroUsize::new(32).unwrap(),
+                    },
+                )]
+                .into(),
                 Arc::new(ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap()),
             );
             let started = tokio::time::Instant::now();
             let request = gateway
-                .fetch(hellas_gateway::WorkFetchRequest {
-                    resource: None,
-                    channel: None,
-                    provider: case.options.provider.node,
-                    service: "openai".into(),
-                    method: "responses".into(),
-                    body: BODY.to_vec(),
-                })
+                .fetch(
+                    "test",
+                    gateway
+                        .jobs
+                        .admit(&hellas_gateway::jobs::Request {
+                            origin: hellas_gateway::jobs::Origin::Local,
+                            method: "POST".into(),
+                            path: "/v1/responses".into(),
+                        })
+                        .unwrap(),
+                    hellas_gateway::WorkFetchRequest {
+                        service: "openai".into(),
+                        method: "responses".into(),
+                        body: BODY.to_vec(),
+                    },
+                )
                 .unwrap()
                 .try_collect::<Vec<_>>();
             tokio::pin!(request);

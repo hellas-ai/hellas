@@ -132,6 +132,7 @@ pub async fn try_session(
 pub fn policy() -> GrantPolicy {
     let route = FetchRoutePolicy::sealed_route("openai", "responses").unwrap();
     GrantPolicy {
+        config_change: Default::default(),
         resource: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test resource")),
         account: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),
         revision: hellas_auth::authority::Revision(1),

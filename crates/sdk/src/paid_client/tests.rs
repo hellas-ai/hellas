@@ -2,6 +2,7 @@ use super::*;
 use crate::test_support::enrollment;
 use futures::StreamExt as _;
 use hellas_private::StoreLocation;
+pub(crate) mod concurrency;
 mod offer;
 mod recovery;
 use hellas_auth::{ProducerSigningKey, PublicKey};
@@ -75,7 +76,8 @@ async fn paid_image_burst_is_verified_and_delivered() {
         commitment_id: [23; 32],
         provider: key.public_key(),
     };
-    let (requester, mut response) = Requester::<ComputeEvent, WorkGatewayError>::new();
+    let (requester, mut response) =
+        Requester::<ComputeEvent, WorkGatewayError>::new(crate::test_support::job());
     // A retained result can arrive in one burst before the consumer polls.
     requester.accepted()(accepted.clone());
     let progress = requester.progress();
@@ -198,7 +200,6 @@ async fn insufficient_quoted_collateral_is_rejected_before_a_bond_request_or_jou
     let args = PaidWorkOptions {
         content: hellas_authority::test_support::content_store(fixture.root.path()).await,
         config,
-        journal_kind: PaidJournalKind::Client,
         provider,
         provider_addrs: vec![],
         assurance: Assurance::ProducerSigned,
@@ -625,4 +626,139 @@ async fn client_checks_live_owner_and_own_payout_before_countersigning() {
             assert_eq!(setup.state().revision(), Some(2));
         }
     }
+}
+
+#[tokio::test]
+async fn gateway_keeps_the_quote_used_for_rendering_until_session_open() {
+    use hellas_gateway::{WorkExecutionBackend, WorkFetchRequest, WorkGatewayError};
+    use hellas_rpc::pb::work::{
+        PaymentEdgeValues, Quote, RequestOfferResponse, request_offer_response,
+    };
+    use hellas_rpc::services::work_setup::{Open, RequestOffer, WorkSetup};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (mut policy, _, _) = fetch_request(Assurance::ProducerSigned);
+    let fees = hellas_chain::domain::KERNEL_FEES;
+    policy.expected_payment_values = hellas_kernel::EdgeValues::new(1000, 0, fees);
+    let fixture = crate::test_support::PaidFixture::on_network(policy.network);
+    let server = Endpoint::builder(presets::Minimal)
+        .alpns(vec![WorkSetup::ALPN.as_bytes().to_vec()])
+        .bind_addr("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .unwrap()
+        .bind()
+        .await
+        .unwrap();
+    let endpoint = bind_paid_endpoint(SecretKey::generate()).await.unwrap();
+    let (bundle, producer) = enrollment(server.id());
+    let address = hellas_client::ProviderAddress::of(&bundle).unwrap();
+    let quotes = Arc::new(AtomicUsize::new(0));
+    let serving = tokio::spawn({
+        let server = server.clone();
+        let quotes = quotes.clone();
+        let policy = policy.clone();
+        async move {
+            while let Some(incoming) = server.accept().await {
+                let connection = incoming.await.unwrap();
+                let transport = IrohTransport::new(connection.clone());
+                serve_open::<Open>(&transport, bundle.clone(), producer.clone()).await;
+                let inbound = transport.accept().await.unwrap().unwrap();
+                assert_eq!(inbound.method_id, RequestOffer::METHOD_ID);
+                quotes.fetch_add(1, Ordering::SeqCst);
+                let policy = policy.clone();
+                hellas_rpc::call::dispatch_unary::<IrohTransport, RequestOffer, _, _, _>(
+                    inbound,
+                    move |request| async move {
+                        assert!(
+                            request.funding_coins.is_empty(),
+                            "no funding for an invalid request"
+                        );
+                        Ok::<_, WireStatus>(RequestOfferResponse {
+                            outcome: Some(request_offer_response::Outcome::Quote(Quote {
+                                provider_channel_policy:
+                                    hellas_rpc::protocol::value::encode_bounded(
+                                        &policy,
+                                        hellas_authority::model::grant::records::MAX_OFFER_BYTES,
+                                    )
+                                    .unwrap(),
+                                required: Some(PaymentEdgeValues {
+                                    value: 1000,
+                                    reserve: 0,
+                                    base_fee: fees.base(),
+                                    slot_fee: fees.slot(),
+                                    proof_fee: fees.proof(),
+                                    lifetime_fee: fees.lifetime(),
+                                }),
+                                omission_bond: 601,
+                                funding_value: 1000,
+                            })),
+                        })
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        }
+    });
+    let content = hellas_authority::test_support::content_store(fixture.root.path()).await;
+    let options = PaidWorkOptions {
+        content: content.clone(),
+        config: fixture.config.clone(),
+        provider: address,
+        provider_addrs: server.bound_sockets().to_vec(),
+        assurance: Assurance::ProducerSigned,
+        apple_trust: None,
+        expected_price: policy.payment_policy.fixed_price,
+        acceptance_blocks: 300,
+        terminal_blocks: 3000,
+        payment_blocks: 600,
+        timeout: None,
+    };
+    let settlement = crate::test_support::signer(1);
+    let owner = Arc::new(
+        crate::client_owner::ClientOwner::new(
+            Arc::new(hellas_kernel::SoftPasskey::from_secret_scalar([0x11; 32]).unwrap()),
+            settlement.party_key(),
+            &options.config.chain,
+        )
+        .unwrap(),
+    );
+    let gateway = crate::ExecutorGateway::new(
+        [(
+            "paid".into(),
+            crate::BackendEntry {
+                backend: crate::Backend::paid(None, options, endpoint.clone(), settlement, owner),
+                evaluator: None,
+                max_in_flight: std::num::NonZeroUsize::MIN,
+            },
+        )]
+        .into(),
+        Arc::new(ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap()),
+    );
+    assert_eq!(
+        gateway.max_steps("paid").await.unwrap(),
+        Some(policy.invocation_policy.limits.step_bound())
+    );
+    let mut output = gateway
+        .fetch(
+            "paid",
+            crate::test_support::job(),
+            WorkFetchRequest {
+                service: "unquoted".into(),
+                method: "unquoted".into(),
+                body: vec![],
+            },
+        )
+        .unwrap();
+    assert!(
+        matches!(output.next().await, Some(Err(WorkGatewayError::PreProposal(error))) if matches!(*error, WorkGatewayError::Rejected(_)))
+    );
+    assert_eq!(
+        quotes.load(Ordering::SeqCst),
+        1,
+        "rendering and admission use the same quote"
+    );
+    gateway.drain().await.unwrap();
+    server.close().await;
+    serving.await.unwrap();
+    endpoint.close().await;
+    content.close().await;
 }

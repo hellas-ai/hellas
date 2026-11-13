@@ -1,6 +1,6 @@
 //! Responses presentation over an already funded, authenticated Work backend.
 use super::backend::provenance::{completed_provenance, provenance_from_execution};
-use super::{WorkEvent, WorkExecutionBackend, WorkFetchRequest};
+use super::{WorkEvent, WorkFetchRequest, route::RouteExecution};
 use axum::{Router, body::Bytes, extract::State, response::Response, routing::post};
 use futures::StreamExt;
 use hellas_adaptors::{
@@ -14,28 +14,41 @@ use std::sync::Arc;
 pub(super) const PATH: &str = "/v1/responses";
 
 pub(super) fn router(
-    options: super::ResponsesFetch,
-    work: Arc<dyn WorkExecutionBackend>,
+    service: String,
+    method: String,
+    overrides: serde_json::Map<String, Value>,
+    work: Arc<RouteExecution>,
 ) -> Router {
     Router::new()
         .route(PATH, post(handle))
-        .with_state(Arc::new(FetchBackend { work, options }))
+        .with_state(Arc::new(ResponsesState {
+            work,
+            service,
+            method,
+            overrides,
+        }))
 }
-
+struct ResponsesState {
+    work: Arc<RouteExecution>,
+    service: String,
+    method: String,
+    overrides: serde_json::Map<String, Value>,
+}
 #[derive(Clone)]
 struct FetchBackend {
-    work: Arc<dyn WorkExecutionBackend>,
-    options: super::ResponsesFetch,
+    state: Arc<ResponsesState>,
+    selection: crate::routing::Selection,
 }
-
-async fn handle(State(backend): State<Arc<FetchBackend>>, body: Bytes) -> Response {
-    let context = super::dispatch::render_context("resp");
-    let backend = backend.as_ref().clone();
+async fn handle(
+    State(state): State<Arc<ResponsesState>>,
+    axum::Extension(selection): axum::Extension<crate::routing::Selection>,
+    body: Bytes,
+) -> Response {
     super::dispatch::serve(
         OpenAiResponsesAdaptor,
         "OpenAI Responses",
-        context,
-        backend,
+        super::dispatch::render_context("resp"),
+        FetchBackend { state, selection },
         &body,
     )
     .await
@@ -52,7 +65,7 @@ impl ExecutionBackend for FetchBackend {
                 .ok_or_else(|| BackendError::rejected("Responses body must be an object"))?;
             if body.get("store").is_some_and(|v| v != &Value::Bool(false))
                 || self
-                    .options
+                    .state
                     .overrides
                     .get("store")
                     .is_some_and(|v| v != &Value::Bool(false))
@@ -61,20 +74,21 @@ impl ExecutionBackend for FetchBackend {
                     "Work Fetch supports store:false only",
                 ));
             }
-            body.extend(self.options.overrides.clone());
+            body.extend(self.state.overrides.clone());
             body.insert("stream".into(), Value::Bool(true));
             body.insert("store".into(), Value::Bool(false));
             let mut events = self
+                .state
                 .work
-                .fetch(WorkFetchRequest {
-                    resource: None,
-                    channel: None,
-                    provider: self.options.provider,
-                    service: self.options.service.clone(),
-                    method: self.options.method.clone(),
-                    body: serde_json::to_vec(&body)
-                        .map_err(|e| BackendError::rejected(e.to_string()))?,
+                .fetch(&mut self.selection.clone(), |_| {
+                    Ok(WorkFetchRequest {
+                        service: self.state.service.clone(),
+                        method: self.state.method.clone(),
+                        body: serde_json::to_vec(&body)
+                            .map_err(|e| crate::WorkGatewayError::Rejected(e.into()))?,
+                    })
                 })
+                .await
                 .map_err(BackendError::from)?;
             let accepted = crate::accepted(&mut events).await;
             let initial = accepted.as_ref().map(provenance_from_execution);

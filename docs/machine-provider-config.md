@@ -24,8 +24,7 @@ authenticated console. If creation cannot be
 confirmed, reconcile by the requested name before retrying; a failed response
 can still correspond to an allocated, billable resource.
 
-The image's entrypoint is `serve --port 31145`. A node with no owner and no paid
-terms prints its invite and waits to be paired. Preserve the persistent home
+The image's entrypoint is `serve --port 31145`. A node with no owner prints its invite and waits to be paired. Preserve the persistent home
 mount.
 
 RunPod does not expose inbound UDP ([port documentation](https://docs.runpod.io/pods/configuration/expose-ports)).
@@ -61,22 +60,18 @@ Updating a tag or template does not upgrade an already running Pod. Review the
 new release's state compatibility before replacing a persistent worker.
 
 Preserve the image's Docker entrypoint: it already selects `serve`, port 31145,
-and its matching backend, including CUDA driver-library setup where needed. In RunPod's
+including CUDA driver-library setup where needed. In RunPod's
 `dockerStartCmd`, pass only additional arguments, for example:
 
 ```json
-["--home", "/var/lib/hellas/.hellas",
- "--content", "/var/lib/hellas/models/whisper-tiny",
- "--program", "PROGRAM_MANIFEST"]
+["--home", "/var/lib/hellas/.hellas"]
 ```
 
-Put the converted weights on the persistent volume before using that command;
-`hellas program --backend EVALUATOR PATH` prints the program id for `--program`. A template does not
-create an allowance or download models. Use `--grant-config` and
-`--content-config` instead for explicit resources and Jobs pins. Then pair,
-share and run a job as in the
-[sharing section](../README.md#2-share-your-gpu-with-a-friend). `hellas share`
-and `hellas pair` require a release containing them on both client and worker.
+Put converted packages on the persistent volume. Pair the invite, then use
+`hellas route add /var/lib/hellas/models/PACKAGE` from an editing CLI that can
+read that path. Routes create bounded resources; allowances and contacts stay
+on the existing `share` and `pair` commands. A template does not download models
+or create allowances. See [sharing](../README.md#2-share-your-gpu).
 The state filesystem must preserve private files owned by the daemon user
 (mode `0600` on Unix). If startup reports `file must be private`, inspect the
 reported path's owner and permissions on the actual mounted filesystem; do not

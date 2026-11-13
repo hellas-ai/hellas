@@ -72,17 +72,6 @@ fn image_cli_and_gateway_surfaces_are_available() {
     ])
     .unwrap();
     assert!(matches!(image.command, Commands::Image(_)));
-    let gateway = parse_gateway(&["--model", "klein", "--model", "qwen.gguf"]).unwrap();
-    let Commands::Gateway { execution, .. } = gateway.command else {
-        panic!("gateway")
-    };
-    assert_eq!(
-        execution.models,
-        [
-            std::path::Path::new("klein"),
-            std::path::Path::new("qwen.gguf")
-        ]
-    );
 }
 
 #[cfg(unix)]
@@ -97,10 +86,10 @@ const TEST_REMOTE_TRUST_ARGS: &[&str] = &[
     "apple-app-attest",
 ];
 
-/// A gateway under an access file, plus `args`.
+/// The route-document gateway command, plus process arguments.
 fn parse_gateway(args: &[&str]) -> Result<Cli, clap::Error> {
     Cli::try_parse_from(
-        ["hellas", "gateway", "--access", "friend.access"]
+        ["hellas", "gateway", "--model", "model.gguf"]
             .into_iter()
             .chain(args.iter().copied()),
     )
@@ -152,66 +141,6 @@ fn remote_trust_flags_are_rejected_by_irrelevant_commands() {
 }
 
 #[test]
-fn serve_accepts_only_its_command_local_assurance() {
-    let cli = Cli::try_parse_from(["hellas", "serve", "--assurance", "apple-app-attest"]).unwrap();
-    assert!(matches!(
-        cli.command,
-        Commands::Serve {
-            assurance: hellas_rpc::Assurance::AppleAppAttest,
-            ..
-        }
-    ));
-
-    for flag in TEST_REMOTE_TRUST_ARGS.as_chunks::<2>().0 {
-        if flag[0] == "--assurance" {
-            continue;
-        }
-        assert!(
-            Cli::try_parse_from(["hellas", "serve"].into_iter().chain(flag.iter().copied()))
-                .is_err(),
-            "serve accepted requester-only {}",
-            flag[0]
-        );
-    }
-}
-
-#[test]
-fn gateway_takes_the_job_commands_targets() {
-    let provider = format!("{}@{}", "11".repeat(32), "22".repeat(32));
-    let gateway = |args: &[&str]| {
-        Cli::try_parse_from(
-            ["hellas", "gateway"]
-                .into_iter()
-                .chain(args.iter().copied()),
-        )
-    };
-    assert!(gateway(&["--access", "friend.access"]).is_ok());
-    assert!(gateway(&["--pay", "20", "--provider", &provider]).is_ok());
-    assert_eq!(cfg!(feature = "compute"), gateway(&["--local"]).is_ok());
-    for refused in [
-        &[][..],
-        &["--pay", "20"][..],
-        &[
-            "--access",
-            "friend.access",
-            "--pay",
-            "20",
-            "--provider",
-            &provider,
-        ][..],
-        &["--offer", "lan"][..],
-        &[
-            "--paid-work-config",
-            "pool.json",
-            "--access",
-            "friend.access",
-        ][..],
-    ] {
-        assert!(gateway(refused).is_err(), "{refused:?}");
-    }
-}
-
-#[test]
 fn admin_target_is_shared_and_requires_an_identity_pin() {
     for operation in [vec!["status"], vec!["grant", "change.json"]] {
         for before in [true, false] {
@@ -248,37 +177,12 @@ fn admin_target_is_shared_and_requires_an_identity_pin() {
 }
 
 #[test]
-fn apple_assurance_requires_a_secure_enclave_root() {
-    assert!(
-        validate_serve_assurance(
-            hellas_rpc::Assurance::AppleAppAttest,
-            hellas_rpc::RootKind::Software,
-        )
-        .is_err()
-    );
-    assert!(
-        validate_serve_assurance(
-            hellas_rpc::Assurance::AppleAppAttest,
-            hellas_rpc::RootKind::SecureEnclave,
-        )
-        .is_ok()
-    );
-}
-
-#[test]
-fn gateway_rejects_a_zero_default_output_limit() {
-    assert!(parse_gateway(&["--default-max-tokens", "0"]).is_err());
-}
-
-#[test]
 fn gateway_wrap_forwards_trailing_args() {
     let cli = parse_gateway(&["--wrap", "pi", "--", "-p", "--no-session", "say hello"]).unwrap();
     match cli.command {
-        Commands::Gateway {
-            wrap, wrap_args, ..
-        } => {
-            assert_eq!(wrap.as_deref(), Some("pi"));
-            assert_eq!(wrap_args, vec!["-p", "--no-session", "say hello"]);
+        Commands::Gateway { args, .. } => {
+            assert_eq!(args.wrap.as_deref(), Some("pi"));
+            assert_eq!(args.wrap_args, vec!["-p", "--no-session", "say hello"]);
         }
         _ => panic!("expected gateway command"),
     }
@@ -288,27 +192,6 @@ fn gateway_wrap_forwards_trailing_args() {
 fn gateway_wrap_args_require_wrap() {
     let result = parse_gateway(&["--", "-p", "hi"]);
     assert!(result.is_err(), "trailing args without --wrap should error");
-}
-
-#[test]
-fn gateway_responses_fetch_takes_overrides_and_its_models() {
-    let cli = parse_gateway(&[
-        "--responses-overrides",
-        r#"{"store":false}"#,
-        "--responses-model",
-        "gpt-x,gpt-y",
-    ])
-    .unwrap();
-    let Commands::Gateway {
-        responses_overrides,
-        responses_models,
-        ..
-    } = cli.command
-    else {
-        panic!("expected gateway command");
-    };
-    assert_eq!(responses_overrides.unwrap()["store"], false);
-    assert_eq!(responses_models, ["gpt-x", "gpt-y"]);
 }
 
 #[test]
@@ -330,23 +213,6 @@ fn identity_commands_accept_global_home() {
 }
 
 #[test]
-fn serve_accepts_work_config() {
-    let cli =
-        Cli::try_parse_from(["hellas", "serve", "--paid-work-config", "/tmp/work.toml"]).unwrap();
-    match cli.command {
-        Commands::Serve {
-            work_config_file, ..
-        } => assert_eq!(
-            work_config_file.as_deref(),
-            Some(std::path::Path::new("/tmp/work.toml"))
-        ),
-        _ => panic!("expected serve command"),
-    }
-}
-
-/// An identity file that is there and is not one is a startup
-/// failure naming that file.
-#[test]
 fn an_unreadable_settlement_identity_is_a_startup_failure() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("identity");
@@ -359,98 +225,6 @@ fn an_unreadable_settlement_identity_is_a_startup_failure() {
         format!("{error:#}").contains(&path.display().to_string()),
         "the refusal does not name the identity file: {error:#}",
     );
-}
-
-#[test]
-fn serve_accepts_fetch_config() {
-    let cli = Cli::try_parse_from([
-        "hellas",
-        "serve",
-        "--fetch-max-in-flight",
-        "3",
-        "--fetch-queue-size",
-        "0",
-        "--fetch-config",
-        "/tmp/fetch-config.json",
-    ])
-    .unwrap();
-    match cli.command {
-        Commands::Serve {
-            fetch_max_in_flight,
-            fetch_queue_size,
-            fetch_config_file,
-            ..
-        } => {
-            assert_eq!(fetch_max_in_flight, 3);
-            assert_eq!(fetch_queue_size, 0);
-            assert_eq!(
-                fetch_config_file.as_deref(),
-                Some(std::path::Path::new("/tmp/fetch-config.json"))
-            );
-        }
-        _ => panic!("expected serve command"),
-    }
-}
-
-#[test]
-fn serve_rejects_zero_fetch_concurrency() {
-    assert!(
-        Cli::try_parse_from(["hellas", "serve", "--fetch-replay-max-in-flight", "0",]).is_err()
-    );
-    assert!(Cli::try_parse_from(["hellas", "serve", "--fetch-max-in-flight", "0"]).is_err());
-}
-
-#[test]
-fn codex_auth_status_uses_home() {
-    let cli =
-        Cli::try_parse_from(["hellas", "codex-auth", "status", "--home", "/state/hellas"]).unwrap();
-    match cli.command {
-        Commands::CodexAuth {
-            command: CodexAuthCommand::Status,
-        } => assert_eq!(
-            cli.home.as_deref(),
-            Some(std::path::Path::new("/state/hellas"))
-        ),
-        _ => panic!("expected codex-auth status command"),
-    }
-}
-
-#[test]
-fn codex_auth_import_accepts_external_source() {
-    let cli = Cli::try_parse_from([
-        "hellas",
-        "codex-auth",
-        "import",
-        "--from",
-        "/state/external-codex-auth.json",
-    ])
-    .unwrap();
-    match cli.command {
-        Commands::CodexAuth {
-            command: CodexAuthCommand::Import { source_path },
-        } => {
-            assert_eq!(
-                source_path.as_deref(),
-                Some(std::path::Path::new("/state/external-codex-auth.json"))
-            );
-        }
-        _ => panic!("expected codex-auth import command"),
-    }
-}
-
-#[test]
-fn serve_uses_bounded_fetch_defaults() {
-    let cli = Cli::try_parse_from(["hellas", "serve"]).unwrap();
-    let Commands::Serve {
-        fetch_max_in_flight,
-        fetch_queue_size,
-        ..
-    } = cli.command
-    else {
-        panic!("serve");
-    };
-    assert_eq!(fetch_max_in_flight, hellas_rpc::DEFAULT_FETCH_MAX_IN_FLIGHT);
-    assert_eq!(fetch_queue_size, hellas_rpc::DEFAULT_FETCH_QUEUE_CAPACITY);
 }
 
 #[test]
@@ -485,7 +259,7 @@ fn metrics_address_defaults_to_loopback_and_accepts_an_explicit_ip() {
                 "::1",
             ),
         ] {
-            let target = ["--access", "friend.access"];
+            let target = ["--model", "model.gguf"];
             let cli = Cli::try_parse_from(
                 args.into_iter()
                     .chain(target.into_iter().filter(|_| command == "gateway")),
@@ -521,68 +295,6 @@ fn metrics_flags_require_the_otel_build() {
                 .expect("metrics flag must be absent");
             assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
         }
-    }
-}
-
-#[test]
-fn serve_admits_configured_programs_and_acknowledges_any_only_from_configuration() {
-    let manifest = format!(
-        "{}/{}",
-        hellas_rpc::protocol::invocation::compute::EVALUATOR,
-        "ab".repeat(32)
-    );
-    let Commands::Serve {
-        programs,
-        knowingly_unsafe,
-        ..
-    } = Cli::try_parse_from(["hellas", "serve", "--program", &manifest])
-        .unwrap()
-        .command
-    else {
-        panic!("serve")
-    };
-    assert_eq!(programs, vec![manifest.parse().unwrap()]);
-    assert!(!knowingly_unsafe);
-    // An acknowledgement for configuration that admits any program, never a mode.
-    for args in [
-        vec![
-            "hellas",
-            "serve",
-            "--knowingly-unsafe",
-            "--grant-config",
-            "g.json",
-        ],
-        vec![
-            "hellas",
-            "serve",
-            "--knowingly-unsafe",
-            "--paid-work-config",
-            "p.toml",
-        ],
-    ] {
-        assert!(Cli::try_parse_from(&args).is_ok(), "{args:?}");
-    }
-    for args in [
-        vec![
-            "hellas",
-            "serve",
-            "--program",
-            &manifest,
-            "--paid-work-config",
-            "p.toml",
-        ],
-        vec![
-            "hellas",
-            "serve",
-            "--program",
-            &manifest,
-            "--grant-config",
-            "g.json",
-        ],
-        vec!["hellas", "serve", "--program", "not-a-hash"],
-        vec!["hellas", "serve", "--await-owner"],
-    ] {
-        assert!(Cli::try_parse_from(&args).is_err(), "{args:?}");
     }
 }
 

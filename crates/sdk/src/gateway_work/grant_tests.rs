@@ -41,6 +41,7 @@ enum UsageReport {
     Missing,
 }
 struct FixtureBuilder {
+    two_resources: bool,
     usage: UsageReport,
     budget: u64,
     completion: Completion,
@@ -48,9 +49,19 @@ struct FixtureBuilder {
     paced_chunks: usize,
     hold_first: bool,
     max_job_millis: Option<u64>,
+    transport_key: u8,
+    max_in_flight: usize,
 }
 impl FixtureBuilder {
+    fn max_in_flight(mut self, limit: usize) -> Self {
+        self.max_in_flight = limit;
+        self
+    }
     /// Body chunks, and the usage chunk after them, each wait for `backend.pace`.
+    fn transport_key(mut self, key: u8) -> Self {
+        self.transport_key = key;
+        self
+    }
     fn hold_first(mut self) -> Self {
         self.hold_first = true;
         self
@@ -90,6 +101,13 @@ impl FixtureBuilder {
         let resource = &mut allowance.definition.policies[0];
         resource.name = "chat".into();
         use_https(resource, template.clone());
+        if self.two_resources {
+            let mut second = resource.clone();
+            second.resource =
+                hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"second"));
+            second.name = "second".into();
+            allowance.definition.policies.push(second);
+        }
         let mut events = Reply::http(
             200,
             "text/event-stream",
@@ -121,12 +139,13 @@ impl FixtureBuilder {
             ..Backend::default()
         };
         let host = crate::test_support::Host::builder()
+            .with_transport_key(self.transport_key)
             .with_allowance(allowance)
             .with_capacity(Capacity::new(2))
             .with_backend(backend)
             .build()
             .await;
-        // Every request opens its own session, over the provider's real transport.
+        // Requests share a session over the provider's real transport.
         let remote = host.remote().await;
         let addresses = remote.addresses();
         let transport = GrantTransport::Remote(
@@ -139,12 +158,32 @@ impl FixtureBuilder {
         );
         let options = host.options(addresses);
         let gateway = ExecutorGateway::new(
-            GatewayTarget::Grant {
-                policy: options.target.offer().grant.policies[0].clone(),
-                options,
-                transport,
-            },
-            Some(hellas_channel::test_support::channel::evaluator()),
+            options
+                .target
+                .offer()
+                .grant
+                .policies
+                .iter()
+                .enumerate()
+                .map(|(index, policy)| {
+                    (
+                        if index == 0 {
+                            "test".into()
+                        } else {
+                            "second".into()
+                        },
+                        BackendEntry {
+                            backend: crate::Backend::grant(
+                                policy.clone(),
+                                options.clone(),
+                                transport.clone(),
+                            ),
+                            evaluator: Some(hellas_channel::test_support::channel::evaluator()),
+                            max_in_flight: std::num::NonZeroUsize::new(self.max_in_flight).unwrap(),
+                        },
+                    )
+                })
+                .collect(),
             Arc::new(ProducerSigningKey::from_secret_bytes([8; 32]).unwrap()),
         );
         Fixture {
@@ -156,26 +195,31 @@ impl FixtureBuilder {
     }
 }
 impl Fixture {
-    fn options(&self) -> &crate::grant_client::GrantSessionOptions {
-        let GatewayTarget::Grant { options, .. } = self.gateway.target() else {
-            unreachable!("a grant fixture")
+    fn backend(&self) -> &crate::GrantBackend {
+        let BackendState::Grant(backend) = &self.gateway.backends["test"].state else {
+            panic!("expected a grant fixture");
         };
-        options
+        backend
     }
-    /// A fresh session on the gateway's channel, to read its client store.
-    async fn session(&self) -> GrantSession {
-        let GatewayTarget::Grant {
-            options, transport, ..
-        } = self.gateway.target()
-        else {
-            unreachable!("a grant fixture")
-        };
-        GrantSession::open(options.clone(), transport.clone())
-            .await
-            .unwrap()
+    fn options(&self) -> &crate::grant_client::GrantSessionOptions {
+        &self.backend().options
+    }
+    /// Inspect the channel's one retained journal under its proposal mutex.
+    async fn session(&self) -> tokio::sync::MappedMutexGuard<'_, GrantSession> {
+        let backend = self.backend();
+        let mut guard = backend.channel.session.lock().await;
+        if guard.is_none() {
+            *guard = Some(
+                GrantSession::open(backend.options.clone(), backend.transport.clone())
+                    .await
+                    .unwrap(),
+            );
+        }
+        tokio::sync::MutexGuard::map(guard, |session| session.as_mut().unwrap())
     }
     fn builder() -> FixtureBuilder {
         FixtureBuilder {
+            two_resources: false,
             usage: UsageReport::Reported,
             budget: 10,
             completion: Completion::Immediate,
@@ -183,14 +227,13 @@ impl Fixture {
             paced_chunks: 0,
             hold_first: false,
             max_job_millis: None,
+            transport_key: 5,
+            max_in_flight: 32,
         }
     }
     async fn command(&self, command: WorkControlCommand) -> WorkControlReply {
         hellas_authority::grant_service::WorkAdministration::new(
             self.host.world.service.clone(),
-            hellas_authority::test_support::common_node::configuration(
-                self.host.allowance.policies.clone(),
-            ),
             self.host.allowance.max_job_millis,
         )
         .execute(
@@ -204,25 +247,17 @@ impl Fixture {
     async fn http(&self) -> Http {
         let access = self.host.gateway_access().await;
         let bearer = access.bearer();
-        let server = hellas_gateway::start(hellas_gateway::GatewayOptions {
-            server: hellas_gateway::ServerOptions {
-                archive: hellas_gateway::ArchiveOptions {
-                    directory: self.host.root.path().join("archive"),
-                    zdr: true,
-                },
-                host: "127.0.0.1".into(),
-                port: Some(0),
-                access,
-                allow_remote: false,
-                wrap: None,
-                wrap_args: vec![],
+        let server = crate::test_support::server::serve(
+            self.host.world.service.node(),
+            bearer.clone(),
+            hellas_gateway::ArchiveOptions {
+                directory: self.host.root.path().join("archive"),
+                zdr: true,
             },
-            work: self.gateway.clone(),
-            presentations: hellas_gateway::Presentations {
-                http: self.gateway.target().http_config().unwrap(),
-                ..Default::default()
-            },
-        })
+            self.gateway.clone(),
+            self.gateway.jobs.clone(),
+            routes(&self.gateway.backends["test"], "test"),
+        )
         .await
         .unwrap();
         Http {
@@ -251,16 +286,17 @@ impl Fixture {
             max_response_bytes: template.max_response_bytes,
         };
         WorkFetchRequest {
-            resource: None,
-            channel: None,
-            provider: self.gateway.target().provider().unwrap().unwrap(),
             service: "openai".into(),
             method: "responses".into(),
             body: serde_json::to_vec(&http).unwrap(),
         }
     }
     async fn result(&self, cap: Option<u64>) -> Result<(), WorkGatewayError> {
-        let mut stream = self.gateway.fetch(self.request(cap))?;
+        let mut stream = self.gateway.fetch(
+            "test",
+            crate::test_support::request_job(&self.gateway.jobs),
+            self.request(cap),
+        )?;
         let mut terminal = false;
         while let Some(event) = stream.next().await {
             terminal |= matches!(event?, WorkEvent::Output(event) if event.terminal().is_some());
@@ -277,7 +313,14 @@ impl Fixture {
 #[tokio::test]
 async fn delivered_transcripts_verify_against_the_accepting_provider() {
     let fixture = Fixture::builder().build().await;
-    let mut stream = fixture.gateway.fetch(fixture.request(None)).unwrap();
+    let mut stream = fixture
+        .gateway
+        .fetch(
+            "test",
+            crate::test_support::request_job(&fixture.gateway.jobs),
+            fixture.request(None),
+        )
+        .unwrap();
     let mut events = Vec::new();
     while let Some(event) = within(stream.next()).await {
         events.push(event.unwrap());
@@ -345,9 +388,13 @@ async fn resource_repair_precedes_client_signing() {
         .inspect_request(inspect_chat)
         .build()
         .await;
-    let config = fixture.gateway.target().http_config().unwrap().unwrap();
-    assert_eq!(config.routes[0].max_response_bytes, 4096);
-    assert_eq!(config.routes[0].tls, fixture.template.tls);
+    let config = routes(&fixture.gateway.backends["test"], "test");
+    let hellas_gateway::Presentation::Http { targets } = &config[0].presentation else {
+        panic!("HTTP route")
+    };
+    let route = &targets["test"].route;
+    assert_eq!(route.max_response_bytes, 4096);
+    assert_eq!(route.tls, fixture.template.tls);
     fixture.result(None).await.unwrap();
     assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 1);
     fixture.shutdown().await;
@@ -356,7 +403,14 @@ async fn resource_repair_precedes_client_signing() {
 #[tokio::test]
 async fn disconnected_consumers_do_not_abandon_accepted_work() {
     let fixture = Fixture::builder().hold_completion().build().await;
-    let mut stream = fixture.gateway.fetch(fixture.request(None)).unwrap();
+    let mut stream = fixture
+        .gateway
+        .fetch(
+            "test",
+            crate::test_support::request_job(&fixture.gateway.jobs),
+            fixture.request(None),
+        )
+        .unwrap();
     assert!(matches!(
         within(stream.next()).await.unwrap().unwrap(),
         WorkEvent::Accepted(_)
@@ -380,18 +434,19 @@ async fn disconnected_consumers_do_not_abandon_accepted_work() {
     assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 1);
     drop(stream);
     fixture.host.backend.finish.release();
+    let queued = crate::test_support::request_job(&fixture.gateway.jobs);
     fixture.gateway.drain().await.unwrap();
     assert_eq!(fixture.host.backend.slots.available_permits(), 2);
     assert_err!(
-        fixture.gateway.fetch(fixture.request(None)),
-        WorkGatewayError::Busy(_)
+        fixture.gateway.fetch("test", queued, fixture.request(None)),
+        WorkGatewayError::PreProposal(error) if matches!(*error, WorkGatewayError::Busy(_))
     );
 }
 
 #[tokio::test]
 async fn requests_above_the_resource_cap_do_not_execute() {
     let fixture = Fixture::builder().build().await;
-    assert_err!(fixture.result(Some(7)).await, WorkGatewayError::Rejected(_));
+    assert_err!(fixture.result(Some(7)).await, WorkGatewayError::PreProposal(error) if matches!(*error, WorkGatewayError::Rejected(_)));
     assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 0);
     fixture.shutdown().await;
 }
@@ -420,7 +475,7 @@ async fn paused_terms_are_denied_at_the_gateway() {
             terms,
         })
         .await;
-    assert_err!(fixture.result(None).await, WorkGatewayError::Denied(_));
+    assert_err!(fixture.result(None).await, WorkGatewayError::PreProposal(error) if matches!(*error, WorkGatewayError::Denied(_)));
     assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 0);
     fixture.shutdown().await;
 }
@@ -439,8 +494,15 @@ async fn refreshed_https_bounds_are_checked_before_proposal() {
             3 => https.paths = vec!["/changed".into()],
             _ => https.max_response_bytes = 128,
         }
-        let guard = fixture.gateway.inner.serial.lock().await;
-        let mut stream = fixture.gateway.fetch(fixture.request(Some(6))).unwrap();
+        let guard = fixture.backend().channel.session.lock().await;
+        let mut stream = fixture
+            .gateway
+            .fetch(
+                "test",
+                crate::test_support::request_job(&fixture.gateway.jobs),
+                fixture.request(Some(6)),
+            )
+            .unwrap();
         let admin = hellas_authority::test_support::common_node::WorkAdmin::new(
             fixture.host.world.service.clone(),
             fixture.host.world.secret(ROOT),
@@ -468,36 +530,6 @@ async fn refreshed_https_bounds_are_checked_before_proposal() {
         assert_eq!(fixture.session().await.store().next_nonce().unwrap(), 1);
         fixture.shutdown().await;
     }
-}
-
-#[tokio::test]
-async fn wrong_resource_or_channel_never_reaches_a_proposal() {
-    let fixture = Fixture::builder().build().await;
-    let resource = fixture.host.allowance.policies[0].resource;
-    let channel = super::channel(fixture.options()).unwrap();
-    for (selected_resource, selected_channel) in [
-        (
-            Some(hellas_auth::authority::ResourceId(
-                hellas_auth::Digest::hash(b"other"),
-            )),
-            Some(channel),
-        ),
-        (
-            Some(resource),
-            Some(hellas_channel::model::grant::ChannelId(
-                hellas_auth::Digest::hash(b"other"),
-            )),
-        ),
-        (Some(resource), None),
-    ] {
-        let mut request = fixture.request(None);
-        request.resource = selected_resource;
-        request.channel = selected_channel;
-        assert!(fixture.gateway.fetch(request).is_err());
-    }
-    assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 0);
-    assert_eq!(fixture.session().await.store().next_nonce().unwrap(), 1);
-    fixture.shutdown().await;
 }
 
 #[tokio::test]
@@ -555,8 +587,15 @@ async fn reused_policy_name_cannot_retarget_an_in_flight_request() {
     let mut replacement = old.clone();
     replacement.resource =
         hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"replacement"));
-    let guard = fixture.gateway.inner.serial.lock().await;
-    let mut stream = fixture.gateway.fetch(fixture.request(None)).unwrap();
+    let guard = fixture.backend().channel.session.lock().await;
+    let mut stream = fixture
+        .gateway
+        .fetch(
+            "test",
+            crate::test_support::request_job(&fixture.gateway.jobs),
+            fixture.request(None),
+        )
+        .unwrap();
     let admin = hellas_authority::test_support::common_node::WorkAdmin::new(
         fixture.host.world.service.clone(),
         fixture.host.world.secret(ROOT),
@@ -586,7 +625,7 @@ async fn reused_policy_name_cannot_retarget_an_in_flight_request() {
 }
 
 struct Http {
-    server: hellas_gateway::GatewayHandle,
+    server: crate::test_support::server::Server,
     bearer: String,
     client: reqwest::Client,
 }
@@ -627,9 +666,13 @@ async fn repaired_resources_are_usable_through_the_gateway() {
         .build()
         .await;
     // L2 owns the quarantine threshold and counters; arrange that state through Work.
-    for _ in 0..3 {
+    for _ in 0..2 {
         fixture.result(None).await.unwrap();
     }
+    assert_err!(fixture.result(None).await, WorkGatewayError::Denied(error)
+        if matches!(error.downcast_ref::<crate::grant_client::GrantClientError>(),
+            Some(crate::grant_client::GrantClientError::Refused { code: hellas_rpc::pb::work::GrantRefusalCode::Quarantined, .. })));
+    assert!(!fixture.gateway.backends()[0].down);
     let http = fixture.http().await;
     assert_eq!(http.status().await, reqwest::StatusCode::FORBIDDEN);
     let WorkControlReply::Resource {
@@ -646,6 +689,7 @@ async fn repaired_resources_are_usable_through_the_gateway() {
     };
     assert!(quarantined);
     let calls = fixture.host.backend.calls.load(Ordering::SeqCst);
+    assert_eq!(calls, 3);
     fixture
         .command(WorkControlCommand::RepairResource {
             policy: "chat".into(),
@@ -669,7 +713,14 @@ async fn streams_outlast_the_control_timeout_while_they_progress() {
         .build()
         .await;
     let pace = fixture.host.backend.pace.clone().unwrap();
-    let mut stream = fixture.gateway.fetch(fixture.request(None)).unwrap();
+    let mut stream = fixture
+        .gateway
+        .fetch(
+            "test",
+            crate::test_support::request_job(&fixture.gateway.jobs),
+            fixture.request(None),
+        )
+        .unwrap();
     assert!(matches!(
         within(stream.next()).await.unwrap().unwrap(),
         WorkEvent::Accepted(_)
@@ -710,7 +761,14 @@ async fn silent_first_result_outlasts_the_control_timeout() {
         .with_max_job_millis(60_000)
         .build()
         .await;
-    let mut stream = fixture.gateway.fetch(fixture.request(None)).unwrap();
+    let mut stream = fixture
+        .gateway
+        .fetch(
+            "test",
+            crate::test_support::request_job(&fixture.gateway.jobs),
+            fixture.request(None),
+        )
+        .unwrap();
     within(fixture.host.backend.started.notified()).await;
     assert!(matches!(
         within(stream.next()).await.unwrap().unwrap(),
@@ -740,7 +798,14 @@ async fn silent_later_result_outlasts_the_control_timeout() {
         .with_max_job_millis(60_000)
         .build()
         .await;
-    let mut stream = fixture.gateway.fetch(fixture.request(None)).unwrap();
+    let mut stream = fixture
+        .gateway
+        .fetch(
+            "test",
+            crate::test_support::request_job(&fixture.gateway.jobs),
+            fixture.request(None),
+        )
+        .unwrap();
     // The acceptance, then the response head.
     for _ in 0..2 {
         within(stream.next()).await.unwrap().unwrap();
@@ -771,7 +836,14 @@ async fn silent_work_still_ends_at_the_signed_deadline() {
         .with_max_job_millis(20_000)
         .build()
         .await;
-    let mut stream = fixture.gateway.fetch(fixture.request(None)).unwrap();
+    let mut stream = fixture
+        .gateway
+        .fetch(
+            "test",
+            crate::test_support::request_job(&fixture.gateway.jobs),
+            fixture.request(None),
+        )
+        .unwrap();
     within(fixture.host.backend.started.notified()).await;
     assert!(matches!(
         within(stream.next()).await.unwrap().unwrap(),
@@ -809,15 +881,18 @@ async fn silent_work_still_ends_at_the_signed_deadline() {
 async fn queued_requests_wait_without_a_deadline_and_cancel_on_disconnect() {
     let fixture = Fixture::builder().build().await;
     for disconnect in [false, true] {
-        let held = fixture.gateway.inner.serial.lock().await;
-        let job = fixture
-            .gateway
-            .inner
-            .target
+        let held = fixture.backend().channel.session.lock().await;
+        let job = fixture.gateway.backends["test"]
             .job(&WorkRequest::Fetch(fixture.request(None)))
             .unwrap();
-        let (requester, stream) = Requester::<OutputEvent, WorkGatewayError>::new();
-        let run = fixture.gateway.inner.run(job, requester);
+        let (requester, stream) =
+            Requester::<OutputEvent, WorkGatewayError>::new(crate::test_support::job());
+        let run = fixture.gateway.backends["test"].run(
+            WorkRequest::Job(job.input().clone()),
+            requester,
+            &fixture.gateway.signer,
+            fixture.gateway.backends["test"].use_session(),
+        );
         tokio::pin!(run);
         assert!(futures::poll!(run.as_mut()).is_pending());
         tokio::time::pause();
@@ -828,7 +903,7 @@ async fn queued_requests_wait_without_a_deadline_and_cancel_on_disconnect() {
             drop(stream);
             // Finish while the other request still owns the mutex.
             within(run).await.unwrap();
-            assert_eq!(fixture.session().await.store().next_nonce().unwrap(), 2);
+            assert_eq!(held.as_ref().unwrap().store().next_nonce().unwrap(), 2);
             drop(held);
         } else {
             drop(held);
@@ -882,15 +957,18 @@ async fn disconnect_during_control_does_not_propose() {
     let fixture = Fixture::builder().build().await;
     let node = fixture.host.world.service.node();
     let held = hellas_authority::test_support::hold_writer(&node).await;
-    let job = fixture
-        .gateway
-        .inner
-        .target
+    let job = fixture.gateway.backends["test"]
         .job(&WorkRequest::Fetch(fixture.request(None)))
         .unwrap();
-    let (requester, stream) = Requester::<OutputEvent, WorkGatewayError>::new();
+    let (requester, stream) =
+        Requester::<OutputEvent, WorkGatewayError>::new(crate::test_support::job());
     {
-        let run = fixture.gateway.inner.run(job, requester);
+        let run = fixture.gateway.backends["test"].run(
+            WorkRequest::Job(job.input().clone()),
+            requester,
+            &fixture.gateway.signer,
+            fixture.gateway.backends["test"].use_session(),
+        );
         tokio::pin!(run);
         assert!(futures::poll!(run.as_mut()).is_pending());
         drop(stream);
@@ -935,36 +1013,28 @@ async fn single_signed_model_responses_route_tracks_continuation() {
         .bind()
         .await
         .unwrap();
-    let gateway = ExecutorGateway::new(
-        GatewayTarget::Grant {
-            policy: options.target.offer().grant.policies[0].clone(),
+    let gateway = crate::test_support::gateway(
+        crate::Backend::grant(
+            options.target.offer().grant.policies[0].clone(),
             options,
-            transport: GrantTransport::Remote(endpoint),
-        },
+            GrantTransport::Remote(endpoint),
+        ),
         Some(hellas_channel::test_support::channel::evaluator()),
         Arc::new(ProducerSigningKey::from_secret_bytes([8; 32]).unwrap()),
     );
     let access = host.gateway_access().await;
     let bearer = access.bearer();
-    let server = hellas_gateway::start(hellas_gateway::GatewayOptions {
-        server: hellas_gateway::ServerOptions {
-            archive: hellas_gateway::ArchiveOptions {
-                directory: host.root.path().join("archive"),
-                zdr: true,
-            },
-            host: "127.0.0.1".into(),
-            port: Some(0),
-            access,
-            allow_remote: false,
-            wrap: None,
-            wrap_args: vec![],
+    let server = crate::test_support::server::serve(
+        host.world.service.node(),
+        bearer.clone(),
+        hellas_gateway::ArchiveOptions {
+            directory: host.root.path().join("archive"),
+            zdr: true,
         },
-        work: gateway.clone(),
-        presentations: hellas_gateway::Presentations {
-            http: gateway.target().http_config().unwrap(),
-            ..Default::default()
-        },
-    })
+        gateway.clone(),
+        gateway.jobs.clone(),
+        routes(&gateway.backends["test"], "test"),
+    )
     .await
     .unwrap();
     let client = reqwest::Client::new();
@@ -992,7 +1062,7 @@ async fn single_signed_model_responses_route_tracks_continuation() {
 /// a rerun of its attempt delivers the retained result without executing.
 #[tokio::test]
 async fn the_command_executor_runs_a_grant_once_and_replays_it() {
-    use crate::execution::{ExecutionAttempt, ExecutionTerms, Executor, GrantExecution, stop_on};
+    use crate::execution::{ExecutionAttempt, ExecutionTerms, Executor, stop_on};
     let template = chat_resource("https://private.fixture", 6);
     let mut allowance = Allowance::responses(ids::ALLOWANCE, FRIEND);
     use_https(&mut allowance.definition.policies[0], template.clone());
@@ -1021,12 +1091,6 @@ async fn the_command_executor_runs_a_grant_once_and_replays_it() {
         max_response_bytes: template.max_response_bytes,
     };
     let input = WorkRequest::Fetch(WorkFetchRequest {
-        resource: None,
-        channel: None,
-        provider: iroh::EndpointId::from_bytes(
-            &grant_transport(&options.target.offer().provider).unwrap(),
-        )
-        .unwrap(),
         service: "openai".into(),
         method: "responses".into(),
         body: serde_json::to_vec(&http).unwrap(),
@@ -1048,12 +1112,16 @@ async fn the_command_executor_runs_a_grant_once_and_replays_it() {
     let signer = ProducerSigningKey::generate();
     let run = |attempt| {
         let delivered = delivered.clone();
-        Executor::Grant(GrantExecution {
-            options: options.clone(),
-            transport: GrantTransport::Local(host.world.service.clone()),
-            resource: policy.resource,
+        Executor {
+            backend: crate::Backend::grant(
+                policy.clone(),
+                options.clone(),
+                GrantTransport::Local(host.world.service.clone()),
+            ),
+            funding: Default::default(),
             attempt: Some(attempt),
-        })
+            settle: false,
+        }
         .run(
             &job,
             &signer,
@@ -1085,4 +1153,367 @@ async fn the_command_executor_runs_a_grant_once_and_replays_it() {
             .unwrap()
             .reported
     );
+}
+
+#[tokio::test]
+async fn two_grant_nodes_fail_over_before_proposal_and_rejoin_on_demand() {
+    let mut first = Fixture::builder()
+        .with_budget(40)
+        .hold_completion()
+        .build()
+        .await;
+    let second = Fixture::builder()
+        .transport_key(6)
+        .with_budget(40)
+        .hold_completion()
+        .build()
+        .await;
+    let address = first
+        .remote
+        .endpoint
+        .bound_sockets()
+        .into_iter()
+        .next()
+        .unwrap();
+    let entry = |fixture: &Fixture| {
+        let mut backend = fixture.gateway.backends["test"].as_ref().clone();
+        if let BackendState::Grant(grant) = &mut backend.state {
+            grant.options.control_timeout = Duration::from_millis(500);
+        }
+        crate::BackendEntry {
+            backend,
+            evaluator: None,
+            max_in_flight: std::num::NonZeroUsize::new(1).unwrap(),
+        }
+    };
+    let work = ExecutorGateway::new(
+        [
+            ("first".into(), entry(&first)),
+            ("second".into(), entry(&second)),
+        ]
+        .into(),
+        first.options().signer.clone(),
+    );
+    let mut routes = routes(&first.gateway.backends["test"], "first");
+    for route in &mut routes {
+        route.backends.push("second".into());
+        if let hellas_gateway::Presentation::Http { targets } = &mut route.presentation {
+            targets.insert("second".into(), targets.values().next().unwrap().clone());
+        }
+    }
+    let access = first.host.gateway_access().await;
+    let bearer = access.bearer();
+    let server = crate::test_support::server::serve(
+        first.host.world.service.node(),
+        bearer.clone(),
+        hellas_gateway::ArchiveOptions {
+            directory: first.host.root.path().join("archive"),
+            zdr: true,
+        },
+        work.clone(),
+        work.jobs.clone(),
+        routes,
+    )
+    .await
+    .unwrap();
+    first.remote.shutdown().await;
+    let client = reqwest::Client::new();
+    let send = || {
+        client
+            .post(format!(
+                "http://{}{}",
+                server.address(),
+                first.template.paths[0]
+            ))
+            .bearer_auth(&bearer)
+            .json(&serde_json::json!({"messages":[],"stream":true}))
+            .send()
+    };
+    let response = within(send()).await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(first.host.backend.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(second.host.backend.calls.load(Ordering::SeqCst), 1);
+    assert!(
+        work.backends()
+            .iter()
+            .find(|backend| backend.id == "first")
+            .unwrap()
+            .down
+    );
+    // No probe or delay recovers a Down backend: with the live backend full,
+    // the next request tries it once and its successful open marks it Up.
+    first.remote = first.host.remote_at(address).await;
+    let returned = within(send()).await.unwrap();
+    assert_eq!(returned.status(), reqwest::StatusCode::OK);
+    assert_eq!(first.host.backend.calls.load(Ordering::SeqCst), 1);
+    assert!(
+        !work
+            .backends()
+            .iter()
+            .find(|backend| backend.id == "first")
+            .unwrap()
+            .down
+    );
+    first.host.backend.finish.release();
+    second.host.backend.finish.release();
+    within(response.bytes()).await.unwrap();
+    within(returned.bytes()).await.unwrap();
+    server.shutdown().await.unwrap();
+    first.shutdown().await;
+    second.shutdown().await;
+}
+
+#[tokio::test]
+async fn grant_jobs_overlap_and_finish_after_disconnect() {
+    grant_concurrency(false).await;
+}
+
+#[tokio::test]
+async fn cancelled_grant_delivery_keeps_accepted_work() {
+    grant_concurrency(true).await;
+}
+
+async fn grant_concurrency(cancel: bool) {
+    let fixture = Fixture::builder()
+        .max_in_flight(2)
+        .with_budget(100)
+        .hold_completion()
+        .build()
+        .await;
+    let first_job = crate::test_support::request_job(&fixture.gateway.jobs);
+    let mut first = fixture
+        .gateway
+        .fetch("test", first_job.clone(), fixture.request(None))
+        .unwrap();
+    let mut second = fixture
+        .gateway
+        .fetch(
+            "test",
+            crate::test_support::request_job(&fixture.gateway.jobs),
+            fixture.request(None),
+        )
+        .unwrap();
+    let accepted = |event| match event {
+        WorkEvent::Accepted(provenance) => {
+            hellas_auth::Digest::from_bytes(provenance.commitment_id)
+        }
+        _ => panic!("acceptance must be first"),
+    };
+    let first_id = accepted(within(first.next()).await.unwrap().unwrap());
+    let second_id = accepted(within(second.next()).await.unwrap().unwrap());
+    assert_ne!(first_id, second_id);
+    for stream in [&mut first, &mut second] {
+        assert!(matches!(
+            within(stream.next()).await.unwrap().unwrap(),
+            WorkEvent::Output(_)
+        ));
+    }
+    assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(fixture.gateway.backends()[0].in_flight, 2);
+    assert!(matches!(
+        fixture.gateway.fetch(
+            "test",
+            crate::test_support::request_job(&fixture.gateway.jobs),
+            fixture.request(None)
+        ),
+        Err(WorkGatewayError::PreProposal(_))
+    ));
+    {
+        let session = fixture.session().await;
+        let first = session
+            .store()
+            .book()
+            .job_by_id(first_id)
+            .unwrap()
+            .authorization()
+            .proposal_nonce;
+        let second = session
+            .store()
+            .book()
+            .job_by_id(second_id)
+            .unwrap()
+            .authorization()
+            .proposal_nonce;
+        assert_eq!([first.min(second), first.max(second)], [1, 2]);
+        assert_eq!(session.store().next_nonce().unwrap(), 3);
+    }
+    if cancel {
+        assert!(fixture.gateway.jobs.cancel(first_job.id()));
+        assert!(within(first.next()).await.is_none());
+    }
+    drop(first);
+    fixture.host.backend.finish.release();
+    fixture.host.backend.finish.release();
+    let mut terminal = false;
+    while let Some(event) = within(second.next()).await {
+        terminal |=
+            matches!(event.unwrap(), WorkEvent::Output(event) if event.terminal().is_some());
+    }
+    assert!(terminal);
+    fixture.gateway.drain().await.unwrap();
+    assert_eq!(fixture.host.backend.slots.available_permits(), 2);
+    fixture.remote.shutdown().await;
+}
+
+#[tokio::test]
+async fn resources_from_one_grant_share_a_sequential_nonce_history() {
+    resources_from_one_grant(false).await;
+}
+#[tokio::test]
+async fn resources_from_one_grant_can_execute_concurrently() {
+    resources_from_one_grant(true).await;
+}
+async fn resources_from_one_grant(concurrent: bool) {
+    let fixture = FixtureBuilder {
+        two_resources: true,
+        completion: if concurrent {
+            Completion::Permits(Arc::new(Semaphore::new(0)))
+        } else {
+            Completion::Immediate
+        },
+        ..Fixture::builder().with_budget(100).max_in_flight(2)
+    }
+    .build()
+    .await;
+    let send = |id| {
+        fixture
+            .gateway
+            .fetch(
+                id,
+                crate::test_support::request_job(&fixture.gateway.jobs),
+                fixture.request(None),
+            )
+            .unwrap()
+    };
+    let finish = |mut stream: hellas_gateway::WorkFetchStream| async move {
+        let mut terminal = false;
+        while let Some(event) = within(stream.next()).await {
+            terminal |=
+                matches!(event.unwrap(), WorkEvent::Output(event) if event.terminal().is_some());
+        }
+        assert!(terminal);
+    };
+    if concurrent {
+        let mut first = send("test");
+        let mut second = send("second");
+        assert!(matches!(
+            within(first.next()).await.unwrap().unwrap(),
+            WorkEvent::Accepted(_)
+        ));
+        assert!(matches!(
+            within(second.next()).await.unwrap().unwrap(),
+            WorkEvent::Accepted(_)
+        ));
+        let next = ExecutorGateway::prepare(
+            Default::default(),
+            fixture.gateway.signer.clone(),
+            fixture.gateway.jobs.clone(),
+            Some(&fixture.gateway),
+            &["second".into()].into(),
+        );
+        fixture.gateway.retire(&next).await.unwrap();
+        fixture.host.backend.finish.release();
+        fixture.host.backend.finish.release();
+        futures::join!(finish(first), finish(second));
+    } else {
+        finish(send("test")).await;
+        finish(send("second")).await;
+    }
+    assert_eq!(fixture.session().await.store().next_nonce().unwrap(), 3);
+    assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 2);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn sharing_a_channel_does_not_reuse_replaced_credentials() {
+    let fixture = Fixture::builder().with_budget(100).build().await;
+    fixture.result(None).await.unwrap();
+    let old = fixture.options();
+    let mut options = old.clone();
+    options.application = Arc::new(crate::node_control::profile::ClientProfile {
+        authority: old.application.authority,
+        authorization: old.application.authorization,
+        credential: hellas_auth::authority::CredentialSecret::from_parts(
+            old.application.credential.id(),
+            [0; 32],
+        ),
+        local: None,
+    });
+    let next = ExecutorGateway::prepare(
+        [(
+            "test".into(),
+            BackendEntry {
+                backend: crate::Backend::grant(
+                    fixture.backend().policy.clone(),
+                    options,
+                    fixture.backend().transport.clone(),
+                ),
+                evaluator: None,
+                max_in_flight: std::num::NonZeroUsize::new(1).unwrap(),
+            },
+        )]
+        .into(),
+        fixture.gateway.signer.clone(),
+        fixture.gateway.jobs.clone(),
+        Some(&fixture.gateway),
+        &Default::default(),
+    );
+    let events = next
+        .fetch(
+            "test",
+            crate::test_support::request_job(&next.jobs),
+            fixture.request(None),
+        )
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+    assert!(
+        events.iter().any(Result::is_err),
+        "replacement must authenticate its own credential"
+    );
+    assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 1);
+    next.drain().await.unwrap();
+    fixture.shutdown().await;
+}
+
+fn routes(backend: &super::Backend, id: &str) -> Vec<hellas_gateway::Route> {
+    let BackendState::Grant(grant) = &backend.state else {
+        panic!("expected grant backend")
+    };
+    grant_routes(&grant.policy, id).unwrap()
+}
+
+#[tokio::test]
+async fn watch_reports_health_for_every_resource_on_a_shared_grant() {
+    let fixture = FixtureBuilder {
+        two_resources: true,
+        ..Fixture::builder().with_budget(100)
+    }
+    .build()
+    .await;
+    let (_, mut events) = fixture.gateway.jobs.watch(|_| ());
+    for down in [true, false] {
+        fixture
+            .gateway
+            .backend("test")
+            .unwrap()
+            .health(down.then(|| "session failed".into()));
+        let mut ids = std::collections::BTreeSet::new();
+        while let Ok(hellas_gateway::jobs::Event::Backend {
+            id, down: observed, ..
+        }) = events.try_recv()
+        {
+            assert_eq!(observed, down);
+            ids.insert(id);
+        }
+        assert_eq!(ids, ["test".into(), "second".into()].into());
+        assert!(
+            fixture
+                .gateway
+                .backends()
+                .iter()
+                .all(|backend| backend.down == down)
+        );
+    }
+    fixture.shutdown().await;
 }

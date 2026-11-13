@@ -111,7 +111,7 @@ impl Observation {
             self.backend = Some(name.into());
         }
     }
-    pub(super) fn bind_response(&mut self, binding: Option<super::routing::ResponseBinding>) {
+    pub(super) fn bind_response(&mut self, binding: Option<crate::routing::ResponseBinding>) {
         self.usage.observe(binding.map(|binding| {
             std::sync::Arc::new(move |value: &serde_json::Value| binding.observe(value)) as _
         }));

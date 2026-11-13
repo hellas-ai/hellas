@@ -167,6 +167,19 @@ pub trait SendHalf: Send {
     fn send_body(&mut self, payload: Bytes)
     -> impl Future<Output = Result<(), Self::Error>> + Send;
 
+    /// Send a public terminal refusal and close with no metadata. Unlike result
+    /// bytes, a refusal does not require delivery authority. Call only between
+    /// completed body writes; a failed protected write cannot be resumed here.
+    fn refuse(&mut self, _payload: Bytes) -> impl Future<Output = std::io::Result<()>> + Send {
+        self.reset(WireCode::PermissionDenied);
+        async {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "carrier cannot send a refusal",
+            ))
+        }
+    }
+
     /// Close the send direction, optionally with a trailer.
     fn close_send(
         &mut self,

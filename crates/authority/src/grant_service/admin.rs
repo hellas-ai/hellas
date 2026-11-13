@@ -8,7 +8,7 @@ use crate::work_store::grant::{
 };
 use hellas_auth::authority::{AuthenticatedCaller, GrantId as Authorization};
 use hellas_auth::authority::{GrantId, Revision, UnixMillis};
-use std::{num::NonZeroU64, sync::Arc};
+use std::num::NonZeroU64;
 
 /// One Work administration service assembled with the host's validated
 /// configuration. Callers supply operations, never a replacement catalogue,
@@ -16,7 +16,6 @@ use std::{num::NonZeroU64, sync::Arc};
 #[derive(Clone)]
 pub struct WorkAdministration {
     service: GrantService,
-    configuration: Arc<configuration::NodeConfiguration>,
     max_job_millis: NonZeroU64,
 }
 enum ChangeReply {
@@ -26,32 +25,13 @@ enum ChangeReply {
 }
 
 impl WorkAdministration {
-    pub fn new(
-        service: GrantService,
-        configuration: configuration::NodeConfiguration,
-        max_job_millis: NonZeroU64,
-    ) -> Self {
+    pub fn new(service: GrantService, max_job_millis: NonZeroU64) -> Self {
         Self {
             service,
-            configuration: Arc::new(configuration),
             max_job_millis,
         }
     }
 
-    /// Apply the host's configuration to an initialized authority. The host is
-    /// its own operator here: no caller, audited as host configuration.
-    pub async fn reconcile(&self) -> Result<(), NodeStoreError> {
-        let mut decision = crate::audit::Decision::new("host.configuration", None, None);
-        let configuration = self.configuration.clone();
-        let result = self
-            .service
-            .administer(async |store, now| {
-                decision.observe(store.state().authority(), None, now);
-                store.reconcile(&configuration, now).await
-            })
-            .await;
-        decision.finish(result)
-    }
     pub fn node(&self) -> crate::node::NodeCoordinator {
         self.service.node()
     }
