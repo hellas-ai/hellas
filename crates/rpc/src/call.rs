@@ -989,8 +989,7 @@ where
             let request = M::Request::decode(&req_bytes[..])
                 .map_err(|error| TransportError::Protocol(format!("prost decode: {error}")))?;
             let handled =
-                await_unary_handler(&mut send, handler(request, inbound.context), &operation)
-                    .await?;
+                await_response(&mut send, handler(request, inbound.context), &operation).await?;
             if let Some(ms) = worked.ms() {
                 tracing::event!(
                     name: "response_worker_ms",
@@ -1058,7 +1057,7 @@ async fn write_trailer<S: SendHalf>(
     Ok(())
 }
 
-async fn await_unary_handler<S: SendHalf, F: std::future::Future>(
+async fn await_response<S: SendHalf, F: std::future::Future>(
     send: &mut S,
     handler: F,
     call: &CallSpan,
@@ -1114,18 +1113,7 @@ async fn write_streaming_response<S: SendHalf, R: Message>(
             .map_err(|error| TransportError::Io(format!("response authority: {error}")))?;
     }
     loop {
-        let next = match futures_util::future::select(
-            Box::pin(responses.next()),
-            Box::pin(send.stopped()),
-        )
-        .await
-        {
-            futures_util::future::Either::Left((next, _)) => next,
-            futures_util::future::Either::Right(_) => {
-                call.finish(WireCode::Cancelled);
-                return Err(TransportError::Io("response consumer disconnected".into()));
-            }
-        };
+        let next = await_response(send, responses.next(), call).await?;
         let Some(response) = next else {
             break;
         };
@@ -1197,8 +1185,7 @@ where
             let request = M::Request::decode(&req_bytes[..])
                 .map_err(|e| TransportError::Protocol(format!("prost decode: {e}")))?;
 
-            let handled =
-                await_unary_handler(&mut send, handler(request, context), &operation).await?;
+            let handled = await_response(&mut send, handler(request, context), &operation).await?;
             write_unary_response(&mut send, handled.map(Into::into), &operation).await
         },
         span,

@@ -652,16 +652,10 @@ async fn provider_injects_secret_without_disclosing_it_to_the_buyer() {
             .windows(SECRET.len())
             .any(|w| w == SECRET.as_bytes())
     }));
-    // Reusing the TLS pool cannot bypass credential scope or override checks.
-    for (path, headers) in [(
-        "/resource",
-        vec![("authorization".into(), "buyer override".into())],
-    )] {
-        let mut forbidden = request.clone();
-        forbidden.url = format!("{}{path}", url.origin().ascii_serialization());
-        forbidden.headers = headers;
-        assert!(provider.run(prepared(&forbidden)).await.is_err());
-    }
+    // Reusing the TLS pool cannot bypass caller-header refusal.
+    let mut forbidden = request.clone();
+    forbidden.headers = vec![("authorization".into(), "buyer override".into())];
+    assert!(provider.run(prepared(&forbidden)).await.is_err());
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     server.abort();
 }

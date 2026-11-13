@@ -1007,7 +1007,13 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let response = fixture::accept_uploaded_service(&service, &proposal).await;
+            fixture::seed_content(
+                &mut service.endpoint().await.unwrap().close.store,
+                PaidJobAuthorizationV2::decode(&proposal.authorization).unwrap(),
+                input.canonical_bytes().unwrap().into(),
+            )
+            .await;
+            let response = service.accept(&proposal, None).await;
             let work = client.accepted(&response).await.unwrap();
             let mut provider = service.endpoint().await.unwrap();
             provider.begin_run(work, &ready).await.unwrap();
@@ -1086,17 +1092,24 @@ mod tests {
         let service = WorkService::new(provider);
         let mut jobs = Vec::new();
         for nonce in 1..=2 {
+            let input = fixture::bundle(nonce);
             let proposal = client
                 .propose(
                     &JobProposal {
-                        prepared_input: fixture::bundle(nonce),
+                        prepared_input: input.clone(),
                         deadlines: fixture::deadlines(),
                     },
                     &content,
                 )
                 .await
                 .unwrap();
-            let response = fixture::accept_uploaded_service(&service, &proposal).await;
+            fixture::seed_content(
+                &mut service.endpoint().await.unwrap().close.store,
+                PaidJobAuthorizationV2::decode(&proposal.authorization).unwrap(),
+                input.canonical_bytes().unwrap().into(),
+            )
+            .await;
+            let response = service.accept(&proposal, None).await;
             jobs.push(client.accepted(&response).await.unwrap());
         }
         let mut provider = service.endpoint().await.unwrap();
