@@ -87,7 +87,7 @@ hellas share --to hellas-contact:… --limit requests:total:10 --expires 1d --ou
 ```
 
 Your friend imports it under a contact name and renders requests from their
-own copy of the same package:
+own copy of the same package or a [metadata-only descriptor](docs/http-gateway.md#model-packages-and-descriptors):
 
 ```sh
 hellas pair friend.access --name alice

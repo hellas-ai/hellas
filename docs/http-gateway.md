@@ -46,19 +46,19 @@ and needs no descriptor conversion.
 `ModelPackage::open`, `hellas program`, `text` and `transcribe` accept these
 directories just as they accept full packages. Descriptors preserve the native
 tokenizer metadata and produce the same program, environment and call-plan
-bytes for the same request and evaluator. The descriptor directory name is
-the gateway's model name.
+bytes for the same request and evaluator. The path's file stem is the gateway's model name: `qwen3.remote` is served as
+`qwen3`.
 
-Describing a package hashes its weights once. Direct package opens cache the
-verified weights identity across evaluators; daemon preparation also reuses
-inspected references for rendering, policy and indexing. Keep packages immutable
-while loaded; replacing a file invalidates the remembered identity. On platforms
-without a trustworthy file identity, content is rechecked.
+Describing a package hashes its weights once. A gateway opening a full package
+shares that hash across offer matching, evaluators and content indexing. Opening
+a descriptor reads only its metadata. Keep model packages immutable while loaded.
 
 A descriptor is for rendering remote jobs. A local executing backend requires
 the full package; the provider's content store verifies actual weight bytes
 against the job's content reference. A descriptor cannot supply or substitute
-for those bytes, and carries no executable-provider trust claim.
+for those bytes. Hand-edited descriptors are trusted renderer input: an incorrect
+weights reference or metadata can produce a job that the provider refuses or
+executes with meaningless results.
 
 ## Upstreams and HTTP access
 
