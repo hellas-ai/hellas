@@ -45,7 +45,8 @@ quote; the provider refuses a program for an evaluator it did not register.
 `--local` renders for this machine's GPU runtime.
 
 `hellas text --model FILE.gguf --prompt TEXT [--system TEXT] [--max-tokens N]`
-renders one Qwen3 chat turn with the GGUF's tokenizer, runs it as a Compute job
+renders one chat turn with the GGUF's tokenizer and embedded Jinja chat template,
+runs it as a Compute job
 and prints the decoded reply.
 
 For remote jobs, `text`, `transcribe` and `program` also accept a

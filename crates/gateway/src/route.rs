@@ -116,6 +116,23 @@ impl RouteExecution {
                 .ok_or(WorkGatewayError::Unsupported)?
                 .clone();
             let attempt = async {
+                let bounded;
+                let request = match request {
+                    ModelRequest::Text {
+                        prompt_ids,
+                        max_new,
+                        stops,
+                    } => {
+                        let max_steps = self.work.max_steps(&id).await?.unwrap_or(u64::MAX);
+                        bounded = ModelRequest::Text {
+                            prompt_ids,
+                            max_new: (*max_new).min(max_steps),
+                            stops,
+                        };
+                        &bounded
+                    }
+                    _ => request,
+                };
                 let job = package
                     .render_job(request)
                     .await

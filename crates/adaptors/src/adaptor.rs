@@ -51,4 +51,11 @@ pub trait WireAdaptor {
     fn render_error(&self, status: u16, message: String) -> WireResponse {
         crate::openai::render_error(status, message)
     }
+
+    /// The code a stream's error event carries for a failure that would
+    /// have had HTTP `status` before the stream began, if the format names
+    /// one, so that a client classifies both alike.
+    fn error_code(&self, _status: u16) -> Option<String> {
+        None
+    }
 }

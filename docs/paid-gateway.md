@@ -183,11 +183,13 @@ HTTP Fetch routes use the same paid channels. The provider's paid policy must se
 matching Fetch route policy; see [HTTP routing](http-gateway.md).
 
 Each text job fixes the rendered program, the GGUF weights, the prompt tokens
-and the token budget (`max_tokens` or the presentation default). The
-provider's step loop feeds each emitted token back until that budget, within
-its policy's `max_steps`. The payment terms fix the price per job. Model
-presentation (the Qwen3 chat template and function tools) lives in the shared
-`hellas-presentation` adapter, usable by clients and the gateway.
+and the token budget (`max_tokens`, else the presentation default), cut to what
+the quoted or granted terms allow. The provider's step loop feeds each emitted
+token back until that budget; a spent budget ends the response with the API's
+length stop. The payment terms fix the price per job. Model presentation (the
+GGUF's embedded Jinja chat template and Qwen3/Qwen3.5 function tools)
+lives in the shared `hellas-presentation` adapter, usable by clients and the
+gateway.
 
 The provider reserves delivery credit before streaming signed output prefixes.
 The gateway verifies each prefix as it arrives, then authenticates and journals

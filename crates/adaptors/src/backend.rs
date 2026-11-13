@@ -413,6 +413,11 @@ pub enum BackendError {
     Unavailable(String),
     #[error("backend failed: {0}")]
     Failed(String),
+    /// The model's output cannot be rendered as the request asks, such as an
+    /// undecodable tool call. Execution is deterministic, so the same request
+    /// fails the same way again.
+    #[error("unusable model output: {0}")]
+    Output(String),
 }
 
 impl BackendError {

@@ -1,7 +1,8 @@
-//! `hellas text`: one Qwen3 chat turn, tokenized here and run as a Compute job.
+//! `hellas text`: one chat turn, tokenized here in the model's chat format
+//! and run as a Compute job.
 use super::*;
 use hellas_client::model::{ModelPackage, ModelRequest, ModelResponse};
-use hellas_presentation::{ChatMessage, ChatTemplate, TextPresentation};
+use hellas_presentation::{ChatMessage, TextPresentation};
 
 #[derive(Debug, Args)]
 pub struct TextArgs {
@@ -61,7 +62,6 @@ async fn prepare(
     let model = args.model.clone();
     let presentation = tokio::task::spawn_blocking(move || {
         TextPresentation::from_gguf(&ModelPackage::gguf_path(&model))
-            .map(|presentation| presentation.with_chat_template(Some(ChatTemplate::Qwen3)))
     })
     .await??;
     let messages: Vec<_> = args
@@ -76,7 +76,7 @@ async fn prepare(
         })
         .collect();
     let prompt: Vec<u64> = presentation
-        .encode_chat(&messages)?
+        .encode_chat(&messages, &[])?
         .into_iter()
         .map(u64::from)
         .collect();
@@ -131,11 +131,14 @@ mod tests {
         let (plan, inputs) = (job.plan, job.inputs);
         assert_eq!(plan.step.as_ref().unwrap().stop.max_steps, 3);
         let prompt = presentation
-            .encode_chat(&[ChatMessage {
-                role: "user".into(),
-                content: "hello".into(),
-                ..Default::default()
-            }])
+            .encode_chat(
+                &[ChatMessage {
+                    role: "user".into(),
+                    content: "hello".into(),
+                    ..Default::default()
+                }],
+                &[],
+            )
             .unwrap();
         let encoded: Vec<u8> = prompt
             .iter()

@@ -20,14 +20,12 @@ pub(super) fn render_context(prefix: &str) -> RenderContext {
 }
 
 /// Serve one wire-format request on `backend`: parse it, run it, render the
-/// result in the same format. `model`, if given, replaces the model the
-/// request names.
+/// result in the same format, under the model the request names.
 pub(super) async fn serve<A, B>(
     adaptor: A,
     surface: &'static str,
     context: RenderContext,
     backend: B,
-    model: Option<&str>,
     body: &[u8],
 ) -> Response
 where
@@ -36,7 +34,7 @@ where
     A::StreamState: Send + 'static,
     B: ExecutionBackend,
 {
-    let (parsed, request) = match parse(&adaptor, body, model) {
+    let (parsed, request) = match parse(&adaptor, body) {
         Ok(parsed) => parsed,
         Err(err) => return adaptor_error(&adaptor, surface, err),
     };
@@ -55,15 +53,8 @@ where
 fn parse<A: WireAdaptor>(
     adaptor: &A,
     body: &[u8],
-    model: Option<&str>,
 ) -> AdaptorResult<(A::ParsedRequest, BackendRequest)> {
-    let mut value: JsonValue = serde_json::from_slice(body)?;
-    if let Some(model) = model
-        && let Some(name @ JsonValue::String(_)) = value.get_mut("model")
-    {
-        *name = model.into();
-    }
-    let raw = RawRequest::from_value(value)?;
+    let raw = RawRequest::from_slice(body)?;
     let parsed = adaptor.parse(raw.clone())?;
     let execution = adaptor.to_execution_request(&parsed)?;
     Ok((parsed, BackendRequest::new(execution, raw)))
@@ -162,7 +153,7 @@ where
                     }
                 }
                 Err(err) => {
-                    for event in render_error_events(&adaptor, &parsed, &mut state, err.to_string()) {
+                    for event in render_error_events(&adaptor, &parsed, &mut state, &err) {
                         yield Ok(event);
                     }
                     return;
@@ -235,9 +226,9 @@ fn sse_event(event: WireStreamEvent) -> Event {
     }
 }
 
-/// A stream failure as `adaptor`'s `error` event.
-fn error_event<A: WireAdaptor>(adaptor: &A, message: String) -> Event {
-    let data = match adaptor.render_error(500, message).body {
+/// A stream failure with HTTP `status` as `adaptor`'s `error` event.
+fn error_event<A: WireAdaptor>(adaptor: &A, status: StatusCode, message: String) -> Event {
+    let data = match adaptor.render_error(status.as_u16(), message).body {
         WireBody::Json(value) => WireEventData::Json(value),
         WireBody::Bytes(bytes) => WireEventData::Bytes(bytes),
     };
@@ -253,26 +244,36 @@ fn render_events<A: WireAdaptor>(
 ) -> Result<Vec<Event>, Event> {
     events
         .map(|events| events.into_iter().map(sse_event).collect())
-        .map_err(|error| error_event(adaptor, error.to_string()))
+        .map_err(|error| {
+            error_event(
+                adaptor,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error.to_string(),
+            )
+        })
 }
 
+/// A backend failure after the stream began, classified as it would have
+/// been before: the same status and error type.
 fn render_error_events<A: WireAdaptor>(
     adaptor: &A,
     parsed: &A::ParsedRequest,
     state: &mut A::StreamState,
-    message: String,
+    error: &BackendError,
 ) -> Vec<Event> {
+    let status = super::backend_status(error);
+    let message = error.to_string();
     let events = adaptor.render_stream_event(
         parsed,
         state,
         OutputEvent::Error {
             message: message.clone(),
-            code: None,
+            code: adaptor.error_code(status.as_u16()),
         },
     );
     match render_events(adaptor, events) {
         Ok(events) if !events.is_empty() => events,
-        Ok(_) => vec![error_event(adaptor, message)],
+        Ok(_) => vec![error_event(adaptor, status, message)],
         Err(event) => vec![event],
     }
 }

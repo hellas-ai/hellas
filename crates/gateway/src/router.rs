@@ -94,13 +94,8 @@ pub async fn with_models(
                     modality,
                 } => match modality {
                     hellas_client::model::ModelKind::Text => crate::state::router(Arc::new(
-                        crate::state::TextState::open(
-                            package.clone(),
-                            model.clone(),
-                            *max_tokens,
-                            execution,
-                        )
-                        .await?,
+                        crate::state::TextState::open(package.clone(), *max_tokens, execution)
+                            .await?,
                     )),
                     hellas_client::model::ModelKind::Transcription => {
                         crate::audio::router(model.clone(), *max_tokens as usize, execution).await?
