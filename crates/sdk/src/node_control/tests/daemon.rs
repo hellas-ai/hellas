@@ -988,7 +988,6 @@ async fn unavailable_paid_provider_does_not_prevent_startup() {
         "backends": {"paid": {"kind": "paid", "provider": crate::test_support::address(provider.id()).to_string(), "addresses": provider.bound_sockets(), "max_price": 1, "max_in_flight": 2}}
     })).unwrap();
     let core = Core::open(options(&f), document).await.unwrap();
-    let (_client, _server, connection, rpc, served) = connect(&f, core.clone()).await;
     assert!(!core.jobs.is_closed());
     use hellas_gateway::WorkExecutionBackend;
     let (_, mut events) = core.watch();
@@ -1035,6 +1034,7 @@ async fn unavailable_paid_provider_does_not_prevent_startup() {
         }
     }
 
+    let (_client, _server, connection, rpc, served) = connect(&f, core.clone()).await;
     assert_eq!(
         rpc.configure(request(&Document::default(), 0))
             .await
