@@ -366,7 +366,9 @@ impl Core {
                 crate::daemon_config::BackendKind::Local { .. }
             );
             let approved = match old.work.backend(id) {
-                Some(active) if unchanged => self.runtime.approval_current(active)?,
+                Some(active) if unchanged => {
+                    self.runtime.approval_current(&backend.kind, active)?
+                }
                 _ => false,
             };
             if unchanged && approved && !local {

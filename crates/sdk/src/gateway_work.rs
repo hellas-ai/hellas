@@ -2,7 +2,6 @@
 //! commands' target, run by the same [`Executor`]. Admission, streamed
 //! output and shutdown are shared here.
 pub(crate) mod provider;
-use crate::daemon_config::BackendKind;
 use crate::execution::{ExecutionError, Executor};
 use crate::grant_client::GrantClientError;
 use crate::job::{Job, JobError, JobInput};
@@ -428,7 +427,7 @@ fn repair(https: &HttpsResource, body: &[u8]) -> Result<Vec<u8>, JobError> {
     Ok(serde_json::to_vec(&http)?)
 }
 
-/// Declared backend kind and the runtime handles resolved from it.
+/// A runtime backend and its shared scheduling state.
 #[derive(Clone)]
 pub struct Backend {
     id: String,
@@ -437,17 +436,27 @@ pub struct Backend {
     slots: Arc<Semaphore>,
     capacity: usize,
     down: Arc<std::sync::atomic::AtomicBool>,
-    pub kind: BackendKind,
-    pub paid: Option<PaidBackend>,
-    pub grant: Option<GrantBackend>,
-    pub content: Option<hellas_store::content::DiskStore>,
-    pub(crate) execution: Option<hellas_executor::ExecutorHandle>,
-    policy: Option<InvocationPolicy>,
-    pub timeout: std::time::Duration,
+    pub state: BackendState,
+}
+
+#[derive(Clone)]
+pub enum BackendState {
+    Local {
+        execution: crate::execution::local::LocalExecution,
+        timeout: std::time::Duration,
+    },
+    Fetch {
+        execution: hellas_executor::ExecutorHandle,
+        policy: InvocationPolicy,
+    },
+    Grant(Box<GrantBackend>),
+    Paid(Box<PaidBackend>),
 }
 
 #[derive(Clone)]
 pub struct PaidBackend {
+    /// Absent until quoted; saved jobs already carry their policy.
+    pub(crate) policy: Option<InvocationPolicy>,
     pub options: crate::paid_client::PaidWorkOptions,
     pub endpoint: iroh::Endpoint,
     pub settlement_key: hellas_kernel::Secp256k1Signer,
@@ -463,7 +472,7 @@ pub struct GrantBackend {
 }
 
 impl Backend {
-    fn new(kind: BackendKind) -> Self {
+    fn new(state: BackendState) -> Self {
         Self {
             id: String::new(),
             jobs: Default::default(),
@@ -471,13 +480,7 @@ impl Backend {
             slots: Arc::new(Semaphore::new(1)),
             capacity: 1,
             down: Default::default(),
-            kind,
-            paid: None,
-            grant: None,
-            content: None,
-            execution: None,
-            policy: None,
-            timeout: std::time::Duration::from_secs(86_400),
+            state,
         }
     }
     pub fn paid(
@@ -487,94 +490,60 @@ impl Backend {
         settlement_key: hellas_kernel::Secp256k1Signer,
         owner: Arc<crate::client_owner::ClientOwner>,
     ) -> Self {
-        let kind = BackendKind::Paid {
-            provider: options.provider.to_string(),
-            addresses: options.provider_addrs.clone(),
-            acceptance_blocks: options.acceptance_blocks,
-            terminal_blocks: options.terminal_blocks,
-            payment_blocks: options.payment_blocks,
-            timeout_seconds: options.timeout.map(|t| t.as_secs()),
-            chain: None,
-            max_price: options.expected_price,
-            evaluator: None,
-            trust: None,
-        };
-        Self {
+        Self::new(BackendState::Paid(Box::new(PaidBackend {
             policy,
-            paid: Some(PaidBackend {
-                options,
-                endpoint,
-                settlement_key,
-                owner,
-                session: Default::default(),
-            }),
-            ..Self::new(kind)
-        }
+            options,
+            endpoint,
+            settlement_key,
+            owner,
+            session: Default::default(),
+        })))
     }
     pub fn grant(
         policy: GrantPolicy,
         options: crate::grant_client::GrantSessionOptions,
         transport: crate::grant_client::GrantTransport,
     ) -> Self {
-        let kind = BackendKind::Grant {
-            access: None,
-            resource: Some(policy.resource),
-            evaluator: None,
-            trust: None,
-        };
-        Self {
-            grant: Some(GrantBackend {
-                options,
-                transport,
-                policy,
-                session: Default::default(),
-            }),
-            ..Self::new(kind)
-        }
+        Self::new(BackendState::Grant(Box::new(GrantBackend {
+            options,
+            transport,
+            policy,
+            session: Default::default(),
+        })))
     }
     pub fn local(
-        kind: BackendKind,
         execution: crate::execution::local::LocalExecution,
         timeout: std::time::Duration,
     ) -> Self {
-        Self {
-            execution: Some(execution.backend),
-            content: Some(execution.content),
-            timeout,
-            ..Self::new(kind)
-        }
+        Self::new(BackendState::Local { execution, timeout })
     }
-    pub fn fetch(
-        kind: BackendKind,
-        execution: hellas_executor::ExecutorHandle,
-        policy: InvocationPolicy,
-    ) -> Self {
-        Self {
-            execution: Some(execution),
-            policy: Some(policy),
-            ..Self::new(kind)
-        }
+    pub fn fetch(execution: hellas_executor::ExecutorHandle, policy: InvocationPolicy) -> Self {
+        Self::new(BackendState::Fetch { execution, policy })
     }
     pub fn policy(&self) -> Option<&InvocationPolicy> {
-        self.grant
-            .as_ref()
-            .map(|grant| &grant.policy.invocation_policy)
-            .or(self.policy.as_ref())
+        match &self.state {
+            BackendState::Local { .. } => None,
+            BackendState::Fetch { policy, .. } => Some(policy),
+            BackendState::Grant(grant) => Some(&grant.policy.invocation_policy),
+            BackendState::Paid(paid) => paid.policy.as_ref(),
+        }
     }
     /// The endpoint requests reach their provider through, if remote.
     pub fn endpoint(&self) -> Option<&iroh::Endpoint> {
-        self.paid.as_ref().map(|paid| &paid.endpoint).or_else(|| {
-            match self.grant.as_ref().map(|grant| &grant.transport) {
-                Some(crate::grant_client::GrantTransport::Remote(endpoint)) => Some(endpoint),
-                _ => None,
-            }
-        })
+        match &self.state {
+            BackendState::Paid(paid) => Some(&paid.endpoint),
+            BackendState::Grant(grant) => match &grant.transport {
+                crate::grant_client::GrantTransport::Remote(endpoint) => Some(endpoint),
+                crate::grant_client::GrantTransport::Local(_) => None,
+            },
+            BackendState::Local { .. } | BackendState::Fetch { .. } => None,
+        }
     }
 
     /// Quote paid work before rendering a job. Saved jobs already carry their
     /// price and can execute without requesting another quote.
     pub async fn quote(&mut self) -> Result<u64, crate::paid_client::PaidClientError> {
-        let Some(paid) = &mut self.paid else {
+        let BackendState::Paid(paid) = &mut self.state else {
             return Ok(0);
         };
         let quote = crate::paid_client::request_paid_quote(
@@ -585,45 +554,41 @@ impl Backend {
         )
         .await?;
         paid.options.expected_price = quote.policy.payment_policy.fixed_price;
-        self.policy = Some(quote.policy.invocation_policy);
+        paid.policy = Some(quote.policy.invocation_policy);
         Ok(paid.options.expected_price)
     }
 
     /// The one job `request` becomes under this target's terms.
     fn job(&self, request: &WorkRequest) -> Result<Job, WorkGatewayError> {
-        let local_policy = match (&self.kind, request) {
-            (BackendKind::Local { .. }, WorkRequest::Job(input)) => {
-                Some(crate::execution::local::policy(input, self.timeout).map_err(rejected)?)
+        use hellas_rpc::Assurance::ProducerSigned;
+        let local_policy;
+        let (policy, https, assurance, price, paid) = match &self.state {
+            BackendState::Local { timeout, .. } => {
+                let WorkRequest::Job(input) = request else {
+                    return Err(WorkGatewayError::Unsupported);
+                };
+                local_policy =
+                    crate::execution::local::policy(input, *timeout).map_err(rejected)?;
+                (&local_policy, None, ProducerSigned, 0, false)
             }
-            (BackendKind::Local { .. }, WorkRequest::Fetch(_)) => {
-                return Err(WorkGatewayError::Unsupported);
-            }
-            _ => None,
+            BackendState::Fetch { policy, .. } => (policy, None, ProducerSigned, 0, false),
+            BackendState::Grant(grant) => (
+                &grant.policy.invocation_policy,
+                grant.policy.https.as_ref(),
+                grant.options.target.trust().required_assurance,
+                0,
+                false,
+            ),
+            BackendState::Paid(paid) => (
+                paid.policy.as_ref().ok_or(WorkGatewayError::Unsupported)?,
+                None,
+                paid.options.assurance,
+                paid.options.expected_price,
+                true,
+            ),
         };
-        let policy = local_policy
-            .as_ref()
-            .or(self.policy())
-            .ok_or(WorkGatewayError::Unsupported)?;
-        let assurance = self
-            .paid
-            .as_ref()
-            .map(|paid| paid.options.assurance)
-            .or_else(|| {
-                self.grant
-                    .as_ref()
-                    .map(|grant| grant.options.target.trust().required_assurance)
-            })
-            .unwrap_or(hellas_rpc::Assurance::ProducerSigned);
-        let price = self
-            .paid
-            .as_ref()
-            .map_or(0, |paid| paid.options.expected_price);
-        let https = self
-            .grant
-            .as_ref()
-            .and_then(|grant| grant.policy.https.as_ref());
         let input = request
-            .admitted(policy, https, assurance, self.paid.is_some())
+            .admitted(policy, https, assurance, paid)
             .map_err(rejected)?;
         Job::from_input(price, input).map_err(rejected)
     }
@@ -647,10 +612,10 @@ impl Backend {
 
     /// A grant contributes the HTTP routes its resource authorizes.
     pub fn routes(&self, id: &str) -> Result<Vec<hellas_gateway::Route>, WorkGatewayError> {
-        let Some(crate::GrantBackend { policy, .. }) = &self.grant else {
+        let BackendState::Grant(grant) = &self.state else {
             return Ok(vec![]);
         };
-        grant_routes(policy, id)
+        grant_routes(&grant.policy, id)
     }
 }
 
@@ -884,18 +849,21 @@ impl ExecutorGateway {
 }
 impl Backend {
     async fn close_sessions(&self) -> Result<(), WorkShutdownError> {
-        if let Some(target) = &self.grant
-            && let Some(mut session) = target.session.lock().await.take()
-        {
-            session
-                .shutdown()
-                .await
-                .map_err(|error| WorkShutdownError::Recovery(Arc::new(error)))?;
-        }
-        if let Some(target) = &self.paid
-            && let Some(mut session) = target.session.lock().await.take()
-        {
-            session.shutdown().await;
+        match &self.state {
+            BackendState::Grant(target) => {
+                if let Some(mut session) = target.session.lock().await.take() {
+                    session
+                        .shutdown()
+                        .await
+                        .map_err(|error| WorkShutdownError::Recovery(Arc::new(error)))?;
+                }
+            }
+            BackendState::Paid(target) => {
+                if let Some(mut session) = target.session.lock().await.take() {
+                    session.shutdown().await;
+                }
+            }
+            BackendState::Local { .. } | BackendState::Fetch { .. } => {}
         }
         Ok(())
     }
@@ -925,37 +893,17 @@ impl Backend {
         use crate::execution::AttemptError;
         let stop = requester.stop();
         let request = WorkRequest::Job(job.input().clone());
-        let run = async {
-            match &self.kind {
-                BackendKind::Paid { .. } => {
-                    self.run_paid(
-                        self.paid.as_ref().ok_or_else(|| {
-                            AttemptError::PreProposal(Box::new(ExecutionError::Identity))
-                        })?,
-                        &job,
-                        &stop,
-                        &requester,
-                        signer,
-                    )
-                    .await
-                }
-                BackendKind::Grant { .. } => {
-                    self.run_grant(
-                        self.grant.as_ref().ok_or_else(|| {
-                            AttemptError::PreProposal(Box::new(ExecutionError::Identity))
-                        })?,
-                        &request,
-                        &stop,
-                        &requester,
-                    )
-                    .await
-                }
-                BackendKind::Fetch { .. } | BackendKind::Local { .. } => {
-                    self.run_here(&job, stop, &requester, signer).await
-                }
+        let run = match &self.state {
+            BackendState::Paid(target) => {
+                self.run_paid(target, &job, &stop, &requester, signer).await
             }
-        }
-        .await;
+            BackendState::Grant(target) => {
+                self.run_grant(target, &request, &stop, &requester).await
+            }
+            BackendState::Fetch { .. } | BackendState::Local { .. } => {
+                self.run_here(&job, stop, &requester, signer).await
+            }
+        };
         let result = match run {
             Ok(_) => Ok(()),
             Err(AttemptError::PreProposal(error)) => {

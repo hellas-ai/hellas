@@ -175,7 +175,7 @@ impl FixtureBuilder {
 }
 impl Fixture {
     fn backend(&self) -> &crate::GrantBackend {
-        let Some(backend) = &self.gateway.backends["test"].grant else {
+        let BackendState::Grant(backend) = &self.gateway.backends["test"].state else {
             panic!("expected a grant fixture");
         };
         backend
@@ -1142,8 +1142,8 @@ async fn two_grant_nodes_fail_over_before_proposal_and_rejoin_on_demand() {
         .unwrap();
     let entry = |fixture: &Fixture| {
         let mut backend = fixture.gateway.backends["test"].as_ref().clone();
-        if let Some(crate::GrantBackend { options, .. }) = &mut backend.grant {
-            options.control_timeout = Duration::from_millis(500);
+        if let BackendState::Grant(grant) = &mut backend.state {
+            grant.options.control_timeout = Duration::from_millis(500);
         }
         crate::BackendEntry {
             backend,

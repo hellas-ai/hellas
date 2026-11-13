@@ -1,6 +1,6 @@
 use super::Result;
 use crate::{
-    Backend, BackendEntry,
+    Backend, BackendEntry, BackendState,
     daemon_config::{BackendKind, Document, Trust},
 };
 use hellas_auth::authority::{NodeKey, PrincipalId, UnixMillis};
@@ -162,29 +162,17 @@ impl Runtime {
             .transpose()
     }
 
-    pub fn approval_current(&self, active: &Backend) -> Result<bool> {
-        let (trust, active) = match &active.kind {
-            BackendKind::Grant { trust, .. } => (
-                trust,
-                active
-                    .grant
-                    .as_ref()
-                    .ok_or("missing grant session")?
-                    .options
-                    .target
-                    .trust()
-                    .clone(),
-            ),
-            BackendKind::Paid { trust, .. } => (
-                trust,
-                active
-                    .paid
-                    .as_ref()
-                    .ok_or("missing paid session")?
-                    .options
-                    .trust()?,
-            ),
-            _ => return Ok(true),
+    pub fn approval_current(&self, configured: &BackendKind, active: &Backend) -> Result<bool> {
+        let (trust, active) = match (configured, &active.state) {
+            (BackendKind::Grant { trust, .. }, BackendState::Grant(grant)) => {
+                (trust, grant.options.target.trust().clone())
+            }
+            (BackendKind::Paid { trust, .. }, BackendState::Paid(paid)) => {
+                (trust, paid.options.trust()?)
+            }
+            (BackendKind::Local { .. }, BackendState::Local { .. })
+            | (BackendKind::Fetch { .. }, BackendState::Fetch { .. }) => return Ok(true),
+            _ => return Ok(false),
         };
         let Some(approved) = self.trust(trust)? else {
             return Ok(true);
@@ -368,7 +356,6 @@ impl Runtime {
                     self.index(paths).await?;
                     (
                         Backend::local(
-                            configured.kind.clone(),
                             crate::execution::local::LocalExecution {
                                 backend,
                                 content: self.options.content.clone(),
@@ -380,7 +367,6 @@ impl Runtime {
                 }
             }
         };
-        backend.kind = configured.kind.clone();
         let price = backend.quote().await?;
         if let BackendKind::Paid { max_price, .. } = configured.kind
             && price > max_price

@@ -440,11 +440,7 @@ async fn start_provider(
         ..Default::default()
     };
     let backend = hellas_sdk::BackendEntry {
-        backend: hellas_sdk::Backend::fetch(
-            document.backends["fetch"].kind.clone(),
-            execution,
-            work_policy(),
-        ),
+        backend: hellas_sdk::Backend::fetch(execution, work_policy()),
         evaluator: None,
         max_in_flight: std::num::NonZeroUsize::MIN,
     };

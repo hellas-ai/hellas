@@ -68,7 +68,6 @@ impl super::Backend {
         config.fetch_max_in_flight = self.max_in_flight.get();
         config.fetch_queue_capacity = 0;
         Ok(Backend::fetch(
-            self.kind.clone(),
             hellas_executor::Executor::spawn_configured(config).await?,
             policy,
         ))

@@ -6,7 +6,7 @@ use hellas_auth::authority::{NodeKey, ResourceId, UnixMillis};
 use hellas_kernel::Secp256k1Signer;
 use hellas_private::StoreLocation;
 use hellas_rpc::Assurance;
-use hellas_sdk::daemon_config::BackendKind;
+use hellas_sdk::BackendState;
 use hellas_sdk::{
     Backend,
     execution::{
@@ -533,10 +533,6 @@ impl TargetArgs {
                     .await?;
             return Ok(ResolvedBackend {
                 backend: Backend::local(
-                    BackendKind::Local {
-                        runtime: "auto".into(),
-                        content: vec![],
-                    },
                     execution,
                     client.timeout.unwrap_or(Duration::from_secs(86_400)),
                 ),
@@ -630,25 +626,17 @@ impl ResolvedBackend {
         job: &Job,
     ) -> super::CliResult<(Executor, String)> {
         let mut executor = Executor::new(self.backend.clone());
-        let provider = match &executor.backend.kind {
-            BackendKind::Paid { .. } => {
-                let hellas_sdk::PaidBackend { options, owner, .. } = executor
-                    .backend
-                    .paid
-                    .as_ref()
-                    .context("missing paid session")?;
+        let provider = match &executor.backend.state {
+            BackendState::Paid(paid) => {
+                let hellas_sdk::PaidBackend { options, owner, .. } = paid.as_ref();
                 executor.attempt = Some(client.purchase(context, job, options, owner)?);
                 executor.settle = client.settle;
                 options.provider.to_string()
             }
-            BackendKind::Grant { .. } => {
+            BackendState::Grant(grant) => {
                 let hellas_sdk::GrantBackend {
                     options, policy, ..
-                } = executor
-                    .backend
-                    .grant
-                    .as_ref()
-                    .context("missing grant session")?;
+                } = grant.as_ref();
                 job.input().admits(&policy.invocation_policy, false)?;
                 let offer = options.target.offer();
                 let provider = hellas_sdk::client::ProviderAddress::of(&offer.provider)?;
@@ -673,7 +661,7 @@ impl ResolvedBackend {
                 executor.attempt = Some(attempt);
                 provider.to_string()
             }
-            BackendKind::Fetch { .. } | BackendKind::Local { .. } => {
+            BackendState::Fetch { .. } | BackendState::Local { .. } => {
                 hex::encode(context.producer.public_key().bytes())
             }
         };
@@ -681,11 +669,10 @@ impl ResolvedBackend {
     }
 
     async fn close(self) -> super::CliResult<()> {
-        if let Some(paid) = self.backend.paid {
-            paid.options.content.close().await;
-        }
-        if let Some(content) = self.backend.content {
-            content.close().await;
+        match self.backend.state {
+            BackendState::Paid(paid) => paid.options.content.close().await,
+            BackendState::Local { execution, .. } => execution.content.close().await,
+            BackendState::Fetch { .. } | BackendState::Grant(_) => {}
         }
         Ok(())
     }

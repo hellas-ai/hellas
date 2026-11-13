@@ -1,7 +1,6 @@
 //! Provider-side exact lookup. An admitted permit owns its selected snapshot entry.
-use super::{Backend, ExecutorGateway};
+use super::{Backend, BackendState, ExecutorGateway};
 use crate::daemon::Core;
-use crate::daemon_config::BackendKind;
 use hellas_auth::PublicKey;
 use hellas_channel::work::{
     Admitted, BackendFault, PaidProgress, WorkBackend,
@@ -19,9 +18,13 @@ pub(crate) struct IrohBackend {
 }
 impl Backend {
     fn executor(&self) -> Result<&hellas_executor::ExecutorHandle, BackendFault> {
-        self.execution.as_ref().ok_or_else(|| {
-            BackendFault::caused_by(std::io::Error::other("iroh cannot forward work"))
-        })
+        match &self.state {
+            BackendState::Local { execution, .. } => Ok(&execution.backend),
+            BackendState::Fetch { execution, .. } => Ok(execution),
+            BackendState::Grant(_) | BackendState::Paid(_) => Err(BackendFault::caused_by(
+                std::io::Error::other("iroh cannot forward work"),
+            )),
+        }
     }
 }
 impl ExecutorGateway {
@@ -32,13 +35,13 @@ impl ExecutorGateway {
         use hellas_rpc::protocol::invocation::{Admission, fetch::FetchRoutePolicy};
         for resource in resources {
             for admission in &resource.invocation_policy.admissions {
-                let available = self.backends.values().any(|inner| match (admission, &inner.kind) {
+                let available = self.backends.values().any(|inner| match (admission, &inner.state) {
                     #[cfg(feature = "compute")]
-                    (Admission::Compute { evaluator, .. }, BackendKind::Local { .. }) => inner.evaluator.as_ref() == Some(evaluator),
-                    (Admission::Fetch { admission }, BackendKind::Fetch { .. }) =>
-                        matches!(admission.route, FetchRoutePolicy::SealedRoute { .. }) && inner.policy().is_some_and(|policy| policy.admissions.iter().any(|offered| {
+                    (Admission::Compute { evaluator, .. }, BackendState::Local { .. }) => inner.evaluator.as_ref() == Some(evaluator),
+                    (Admission::Fetch { admission }, BackendState::Fetch { policy, .. }) =>
+                        matches!(admission.route, FetchRoutePolicy::SealedRoute { .. }) && policy.admissions.iter().any(|offered| {
                             matches!(offered, Admission::Fetch { admission: offered } if offered.route == admission.route && offered.contract == admission.contract)
-                        })),
+                        }),
                     _ => false,
                 });
                 if !available {

@@ -58,7 +58,8 @@ pub mod daemon;
 pub mod daemon_config;
 mod gateway_work;
 pub use gateway_work::{
-    Backend, BackendEntry, ExecutorGateway, GrantBackend, PaidBackend, WorkRequest, grant_routes,
+    Backend, BackendEntry, BackendState, ExecutorGateway, GrantBackend, PaidBackend, WorkRequest,
+    grant_routes,
 };
 
 mod resource_config;

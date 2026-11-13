@@ -256,7 +256,6 @@ impl ShareFixtureBuilder {
         executor.fetch_queue_capacity = 0;
         let backend = hellas_sdk::BackendEntry {
             backend: hellas_sdk::Backend::fetch(
-                document.backends["openai"].kind.clone(),
                 hellas_executor::Executor::spawn_configured(executor)
                     .await
                     .unwrap(),

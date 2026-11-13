@@ -6,7 +6,7 @@ use super::{
     Terminal, before_proposal, open_paid_session, within,
 };
 use crate::job::Job;
-use crate::{daemon_config::BackendKind, gateway_work::WorkRequest};
+use crate::{BackendState, gateway_work::WorkRequest};
 use hellas_auth::ProducerSigningKey;
 
 /// One invocation's lifecycle options, independent of the backend kind.
@@ -47,43 +47,187 @@ impl Executor {
             observers,
             deliver: Some(deliver),
         };
-        match &self.backend.kind {
-            BackendKind::Paid { .. } => self.run_paid(job, signer, stop, controls).await,
-            BackendKind::Grant { .. } => self.run_grant(job, stop, controls).await,
-            BackendKind::Fetch { .. } | BackendKind::Local { .. } => {
-                let local_policy;
-                let policy = if let Some(policy) = self.backend.policy() {
-                    policy
-                } else {
-                    local_policy = super::local::policy(job.input(), self.backend.timeout)?;
-                    &local_policy
+        let local_policy;
+        let (execution, content, policy) = match &self.backend.state {
+            BackendState::Paid(paid) => {
+                let crate::PaidBackend {
+                    options,
+                    endpoint,
+                    settlement_key,
+                    owner,
+                    ..
+                } = paid.as_ref();
+                let open = |open| {
+                    open_paid_session(
+                        options.clone(),
+                        endpoint.clone(),
+                        settlement_key.clone(),
+                        owner.clone(),
+                        self.funding,
+                        open,
+                        None,
+                    )
                 };
-                let content = if let Some(content) = &self.backend.content {
-                    super::local::prepare(content, job.input()).await?
-                } else {
-                    job.input().content()
+                let request = WorkRequest::Job(job.input().clone());
+                let terms = ExecutionTerms::Paid { price: job.price() };
+                let mut completed = match self.attempt {
+                    None => {
+                        let mut session =
+                            before_proposal(deadline, &stop, None, open(PaidOpen::Job(job)))
+                                .await??;
+                        let run = ExecutionSession::Paid(&mut session)
+                            .run(&request, terms, signer, controls, None)
+                            .await;
+                        session.shutdown().await;
+                        run?
+                    }
+                    Some(mut attempt) => match attempt.retained_paid_result()? {
+                        Some(completed) => {
+                            attempt.bind_target(ExecutionTarget {
+                                network: options.config.network(),
+                                provider: options.provider,
+                            })?;
+                            replay(&mut attempt, completed, controls.deliver)?
+                        }
+                        None => {
+                            if attempt.inspect()?.terminal == Terminal::Rejected {
+                                return Err(ExecutionError::Terminal);
+                            }
+                            let mut session = before_proposal(
+                                deadline,
+                                &stop,
+                                None,
+                                open(PaidOpen::Attempt(job, &mut attempt)),
+                            )
+                            .await??;
+                            let run = ExecutionSession::Paid(&mut session)
+                                .run(&request, terms, signer, controls, Some(&mut attempt))
+                                .await;
+                            let run = unresolved(run, deadline, async {
+                                ExecutionSession::Paid(&mut session)
+                                    .recover(&mut attempt)
+                                    .await
+                            })
+                            .await;
+                            session.shutdown().await;
+                            run?
+                        }
+                    },
                 };
-                let completed = super::local::run(
-                    self.backend
-                        .execution
-                        .as_ref()
-                        .ok_or(ExecutionError::Identity)?,
-                    content,
-                    job.input(),
+                if self.settle
+                    && let Some(paid) = &mut completed.paid
+                {
+                    let receipt = within(
+                        deadline,
+                        crate::paid_client::settle_channel(
+                            options,
+                            paid.bond_edge,
+                            owner.principal(),
+                            settlement_key,
+                        ),
+                    )
+                    .await??;
+                    if receipt.channel != paid.channel_id {
+                        return Err(ExecutionError::Identity);
+                    }
+                    paid.settled = Some(receipt.provider_payout);
+                }
+                return Ok(completed);
+            }
+            BackendState::Grant(grant) => {
+                let crate::GrantBackend {
+                    options,
+                    transport,
                     policy,
-                    signer,
+                    ..
+                } = grant.as_ref();
+                let request = WorkRequest::Job(job.input().clone());
+                let terms = ExecutionTerms::Grant {
+                    resource: policy.resource,
+                };
+                let Some(mut attempt) = self.attempt else {
+                    let mut session = before_proposal(
+                        deadline,
+                        &stop,
+                        None,
+                        crate::grant_client::GrantSession::open(options.clone(), transport.clone()),
+                    )
+                    .await??;
+                    let signer = session.execution_signer().clone();
+                    let run = ExecutionSession::Grant(&mut session)
+                        .run(&request, terms, &signer, controls, None)
+                        .await;
+                    let closed = session.shutdown().await;
+                    let completed = run?;
+                    closed?;
+                    return Ok(completed);
+                };
+                if let Some(retained) = attempt.retained_result()? {
+                    let provider_key = hellas_auth::PublicKey::Secp256k1(
+                        hellas_authority::model::grant::records::grant_producer(
+                            &options.target.offer().provider,
+                        )
+                        .map_err(crate::grant_client::GrantClientError::from)?
+                        .to_bytes(),
+                    );
+                    let completed = Completed {
+                        work_id: attempt.inspect()?.work.ok_or(ExecutionError::Identity)?,
+                        output: retained.output,
+                        transcript: retained.transcript,
+                        provider_key,
+                        paid: None,
+                        live: None,
+                    };
+                    return replay(&mut attempt, completed, controls.deliver);
+                }
+                let mut session = before_proposal(
                     deadline,
                     &stop,
-                    controls.observers,
+                    None,
+                    attempt.open_grant_session(options.clone(), transport.clone()),
                 )
-                .await?;
-                controls
-                    .deliver
-                    .map_or(Ok(()), |deliver| deliver(&completed))
-                    .map_err(ExecutionError::Delivery)?;
-                Ok(completed)
+                .await??;
+                let signer = session.execution_signer().clone();
+                let run = ExecutionSession::Grant(&mut session)
+                    .run(&request, terms, &signer, controls, Some(&mut attempt))
+                    .await;
+                let run = unresolved(run, deadline, async {
+                    ExecutionSession::Grant(&mut session)
+                        .recover(&mut attempt)
+                        .await
+                })
+                .await;
+                let closed = session.shutdown().await;
+                let completed = run?;
+                closed?;
+                return Ok(completed);
             }
-        }
+            BackendState::Local { execution, timeout } => {
+                local_policy = super::local::policy(job.input(), *timeout)?;
+                (
+                    &execution.backend,
+                    super::local::prepare(&execution.content, job.input()).await?,
+                    &local_policy,
+                )
+            }
+            BackendState::Fetch { execution, policy } => (execution, job.input().content(), policy),
+        };
+        let completed = super::local::run(
+            execution,
+            content,
+            job.input(),
+            policy,
+            signer,
+            deadline,
+            &stop,
+            controls.observers,
+        )
+        .await?;
+        controls
+            .deliver
+            .map_or(Ok(()), |deliver| deliver(&completed))
+            .map_err(ExecutionError::Delivery)?;
+        Ok(completed)
     }
 }
 
@@ -98,176 +242,6 @@ fn replay(
     }
     attempt.reported()?;
     Ok(completed)
-}
-
-impl Executor {
-    async fn run_paid(
-        self,
-        job: &Job,
-        signer: &ProducerSigningKey,
-        stop: Stop,
-        controls: Controls<'_>,
-    ) -> Result<Completed> {
-        let crate::PaidBackend {
-            options,
-            endpoint,
-            settlement_key,
-            owner,
-            ..
-        } = self.backend.paid.as_ref().ok_or(ExecutionError::Identity)?;
-        let deadline = controls.deadline;
-        let open = |open| {
-            open_paid_session(
-                options.clone(),
-                endpoint.clone(),
-                settlement_key.clone(),
-                owner.clone(),
-                self.funding,
-                open,
-                None,
-            )
-        };
-        let request = WorkRequest::Job(job.input().clone());
-        let terms = ExecutionTerms::Paid { price: job.price() };
-        let mut completed = match self.attempt {
-            None => {
-                let mut session =
-                    before_proposal(deadline, &stop, None, open(PaidOpen::Job(job))).await??;
-                let run = ExecutionSession::Paid(&mut session)
-                    .run(&request, terms, signer, controls, None)
-                    .await;
-                session.shutdown().await;
-                run?
-            }
-            Some(mut attempt) => match attempt.retained_paid_result()? {
-                Some(completed) => {
-                    attempt.bind_target(ExecutionTarget {
-                        network: options.config.network(),
-                        provider: options.provider,
-                    })?;
-                    replay(&mut attempt, completed, controls.deliver)?
-                }
-                None => {
-                    if attempt.inspect()?.terminal == Terminal::Rejected {
-                        return Err(ExecutionError::Terminal);
-                    }
-                    let mut session = before_proposal(
-                        deadline,
-                        &stop,
-                        None,
-                        open(PaidOpen::Attempt(job, &mut attempt)),
-                    )
-                    .await??;
-                    let run = ExecutionSession::Paid(&mut session)
-                        .run(&request, terms, signer, controls, Some(&mut attempt))
-                        .await;
-                    let run = unresolved(run, deadline, async {
-                        ExecutionSession::Paid(&mut session)
-                            .recover(&mut attempt)
-                            .await
-                    })
-                    .await;
-                    session.shutdown().await;
-                    run?
-                }
-            },
-        };
-        if self.settle
-            && let Some(paid) = &mut completed.paid
-        {
-            let receipt = within(
-                deadline,
-                crate::paid_client::settle_channel(
-                    options,
-                    paid.bond_edge,
-                    owner.principal(),
-                    settlement_key,
-                ),
-            )
-            .await??;
-            if receipt.channel != paid.channel_id {
-                return Err(ExecutionError::Identity);
-            }
-            paid.settled = Some(receipt.provider_payout);
-        }
-        Ok(completed)
-    }
-}
-
-impl Executor {
-    async fn run_grant(self, job: &Job, stop: Stop, controls: Controls<'_>) -> Result<Completed> {
-        let crate::GrantBackend {
-            options,
-            transport,
-            policy,
-            ..
-        } = self
-            .backend
-            .grant
-            .as_ref()
-            .ok_or(ExecutionError::Identity)?;
-        let deadline = controls.deadline;
-        let request = WorkRequest::Job(job.input().clone());
-        let terms = ExecutionTerms::Grant {
-            resource: policy.resource,
-        };
-        let Some(mut attempt) = self.attempt else {
-            let mut session = before_proposal(
-                deadline,
-                &stop,
-                None,
-                crate::grant_client::GrantSession::open(options.clone(), transport.clone()),
-            )
-            .await??;
-            let signer = session.execution_signer().clone();
-            let run = ExecutionSession::Grant(&mut session)
-                .run(&request, terms, &signer, controls, None)
-                .await;
-            let closed = session.shutdown().await;
-            let completed = run?;
-            closed?;
-            return Ok(completed);
-        };
-        if let Some(retained) = attempt.retained_result()? {
-            let provider_key = hellas_auth::PublicKey::Secp256k1(
-                hellas_authority::model::grant::records::grant_producer(
-                    &options.target.offer().provider,
-                )
-                .map_err(crate::grant_client::GrantClientError::from)?
-                .to_bytes(),
-            );
-            let completed = Completed {
-                work_id: attempt.inspect()?.work.ok_or(ExecutionError::Identity)?,
-                output: retained.output,
-                transcript: retained.transcript,
-                provider_key,
-                paid: None,
-                live: None,
-            };
-            return replay(&mut attempt, completed, controls.deliver);
-        }
-        let mut session = before_proposal(
-            deadline,
-            &stop,
-            None,
-            attempt.open_grant_session(options.clone(), transport.clone()),
-        )
-        .await??;
-        let signer = session.execution_signer().clone();
-        let run = ExecutionSession::Grant(&mut session)
-            .run(&request, terms, &signer, controls, Some(&mut attempt))
-            .await;
-        let run = unresolved(run, deadline, async {
-            ExecutionSession::Grant(&mut session)
-                .recover(&mut attempt)
-                .await
-        })
-        .await;
-        let closed = session.shutdown().await;
-        let completed = run?;
-        closed?;
-        Ok(completed)
-    }
 }
 
 /// An earlier proposal for this attempt is reconciled, never proposed again;
