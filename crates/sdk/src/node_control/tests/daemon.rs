@@ -389,6 +389,18 @@ async fn removing_a_backend_preserves_its_accepted_request_and_routes_the_next_o
             },
         });
         rpc.configure(request(&document)).await.unwrap();
+        let execution = core.execution();
+        let outgoing = execution.backend("first").unwrap().endpoint().unwrap();
+        assert_eq!(
+            outgoing.id(),
+            execution
+                .backend("second")
+                .unwrap()
+                .endpoint()
+                .unwrap()
+                .id()
+        );
+        assert_ne!(outgoing.id(), options(&f).transport.public());
         let url = format!(
             "http://{}{}",
             core.http_addresses()["api"],
@@ -413,6 +425,37 @@ async fn removing_a_backend_preserves_its_accepted_request_and_routes_the_next_o
         let held = tokio::spawn(send());
         providers[0].0.backend.started.notified().await;
         assert_eq!(core.watch().0.jobs.len(), 1);
+        // Unchanged document entries still recheck an external trust approval.
+        let trust =
+            crate::trust_policy::TrustPolicyStore::new(f.directory.path().join("trust/second"));
+        let approved = trust.load("second").unwrap();
+        let mut changed = approved.policy.clone();
+        changed.provider_genesis = hellas_rpc::ContentId::from_bytes([99; 32]);
+        trust
+            .approve(
+                "second",
+                approved.revision,
+                changed,
+                "replacement pin".into(),
+            )
+            .unwrap();
+        let stored = f.node.configuration().await.unwrap();
+        assert!(
+            rpc.configure(request(&core.watch().0.document))
+                .await
+                .is_err()
+        );
+        assert_eq!(core.watch().0.document.revision, Revision(1));
+        assert_eq!(f.node.configuration().await.unwrap(), stored);
+        assert!(!held.is_finished());
+        trust
+            .approve(
+                "second",
+                approved.revision + 1,
+                approved.policy,
+                "restored pin".into(),
+            )
+            .unwrap();
         let mut document = core.watch().0.document;
         document.remove_backend("first").unwrap();
         rpc.configure(request(&document)).await.unwrap();
@@ -531,16 +574,17 @@ async fn embedded_clients_share_the_daemons_funding_owner() {
         let chain = opts.chain.clone();
         let delegate = opts.settlement.party_key();
         let core = Core::open(opts, Document::default()).await.unwrap();
-        let (first, second) = tokio::join!(core.funding_owner(&chain), core.funding_owner(&chain));
-        let owner = first.unwrap();
-        assert!(Arc::ptr_eq(&owner, &second.unwrap()));
+        let (first, second) =
+            tokio::join!(core.client_resources(&chain), core.client_resources(&chain));
+        let owner = first.unwrap().0;
+        assert!(Arc::ptr_eq(&owner, &second.unwrap().0));
         // Independent owners cannot share the wallet's exclusive writer lock.
         assert!(
             crate::client_owner::ClientOwner::new(Arc::new(ROOT.passkey()), delegate, &chain,)
                 .is_err()
         );
         core.shutdown().await.unwrap();
-        assert!(core.funding_owner(&chain).await.is_err());
+        assert!(core.client_resources(&chain).await.is_err());
         drop(core);
         drop(owner);
         assert!(

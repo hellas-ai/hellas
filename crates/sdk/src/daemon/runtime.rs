@@ -39,8 +39,7 @@ pub(super) struct Runtime {
             (Arc<crate::client_owner::ClientOwner>, DiskStore),
         >,
     >,
-    grant: tokio::sync::OnceCell<iroh::Endpoint>,
-    paid: tokio::sync::OnceCell<iroh::Endpoint>,
+    consumer: tokio::sync::OnceCell<iroh::Endpoint>,
     #[cfg(feature = "compute")]
     hip: tokio::sync::OnceCell<hellas_executor::ExecutorHandle>,
     #[cfg(feature = "compute")]
@@ -63,8 +62,7 @@ impl Runtime {
             endpoint: tokio::sync::Mutex::new(options.endpoint.take()),
             options,
             clients: Default::default(),
-            grant: Default::default(),
-            paid: Default::default(),
+            consumer: Default::default(),
             #[cfg(feature = "compute")]
             hip: Default::default(),
             #[cfg(feature = "compute")]
@@ -75,17 +73,29 @@ impl Runtime {
     }
 
     pub fn consumer_endpoints(&self) -> impl Iterator<Item = iroh::Endpoint> {
-        [self.grant.get(), self.paid.get()]
-            .into_iter()
-            .flatten()
-            .cloned()
+        self.consumer.get().cloned().into_iter()
+    }
+
+    async fn consumer_endpoint(&self) -> Result<iroh::Endpoint> {
+        // Outgoing sessions share one endpoint, distinct from the enrolled listener.
+        let key = hellas_auth::hash_tuple(
+            "hellas.daemon.client-transport.v1",
+            &[&self.options.transport.to_bytes()],
+        );
+        Ok(self
+            .consumer
+            .get_or_try_init(|| {
+                crate::paid_client::bind_paid_endpoint(iroh::SecretKey::from_bytes(key.as_bytes()))
+            })
+            .await?
+            .clone())
     }
 
     pub async fn shutdown(&self) {
         for (_, content) in self.clients.lock().await.values() {
             content.close().await;
         }
-        for endpoint in [self.grant.get(), self.paid.get()].into_iter().flatten() {
+        if let Some(endpoint) = self.consumer.get() {
             endpoint.close().await;
         }
     }
@@ -159,6 +169,30 @@ impl Runtime {
             .transpose()
     }
 
+    pub fn approval_current(&self, configured: &BackendKind, active: &Backend) -> Result<bool> {
+        let (trust, active) = match (configured, active) {
+            (BackendKind::Grant { trust, .. }, Backend::Grant { options, .. }) => {
+                (trust, options.target.trust().clone())
+            }
+            (BackendKind::Paid { trust, .. }, Backend::Paid { options, .. }) => {
+                (trust, options.trust()?)
+            }
+            _ => return Ok(true),
+        };
+        let Some(approved) = self.trust(trust)? else {
+            return Ok(true);
+        };
+        let apple_pins = |trust: &hellas_client::ProviderTrustAnchor| {
+            trust
+                .apple_app_attest
+                .as_ref()
+                .map(|apple| (apple.app_id.clone(), apple.allowed_cd_hashes.clone()))
+        };
+        Ok(active.expected_genesis == approved.expected_genesis
+            && active.required_assurance == approved.required_assurance
+            && apple_pins(&active) == apple_pins(&approved))
+    }
+
     pub async fn open_backend(
         &self,
         id: &str,
@@ -210,13 +244,7 @@ impl Runtime {
                 let target =
                     crate::grant_client::UnpinnedOffer::decode(&offer.encode()?, UnixMillis(0))?
                         .pin(&trust)?;
-                let endpoint = self
-                    .grant
-                    .get_or_try_init(|| {
-                        crate::grant_client::bind_endpoint(self.options.transport.clone())
-                    })
-                    .await?
-                    .clone();
+                let endpoint = self.consumer_endpoint().await?;
                 (
                     Backend::Grant {
                         options: crate::grant_client::GrantSessionOptions {
@@ -248,13 +276,7 @@ impl Runtime {
                 let provider = provider.parse()?;
                 let chain = self.chain(chain)?;
                 let (owner, content) = self.client_resources(&chain).await?;
-                let endpoint = self
-                    .paid
-                    .get_or_try_init(|| {
-                        crate::paid_client::bind_paid_endpoint(self.options.transport.clone())
-                    })
-                    .await?
-                    .clone();
+                let endpoint = self.consumer_endpoint().await?;
                 let apple_trust = self.trust(trust)?;
                 let options = crate::paid_client::PaidWorkOptions {
                     content,

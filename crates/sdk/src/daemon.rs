@@ -196,16 +196,19 @@ impl Core {
         &self.runtime.options.node
     }
 
-    /// Share the daemon's wallet reservations with an embedded native client.
-    pub async fn funding_owner(
+    /// Share wallet reservations and retained content with an embedded native client.
+    pub async fn client_resources(
         &self,
         chain: &hellas_chain::chain_dir::ChainDir,
-    ) -> Result<Arc<crate::client_owner::ClientOwner>> {
+    ) -> Result<(
+        Arc<crate::client_owner::ClientOwner>,
+        hellas_store::content::DiskStore,
+    )> {
         let _serial = self.configuring.lock().await;
         if self.closed.load(std::sync::atomic::Ordering::Acquire) {
             return Err("daemon is closed".into());
         }
-        Ok(self.runtime.client_resources(chain).await?.0)
+        self.runtime.client_resources(chain).await
     }
 
     /// The same backends and job table used by listeners, for an embedded native UI.
@@ -406,7 +409,13 @@ impl Core {
                 backend.kind,
                 crate::daemon_config::BackendKind::Local { .. }
             );
-            if unchanged && !local {
+            let approved = match old.work.backend(id) {
+                Some(active) if unchanged => {
+                    self.runtime.approval_current(&backend.kind, active)?
+                }
+                _ => false,
+            };
+            if unchanged && approved && !local {
                 reuse.insert(id.clone());
             } else {
                 entries.insert(

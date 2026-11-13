@@ -471,7 +471,17 @@ async fn queued_setting_and_revocation_use_the_same_writer_order() {
         changed,
         NodeStoreError::Authority(AuthorityError::Credential)
     );
-    let (writer, _) = application(&node, &root, ids::FRIEND_GRANT, FRIEND, &[HOST_CONFIGURE]).await;
+    let (daily, secret) =
+        application(&node, &root, ids::FRIEND_GRANT, FRIEND, &[HOST_CONFIGURE]).await;
+    assert_err!(
+        node.host_action(&daily, ids::FRIEND_GRANT, HOST_CONFIGURE, |_| ())
+            .await,
+        NodeStoreError::Authority(AuthorityError::StepUp)
+    );
+    let writer = node
+        .authenticate_session(&secret, SessionKey::Passkey(&FRIEND.passkey()))
+        .await
+        .unwrap();
     let held = node.store.lock().await.unwrap();
     // Grant revisions are authority-wide, not per grant.
     let expected = held
