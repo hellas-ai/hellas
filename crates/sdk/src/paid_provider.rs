@@ -1475,6 +1475,7 @@ mod tests {
     use super::*;
     use crate::test_support::{PaidFixture, accept_uploaded};
     use hellas_channel::work_store::JobPhase;
+    use hellas_wire::WireCode;
 
     #[tokio::test]
     async fn stale_observation_keeps_the_original_proposal_waiting_for_finalized_progress() {
@@ -1641,7 +1642,6 @@ mod tests {
 
     #[tokio::test]
     async fn disconnect_drops_waiting_paid_admission() {
-        use hellas_channel::work::ClientChannel as _;
         use hellas_rpc::services::work::AcceptWork;
         use hellas_wire::{MethodMarker as _, SendHalf as _, Stream as _, StreamTransport as _};
         use prost::Message as _;
