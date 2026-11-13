@@ -81,6 +81,8 @@ async fn descriptors_render_identical_jobs_without_the_original_weights() {
             let described = QwenTokenizer::from_gguf(ModelPackage::gguf_path(&descriptor))
                 .unwrap()
                 .unwrap();
+            assert!(described.chat_template().is_some());
+            assert_eq!(original.chat_template(), described.chat_template());
             assert_eq!(
                 original.encode("hi").unwrap(),
                 described.encode("hi").unwrap()
