@@ -376,7 +376,6 @@ async fn removing_a_backend_preserves_its_accepted_request_and_routes_the_next_o
                                     path: template.paths[0].clone(),
                                     method: "POST".into(),
                                     url: format!("{}{}", template.origin, template.paths[0]),
-                                    credential: None,
                                     tls: template.tls.clone(),
                                     headers: vec![],
                                     max_response_bytes: template.max_response_bytes,
@@ -794,7 +793,7 @@ async fn resources_require_a_backend_allowed_by_the_iroh_listener() {
         origin: "https://api.example".into(),
         paths: vec!["/v1/responses".into()],
         methods: vec!["POST".into()],
-        credential: Some("api".into()),
+        account_backed: true,
         tls: hellas_rpc::http_fetch::HttpTls {
             roots: hellas_rpc::http_fetch::HttpTrustRoots::WebPki,
             spki_sha256: vec![],
@@ -807,7 +806,10 @@ async fn resources_require_a_backend_allowed_by_the_iroh_listener() {
     document.resources.push(crate::daemon_config::Resource::new(
         "model".into(),
         "api".into(),
-        crate::daemon_config::ResourceKind::Https { https },
+        crate::daemon_config::ResourceKind::Https {
+            https,
+            credential: Some("api".into()),
+        },
     ));
     document.listeners.insert(
         "work".into(),
@@ -1101,4 +1103,69 @@ async fn occupied_saved_listener_keeps_control_available_for_repair() {
     core.shutdown().await.unwrap();
     connection.close(0u32.into(), b"test complete");
     let _ = served.await.unwrap();
+}
+
+#[tokio::test]
+async fn changing_private_resource_binding_replaces_backend_and_preserves_old_snapshot() {
+    hellas_authority::test_support::within(async {
+        let f = fixture().await;
+        let mut document = Document::default();
+        document
+            .add_upstream("api", "https://example.com", Some("first-key".into()))
+            .unwrap();
+        let crate::daemon_config::BackendKind::Fetch {
+            upstream: crate::daemon_config::Upstream::Http { credentials, .. },
+            ..
+        } = &mut document.backends.get_mut("api").unwrap().kind
+        else {
+            unreachable!()
+        };
+        let mut second = credentials["api"].clone();
+        second.secret = Some("second-key".into());
+        credentials.insert("second".into(), second);
+        let resource = crate::daemon_config::Resource::new(
+            "account".into(),
+            "api".into(),
+            crate::daemon_config::ResourceKind::Https {
+                https: hellas_authority::test_support::chat_resource("https://example.com", 8),
+                credential: Some("api".into()),
+            },
+        );
+        let resource_id = resource.resource;
+        document.resources.push(resource);
+        let core = Core::open(options(&f), document.clone()).await.unwrap();
+        let old = core.snapshot.load_full();
+        let original = core.watch().0.backends[0].instance;
+        let (_client, _server, _connection, rpc, _served) = connect(&f, core.clone()).await;
+        rpc.configure(request(&document, 0)).await.unwrap();
+        assert_eq!(core.watch().0.backends[0].instance, original);
+        let crate::daemon_config::ResourceKind::Https { credential, .. } =
+            &mut document.resources[0].kind
+        else {
+            unreachable!()
+        };
+        *credential = Some("second".into());
+        rpc.configure(request(&document, 1)).await.unwrap();
+        assert_ne!(core.watch().0.backends[0].instance, original);
+        assert!(!std::ptr::eq(
+            old.work.backend("api").unwrap(),
+            core.snapshot.load().work.backend("api").unwrap()
+        ));
+        assert_eq!(
+            old.document.http_credentials("api").unwrap()[&resource_id],
+            Some("api".into())
+        );
+        assert_eq!(
+            core.snapshot
+                .load()
+                .document
+                .http_credentials("api")
+                .unwrap()[&resource_id],
+            Some("second".into())
+        );
+        core.shutdown().await.unwrap();
+        f.node.close().await;
+        f.content.close().await;
+    })
+    .await;
 }

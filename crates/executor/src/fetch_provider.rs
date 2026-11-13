@@ -82,6 +82,7 @@ pub struct PreparedFetchRequest {
     pub method: String,
     pub body: JsonBytes,
     input_commitment: InputCommitment,
+    pub(crate) resource: Option<hellas_auth::authority::ResourceId>,
 }
 
 impl PreparedFetchRequest {
@@ -92,7 +93,13 @@ impl PreparedFetchRequest {
             method: call.method.clone(),
             body,
             input_commitment: call.input_commitment,
+            resource: None,
         }
+    }
+
+    /// Trusted dispatch context, assigned after matching the provider's grant.
+    pub fn resource(&self) -> Option<hellas_auth::authority::ResourceId> {
+        self.resource
     }
 
     pub fn idempotency_key(&self) -> String {

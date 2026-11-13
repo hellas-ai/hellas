@@ -65,11 +65,20 @@ impl std::fmt::Debug for HttpCredential {
     }
 }
 
+/// Provider-owned selection. A grant resource must have an exact binding, even
+/// when its binding intentionally selects no credential.
+#[derive(Clone, Debug, Default)]
+pub struct HttpCredentialBindings {
+    pub owner: Option<String>,
+    pub resources: BTreeMap<hellas_auth::authority::ResourceId, Option<String>>,
+}
+
 #[derive(Clone, Debug)]
 pub struct HttpFetchProvider {
     environment: ContentId,
     policy: HttpEgressPolicy,
     credentials: Arc<BTreeMap<String, HttpCredential>>,
+    bindings: HttpCredentialBindings,
     clients: Arc<clients::Clients>,
 }
 
@@ -81,6 +90,7 @@ impl HttpFetchProvider {
     pub fn new(
         policy: HttpEgressPolicy,
         credentials: BTreeMap<String, HttpCredential>,
+        bindings: HttpCredentialBindings,
     ) -> Result<Self, FetchProviderError> {
         if policy.allow_private_addresses && policy.allowed_hosts.is_empty() {
             return Err(fault("private egress requires an explicit host allowlist"));
@@ -103,6 +113,10 @@ impl HttpFetchProvider {
             .validate()
             .map_err(|_| fault("invalid credential trust roots"))?;
             if alias.is_empty()
+                || alias.len() > 128
+                || !alias
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
                 || credential.allowed_origins.is_empty()
                 || credential.allowed_paths.is_empty()
                 || credential.allowed_methods.is_empty()
@@ -145,22 +159,48 @@ impl HttpFetchProvider {
                 }
             }
         }
+        for alias in bindings
+            .owner
+            .iter()
+            .chain(bindings.resources.values().flatten())
+        {
+            if !credentials.contains_key(alias) {
+                return Err(fault("unknown credential alias"));
+            }
+        }
         Ok(Self {
             environment: FetchContract::http()
                 .map_err(|_| fault("invalid HTTP execution contract"))?
                 .manifest_id(),
             policy,
             credentials: Arc::new(credentials),
+            bindings,
             clients: Arc::new(clients::Clients::default()),
         })
+    }
+
+    fn credential_alias(
+        &self,
+        resource: Option<hellas_auth::authority::ResourceId>,
+    ) -> Result<Option<&str>, FetchProviderError> {
+        match resource {
+            Some(resource) => self
+                .bindings
+                .resources
+                .get(&resource)
+                .map(|alias| alias.as_deref())
+                .ok_or_else(|| fault("HTTP resource has no credential binding")),
+            None => Ok(self.bindings.owner.as_deref()),
+        }
     }
 
     fn credential(
         &self,
         request: &HttpFetchRequest,
         url: &Url,
+        alias: Option<&str>,
     ) -> Result<Option<&HttpCredential>, FetchProviderError> {
-        let Some(alias) = &request.credential else {
+        let Some(alias) = alias else {
             return Ok(None);
         };
         let credential = self
@@ -215,7 +255,8 @@ impl HttpFetchProvider {
         {
             return Err(fault("HTTPS host is outside the egress policy"));
         }
-        let credential = self.credential(&request, &url)?;
+        let alias = self.credential_alias(prepared.resource())?;
+        let credential = self.credential(&request, &url, alias)?;
         let port = url
             .port_or_known_default()
             .ok_or_else(|| fault("missing HTTPS port"))?;
@@ -241,7 +282,7 @@ impl HttpFetchProvider {
         {
             return Err(fault("HTTPS DNS addresses are outside the egress policy"));
         }
-        let client = self.clients.get(&request, &url, addresses)?;
+        let client = self.clients.get(&request, &url, addresses, alias)?;
         let method = request
             .method
             .parse()

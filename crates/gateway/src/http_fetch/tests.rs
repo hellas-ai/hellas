@@ -39,7 +39,12 @@ async fn http_uses_the_paid_backend_and_waits_for_its_payment_completion() {
             let http = hellas_rpc::http_fetch::HttpFetchRequest::decode(&request.body).unwrap();
             assert_eq!(http.url, "https://example.com/v1/responses?x=%2F&x=y");
             assert_eq!(http.body().unwrap(), b"opaque request");
-            assert_eq!(http.credential.as_deref(), Some("account"));
+            assert!(
+                serde_json::from_slice::<serde_json::Value>(&request.body)
+                    .unwrap()
+                    .get("credential")
+                    .is_none()
+            );
             if self.busy {
                 return Err(crate::WorkGatewayBusy.into());
             }
@@ -67,7 +72,7 @@ async fn http_uses_the_paid_backend_and_waits_for_its_payment_completion() {
             ack: Arc::default(),
             busy,
         });
-        let config = vec![http("/v1/responses", None, Some("account"))];
+        let config = vec![http("/v1/responses", None)];
         let archive = tempfile::tempdir().unwrap();
         let fixture = crate::access::tests::Fixture::new().await;
         let handle = crate::test_support::server::serve(
@@ -131,7 +136,6 @@ fn forward_only_protocol_headers_and_keep_retry_and_quota_metadata() {
         path: "/v1/messages".into(),
         method: "POST".into(),
         url: "https://api.example.com/v1/messages".into(),
-        credential: Some("account".into()),
         tls: public_tls(),
         headers: vec![("anthropic-version".into(), "2023-06-01".into())],
         models: None,
@@ -190,7 +194,6 @@ fn credentials_and_hop_headers_cannot_be_configured_as_static_headers() {
             path: "/v1/messages".into(),
             method: "POST".into(),
             url: "https://example.com/v1/messages".into(),
-            credential: Some("account".into()),
             tls: public_tls(),
             headers: vec![(name.into(), "secret".into())],
             models: None,
@@ -317,7 +320,7 @@ async fn exchange(address: std::net::SocketAddr, bearer: &str) -> String {
 /// A gateway serving the HTTP Fetch presentation, with archiving enabled so
 /// trailers must pass through it too. The directory stays alive with the test.
 async fn proxy(paid: Arc<Proxied>) -> (crate::test_support::server::Server, tempfile::TempDir) {
-    let config = vec![http("/v1/responses", None, None)];
+    let config = vec![http("/v1/responses", None)];
     let archive = tempfile::tempdir().unwrap();
     let fixture = crate::access::tests::Fixture::new().await;
     let handle = crate::test_support::server::serve(
@@ -476,7 +479,7 @@ impl WorkExecutionBackend for ContinuationBackend {
 async fn signed_single_route_registers_response_for_followup() {
     use tower::ServiceExt;
     let work = Arc::new(ContinuationBackend { calls: 0.into() });
-    let config = vec![http("/v1/responses", Some(vec!["m".into()]), None)];
+    let config = vec![http("/v1/responses", Some(vec!["m".into()]))];
     let app = crate::router::router(
         config,
         work.clone(),
@@ -512,8 +515,8 @@ async fn duplicate_session_header_never_discards_an_unknown_continuation() {
     use tower::ServiceExt;
     let work = Arc::new(ContinuationBackend { calls: 0.into() });
     let config = vec![
-        http("/v1/responses", None, None),
-        http("/v1/audio/transcriptions", None, None),
+        http("/v1/responses", None),
+        http("/v1/audio/transcriptions", None),
     ];
     let app = crate::router::router(
         config,
@@ -584,7 +587,7 @@ async fn duplicate_session_header_never_discards_an_unknown_continuation() {
     assert_eq!(work.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
 
-fn http(path: &str, models: Option<Vec<String>>, credential: Option<&str>) -> crate::Route {
+fn http(path: &str, models: Option<Vec<String>>) -> crate::Route {
     crate::test_support::route(crate::Presentation::Http {
         targets: ["test"]
             .into_iter()
@@ -598,7 +601,6 @@ fn http(path: &str, models: Option<Vec<String>>, credential: Option<&str>) -> cr
                             path: path.into(),
                             method: "POST".into(),
                             url: format!("https://example.com{path}"),
-                            credential: credential.map(str::to_owned),
                             tls: public_tls(),
                             headers: vec![],
                             max_response_bytes: hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES,
@@ -612,7 +614,7 @@ fn http(path: &str, models: Option<Vec<String>>, credential: Option<&str>) -> cr
 }
 
 #[tokio::test]
-async fn failover_uses_each_backends_own_destination_and_credential() {
+async fn failover_uses_each_backends_own_destination_without_caller_credentials() {
     use tower::ServiceExt;
     struct Targets(std::sync::Mutex<Vec<String>>);
     impl crate::WorkExecutionBackend for Targets {
@@ -643,7 +645,6 @@ async fn failover_uses_each_backends_own_destination_and_credential() {
                 upstream.url,
                 format!("https://{id}.example/v1/responses?stream=true")
             );
-            assert_eq!(upstream.credential.as_deref(), Some(id));
             assert!(
                 !upstream
                     .headers
@@ -661,7 +662,7 @@ async fn failover_uses_each_backends_own_destination_and_credential() {
             Box::pin(async { Ok(()) })
         }
     }
-    let mut route = http("/v1/responses", Some(vec!["m".into()]), None);
+    let mut route = http("/v1/responses", Some(vec!["m".into()]));
     let crate::Presentation::Http { targets } = &mut route.presentation else {
         unreachable!()
     };
@@ -670,7 +671,6 @@ async fn failover_uses_each_backends_own_destination_and_credential() {
         let mut target = original.clone();
         target.service = id.into();
         target.route.url = format!("https://{id}.example/v1/responses");
-        target.route.credential = Some(id.into());
         targets.insert(id.into(), target);
     }
     route.backends = vec!["first".into(), "second".into()];

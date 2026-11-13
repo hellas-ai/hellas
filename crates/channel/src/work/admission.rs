@@ -152,6 +152,7 @@ impl WorkAdmission {
 
     pub fn grant(
         permit: WorkPermit,
+        resource: hellas_auth::authority::ResourceId,
         deadline: Instant,
         cancellation: Cancellation,
         dispatch: impl Future<Output = Result<(), BackendFault>> + Send + 'static,
@@ -159,6 +160,7 @@ impl WorkAdmission {
         Self(Authorization::Reserved(AdmittedWork {
             permit,
             funding: Funding::Grant {
+                resource,
                 deadline,
                 cancellation,
                 dispatch: Box::pin(dispatch),
@@ -196,6 +198,7 @@ pub struct AdmittedWork {
 enum Funding {
     Payment,
     Grant {
+        resource: hellas_auth::authority::ResourceId,
         deadline: Instant,
         cancellation: Cancellation,
         dispatch: Dispatch,
@@ -247,9 +250,10 @@ impl AdmittedWork {
             return Err(AdmissionError::Cancelled.into());
         }
         let started = Instant::now();
-        let (deadline, cancellation) = match self.funding {
-            Funding::Payment => (None, None),
+        let (deadline, cancellation, resource) = match self.funding {
+            Funding::Payment => (None, None, None),
             Funding::Grant {
+                resource,
                 deadline,
                 cancellation,
                 dispatch,
@@ -267,7 +271,7 @@ impl AdmittedWork {
                 if Instant::now() >= deadline {
                     return Err(AdmissionError::Deadline.into());
                 }
-                (Some(deadline), Some(cancellation))
+                (Some(deadline), Some(cancellation), Some(resource))
             }
         };
         Ok(RunningWork {
@@ -275,6 +279,7 @@ impl AdmittedWork {
             started,
             deadline,
             cancellation,
+            resource,
         })
     }
 }
@@ -284,10 +289,15 @@ impl AdmittedWork {
 pub struct RunningWork {
     _permit: WorkPermit,
     started: Instant,
+    resource: Option<hellas_auth::authority::ResourceId>,
     deadline: Option<Instant>,
     cancellation: Option<Cancellation>,
 }
 impl RunningWork {
+    /// The provider-matched grant resource; owner/payment execution has none.
+    pub fn resource(&self) -> Option<hellas_auth::authority::ResourceId> {
+        self.resource
+    }
     pub fn deadline(&self) -> Option<Instant> {
         self.deadline
     }
@@ -390,6 +400,7 @@ mod tests {
             let (commit, committed) = tokio::sync::oneshot::channel();
             let admission = WorkAdmission::grant(
                 permit(&capacity, CapacityDomain::Fetch),
+                hellas_auth::authority::ResourceId(hellas_auth::Digest::ZERO),
                 Instant::now() + Duration::from_secs(10),
                 Cancellation::new(),
                 async move {
@@ -432,6 +443,7 @@ mod tests {
         let signed = Instant::now() + Duration::from_secs(20 * 60);
         let running = WorkAdmission::grant(
             permit(&capacity, CapacityDomain::Fetch),
+            hellas_auth::authority::ResourceId(hellas_auth::Digest::ZERO),
             signed,
             Cancellation::new(),
             async { Ok(()) },
@@ -443,11 +455,18 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(running.deadline_or(fallback), signed);
+        assert_eq!(
+            running.resource(),
+            Some(hellas_auth::authority::ResourceId(
+                hellas_auth::Digest::ZERO
+            ))
+        );
         let paid = AdmittedWork::payment(permit(&capacity, CapacityDomain::Fetch))
             .dispatch()
             .await
             .unwrap();
         assert!(paid.deadline_or(fallback) <= Instant::now() + fallback);
+        assert_eq!(paid.resource(), None);
     }
 
     #[tokio::test]
@@ -455,6 +474,7 @@ mod tests {
         let capacity = Arc::new(Semaphore::new(1));
         let admission = WorkAdmission::grant(
             permit(&capacity, CapacityDomain::Gpu),
+            hellas_auth::authority::ResourceId(hellas_auth::Digest::ZERO),
             Instant::now(),
             Cancellation::new(),
             async { panic!("expired grant dispatched") },
@@ -477,6 +497,7 @@ mod tests {
         let observed = completed.clone();
         let admitted = WorkAdmission::grant(
             permit(&capacity, CapacityDomain::Gpu),
+            hellas_auth::authority::ResourceId(hellas_auth::Digest::ZERO),
             deadline,
             Cancellation::new(),
             async move {
@@ -505,6 +526,7 @@ mod tests {
             let (commit, committed) = tokio::sync::oneshot::channel();
             let admitted = WorkAdmission::grant(
                 permit(&capacity, CapacityDomain::Fetch),
+                hellas_auth::authority::ResourceId(hellas_auth::Digest::ZERO),
                 Instant::now() + Duration::from_secs(30),
                 cancellation.clone(),
                 async {

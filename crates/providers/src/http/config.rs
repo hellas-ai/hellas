@@ -16,6 +16,9 @@ pub struct HttpProviderConfig {
     pub allow_private_addresses: bool,
     #[serde(default)]
     pub credentials: BTreeMap<String, HttpCredentialConfig>,
+    /// Explicit owner-Fetch selection; requests cannot choose an alias.
+    #[serde(default)]
+    pub credential: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -320,6 +323,10 @@ impl HttpProviderConfig {
                 allow_private_addresses: self.allow_private_addresses,
             },
             credentials,
+            super::HttpCredentialBindings {
+                owner: self.credential,
+                resources: BTreeMap::new(),
+            },
         )?;
         FetchRouteEntry::new(
             std::sync::Arc::new(provider),

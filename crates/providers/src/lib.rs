@@ -6,9 +6,9 @@ mod http;
 mod openai_responses;
 mod responses_fetch;
 pub use http::{
-    CredentialRefresh, HttpCredential, HttpCredentialConfig, HttpEgressPolicy,
-    HttpFetchAdaptorFactory, HttpFetchProvider, HttpProviderConfig, HttpSecret, HttpSecretConfig,
-    HttpSecretStore,
+    CredentialRefresh, HttpCredential, HttpCredentialBindings, HttpCredentialConfig,
+    HttpEgressPolicy, HttpFetchAdaptorFactory, HttpFetchProvider, HttpProviderConfig, HttpSecret,
+    HttpSecretConfig, HttpSecretStore,
 };
 
 pub use codex_responses::{

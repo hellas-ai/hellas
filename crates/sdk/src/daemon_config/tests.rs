@@ -299,6 +299,7 @@ async fn model_and_operator_inputs_keep_their_terms_in_one_configuration() {
         "models".into(),
         ResourceKind::Https {
             https: model.https.clone().unwrap(),
+            credential: Some("api".into()),
         },
     );
     explicit.max_job_millis = std::num::NonZeroU64::new(123_000).unwrap();
@@ -372,5 +373,55 @@ async fn granted_upstream_routes_preserve_the_direct_local_paths() {
     assert_eq!(
         serde_json::to_value(granted).unwrap(),
         serde_json::to_value(&document.routes).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn resource_account_consent_is_derived_from_private_binding() {
+    let mut document = Document::default();
+    document
+        .add_upstream("api", "https://example.com", Some("key".into()))
+        .unwrap();
+    for (name, credential, declared) in [
+        ("account", Some("api".into()), false),
+        ("anonymous", None, true),
+    ] {
+        let mut https = hellas_authority::test_support::chat_resource("https://example.com", 8);
+        https.account_backed = declared;
+        document.resources.push(Resource::new(
+            name.into(),
+            "api".into(),
+            ResourceKind::Https { https, credential },
+        ));
+    }
+    let configuration = document.configuration_for_test(&[]).await.unwrap();
+    assert!(
+        configuration
+            .resource("account")
+            .unwrap()
+            .https
+            .as_ref()
+            .unwrap()
+            .account_backed
+    );
+    assert!(
+        !configuration
+            .resource("anonymous")
+            .unwrap()
+            .https
+            .as_ref()
+            .unwrap()
+            .account_backed
+    );
+    let bindings = document.http_credentials("api").unwrap();
+    assert_eq!(
+        bindings[&document.resources[0].resource],
+        Some("api".into())
+    );
+    assert_eq!(bindings[&document.resources[1].resource], None);
+    assert!(
+        !serde_json::to_string(configuration.resources())
+            .unwrap()
+            .contains("credential")
     );
 }

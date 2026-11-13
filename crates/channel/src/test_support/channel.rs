@@ -1151,7 +1151,6 @@ pub fn fetch_bundle(nonce: u8) -> PreparedInvocation {
             roots: hellas_rpc::http_fetch::HttpTrustRoots::WebPki,
             spki_sha256: vec![],
         },
-        credential: None,
         max_response_bytes: 128,
     })
     .unwrap();

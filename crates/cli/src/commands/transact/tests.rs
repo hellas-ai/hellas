@@ -207,11 +207,32 @@ fn fetch_args(extra: &[&str]) -> FetchArgs {
 }
 
 #[test]
-fn fetch_selects_a_provider_credential_without_copying_its_secret() {
-    let request = fetch_args(&["--credential", "api"]).request().unwrap();
-    assert_eq!(request.credential.as_deref(), Some("api"));
+fn fetch_does_not_accept_provider_credential_selection() {
+    let request = fetch_args(&[]).request().unwrap();
     assert!(request.headers.is_empty());
-    assert_eq!(fetch_args(&[]).request().unwrap().credential, None);
+    assert!(
+        serde_json::to_value(request)
+            .unwrap()
+            .get("credential")
+            .is_none()
+    );
+    let id = provider();
+    let error = crate::Cli::try_parse_from([
+        "hellas",
+        "fetch",
+        "https://example.test",
+        "--provider",
+        &id,
+        "--pay",
+        "20",
+        "--contract",
+        "http",
+        "--credential",
+        "api",
+    ])
+    .err()
+    .unwrap();
+    assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
 }
 
 #[test]

@@ -462,7 +462,9 @@ impl Core {
             if entries.contains_key(id) {
                 continue;
             }
-            let unchanged = old.document.backends.get(id) == Some(backend);
+            let resources = document.http_credentials(id)?;
+            let unchanged = old.document.backends.get(id) == Some(backend)
+                && old.document.http_credentials(id)? == resources;
             let approved = match old.work.backend(id) {
                 Some(active) if unchanged => self
                     .runtime
@@ -476,7 +478,7 @@ impl Core {
                 entries.insert(
                     id.clone(),
                     self.runtime
-                        .open_backend(backend, counters.clone())
+                        .open_backend(backend, counters.clone(), resources)
                         .await
                         .unwrap_or_else(|error| {
                             runtime::PreparedBackend::unavailable(

@@ -15,14 +15,13 @@ body, encoded as standard padded base64.
     "roots": {"mode": "web_pki"},
     "spki_sha256": []
   },
-  "credential": "account-1",
   "max_response_bytes": 262144
 }
 ```
 
 `body_base64` above is `{}`; replace it with your actual API request. Header
-names are lowercase. `credential` may be omitted for unauthenticated requests
-or caller-owned authorization headers. The response ceiling is at most 8 MiB.
+names are lowercase. Requests contain no provider credential selector. The
+response ceiling is at most 8 MiB.
 All final HTTP statuses, including errors and redirects, are returned to the
 client as signed responses; they are never logged with their bodies. Redirects
 are not followed. A transport failure or an oversized response is not a
@@ -34,7 +33,8 @@ are not silently added. Hostname, certificate validity, chain signatures and
 TLS handshake signatures are always checked. `spki_sha256` is an optional
 array of lowercase 64-digit SHA-256 hashes of the leaf certificate's DER SPKI;
 at least one must match when supplied. Pins add constraints to chain validation.
-A caller-supplied trust anchor does not qualify for provider-owned credentials.
+Provider credentials require the exact trust roots configured by the operator;
+a caller cannot substitute different roots.
 
 The operator configures account aliases separately:
 
@@ -42,6 +42,7 @@ The operator configures account aliases separately:
 {
   "allowed_hosts": [],
   "allow_private_addresses": false,
+  "credential": "account-1",
   "credentials": {
     "account-1": {
       "allowed_origins": ["https://api.example.com"],
@@ -63,8 +64,13 @@ The operator configures account aliases separately:
 }
 ```
 
-Aliases select independent accounts, including several accounts at the same
-origin. Secrets are read from the provider process's environment and held in
+The private backend `credential` selects the account for owner Fetch. An omitted
+selection means anonymous access, even when accounts are configured. For granted
+Fetch, the provider selects the alias bound to the authorized resource in its
+private `ResourceKind::Https` configuration. An unknown resource is refused; it
+does not inherit the owner selection. Signed offers expose only an `account_backed`
+consent flag, never the provider alias. This supports independent accounts at the
+same origin. Secrets are read from the provider process's environment and held in
 memory. Alternatively, replace `secret_env` with `secret_file` and `secret_field`
 to read a private JSON login file on each request. The loader rejects symlinks,
 non-regular files, files that are not owner-only, and files over 64 KiB; atomic
@@ -94,7 +100,8 @@ with a renewed token. Failures impose a cooldown. The account's login tool owns
 OAuth and refresh-token persistence; Hellas does not interpret vendor logins.
 
 Resolved secrets are injected only for an exact authorized origin, path and method,
-with public WebPKI roots. Callers cannot override that account's header or
+with the operator's configured roots (public WebPKI by default). Callers cannot
+override that account's header or
 change trust roots to impersonate its origin. Restrict paths to the inference
 endpoints the account is intended to expose. Path restrictions do not cover
 query strings: if an API selects models or pricing through query parameters,
@@ -138,11 +145,12 @@ and checks ordering and size after transcript signature verification.
 
 ## Provider-owned credential demonstration
 
-Generic HTTPS preserves provider-side API-key injection. The buyer signs only
-`credential: "account-1"`; the provider resolves that alias and inserts its
-secret header immediately before sending HTTPS. The key is absent from the
-buyer input transcript and the normal response transcript. Credentialed
-requests require public trust roots, an exact permitted origin/path/method,
+Generic HTTPS preserves provider-side API-key injection. The buyer signs the
+HTTP request without an alias. The provider resolves its private resource or
+owner binding and inserts the secret header immediately before sending HTTPS.
+Neither the alias nor the key is added to the buyer input transcript or normal
+response transcript. Credentialed requests require the operator's configured
+trust roots, an exact permitted origin/path/method,
 and no caller override of the credential header. Redirects are not followed.
 Scope aliases to upstreams you trust: an upstream receives the header and could
 include it in its response; a transparent proxy cannot promise to hide a secret
@@ -156,7 +164,7 @@ nix develop --command cargo test -p hellas-providers provider_injects_secret -- 
 
 It runs the production HTTP provider and adaptor against a local TLS server,
 checks that the server receives the key, verifies the signed input and output,
-and confirms neither transcript contains the key. It also checks that warmed
+and confirms neither transcript contains the key and the request contains no alias. It also checks that warmed
 connection pools cannot bypass credential scope or header-override checks. The
-fixture installs its own CA in the test client pool; production credentialed
-requests still refuse buyer-supplied roots.
+fixture configures its CA as the operator credential's trust root; a buyer
+substitution of those roots is refused.

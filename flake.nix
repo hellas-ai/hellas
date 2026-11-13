@@ -96,11 +96,6 @@
         hellasLib = import ./nix/lib { pkgs = final; };
       };
 
-      kernelPatches.amdgpu-kfd-ipc = {
-        name = "amdgpu-kfd-import-ownership";
-        patch = ./nix/patches/amdgpu-kfd-import-ownership.patch;
-      };
-
       nixosModules = {
         hellas = import ./nix/modules/nixos.nix { inherit self; };
         validators = import ./nix/modules/validators.nix { inherit self; };

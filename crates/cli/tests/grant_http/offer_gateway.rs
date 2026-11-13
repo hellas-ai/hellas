@@ -140,7 +140,7 @@ impl OfferHost {
             "resource": hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test resource")),
             "account": hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),
             "revision": 1, "pricing": {"revision":1,"rates":null}, "name":"glm", "invocation_policy":invocation_policy.canonical_bytes().unwrap(),
-            "https":{"origin":https.origin,"paths":["/v1/chat/completions"],"methods":["POST"],"credential":"glm-account",
+            "https":{"origin":https.origin,"paths":["/v1/chat/completions"],"methods":["POST"],"account_backed":true,
                 "tls":{"roots":{"mode":"certificates","der_base64":[https.root_der]},"spki_sha256":[]},
                 "accounting":"openai-chat","max_output_tokens":8,"max_response_bytes":65536,
                 "model_policy":[{"path":"/v1/chat/completions","models":["m"]}]}
@@ -174,6 +174,7 @@ impl OfferHost {
                         upstream: Upstream::Http {
                             allowed_hosts: vec!["localhost".into()],
                             allow_private_addresses: true,
+                            credential: None,
                             credentials: [(
                                 "glm-account".into(),
                                 Credential {
@@ -209,6 +210,7 @@ impl OfferHost {
                     .unwrap(),
                 kind: hellas_sdk::daemon_config::ResourceKind::Https {
                     https: resource.https.clone().unwrap(),
+                    credential: Some("glm-account".into()),
                 },
             }],
             machine: Some(ConfiguredBudget {
@@ -513,9 +515,13 @@ async fn approved_offer_streams_from_the_private_ca_upstream() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn generic_fetch_uses_the_granted_provider_credential() {
+async fn generic_fetch_through_a_grant_uses_the_provider_sealed_credential_without_client_input() {
     let host = OfferHost::start().await;
     let access = host.access().await;
+    let bundle = std::fs::read(&access).unwrap();
+    for private in [b"glm-account".as_slice(), b"fixture-key".as_slice()] {
+        assert!(!bundle.windows(private.len()).any(|bytes| bytes == private));
+    }
     let root = host.root().join("upstream.der");
     std::fs::write(&root, STANDARD.decode(&host.https.root_der).unwrap()).unwrap();
     let body = host.root().join("request.json");
@@ -526,7 +532,7 @@ async fn generic_fetch_uses_the_granted_provider_credential() {
     .unwrap();
     let url = format!("{}/v1/chat/completions", host.https.origin);
     let data = format!("@{}", body.display());
-    let mut arguments = vec![
+    let arguments = vec![
         "fetch",
         &url,
         "--contract",
@@ -544,11 +550,12 @@ async fn generic_fetch_uses_the_granted_provider_credential() {
         "--access",
         string(&access),
     ];
-    let refused = host.client.output(&arguments).await;
+    let mut caller_credential = arguments.clone();
+    caller_credential.extend(["-H", "Authorization: Bearer caller-secret"]);
+    let refused = host.client.output(&caller_credential).await;
     assert!(!refused.status.success());
-    assert!(String::from_utf8_lossy(&refused.stderr).contains("HTTPS credential mismatch"));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("invalid request headers"));
     assert_eq!(host.https.calls.load(Ordering::SeqCst), 0);
-    arguments.extend(["--credential", "glm-account"]);
     let result: Value = serde_json::from_str(&host.client.run(&arguments).await).unwrap();
     assert_eq!(result["choices"][0]["message"]["content"], "hello");
     assert_eq!(host.https.calls.load(Ordering::SeqCst), 1);
@@ -1142,7 +1149,6 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
             },
             spki_sha256: vec![],
         },
-        credential: Some("glm-account".into()),
         max_response_bytes: 65536,
     };
     let job = hellas_sdk::job::Job::fetch(

@@ -307,10 +307,10 @@ recovered request whose policy does not admit the job's contract is refused
 before funding or payment. `request.json` is an
 `HttpFetchRequest` or the selected service's JSON input. For HTTPS, the helper
 supports `-X METHOD`, repeated `-H 'Name: value'`, `--data @FILE`, and
-`--max-response-bytes N`. `--credential NAME` selects a credential stored on
-the provider; upstreams created with `backend add` use `--credential api`.
-The selector sends no credential secret. Without an explicit cap, it uses the
-provider's deliverable response limit. `--tls-root FILE` supplies a DER trust anchor;
+`--max-response-bytes N`. The provider selects its sealed credential from the
+matched grant resource or its backend configuration; the request carries no
+credential selector or secret. Without an explicit cap, it uses the provider's
+deliverable response limit. `--tls-root FILE` supplies a DER trust anchor;
 `--spki-sha256 HEX` supplies a leaf SPKI pin when the provider requires one.
 
 Apple-attested providers require the independent `--trust-store` and

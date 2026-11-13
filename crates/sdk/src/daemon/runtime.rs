@@ -280,10 +280,13 @@ impl Runtime {
         &self,
         configured: &crate::daemon_config::Backend,
         counters: Arc<crate::counter_store::FilesystemAssertionCounterStore>,
+        resources: BTreeMap<hellas_auth::authority::ResourceId, Option<String>>,
     ) -> Result<PreparedBackend> {
         let (backend, evaluator) = match &configured.kind {
             BackendKind::Fetch { .. } => (
-                configured.open_fetch(self.options.signer.clone()).await?,
+                configured
+                    .open_fetch(self.options.signer.clone(), resources)
+                    .await?,
                 None,
             ),
             BackendKind::Grant {

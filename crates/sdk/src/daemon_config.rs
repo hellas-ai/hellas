@@ -114,6 +114,9 @@ pub enum Upstream {
         allow_private_addresses: bool,
         #[serde(default)]
         credentials: BTreeMap<String, Credential>,
+        /// Provider-owned selection for owner Fetch execution.
+        #[serde(default)]
+        credential: Option<String>,
     },
     OpenaiResponses {
         #[serde(default, skip_serializing_if = "Option::is_none")]

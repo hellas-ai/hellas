@@ -414,7 +414,7 @@ impl ExecutorHandle {
             request.body,
             request.input_commitment,
         );
-        let session = entry
+        let mut session = entry
             .adaptor_factory
             .create(&call)
             .map_err(|e| invalid(&e))?;
@@ -422,6 +422,7 @@ impl ExecutorHandle {
             .capabilities
             .validate(&session.request_view)
             .map_err(|e| invalid(&e))?;
+        session.provider_request.resource = running.resource();
         let projected = crate::fetch_execution::project_fetch(
             entry.provider.clone(),
             session.provider_request,

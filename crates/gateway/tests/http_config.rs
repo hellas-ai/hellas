@@ -22,7 +22,7 @@ fn public_http_validation_accepts_valid_routes_and_refuses_invalid_configuration
         .push(("authorization".into(), "inline-secret".into()));
     assert!(matches!(
         c.validate(),
-        Err(GatewayError::Config(GatewayConfigError::CredentialAlias))
+        Err(GatewayError::Config(GatewayConfigError::CredentialHeader))
     ));
     for url in ["http://api.example.com", "not a URL"] {
         let mut c = config();
@@ -32,4 +32,12 @@ fn public_http_validation_accepts_valid_routes_and_refuses_invalid_configuration
     let mut c = config();
     c.max_response_bytes = 0;
     assert!(matches!(c.validate(), Err(GatewayError::HttpRequest(_))));
+}
+
+#[test]
+fn http_routes_cannot_name_provider_credentials() {
+    let mut route = serde_json::to_value(config()).unwrap();
+    assert!(route.get("credential").is_none());
+    route["credential"] = "provider-account".into();
+    assert!(serde_json::from_value::<HttpRoute>(route).is_err());
 }

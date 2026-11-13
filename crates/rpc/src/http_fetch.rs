@@ -1,5 +1,5 @@
-//! Caller-signed HTTPS request vocabulary. Provider-owned credentials are selected
-//! by alias; their secret values stay with the provider.
+//! Caller-signed HTTPS request vocabulary. Credential selection and secret values
+//! stay with the provider.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
@@ -8,7 +8,7 @@ pub const MAX_HTTP_RESPONSE_BYTES: u32 = 8 * 1024 * 1024;
 pub const MAX_HTTP_HEADERS_BYTES: usize = 16 * 1024;
 pub const MAX_HTTP_HEADERS: usize = 64;
 
-/// Provider credential aliases are the only way to select these upstream secrets.
+/// Headers reserved for provider-owned credentials.
 pub const CREDENTIAL_HEADERS: &[&str] = &[
     "authorization",
     "cookie",
@@ -32,8 +32,6 @@ pub struct HttpFetchRequest {
     #[serde(default)]
     pub body_base64: String,
     pub tls: HttpTls,
-    #[serde(default)]
-    pub credential: Option<String>,
     pub max_response_bytes: u32,
 }
 
@@ -84,15 +82,6 @@ impl HttpFetchRequest {
             return Err(HttpRequestError("response byte limit"));
         }
         self.body()?;
-        if self.credential.as_ref().is_some_and(|alias| {
-            alias.is_empty()
-                || alias.len() > 128
-                || !alias
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
-        }) {
-            return Err(HttpRequestError("credential alias"));
-        }
         self.tls.validate()
     }
 
@@ -301,7 +290,6 @@ mod tests {
                 roots: HttpTrustRoots::WebPki,
                 spki_sha256: vec![],
             },
-            credential: None,
             max_response_bytes: 3,
         }
     }
@@ -358,6 +346,16 @@ mod tests {
             assert!(HttpFetchResponse::from_output(&request(), &output(events)).is_err());
         }
     }
+    #[test]
+    fn callers_cannot_select_a_provider_credential() {
+        let mut encoded = serde_json::to_value(request()).unwrap();
+        assert!(encoded.get("credential").is_none());
+        for alias in [serde_json::Value::Null, "provider-account".into()] {
+            encoded["credential"] = alias;
+            assert!(HttpFetchRequest::decode(&serde_json::to_vec(&encoded).unwrap()).is_err());
+        }
+    }
+
     #[test]
     fn requests_reject_ambiguous_or_unbounded_transport_inputs() {
         for url in [

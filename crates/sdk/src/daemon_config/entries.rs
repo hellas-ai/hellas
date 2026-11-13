@@ -36,13 +36,22 @@ impl Document {
         let BackendKind::Fetch {
             service,
             method,
-            upstream: Upstream::Http { credentials, .. },
+            upstream:
+                Upstream::Http {
+                    credential,
+                    credentials,
+                    ..
+                },
         } = &self.backends.get(id).ok_or("unknown upstream")?.kind
         else {
             return Err("backend is not an HTTP upstream".into());
         };
         let api = credentials
-            .get("api")
+            .get(
+                credential
+                    .as_ref()
+                    .ok_or("upstream has no model API credential")?,
+            )
             .ok_or("upstream has no model API credential")?;
         let [origin] = api.allowed_origins.as_slice() else {
             return Err("model API needs one origin".into());
@@ -62,7 +71,6 @@ impl Document {
                                 path: crate::gateway_work::http_route_path(upstream_path).into(),
                                 method: "POST".into(),
                                 url: format!("{origin}{upstream_path}"),
-                                credential: Some("api".into()),
                                 tls: HttpTls {
                                     roots: api.trust_roots.clone(),
                                     spki_sha256: vec![],
@@ -150,6 +158,7 @@ impl Upstream {
         Ok(Self::Http {
             allowed_hosts: vec![parsed.host_str().ok_or("upstream has no host")?.into()],
             allow_private_addresses: false,
+            credential: Some("api".into()),
             credentials: [(
                 "api".into(),
                 Credential {

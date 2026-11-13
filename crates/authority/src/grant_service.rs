@@ -634,8 +634,12 @@ impl GrantService {
                 );
                 let service = self.clone();
                 let execution_access = access.clone();
-                let admission =
-                    WorkAdmission::grant(permit, deadline, cancellation.clone(), async move {
+                let admission = WorkAdmission::grant(
+                    permit,
+                    policy.resource,
+                    deadline,
+                    cancellation.clone(),
+                    async move {
                         let mut store =
                             service.node.store.lock().await.map_err(|_| {
                                 BackendFault::caused_by(NodeStoreError::WriterPoisoned)
@@ -676,7 +680,8 @@ impl GrantService {
                             .ok_or_else(|| BackendFault::caused_by(ExecutionError::MissingInput))?
                             .phase = LivePhase::Running;
                         Ok(())
-                    });
+                    },
+                );
                 let service = self.clone();
                 let progress_service = self.clone();
                 let progress = Arc::new(move |event| progress_service.progress(id, event));

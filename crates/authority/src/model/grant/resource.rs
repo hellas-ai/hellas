@@ -22,7 +22,9 @@ pub struct HttpsResource {
     pub origin: String,
     pub paths: Vec<String>,
     pub methods: Vec<String>,
-    pub credential: Option<String>,
+    /// Public consent metadata; the credential alias stays in provider configuration.
+    #[serde(default)]
+    pub account_backed: bool,
     pub tls: HttpTls,
     pub accounting: AccountingProfile,
     pub max_output_tokens: u64,
@@ -43,8 +45,6 @@ pub enum TemplateError {
     PathMethod,
     #[error("HTTPS trust roots or pins mismatch")]
     Tls,
-    #[error("HTTPS credential mismatch")]
-    Credential,
     #[error("invalid request headers")]
     Headers,
     #[error("invalid generation bound")]
@@ -121,7 +121,6 @@ impl HttpsResource {
             headers: vec![],
             body_base64: String::new(),
             tls: self.tls.clone(),
-            credential: self.credential.clone(),
             max_response_bytes: self.max_response_bytes,
         };
         sample.validate()?;
@@ -141,9 +140,6 @@ impl HttpsResource {
         }
         if request.tls != self.tls {
             return Err(TemplateError::Tls);
-        }
-        if request.credential != self.credential {
-            return Err(TemplateError::Credential);
         }
         if request
             .headers

@@ -799,7 +799,6 @@ fn policy_http_routes(
                     path: http_route_path(path).into(),
                     method: verb.clone(),
                     url: format!("{}{}", template.origin, path),
-                    credential: template.credential.clone(),
                     tls: template.tls.clone(),
                     headers: vec![],
                     max_response_bytes: template.max_response_bytes,
@@ -1524,7 +1523,6 @@ fn grant_error(e: GrantClientError) -> WorkGatewayError {
             | C::Origin
             | C::PathMethod
             | C::Tls
-            | C::Credential
             | C::Headers
             | C::GenerationCap
             | C::StreamUsage

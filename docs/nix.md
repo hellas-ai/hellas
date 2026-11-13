@@ -127,9 +127,6 @@ A GPU asset owner uploads verified weights once and execution workers receive
 them as read-only views over GPU IPC. Worker replacement retains weights; asset
 pressure recreates the owner.
 
-For the Linux 7.4-rc1 KFD import ownership bug, see the explicit
-[AMD GPU IPC kernel patch](hip-ipc.md).
-
 ## Recording and replaying jobs
 
 The gateway keeps no inference cache. `hellas_gateway::start` runs over any

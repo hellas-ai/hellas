@@ -547,6 +547,7 @@ mod tests {
                         prepare(&policy).request.runner_public_key,
                     )
                     .unwrap(),
+                hellas_auth::authority::ResourceId(hellas_auth::Digest::ZERO),
                 std::time::Instant::now()
                     + if revoked {
                         std::time::Duration::from_secs(30)
