@@ -66,8 +66,10 @@ provider's price, execution limits and automatic-offer bounds. It requires the
 authority owner's passkey session and `work.paid.configure` on the machine
 resource. The node generates the policy salt and retains the original terms
 with each signed offer; changing the standing policy does not alter open channels.
-Use `admin set-paid-policy --terms FILE --expected-revision REVISION` to approve
-paid terms; see the [paid work guide](paid-gateway.md). The provider runs each Catena job in a
+Use `hellas admin work docs/examples/faucet-provider.json` for the first approval;
+its `SetPaidPolicy.expected_revision` is 0. Keep the returned revision for the
+next edit. The [paid work guide](paid-gateway.md#sell) explains the complete JSON
+policy, evaluator selection and funding amounts. The provider runs each Catena job in a
 separate worker process. That isolation is crash/timeout containment, not a
 sandbox, and there is no memory metering. Requesters pay only for a result
 signed by this provider that matches their job; Hellas does not re-run it.

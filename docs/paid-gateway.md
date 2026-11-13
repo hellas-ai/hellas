@@ -16,14 +16,34 @@ hellas serve
 # In another shell, pair the printed invite, then configure a package:
 hellas pair hellas-invite:… --name mine
 hellas route add /srv/models/whisper-tiny
-hellas admin set-paid-policy --terms docs/examples/faucet-provider.toml --expected-revision 0
+hellas admin work docs/examples/faucet-provider.json
 ```
 
-The TOML file supplies paid terms to one checked administration command; it
-is not a daemon routing file. The policy fixes prices, channel credit, offer
-bounds and invocation limits. Existing channels keep their signed terms.
-Use the current policy revision for later approvals. A stale revision or a
-daily node-key session cannot change paid terms.
+Run the example from the repository root with the paired owner's passkey
+(`--passkey PATH`, or the owner's configured key). With several paired nodes,
+select this node using `hellas admin --profile "$HOME/.hellas/nodes/mine/profile.json"
+work docs/examples/faucet-provider.json`.
+
+The JSON is a complete `WorkControlCommand`: `SetPaidPolicy` contains
+`expected_revision` and `policy`. The first approval expects revision 0 and
+returns `{"PaidPolicyChanged":{"revision":1}}`. For later approvals, copy the
+file and set `expected_revision` to the last returned revision. Stale revisions
+and daily node-key sessions cannot change paid terms.
+
+The policy's `invocation_policy` names the evaluator shown by `hellas routes`.
+Change the example's HIP evaluator if the provider uses another runtime. Its
+`programs: {"mode":"any"}` allows arbitrary programs for that evaluator;
+restrict it to `{"mode":"only","manifests":["CONTENT_ID"]}` to allow only
+specific program manifests. Those programs run with the provider process's
+filesystem and device access. The example sells Compute only; Fetch requires
+an explicit Fetch admission in the same policy.
+
+`payment_policy` sets price and block margins; `channel_policy` limits credit;
+`offers` bounds automatic funding. At price 20 and 10 jobs per channel, capacity
+is 200. The example adds omission collateral 201 and uses zero close fees, so
+`expected_payment_values.value` is 401 and `reserve` is 0. Keep these amounts
+consistent when changing the price or channel size. Existing channels retain
+their signed terms.
 
 Stake must belong to the authority owner and be delegated to the daemon's
 settlement key. Use `chain delegate --coin COIN_ID --node SETTLEMENT_KEY
@@ -70,7 +90,7 @@ memory metering. Before paying, the client checks that each result is signed
 by the provider and matches this job; Hellas does not re-run it.
 
 Compute terms should allow at least 4 MiB of upload for Whisper. The faucet
-example uses `max_upload_bytes = 4194304`; provider and grant limits are explicit
+example uses `"max_upload_bytes": 4194304`; provider and grant limits are explicit
 terms, with no implicit runtime default. Whisper ships roughly 0.47–0.85 MB of
 rendered program, 960,000 bytes of log-mel features, and three F32 vocabulary
 masks (622,380 bytes for a 51,865-token model). The allowance also covers input

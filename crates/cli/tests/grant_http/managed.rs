@@ -45,6 +45,32 @@ async fn paired_owner_configures_routes_and_restart_preserves_them() {
         ])
         .await;
     drop(occupied);
+    // Execute the paid-policy command exactly as the selling guide spells it.
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let guide = std::fs::read_to_string(repository.join("docs/paid-gateway.md")).unwrap();
+    let recipe = guide
+        .lines()
+        .find(|line| line.starts_with("hellas admin "))
+        .unwrap();
+    let arguments: Vec<String> = recipe
+        .split_whitespace()
+        .skip(1)
+        .map(|arg| {
+            if arg.starts_with("docs/") {
+                repository.join(arg).display().to_string()
+            } else {
+                arg.into()
+            }
+        })
+        .collect();
+    let arguments: Vec<_> = arguments.iter().map(String::as_str).collect();
+    let applied: Value = serde_json::from_str(&owner.run(&arguments).await).unwrap();
+    assert_eq!(applied["PaidPolicyChanged"]["revision"], 1);
+    assert!(
+        !owner.output(&arguments).await.status.success(),
+        "stale policy revision must fail"
+    );
+
     let key = root.path().join("api.key");
     std::fs::write(&key, "write-only-fixture-key").unwrap();
     owner

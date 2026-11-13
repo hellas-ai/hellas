@@ -54,7 +54,7 @@ let
       ../proto
       # Documentation that tests check against the implementation.
       ../docs/admin.md
-      ../docs/examples/faucet-provider.toml
+      ../docs/examples/faucet-provider.json
       ../docs/http-gateway.md
       ../docs/jobs.md
       ../docs/machine-provider.json

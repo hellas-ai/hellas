@@ -1,0 +1,52 @@
+{
+  "SetPaidPolicy": {
+    "expected_revision": 0,
+    "policy": {
+      "channel_policy": {
+        "compute_credit_limit": 40,
+        "delivery_credit_limit": 40
+      },
+      "invocation_policy": {
+        "admissions": [
+          {
+            "kind": "compute",
+            "evaluator": "hellas/catena-dfad87438018-hip",
+            "programs": {
+              "mode": "any"
+            }
+          }
+        ],
+        "limits": {
+          "max_upload_bytes": 4194304,
+          "max_output_bytes": 1048576,
+          "max_steps": 256,
+          "execution_timeout_ms": 90000
+        }
+      },
+      "payment_policy": {
+        "fixed_price": 20,
+        "dispatch_margin_blocks": 4,
+        "delivery_margin_blocks": 2,
+        "oracle_grace_blocks": 6
+      },
+      "expected_payment_values": {
+        "value": 401,
+        "reserve": 0,
+        "close_fees": {
+          "base": 0,
+          "slot": 0,
+          "proof": 0,
+          "lifetime": 0
+        }
+      },
+      "jobs_per_channel": 10,
+      "offers": {
+        "max_stake_per_client": 12,
+        "max_open_offers": 3,
+        "bond_lifetime_blocks": 10000,
+        "omission_bond": 201,
+        "redelegate_payout": true
+      }
+    }
+  }
+}
