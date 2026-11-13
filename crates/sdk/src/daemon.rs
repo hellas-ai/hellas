@@ -119,7 +119,7 @@ impl Core {
             .configuration()
             .await?
             .map_or(Revision(0), |c| c.revision);
-        Self::open_prepared(options, document, BTreeMap::new(), revision).await
+        Self::open_prepared(options, document, BTreeMap::new(), revision, false).await
     }
 
     /// Use deterministic executors while exercising the real daemon and transports.
@@ -134,7 +134,7 @@ impl Core {
             .configuration()
             .await?
             .map_or(Revision(0), |c| c.revision);
-        Self::open_prepared(options, document, backends, revision).await
+        Self::open_prepared(options, document, backends, revision, false).await
     }
 
     async fn open_prepared(
@@ -142,6 +142,7 @@ impl Core {
         document: Document,
         entries: BTreeMap<String, BackendEntry>,
         revision: Revision,
+        commit: bool,
     ) -> Result<Arc<Self>> {
         if options.node.provider().await?.is_some_and(|enrollment| {
             enrollment.genesis.statement.root_kind == hellas_rpc::RootKind::Software
@@ -180,13 +181,36 @@ impl Core {
             &core.runtime.options.content,
         )
         .await?;
-        let (snapshot, _) = core.prepare(document, entries, revision).await?;
+        let next = if commit {
+            revision.next().ok_or("configuration revision overflow")?
+        } else {
+            revision
+        };
+        let (snapshot, configuration) = core.prepare(document, entries, next).await?;
+        if commit {
+            let (redacted, secrets) = snapshot.document.redacted();
+            core.node()
+                .configure_startup(
+                    ConfigurationDocument {
+                        revision,
+                        document: serde_json::to_string(&redacted)?,
+                        secrets,
+                    },
+                    &configuration,
+                )
+                .await?;
+        }
         core.publish(snapshot);
         Ok(core)
     }
 
     pub async fn restore(options: Options) -> Result<Arc<Self>> {
-        let (document, revision) = match options.node.configuration().await? {
+        Self::restore_on_port(options, None).await
+    }
+
+    /// Apply an explicit process startup port as a journaled edit before listening.
+    pub async fn restore_on_port(options: Options, port: Option<u16>) -> Result<Arc<Self>> {
+        let (mut document, revision) = match options.node.configuration().await? {
             Some(stored) => {
                 let mut document: Document = serde_json::from_str(&stored.document)?;
                 document.restore_secrets(&stored.secrets);
@@ -194,7 +218,31 @@ impl Core {
             }
             None => (Document::default(), Revision(0)),
         };
-        Self::open_prepared(options, document, BTreeMap::new(), revision).await
+        let mut changed = false;
+        if let Some(port) = port {
+            let listener = document
+                .listeners
+                .values_mut()
+                .find(|listener| matches!(listener, Listener::Iroh { .. }));
+            match listener {
+                Some(Listener::Iroh { port: saved, .. }) => {
+                    changed = *saved != port;
+                    *saved = port;
+                }
+                _ => {
+                    document.listeners.insert(
+                        "work".into(),
+                        Listener::Iroh {
+                            port,
+                            chain: None,
+                            backends: vec![],
+                        },
+                    );
+                    changed = true;
+                }
+            }
+        }
+        Self::open_prepared(options, document, BTreeMap::new(), revision, changed).await
     }
 
     pub fn node(&self) -> &NodeCoordinator {

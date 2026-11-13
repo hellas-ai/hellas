@@ -566,6 +566,7 @@ pub async fn gateway(
     run_daemon(
         options,
         Some(document),
+        None,
         #[cfg(feature = "otel")]
         metrics,
         async |core| {
@@ -651,6 +652,7 @@ pub async fn serve(
     run_daemon(
         options,
         document,
+        port,
         #[cfg(feature = "otel")]
         metrics,
         async |core| {
@@ -679,6 +681,7 @@ pub async fn serve(
 async fn run_daemon(
     options: hellas_sdk::daemon::Options,
     document: Option<Document>,
+    port: Option<u16>,
     #[cfg(feature = "otel")] metrics: Option<(std::net::SocketAddr, crate::metrics::MetricsBundle)>,
     run: impl AsyncFnOnce(Arc<hellas_sdk::daemon::Core>) -> Result<()>,
 ) -> Result<()> {
@@ -687,7 +690,7 @@ async fn run_daemon(
     let serving = async {
         let core = match document {
             Some(document) => hellas_sdk::daemon::Core::open(options, document).await,
-            None => hellas_sdk::daemon::Core::restore(options).await,
+            None => hellas_sdk::daemon::Core::restore_on_port(options, port).await,
         }
         .map_err(anyhow::Error::from_boxed)?;
         let result = async {

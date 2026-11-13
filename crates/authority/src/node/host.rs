@@ -1,4 +1,4 @@
-//! The first checked host read and Work setting. No transport or owner shortcuts.
+//! Checked host operations and trusted in-process startup configuration.
 use super::*;
 use crate::model::grant::budget::{BudgetNode, Limit};
 use crate::operations::Operation;
@@ -53,6 +53,26 @@ impl NodeCoordinator {
     {
         let (store, _) = self.lock().await?;
         Ok(store.state().configuration().cloned())
+    }
+
+    /// Apply trusted process startup options before exposing control transports.
+    /// Remote callers must use `configure`, which requires permission and step-up.
+    pub async fn configure_startup(
+        &self,
+        document: crate::model::grant::configuration::ConfigurationDocument,
+        configuration: &crate::model::grant::configuration::NodeConfiguration,
+    ) -> Result<(), NodeStoreError> {
+        let _changed = ChangeNotification(self.changed.clone());
+        let (mut store, now) = self.lock().await?;
+        store
+            .configure(
+                document.revision,
+                document.document,
+                document.secrets,
+                configuration,
+                now,
+            )
+            .await
     }
 
     /// The whole daemon change has one authority check and one durable frame.

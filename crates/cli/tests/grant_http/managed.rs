@@ -78,11 +78,74 @@ async fn paired_owner_configures_routes_and_restart_preserves_them() {
     assert!(!bad.status.success());
     assert_eq!(owner.run(&["routes"]).await, before);
     process.stop().await;
-    let mut restarted = worker.spawn(&["serve", "--port", &port], "managed-restart.log");
+    let saved = saved_configuration(&worker).await;
+    let reserved = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let next_port = reserved.local_addr().unwrap().port();
+    drop(reserved);
+    let mut restarted = worker.spawn(
+        &["serve", "--port", &next_port.to_string()],
+        "managed-restart.log",
+    );
+    restarted.wait_for("Daemon ready;").await;
+    assert!(
+        std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, next_port)).is_err(),
+        "explicit startup port must be bound"
+    );
+    assert!(
+        std::net::UdpSocket::bind(format!("127.0.0.1:{port}")).is_ok(),
+        "old port must be released"
+    );
+    let mut remote: Value = serde_json::from_slice(&std::fs::read(&profile_path).unwrap()).unwrap();
+    remote["remote_addresses"] = json!([format!("127.0.0.1:{next_port}")]);
+    hellas_private::write_atomically(
+        &profile_path,
+        ".moved",
+        &serde_json::to_vec(&remote).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(owner.run(&["routes"]).await, before);
+    restarted.stop().await;
+    let moved = saved_configuration(&worker).await;
+    assert_eq!(moved.revision, saved.revision.next().unwrap());
+    let mut expected: hellas_sdk::daemon_config::Document =
+        serde_json::from_str(&saved.document).unwrap();
+    let hellas_sdk::daemon_config::Listener::Iroh { port, .. } =
+        expected.listeners.get_mut("work").unwrap()
+    else {
+        panic!("work listener")
+    };
+    *port = next_port;
+    assert_eq!(
+        serde_json::from_str::<Value>(&moved.document).unwrap(),
+        serde_json::to_value(&expected).unwrap()
+    );
+    assert_eq!(moved.secrets, saved.secrets);
+    // No flag on the next start: the journal itself must carry the edit.
+    let mut restarted = worker.spawn(&["serve"], "managed-restored.log");
     restarted.wait_for("Daemon ready;").await;
     assert_eq!(owner.run(&["routes"]).await, before);
     owner.run(&["route", "rm", "model@upstream"]).await;
     assert!(!owner.run(&["routes"]).await.contains("model"));
     owner.run(&["backend", "rm", "upstream"]).await;
     restarted.stop().await;
+}
+
+async fn saved_configuration(
+    cli: &Cli,
+) -> hellas_authority::model::grant::configuration::ConfigurationDocument {
+    let root = hellas_private::StoreLocation::from_home(
+        &cli.home.join("provider/authority"),
+        hellas_private::Durability::Crash,
+    );
+    let mut store = hellas_authority::work_store::grant::NodeStore::open(
+        &root,
+        hellas_authority::model::grant::grant_network(),
+        None,
+        hellas_auth::authority::UnixMillis::now().unwrap(),
+    )
+    .await
+    .unwrap();
+    let saved = store.state().configuration().unwrap().clone();
+    store.close().await;
+    saved
 }

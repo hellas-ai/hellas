@@ -57,7 +57,9 @@ client. The bearer changes on restart.
 ## Persistent service
 
 `hellas serve` runs the same core, restoring its document from the authority
-journal. A fresh node has no HTTP listener. Pair its printed invite first, then use the
+journal. An explicit `serve --port PORT` changes the saved iroh port through
+a journaled configuration edit before listening; later starts without the flag
+restore that port. A fresh node has no HTTP listener. Pair its printed invite first, then use the
 paired profile for edits:
 
 ```sh
