@@ -663,6 +663,7 @@ impl Core {
                         .boxed()
                 }
                 Bound::Iroh(bound) => {
+                    bound.start();
                     let bound = bound.clone();
                     let stop = listener.stop.subscribe();
                     async move { bound.serve(core, stop).await }.boxed()
