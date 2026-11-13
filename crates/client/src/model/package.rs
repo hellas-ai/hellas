@@ -32,9 +32,9 @@ pub struct ModelPackage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelKind {
-    /// A Qwen GGUF file.
+    /// A Qwen GGUF file or descriptor directory.
     Text,
-    /// A converted Whisper package directory.
+    /// A converted Whisper package or descriptor directory.
     Transcription,
     /// A converted Flux package directory.
     Image,
@@ -107,8 +107,8 @@ impl ModelPackage {
         tokio::task::spawn_blocking(move || descriptor::describe(&path, &output)).await?
     }
 
-    /// A Qwen GGUF, or a converted Whisper or Flux package directory, rendering
-    /// programs with the renderer registered under `evaluator`.
+    /// A Qwen GGUF, converted Whisper or Flux package, or Qwen/Whisper descriptor,
+    /// rendering programs with the renderer registered under `evaluator`.
     pub async fn open(path: &Path, evaluator: &str) -> Result<Self> {
         Self::open_with_weights(path, evaluator, None).await
     }

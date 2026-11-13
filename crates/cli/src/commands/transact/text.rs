@@ -7,8 +7,8 @@ use hellas_presentation::{ChatMessage, ChatTemplate, TextPresentation};
 pub struct TextArgs {
     #[command(flatten)]
     client: ClientArgs,
-    /// Qwen3 GGUF; the provider holds the same weights.
-    #[arg(long, value_name = "FILE")]
+    /// Qwen GGUF or descriptor; the provider holds the matching weights.
+    #[arg(long, value_name = "PATH")]
     model: PathBuf,
     #[arg(long)]
     prompt: String,

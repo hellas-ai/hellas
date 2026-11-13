@@ -48,6 +48,11 @@ quote; the provider refuses a program for an evaluator it did not register.
 renders one Qwen3 chat turn with the GGUF's tokenizer, runs it as a Compute job
 and prints the decoded reply.
 
+For remote jobs, `text`, `transcribe` and `program` also accept a
+[model descriptor](http-gateway.md#model-packages-and-descriptors), produced by
+`hellas model describe PATH -o DIR`. It retains rendering metadata and the
+weights' content reference; the executing provider holds the real weights.
+
 `hellas transact --job DIR` executes a caller-owned job folder for any
 application. `hellas run` (one call of a Catena program) and `hellas fetch`
 (one HTTPS request) build such a folder and go through the same SDK
