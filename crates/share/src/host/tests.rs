@@ -438,8 +438,8 @@ async fn credential_revocation_closes_the_real_upstream_tls_body() {
         .unwrap()
         .unwrap()
         .unwrap();
-    // The provider ended the job: a failure upstream of the gateway.
-    assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
+    // Revocation reaches the client as a typed refusal after the upstream closes.
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
     fixture.shutdown().await;
 }
 
