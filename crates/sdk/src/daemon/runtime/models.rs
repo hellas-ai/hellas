@@ -1,6 +1,6 @@
 use super::{Result, Runtime};
 use crate::daemon_config::{BackendKind, Document, ResourceKind};
-use hellas_client::model::{ModelKind, ModelPackage};
+use hellas_client::model::ModelPackage;
 use hellas_gateway::{BackendInfo, Presentation, router::Models};
 use hellas_rpc::ContentRef;
 use std::{
@@ -42,21 +42,15 @@ impl Runtime {
                     cached.packages.clear();
                     cached.files = files;
                 }
-                let weights = match ModelKind::of(&path) {
-                    ModelKind::Text => Some(path.clone()),
-                    ModelKind::Transcription => {
-                        Some(path.join(hellas_client::model::whisper::WEIGHTS_FILE))
-                    }
-                    ModelKind::Image => None,
-                }
-                .map(|path| {
-                    cached
-                        .files
-                        .get(&path)
-                        .copied()
-                        .ok_or("model weights were not inspected")
-                })
-                .transpose()?;
+                let weights = ModelPackage::weights_path(&path)
+                    .map(|path| {
+                        cached
+                            .files
+                            .get(&path)
+                            .copied()
+                            .ok_or("model weights were not inspected")
+                    })
+                    .transpose()?;
                 for evaluator in &evaluators {
                     if !cached.packages.contains_key(evaluator) {
                         let package =
@@ -80,7 +74,7 @@ impl Runtime {
             let BackendKind::Local { content, .. } = &backend.kind else {
                 continue;
             };
-            let mut paths: BTreeSet<_> = content.iter().cloned().collect();
+            let mut paths = BTreeSet::new();
             paths.extend(
                 document
                     .routes
@@ -101,6 +95,14 @@ impl Runtime {
                         _ => None,
                     }),
             );
+            if paths.iter().any(|path| ModelPackage::is_descriptor(path)) {
+                index.insert(
+                    id.clone(),
+                    Err("local execution requires the full model weights, not a descriptor".into()),
+                );
+                continue;
+            }
+            paths.extend(content.iter().cloned());
             index.insert(
                 id.clone(),
                 self.options

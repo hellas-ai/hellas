@@ -860,6 +860,34 @@ fn model_document(path: std::path::PathBuf) -> Document {
 
 #[cfg(feature = "compute")]
 #[tokio::test]
+async fn a_descriptor_cannot_activate_a_local_model_backend() {
+    let f = fixture().await;
+    let descriptor = f.directory.path().join("descriptor");
+    hellas_client::model::ModelPackage::describe(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../client/src/model/package/mini-qwen3.gguf"),
+        &descriptor,
+    )
+    .await
+    .unwrap();
+    let core = Core::open(options(&f), model_document(descriptor))
+        .await
+        .unwrap();
+    let view = core.watch().0;
+    assert!(view.backends[0].down);
+    assert!(
+        view.backends[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("full model weights")
+    );
+    assert!(!core.jobs.is_closed());
+    core.shutdown().await.unwrap();
+}
+
+#[cfg(feature = "compute")]
+#[tokio::test]
 async fn missing_saved_model_keeps_control_available_for_repair() {
     let f = fixture().await;
     let document = model_document(f.directory.path().join("missing.gguf"));

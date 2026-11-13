@@ -193,7 +193,10 @@ async fn descriptors_reject_invalid_ranges_payloads_and_supplied_weight_identiti
 
 #[tokio::test]
 async fn a_descriptor_does_not_supply_the_providers_weights() {
-    use hellas_store::content::{DiskStore, IndexMode, LocalStore, Reservations};
+    use hellas_store::content::{
+        ContentStore, DiskStore, IndexMode, LocalStore, PinName, PinPolicy, PinValue, Reservations,
+        Target,
+    };
     let root = tempfile::tempdir().unwrap();
     let descriptor = root.path().join("descriptor");
     let weights = ModelPackage::describe(&fixture(), &descriptor)
@@ -209,7 +212,20 @@ async fn a_descriptor_does_not_supply_the_providers_weights() {
     )
     .await
     .unwrap();
+    store.finish_recovery().await.unwrap();
     let local = LocalStore::Disk(store.clone());
+    let name = PinName::new("weights".into()).unwrap();
+    let value = PinValue {
+        target: Target::Object(weights),
+        policy: PinPolicy::Jobs,
+        expires: None,
+    };
+    assert!(
+        store
+            .set_pin(&Scope::Owner, &name, None, Some(value.clone()))
+            .await
+            .is_err()
+    );
     assert!(matches!(
         hellas_channel::content::read(&local, &Scope::Owner, weights, weights.bytes()).await,
         Err(hellas_store::content::Error::Missing)
@@ -218,17 +234,43 @@ async fn a_descriptor_does_not_supply_the_providers_weights() {
     let mut bytes = std::fs::read(fixture()).unwrap();
     *bytes.last_mut().unwrap() ^= 1;
     std::fs::write(&full, &bytes).unwrap();
+    assert_ne!(
+        store.inspect_files(vec![full.clone()]).await.unwrap()[&full],
+        weights
+    );
     store
         .rescan(vec![full.clone()], IndexMode::Resume)
         .await
         .unwrap();
     assert!(
+        store
+            .set_pin(&Scope::Owner, &name, None, Some(value.clone()))
+            .await
+            .is_err()
+    );
+    assert!(
         hellas_channel::content::read(&local, &Scope::Owner, weights, weights.bytes())
             .await
             .is_err()
     );
-    std::fs::copy(fixture(), &full).unwrap();
+    // Replace the immutable package, rather than relying on the filesystem
+    // clock to distinguish two in-place writes within the same tick.
+    let replacement = root.path().join("replacement.gguf");
+    std::fs::copy(fixture(), &replacement).unwrap();
+    std::fs::rename(replacement, &full).unwrap();
+    assert_eq!(
+        ContentRef::for_bytes(&std::fs::read(&full).unwrap()),
+        weights
+    );
+    assert_eq!(
+        store.inspect_files(vec![full.clone()]).await.unwrap()[&full],
+        weights
+    );
     store.rescan(vec![full], IndexMode::Resume).await.unwrap();
+    store
+        .set_pin(&Scope::Owner, &name, None, Some(value))
+        .await
+        .unwrap();
     assert_eq!(
         *hellas_channel::content::read(&local, &Scope::Owner, weights, weights.bytes())
             .await

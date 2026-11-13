@@ -355,18 +355,29 @@ async fn compute_is_rendered_for_each_selected_evaluator() {
     }
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../client/src/model/package/mini-qwen3.gguf");
+    let root = tempfile::tempdir().unwrap();
+    let descriptor = root.path().join("descriptor");
+    ModelPackage::describe(&path, &descriptor).await.unwrap();
     let route = Route {
         backends: vec!["hip".into(), "cuda".into()],
         presentation: Presentation::Model {
             modality: hellas_client::model::ModelKind::Text,
             model: "tiny".into(),
-            package: path.clone(),
+            package: descriptor,
             max_tokens: 1,
         },
     };
     let work = Arc::new(Renderers {
         calls: Default::default(),
     });
+    crate::router::router(
+        vec![route.clone()],
+        work.clone(),
+        Default::default(),
+        Default::default(),
+    )
+    .await
+    .unwrap();
     let routing = Routing::new(vec![route.clone()], work.clone(), Default::default()).unwrap();
     let execution = crate::test_support::execution(work.clone(), route.presentation.clone()).await;
     let request = ModelRequest::Text {
