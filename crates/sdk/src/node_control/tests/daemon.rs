@@ -195,7 +195,7 @@ async fn configure_commits_and_publishes_after_the_control_connection_closes() {
         response.bytes().await.unwrap();
         core.shutdown().await.unwrap();
         let opts = options(&f);
-        let restored = Core::restore(opts).await.unwrap();
+        let restored = Core::restore(opts, None).await.unwrap();
         assert_eq!(
             serde_json::to_value(&restored.watch().0.document).unwrap(),
             serde_json::to_value(view.document).unwrap()
@@ -254,7 +254,7 @@ port: 0, backends: vec!["missing".into()] });
         connection.close(0u32.into(), b"test finished");
         let _ = served.await.unwrap();
         core.shutdown().await.unwrap();
-        let restored = Core::restore(options(&f)).await.unwrap();
+        let restored = Core::restore(options(&f), None).await.unwrap();
         assert_eq!(restored.watch().0.revision, Revision(2));
         restored.shutdown().await.unwrap();
     }).await;
@@ -474,7 +474,7 @@ async fn removing_a_backend_preserves_its_accepted_request_and_routes_the_next_o
         let mut opts = options(&f);
         opts.signer = Arc::new(FRIEND.node_key());
         opts.owner = Some(Arc::new(FRIEND.passkey()));
-        let restored = Core::restore(opts).await.unwrap();
+        let restored = Core::restore(opts, None).await.unwrap();
         let view = restored.watch().0;
         assert_eq!(view.revision, Revision(2));
         assert_eq!(view.backends.len(), 1);
@@ -847,4 +847,131 @@ async fn local_backends_register_by_evaluator_id() {
         Some(evaluator.as_str())
     );
     core.shutdown().await.unwrap();
+}
+
+#[cfg(feature = "compute")]
+fn model_document(path: std::path::PathBuf) -> Document {
+    serde_json::from_value(serde_json::json!({
+        "listeners": {"api": {"kind": "http", "bind": "127.0.0.1:0", "zdr": true}},
+        "backends": {"local": {"kind": "local", "evaluator": hellas_executor::catena::evaluator(hellas_executor::GpuDialect::Hip), "max_in_flight": 2}},
+        "routes": [{"backends": ["local"], "kind": "model", "model": "tiny", "package": path, "modality": "text", "max_tokens": 1}]
+    })).unwrap()
+}
+
+#[cfg(feature = "compute")]
+#[tokio::test]
+async fn missing_saved_model_keeps_control_available_for_repair() {
+    let f = fixture().await;
+    let document = model_document(f.directory.path().join("missing.gguf"));
+    let (echo, secrets) = document.redacted();
+    f.node
+        .configure_startup(
+            hellas_authority::model::grant::configuration::ConfigurationDocument {
+                revision: Revision(0),
+                document: serde_json::to_string(&echo).unwrap(),
+                secrets,
+            },
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+    let core = Core::restore(options(&f), None).await.unwrap();
+    let view = core.watch().0;
+    assert_eq!(view.revision, Revision(1));
+    assert!(view.backends[0].down);
+    assert!(
+        serde_json::to_value(&view.backends[0]).unwrap()["error"]
+            .as_str()
+            .is_some_and(|error| !error.is_empty())
+    );
+    assert!(!core.jobs.is_closed());
+    let (_client, _server, connection, rpc, served) = connect(&f, core.clone()).await;
+    assert_eq!(
+        rpc.configure(request(&Document::default(), 1))
+            .await
+            .unwrap()
+            .revision,
+        2
+    );
+    assert!(core.watch().0.backends.is_empty());
+    core.shutdown().await.unwrap();
+    connection.close(0u32.into(), b"test complete");
+    let _ = served.await.unwrap();
+}
+
+#[cfg(feature = "compute")]
+#[tokio::test]
+async fn committed_backend_activation_failure_is_published_and_reported() {
+    let f = fixture().await;
+    let package = f.directory.path().join("model.gguf");
+    std::fs::copy(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../client/src/model/package/mini-qwen3.gguf"),
+        &package,
+    )
+    .unwrap();
+    let core = Core::open(options(&f), Document::default()).await.unwrap();
+    let (_client, _server, connection, rpc, served) = connect(&f, core.clone()).await;
+    let committed = Arc::new(Semaphore::new(0));
+    let resume = Arc::new(Semaphore::new(0));
+    *core.after_commit.lock().unwrap() = Some((committed.clone(), resume.clone()));
+    let document = model_document(package.clone());
+    let configured = rpc.configure(request(&document, 0));
+    tokio::pin!(configured);
+    tokio::select! {
+        permit = committed.acquire() => permit.unwrap().forget(),
+        result = &mut configured => panic!("Configure ended before commit: {result:?}"),
+    }
+    std::fs::remove_file(&package).unwrap();
+    resume.add_permits(1);
+    let error = configured.await.unwrap_err();
+    assert!(error.to_string().contains("committed"), "{error}");
+    assert!(!core.jobs.is_closed());
+    let view = core.watch().0;
+    assert_eq!(view.revision, Revision(1));
+    assert!(view.backends[0].down);
+    assert!(
+        serde_json::to_value(&view.backends[0]).unwrap()["error"]
+            .as_str()
+            .is_some_and(|error| !error.is_empty())
+    );
+    assert_eq!(
+        rpc.configure(request(&Document::default(), 1))
+            .await
+            .unwrap()
+            .revision,
+        2
+    );
+    core.shutdown().await.unwrap();
+    connection.close(0u32.into(), b"test complete");
+    let _ = served.await.unwrap();
+}
+
+#[tokio::test]
+async fn unavailable_paid_provider_does_not_prevent_startup() {
+    let f = fixture().await;
+    let provider = Endpoint::builder(::iroh::endpoint::presets::Minimal)
+        .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+        .unwrap()
+        .bind()
+        .await
+        .unwrap();
+    let document: Document = serde_json::from_value(serde_json::json!({
+        "listeners": {},
+        "backends": {"paid": {"kind": "paid", "provider": crate::test_support::address(provider.id()).to_string(), "addresses": provider.bound_sockets(), "max_price": 1, "max_in_flight": 2}}
+    })).unwrap();
+    let core = Core::open(options(&f), document).await.unwrap();
+    let (_client, _server, connection, rpc, served) = connect(&f, core.clone()).await;
+    assert!(!core.jobs.is_closed());
+    assert_eq!(
+        rpc.configure(request(&Document::default(), 0))
+            .await
+            .unwrap()
+            .revision,
+        1
+    );
+    core.shutdown().await.unwrap();
+    provider.close().await;
+    connection.close(0u32.into(), b"test complete");
+    let _ = served.await.unwrap();
 }

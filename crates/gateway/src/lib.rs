@@ -156,6 +156,7 @@ pub struct BackendInfo {
     pub max_in_flight: usize,
     pub in_flight: usize,
     pub down: bool,
+    pub error: Option<String>,
 }
 
 /// The source every presentation runs its jobs on.

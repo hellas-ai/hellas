@@ -19,6 +19,9 @@ pub(crate) struct IrohBackend {
 impl Backend {
     fn executor(&self) -> Result<&hellas_executor::ExecutorHandle, BackendFault> {
         match &self.state {
+            BackendState::Unavailable(error) => Err(BackendFault::caused_by(
+                std::io::Error::other(error.clone()),
+            )),
             BackendState::Local { execution, .. } => Ok(&execution.backend),
             BackendState::Fetch { execution, .. } => Ok(execution),
             BackendState::Grant(_) | BackendState::Paid(_) => Err(BackendFault::caused_by(

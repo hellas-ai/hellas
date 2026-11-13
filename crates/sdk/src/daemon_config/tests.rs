@@ -20,6 +20,7 @@ fn info(id: &str, evaluator: &str) -> hellas_gateway::BackendInfo {
         max_in_flight: 1,
         in_flight: 0,
         down: false,
+        error: None,
     }
 }
 
@@ -263,7 +264,7 @@ async fn model_and_operator_inputs_keep_their_terms_in_one_configuration() {
     );
     let evaluator = hellas_client::model::evaluator(hellas_client::model::GpuDialect::Cuda);
     let configuration = document
-        .configuration(&[info("gpu", &evaluator)])
+        .configuration_for_test(&[info("gpu", &evaluator)])
         .await
         .unwrap();
     assert_eq!(configuration.machine().unwrap().max_in_flight.get(), 64);
@@ -303,7 +304,7 @@ async fn model_and_operator_inputs_keep_their_terms_in_one_configuration() {
     explicit.max_job_millis = std::num::NonZeroU64::new(123_000).unwrap();
     document.resources.push(explicit);
     let configured = document
-        .configuration(&[info("gpu", &evaluator)])
+        .configuration_for_test(&[info("gpu", &evaluator)])
         .await
         .unwrap();
     let explicit = configured.resource("models").unwrap();

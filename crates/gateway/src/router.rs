@@ -4,7 +4,14 @@ use crate::{
     route::RouteExecution, routing::Routing,
 };
 use axum::{Router, body::Body, extract::Request, http::StatusCode, response::Response};
-use std::sync::Arc;
+use hellas_client::model::ModelPackage;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+    sync::Arc,
+};
+
+pub type Models = BTreeMap<PathBuf, Result<BTreeMap<String, Arc<ModelPackage>>, String>>;
 use tower::ServiceExt;
 
 pub async fn router(
@@ -13,60 +20,147 @@ pub async fn router(
     jobs: Arc<crate::jobs::Jobs>,
     memory: Arc<crate::RoutingState>,
 ) -> GatewayResult<Router> {
+    let mut evaluators: BTreeMap<PathBuf, BTreeSet<String>> = BTreeMap::new();
+    let backends = work.backends();
+    for route in &routes {
+        if let Presentation::Model { package, .. } = &route.presentation {
+            for id in &route.backends {
+                let evaluator = backends
+                    .iter()
+                    .find(|backend| backend.id == *id)
+                    .and_then(|backend| backend.evaluator.clone())
+                    .ok_or_else(|| {
+                        crate::GatewayError::Presentation(
+                            format!("backend {id} has no Compute evaluator").into(),
+                        )
+                    })?;
+                evaluators
+                    .entry(package.clone())
+                    .or_default()
+                    .insert(evaluator);
+            }
+        }
+    }
+    let mut models = Models::new();
+    for (path, evaluators) in evaluators {
+        models.insert(
+            path.clone(),
+            Ok(ModelPackage::open_many(&path, evaluators)
+                .await
+                .map_err(|error| crate::GatewayError::Presentation(error.into()))?),
+        );
+    }
+    let (router, errors) = with_models(routes, work, jobs, memory, &models).await?;
+    if let Some(error) = errors.into_values().next() {
+        return Err(crate::GatewayError::Presentation(error.into()));
+    }
+    Ok(router)
+}
+
+/// Assemble presentations from prepared packages. Failed packages retain their
+/// route keys and answer 503 while the operator repairs the live document.
+pub async fn with_models(
+    routes: Vec<Route>,
+    work: Arc<dyn WorkExecutionBackend>,
+    jobs: Arc<crate::jobs::Jobs>,
+    memory: Arc<crate::RoutingState>,
+    models: &Models,
+) -> GatewayResult<(Router, BTreeMap<String, String>)> {
     let routing = Routing::new(routes, work.clone(), memory)?;
     let mut presentations = Vec::new();
+    let mut errors = BTreeMap::new();
     for route in &routing.routes {
-        let execution = RouteExecution::open(route, work.clone()).await?;
-        let router = match &route.presentation {
-            Presentation::Model {
-                model,
-                package,
-                max_tokens,
-                modality,
-            } => match modality {
-                hellas_client::model::ModelKind::Text => crate::state::router(Arc::new(
-                    crate::state::TextState::open(
-                        package.clone(),
-                        model.clone(),
-                        *max_tokens,
-                        execution,
-                    )
-                    .await?,
-                )),
-                hellas_client::model::ModelKind::Transcription => {
-                    crate::audio::router(model.clone(), *max_tokens as usize, execution).await?
+        let prepared: GatewayResult<Router> = async {
+            let packages = match &route.presentation {
+                Presentation::Model { package, .. } => models
+                    .get(package)
+                    .ok_or_else(|| {
+                        crate::GatewayError::Presentation("model was not prepared".into())
+                    })?
+                    .as_ref()
+                    .map_err(|error| crate::GatewayError::Presentation(error.clone().into()))?
+                    .clone(),
+                _ => BTreeMap::new(),
+            };
+            let execution = Arc::new(RouteExecution {
+                work: work.clone(),
+                packages,
+            });
+            Ok(match &route.presentation {
+                Presentation::Model {
+                    model,
+                    package,
+                    max_tokens,
+                    modality,
+                } => match modality {
+                    hellas_client::model::ModelKind::Text => crate::state::router(Arc::new(
+                        crate::state::TextState::open(
+                            package.clone(),
+                            model.clone(),
+                            *max_tokens,
+                            execution,
+                        )
+                        .await?,
+                    )),
+                    hellas_client::model::ModelKind::Transcription => {
+                        crate::audio::router(model.clone(), *max_tokens as usize, execution).await?
+                    }
+                    hellas_client::model::ModelKind::Image => {
+                        crate::image::router(model.clone(), execution).await?
+                    }
+                },
+                Presentation::Responses {
+                    service,
+                    method,
+                    overrides,
+                    ..
+                } => crate::responses_fetch::router(
+                    service.clone(),
+                    method.clone(),
+                    overrides.clone(),
+                    execution,
+                ),
+                Presentation::Http { targets } => {
+                    crate::http_fetch::router(targets.clone(), execution)?
                 }
-                hellas_client::model::ModelKind::Image => {
-                    crate::image::router(model.clone(), execution).await?
+            })
+        }
+        .await;
+        let router = match prepared {
+            Ok(router) => router,
+            Err(crate::GatewayError::Presentation(error)) => {
+                let reason = error.to_string();
+                for id in &route.backends {
+                    errors.insert(id.clone(), reason.clone());
                 }
-            },
-            Presentation::Responses {
-                service,
-                method,
-                overrides,
-                ..
-            } => crate::responses_fetch::router(
-                service.clone(),
-                method.clone(),
-                overrides.clone(),
-                execution,
-            ),
-            Presentation::Http { targets } => {
-                crate::http_fetch::router(targets.clone(), execution)?
+                Router::new().fallback(move |request: Request| {
+                    let reason = reason.clone();
+                    async move {
+                        path_error(
+                            request.uri().path(),
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            reason,
+                        )
+                    }
+                })
             }
+            Err(error) => return Err(error),
         };
         presentations.push(router);
     }
-    Ok(Router::new()
-        .fallback(move |request| {
-            dispatch(
-                routing.clone(),
-                presentations.clone(),
-                jobs.clone(),
-                request,
-            )
-        })
-        .layer(axum::extract::DefaultBodyLimit::disable()))
+    Ok((
+        Router::new()
+            .fallback(move |request| {
+                dispatch(
+                    routing.clone(),
+                    presentations.clone(),
+                    jobs.clone(),
+                    request,
+                )
+            })
+            .layer(axum::extract::DefaultBodyLimit::disable()),
+        errors,
+    ))
 }
 
 async fn dispatch(

@@ -1,18 +1,13 @@
 use super::Result;
 use crate::{
     Backend, BackendEntry, BackendState,
-    daemon_config::{BackendKind, Document, Trust},
+    daemon_config::{BackendKind, Trust},
 };
 use hellas_auth::authority::{NodeKey, PrincipalId, UnixMillis};
 use hellas_store::content::DiskStore;
-#[cfg(feature = "compute")]
-use hellas_store::content::{ContentStore, IndexMode, PinName, PinPolicy, PinValue, Scope, Target};
-use std::sync::Arc;
-#[cfg(feature = "compute")]
-use std::{
-    collections::BTreeSet,
-    path::{Path, PathBuf},
-};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+mod models;
+pub(super) use models::Files;
 
 pub struct Options {
     pub discovery: bool,
@@ -44,16 +39,13 @@ pub(super) struct Runtime {
     executors:
         tokio::sync::Mutex<std::collections::BTreeMap<String, hellas_executor::ExecutorHandle>>,
     #[cfg(feature = "compute")]
-    indexed: tokio::sync::Mutex<BTreeSet<PathBuf>>,
+    indexed: tokio::sync::Mutex<Files>,
+    models: tokio::sync::Mutex<BTreeMap<PathBuf, models::Cached>>,
 }
 
 pub(super) enum PreparedBackend {
-    Ready {
-        entry: BackendEntry,
-        paths: Vec<std::path::PathBuf>,
-    },
+    Ready(BackendEntry),
     Paid {
-        quote: crate::paid_client::PaidQuote,
         options: Box<crate::paid_client::PaidWorkOptions>,
         endpoint: iroh::Endpoint,
         evaluator: Option<String>,
@@ -62,14 +54,36 @@ pub(super) enum PreparedBackend {
 }
 impl PreparedBackend {
     pub fn ready(entry: BackendEntry) -> Self {
-        Self::Ready {
-            entry,
-            paths: vec![],
-        }
+        Self::Ready(entry)
+    }
+    pub fn unavailable(configured: &crate::daemon_config::Backend, reason: String) -> Self {
+        let evaluator = match &configured.kind {
+            BackendKind::Local { evaluator, .. } => {
+                #[cfg(feature = "compute")]
+                {
+                    Some(evaluator.clone().unwrap_or_else(|| {
+                        hellas_executor::catena::evaluator(hellas_executor::catena::default_gpu())
+                    }))
+                }
+                #[cfg(not(feature = "compute"))]
+                {
+                    evaluator.clone()
+                }
+            }
+            BackendKind::Grant { evaluator, .. } | BackendKind::Paid { evaluator, .. } => {
+                evaluator.clone()
+            }
+            BackendKind::Fetch { .. } => None,
+        };
+        Self::ready(BackendEntry {
+            backend: Backend::unavailable(reason),
+            evaluator,
+            max_in_flight: configured.max_in_flight,
+        })
     }
     pub fn info(&self, id: &str) -> hellas_gateway::BackendInfo {
         let (evaluator, capacity) = match self {
-            Self::Ready { entry, .. } => (&entry.evaluator, entry.max_in_flight),
+            Self::Ready(entry) => (&entry.evaluator, entry.max_in_flight),
             Self::Paid {
                 evaluator,
                 capacity,
@@ -82,20 +96,17 @@ impl PreparedBackend {
             evaluator: evaluator.clone(),
             max_in_flight: capacity.get(),
             in_flight: 0,
-            down: false,
+            down: matches!(self, Self::Ready(entry) if entry.backend.error().is_some()),
+            error: match self {
+                Self::Ready(entry) => entry.backend.error(),
+                _ => None,
+            },
         }
     }
     pub async fn activate(self, runtime: &Runtime) -> Result<BackendEntry> {
         match self {
-            Self::Ready { entry, paths } => {
-                #[cfg(feature = "compute")]
-                runtime.index(paths).await?;
-                #[cfg(not(feature = "compute"))]
-                let _ = paths;
-                Ok(entry)
-            }
+            Self::Ready(entry) => Ok(entry),
             Self::Paid {
-                quote,
                 mut options,
                 endpoint,
                 evaluator,
@@ -104,10 +115,9 @@ impl PreparedBackend {
                 options.config.chain.persist()?;
                 let (owner, content) = runtime.client_resources(&options.config.chain).await?;
                 options.content = content;
-                options.expected_price = quote.policy.payment_policy.fixed_price;
                 Ok(BackendEntry {
                     backend: Backend::paid(
-                        Some(quote.policy.invocation_policy),
+                        None,
                         *options,
                         endpoint,
                         runtime.options.settlement.clone(),
@@ -132,6 +142,7 @@ impl Runtime {
             executors: Default::default(),
             #[cfg(feature = "compute")]
             indexed: Default::default(),
+            models: Default::default(),
         }
     }
 
@@ -258,13 +269,9 @@ impl Runtime {
 
     pub async fn open_backend(
         &self,
-        id: &str,
         configured: &crate::daemon_config::Backend,
-        document: &Document,
-        counters: Arc<crate::counter_store::PreparedCounters>,
+        counters: Arc<crate::counter_store::FilesystemAssertionCounterStore>,
     ) -> Result<PreparedBackend> {
-        #[allow(unused_mut)]
-        let mut index_paths = Vec::new();
         let (backend, evaluator) = match &configured.kind {
             BackendKind::Fetch { .. } => (
                 configured.open_fetch(self.options.signer.clone()).await?,
@@ -346,7 +353,6 @@ impl Runtime {
             } => {
                 let provider = provider.parse()?;
                 let chain = self.chain(chain)?;
-                let principal = self.principal()?;
                 let endpoint = self.consumer_endpoint().await?;
                 let apple_trust = self.trust(trust, counters.clone())?;
                 let options = crate::paid_client::PaidWorkOptions {
@@ -367,28 +373,17 @@ impl Runtime {
                     payment_blocks: *payment_blocks,
                     timeout: timeout_seconds.map(std::time::Duration::from_secs),
                 };
-                let quote = crate::paid_client::request_paid_quote(
-                    &options,
-                    &endpoint,
-                    &self.options.settlement,
-                    principal,
-                )
-                .await?;
-                if quote.policy.payment_policy.fixed_price > *max_price {
-                    return Err("quoted price exceeds the backend limit".into());
-                }
                 return Ok(PreparedBackend::Paid {
-                    quote,
                     options: Box::new(options),
                     endpoint,
                     evaluator: evaluator.clone(),
                     capacity: configured.max_in_flight,
                 });
             }
-            BackendKind::Local { evaluator, content } => {
+            BackendKind::Local { evaluator, .. } => {
                 #[cfg(not(feature = "compute"))]
                 {
-                    let _ = (id, document, evaluator, content);
+                    let _ = evaluator;
                     return Err("local backends require the compute build".into());
                 }
                 #[cfg(feature = "compute")]
@@ -416,30 +411,6 @@ impl Runtime {
                             .clone(),
                     };
                     drop(executors);
-                    let mut paths = content.clone();
-                    paths.extend(
-                        document
-                            .routes
-                            .iter()
-                            .filter(|route| route.backends.contains(&id.to_owned()))
-                            .filter_map(|route| {
-                                if let hellas_gateway::Presentation::Model { package, .. } =
-                                    &route.presentation
-                                {
-                                    Some(package.clone())
-                                } else {
-                                    None
-                                }
-                            }),
-                    );
-                    let mut files = Vec::new();
-                    for path in &paths {
-                        collect_files(&std::fs::canonicalize(path)?, &mut files)?;
-                    }
-                    for path in files {
-                        hellas_store::content::file_content(&path)?;
-                    }
-                    index_paths = paths;
                     (
                         Backend::local(
                             crate::execution::local::LocalExecution {
@@ -453,66 +424,10 @@ impl Runtime {
                 }
             }
         };
-        Ok(PreparedBackend::Ready {
-            entry: BackendEntry {
-                backend,
-                evaluator,
-                max_in_flight: configured.max_in_flight,
-            },
-            paths: index_paths,
-        })
+        Ok(PreparedBackend::Ready(BackendEntry {
+            backend,
+            evaluator,
+            max_in_flight: configured.max_in_flight,
+        }))
     }
-
-    /// Indexing is a content cache; it never replaces the serving document or drops old objects.
-    #[cfg(feature = "compute")]
-    async fn index(&self, paths: Vec<PathBuf>) -> Result<()> {
-        let mut indexed = self.indexed.lock().await;
-        let mut next = indexed.clone();
-        let mut files = Vec::new();
-        for path in paths {
-            let path = std::fs::canonicalize(path)?;
-            if next.insert(path.clone()) {
-                collect_files(&path, &mut files)?;
-            }
-        }
-        if files.is_empty() {
-            return Ok(());
-        }
-        self.options
-            .content
-            .rescan(next.iter().cloned().collect(), IndexMode::Resume)
-            .await?;
-        for file in files {
-            let object = hellas_store::content::file_content(&file)?;
-            let name = PinName::new(format!("models/{}", object.id()))?;
-            let old = hellas_store::content::owner_pin(&self.options.content, &name).await?;
-            let value = PinValue {
-                target: Target::Object(object),
-                policy: PinPolicy::Jobs,
-                expires: None,
-            };
-            if old.as_ref() != Some(&value) {
-                self.options
-                    .content
-                    .set_pin(&Scope::Owner, &name, old.as_ref(), Some(value))
-                    .await?;
-            }
-        }
-        *indexed = next;
-        Ok(())
-    }
-}
-#[cfg(feature = "compute")]
-fn collect_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
-    let kind = std::fs::symlink_metadata(path)?.file_type();
-    if kind.is_file() {
-        files.push(path.to_owned());
-    } else if kind.is_dir() {
-        for entry in std::fs::read_dir(path)? {
-            collect_files(&entry?.path(), files)?;
-        }
-    } else {
-        return Err("model content must contain regular files or directories".into());
-    }
-    Ok(())
 }

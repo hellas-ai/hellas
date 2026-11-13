@@ -50,6 +50,7 @@ impl Executor {
         let local_policy;
         // Box remote lifecycles to bound the caller's async state.
         let (execution, content, policy) = match &self.backend.state {
+            BackendState::Unavailable(error) => return Err(ExecutionError::Local(error.clone())),
             BackendState::Paid(paid) => {
                 return Box::pin(async {
                     let crate::PaidBackend {

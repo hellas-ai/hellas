@@ -115,7 +115,8 @@ impl ModelPackage {
         Ok(packages)
     }
 
-    async fn open_with_weights(
+    /// Load a renderer using weights already inspected by the content store.
+    pub async fn open_with_weights(
         path: &Path,
         evaluator: &str,
         weights: Option<hellas_rpc::ContentRef>,

@@ -13,6 +13,7 @@ pub fn backend(evaluator: Option<String>) -> Vec<BackendInfo> {
         max_in_flight: 4,
         in_flight: 0,
         down: false,
+        error: None,
     }]
 }
 pub fn route(presentation: Presentation) -> Route {
@@ -48,9 +49,18 @@ pub async fn execution(
     work: Arc<dyn WorkExecutionBackend>,
     presentation: Presentation,
 ) -> Arc<RouteExecution> {
-    RouteExecution::open(&route(presentation), work)
+    let packages = match &presentation {
+        Presentation::Model { package, .. } => hellas_client::model::ModelPackage::open_many(
+            package,
+            work.backends()
+                .into_iter()
+                .filter_map(|backend| backend.evaluator),
+        )
         .await
-        .unwrap()
+        .unwrap(),
+        _ => Default::default(),
+    };
+    Arc::new(RouteExecution { work, packages })
 }
 
 pub fn job() -> Arc<crate::jobs::Job> {

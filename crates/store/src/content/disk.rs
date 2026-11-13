@@ -914,6 +914,31 @@ impl Drop for FileObject {
     }
 }
 impl DiskStore {
+    /// Inspect lower files without publishing objects or writing pins.
+    pub async fn inspect_files(
+        &self,
+        paths: Vec<PathBuf>,
+    ) -> Result<BTreeMap<PathBuf, ContentRef>> {
+        self.core
+            .run(move |core| {
+                let disk = core.disk.as_ref().expect("disk store");
+                let mut files = BTreeMap::new();
+                crate::fastresume::walk_lower(&paths, |path| {
+                    let (indexed, _) = disk.index(path, IndexMode::Resume)?;
+                    files.insert(
+                        path.to_owned(),
+                        ContentRef::new(
+                            ContentId::from_bytes(indexed.id.into_bytes()),
+                            indexed.len,
+                        ),
+                    );
+                    Ok(())
+                })?;
+                Ok(files)
+            })
+            .await
+    }
+
     pub async fn rescan(&self, lower: Vec<PathBuf>, mode: IndexMode) -> Result<()> {
         self.core
             .access(&Scope::Owner, move |core| {

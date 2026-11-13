@@ -96,37 +96,6 @@ pub(crate) struct RouteExecution {
 }
 
 impl RouteExecution {
-    pub async fn open(
-        route: &Route,
-        work: Arc<dyn WorkExecutionBackend>,
-    ) -> crate::GatewayResult<Arc<Self>> {
-        let packages = match &route.presentation {
-            Presentation::Model { package, .. } => {
-                let backends = work.backends();
-                let evaluators = route
-                    .backends
-                    .iter()
-                    .map(|id| {
-                        backends
-                            .iter()
-                            .find(|b| b.id == *id)
-                            .and_then(|b| b.evaluator.clone())
-                            .ok_or_else(|| {
-                                crate::GatewayError::Presentation(
-                                    format!("backend {id} has no Compute evaluator").into(),
-                                )
-                            })
-                    })
-                    .collect::<crate::GatewayResult<Vec<_>>>()?;
-                ModelPackage::open_many(package, evaluators)
-                    .await
-                    .map_err(|error| crate::GatewayError::Presentation(error.into()))?
-            }
-            _ => BTreeMap::new(),
-        };
-        Ok(Arc::new(Self { work, packages }))
-    }
-
     pub async fn compute(
         &self,
         selection: &mut crate::routing::Selection,

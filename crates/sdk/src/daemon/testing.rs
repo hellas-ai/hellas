@@ -41,5 +41,5 @@ impl Daemon {
 pub async fn configuration(
     document: &Document,
 ) -> hellas_authority::model::grant::configuration::NodeConfiguration {
-    document.configuration(&[]).await.unwrap()
+    document.configuration_for_test(&[]).await.unwrap()
 }

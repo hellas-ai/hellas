@@ -243,6 +243,14 @@ impl ModelContext {
     }
 }
 
+fn grant_backend_id(destination: &str, resource: hellas_auth::authority::ResourceId) -> String {
+    hellas_auth::hash_tuple(
+        "hellas.gateway.grant-backend.v1",
+        &[destination.as_bytes(), resource.to_string().as_bytes()],
+    )
+    .to_string()
+}
+
 fn grant_backend(
     document: &mut Document,
     destination: &str,
@@ -251,11 +259,7 @@ fn grant_backend(
     evaluator: Option<String>,
     trust: Option<hellas_sdk::daemon_config::Trust>,
 ) -> String {
-    let id = hellas_auth::hash_tuple(
-        "hellas.gateway.grant-backend.v1",
-        &[destination.as_bytes(), resource.to_string().as_bytes()],
-    )
-    .to_string();
+    let id = grant_backend_id(destination, resource);
     let max_in_flight = document
         .backends
         .get(&id)
@@ -394,7 +398,7 @@ pub async fn apply(document: &mut Document, edit: Edit, context: &ModelContext) 
 }
 
 pub fn print(view: &hellas_sdk::daemon::View) {
-    println!("MODEL\tMODALITY\tAPI PATH\tBACKEND\tSTATE\tJOBS");
+    println!("MODEL\tMODALITY\tAPI PATH\tBACKEND\tSTATE\tJOBS\tERROR");
     for route in &view.document.routes {
         let modality = match &route.presentation {
             Presentation::Model { modality, .. } => match modality {
@@ -408,14 +412,17 @@ pub fn print(view: &hellas_sdk::daemon::View) {
             for id in &route.backends {
                 let backend = view.backends.iter().find(|backend| backend.id == *id);
                 println!(
-                    "{}\t{modality}\t{path}\t{id}\t{}\t{}",
+                    "{}\t{modality}\t{path}\t{id}\t{}\t{}\t{}",
                     model.as_deref().unwrap_or("*"),
                     if backend.is_some_and(|backend| backend.down) {
                         "Down"
                     } else {
                         "Up"
                     },
-                    backend.map_or(0, |backend| backend.in_flight)
+                    backend.map_or(0, |backend| backend.in_flight),
+                    backend
+                        .and_then(|backend| backend.error.as_deref())
+                        .unwrap_or("")
                 );
             }
         }
@@ -711,7 +718,7 @@ async fn run_daemon(
     let serving = async {
         let core = match document {
             Some(document) => hellas_sdk::daemon::Core::open(options, document).await,
-            None => hellas_sdk::daemon::Core::restore_on_port(options, port).await,
+            None => hellas_sdk::daemon::Core::restore(options, port).await,
         }
         .map_err(anyhow::Error::from_boxed)?;
         let result = async {

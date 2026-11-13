@@ -19,6 +19,7 @@ impl Fake {
                         max_in_flight: 4,
                         in_flight: 0,
                         down: false,
+                        error: None,
                     })
                     .into(),
             ),
@@ -260,9 +261,8 @@ async fn failover_stops_at_the_proposal_boundary() {
         Arc::get_mut(&mut work).unwrap().committed = committed;
         let route = row(&["a", "b"], None);
         let routing = Routing::new(vec![route.clone()], work.clone(), Default::default()).unwrap();
-        let execution = crate::route::RouteExecution::open(&route, work.clone())
-            .await
-            .unwrap();
+        let execution =
+            crate::test_support::execution(work.clone(), route.presentation.clone()).await;
         let mut selection = choose(&routing, None, None).unwrap();
         let result = execution
             .fetch(&mut selection, |_| {
@@ -295,9 +295,7 @@ async fn pinned_pre_proposal_failure_is_not_retried_on_another_backend() {
     let mut first = choose(&routing, None, Some("session")).unwrap();
     first.next();
     first.accept("a");
-    let execution = crate::route::RouteExecution::open(&route, work.clone())
-        .await
-        .unwrap();
+    let execution = crate::test_support::execution(work.clone(), route.presentation.clone()).await;
     let mut pinned = choose(&routing, None, Some("session")).unwrap();
     assert!(
         execution
@@ -328,6 +326,7 @@ async fn compute_is_rendered_for_each_selected_evaluator() {
                     max_in_flight: 2,
                     in_flight: 0,
                     down: false,
+                    error: None,
                 })
                 .into()
         }
@@ -369,9 +368,7 @@ async fn compute_is_rendered_for_each_selected_evaluator() {
         calls: Default::default(),
     });
     let routing = Routing::new(vec![route.clone()], work.clone(), Default::default()).unwrap();
-    let execution = crate::route::RouteExecution::open(&route, work.clone())
-        .await
-        .unwrap();
+    let execution = crate::test_support::execution(work.clone(), route.presentation.clone()).await;
     let request = ModelRequest::Text {
         prompt_ids: &[0],
         max_new: 1,
