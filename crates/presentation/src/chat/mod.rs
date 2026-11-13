@@ -83,7 +83,7 @@ impl TextPresentation {
                     request.instructions.as_deref(),
                     require_tool,
                 )?;
-                self.encode_chat_with_tools(&messages, &tools)?
+                self.encode_chat(&messages, &tools)?
             }
         };
         Ok(PreparedChat {
@@ -265,7 +265,7 @@ mod tests {
         ]);
         let messages = input::text_chat_messages(&input, None, false).unwrap();
         let rendered = crate::tests::template(false)
-            .render_with_tools(&messages, &input::chat_tools(&request()).unwrap())
+            .render(&messages, &input::chat_tools(&request()).unwrap())
             .unwrap();
         assert!(rendered.contains(
             "<tool_call>\n{\"name\": \"bash\", \"arguments\": {\"command\":\"df -h\"}}\n</tool_call>"
@@ -308,7 +308,7 @@ mod tests {
             ]);
             let messages = input::text_chat_messages(&input, None, false).unwrap();
             let rendered = crate::tests::template(true)
-                .render_with_tools(&messages, &input::chat_tools(&request()).unwrap())
+                .render(&messages, &input::chat_tools(&request()).unwrap())
                 .unwrap();
             assert!(rendered.contains(&output));
             assert!(rendered.ends_with("<|im_start|>user\n<tool_response>\n/home: 74% used\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"));

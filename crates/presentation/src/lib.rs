@@ -53,15 +53,7 @@ impl ChatTemplate {
         Ok(Self { environment })
     }
 
-    pub fn render(&self, messages: &[ChatMessage]) -> Result<String> {
-        self.render_with_tools(messages, &[])
-    }
-
-    pub fn render_with_tools(
-        &self,
-        messages: &[ChatMessage],
-        tools: &[serde_json::Value],
-    ) -> Result<String> {
+    pub fn render(&self, messages: &[ChatMessage], tools: &[serde_json::Value]) -> Result<String> {
         anyhow::ensure!(!messages.is_empty(), "chat requires at least one message");
         self.environment
             .get_template("chat")?
@@ -96,16 +88,12 @@ impl TextPresentation {
         })
     }
 
-    pub fn encode_chat(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
-        self.encode_chat_with_tools(messages, &[])
-    }
-
-    pub fn encode_chat_with_tools(
+    pub fn encode_chat(
         &self,
         messages: &[ChatMessage],
         tools: &[serde_json::Value],
     ) -> Result<Vec<u32>> {
-        self.encode(&self.chat_template.render_with_tools(messages, tools)?)
+        self.encode(&self.chat_template.render(messages, tools)?)
     }
 
     /// Plain text tokenization, independent of the selected chat template.
@@ -238,7 +226,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            template(false).render(&messages).unwrap(),
+            template(false).render(&messages, &[]).unwrap(),
             concat!(
                 "<|im_start|>system\nBe concise.<|im_end|>\n",
                 "<|im_start|>user\nFirst question<|im_end|>\n",
@@ -262,8 +250,8 @@ mod tests {
             ..Default::default()
         }];
         assert_eq!(
-            presentation.chat_template.render(&messages).unwrap(),
-            template(false).render(&messages).unwrap()
+            presentation.chat_template.render(&messages, &[]).unwrap(),
+            template(false).render(&messages, &[]).unwrap()
         );
         // Change only the embedded template, keeping architecture and weights.
         let mut bytes = std::fs::read(&model).unwrap();
@@ -280,7 +268,7 @@ mod tests {
         assert!(
             custom
                 .chat_template
-                .render(&messages)
+                .render(&messages, &[])
                 .unwrap()
                 .ends_with("<|im_start|>different\n<think>\n\n</think>\n\n")
         );

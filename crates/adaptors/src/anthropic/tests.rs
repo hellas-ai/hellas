@@ -710,17 +710,18 @@ fn tool_search_loads_only_referenced_definitions() {
             .collect::<Vec<_>>(),
         ["ToolSearch", "read"]
     );
+    assert_eq!(
+        canonical.tools[1].description.as_deref(),
+        Some("Read a file")
+    );
+    assert_eq!(canonical.tools[1].parameters, json!({"type":"object"}));
     let Input::Items(items) = canonical.input else {
         panic!();
     };
     let [InputItem::ToolResult { output, .. }] = &items[..] else {
         panic!("{items:?}");
     };
-    assert_eq!(text_of(&output[..1]), "Found: ");
-    let expanded: JsonValue = serde_json::from_str(&text_of(&output[1..2])).unwrap();
-    assert_eq!(expanded["function"]["name"], "read");
-    assert_eq!(expanded["function"]["description"], "Read a file");
-    assert_eq!(expanded["function"]["parameters"], json!({"type":"object"}));
+    assert_eq!(text_of(output), "Found: Loaded tool: read\n");
     for invalid in [json!("missing"), json!(null), json!(3)] {
         request["messages"][0]["content"][0]["content"][1]["tool_name"] = invalid;
         assert!(adaptor().parse(raw(request.clone())).is_err());

@@ -476,7 +476,7 @@ fn project_tool(value: &JsonValue) -> AdaptorResult<(ToolSpec, bool)> {
 }
 
 /// Client-side ToolSearch returns references to definitions in this request.
-/// Expand them in place and allow the discovered tools in subsequent output.
+/// Load each discovered tool once and include its name in the search result.
 fn tool_result_content(
     value: Option<&JsonValue>,
     tools: &mut [(ToolSpec, bool)],
@@ -493,7 +493,7 @@ fn tool_result_content(
             "text" => output.push(text_part(block)?),
             "tool_reference" => {
                 let name = required_string(block, "tool_name")?;
-                let (tool, loaded) = tools
+                let (_, loaded) = tools
                     .iter_mut()
                     .find(|(tool, _)| tool.name == name)
                     .ok_or_else(|| {
@@ -501,10 +501,12 @@ fn tool_result_content(
                             "tool_reference names unknown tool `{name}`"
                         ))
                     })?;
-                *loaded = true;
-                output.push(ContentPart::Text { text: json!({
-                    "type": "function", "function": {"name": tool.name, "description": tool.description, "parameters": tool.parameters}
-                }).to_string() });
+                if !*loaded {
+                    *loaded = true;
+                    output.push(ContentPart::Text {
+                        text: format!("Loaded tool: {name}\n"),
+                    });
+                }
             }
             _ => {
                 return Err(AdaptorError::invalid_request(

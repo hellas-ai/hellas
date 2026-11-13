@@ -74,7 +74,7 @@ async fn prepare(
         })
         .collect();
     let prompt: Vec<u64> = presentation
-        .encode_chat(&messages)?
+        .encode_chat(&messages, &[])?
         .into_iter()
         .map(u64::from)
         .collect();
@@ -129,11 +129,14 @@ mod tests {
         let (plan, inputs) = (job.plan, job.inputs);
         assert_eq!(plan.step.as_ref().unwrap().stop.max_steps, 3);
         let prompt = presentation
-            .encode_chat(&[ChatMessage {
-                role: "user".into(),
-                content: "hello".into(),
-                ..Default::default()
-            }])
+            .encode_chat(
+                &[ChatMessage {
+                    role: "user".into(),
+                    content: "hello".into(),
+                    ..Default::default()
+                }],
+                &[],
+            )
             .unwrap();
         let encoded: Vec<u8> = prompt
             .iter()
