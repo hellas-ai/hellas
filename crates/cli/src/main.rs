@@ -181,6 +181,11 @@ enum Commands {
         #[arg(long, value_name = "EVALUATOR")]
         backend: String,
     },
+    /// Prepare model metadata for rendering jobs on another machine.
+    Model {
+        #[command(subcommand)]
+        command: commands::model::ModelCommand,
+    },
     /// Transcribe one WAV with a client-rendered Whisper job.
     Transcribe(commands::transact::TranscribeArgs),
     /// Answer one prompt with a client-rendered Qwen3 text job.
@@ -380,6 +385,15 @@ async fn async_main() {
                 .await
                 .and_then(|package| package.program())
                 .map(|program| println!("{program}"));
+            tracer_provider.shutdown();
+            if let Err(error) = result {
+                eprintln!("error: {error:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        Commands::Model { command } => {
+            let result = commands::model::run(command).await;
             tracer_provider.shutdown();
             if let Err(error) = result {
                 eprintln!("error: {error:#}");
@@ -623,6 +637,7 @@ async fn async_main() {
             .await
         }
         Commands::ConvertWhisper { .. }
+        | Commands::Model { .. }
         | Commands::ConvertFlux { .. }
         | Commands::Program { .. } => {
             unreachable!("model commands handled before identity load")

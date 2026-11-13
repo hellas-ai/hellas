@@ -139,7 +139,7 @@ impl TextState {
             return Err(crate::GatewayConfigError::MaxTokens.into());
         }
         let presentation = tokio::task::spawn_blocking(move || {
-            TextPresentation::from_gguf(&path)
+            TextPresentation::from_gguf(&hellas_client::model::ModelPackage::gguf_path(&path))
                 .map(|presentation| presentation.with_chat_template(Some(ChatTemplate::Qwen3)))
         })
         .await

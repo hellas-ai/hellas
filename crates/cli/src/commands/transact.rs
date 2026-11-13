@@ -529,6 +529,12 @@ impl TargetArgs {
         #[cfg(feature = "compute")]
         if self.local {
             ensure!(pay == 0, "local work is not paid; drop --pay");
+            ensure!(
+                self.models
+                    .iter()
+                    .all(|path| !hellas_client::model::ModelPackage::is_descriptor(path)),
+                "local execution requires the full model weights, not a descriptor"
+            );
             let mut native = self.native;
             native.content.extend(self.models);
             let execution =

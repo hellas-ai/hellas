@@ -29,6 +29,41 @@ pub(super) struct Qwen3 {
     states: Vec<String>,
 }
 
+pub(super) fn metadata(
+    path: &Path,
+    weights_bytes: Option<u64>,
+) -> Result<(ModelConfig, Vec<(u64, u64)>)> {
+    let mut file = File::open(path)?;
+    let header = match weights_bytes {
+        Some(bytes) => gguf::read_descriptor(&mut file, bytes)?,
+        None => gguf::read_header(&mut file)?,
+    };
+    let config = read_gguf_model_config(path)?;
+    let tensors: BTreeMap<_, _> = header
+        .tensors
+        .iter()
+        .map(|t| (t.name.as_str(), t))
+        .collect();
+    let mut views = Vec::new();
+    for spec in weight_specs(&config)? {
+        let tensor = tensors
+            .get(spec.gguf_name.as_str())
+            .with_context(|| format!("missing weight {}", spec.gguf_name))?;
+        let dtype = match spec.dtype {
+            WeightDtype::F32 => Dtype::F32,
+            WeightDtype::Bf16 => Dtype::Bf16,
+        };
+        ensure!(
+            tensor.dtype == dtype
+                && tensor.shape == spec.shape.iter().map(|n| *n as u64).collect::<Vec<_>>(),
+            "weight shape or dtype mismatch: {}",
+            spec.gguf_name
+        );
+        views.push((tensor.offset, tensor.bytes));
+    }
+    Ok((config, views))
+}
+
 impl Qwen3 {
     pub async fn open(
         path: &Path,
@@ -38,33 +73,22 @@ impl Qwen3 {
         let path = path.to_owned();
         let (config, views, object, source, states) =
             tokio::task::spawn_blocking(move || -> Result<_> {
-                let header = gguf::read_header(&mut File::open(&path)?)?;
-                let config = read_gguf_model_config(&path)?;
-                let tensors: BTreeMap<_, _> = header
-                    .tensors
-                    .iter()
-                    .map(|t| (t.name.as_str(), t))
-                    .collect();
-                let mut views = Vec::new();
-                for spec in weight_specs(&config)? {
-                    let tensor = tensors
-                        .get(spec.gguf_name.as_str())
-                        .with_context(|| format!("missing weight {}", spec.gguf_name))?;
-                    let dtype = match spec.dtype {
-                        WeightDtype::F32 => Dtype::F32,
-                        WeightDtype::Bf16 => Dtype::Bf16,
-                    };
-                    ensure!(
-                        tensor.dtype == dtype
-                            && tensor.shape
-                                == spec.shape.iter().map(|n| *n as u64).collect::<Vec<_>>(),
-                        "weight shape or dtype mismatch: {}",
-                        spec.gguf_name
-                    );
-                    views.push((tensor.offset, tensor.bytes));
-                }
-                let object =
-                    weights.map_or_else(|| hellas_store::content::file_content(&path), Ok)?;
+                let descriptor = super::descriptor::weights(&path)?;
+                let object = match (descriptor, weights) {
+                    (Some(object), Some(inspected)) => {
+                        ensure!(
+                            object == inspected,
+                            "descriptor and supplied weights disagree"
+                        );
+                        object
+                    }
+                    (Some(object), None) | (None, Some(object)) => object,
+                    (None, None) => super::descriptor::file_content(&path)?,
+                };
+                let (config, views) = metadata(
+                    &super::descriptor::gguf_path(&path),
+                    descriptor.map(|object| object.bytes()),
+                )?;
                 // Qwen3.5 prefills with matrix cores; Qwen3 has only SIMT kernels.
                 let wmma = matches!(
                     config.architecture,

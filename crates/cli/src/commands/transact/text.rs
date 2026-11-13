@@ -60,7 +60,7 @@ async fn prepare(
 )> {
     let model = args.model.clone();
     let presentation = tokio::task::spawn_blocking(move || {
-        TextPresentation::from_gguf(&model)
+        TextPresentation::from_gguf(&ModelPackage::gguf_path(&model))
             .map(|presentation| presentation.with_chat_template(Some(ChatTemplate::Qwen3)))
     })
     .await??;

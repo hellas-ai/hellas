@@ -21,7 +21,7 @@ use std::{
 
 pub const WEIGHTS_FILE: &str = "weights.bf16";
 pub const OUTPUT: &str = "transcription";
-const METADATA: [&str; 3] = ["config.json", "generation_config.json", "tokenizer.json"];
+pub(super) const METADATA: [&str; 3] = ["config.json", "generation_config.json", "tokenizer.json"];
 /// The published checkpoint files [`convert_whisper`] reads.
 pub const CHECKPOINT: [&str; 4] = [METADATA[0], METADATA[1], METADATA[2], "model.safetensors"];
 
@@ -136,6 +136,20 @@ fn views(config: &Config) -> Result<Vec<(u64, u64)>> {
         .collect()
 }
 
+pub(super) fn validate_metadata(dir: &Path, object: ContentRef) -> Result<()> {
+    let (config, _, _) = metadata(dir)?;
+    validate_weight_length(&views(&config)?, object)
+}
+
+fn validate_weight_length(views: &[(u64, u64)], object: ContentRef) -> Result<()> {
+    let (offset, bytes) = views.last().context("model has no weights")?;
+    ensure!(
+        object.bytes() == offset + bytes,
+        "derived weight file has wrong length"
+    );
+    Ok(())
+}
+
 /// Convert a published local checkpoint into a client package directory. The
 /// derived weight file is an ordinary content-addressed provider asset.
 pub fn convert_whisper(checkpoint: &Path, destination: &Path) -> Result<ContentRef> {
@@ -202,15 +216,19 @@ impl Whisper {
             tokio::task::spawn_blocking(move || -> Result<_> {
                 let (config, generation, tokenizer) = metadata(&dir)?;
                 let views = views(&config)?;
-                let object = weights.map_or_else(
-                    || hellas_store::content::file_content(&dir.join(WEIGHTS_FILE)),
-                    Ok,
-                )?;
-                let (offset, bytes) = views.last().context("model has no weights")?;
-                ensure!(
-                    object.bytes() == offset + bytes,
-                    "derived weight file has wrong length"
-                );
+                let descriptor = super::descriptor::weights(&dir)?;
+                let object = match (descriptor, weights) {
+                    (Some(object), Some(inspected)) => {
+                        ensure!(
+                            object == inspected,
+                            "descriptor and supplied weights disagree"
+                        );
+                        object
+                    }
+                    (Some(object), None) | (None, Some(object)) => object,
+                    (None, None) => super::descriptor::file_content(&dir.join(WEIGHTS_FILE))?,
+                };
+                validate_weight_length(&views, object)?;
                 let source = super::program::render(&graph::bundle(&config, false)?, dialect)?;
                 Ok((config, generation, tokenizer, views, object, source))
             })

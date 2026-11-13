@@ -1,5 +1,6 @@
 //! Model families render the same opaque program-and-bytes Compute contract.
 use super::{
+    descriptor,
     flux::{Flux, Image, ImageRequest},
     qwen3::Qwen3,
     whisper::Whisper,
@@ -11,7 +12,10 @@ use hellas_rpc::protocol::invocation::{
     output::InvocationOutput,
 };
 use hellas_store::content::{LocalStore, Scope};
-use std::{path::Path, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 enum Family {
     Qwen3(Arc<Qwen3>),
@@ -40,6 +44,8 @@ impl ModelKind {
     pub fn of(path: &Path) -> Self {
         if path.join("model_index.json").is_file() {
             Self::Image
+        } else if path.join(descriptor::GGUF).is_file() {
+            Self::Text
         } else if path.is_dir() {
             Self::Transcription
         } else {
@@ -80,6 +86,27 @@ pub enum ModelResponse {
 }
 
 impl ModelPackage {
+    /// Native GGUF metadata, whether held in a full file or a descriptor directory.
+    pub fn gguf_path(path: &Path) -> PathBuf {
+        descriptor::gguf_path(path)
+    }
+
+    /// The full weight file to inspect. Descriptors carry only a reference;
+    /// Flux names its separately held assets in assets.json.
+    pub fn weights_path(path: &Path) -> Option<PathBuf> {
+        descriptor::weights_path(path)
+    }
+
+    pub fn is_descriptor(path: &Path) -> bool {
+        descriptor::is_descriptor(path)
+    }
+
+    /// Create a new metadata-only package directory from a full Qwen or Whisper package.
+    pub async fn describe(path: &Path, output: &Path) -> Result<hellas_rpc::ContentRef> {
+        let (path, output) = (path.to_owned(), output.to_owned());
+        tokio::task::spawn_blocking(move || descriptor::describe(&path, &output)).await?
+    }
+
     /// A Qwen GGUF, or a converted Whisper or Flux package directory, rendering
     /// programs with the renderer registered under `evaluator`.
     pub async fn open(path: &Path, evaluator: &str) -> Result<Self> {
@@ -95,18 +122,16 @@ impl ModelPackage {
         for evaluator in &evaluators {
             super::renderer(evaluator)?;
         }
-        let weights = match ModelKind::of(path) {
-            ModelKind::Text => Some(path.to_owned()),
-            ModelKind::Transcription => Some(path.join(super::whisper::WEIGHTS_FILE)),
-            ModelKind::Image => None,
-        };
-        let weights = match weights {
-            Some(path) => Some(
-                tokio::task::spawn_blocking(move || hellas_store::content::file_content(&path))
-                    .await??,
-            ),
-            None => None,
-        };
+        let path_owned = path.to_owned();
+        let weights = tokio::task::spawn_blocking(move || -> Result<_> {
+            if let Some(weights) = descriptor::weights(&path_owned)? {
+                return Ok(Some(weights));
+            }
+            descriptor::weights_path(&path_owned)
+                .map(|path| descriptor::file_content(&path))
+                .transpose()
+        })
+        .await??;
         let mut packages = std::collections::BTreeMap::new();
         for evaluator in evaluators {
             let package = Self::open_with_weights(path, &evaluator, weights).await?;
@@ -115,7 +140,10 @@ impl ModelPackage {
         Ok(packages)
     }
 
-    async fn open_with_weights(
+    /// Render using an identity already inspected by the caller's content store.
+    /// This does not publish or verify a provider's weights. A descriptor's
+    /// embedded reference must agree with any supplied identity.
+    pub async fn open_with_weights(
         path: &Path,
         evaluator: &str,
         weights: Option<hellas_rpc::ContentRef>,
