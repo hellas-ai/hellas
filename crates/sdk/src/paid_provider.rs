@@ -99,6 +99,7 @@ impl WorkRunnerConfig {
 
 /// Owns the observer through graceful shutdown, including cancellation of the caller.
 pub struct WorkWatcher {
+    settings: tokio::sync::watch::Sender<WorkSettings>,
     stop: Option<oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<Result<(), MountError>>,
 }
@@ -107,8 +108,14 @@ impl WorkWatcher {
         let (stop, stopped) = oneshot::channel();
         Self {
             stop: Some(stop),
+            settings: runner.settings.clone(),
             task: tokio::spawn(runner.run(stopped)),
         }
+    }
+
+    pub(crate) fn configure(&self, chain: crate::work_config::WorkConfig, addresses: Vec<String>) {
+        self.settings
+            .send_replace(WorkSettings { chain, addresses });
     }
 
     pub async fn shutdown(&mut self) -> Result<(), PaidProviderError> {
@@ -1384,15 +1391,16 @@ impl WorkRunner {
         provider: hellas_rpc::ProviderEnrollmentBundle,
         addresses: Vec<String>,
     ) -> ChainWorkRunner {
+        let (settings, current) = tokio::sync::watch::channel(WorkSettings { chain, addresses });
         self.setup_mount
             .1
             .set(AutomaticOffers::spawn(OfferAllocator {
                 needs_restart: Default::default(),
                 config: self.config.clone(),
-                chain: offers::OfferChain::new(chain.clone()),
+                chain: offers::OfferChain::new(current.clone()),
                 authority,
                 provider,
-                addresses,
+                settings: current,
                 registry: Arc::new(tokio::sync::Mutex::new(self.registry.clone())),
                 adopt: self.sender.clone(),
                 mount: MountedSetup(
@@ -1404,7 +1412,7 @@ impl WorkRunner {
             .unwrap_or_else(|_| panic!("offer service already installed"));
         ChainWorkRunner {
             runner: self,
-            chain,
+            settings,
         }
     }
 }
@@ -1433,20 +1441,30 @@ impl<S: TxSink + Sync> TxSink for BoundedSink<'_, S> {
 }
 
 /// A provider clock bound to remote, proof-checked reads of its chain.
+#[derive(Clone)]
+struct WorkSettings {
+    chain: crate::work_config::WorkConfig,
+    addresses: Vec<String>,
+}
 pub struct ChainWorkRunner {
     runner: WorkRunner,
-    chain: crate::work_config::WorkConfig,
+    settings: tokio::sync::watch::Sender<WorkSettings>,
 }
 
 impl ChainWorkRunner {
     /// Runs the clock until `stop`, dialling the next configured validator
     /// whenever a read fails or is too old to act on.
     pub async fn run(self, stop: oneshot::Receiver<()>) -> Result<(), MountError> {
-        let config = Mutex::new(self.chain);
+        let config = Mutex::new(self.settings.borrow().chain.clone());
+        let current = Mutex::new(self.settings.subscribe());
         self.runner
             .run_over(stop, || {
                 let config = match config.lock() {
                     Ok(mut config) => {
+                        let mut current = current.lock().unwrap_or_else(|error| error.into_inner());
+                        if current.has_changed().unwrap_or(false) {
+                            *config = current.borrow_and_update().chain.clone();
+                        }
                         config.chain.rotate_validators();
                         config.clone()
                     }

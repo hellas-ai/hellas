@@ -953,6 +953,7 @@ impl GrantSession {
     }
 
     /// Run a prepared resource with fresh admission standing.
+    #[cfg(test)]
     pub(crate) async fn run_resource(
         &mut self,
         resource: hellas_auth::authority::ResourceId,
@@ -1006,13 +1007,14 @@ impl GrantSession {
         input: PreparedInvocation,
         content: &(LocalStore, Scope),
         proposed: Option<&std::sync::atomic::AtomicBool>,
+        tracker: Option<&mut crate::execution::GrantAttempt>,
     ) -> Result<GrantDelivery> {
         self.propose_selected(
             GrantSelection::Resource(resource),
             input,
             content,
             proposed,
-            None,
+            tracker,
         )
         .await
     }

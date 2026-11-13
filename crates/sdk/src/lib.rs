@@ -62,7 +62,6 @@ pub use gateway_work::{
     grant_routes,
 };
 
-
 #[cfg(test)]
 mod test_identity;
 

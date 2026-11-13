@@ -710,24 +710,25 @@ impl ExecutionSession<'_> {
             };
             attempt.matches(input, terms).map_err(pre)?;
         }
+        let proposed = Arc::new(AtomicBool::new(false));
         let completed = match (self, terms) {
             (Self::Paid(session), ExecutionTerms::Paid { price }) => {
                 run_paid(
-                    session,
+                    SessionSource::Direct(session),
                     request,
                     price,
                     signer,
-                    (deadline, &stop, observers),
+                    (deadline, &stop, observers, &proposed),
                     attempt.as_deref_mut(),
                 )
                 .await?
             }
             (Self::Grant(session), ExecutionTerms::Grant { resource }) => {
                 run_grant(
-                    session,
+                    SessionSource::Direct(session),
                     request,
                     resource,
-                    (deadline, &stop, observers),
+                    (deadline, &stop, observers, &proposed),
                     attempt.as_deref_mut(),
                 )
                 .await?
@@ -744,22 +745,62 @@ impl ExecutionSession<'_> {
     }
 }
 
-type RunControls<'a> = (Option<tokio::time::Instant>, &'a Stop, ExecutionObservers);
+/// A command borrows its session; a gateway releases the proposal lock while
+/// collecting output, then takes it again for the accounting transition.
+pub(crate) enum SessionSource<'a, S> {
+    Direct(&'a mut S),
+    Shared(&'a tokio::sync::Mutex<Option<S>>),
+}
+enum SessionBorrow<'a, S> {
+    Direct(&'a mut S),
+    Shared(tokio::sync::MutexGuard<'a, Option<S>>),
+}
+impl<S> SessionSource<'_, S> {
+    async fn borrow(&mut self) -> SessionBorrow<'_, S> {
+        match self {
+            Self::Direct(session) => SessionBorrow::Direct(session),
+            Self::Shared(session) => SessionBorrow::Shared(session.lock().await),
+        }
+    }
+}
+impl<S> SessionBorrow<'_, S> {
+    fn get(&mut self) -> Result<&mut S> {
+        match self {
+            Self::Direct(session) => Ok(session),
+            Self::Shared(session) => session.as_mut().ok_or(ExecutionError::Identity),
+        }
+    }
+}
 
-async fn run_paid(
-    session: &mut PaidWorkSession,
+type RunControls<'a> = (
+    Option<tokio::time::Instant>,
+    &'a Stop,
+    ExecutionObservers,
+    &'a Arc<AtomicBool>,
+);
+
+pub(crate) async fn run_paid(
+    mut source: SessionSource<'_, PaidWorkSession>,
     request: &WorkRequest,
     price: u64,
     signer: &ProducerSigningKey,
-    (deadline, stop, observers): RunControls<'_>,
+    (deadline, stop, observers, proposed): RunControls<'_>,
     mut attempt: Option<&mut ExecutionAttempt>,
 ) -> Attempted<Completed> {
-    let WorkRequest::Job(input) = request else {
-        return Err(pre(ExecutionError::Identity));
-    };
-    let job = Job::from_input(price, input.clone()).map_err(pre)?;
+    let recover = matches!(source, SessionSource::Direct(_));
+    let mut held = before_proposal(deadline, stop, None, source.borrow()).await?;
+    let session = held.get().map_err(pre)?;
+    let input = request
+        .admitted(
+            session.descriptor().invocation_policy(),
+            None,
+            session.assurance(),
+            true,
+        )
+        .map_err(pre)?;
+    let job = Job::from_input(price, input).map_err(pre)?;
     let tracked = attempt.is_some();
-    let purchase = match attempt.as_deref_mut() {
+    let mut purchase = match attempt.as_deref_mut() {
         Some(attempt) => {
             let purchase = attempt.paid_on(session).map_err(pre)?;
             if purchase.has_proposal_intent() {
@@ -772,7 +813,7 @@ async fn run_paid(
     // An untracked request first resumes the channel's retained work; it
     // never proposes this request, so its failure leaves fallback open. A
     // tracked attempt recovers only itself.
-    if !tracked && session.needs_recovery() {
+    if recover && !tracked && session.needs_recovery() {
         let bound = tokio::time::Instant::now() + PAID_RECOVERY_TIMEOUT;
         let deadline = Some(deadline.map_or(bound, |deadline| deadline.min(bound)));
         before_proposal(
@@ -789,25 +830,11 @@ async fn run_paid(
         .with_state(|state| state.proposal_nonce_high_water())
         .await
         .map_err(pre)?;
-    let proposed = Arc::new(AtomicBool::new(false));
     let result = before_proposal(
         deadline,
         stop,
-        Some(&proposed),
-        crate::transact::transact(
-            session,
-            &job,
-            signer,
-            crate::transact::TransactionOptions {
-                purchase,
-                // A request is always a new purchase; recovery never searches
-                // for a matching old job here.
-                new_purchase: true,
-                progress: observers.progress,
-                accepted: observers.accepted,
-                proposed: Some(&proposed),
-            },
-        ),
+        Some(proposed),
+        session.propose_job(&job, signer, proposed, purchase.as_deref_mut()),
     )
     .await?;
     let result = match result {
@@ -836,6 +863,25 @@ async fn run_paid(
             );
         }
     };
+    drop(held);
+    let collected = within(
+        deadline,
+        result.collect(
+            observers.progress.as_ref(),
+            observers.accepted.as_ref(),
+            purchase.as_deref_mut(),
+        ),
+    )
+    .await?
+    .map_err(committed)?;
+    let mut held = within(deadline, source.borrow()).await?;
+    let result = within(deadline, held.get().map_err(committed)?.pay(collected))
+        .await?
+        .map_err(committed)?;
+    if let Some(purchase) = purchase {
+        purchase.paid(result.work_id).map_err(committed)?;
+    }
+    drop(held);
     let completed = paid_completed(result);
     if let Some(attempt) = attempt {
         attempt
@@ -871,13 +917,16 @@ pub(crate) fn paid_completed(result: crate::paid_client::PaidWorkResult) -> Comp
     }
 }
 
-async fn run_grant(
-    session: &mut crate::grant_client::GrantSession,
+pub(crate) async fn run_grant(
+    mut source: SessionSource<'_, crate::grant_client::GrantSession>,
     request: &WorkRequest,
     resource: ResourceId,
-    (deadline, stop, observers): RunControls<'_>,
+    (deadline, stop, observers, proposed): RunControls<'_>,
     mut attempt: Option<&mut ExecutionAttempt>,
 ) -> Attempted<Completed> {
+    let recover = matches!(source, SessionSource::Direct(_));
+    let mut held = before_proposal(deadline, stop, None, source.borrow()).await?;
+    let session = held.get().map_err(pre)?;
     let tracker = match attempt.as_deref_mut() {
         Some(attempt) => {
             let tracker = attempt.grant_on(session).map_err(pre)?;
@@ -890,7 +939,9 @@ async fn run_grant(
     };
     let assurance = session.assurance();
     before_proposal(deadline, stop, None, async {
-        session.recover().await?;
+        if recover {
+            session.recover().await?;
+        }
         session.refresh().await
     })
     .await?
@@ -914,23 +965,12 @@ async fn run_grant(
         .map_err(pre)?;
     let prepared = prepare_grant_input(&input, policy, session.offer(), session.execution_signer())
         .map_err(pre)?;
-    let proposed = AtomicBool::new(false);
     let content = input.content();
     let result = before_proposal(
         deadline,
         stop,
-        Some(&proposed),
-        session.run_resource(
-            resource,
-            prepared,
-            &content,
-            ExecutionObservers {
-                progress: observers.progress.clone(),
-                accepted: observers.accepted.clone(),
-            },
-            Some(&proposed),
-            tracker,
-        ),
+        Some(proposed),
+        session.propose_resource(resource, prepared, &content, Some(proposed), tracker),
     )
     .await?;
     let result = result.map_err(|error| {
@@ -941,6 +981,18 @@ async fn run_grant(
             committed(error)
         }
     })?;
+    drop(held);
+    let collected = within(
+        deadline,
+        result.collect(observers.progress, observers.accepted),
+    )
+    .await?
+    .map_err(committed)?;
+    let mut held = within(deadline, source.borrow()).await?;
+    let result = within(deadline, held.get().map_err(committed)?.complete(collected))
+        .await?
+        .map_err(committed)?;
+    drop(held);
     let finished = result.result.outcome == hellas_channel::model::work::ResultOutcome::Finished;
     let completed = grant_completed(result)?;
     if let Some(attempt) = attempt {

@@ -367,7 +367,7 @@ pub async fn apply(document: &mut Document, edit: Edit, context: &ModelContext) 
                     continue;
                 }
                 route.backends.retain(|id| {
-                    let selected = destination.is_none_or(|destination| id == destination || document.backends.get(id).is_some_and(|backend| matches!(&backend.kind, BackendKind::Grant { resource: Some(resource), .. } if *id == format!("{destination}-{}", &resource.to_string()[..12]))));
+                    let selected = destination.is_none_or(|destination| id == destination || document.backends.get(id).is_some_and(|backend| matches!(&backend.kind, BackendKind::Grant { resource: Some(resource), .. } if *id == grant_backend_id(destination, *resource))));
                     removed |= selected;
                     !selected
                 });
@@ -796,6 +796,50 @@ mod tests {
             grant_backend(&mut document, &other, resource, "other".into(), None, None),
             id
         );
+    }
+
+    #[tokio::test]
+    async fn remove_grant_route_by_contact_uses_its_generated_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let context = ModelContext {
+            home: directory.path().into(),
+            principal: None,
+            holder: NodeKey::from_public_key(
+                hellas_auth::ProducerSigningKey::from_secret_bytes([1; 32])
+                    .unwrap()
+                    .public_key(),
+            )
+            .unwrap(),
+        };
+        let contact = "a".repeat(64);
+        let mut document = Document::default();
+        let id = grant_backend(
+            &mut document,
+            &contact,
+            hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"model")),
+            "access".into(),
+            None,
+            None,
+        );
+        document.routes.push(Route {
+            backends: vec![id],
+            presentation: Presentation::Responses {
+                service: "openai".into(),
+                method: "responses".into(),
+                models: vec!["model".into()],
+                overrides: Default::default(),
+            },
+        });
+        apply(
+            &mut document,
+            Edit::Route(RouteCommand::Rm {
+                model: format!("model@{contact}"),
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
+        assert!(document.routes.is_empty());
     }
 
     #[cfg(feature = "compute")]

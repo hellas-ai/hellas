@@ -27,6 +27,7 @@ pub struct Options {
 
 pub(super) struct Runtime {
     pub options: Options,
+    pub paid: tokio::sync::Mutex<BTreeMap<PathBuf, Arc<super::iroh_listener::Paid>>>,
     pub endpoint: tokio::sync::Mutex<Option<iroh::Endpoint>>,
     clients: tokio::sync::Mutex<
         std::collections::BTreeMap<
@@ -136,6 +137,7 @@ impl Runtime {
         Self {
             endpoint: tokio::sync::Mutex::new(options.endpoint.take()),
             options,
+            paid: Default::default(),
             clients: Default::default(),
             consumer: Default::default(),
             #[cfg(feature = "compute")]
@@ -165,13 +167,20 @@ impl Runtime {
             .clone())
     }
 
-    pub async fn shutdown(&self) {
+    pub async fn shutdown(&self) -> Result<()> {
+        let mut failure = None;
+        for paid in self.paid.lock().await.values() {
+            if let Err(error) = paid.shutdown().await {
+                failure.get_or_insert(error);
+            }
+        }
         for (_, content) in self.clients.lock().await.values() {
             content.close().await;
         }
         if let Some(endpoint) = self.consumer.get() {
             endpoint.close().await;
         }
+        failure.map_or(Ok(()), Err)
     }
 
     pub async fn client_resources(
