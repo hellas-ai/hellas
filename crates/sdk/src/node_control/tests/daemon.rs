@@ -820,8 +820,7 @@ async fn resources_require_a_backend_allowed_by_the_iroh_listener() {
     let error = rpc
         .configure(request(&document, 0))
         .await
-        .err()
-        .expect("unserved resource must be rejected");
+        .expect_err("unserved resource must be rejected");
     assert!(
         error.to_string().contains("resource has no backend"),
         "{error}"
@@ -991,6 +990,51 @@ async fn unavailable_paid_provider_does_not_prevent_startup() {
     let core = Core::open(options(&f), document).await.unwrap();
     let (_client, _server, connection, rpc, served) = connect(&f, core.clone()).await;
     assert!(!core.jobs.is_closed());
+    use hellas_gateway::WorkExecutionBackend;
+    let (_, mut events) = core.watch();
+    let job = core
+        .jobs
+        .admit(&hellas_gateway::jobs::Request {
+            origin: hellas_gateway::jobs::Origin::Local,
+            method: "POST".into(),
+            path: "/v1/responses".into(),
+        })
+        .unwrap();
+    let mut output = core
+        .execution()
+        .fetch(
+            "paid",
+            job,
+            hellas_gateway::WorkFetchRequest {
+                service: "openai".into(),
+                method: "responses".into(),
+                body: vec![],
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        output.next().await,
+        Some(Err(hellas_gateway::WorkGatewayError::PreProposal(_)))
+    ));
+    let view = core.watch().0;
+    assert!(view.backends[0].down);
+    assert!(
+        view.backends[0]
+            .error
+            .as_ref()
+            .is_some_and(|reason| !reason.is_empty())
+    );
+    loop {
+        if let hellas_gateway::jobs::Event::Backend { id, down, reason } =
+            events.recv().await.unwrap()
+        {
+            assert_eq!(id, "paid");
+            assert!(down);
+            assert_eq!(Some(reason), view.backends[0].error);
+            break;
+        }
+    }
+
     assert_eq!(
         rpc.configure(request(&Document::default(), 0))
             .await

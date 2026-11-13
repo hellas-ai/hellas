@@ -790,7 +790,7 @@ impl PaidWorkSession {
         job: &crate::job::Job,
         signer: &hellas_auth::ProducerSigningKey,
         proposed: &Arc<AtomicBool>,
-        mut purchase: Option<&mut crate::transact::Purchase>,
+        purchase: Option<&mut crate::transact::Purchase>,
     ) -> std::result::Result<PaidDelivery, crate::transact::TransactError> {
         if let Some(purchase) = purchase.as_deref() {
             purchase.ensure_chain(self)?;
@@ -804,7 +804,7 @@ impl PaidWorkSession {
         }
         let (nonce, prepared) =
             crate::transact::prepare(self, job, signer, false, purchase.as_deref()).await?;
-        if let Some(purchase) = purchase.as_deref_mut() {
+        if let Some(purchase) = purchase {
             purchase.begin(
                 self.descriptor.channel().id(),
                 self.descriptor.bond_edge(),

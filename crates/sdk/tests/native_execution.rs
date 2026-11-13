@@ -801,6 +801,7 @@ async fn check_gateway_quote(
     options: &PaidWorkOptions,
     owner: Arc<hellas_sdk::client_owner::ClientOwner>,
 ) {
+    use futures::StreamExt as _;
     use hellas_gateway::WorkExecutionBackend as _;
     let endpoint = bind_paid_endpoint(iroh::SecretKey::generate())
         .await
@@ -845,24 +846,29 @@ async fn check_gateway_quote(
     let before = setups().await;
 
     assert!(
-        gateway
-            .fetch(
-                "test",
-                gateway
-                    .jobs
-                    .admit(&hellas_gateway::jobs::Request {
-                        origin: hellas_gateway::jobs::Origin::Local,
-                        method: "POST".into(),
-                        path: "/v1/responses".into()
-                    })
-                    .unwrap(),
-                hellas_gateway::WorkFetchRequest {
-                    service: "openai".into(),
-                    method: "wrong-route".into(),
-                    body: BODY.to_vec(),
-                }
-            )
-            .is_err(),
+        matches!(
+            gateway
+                .fetch(
+                    "test",
+                    gateway
+                        .jobs
+                        .admit(&hellas_gateway::jobs::Request {
+                            origin: hellas_gateway::jobs::Origin::Local,
+                            method: "POST".into(),
+                            path: "/v1/responses".into()
+                        })
+                        .unwrap(),
+                    hellas_gateway::WorkFetchRequest {
+                        service: "openai".into(),
+                        method: "wrong-route".into(),
+                        body: BODY.to_vec(),
+                    }
+                )
+                .unwrap()
+                .next()
+                .await,
+            Some(Err(hellas_gateway::WorkGatewayError::PreProposal(_)))
+        ),
         "gateway checks the quoted route before requesting funding"
     );
     let oversized = format!(
@@ -870,24 +876,29 @@ async fn check_gateway_quote(
         "x".repeat(4096) // Over the quoted admission's request body limit.
     );
     assert!(
-        gateway
-            .fetch(
-                "test",
-                gateway
-                    .jobs
-                    .admit(&hellas_gateway::jobs::Request {
-                        origin: hellas_gateway::jobs::Origin::Local,
-                        method: "POST".into(),
-                        path: "/v1/responses".into()
-                    })
-                    .unwrap(),
-                hellas_gateway::WorkFetchRequest {
-                    service: "openai".into(),
-                    method: "responses".into(),
-                    body: oversized.into_bytes(),
-                }
-            )
-            .is_err(),
+        matches!(
+            gateway
+                .fetch(
+                    "test",
+                    gateway
+                        .jobs
+                        .admit(&hellas_gateway::jobs::Request {
+                            origin: hellas_gateway::jobs::Origin::Local,
+                            method: "POST".into(),
+                            path: "/v1/responses".into()
+                        })
+                        .unwrap(),
+                    hellas_gateway::WorkFetchRequest {
+                        service: "openai".into(),
+                        method: "responses".into(),
+                        body: oversized.into_bytes(),
+                    }
+                )
+                .unwrap()
+                .next()
+                .await,
+            Some(Err(hellas_gateway::WorkGatewayError::PreProposal(_)))
+        ),
         "gateway admits the whole request before requesting funding"
     );
     gateway.drain().await.unwrap();
