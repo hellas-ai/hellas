@@ -256,7 +256,7 @@ impl Fixture {
             },
             self.gateway.clone(),
             self.gateway.jobs.clone(),
-            self.gateway.backends["test"].routes("test").unwrap(),
+            routes(&self.gateway.backends["test"], "test"),
         )
         .await
         .unwrap();
@@ -388,7 +388,7 @@ async fn resource_repair_precedes_client_signing() {
         .inspect_request(inspect_chat)
         .build()
         .await;
-    let config = fixture.gateway.backends["test"].routes("test").unwrap();
+    let config = routes(&fixture.gateway.backends["test"], "test");
     let hellas_gateway::Presentation::Http { targets } = &config[0].presentation else {
         panic!("HTTP route")
     };
@@ -1020,7 +1020,7 @@ async fn single_signed_model_responses_route_tracks_continuation() {
         },
         gateway.clone(),
         gateway.jobs.clone(),
-        gateway.backends["test"].routes("test").unwrap(),
+        routes(&gateway.backends["test"], "test"),
     )
     .await
     .unwrap();
@@ -1181,7 +1181,7 @@ async fn two_grant_nodes_fail_over_before_proposal_and_rejoin_on_demand() {
         .into(),
         first.options().signer.clone(),
     );
-    let mut routes = first.gateway.backends["test"].routes("first").unwrap();
+    let mut routes = routes(&first.gateway.backends["test"], "first");
     for route in &mut routes {
         route.backends.push("second".into());
         if let hellas_gateway::Presentation::Http { targets } = &mut route.presentation {
@@ -1461,4 +1461,11 @@ async fn sharing_a_channel_does_not_reuse_replaced_credentials() {
     assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 1);
     next.drain().await.unwrap();
     fixture.shutdown().await;
+}
+
+fn routes(backend: &super::Backend, id: &str) -> Vec<hellas_gateway::Route> {
+    let BackendState::Grant(grant) = &backend.state else {
+        panic!("expected grant backend")
+    };
+    grant_routes(&grant.policy, id).unwrap()
 }

@@ -169,7 +169,7 @@ pub(super) struct TargetArgs {
     local: bool,
     #[cfg(feature = "compute")]
     #[command(flatten)]
-    native: crate::compute::ServeArgs,
+    native: crate::compute::LocalArgs,
     /// The registered renderer (evaluator id) remote jobs are rendered for,
     /// as `hellas program --backend` takes; local jobs render for this
     /// machine's GPU runtime.

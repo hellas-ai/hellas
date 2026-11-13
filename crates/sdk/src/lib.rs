@@ -62,8 +62,6 @@ pub use gateway_work::{
     grant_routes,
 };
 
-mod resource_config;
-pub use resource_config::ResourceConfigError;
 
 #[cfg(test)]
 mod test_identity;

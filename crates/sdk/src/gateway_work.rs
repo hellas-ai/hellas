@@ -644,14 +644,6 @@ impl Backend {
         }
         routes
     }
-
-    /// A grant contributes the HTTP routes its resource authorizes.
-    pub fn routes(&self, id: &str) -> Result<Vec<hellas_gateway::Route>, WorkGatewayError> {
-        let BackendState::Grant(grant) = &self.state else {
-            return Ok(vec![]);
-        };
-        grant_routes(&grant.policy, id)
-    }
 }
 
 pub fn grant_routes(

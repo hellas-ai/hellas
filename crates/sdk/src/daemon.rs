@@ -26,18 +26,6 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 type Result<T> = std::result::Result<T, Error>;
 type ListenerExit = (String, std::sync::Weak<BoundListener>, Result<()>);
 
-/// The local runtime's registered evaluator, without starting a worker.
-pub fn local_evaluator() -> Option<String> {
-    #[cfg(feature = "compute")]
-    {
-        Some(hellas_executor::catena::evaluator(runtime::automatic_gpu()))
-    }
-    #[cfg(not(feature = "compute"))]
-    {
-        None
-    }
-}
-
 pub struct Core {
     runtime: runtime::Runtime,
     pub(crate) snapshot: ArcSwap<Snapshot>,
@@ -81,7 +69,6 @@ impl Drop for BoundListener {
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct View {
     pub revision: Revision,
-    pub local_evaluator: Option<String>,
     pub document: Document,
     pub backends: Vec<hellas_gateway::BackendInfo>,
     pub jobs: Vec<hellas_gateway::jobs::Info>,
@@ -326,7 +313,6 @@ impl Core {
             let snapshot = self.snapshot.load();
             View {
                 revision: snapshot.revision,
-                local_evaluator: local_evaluator(),
                 document: snapshot.document.redacted().0,
                 backends: snapshot.work.backends(),
                 jobs,

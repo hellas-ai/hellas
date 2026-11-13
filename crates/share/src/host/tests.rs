@@ -536,6 +536,8 @@ async fn controlled_gateway(
     let endpoint = hellas_sdk::grant_client::bind_endpoint(identity.transport_key())
         .await
         .unwrap();
+    let routes =
+        hellas_sdk::grant_routes(&session.target.offer().grant.policies[0], "friend").unwrap();
     let target = hellas_sdk::Backend::grant(
         session.target.offer().grant.policies[0].clone(),
         session,
@@ -550,7 +552,7 @@ async fn controlled_gateway(
             },
         )]
         .into(),
-        routes: target.routes("friend").unwrap(),
+        routes,
         backends: [(
             "friend".into(),
             hellas_sdk::daemon_config::Backend {

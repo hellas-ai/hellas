@@ -5,7 +5,7 @@ use clap::Args;
 use std::path::PathBuf;
 
 #[derive(Args, Debug)]
-pub(crate) struct ServeArgs {
+pub(crate) struct LocalArgs {
     /// Node content configuration containing [content].
     #[arg(long, value_name = "FILE")]
     pub(crate) content_config: Option<PathBuf>,
@@ -48,7 +48,7 @@ pub(crate) fn parse_gpu_backend(value: &str) -> Result<hellas_executor::GpuDiale
 #[cfg(feature = "compute")]
 pub(crate) async fn local(
     home: &hellas_private::StoreLocation,
-    native: ServeArgs,
+    native: LocalArgs,
     signer: std::sync::Arc<hellas_auth::ProducerSigningKey>,
 ) -> CliResult<hellas_sdk::execution::local::LocalExecution> {
     let configuration = crate::content_configuration::ContentConfiguration::load(

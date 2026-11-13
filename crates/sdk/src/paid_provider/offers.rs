@@ -326,12 +326,11 @@ impl OfferAllocator {
             let bundle = state
                 .bundle()
                 .ok_or_else(|| unavailable("offer journal has no proposal"))?;
-            let funding = state.funding_coins();
             let snapshot = chain
                 .work_channel_snapshot(WorkChannelQuery {
                     bond_edge: bundle.bond_edge(),
                     payment_edge: bundle.payment_edge(),
-                    funding: funding.clone(),
+                    funding: state.funding_coins(),
                 })
                 .await
                 .map_err(unavailable)?

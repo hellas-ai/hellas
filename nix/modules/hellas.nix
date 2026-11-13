@@ -364,7 +364,7 @@ rec {
       extraArgs = mkOption {
         type = types.listOf types.str;
         default = [ ];
-        description = "Extra arguments to pass to `hellas serve`. They may add harmless switches such as `--no-discovery`, but may not override module-managed runtime, content, identity, trust, or configuration flags (including `--flag=value`).";
+        description = "Extra arguments to pass to `hellas serve`. They may not override module-managed runtime, content, identity, trust, or configuration flags (including `--flag=value`).";
       };
     };
 

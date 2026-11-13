@@ -71,7 +71,7 @@ impl Default for ResourceHealth {
 /// It names the frame format, so a journal written under different semantics
 /// is refused at the boundary instead of being reinterpreted. Bump it with
 /// any change to [`Frame`] or [`Change`] that is not readable as written.
-pub(super) const JOURNAL_NAMESPACE: &str = "hellas.node.journal.v8";
+pub(super) const JOURNAL_NAMESPACE: &str = "hellas.node.journal.v5";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct Frame {
@@ -967,7 +967,7 @@ fn verify(
 
 /// Snapshots retain health decisions made under the frame accounting semantics.
 /// Refuse pre-v5 state even when rotation removed every old frame.
-const CHECKPOINT_NAMESPACE: &str = "hellas.node.checkpoint.v6";
+const CHECKPOINT_NAMESPACE: &str = "hellas.node.checkpoint.v5";
 
 #[derive(Serialize, Deserialize)]
 pub(super) struct Snapshot {

@@ -234,8 +234,8 @@ or verified delivery retain their credit reservation until the payment deadline;
 recovery skips them and never submits them anew. Disconnecting an
 HTTP client cancels work that has not yet been proposed. Once a signed proposal
 may have reached a provider, collection and payment continue despite disconnects.
-A gateway admits at most 32 queued or running requests; further requests are
-refused and may be retried. SIGTERM and wrapped-command failures drain
+Each backend bounds its queued and running requests with `max_in_flight`.
+A full backend refuses new work; other eligible backends can take an unproposed request. SIGTERM and wrapped-command failures drain
 outstanding operations. An operation that reaches its deadline retains its
 journal for recovery, as does abrupt process termination.
 

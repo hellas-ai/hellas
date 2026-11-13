@@ -70,7 +70,6 @@ pub enum Edit {
 
 pub struct ModelContext {
     pub home: PathBuf,
-    pub local_evaluator: Option<String>,
     pub principal: Option<PrincipalId>,
     pub holder: NodeKey,
 }
@@ -82,7 +81,6 @@ impl ModelContext {
     ) -> Result<Self> {
         Ok(Self {
             home: home.into(),
-            local_evaluator: hellas_sdk::daemon::local_evaluator(),
             holder: NodeKey::from_public_key(identity.node_key.public_key())?,
             principal: owner
                 .map(|owner| {
@@ -399,7 +397,7 @@ pub async fn control<T>(
     client: &hellas_rpc::services::host_control::HostControlClientImpl<T>,
     authorization: hellas_auth::authority::GrantId,
     edit: Option<Edit>,
-    mut context: ModelContext,
+    context: ModelContext,
 ) -> Result<()>
 where
     T: hellas_wire::StreamTransport + Send + Sync,
@@ -411,12 +409,6 @@ where
         print(&view);
         return Ok(());
     };
-    context.local_evaluator = view
-        .backends
-        .iter()
-        .find(|backend| backend.id == "local")
-        .and_then(|backend| backend.evaluator.clone())
-        .or(view.local_evaluator);
     let mut document = view.document;
     apply(&mut document, edit, &context).await?;
     let result = client
@@ -619,7 +611,7 @@ pub async fn serve(
     let shutdown = shutdown_signal()?;
     tokio::pin!(shutdown);
     let endpoint = tokio::select! {
-        result = super::serve::bootstrap::prepare(home, &identity.transport_key, &identity.enrollment, port) => result?,
+        result = super::bootstrap::prepare(home, &identity.transport_key, &identity.enrollment, port) => result?,
         signal = &mut shutdown => return Ok(signal?),
     };
     let store = hellas_authority::work_store::grant::NodeStore::open(
@@ -784,7 +776,6 @@ mod tests {
         std::fs::write(&key_file, "test-secret\n").unwrap();
         let context = ModelContext {
             home: directory.path().into(),
-            local_evaluator: None,
             principal: None,
             holder: NodeKey::from_public_key(
                 hellas_auth::ProducerSigningKey::from_secret_bytes([1; 32])

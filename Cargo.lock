@@ -3246,7 +3246,6 @@ dependencies = [
  "opentelemetry_sdk",
  "p256",
  "prometheus",
- "qrcode",
  "rand 0.10.3",
  "rcgen",
  "reqwest",
@@ -3257,7 +3256,6 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "tempfile",
- "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
  "toml",
@@ -3389,7 +3387,6 @@ dependencies = [
  "http-body",
  "http-body-util",
  "httpdate",
- "iroh",
  "libc",
  "opentelemetry",
  "opentelemetry_sdk",
@@ -3637,7 +3634,6 @@ dependencies = [
  "rustls",
  "serde_json",
  "tempfile",
- "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
  "tracing",
@@ -6643,12 +6639,6 @@ dependencies = [
  "prost-types",
  "thiserror 2.0.21",
 ]
-
-[[package]]
-name = "qrcode"
-version = "0.14.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 
 [[package]]
 name = "quanta"
