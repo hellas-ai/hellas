@@ -790,7 +790,11 @@ impl PaidWorkSession {
         job: &crate::job::Job,
         signer: &hellas_auth::ProducerSigningKey,
         proposed: &Arc<AtomicBool>,
+        mut purchase: Option<&mut crate::transact::Purchase>,
     ) -> std::result::Result<PaidDelivery, crate::transact::TransactError> {
+        if let Some(purchase) = purchase.as_deref() {
+            purchase.ensure_chain(self)?;
+        }
         let quoted = self.descriptor.payment_policy().fixed_price;
         if quoted != job.price() {
             return Err(crate::transact::TransactError::Price {
@@ -798,7 +802,16 @@ impl PaidWorkSession {
                 requested: job.price(),
             });
         }
-        let (_, prepared) = crate::transact::prepare(self, job, signer, false, None).await?;
+        let (nonce, prepared) =
+            crate::transact::prepare(self, job, signer, false, purchase.as_deref()).await?;
+        if let Some(purchase) = purchase.as_deref_mut() {
+            purchase.begin(
+                self.descriptor.channel().id(),
+                self.descriptor.bond_edge(),
+                nonce,
+                prepared.request.commitment()?.digest(),
+            )?;
+        }
         check_request(
             &self.policy,
             &prepared,
@@ -818,6 +831,10 @@ impl PaidWorkSession {
             Some(proposed),
         )
         .await?)
+    }
+
+    pub(crate) fn assurance(&self) -> hellas_rpc::Assurance {
+        self.args.assurance
     }
 
     pub(crate) async fn pay(&mut self, mut result: PaidWorkResult) -> Result<PaidWorkResult> {

@@ -177,7 +177,7 @@ async fn paid_concurrency(cancel: bool) {
             let delivery = session
                 .lock()
                 .await
-                .propose_job(&job, &key, &proposed)
+                .propose_job(&job, &key, &proposed, None)
                 .await
                 .unwrap();
             assert!(proposed.load(Ordering::Acquire));
@@ -248,7 +248,7 @@ async fn paid_concurrency(cancel: bool) {
         let delivery = session
             .lock()
             .await
-            .propose_job(&job, &key, &Arc::new(AtomicBool::new(false)))
+            .propose_job(&job, &key, &Arc::new(AtomicBool::new(false)), None)
             .await
             .unwrap();
         assert_eq!(starts.recv().await.unwrap(), 2);

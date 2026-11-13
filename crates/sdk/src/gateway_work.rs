@@ -1193,65 +1193,18 @@ impl Backend {
         let session = guard
             .as_mut()
             .ok_or_else(|| pre(ExecutionError::Identity))?;
-        let input = request
-            .admitted(
-                session.descriptor().invocation_policy(),
-                None,
-                options.assurance,
-                true,
-            )
-            .map_err(|error| pre(error.into()))?;
-        let job = Job::from_input(session.descriptor().payment_policy().fixed_price, input)
-            .map_err(|error| pre(error.into()))?;
-        let floor = session
-            .with_state(|state| state.proposal_nonce_high_water())
-            .await
-            .map_err(|error| pre(error.into()))?;
+        let price = session.descriptor().payment_policy().fixed_price;
+        drop(guard);
         let proposed = requester.job.proposal();
-        let proposal = before_proposal(
+        let completed = crate::execution::run_paid(
+            crate::execution::SessionSource::Shared(&target.session),
+            request,
+            price,
+            signer,
+            (None, stop, requester.observers(), &proposed),
             None,
-            stop,
-            Some(&proposed),
-            session.propose_job(&job, signer, &proposed),
         )
         .await?;
-        let delivery = match proposal {
-            Ok(delivery) => delivery,
-            Err(error) => {
-                let after = session
-                    .with_state(|state| state.proposal_nonce_high_water())
-                    .await
-                    .ok();
-                let error = ExecutionError::from(error);
-                return Err(
-                    if !proposed.load(Ordering::Acquire) && after == Some(floor) {
-                        pre(error)
-                    } else {
-                        committed(error)
-                    },
-                );
-            }
-        };
-        drop(guard);
-        let collected = delivery
-            .collect(
-                Some(&requester.progress()),
-                Some(&requester.accepted()),
-                None,
-            )
-            .await
-            .map_err(|error| committed(error.into()))?;
-        // Payment uses the proposal mutex: no new proposal can pass an
-        // unacknowledged cumulative certificate.
-        let mut guard = target.session.lock().await;
-        let result = guard
-            .as_mut()
-            .ok_or_else(|| committed(ExecutionError::Identity))?
-            .pay(collected)
-            .await;
-        let result = result.map_err(|error| committed(error.into()))?;
-        drop(guard);
-        let completed = crate::execution::paid_completed(result);
         requester.delivery()(&completed)
             .map_err(|error| committed(ExecutionError::Delivery(error)))?;
         Ok(completed)
@@ -1264,7 +1217,7 @@ impl Backend {
         stop: &crate::execution::Stop,
         requester: &Requester<E, WorkGatewayError>,
     ) -> Result<crate::execution::Completed, crate::execution::AttemptError> {
-        use crate::execution::{AttemptError, before_proposal, prepare_grant_input};
+        use crate::execution::{AttemptError, before_proposal};
         let pre = |error: ExecutionError| AttemptError::PreProposal(Box::new(error));
         let committed = |error: ExecutionError| AttemptError::Committed(Box::new(error));
         let GrantBackend {
@@ -1309,59 +1262,16 @@ impl Backend {
             *guard = Some(opened);
             self.health(None);
         }
-        let session = guard
-            .as_mut()
-            .ok_or_else(|| pre(ExecutionError::Identity))?;
-        let proposed = requester.job.proposal();
-        let proposal = before_proposal(None, stop, Some(&proposed), async {
-            session.refresh().await?;
-            let current = session
-                .offer()
-                .offer()
-                .grant
-                .policies
-                .iter()
-                .find(|current| current.resource == policy.resource)
-                .ok_or(ExecutionError::Identity)?;
-            let input = request.admitted(
-                &current.invocation_policy,
-                current.https.as_ref(),
-                session.assurance(),
-                false,
-            )?;
-            let prepared =
-                prepare_grant_input(&input, current, session.offer(), session.execution_signer())?;
-            Ok::<_, ExecutionError>(
-                session
-                    .propose_resource(policy.resource, prepared, &input.content(), Some(&proposed))
-                    .await?,
-            )
-        })
-        .await?;
-        let delivery = proposal.map_err(|error| {
-            if proposed.load(std::sync::atomic::Ordering::Acquire) {
-                committed(error)
-            } else {
-                pre(error)
-            }
-        })?;
         drop(guard);
-        // A remote acceptance cannot be cancelled by the HTTP consumer.
-        let collected = delivery
-            .collect(Some(requester.progress()), Some(requester.accepted()))
-            .await
-            .map_err(|error| committed(error.into()))?;
-        let result = target
-            .channel
-            .session
-            .lock()
-            .await
-            .as_mut()
-            .ok_or_else(|| committed(ExecutionError::Identity))?
-            .complete(collected)
-            .await
-            .map_err(|error| committed(error.into()))?;
-        let completed = crate::execution::grant_completed(result)?;
+        let proposed = requester.job.proposal();
+        let completed = crate::execution::run_grant(
+            crate::execution::SessionSource::Shared(&target.channel.session),
+            request,
+            policy.resource,
+            (None, stop, requester.observers(), &proposed),
+            None,
+        )
+        .await?;
         requester.delivery()(&completed)
             .map_err(|error| committed(ExecutionError::Delivery(error)))?;
         Ok(completed)

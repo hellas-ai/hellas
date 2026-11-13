@@ -356,7 +356,7 @@ impl Purchase {
     }
     /// Channel, bond, nonce and its exact request binding must survive
     /// together, before any proposal can leave the process.
-    pub(super) fn begin(
+    pub(crate) fn begin(
         &mut self,
         channel: Digest,
         bond: EdgeId,
