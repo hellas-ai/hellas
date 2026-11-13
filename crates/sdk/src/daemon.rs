@@ -398,12 +398,24 @@ impl Core {
                 .work
                 .backends()
                 .into_iter()
+                .filter(|backend| {
+                    !current.work.backend(&backend.id).is_some_and(|old| {
+                        std::ptr::eq(old, candidate.work.backend(&backend.id).unwrap())
+                    })
+                })
                 .filter_map(|backend| {
                     backend
                         .error
                         .map(|error| format!("backend {}: {error}", backend.id))
                 })
                 .chain(candidate.listeners.iter().filter_map(|(id, listener)| {
+                    if current
+                        .listeners
+                        .get(id)
+                        .is_some_and(|old| Arc::ptr_eq(old, listener))
+                    {
+                        return None;
+                    }
                     listener
                         .failure
                         .get()

@@ -243,9 +243,14 @@ impl Document {
                 }
             }
         }
-        for resource in &self.resources {
-            if !self.listeners.values().any(|listener| matches!(listener, Listener::Iroh { backends, .. } if backends.contains(&resource.backend))) {
-                return Err("resource has no backend allowed by the iroh listener");
+        if let Some(backends) = self.listeners.values().find_map(|listener| match listener {
+            Listener::Iroh { backends, .. } => Some(backends),
+            _ => None,
+        }) {
+            for resource in &self.resources {
+                if !backends.contains(&resource.backend) {
+                    return Err("resource has no backend allowed by the iroh listener");
+                }
             }
         }
         Ok(())

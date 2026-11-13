@@ -825,6 +825,11 @@ async fn resources_require_a_backend_allowed_by_the_iroh_listener() {
         error.to_string().contains("resource has no backend"),
         "{error}"
     );
+    document.listeners.clear();
+    assert_eq!(
+        rpc.configure(request(&document, 0)).await.unwrap().revision,
+        1
+    );
     core.shutdown().await.unwrap();
     connection.close(0u32.into(), b"test complete");
     let _ = served.await.unwrap();
@@ -987,7 +992,7 @@ async fn unavailable_paid_provider_does_not_prevent_startup() {
         "listeners": {},
         "backends": {"paid": {"kind": "paid", "provider": crate::test_support::address(provider.id()).to_string(), "addresses": provider.bound_sockets(), "max_price": 1, "max_in_flight": 2}}
     })).unwrap();
-    let core = Core::open(options(&f), document).await.unwrap();
+    let core = Core::open(options(&f), document.clone()).await.unwrap();
     assert!(!core.jobs.is_closed());
     use hellas_gateway::WorkExecutionBackend;
     let (_, mut events) = core.watch();
@@ -1036,11 +1041,16 @@ async fn unavailable_paid_provider_does_not_prevent_startup() {
 
     let (_client, _server, connection, rpc, served) = connect(&f, core.clone()).await;
     assert_eq!(
-        rpc.configure(request(&Document::default(), 0))
+        rpc.configure(request(&document, 0)).await.unwrap().revision,
+        1
+    );
+    assert!(core.watch().0.backends[0].down);
+    assert_eq!(
+        rpc.configure(request(&Document::default(), 1))
             .await
             .unwrap()
             .revision,
-        1
+        2
     );
     core.shutdown().await.unwrap();
     provider.close().await;
