@@ -114,6 +114,7 @@ pub(crate) fn backend_status(error: &BackendError) -> StatusCode {
         BackendError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
         BackendError::Unavailable(_) => StatusCode::BAD_GATEWAY,
         BackendError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        BackendError::Output(_) => StatusCode::UNPROCESSABLE_ENTITY,
     }
 }
 
@@ -194,6 +195,12 @@ pub trait WorkExecutionBackend: Send + Sync {
 
     /// An explicit end-to-end budget, including queued time, if the source has one.
     fn timeout(&self) -> Option<std::time::Duration> {
+        None
+    }
+
+    /// The most steps one Compute job may take under this source's terms,
+    /// if they bound it.
+    fn max_steps(&self) -> Option<u64> {
         None
     }
 
@@ -312,10 +319,11 @@ pub struct AudioOptions {
 
 #[derive(Clone)]
 pub struct TextOptions {
-    /// Qwen3 GGUF whose rendered program, weights and tokenizer serve the
+    /// Qwen GGUF whose rendered program, weights, tokenizer and chat format serve the
     /// text routes; providers must already hold the file.
     pub model: PathBuf,
-    /// The model name these routes answer to and report.
+    /// The model name these routes answer to where several presentations
+    /// share them; responses name the model the request names.
     pub model_name: String,
     pub default_max_tokens: u32,
 }

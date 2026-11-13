@@ -36,7 +36,6 @@ async fn handle(State(backend): State<Arc<FetchBackend>>, body: Bytes) -> Respon
         "OpenAI Responses",
         context,
         backend,
-        None,
         &body,
     )
     .await

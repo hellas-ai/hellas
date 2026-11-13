@@ -1,0 +1,38 @@
+{
+ "model": "gpt-5.4-nano",
+ "input": [
+  {
+   "role": "developer",
+   "content": "You are a title generator. You output ONLY a thread title. Nothing else.\n\n<task>\nGenerate a brief title that would help …"
+  },
+  {
+   "role": "user",
+   "content": [
+    {
+     "type": "input_text",
+     "text": "Generate a title for this conversation:\n"
+    }
+   ]
+  },
+  {
+   "role": "user",
+   "content": [
+    {
+     "type": "input_text",
+     "text": "\"create hello.py that prints hello, then run it\""
+    }
+   ]
+  }
+ ],
+ "temperature": 0.5,
+ "store": false,
+ "service_tier": "flex",
+ "include": [
+  "reasoning.encrypted_content"
+ ],
+ "reasoning": {
+  "effort": "none",
+  "summary": "auto"
+ },
+ "stream": true
+}

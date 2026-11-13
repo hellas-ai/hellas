@@ -145,6 +145,7 @@ impl Inference {
             BackendError::Timeout(_) => "timeout",
             BackendError::Unavailable(_) => "provider_unavailable",
             BackendError::Failed(_) => "backend_error",
+            BackendError::Output(_) => "model_output",
         }));
         self.finish_reason("error");
     }

@@ -87,7 +87,6 @@ async fn fixture(name: &str, request: Value, events: Vec<OutputEvent>, expected:
         "OpenAI Responses",
         hellas_adaptors::RenderContext::new("resp-fixture", "msg-fixture", 1_700_000_000),
         backend,
-        None,
         &serde_json::to_vec(&request).unwrap(),
     )
     .await;
