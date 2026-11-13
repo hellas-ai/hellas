@@ -152,7 +152,7 @@ impl Fixture {
     async fn session(&self) -> crate::grant_client::GrantSession {
         crate::grant_client::GrantSession::open(
             self.options(),
-            GrantTransport::Local(self.service.clone()),
+            GrantTransport::Local(self.service.clone().into()),
         )
         .await
         .unwrap()
@@ -761,7 +761,7 @@ async fn stalled_local_transport_setup_keeps_its_control_timeout() {
     tokio::time::pause();
     let result = tokio::time::timeout(
         Duration::from_secs(6),
-        GrantSession::open(f.options(), GrantTransport::Local(f.service.clone())),
+        GrantSession::open(f.options(), GrantTransport::Local(f.service.clone().into())),
     )
     .await
     .expect("control deadline must end stalled local authentication");

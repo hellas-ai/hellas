@@ -730,6 +730,10 @@ pub async fn serve(
                 .control()
                 .map_err(anyhow::Error::from_boxed)?
                 .bind_local(home.join("provider/control.sock"), tls)?;
+            eprintln!(
+                "Provider: {}",
+                hellas_sdk::client::ProviderAddress::of(&identity.enrollment)?
+            );
             eprintln!("Daemon ready; configure it with hellas backend and hellas route.");
             let signal: Result<()> = tokio::select! {
                 result = &mut shutdown => result.map_err(Into::into),

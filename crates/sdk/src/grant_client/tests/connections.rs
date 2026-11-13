@@ -349,7 +349,7 @@ async fn revoked_credentials_are_rejected_before_work_body_decoding() {
     )
     .await
     .unwrap();
-    let _stream = pair
+    let stream = pair
         .outgoing
         .open(AcceptWork::METHOD_ID, Metadata::default())
         .await
@@ -359,6 +359,10 @@ async fn revoked_credentials_are_rejected_before_work_body_decoding() {
         within(Dispatcher::<IrohTransport>::dispatch(&server, inbound)).await,
         hellas_wire::TransportError::Protocol(_)
     );
+    use hellas_wire::{RecvHalf as _, Stream as _};
+    let (_send, mut recv) = stream.split();
+    assert!(within(recv.next()).await.is_none());
+    assert_eq!(recv.trailer().unwrap().status, WireCode::PermissionDenied);
     within(pair.outgoing.connection().closed()).await;
     assert_eq!(f.calls.load(Ordering::SeqCst), 0);
     drop(server);

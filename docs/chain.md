@@ -1,7 +1,7 @@
 # Chain
 
 The standard CLI includes `chain query`, `chain open`, and `chain close`.
-The `indexer` feature adds `chain indexer follow`; the `validator` feature adds
+The `indexer` feature adds `chain indexer serve`; the `validator` feature adds
 `chain validator config`, `chain validator run`, and
 `chain validator check-config`.
 

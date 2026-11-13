@@ -599,19 +599,6 @@ impl ProviderEndpoint {
         }
     }
 
-    /// The readiness this endpoint admits new work under, or the refusal
-    /// that says it has none.
-    ///
-    /// # Errors
-    ///
-    /// [`EndpointError::NotAdmitting`] when readiness is unavailable,
-    /// and [`EndpointError::ObservationStale`]
-    /// while awaiting fresh finalized progress.
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn fixture_store(&mut self) -> &mut ChannelStore {
-        &mut self.close.store
-    }
-
     fn admitting(&self) -> Result<&ReadyChannel, EndpointError> {
         let ready = self.ready.as_ref().ok_or(EndpointError::NotAdmitting)?;
         if let Some(observation) = &self.observation {
@@ -641,36 +628,6 @@ impl ProviderEndpoint {
     #[must_use]
     pub const fn state(&self) -> &Channel {
         self.close.state()
-    }
-
-    /// Answers one proposal.
-    ///
-    /// Infallible by construction: every outcome an endpoint can have is
-    /// one of the six refusal codes or a co-signature, so there is one
-    /// channel for answers and not two. Transport faults stay the
-    /// transport's.
-    ///
-    /// An authenticated retry returns its retained co-signature or terminal
-    /// before readiness is consulted. An unaccepted proposal already past
-    /// its acceptance deadline at the persisted cursor is permanently expired.
-    /// Everything still requiring a new co-signature needs a readiness
-    /// decision; without one it is retryable `NotReady`.
-    ///
-    /// On the accepting path the client's proposal is journaled — which
-    /// is what reserves the compute credit — before the co-signature is
-    /// produced, and the co-signature is journaled before this returns
-    /// it. A crash before the first commit leaves nothing: the client
-    /// retries into a fresh admission. A crash between the two leaves a
-    /// half-signed job holding its credit, and the retry co-signs it if
-    /// the deadlines still allow. A crash after the second commit and
-    /// before the answer reaches the client leaves an accepted job, and
-    /// the retry returns the retained signature.
-    pub async fn accept(
-        &mut self,
-        request: &AcceptWorkRequest,
-        execution: Option<AcceptExecution>,
-    ) -> AcceptWorkResponse {
-        acceptance_response(self.decide(request, execution).await)
     }
 
     fn authenticate_proposal(
@@ -740,8 +697,10 @@ impl ProviderEndpoint {
         &mut self,
         request: &AcceptWorkRequest,
         execution: Option<AcceptExecution>,
+        ready: Result<ReadyChannel, EndpointError>,
+        proposal: (PaidJobAuthorizationV2, Sig, Digest),
     ) -> Result<(Digest, Sig), Refusal> {
-        let (authorization, client_signature, work_id) = self.authenticate_proposal(request)?;
+        let (authorization, client_signature, work_id) = proposal;
         if let Some(retained) = self.prior_acceptance(&authorization, work_id)? {
             self.close.store.reconcile_content(false).await?;
             return Ok((work_id, retained));
@@ -749,10 +708,8 @@ impl ProviderEndpoint {
         if !self.accepting {
             return Err(Refusal::new(WorkRefusal::NotReady, "provider is draining"));
         }
-        let ready = self
-            .admitting()
-            .map_err(|error| Refusal::new(endpoint_refusal(error), error.to_string()))?
-            .clone();
+        let ready =
+            ready.map_err(|error| Refusal::new(endpoint_refusal(error), error.to_string()))?;
         if self.state().close_prepared().is_some()
             || self.state().close_opened().is_some()
             || self.state().close_settled().is_some()
@@ -821,6 +778,7 @@ impl ProviderEndpoint {
                 prepare(
                     &bundle,
                     hellas_auth::PublicKey::Secp256k1(ready.channel().client_key().to_bytes()),
+                    ready.clone(),
                 )
             })
             .transpose()
@@ -1944,6 +1902,7 @@ pub type AcceptExecution = Box<
     dyn FnOnce(
             &PreparedInvocation,
             hellas_auth::PublicKey,
+            ReadyChannel,
         ) -> Result<Box<dyn FnOnce(Digest) + Send>, BackendFault>
         + Send,
 >;
@@ -2469,13 +2428,10 @@ impl WorkService {
     /// Finish provider unaccepted content cleanup and release the journal
     /// after request execution and observation have drained.
     pub async fn close(&self) -> Result<(), WorkStoreError> {
-        self.endpoint
-            .lock_for_shutdown()
-            .await
-            .close
-            .store
-            .close()
-            .await
+        let mut endpoint = self.endpoint.lock_for_shutdown().await;
+        endpoint.accepting = false;
+        self.changed.notify_waiters();
+        endpoint.close.store.close().await
     }
 
     /// Stop new acceptances while admitted execution and delivery retain their policy.
@@ -2663,44 +2619,53 @@ impl WorkService {
     // answer, only a driver that offers one and then records what
     // became of it.
 
-    /// Answers an authenticated proposal from retained state alone, when
-    /// possible, without signing, writing the journal, or requiring readiness.
-    ///
-    /// A retained acceptance takes precedence over expiry: its acknowledgement
-    /// may have been lost. Otherwise a retained terminal or an acceptance
-    /// deadline already passed by the persisted cursor is permanent. Malformed
-    /// or unauthenticated requests are refused before consulting job state.
-    /// `None` means fresh readiness and the normal acceptance checks are needed.
-    #[must_use]
-    pub async fn precheck_acceptance(
-        &self,
-        request: &AcceptWorkRequest,
-    ) -> Option<AcceptWorkResponse> {
-        let result = self
-            .endpoint()
-            .await
-            .map_err(|error| Refusal::new(endpoint_refusal(error), error.to_string()))
-            .and_then(|endpoint| {
-                let (authorization, _, work_id) = endpoint.authenticate_proposal(request)?;
-                let retained = endpoint.prior_acceptance(&authorization, work_id)?;
-                Ok(retained.map(|signature| (work_id, signature)))
-            });
-        result.transpose().map(acceptance_response)
-    }
-
-    /// Answers one proposal, or says the endpoint is unreachable.
+    /// Keep the authenticated proposal pending while certified progress is
+    /// unavailable. Retained signatures and permanent refusals do not wait.
     pub async fn accept(
         &self,
         request: &AcceptWorkRequest,
         execution: Option<AcceptExecution>,
     ) -> AcceptWorkResponse {
-        let result = match self.endpoint.lock_owned().await {
+        let proposal = match self.endpoint().await {
+            Ok(endpoint) => endpoint.authenticate_proposal(request),
+            Err(error) => Err(Refusal::new(endpoint_refusal(error), error.to_string())),
+        };
+        let proposal = match proposal {
+            Ok(proposal) => proposal,
+            Err(refusal) => return acceptance_response(Err(refusal)),
+        };
+        let (endpoint, ready) = loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let endpoint = self.endpoint.lock_owned().await;
+            let ready = endpoint
+                .as_ref()
+                .map_err(|_| EndpointError::Poisoned)
+                .and_then(|endpoint| endpoint.admitting().cloned());
+            let waiting = matches!(ready, Err(EndpointError::ObservationStale))
+                && endpoint.as_ref().is_ok_and(|endpoint| {
+                    endpoint.accepting
+                        && !endpoint.state().is_closing()
+                        && matches!(endpoint.prior_acceptance(&proposal.0, proposal.2), Ok(None))
+                });
+            if !waiting {
+                break (endpoint, ready);
+            }
+            drop(endpoint);
+            changed.await;
+        };
+        let result = match endpoint {
             Ok(mut endpoint) => {
                 let (request, changed) = (request.clone(), self.changed.clone());
                 // Acceptance, publication and RAM transfer retain the writer even
                 // when the RPC drops its response after a journal append started.
                 tokio::spawn(async move {
-                    let response = endpoint.accept(&request, execution).await;
+                    // Use the readiness captured under this same writer; neither
+                    // observer suspension nor task scheduling can split admission.
+                    let response = acceptance_response(
+                        endpoint.decide(&request, execution, ready, proposal).await,
+                    );
                     changed.notify_waiters();
                     response
                 })

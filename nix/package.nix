@@ -88,8 +88,8 @@ let
     cargoLock = {
       lockFile = ../Cargo.lock;
       outputHashes = {
-        "catena-lang-0.1.0" = "sha256-45JKipVBS8kj02xMaaLVfS/N7km4DzE5kASF0eAZE6o=";
-        "catena-models-0.1.0" = "sha256-lz/mbBTfZ7ePL1KBocKLYpU5zBNelffQhyWPKkq4V9s=";
+        "catena-lang-0.1.0" = "sha256-U3aYYin89Q0uIcUVB3gwGsGTC3/N+F32qorECfo+kHs=";
+        "catena-models-0.1.0" = "sha256-MhmPrLGvVb0be72X3+Dv1tZXWfL24ckXyojB7me+KUk=";
         "commonware-actor-2026.7.0" = "sha256-Z1mtElU3fYKzHW0BTALtb6Bm3xasEJuH/dKlZXEDt+8=";
       };
     };

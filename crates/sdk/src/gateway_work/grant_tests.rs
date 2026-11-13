@@ -282,7 +282,6 @@ impl Fixture {
             headers: vec![],
             body_base64: STANDARD.encode(serde_json::to_vec(&body).unwrap()),
             tls: template.tls.clone(),
-            credential: None,
             max_response_bytes: template.max_response_bytes,
         };
         WorkFetchRequest {
@@ -489,7 +488,7 @@ async fn refreshed_https_bounds_are_checked_before_proposal() {
         let https = policy.https.as_mut().unwrap();
         match change {
             0 => https.origin = "https://changed.fixture".into(),
-            1 => https.credential = Some("changed".into()),
+            1 => https.tls.spki_sha256.push("00".repeat(32)),
             2 => https.max_output_tokens = 3,
             3 => https.paths = vec!["/changed".into()],
             _ => https.max_response_bytes = 128,
@@ -546,7 +545,7 @@ async fn https_policy_conversion_rejects_a_non_http_schema() {
 }
 
 #[tokio::test]
-async fn https_policy_conversion_keeps_models_on_their_signed_paths() {
+async fn https_policy_conversion_keeps_models_and_refuses_colliding_local_paths() {
     let fixture = Fixture::builder().build().await;
     let mut policy = fixture.host.allowance.policies[0].clone();
     let template = policy.https.as_mut().unwrap();
@@ -573,6 +572,22 @@ async fn https_policy_conversion_keeps_models_on_their_signed_paths() {
             .unwrap()
             .models
             .is_none()
+    );
+    let template = policy.https.as_mut().unwrap();
+    template.paths = vec![
+        "/a/v1/chat/completions".into(),
+        "/b/v1/chat/completions".into(),
+    ];
+    template.model_policy = None;
+    let result = hellas_gateway::router::router(
+        grant_routes(&policy, "test").unwrap(),
+        fixture.gateway.clone(),
+        fixture.gateway.jobs.clone(),
+        Default::default(),
+    )
+    .await;
+    assert!(
+        matches!(result, Err(hellas_gateway::GatewayError::Routing(error)) if error.0 == "duplicate route key")
     );
     fixture.shutdown().await;
 }
@@ -1087,7 +1102,6 @@ async fn the_command_executor_runs_a_grant_once_and_replays_it() {
         headers: vec![],
         body_base64: STANDARD.encode(br#"{"messages":[],"max_tokens":6}"#),
         tls: template.tls.clone(),
-        credential: None,
         max_response_bytes: template.max_response_bytes,
     };
     let input = WorkRequest::Fetch(WorkFetchRequest {
@@ -1116,7 +1130,7 @@ async fn the_command_executor_runs_a_grant_once_and_replays_it() {
             backend: crate::Backend::grant(
                 policy.clone(),
                 options.clone(),
-                GrantTransport::Local(host.world.service.clone()),
+                GrantTransport::Local(host.world.service.clone().into()),
             ),
             funding: Default::default(),
             attempt: Some(attempt),

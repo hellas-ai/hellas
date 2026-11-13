@@ -1090,7 +1090,6 @@ impl FetchArgs {
                 roots,
                 spki_sha256: self.spki_sha256.clone(),
             },
-            credential: None,
             max_response_bytes: self
                 .max_response_bytes
                 .unwrap_or(hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES),

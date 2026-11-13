@@ -210,6 +210,25 @@ pub async fn retained_settlement_channels(
     Ok(channels)
 }
 
+/// Whether this retained channel has a certified, journaled close. Spending
+/// either payout coin does not change this status or require closing it again.
+/// Stop/drop any session owning this channel before calling this function.
+pub fn channel_is_settled(
+    args: &PaidWorkOptions,
+    bond: EdgeId,
+    owner: PrincipalId,
+    delegate: Key,
+) -> impl Future<Output = Result<bool>> {
+    Box::pin(async move {
+        let mut recovery = open_settlement(args, bond, owner, delegate).await?;
+        let result = observe_settlement(&mut recovery).await;
+        let closed = recovery.journal.close().await;
+        result?;
+        closed?;
+        Ok(recovery.journal.state().close_settled().is_some())
+    })
+}
+
 /// Recover a specific channel's settlement from its signed journals, one
 /// certified read of the channel, and its two payout coins. Returns `None`
 /// for a channel that has not closed. A payout coin already spent is an
@@ -233,20 +252,8 @@ async fn finalized_channel_settlement_inner(
     delegate: Key,
 ) -> Result<Option<FinalizedChannelSettlement>> {
     let mut recovery = open_settlement(args, bond, owner, delegate).await?;
-    let verifier = Secp256k1Verifier::new();
-    // Observing the channel can expire jobs and record closure, but cannot
-    // approve, sign, submit, or pay for any work.
     let result = async {
-        if recovery.journal.state().close_settled().is_none() {
-            let channel = recovery.journal.state().channel().clone();
-            let snapshot = channel_read(&recovery.chain, &channel).await?;
-            hellas_channel::work_close::observe(
-                &mut recovery.journal,
-                &snapshot.observed_channel(),
-                &verifier,
-            )
-            .await?;
-        }
+        observe_settlement(&mut recovery).await?;
         settlement_receipt(&recovery).await
     }
     .await;
@@ -420,6 +427,21 @@ async fn open_settlement(
         bond,
         funding_value,
     })
+}
+
+/// Observing may record closure, but never signs, submits, or pays for work.
+async fn observe_settlement(recovery: &mut SettlementRecovery) -> Result<()> {
+    if recovery.journal.state().close_settled().is_none() {
+        let channel = recovery.journal.state().channel().clone();
+        let snapshot = channel_read(&recovery.chain, &channel).await?;
+        hellas_channel::work_close::observe(
+            &mut recovery.journal,
+            &snapshot.observed_channel(),
+            &Secp256k1Verifier::new(),
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 async fn settlement_receipt(

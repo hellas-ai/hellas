@@ -235,7 +235,7 @@ impl GrantDef {
                 Admission::Compute { .. } => false,
                 Admission::Fetch { admission } => {
                     admission.contract.schema() == hellas_rpc::FetchSchema::StatelessResponsesV1
-                        || policy.https.as_ref().is_none_or(|r| r.credential.is_some())
+                        || policy.https.as_ref().is_none_or(|r| r.account_backed)
                 }
             });
             if !self.allow_account_backed && account_backed {

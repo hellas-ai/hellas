@@ -85,23 +85,20 @@ impl Upstream {
             } => {
                 let credentials = credentials
                     .iter()
-                    .map(|(id, credential)| {
-                        Ok((
-                            id.clone(),
-                            hellas_providers::HttpCredential {
-                                allowed_origins: credential.allowed_origins.clone(),
-                                allowed_paths: credential.allowed_paths.clone(),
-                                allowed_methods: credential.allowed_methods.clone(),
-                                trust_roots: credential.trust_roots.clone(),
-                                header_name: credential.header_name.clone(),
-                                header_value: hellas_providers::HttpSecret::Value(
-                                    credential
-                                        .secret
-                                        .clone()
-                                        .ok_or("missing upstream credential")?,
-                                ),
-                            },
-                        ))
+                    .map(|credential| {
+                        Ok(hellas_providers::HttpCredential {
+                            allowed_origins: credential.allowed_origins.clone(),
+                            allowed_paths: credential.allowed_paths.clone(),
+                            allowed_methods: credential.allowed_methods.clone(),
+                            trust_roots: credential.trust_roots.clone(),
+                            header_name: credential.header_name.clone(),
+                            header_value: hellas_providers::HttpSecret::Value(
+                                credential
+                                    .secret
+                                    .clone()
+                                    .ok_or("missing upstream credential")?,
+                            ),
+                        })
                     })
                     .collect::<Result<_, Box<dyn std::error::Error + Send + Sync>>>()?;
                 FetchRouteEntry::new(

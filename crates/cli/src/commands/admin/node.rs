@@ -235,10 +235,7 @@ pub(in crate::commands) async fn connect_remote(
     HostControlClientImpl<hellas_wire::iroh::IrohTransport>,
     hellas_auth::authority::SessionChallenge,
 )> {
-    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-        .secret_key(identity.transport_key.clone())
-        .bind()
-        .await?;
+    let endpoint = control_endpoint(identity, node).await?;
     let (client, challenge) = hellas_wire::iroh::close_on_error(&endpoint, async {
         let address = iroh::EndpointAddr::from_parts(
             node,
@@ -259,6 +256,19 @@ pub(in crate::commands) async fn connect_remote(
     })
     .await?;
     Ok((endpoint, client, challenge))
+}
+
+async fn control_endpoint(
+    identity: &LocalIdentity,
+    node: iroh::EndpointId,
+) -> Result<iroh::Endpoint> {
+    let mut builder = iroh::Endpoint::builder(iroh::endpoint::presets::N0);
+    // A local owner shares the daemon's home, but iroh cannot connect an
+    // endpoint to itself. Holder authentication uses the independent node key.
+    if identity.transport_key.public() != node {
+        builder = builder.secret_key(identity.transport_key.clone());
+    }
+    Ok(builder.bind().await?)
 }
 pub(in crate::commands) async fn connect_local(
     profile: profile::ClientProfile,
@@ -756,10 +766,7 @@ pub async fn pair(
         &secret,
     )?;
     profile::pin_remote(&profile, invitation.node, &invitation.addresses)?;
-    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-        .secret_key(identity.transport_key.clone())
-        .bind()
-        .await?;
+    let endpoint = control_endpoint(identity, invitation.node).await?;
     let result = node_control::bootstrap::connect(&endpoint, &invitation, root, approval).await;
     endpoint.close().await;
     result.with_context(|| format!("credential {} retained in {}; authenticate and inspect its exact ID after a lost reply", secret.id(), profile.display()))?;

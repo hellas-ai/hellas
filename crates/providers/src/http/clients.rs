@@ -12,7 +12,6 @@ struct Key {
     origin: String,
     addresses: Vec<SocketAddr>,
     tls: HttpTls,
-    credential: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -34,7 +33,6 @@ impl Clients {
             origin: url.origin().ascii_serialization(),
             addresses,
             tls: request.tls.clone(),
-            credential: request.credential.clone(),
         };
         if let Some(client) = Self::cached(&mut self.0.lock().unwrap(), &key) {
             return Ok(client);

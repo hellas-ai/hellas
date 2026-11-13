@@ -1,10 +1,9 @@
-//! Operator-owned account aliases reference environment variables, private
+//! Operator-owned credential scopes reference environment variables, private
 //! credential files or secret stores; route configuration contains no secret values.
 use super::{HttpCredential, HttpEgressPolicy, HttpFetchProvider};
 use hellas_auth::authority::UnixMillis;
 use hellas_executor::{FetchProviderError, FetchRouteEntry, FetchRoutePolicy};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::{io::Read, path::PathBuf, sync::Arc, time::Duration};
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -15,7 +14,7 @@ pub struct HttpProviderConfig {
     #[serde(default)]
     pub allow_private_addresses: bool,
     #[serde(default)]
-    pub credentials: BTreeMap<String, HttpCredentialConfig>,
+    pub credentials: Vec<HttpCredentialConfig>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -297,22 +296,19 @@ impl HttpProviderConfig {
         self,
         capabilities: FetchRoutePolicy,
     ) -> Result<FetchRouteEntry, FetchProviderError> {
-        let mut credentials = BTreeMap::new();
-        for (alias, config) in self.credentials {
+        let mut credentials = Vec::new();
+        for config in self.credentials {
             let header_value = config.source.into_secret()?;
-            credentials.insert(
-                alias,
-                HttpCredential {
-                    allowed_origins: config.allowed_origins,
-                    allowed_paths: config.allowed_paths,
-                    allowed_methods: config.allowed_methods,
-                    trust_roots: config
-                        .trust_roots
-                        .unwrap_or(hellas_rpc::http_fetch::HttpTrustRoots::WebPki),
-                    header_name: config.header_name,
-                    header_value,
-                },
-            );
+            credentials.push(HttpCredential {
+                allowed_origins: config.allowed_origins,
+                allowed_paths: config.allowed_paths,
+                allowed_methods: config.allowed_methods,
+                trust_roots: config
+                    .trust_roots
+                    .unwrap_or(hellas_rpc::http_fetch::HttpTrustRoots::WebPki),
+                header_name: config.header_name,
+                header_value,
+            });
         }
         let provider = HttpFetchProvider::new(
             HttpEgressPolicy {

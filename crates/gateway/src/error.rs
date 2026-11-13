@@ -36,8 +36,8 @@ pub enum GatewayConfigError {
     RoutePath,
     #[error("duplicate HTTP route")]
     DuplicateRoute,
-    #[error("use a provider credential alias for authentication")]
-    CredentialAlias,
+    #[error("credential headers belong to the provider")]
+    CredentialHeader,
     #[error("default maximum tokens must be positive and fit the model capacity")]
     MaxTokens,
     #[error("the gateway serves no presentation")]

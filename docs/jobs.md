@@ -40,7 +40,7 @@ hellas text --model ./qwen3.gguf --prompt 'Why is the sky blue?' --local
 
 A Compute job names the evaluator its program is rendered for. Remote Compute
 commands render for `--backend EVALUATOR`, the id the provider's GPU runtime
-registers (such as `hellas/catena-dfad87438018-hip`), before they ask for a
+registers (such as `hellas/catena-325d75d20f6f-hip`), before they ask for a
 quote; the provider refuses a program for an evaluator it did not register.
 `--local` renders for this machine's GPU runtime.
 
@@ -67,7 +67,7 @@ Signing keys and funding/channel recovery journals remain durable.
 ```sh
 hellas faucet
 hellas run --provider ENROLLMENT_ID@NODE_ID --source counter.hex --entry advance \
-  --arg u64:2 --arg u64:3 --returns u64 --backend hellas/catena-dfad87438018-hip \
+  --arg u64:2 --arg u64:3 --returns u64 --backend hellas/catena-325d75d20f6f-hip \
   --pay 20 --save-job ./add
 hellas transact --job ./add --provider ENROLLMENT_ID@NODE_ID@127.0.0.1:9000 -o ./result
 hellas fetch https://example.com/data --provider ENROLLMENT_ID@NODE_ID --pay 20 \
@@ -115,7 +115,7 @@ intentionally have different trust boundaries:
 
 | Application | Root and trusted computation | Outside that guarantee |
 | --- | --- | --- |
-| `hellas/catena-dfad87438018-<runtime>` (the id a GPU runtime registers, such as `-hip`), `compute-0.0.1` | The GPU runtime the program is compiled for, exact Catena Hex sources, named content-addressed assets, inputs, the call plan (calls, optional step loop and stop rule) and declared outputs | Where sources and weights come from, tokenizer, chat template, text decoding, and API presentation |
+| `hellas/catena-325d75d20f6f-<runtime>` (the id a GPU runtime registers, such as `-hip`), `compute-0.0.1` | The GPU runtime the program is compiled for, exact Catena Hex sources, named content-addressed assets, inputs, the call plan (calls, optional step loop and stop rule) and declared outputs | Where sources and weights come from, tokenizer, chat template, text decoding, and API presentation |
 | `hellas/fetch-0.0.2`, the contract's adaptor (`http-0.0.1`, `codex-responses-0.0.2` or `openai-responses-0.0.3`) | A strict stateless Responses field set; typed reconstruction of provider-shaped JSON; `stream=true` and upstream `store=false`; the exact official Codex or OpenAI HTTPS endpoint; no redirects; and SSE response projection | The truth, correctness, and availability of the adversarial upstream service; provider route label; credentials/auth-file location; and access policy |
 
 Fetch's purpose is to attest the exact transformation around a
@@ -171,7 +171,7 @@ are part of the job's content identity.
 format = "hellas.job.v1"
 
 [application]
-evaluator = "hellas/catena-dfad87438018-hip"
+evaluator = "hellas/catena-325d75d20f6f-hip"
 adaptor = "compute-0.0.1"
 
 [payment]
@@ -255,7 +255,7 @@ the selected hardware and step count.
 ```sh
 hellas image --provider ENROLLMENT_ID@NODE_ID --model klein \
   --prompt 'a small red fox' --seed 42 --width 512 --height 512 --steps 4 \
-  --backend hellas/catena-dfad87438018-hip --pay 20 -o fox.png
+  --backend hellas/catena-325d75d20f6f-hip --pay 20 -o fox.png
 ```
 
 `image` saves the job before purchase, writes the PNG to `-o` (default
@@ -307,9 +307,15 @@ recovered request whose policy does not admit the job's contract is refused
 before funding or payment. `request.json` is an
 `HttpFetchRequest` or the selected service's JSON input. For HTTPS, the helper
 supports `-X METHOD`, repeated `-H 'Name: value'`, `--data @FILE`, and
-`--max-response-bytes N`. Without an explicit cap, it uses the provider's
-deliverable response limit. `--tls-root FILE` supplies a DER trust anchor;
+`--max-response-bytes N`. The provider uses the credential whose configured
+origin, path and method cover the request, or sends it without a credential when
+none applies. The request carries no credential selector or provider secret.
+Without an explicit cap, it uses the provider's deliverable response limit.
+`--tls-root FILE` supplies a DER trust anchor;
 `--spki-sha256 HEX` supplies a leaf SPKI pin when the provider requires one.
+
+A configured gateway `GET /v1/models` passthrough takes precedence over generated
+model discovery. Other configured methods on that path keep their normal routing.
 
 Apple-attested providers require the independent `--trust-store` and
 `--trust-policy` approval. Fetch additionally selects
