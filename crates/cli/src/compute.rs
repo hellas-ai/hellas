@@ -41,8 +41,15 @@ pub(crate) async fn content(
     let mut configuration =
         crate::content_configuration::ContentConfiguration::load(native.content_config.clone())?
             .with_default_upper(home.join("provider/content"));
-    let content = configuration
-        .config()
+    let paths = native
+        .content
+        .iter()
+        .chain(models)
+        .map(std::path::absolute)
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let mut initial = configuration.config().clone();
+    initial.lower.extend(paths.iter().cloned());
+    let content = initial
         .open(
             home,
             hellas_store::content::Reservations::ram(
@@ -53,12 +60,7 @@ pub(crate) async fn content(
         .await?;
     let prepared: CliResult<()> = async {
         content.finish_recovery().await?;
-        configuration
-            .add_content(
-                &content,
-                native.content.iter().chain(models).cloned().collect(),
-            )
-            .await?;
+        configuration.add_content(&content, paths).await?;
         configuration.apply(&content).await?;
         Ok(())
     }
@@ -100,4 +102,45 @@ pub(crate) async fn local(
         content.close().await;
     }
     prepared
+}
+
+#[cfg(all(test, feature = "compute"))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn local_content_preserves_require_index_mode_for_explicit_weights() {
+        let root = tempfile::tempdir().unwrap();
+        let weights = root.path().join("weights");
+        std::fs::write(&weights, b"unindexed weights").unwrap();
+        let configuration = root.path().join("content.toml");
+        std::fs::write(&configuration, "[content]\nindex = \"require\"\n").unwrap();
+        let native = LocalArgs {
+            content_config: Some(configuration),
+            content: vec![],
+            gpu: GpuArgs {
+                evaluator: None,
+                gpu_session_programs: 1,
+                gpu_session_asset_bytes: 1024,
+            },
+        };
+        let result = content(
+            &hellas_private::StoreLocation::for_test(root.path()),
+            &native,
+            &[weights],
+        )
+        .await;
+        match result {
+            Err(error) => assert!(
+                error
+                    .to_string()
+                    .contains("lower file requires an index record"),
+                "{error:#}"
+            ),
+            Ok(store) => {
+                store.close().await;
+                panic!("require mode must not hash previously unindexed weights");
+            }
+        }
+    }
 }
