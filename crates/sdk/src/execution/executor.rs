@@ -48,159 +48,169 @@ impl Executor {
             deliver: Some(deliver),
         };
         let local_policy;
+        // Box remote lifecycles to bound the caller's async state.
         let (execution, content, policy) = match &self.backend.state {
             BackendState::Paid(paid) => {
-                let crate::PaidBackend {
-                    options,
-                    endpoint,
-                    settlement_key,
-                    owner,
-                    ..
-                } = paid.as_ref();
-                let open = |open| {
-                    open_paid_session(
-                        options.clone(),
-                        endpoint.clone(),
-                        settlement_key.clone(),
-                        owner.clone(),
-                        self.funding,
-                        open,
-                        None,
-                    )
-                };
-                let request = WorkRequest::Job(job.input().clone());
-                let terms = ExecutionTerms::Paid { price: job.price() };
-                let mut completed = match self.attempt {
-                    None => {
-                        let mut session =
-                            before_proposal(deadline, &stop, None, open(PaidOpen::Job(job)))
-                                .await??;
-                        let run = ExecutionSession::Paid(&mut session)
-                            .run(&request, terms, signer, controls, None)
-                            .await;
-                        session.shutdown().await;
-                        run?
-                    }
-                    Some(mut attempt) => match attempt.retained_paid_result()? {
-                        Some(completed) => {
-                            attempt.bind_target(ExecutionTarget {
-                                network: options.config.network(),
-                                provider: options.provider,
-                            })?;
-                            replay(&mut attempt, completed, controls.deliver)?
-                        }
+                return Box::pin(async {
+                    let crate::PaidBackend {
+                        options,
+                        endpoint,
+                        settlement_key,
+                        owner,
+                        ..
+                    } = paid.as_ref();
+                    let open = |open| {
+                        open_paid_session(
+                            options.clone(),
+                            endpoint.clone(),
+                            settlement_key.clone(),
+                            owner.clone(),
+                            self.funding,
+                            open,
+                            None,
+                        )
+                    };
+                    let request = WorkRequest::Job(job.input().clone());
+                    let terms = ExecutionTerms::Paid { price: job.price() };
+                    let mut completed = match self.attempt {
                         None => {
-                            if attempt.inspect()?.terminal == Terminal::Rejected {
-                                return Err(ExecutionError::Terminal);
-                            }
-                            let mut session = before_proposal(
-                                deadline,
-                                &stop,
-                                None,
-                                open(PaidOpen::Attempt(job, &mut attempt)),
-                            )
-                            .await??;
+                            let mut session =
+                                before_proposal(deadline, &stop, None, open(PaidOpen::Job(job)))
+                                    .await??;
                             let run = ExecutionSession::Paid(&mut session)
-                                .run(&request, terms, signer, controls, Some(&mut attempt))
+                                .run(&request, terms, signer, controls, None)
                                 .await;
-                            let run = unresolved(run, deadline, async {
-                                ExecutionSession::Paid(&mut session)
-                                    .recover(&mut attempt)
-                                    .await
-                            })
-                            .await;
                             session.shutdown().await;
                             run?
                         }
-                    },
-                };
-                if self.settle
-                    && let Some(paid) = &mut completed.paid
-                {
-                    let receipt = within(
-                        deadline,
-                        crate::paid_client::settle_channel(
-                            options,
-                            paid.bond_edge,
-                            owner.principal(),
-                            settlement_key,
-                        ),
-                    )
-                    .await??;
-                    if receipt.channel != paid.channel_id {
-                        return Err(ExecutionError::Identity);
+                        Some(mut attempt) => match attempt.retained_paid_result()? {
+                            Some(completed) => {
+                                attempt.bind_target(ExecutionTarget {
+                                    network: options.config.network(),
+                                    provider: options.provider,
+                                })?;
+                                replay(&mut attempt, completed, controls.deliver)?
+                            }
+                            None => {
+                                if attempt.inspect()?.terminal == Terminal::Rejected {
+                                    return Err(ExecutionError::Terminal);
+                                }
+                                let mut session = before_proposal(
+                                    deadline,
+                                    &stop,
+                                    None,
+                                    open(PaidOpen::Attempt(job, &mut attempt)),
+                                )
+                                .await??;
+                                let run = ExecutionSession::Paid(&mut session)
+                                    .run(&request, terms, signer, controls, Some(&mut attempt))
+                                    .await;
+                                let run = unresolved(run, deadline, async {
+                                    ExecutionSession::Paid(&mut session)
+                                        .recover(&mut attempt)
+                                        .await
+                                })
+                                .await;
+                                session.shutdown().await;
+                                run?
+                            }
+                        },
+                    };
+                    if self.settle
+                        && let Some(paid) = &mut completed.paid
+                    {
+                        let receipt = within(
+                            deadline,
+                            crate::paid_client::settle_channel(
+                                options,
+                                paid.bond_edge,
+                                owner.principal(),
+                                settlement_key,
+                            ),
+                        )
+                        .await??;
+                        if receipt.channel != paid.channel_id {
+                            return Err(ExecutionError::Identity);
+                        }
+                        paid.settled = Some(receipt.provider_payout);
                     }
-                    paid.settled = Some(receipt.provider_payout);
-                }
-                return Ok(completed);
+                    Ok(completed)
+                })
+                .await;
             }
             BackendState::Grant(grant) => {
-                let crate::GrantBackend {
-                    options,
-                    transport,
-                    policy,
-                    ..
-                } = grant.as_ref();
-                let request = WorkRequest::Job(job.input().clone());
-                let terms = ExecutionTerms::Grant {
-                    resource: policy.resource,
-                };
-                let Some(mut attempt) = self.attempt else {
+                return Box::pin(async {
+                    let crate::GrantBackend {
+                        options,
+                        transport,
+                        policy,
+                        ..
+                    } = grant.as_ref();
+                    let request = WorkRequest::Job(job.input().clone());
+                    let terms = ExecutionTerms::Grant {
+                        resource: policy.resource,
+                    };
+                    let Some(mut attempt) = self.attempt else {
+                        let mut session = before_proposal(
+                            deadline,
+                            &stop,
+                            None,
+                            crate::grant_client::GrantSession::open(
+                                options.clone(),
+                                transport.clone(),
+                            ),
+                        )
+                        .await??;
+                        let signer = session.execution_signer().clone();
+                        let run = ExecutionSession::Grant(&mut session)
+                            .run(&request, terms, &signer, controls, None)
+                            .await;
+                        let closed = session.shutdown().await;
+                        let completed = run?;
+                        closed?;
+                        return Ok(completed);
+                    };
+                    if let Some(retained) = attempt.retained_result()? {
+                        let provider_key = hellas_auth::PublicKey::Secp256k1(
+                            hellas_authority::model::grant::records::grant_producer(
+                                &options.target.offer().provider,
+                            )
+                            .map_err(crate::grant_client::GrantClientError::from)?
+                            .to_bytes(),
+                        );
+                        let completed = Completed {
+                            work_id: attempt.inspect()?.work.ok_or(ExecutionError::Identity)?,
+                            output: retained.output,
+                            transcript: retained.transcript,
+                            provider_key,
+                            paid: None,
+                            live: None,
+                        };
+                        return replay(&mut attempt, completed, controls.deliver);
+                    }
                     let mut session = before_proposal(
                         deadline,
                         &stop,
                         None,
-                        crate::grant_client::GrantSession::open(options.clone(), transport.clone()),
+                        attempt.open_grant_session(options.clone(), transport.clone()),
                     )
                     .await??;
                     let signer = session.execution_signer().clone();
                     let run = ExecutionSession::Grant(&mut session)
-                        .run(&request, terms, &signer, controls, None)
+                        .run(&request, terms, &signer, controls, Some(&mut attempt))
                         .await;
+                    let run = unresolved(run, deadline, async {
+                        ExecutionSession::Grant(&mut session)
+                            .recover(&mut attempt)
+                            .await
+                    })
+                    .await;
                     let closed = session.shutdown().await;
                     let completed = run?;
                     closed?;
-                    return Ok(completed);
-                };
-                if let Some(retained) = attempt.retained_result()? {
-                    let provider_key = hellas_auth::PublicKey::Secp256k1(
-                        hellas_authority::model::grant::records::grant_producer(
-                            &options.target.offer().provider,
-                        )
-                        .map_err(crate::grant_client::GrantClientError::from)?
-                        .to_bytes(),
-                    );
-                    let completed = Completed {
-                        work_id: attempt.inspect()?.work.ok_or(ExecutionError::Identity)?,
-                        output: retained.output,
-                        transcript: retained.transcript,
-                        provider_key,
-                        paid: None,
-                        live: None,
-                    };
-                    return replay(&mut attempt, completed, controls.deliver);
-                }
-                let mut session = before_proposal(
-                    deadline,
-                    &stop,
-                    None,
-                    attempt.open_grant_session(options.clone(), transport.clone()),
-                )
-                .await??;
-                let signer = session.execution_signer().clone();
-                let run = ExecutionSession::Grant(&mut session)
-                    .run(&request, terms, &signer, controls, Some(&mut attempt))
-                    .await;
-                let run = unresolved(run, deadline, async {
-                    ExecutionSession::Grant(&mut session)
-                        .recover(&mut attempt)
-                        .await
+                    Ok(completed)
                 })
                 .await;
-                let closed = session.shutdown().await;
-                let completed = run?;
-                closed?;
-                return Ok(completed);
             }
             BackendState::Local { execution, timeout } => {
                 local_policy = super::local::policy(job.input(), *timeout)?;
