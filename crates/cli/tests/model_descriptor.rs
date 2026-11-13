@@ -52,3 +52,58 @@ fn describe_and_program_work_without_an_identity_or_original_weights() {
     assert!(!home.join("identity").exists());
     assert!(!home.join("principal.key").exists());
 }
+
+#[cfg(feature = "compute")]
+#[test]
+fn local_model_commands_refuse_descriptors_before_reading_render_inputs() {
+    let root = tempfile::tempdir().unwrap();
+    for (fixture, metadata, command) in [
+        (
+            "../client/src/model/package/mini-qwen3.gguf",
+            "header.gguf",
+            vec!["text", "--prompt", "hello"],
+        ),
+        (
+            "../client/src/model/whisper/mini",
+            "config.json",
+            vec!["transcribe", "--audio", "absent.wav"],
+        ),
+    ] {
+        let descriptor = root.path().join(command[0]);
+        let output = Command::new(env!("CARGO_BIN_EXE_hellas"))
+            .arg("model")
+            .arg("describe")
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join(fixture))
+            .arg("-o")
+            .arg(&descriptor)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for corrupt_metadata in [false, true] {
+            // Refusal does not depend on usable metadata, audio input, or a GPU.
+            if corrupt_metadata {
+                std::fs::write(descriptor.join(metadata), []).unwrap();
+            }
+            let output = Command::new(env!("CARGO_BIN_EXE_hellas"))
+                .arg("--home")
+                .arg(root.path().join("home"))
+                .args(&command)
+                .arg("--model")
+                .arg(&descriptor)
+                .arg("--local")
+                .output()
+                .unwrap();
+            assert!(!output.status.success());
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("local execution requires the full model weights, not a descriptor"),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}

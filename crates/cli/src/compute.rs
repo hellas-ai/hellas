@@ -32,18 +32,15 @@ pub(crate) struct GpuArgs {
     pub(crate) gpu_session_asset_bytes: u64,
 }
 
-/// One-shot local execution uses the same native constructor as the daemon.
 #[cfg(feature = "compute")]
-pub(crate) async fn local(
+pub(crate) async fn content(
     home: &hellas_private::StoreLocation,
-    native: LocalArgs,
-    signer: std::sync::Arc<hellas_auth::ProducerSigningKey>,
-) -> CliResult<hellas_sdk::execution::local::LocalExecution> {
-    let configuration = crate::content_configuration::ContentConfiguration::load(
-        native.content_config,
-        native.content,
-    )?
-    .with_default_upper(home.join("provider/content"));
+    native: &LocalArgs,
+    models: &[PathBuf],
+) -> CliResult<hellas_store::content::DiskStore> {
+    let mut configuration =
+        crate::content_configuration::ContentConfiguration::load(native.content_config.clone())?
+            .with_default_upper(home.join("provider/content"));
     let content = configuration
         .config()
         .open(
@@ -54,9 +51,33 @@ pub(crate) async fn local(
             true,
         )
         .await?;
-    let prepared = async {
+    let prepared: CliResult<()> = async {
         content.finish_recovery().await?;
+        configuration
+            .add_content(
+                &content,
+                native.content.iter().chain(models).cloned().collect(),
+            )
+            .await?;
         configuration.apply(&content).await?;
+        Ok(())
+    }
+    .await;
+    if let Err(error) = prepared {
+        content.close().await;
+        return Err(error);
+    }
+    Ok(content)
+}
+
+/// One-shot local execution uses the same native constructor as the daemon.
+#[cfg(feature = "compute")]
+pub(crate) async fn local(
+    content: hellas_store::content::DiskStore,
+    native: LocalArgs,
+    signer: std::sync::Arc<hellas_auth::ProducerSigningKey>,
+) -> CliResult<hellas_sdk::execution::local::LocalExecution> {
+    let prepared = async {
         let backend = hellas_sdk::execution::local::spawn(
             signer,
             hellas_executor::GpuConfig {

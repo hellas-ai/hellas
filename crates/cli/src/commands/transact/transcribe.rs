@@ -23,42 +23,52 @@ pub struct TranscribeArgs {
     output: Option<PathBuf>,
 }
 
-pub async fn transcribe(args: TranscribeArgs, context: Context) -> super::super::CliResult<()> {
-    let samples = wav::decode(&super::super::read_bounded_regular_file(
-        &args.audio,
-        "WAV",
-        wav::MAX_WAV_BYTES,
-    )?)?;
-    let evaluator = args.target.renderer()?;
-    let package = ModelPackage::open(&args.model, &evaluator).await?;
-    let rendered = package
-        .render_job(&ModelRequest::Transcription {
-            samples: &samples,
-            language: args.language.as_deref(),
-            max_new_tokens: args.max_tokens,
+pub async fn transcribe(mut args: TranscribeArgs, context: Context) -> super::super::CliResult<()> {
+    context
+        .model_command(async {
+            args.target.models = vec![args.model.clone()];
+            let content = args.target.content(&context).await?;
+            let samples = wav::decode(&super::super::read_bounded_regular_file(
+                &args.audio,
+                "WAV",
+                wav::MAX_WAV_BYTES,
+            )?)?;
+            let evaluator = args.target.renderer()?;
+            let package =
+                ModelPackage::open_many(&args.model, [evaluator.clone()], content.as_ref())
+                    .await?
+                    .remove(&evaluator)
+                    .context("model evaluator is not prepared")?;
+            let rendered = package
+                .render_job(&ModelRequest::Transcription {
+                    samples: &samples,
+                    language: args.language.as_deref(),
+                    max_new_tokens: args.max_tokens,
+                })
+                .await?;
+            let target = args.target;
+            run_quoted(
+                &args.client,
+                target,
+                &context,
+                args.pay,
+                None,
+                async |price| compute_job(price, evaluator, rendered).await,
+                |_| args.output.clone(),
+                |_, completed, _| {
+                    let ModelResponse::Transcription(transcription) =
+                        package.decode(&completed.output)?
+                    else {
+                        bail!("expected transcription");
+                    };
+                    println!("{}", transcription.text);
+                    std::io::stdout().lock().flush()?;
+                    Ok(())
+                },
+            )
+            .await
         })
-        .await?;
-    let mut target = args.target;
-    target.models = vec![args.model.clone()];
-    run_quoted(
-        &args.client,
-        target,
-        &context,
-        args.pay,
-        None,
-        async |price| compute_job(price, evaluator, rendered).await,
-        |_| args.output.clone(),
-        |_, completed, _| {
-            let ModelResponse::Transcription(transcription) = package.decode(&completed.output)?
-            else {
-                bail!("expected transcription");
-            };
-            println!("{}", transcription.text);
-            std::io::stdout().lock().flush()?;
-            Ok(())
-        },
-    )
-    .await
+        .await
 }
 
 #[cfg(test)]

@@ -42,21 +42,16 @@ impl Runtime {
                     cached.packages.clear();
                     cached.files = files;
                 }
-                let weights = ModelPackage::weights_path(&path)
-                    .map(|path| {
-                        cached
-                            .files
-                            .get(&path)
-                            .copied()
-                            .ok_or("model weights were not inspected")
-                    })
-                    .transpose()?;
-                for evaluator in &evaluators {
-                    if !cached.packages.contains_key(evaluator) {
-                        let package =
-                            ModelPackage::open_with_weights(&path, evaluator, weights).await?;
-                        cached.packages.insert(evaluator.clone(), Arc::new(package));
-                    }
+                let missing = evaluators
+                    .iter()
+                    .filter(|evaluator| !cached.packages.contains_key(*evaluator))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !missing.is_empty() {
+                    cached.packages.extend(
+                        ModelPackage::open_many(&path, missing, Some(&self.options.content))
+                            .await?,
+                    );
                 }
                 Ok(cached
                     .packages
@@ -95,11 +90,11 @@ impl Runtime {
                         _ => None,
                     }),
             );
-            if paths.iter().any(|path| ModelPackage::is_descriptor(path)) {
-                index.insert(
-                    id.clone(),
-                    Err("local execution requires the full model weights, not a descriptor".into()),
-                );
+            if let Err(error) = paths
+                .iter()
+                .try_for_each(|path| ModelPackage::require_local_weights(path))
+            {
+                index.insert(id.clone(), Err(error.to_string()));
                 continue;
             }
             paths.extend(content.iter().cloned());

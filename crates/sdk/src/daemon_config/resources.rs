@@ -98,7 +98,8 @@ impl Document {
     ) -> Result<NodeConfiguration, crate::daemon::Error> {
         let mut models = hellas_gateway::router::Models::new();
         for (path, evaluators) in self.model_evaluators(info) {
-            let packages = hellas_client::model::ModelPackage::open_many(&path, evaluators).await?;
+            let packages =
+                hellas_client::model::ModelPackage::open_many(&path, evaluators, None).await?;
             models.insert(path, Ok(packages));
         }
         self.configuration(info, &models)

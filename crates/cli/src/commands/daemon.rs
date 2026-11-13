@@ -12,7 +12,7 @@ use std::{
 
 #[derive(clap::Args)]
 pub struct GatewayArgs {
-    /// Qwen GGUF, converted Whisper/Flux directory, PATH@CONTACT or NAME@UPSTREAM.
+    /// Qwen GGUF, Whisper/Flux package or descriptor; PATH@CONTACT or NAME@UPSTREAM.
     #[arg(long = "model", required = true)]
     pub models: Vec<String>,
     /// NAME=HTTPS_API_URL,key-file=PATH (an OpenAI-compatible service).
@@ -72,6 +72,7 @@ pub struct ModelContext {
     pub home: PathBuf,
     pub principal: Option<PrincipalId>,
     pub holder: NodeKey,
+    pub content: Option<hellas_store::content::DiskStore>,
 }
 impl ModelContext {
     pub fn new(
@@ -81,6 +82,7 @@ impl ModelContext {
     ) -> Result<Self> {
         Ok(Self {
             home: home.into(),
+            content: None,
             holder: NodeKey::from_public_key(identity.node_key.public_key())?,
             principal: owner
                 .map(|owner| {
@@ -90,6 +92,14 @@ impl ModelContext {
                 })
                 .transpose()?,
         })
+    }
+
+    async fn open_many(
+        &self,
+        path: &Path,
+        evaluators: impl IntoIterator<Item = String>,
+    ) -> Result<std::collections::BTreeMap<String, Arc<hellas_client::model::ModelPackage>>> {
+        hellas_client::model::ModelPackage::open_many(path, evaluators, self.content.as_ref()).await
     }
 
     async fn add(&self, document: &mut Document, model: &str) -> Result<()> {
@@ -144,21 +154,36 @@ impl ModelContext {
             .exists()
             .then(|| std::fs::canonicalize(name))
             .transpose()?;
+        let packages = if let Some(path) = &package {
+            let evaluators = bundle
+                .offers
+                .iter()
+                .flat_map(|offer| &offer.offer().grant.policies)
+                .flat_map(|policy| &policy.invocation_policy.admissions)
+                .filter_map(|admission| match admission {
+                    hellas_rpc::protocol::invocation::Admission::Compute { evaluator, .. } => {
+                        Some(evaluator.clone())
+                    }
+                    _ => None,
+                });
+            self.open_many(path, evaluators).await?
+        } else {
+            Default::default()
+        };
         let mut matches = vec![];
         for policy in bundle
             .offers
             .iter()
             .flat_map(|offer| &offer.offer().grant.policies)
         {
-            if let Some(package) = &package {
+            if package.is_some() {
                 for admission in &policy.invocation_policy.admissions {
                     if let hellas_rpc::protocol::invocation::Admission::Compute {
                         evaluator,
                         programs,
                     } = admission
                     {
-                        let opened =
-                            hellas_client::model::ModelPackage::open(package, evaluator).await?;
+                        let opened = &packages[evaluator];
                         if let Ok(program) = opened.program() {
                             match programs {
                                 hellas_rpc::protocol::invocation::ComputePrograms::Any {} => {}
@@ -290,7 +315,7 @@ fn package_route(package: PathBuf, backend: &str) -> Result<Route> {
     Ok(Route {
         backends: vec![backend.into()],
         presentation: Presentation::Model {
-            modality: hellas_client::model::ModelKind::of(&package),
+            modality: hellas_client::model::ModelKind::of(&package)?,
             model,
             package,
             max_tokens: 128,
@@ -542,45 +567,11 @@ pub async fn gateway(
     } else {
         None
     };
-    let context = ModelContext::new(
+    let mut context = ModelContext::new(
         home,
         identity,
         owner.map(|owner| owner as &dyn Authenticator),
     )?;
-    let mut document = Document::default();
-    document.listeners.insert(
-        "api".into(),
-        Listener::Http {
-            bind: args.bind,
-            zdr: true,
-        },
-    );
-    for upstream in args.upstreams {
-        let (definition, key_file) = upstream
-            .rsplit_once(",key-file=")
-            .context("upstream is NAME=HTTPS_API_URL,key-file=PATH")?;
-        let (name, url) = definition
-            .split_once('=')
-            .context("upstream is NAME=HTTPS_API_URL,key-file=PATH")?;
-        apply(
-            &mut document,
-            Edit::Backend(BackendCommand::Add {
-                name: name.into(),
-                url: url.into(),
-                key_file: key_file.into(),
-            }),
-            &context,
-        )
-        .await?;
-    }
-    for model in args.models {
-        apply(
-            &mut document,
-            Edit::Route(RouteCommand::Add { model }),
-            &context,
-        )
-        .await?;
-    }
     hellas_private::create_dir_all_durable(home)?;
     let temporary = tempfile::Builder::new()
         .prefix(".gateway-")
@@ -591,6 +582,53 @@ pub async fn gateway(
         super::admin::gateway_authority(&home.child(temporary.path()), identity, &ephemeral)
             .await?;
     let options = options(home.clone(), identity, owner, chain, node.clone(), None).await?;
+    context.content = Some(options.content.clone());
+    let prepared: Result<_> = async {
+        let mut document = Document::default();
+        document.listeners.insert(
+            "api".into(),
+            Listener::Http {
+                bind: args.bind,
+                zdr: true,
+            },
+        );
+        for upstream in args.upstreams {
+            let (definition, key_file) = upstream
+                .rsplit_once(",key-file=")
+                .context("upstream is NAME=HTTPS_API_URL,key-file=PATH")?;
+            let (name, url) = definition
+                .split_once('=')
+                .context("upstream is NAME=HTTPS_API_URL,key-file=PATH")?;
+            apply(
+                &mut document,
+                Edit::Backend(BackendCommand::Add {
+                    name: name.into(),
+                    url: url.into(),
+                    key_file: key_file.into(),
+                }),
+                &context,
+            )
+            .await?;
+        }
+        for model in args.models {
+            apply(
+                &mut document,
+                Edit::Route(RouteCommand::Add { model }),
+                &context,
+            )
+            .await?;
+        }
+        Ok(document)
+    }
+    .await;
+    let document = match prepared {
+        Ok(document) => document,
+        Err(error) => {
+            options.content.close().await;
+            node.close().await;
+            return Err(error);
+        }
+    };
     run_daemon(
         options,
         Some(document),
@@ -760,6 +798,166 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn gateway_matching_and_store_preparation_hash_full_weights_once() {
+        const CHILD: &str = "HELLAS_TEST_GATEWAY_HASH_ONCE";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "commands::daemon::tests::gateway_matching_and_store_preparation_hash_full_weights_once", "--nocapture"])
+                .env(CHILD, "1")
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("full.gguf");
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../client/src/model/package/mini-qwen3.gguf"),
+            &path,
+        )
+        .unwrap();
+        let size = 32 << 20;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(size)
+            .unwrap();
+        let store = hellas_store::content::DiskStore::open(
+            hellas_private::StoreLocation::for_test(&root.path().join("content")),
+            vec![],
+            hellas_store::content::IndexMode::Resume,
+            None,
+            hellas_store::content::Reservations::ram(
+                hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
+            ),
+            false,
+        )
+        .await
+        .unwrap();
+        let context = ModelContext {
+            home: root.path().into(),
+            principal: None,
+            holder: NodeKey::from_public_key(
+                hellas_auth::ProducerSigningKey::from_secret_bytes([1; 32])
+                    .unwrap()
+                    .public_key(),
+            )
+            .unwrap(),
+            content: Some(store.clone()),
+        };
+        let read_bytes = || -> u64 {
+            std::fs::read_to_string("/proc/self/io")
+                .unwrap()
+                .lines()
+                .find_map(|line| line.strip_prefix("rchar: ").map(|n| n.parse().unwrap()))
+                .unwrap()
+        };
+        let before = read_bytes();
+        let hip = hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip);
+        let cuda = hellas_client::model::evaluator(hellas_client::model::GpuDialect::Cuda);
+        let packages = context
+            .open_many(&path, [hip.clone(), hip, cuda])
+            .await
+            .unwrap();
+        assert_eq!(packages.len(), 2);
+        let inspected = store.inspect_files(vec![path.clone()]).await.unwrap();
+        assert_eq!(inspected[&path].bytes(), size);
+        store
+            .rescan(vec![path], hellas_store::content::IndexMode::Resume)
+            .await
+            .unwrap();
+        let bytes = read_bytes() - before;
+        assert!(bytes >= size, "cold weights were not read: {bytes}");
+        assert!(
+            bytes < size + (1 << 20),
+            "weights were read more than once: {bytes} bytes for {size} weights bytes"
+        );
+        store.close().await;
+    }
+
+    #[cfg(all(target_os = "linux", feature = "compute"))]
+    #[tokio::test]
+    async fn local_rendering_and_indexing_hash_full_weights_once() {
+        const CHILD: &str = "HELLAS_TEST_LOCAL_HASH_ONCE";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "commands::daemon::tests::local_rendering_and_indexing_hash_full_weights_once",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("full.gguf");
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../client/src/model/package/mini-qwen3.gguf"),
+            &path,
+        )
+        .unwrap();
+        let size = 32 << 20;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(size)
+            .unwrap();
+        let native = crate::compute::LocalArgs {
+            content_config: None,
+            content: vec![],
+            gpu: crate::compute::GpuArgs {
+                evaluator: None,
+                gpu_session_programs: 1,
+                gpu_session_asset_bytes: size,
+            },
+        };
+        let read_bytes = || -> u64 {
+            std::fs::read_to_string("/proc/self/io")
+                .unwrap()
+                .lines()
+                .find_map(|line| line.strip_prefix("rchar: ").map(|n| n.parse().unwrap()))
+                .unwrap()
+        };
+        let before = read_bytes();
+        let store = crate::compute::content(
+            &StoreLocation::for_test(root.path()),
+            &native,
+            std::slice::from_ref(&path),
+        )
+        .await
+        .unwrap();
+        let evaluator = hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip);
+        let packages =
+            hellas_client::model::ModelPackage::open_many(&path, [evaluator.clone()], Some(&store))
+                .await
+                .unwrap();
+        packages[&evaluator].program().unwrap();
+        let bytes = read_bytes() - before;
+        assert!(
+            bytes >= size && bytes < size + (1 << 20),
+            "weights were read more than once: {bytes} bytes for {size} weights bytes"
+        );
+        store.close().await;
+    }
+
     #[test]
     fn generated_grant_ids_fit_and_repair_refreshes_access() {
         let resource = hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"model"));
@@ -803,6 +1001,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let context = ModelContext {
             home: directory.path().into(),
+            content: None,
             principal: None,
             holder: NodeKey::from_public_key(
                 hellas_auth::ProducerSigningKey::from_secret_bytes([1; 32])
@@ -910,6 +1109,7 @@ mod tests {
         std::fs::write(&key_file, "test-secret\n").unwrap();
         let context = ModelContext {
             home: directory.path().into(),
+            content: None,
             principal: None,
             holder: NodeKey::from_public_key(
                 hellas_auth::ProducerSigningKey::from_secret_bytes([1; 32])

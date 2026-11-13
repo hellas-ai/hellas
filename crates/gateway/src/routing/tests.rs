@@ -370,14 +370,6 @@ async fn compute_is_rendered_for_each_selected_evaluator() {
     let work = Arc::new(Renderers {
         calls: Default::default(),
     });
-    let _router = crate::router::router(
-        vec![route.clone()],
-        work.clone(),
-        Default::default(),
-        Default::default(),
-    )
-    .await
-    .unwrap();
     let routing = Routing::new(vec![route.clone()], work.clone(), Default::default()).unwrap();
     let execution = crate::test_support::execution(work.clone(), route.presentation.clone()).await;
     let request = ModelRequest::Text {

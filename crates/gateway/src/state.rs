@@ -143,7 +143,7 @@ impl TextState {
             return Err(crate::GatewayConfigError::MaxTokens.into());
         }
         let presentation = tokio::task::spawn_blocking(move || {
-            TextPresentation::from_gguf(&hellas_client::model::ModelPackage::gguf_path(&path))
+            TextPresentation::from_gguf(&hellas_client::model::ModelPackage::gguf_path(&path)?)
         })
         .await
         .map_err(crate::GatewayError::Task)?

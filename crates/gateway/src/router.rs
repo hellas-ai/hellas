@@ -45,7 +45,7 @@ pub async fn router(
     for (path, evaluators) in evaluators {
         models.insert(
             path.clone(),
-            Ok(ModelPackage::open_many(&path, evaluators)
+            Ok(ModelPackage::open_many(&path, evaluators, None)
                 .await
                 .map_err(|error| crate::GatewayError::Presentation(error.into()))?),
         );

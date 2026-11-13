@@ -230,6 +230,8 @@ pub struct Context {
     /// after the executor that borrowed them has finished.
     paid_endpoint: tokio::sync::OnceCell<iroh::Endpoint>,
     grant_endpoint: tokio::sync::OnceCell<iroh::Endpoint>,
+    #[cfg(feature = "compute")]
+    local_content: tokio::sync::OnceCell<hellas_store::content::DiskStore>,
 }
 
 impl Context {
@@ -250,7 +252,22 @@ impl Context {
             chain: hellas_chain::chain_dir::ChainDir::open(home, chain)?,
             paid_endpoint: tokio::sync::OnceCell::new(),
             grant_endpoint: tokio::sync::OnceCell::new(),
+            #[cfg(feature = "compute")]
+            local_content: tokio::sync::OnceCell::new(),
         })
+    }
+
+    /// Model preparation can open local content before execution has a backend.
+    async fn model_command(
+        &self,
+        work: impl std::future::Future<Output = super::CliResult<()>>,
+    ) -> super::CliResult<()> {
+        let result = work.await;
+        #[cfg(feature = "compute")]
+        if let Some(content) = self.local_content.get() {
+            content.close().await;
+        }
+        result
     }
 
     /// Paid and granted work act for the principal, whose home key is
@@ -498,6 +515,30 @@ impl From<Backend> for ResolvedBackend {
 }
 
 impl TargetArgs {
+    async fn content(
+        &self,
+        context: &Context,
+    ) -> super::CliResult<Option<hellas_store::content::DiskStore>> {
+        #[cfg(feature = "compute")]
+        if self.local {
+            for path in &self.models {
+                hellas_client::model::ModelPackage::require_local_weights(path)?;
+            }
+            return Ok(Some(
+                context
+                    .local_content
+                    .get_or_try_init(|| {
+                        crate::compute::content(&context.home, &self.native, &self.models)
+                    })
+                    .await?
+                    .clone(),
+            ));
+        }
+        #[cfg(not(feature = "compute"))]
+        let _ = context;
+        Ok(None)
+    }
+
     /// The evaluator id jobs for this target are rendered for.
     fn evaluator(&self) -> Option<String> {
         #[cfg(feature = "compute")]
@@ -529,16 +570,12 @@ impl TargetArgs {
         #[cfg(feature = "compute")]
         if self.local {
             ensure!(pay == 0, "local work is not paid; drop --pay");
-            ensure!(
-                self.models
-                    .iter()
-                    .all(|path| !hellas_client::model::ModelPackage::is_descriptor(path)),
-                "local execution requires the full model weights, not a descriptor"
-            );
-            let mut native = self.native;
-            native.content.extend(self.models);
+            let content = self
+                .content(context)
+                .await?
+                .context("local content is not prepared")?;
             let execution =
-                crate::compute::local(&context.home, native, Arc::new(context.producer.clone()))
+                crate::compute::local(content, self.native, Arc::new(context.producer.clone()))
                     .await?;
             return Ok(ResolvedBackend {
                 backend: Backend::local(
