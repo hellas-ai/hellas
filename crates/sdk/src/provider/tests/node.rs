@@ -3083,6 +3083,11 @@ impl RunningPaidNode {
                     .service(&self.context(), descriptor().channel().id())
                     .unwrap()
                     .is_some()
+                    && self
+                        .setup_mount
+                        .service(&self.context(), bond_edge())
+                        .unwrap()
+                        .is_none()
                 {
                     break;
                 }
