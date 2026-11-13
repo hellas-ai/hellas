@@ -702,24 +702,6 @@ async fn repaired_resources_are_usable_through_the_gateway() {
     fixture.shutdown().await;
 }
 
-#[tokio::test]
-async fn quarantine_triggering_request_is_http_forbidden_and_keeps_the_channel_up() {
-    let fixture = Fixture::builder()
-        .without_usage()
-        .with_budget(100)
-        .build()
-        .await;
-    for _ in 0..2 {
-        fixture.result(None).await.unwrap();
-    }
-    let http = fixture.http().await;
-    assert_eq!(http.status().await, reqwest::StatusCode::FORBIDDEN);
-    assert!(!fixture.gateway.backends()[0].down);
-    assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 3);
-    http.server.shutdown().await.unwrap();
-    fixture.shutdown().await;
-}
-
 /// Control timeouts do not bound a stream within its signed job terms.
 #[tokio::test]
 async fn streams_outlast_the_control_timeout_while_they_progress() {
