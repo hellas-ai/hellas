@@ -23,6 +23,11 @@ impl Prepared {
         &self,
         core: &Core,
     ) -> Result<hellas_authority::model::grant::configuration::NodeConfiguration> {
+        for (id, listener) in &self.listeners {
+            if let Some(error) = listener.failure.get() {
+                return Err(format!("listener {id}: {error}").into());
+            }
+        }
         let old = core.snapshot.load_full();
         for (id, entry) in &self.entries {
             if let runtime::PreparedBackend::Ready(entry) = entry

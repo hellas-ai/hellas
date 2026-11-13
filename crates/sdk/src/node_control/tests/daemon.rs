@@ -1029,3 +1029,48 @@ async fn unavailable_paid_provider_does_not_prevent_startup() {
     connection.close(0u32.into(), b"test complete");
     let _ = served.await.unwrap();
 }
+
+#[tokio::test]
+async fn occupied_saved_listener_keeps_control_available_for_repair() {
+    let f = fixture().await;
+    let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut document = Document::default();
+    document.listeners.insert(
+        "api".into(),
+        Listener::Http {
+            bind: occupied.local_addr().unwrap(),
+            zdr: true,
+        },
+    );
+    let (echo, secrets) = document.redacted();
+    f.node
+        .configure_startup(
+            hellas_authority::model::grant::configuration::ConfigurationDocument {
+                revision: Revision(0),
+                document: serde_json::to_string(&echo).unwrap(),
+                secrets,
+            },
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+    let core = Core::restore(options(&f), None).await.unwrap();
+    let view = core.watch().0;
+    assert_eq!(view.revision, Revision(1));
+    assert!(!view.listener_errors["api"].is_empty());
+    assert!(view.http_addresses.is_empty());
+    assert!(!core.jobs.is_closed());
+    let (_client, _server, connection, rpc, served) = connect(&f, core.clone()).await;
+    assert!(rpc.configure(request(&document, 1)).await.is_err());
+    assert_eq!(core.watch().0.revision, Revision(1));
+    drop(occupied);
+    assert_eq!(
+        rpc.configure(request(&document, 1)).await.unwrap().revision,
+        2
+    );
+    assert!(core.watch().0.listener_errors.is_empty());
+    assert_eq!(core.http_addresses().len(), 1);
+    core.shutdown().await.unwrap();
+    connection.close(0u32.into(), b"test complete");
+    let _ = served.await.unwrap();
+}
