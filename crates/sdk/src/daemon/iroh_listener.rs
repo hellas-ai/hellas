@@ -93,15 +93,6 @@ impl Bound {
             );
             let work = MountedWork::with_backend(backend);
             let setup = MountedSetup::with_content_store(options.content.clone());
-            let runner = WorkRunner::discover(
-                WorkRunnerConfig {
-                    chain: chain.chain.clone(),
-                    settlement_key: options.settlement.clone(),
-                },
-                work.clone(),
-                setup.clone(),
-            )
-            .await?;
             Ok(Self {
                 port,
                 alpns,
@@ -113,7 +104,7 @@ impl Bound {
                 administration,
                 work,
                 setup,
-                runner: Mutex::new(Some(runner)),
+                runner: Mutex::new(None),
             })
         }
         .await;
@@ -121,6 +112,24 @@ impl Bound {
             endpoint.close().await;
         }
         prepare
+    }
+
+    pub async fn activate(&self, core: &Core) -> Result<()> {
+        self.chain.chain.persist()?;
+        let runner = WorkRunner::discover(
+            WorkRunnerConfig {
+                chain: self.chain.chain.clone(),
+                settlement_key: core.runtime.options.settlement.clone(),
+            },
+            self.work.clone(),
+            self.setup.clone(),
+        )
+        .await?;
+        *self
+            .runner
+            .lock()
+            .map_err(|_| "iroh runner lock poisoned")? = Some(runner);
+        Ok(())
     }
 
     pub async fn serve(

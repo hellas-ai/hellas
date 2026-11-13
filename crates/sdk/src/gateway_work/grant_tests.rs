@@ -1410,3 +1410,55 @@ async fn resources_from_one_grant(concurrent: bool) {
     assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 2);
     fixture.shutdown().await;
 }
+
+#[tokio::test]
+async fn sharing_a_channel_does_not_reuse_replaced_credentials() {
+    let fixture = Fixture::builder().with_budget(100).build().await;
+    fixture.result(None).await.unwrap();
+    let old = fixture.options();
+    let mut options = old.clone();
+    options.application = Arc::new(crate::node_control::profile::ClientProfile {
+        authority: old.application.authority,
+        authorization: old.application.authorization,
+        credential: hellas_auth::authority::CredentialSecret::from_parts(
+            old.application.credential.id(),
+            [0; 32],
+        ),
+        local: None,
+    });
+    let next = ExecutorGateway::prepare(
+        [(
+            "test".into(),
+            BackendEntry {
+                backend: crate::Backend::grant(
+                    fixture.backend().policy.clone(),
+                    options,
+                    fixture.backend().transport.clone(),
+                ),
+                evaluator: None,
+                max_in_flight: std::num::NonZeroUsize::new(1).unwrap(),
+            },
+        )]
+        .into(),
+        fixture.gateway.signer.clone(),
+        fixture.gateway.jobs.clone(),
+        Some(&fixture.gateway),
+        &Default::default(),
+    );
+    let events = next
+        .fetch(
+            "test",
+            crate::test_support::request_job(&next.jobs),
+            fixture.request(None),
+        )
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+    assert!(
+        events.iter().any(Result::is_err),
+        "replacement must authenticate its own credential"
+    );
+    assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 1);
+    next.drain().await.unwrap();
+    fixture.shutdown().await;
+}

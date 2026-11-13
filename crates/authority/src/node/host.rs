@@ -75,6 +75,25 @@ impl NodeCoordinator {
             .await
     }
 
+    /// Reject unauthorized candidates before any runtime preparation.
+    pub async fn authorize_configure(
+        &self,
+        caller: &AuthenticatedCaller,
+        authorization: GrantId,
+    ) -> Result<(), NodeStoreError> {
+        self.checked(caller, authorization, HOST_CONFIGURE, async |store, now| {
+            let authority = store.state().authority();
+            authority.authorize_caller(
+                caller,
+                authorization,
+                &Operation::named(HOST_CONFIGURE)?.permission(authority.authority(), None)?,
+                now,
+            )?;
+            caller.session().step_up().map_err(Into::into)
+        })
+        .await
+    }
+
     /// The whole daemon change has one authority check and one durable frame.
     pub async fn configure(
         &self,

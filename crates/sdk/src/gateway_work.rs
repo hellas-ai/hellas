@@ -808,6 +808,17 @@ impl ExecutorGateway {
         previous: Option<&Self>,
         reuse: &std::collections::BTreeSet<String>,
     ) -> Arc<Self> {
+        Self::prepare_identified(backends, signer, jobs, previous, reuse, &[])
+    }
+
+    pub(crate) fn prepare_identified(
+        backends: std::collections::BTreeMap<String, BackendEntry>,
+        signer: Arc<hellas_auth::ProducerSigningKey>,
+        jobs: Arc<hellas_gateway::jobs::Jobs>,
+        previous: Option<&Self>,
+        reuse: &std::collections::BTreeSet<String>,
+        identities: &[hellas_gateway::BackendInfo],
+    ) -> Arc<Self> {
         let grants: Arc<std::sync::Mutex<GrantChannels>> =
             previous.map_or_else(Default::default, |old| old.grants.clone());
         let mut channels = grants.lock().unwrap();
@@ -821,7 +832,10 @@ impl ExecutorGateway {
         resolved.extend(backends.into_iter().map(|(id, entry)| {
             let mut backend = entry.backend;
             backend.id = id.clone();
-            backend.instance = rand::random();
+            backend.instance = identities
+                .iter()
+                .find(|info| info.id == id)
+                .map_or_else(rand::random, |info| info.instance);
             backend.jobs = jobs.clone();
             backend.evaluator = entry.evaluator;
             backend.capacity = entry.max_in_flight.get();
@@ -1195,7 +1209,7 @@ impl Backend {
         let mut guard = before_proposal(None, stop, None, target.channel.session.lock()).await?;
         if guard
             .as_ref()
-            .is_some_and(|session| session.trust() != options.target.trust())
+            .is_some_and(|session| !session.reusable_with(options))
         {
             if target
                 .channel

@@ -233,7 +233,6 @@ pub async fn listener_router(
     archive: ArchiveOptions,
 ) -> GatewayResult<axum::Router> {
     let policy = archive::Policy::new(archive);
-    policy.prepare();
     let app =
         app.layer(provenance_layer::ProvenanceLayer)
             .layer(axum::middleware::from_fn_with_state(

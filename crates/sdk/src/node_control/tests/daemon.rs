@@ -499,6 +499,14 @@ async fn an_unbound_daemon_can_install_its_iroh_listener_after_owner_binding() {
     hellas_authority::test_support::within(async {
         let f = fixture().await;
         let opts = options(&f);
+        let profile_path = opts
+            .home
+            .join("chains")
+            .join(
+                hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet)
+                    .state_key(),
+            )
+            .join("profile.json");
         let enrollment = hellas_channel::test_support::enrollment(
             &hellas_auth::ProducerSigningKey::from_secret_bytes([55; 32]).unwrap(),
             &opts.signer,
@@ -526,6 +534,10 @@ async fn an_unbound_daemon_can_install_its_iroh_listener_after_owner_binding() {
                 .await
                 .is_err()
         );
+        assert!(
+            !profile_path.exists(),
+            "failed preparation must not create a profile"
+        );
         assert_eq!(core.watch().0.revision, Revision(0));
         rpc.bind_provider(BindProviderRequest {
             authorization: ROOT_GRANT.0.to_vec(),
@@ -533,13 +545,22 @@ async fn an_unbound_daemon_can_install_its_iroh_listener_after_owner_binding() {
         })
         .await
         .unwrap();
-        assert_eq!(
-            rpc.configure(request(&document, core.watch().0.revision.0))
-                .await
-                .unwrap()
-                .revision,
-            1
+        let committed = Arc::new(Semaphore::new(0));
+        let resume = Arc::new(Semaphore::new(0));
+        *core.after_commit.lock().unwrap() = Some((committed.clone(), resume.clone()));
+        let configured = rpc.configure(request(&document, 0));
+        tokio::pin!(configured);
+        tokio::select! {
+            permit = committed.acquire() => permit.unwrap().forget(),
+            result = &mut configured => panic!("Configure ended before commit barrier: {result:?}"),
+        }
+        assert!(
+            !profile_path.exists(),
+            "profile writes belong to committed activation"
         );
+        resume.add_permits(1);
+        assert_eq!(configured.await.unwrap().revision, 1);
+        assert!(profile_path.is_file());
         assert_eq!(core.iroh_addresses().len(), 1);
         let bound = core.iroh_endpoints().pop().unwrap();
         let mut invalid = core.watch().0.document;
@@ -586,4 +607,64 @@ async fn an_unbound_daemon_can_install_its_iroh_listener_after_owner_binding() {
         f.node.close().await;
     })
     .await;
+}
+
+#[tokio::test]
+async fn denied_configure_never_rewrites_a_chain_profile() {
+    rejected_profile(false).await;
+}
+#[tokio::test]
+async fn invalid_authorized_configure_never_rewrites_a_chain_profile() {
+    rejected_profile(true).await;
+}
+async fn rejected_profile(authorized: bool) {
+    let f = fixture().await;
+    let opts = options(&f);
+    let path = opts.chain.as_path().join("profile.json");
+    let original = std::fs::read(&path).unwrap();
+    let archive = opts.home.join("gateway-archive");
+    let mut profile = opts.chain.to_file();
+    profile.validators = vec!["wss://changed.invalid/chain".into()];
+    let core = Core::open(opts, Document::default()).await.unwrap();
+    let (_client, _server, connection, rpc, served) = connect(&f, core.clone()).await;
+    let mut document = Document::default();
+    // A valid chain descriptor followed by invalid provider configuration:
+    // this fixture has no bound enrollment.
+    document.listeners.insert(
+        "work".into(),
+        Listener::Iroh {
+            port: 0,
+            chain: Some(profile),
+            backends: vec![],
+        },
+    );
+    document.listeners.insert(
+        "api".into(),
+        Listener::Http {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            zdr: false,
+        },
+    );
+    let mut candidate = request(&document, 0);
+    if !authorized {
+        candidate.authorization = vec![0xfe; 16];
+    }
+    let error = rpc.configure(candidate).await.unwrap_err();
+    if !authorized {
+        assert_eq!(error.code(), WireCode::PermissionDenied);
+    }
+    assert!(
+        !archive.exists(),
+        "preparation created the archive directory"
+    );
+    assert!(
+        std::fs::read(&path).unwrap() == original,
+        "rejected Configure changed the profile (authorized={authorized})"
+    );
+    assert!(f.node.configuration().await.unwrap().is_none());
+    connection.close(0u32.into(), b"done");
+    let _ = served.await;
+    core.shutdown().await.unwrap();
+    f.node.close().await;
+    f.content.close().await;
 }

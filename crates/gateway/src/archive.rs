@@ -37,6 +37,7 @@ impl Policy {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn prepare(&self) {
         if !self.options.zdr
             && let Err(error) = prepare(&self.options.directory)

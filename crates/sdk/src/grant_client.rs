@@ -630,8 +630,24 @@ pub struct GrantSession {
     pending_body: std::collections::BTreeMap<Digest, (PreparedInvocation, (LocalStore, Scope))>,
 }
 impl GrantSession {
-    pub(crate) fn trust(&self) -> &ProviderTrustAnchor {
-        self.options.target.trust()
+    pub(crate) fn reusable_with(&self, options: &GrantSessionOptions) -> bool {
+        let old = self.options.target.trust();
+        let next = options.target.trust();
+        let apple = |trust: &ProviderTrustAnchor| {
+            trust
+                .apple_app_attest
+                .as_ref()
+                .map(|apple| (apple.app_id.clone(), apple.allowed_cd_hashes.clone()))
+        };
+        let application = &self.options.application;
+        old.expected_genesis == next.expected_genesis
+            && old.required_assurance == next.required_assurance
+            && apple(old) == apple(next)
+            && application.authority == options.application.authority
+            && application.authorization == options.application.authorization
+            && application.credential.id() == options.application.credential.id()
+            && application.credential.expose_secret()
+                == options.application.credential.expose_secret()
     }
     pub(crate) fn execution_target(&self) -> Result<crate::execution::ExecutionTarget> {
         Ok(crate::execution::ExecutionTarget {

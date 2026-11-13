@@ -56,6 +56,80 @@ pub(super) fn automatic_gpu() -> hellas_executor::GpuDialect {
     }
 }
 
+pub(super) enum PreparedBackend {
+    Ready {
+        entry: BackendEntry,
+        paths: Vec<std::path::PathBuf>,
+    },
+    Paid {
+        quote: crate::paid_client::PaidQuote,
+        options: Box<crate::paid_client::PaidWorkOptions>,
+        endpoint: iroh::Endpoint,
+        evaluator: Option<String>,
+        capacity: std::num::NonZeroUsize,
+    },
+}
+impl PreparedBackend {
+    pub fn ready(entry: BackendEntry) -> Self {
+        Self::Ready {
+            entry,
+            paths: vec![],
+        }
+    }
+    pub fn info(&self, id: &str) -> hellas_gateway::BackendInfo {
+        let (evaluator, capacity) = match self {
+            Self::Ready { entry, .. } => (&entry.evaluator, entry.max_in_flight),
+            Self::Paid {
+                evaluator,
+                capacity,
+                ..
+            } => (evaluator, *capacity),
+        };
+        hellas_gateway::BackendInfo {
+            id: id.into(),
+            instance: rand::random(),
+            evaluator: evaluator.clone(),
+            max_in_flight: capacity.get(),
+            in_flight: 0,
+            down: false,
+        }
+    }
+    pub async fn activate(self, runtime: &Runtime) -> Result<BackendEntry> {
+        match self {
+            Self::Ready { entry, paths } => {
+                #[cfg(feature = "compute")]
+                runtime.index(paths).await?;
+                #[cfg(not(feature = "compute"))]
+                let _ = paths;
+                Ok(entry)
+            }
+            Self::Paid {
+                quote,
+                mut options,
+                endpoint,
+                evaluator,
+                capacity,
+            } => {
+                options.config.chain.persist()?;
+                let (owner, content) = runtime.client_resources(&options.config.chain).await?;
+                options.content = content;
+                options.expected_price = quote.policy.payment_policy.fixed_price;
+                Ok(BackendEntry {
+                    backend: Backend::paid(
+                        Some(quote.policy.invocation_policy),
+                        *options,
+                        endpoint,
+                        runtime.options.settlement.clone(),
+                        owner,
+                    ),
+                    evaluator,
+                    max_in_flight: capacity,
+                })
+            }
+        }
+    }
+}
+
 impl Runtime {
     pub fn new(mut options: Options) -> Self {
         Self {
@@ -128,7 +202,7 @@ impl Runtime {
         profile: &Option<hellas_chain::genesis::CustomChainFile>,
     ) -> Result<hellas_chain::chain_dir::ChainDir> {
         match profile {
-            Some(profile) => Ok(hellas_chain::chain_dir::ChainDir::open(
+            Some(profile) => Ok(hellas_chain::chain_dir::ChainDir::prepare(
                 &self.options.home,
                 &hellas_chain::genesis::ChainProfile::custom(profile.clone())?,
             )?),
@@ -147,17 +221,16 @@ impl Runtime {
         ))?)
     }
 
-    fn trust(&self, trust: &Option<Trust>) -> Result<Option<hellas_client::ProviderTrustAnchor>> {
+    fn trust(
+        &self,
+        trust: &Option<Trust>,
+        counters: Arc<dyn hellas_attestation::AssertionCounterStore + Send + Sync>,
+    ) -> Result<Option<hellas_client::ProviderTrustAnchor>> {
         trust
             .as_ref()
             .map(|trust| {
                 let store = crate::trust_policy::TrustPolicyStore::new(&trust.store);
-                Ok(store.approved(
-                    &trust.policy,
-                    Arc::new(crate::FilesystemAssertionCounterStore::in_home(
-                        &self.options.home,
-                    )),
-                )?)
+                Ok(store.approved(&trust.policy, counters.clone())?)
             })
             .transpose()
     }
@@ -174,7 +247,13 @@ impl Runtime {
             | (BackendKind::Fetch { .. }, BackendState::Fetch { .. }) => return Ok(true),
             _ => return Ok(false),
         };
-        let Some(approved) = self.trust(trust)? else {
+        let Some(approved) = self.trust(
+            trust,
+            Arc::new(crate::FilesystemAssertionCounterStore::in_home(
+                &self.options.home,
+            )),
+        )?
+        else {
             return Ok(true);
         };
         let apple_pins = |trust: &hellas_client::ProviderTrustAnchor| {
@@ -193,8 +272,11 @@ impl Runtime {
         id: &str,
         configured: &crate::daemon_config::Backend,
         document: &Document,
-    ) -> Result<BackendEntry> {
-        let (mut backend, evaluator) = match &configured.kind {
+        counters: Arc<crate::counter_store::PreparedCounters>,
+    ) -> Result<PreparedBackend> {
+        #[allow(unused_mut)]
+        let mut index_paths = Vec::new();
+        let (backend, evaluator) = match &configured.kind {
             BackendKind::Fetch { .. } => (
                 configured.open_fetch(self.options.signer.clone()).await?,
                 None,
@@ -229,13 +311,13 @@ impl Runtime {
                     (offer.clone(), policy.clone())
                 };
                 let provider = hellas_client::ProviderAddress::of(&offer.offer().provider)?;
-                let trust = self
-                    .trust(trust)?
-                    .unwrap_or(hellas_client::ProviderTrustAnchor {
+                let trust = self.trust(trust, counters.clone())?.unwrap_or(
+                    hellas_client::ProviderTrustAnchor {
                         expected_genesis: provider.enrollment,
                         required_assurance: hellas_rpc::Assurance::ProducerSigned,
                         apple_app_attest: None,
-                    });
+                    },
+                );
                 let target =
                     crate::grant_client::UnpinnedOffer::decode(&offer.encode()?, UnixMillis(0))?
                         .pin(&trust)?;
@@ -275,11 +357,12 @@ impl Runtime {
             } => {
                 let provider = provider.parse()?;
                 let chain = self.chain(chain)?;
-                let (owner, content) = self.client_resources(&chain).await?;
+                let principal = self.principal()?;
                 let endpoint = self.consumer_endpoint().await?;
-                let apple_trust = self.trust(trust)?;
+                let apple_trust = self.trust(trust, counters.clone())?;
                 let options = crate::paid_client::PaidWorkOptions {
-                    content,
+                    // Quoting reads no content. Activation supplies the recovered client store.
+                    content: self.options.content.clone(),
                     config: crate::work_config::WorkConfig::from_chain_dir(chain)?,
                     provider,
                     provider_addrs: addresses.clone(),
@@ -295,16 +378,23 @@ impl Runtime {
                     payment_blocks: *payment_blocks,
                     timeout: timeout_seconds.map(std::time::Duration::from_secs),
                 };
-                (
-                    Backend::paid(
-                        None,
-                        options,
-                        endpoint,
-                        self.options.settlement.clone(),
-                        owner,
-                    ),
-                    evaluator.clone(),
+                let quote = crate::paid_client::request_paid_quote(
+                    &options,
+                    &endpoint,
+                    &self.options.settlement,
+                    principal,
                 )
+                .await?;
+                if quote.policy.payment_policy.fixed_price > *max_price {
+                    return Err("quoted price exceeds the backend limit".into());
+                }
+                return Ok(PreparedBackend::Paid {
+                    quote,
+                    options: Box::new(options),
+                    endpoint,
+                    evaluator: evaluator.clone(),
+                    capacity: configured.max_in_flight,
+                });
             }
             BackendKind::Local { runtime, content } => {
                 #[cfg(not(feature = "compute"))]
@@ -353,7 +443,14 @@ impl Runtime {
                                 }
                             }),
                     );
-                    self.index(paths).await?;
+                    let mut files = Vec::new();
+                    for path in &paths {
+                        collect_files(&std::fs::canonicalize(path)?, &mut files)?;
+                    }
+                    for path in files {
+                        hellas_store::content::file_content(&path)?;
+                    }
+                    index_paths = paths;
                     (
                         Backend::local(
                             crate::execution::local::LocalExecution {
@@ -367,16 +464,13 @@ impl Runtime {
                 }
             }
         };
-        let price = backend.quote().await?;
-        if let BackendKind::Paid { max_price, .. } = configured.kind
-            && price > max_price
-        {
-            return Err("quoted price exceeds the backend limit".into());
-        }
-        Ok(BackendEntry {
-            backend,
-            evaluator,
-            max_in_flight: configured.max_in_flight,
+        Ok(PreparedBackend::Ready {
+            entry: BackendEntry {
+                backend,
+                evaluator,
+                max_in_flight: configured.max_in_flight,
+            },
+            paths: index_paths,
         })
     }
 

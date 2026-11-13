@@ -14,21 +14,37 @@ pub struct ChainDir {
 impl ChainDir {
     /// Chain stores inherit `home`'s durability.
     pub fn open(home: &StoreLocation, profile: &ChainProfile) -> io::Result<Self> {
-        let root = home.child("chains").child(profile.state_key());
-        let path = root.join("profile.json");
-        let bytes = serde_json::to_vec(&profile.to_file()).map_err(invalid_profile)?;
+        let directory = Self::prepare(home, profile)?;
+        directory.persist()?;
+        Ok(directory)
+    }
+
+    /// Validate a directory descriptor without creating or changing its files.
+    pub fn prepare(home: &StoreLocation, profile: &ChainProfile) -> io::Result<Self> {
+        let directory = Self {
+            home: home.clone(),
+            root: home.child("chains").child(profile.state_key()),
+            profile: profile.clone(),
+        };
+        directory.profile_bytes()?;
+        Ok(directory)
+    }
+
+    /// Publish the validated profile when its owning configuration commits.
+    pub fn persist(&self) -> io::Result<()> {
+        let bytes = self.profile_bytes()?;
+        self.root.durability().create_dir_all(&self.root)?;
+        self.root
+            .durability()
+            .write_atomically(&self.root.join("profile.json"), ".profile", &bytes)
+    }
+
+    fn profile_bytes(&self) -> io::Result<Vec<u8>> {
+        let bytes = serde_json::to_vec(&self.profile.to_file()).map_err(invalid_profile)?;
         if bytes.len() > MAX_PROFILE_BYTES {
             return Err(invalid_profile("chain profile is too large"));
         }
-        root.durability().create_dir_all(&root)?;
-        root.durability()
-            .write_atomically(&path, ".profile", &bytes)?;
-        tracing::info!("chain {} state: {}", profile.network_id(), root.display());
-        Ok(Self {
-            home: home.clone(),
-            root,
-            profile: profile.clone(),
-        })
+        Ok(bytes)
     }
 
     /// Read every retained chain without creating directories or rewriting profiles.

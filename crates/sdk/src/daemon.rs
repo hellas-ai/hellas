@@ -17,6 +17,7 @@ use std::{
 use tower::ServiceExt;
 
 mod iroh_listener;
+mod prepared;
 mod runtime;
 #[cfg(any(test, feature = "integration-tests"))]
 pub mod testing;
@@ -93,6 +94,9 @@ impl Core {
     pub async fn wait(&self) -> Result<()> {
         let (_, mut events) = self.jobs.watch(|_| ());
         loop {
+            if self.jobs.is_closed() {
+                return Err("daemon admission stopped".into());
+            }
             tokio::select! {
                 result = std::future::poll_fn(|cx| self.listeners.lock().unwrap_or_else(|e| e.into_inner()).poll_join_next(cx)) => {
                     match result {
@@ -186,9 +190,9 @@ impl Core {
         } else {
             revision
         };
-        let (snapshot, configuration) = core.prepare(document, entries, next).await?;
+        let candidate = core.prepare(document, entries, next).await?;
         if commit {
-            let (redacted, secrets) = snapshot.document.redacted();
+            let (redacted, secrets) = candidate.document.redacted();
             core.node()
                 .configure_startup(
                     ConfigurationDocument {
@@ -196,10 +200,11 @@ impl Core {
                         document: serde_json::to_string(&redacted)?,
                         secrets,
                     },
-                    &configuration,
+                    &candidate.configuration,
                 )
                 .await?;
         }
+        let snapshot = candidate.activate(&core).await?;
         core.publish(snapshot);
         Ok(core)
     }
@@ -340,6 +345,10 @@ impl Core {
         mut document: Document,
     ) -> Result<Revision> {
         let serial = self.configuring.clone().lock_owned().await;
+        let caller = self.node().session_caller(&session, binding).await?;
+        self.node()
+            .authorize_configure(caller, authorization)
+            .await?;
         if self.jobs.is_closed() {
             return Err("daemon is draining".into());
         }
@@ -349,7 +358,7 @@ impl Core {
         }
         document.restore_secrets(&current.document.redacted().1);
         let revision = expected.next().ok_or("configuration revision overflow")?;
-        let (candidate, configuration) = self.prepare(document, BTreeMap::new(), revision).await?;
+        let candidate = self.prepare(document, BTreeMap::new(), revision).await?;
         let (redacted, secrets) = candidate.document.redacted();
         let stored = ConfigurationDocument {
             revision: expected,
@@ -362,7 +371,7 @@ impl Core {
             let _serial = serial;
             let caller = core.node().session_caller(&session, binding).await?;
             core.node()
-                .configure(caller, authorization, stored, &configuration)
+                .configure(caller, authorization, stored, &candidate.configuration)
                 .await?;
             #[cfg(test)]
             {
@@ -373,6 +382,19 @@ impl Core {
                 }
             }
             let revision = candidate.revision;
+            let candidate = match candidate.activate(&core).await {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    // The journal is authoritative. Stop admission until restart
+                    // can restore it; never continue serving an older document.
+                    core.jobs.close();
+                    for listener in core.snapshot.load().listeners.values() {
+                        listener.stop.send_replace(true);
+                    }
+                    tracing::error!(%error, revision = revision.0, "committed configuration could not activate; restart required");
+                    return Ok(revision);
+                }
+            };
             let previous = core.publish(candidate.clone());
             if let Err(error) = previous.work.retire(&candidate.work).await {
                 tracing::warn!(%error, "retired backend retains recovery obligations");
@@ -395,15 +417,19 @@ impl Core {
     async fn prepare(
         self: &Arc<Self>,
         document: Document,
-        mut entries: BTreeMap<String, BackendEntry>,
+        entries: BTreeMap<String, BackendEntry>,
         revision: Revision,
-    ) -> Result<(
-        Arc<Snapshot>,
-        hellas_authority::model::grant::configuration::NodeConfiguration,
-    )> {
+    ) -> Result<prepared::Prepared> {
+        let mut entries: BTreeMap<_, _> = entries
+            .into_iter()
+            .map(|(id, entry)| (id, runtime::PreparedBackend::ready(entry)))
+            .collect();
         document.validate().map_err(Error::from)?;
         let old = self.snapshot.load_full();
         let mut reuse = BTreeSet::new();
+        let counters = Arc::new(crate::counter_store::PreparedCounters::new(
+            &self.runtime.options.home,
+        ));
         for (id, backend) in &document.backends {
             if entries.contains_key(id) {
                 continue;
@@ -424,19 +450,39 @@ impl Core {
             } else {
                 entries.insert(
                     id.clone(),
-                    self.runtime.open_backend(id, backend, &document).await?,
+                    self.runtime
+                        .open_backend(id, backend, &document, counters.clone())
+                        .await?,
                 );
             }
         }
-        let work = ExecutorGateway::prepare(
-            entries,
-            self.runtime.options.signer.clone(),
-            self.jobs.clone(),
-            Some(&old.work),
-            &reuse,
-        );
-        let configuration = document.configuration(&work.backends()).await?;
-        work.validate_resources(configuration.resources())
+        let mut info: Vec<_> = old
+            .work
+            .backends()
+            .into_iter()
+            .filter(|backend| reuse.contains(&backend.id))
+            .collect();
+        info.extend(entries.iter().map(|(id, backend)| backend.info(id)));
+        let work = prepared::PreparedWork::new(info);
+        let configuration = document.configuration(&work.info).await?;
+        let mut executable: Vec<_> = entries
+            .values()
+            .filter_map(|entry| match entry {
+                runtime::PreparedBackend::Ready { entry, .. } => {
+                    Some((&entry.backend, entry.evaluator.as_deref()))
+                }
+                runtime::PreparedBackend::Paid { .. } => None,
+            })
+            .collect();
+        for info in &work.info {
+            if reuse.contains(&info.id) {
+                executable.push((
+                    old.work.backend(&info.id).expect("reused backend"),
+                    info.evaluator.as_deref(),
+                ));
+            }
+        }
+        crate::gateway_work::provider::validate_resources(&executable, configuration.resources())
             .map_err(Error::from)?;
         document
             .validate_resolved(&work.backends())
@@ -498,16 +544,17 @@ impl Core {
                 .await?,
             );
         }
-        Ok((
-            Arc::new(Snapshot {
-                revision,
-                document,
-                work,
-                routers,
-                listeners,
-            }),
+        Ok(prepared::Prepared {
+            revision,
+            document,
             configuration,
-        ))
+            entries,
+            reuse,
+            work,
+            counters,
+            routers,
+            listeners,
+        })
     }
 
     fn publish(self: &Arc<Self>, next: Arc<Snapshot>) -> Arc<Snapshot> {

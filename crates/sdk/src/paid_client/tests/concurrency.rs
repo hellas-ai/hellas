@@ -365,6 +365,10 @@ async fn funded_capacity_refuses_before_signing_or_consuming_a_nonce() {
 
 #[tokio::test]
 async fn gateway_retires_an_idle_paid_channel_after_close() {
+    hellas_authority::test_support::within(retire_closed_paid_channel()).await;
+}
+
+async fn retire_closed_paid_channel() {
     use hellas_channel::work::ClientChannel as _;
     use hellas_gateway::WorkExecutionBackend as _;
     let fixture = PaidFixture::new();

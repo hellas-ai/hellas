@@ -27,30 +27,30 @@ impl Backend {
         }
     }
 }
-impl ExecutorGateway {
-    pub(crate) fn validate_resources(
-        &self,
-        resources: &[hellas_authority::model::grant::records::GrantPolicy],
-    ) -> Result<(), &'static str> {
-        use hellas_rpc::protocol::invocation::{Admission, fetch::FetchRoutePolicy};
-        for resource in resources {
-            for admission in &resource.invocation_policy.admissions {
-                let available = self.backends.values().any(|inner| match (admission, &inner.state) {
+pub(crate) fn validate_resources(
+    backends: &[(&Backend, Option<&str>)],
+    resources: &[hellas_authority::model::grant::records::GrantPolicy],
+) -> Result<(), &'static str> {
+    use hellas_rpc::protocol::invocation::{Admission, fetch::FetchRoutePolicy};
+    for resource in resources {
+        for admission in &resource.invocation_policy.admissions {
+            let available = backends.iter().any(|(inner, _evaluator_name)| match (admission, &inner.state) {
                     #[cfg(feature = "compute")]
-                    (Admission::Compute { evaluator, .. }, BackendState::Local { .. }) => inner.evaluator.as_ref() == Some(evaluator),
+                    (Admission::Compute { evaluator, .. }, BackendState::Local { .. }) => *_evaluator_name == Some(evaluator.as_str()),
                     (Admission::Fetch { admission }, BackendState::Fetch { policy, .. }) =>
                         matches!(admission.route, FetchRoutePolicy::SealedRoute { .. }) && policy.admissions.iter().any(|offered| {
                             matches!(offered, Admission::Fetch { admission: offered } if offered.route == admission.route && offered.contract == admission.contract)
                         }),
                     _ => false,
                 });
-                if !available {
-                    return Err("resource has no backend with its evaluator or Fetch contract");
-                }
+            if !available {
+                return Err("resource has no backend with its evaluator or Fetch contract");
             }
         }
-        Ok(())
     }
+    Ok(())
+}
+impl ExecutorGateway {
     fn lookup(&self, allowed: &[String], key: &BackendKey) -> Result<Arc<Backend>, BackendFault> {
         self.backends.iter().find_map(|(id, inner)| {
             if !allowed.contains(id) { return None; }
