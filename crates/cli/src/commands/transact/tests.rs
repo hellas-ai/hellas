@@ -92,7 +92,9 @@ async fn paid_deadline_options_reach_the_signed_job_configuration() {
             &location,
         )
         .unwrap();
-        let content = client::content(&context, config.network()).await.unwrap();
+        let content = hellas_sdk::chain_home::open_client_content(&context.chain)
+            .await
+            .unwrap();
         let options = args
             .options_with_config(
                 &context,

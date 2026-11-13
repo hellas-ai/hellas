@@ -171,31 +171,34 @@ async fn within<T>(
     }
 }
 
+impl PaidJournalKind {
+    pub fn journal_root(
+        self,
+        chain: &hellas_chain::chain_dir::ChainDir,
+        provider: hellas_client::ProviderAddress,
+    ) -> StoreLocation {
+        match self {
+            Self::Client => chain.client_journals(&provider.to_string()),
+            Self::Gateway => chain.gateway(&provider.node.to_string()),
+        }
+    }
+}
+
 impl PaidWorkOptions {
     pub fn journal_root(&self) -> StoreLocation {
-        match self.journal_kind {
-            PaidJournalKind::Client => self
-                .config
-                .chain
-                .client_journals(&self.provider.to_string()),
-            PaidJournalKind::Gateway => self.config.chain.gateway(&self.provider.node.to_string()),
-        }
+        self.journal_kind
+            .journal_root(&self.config.chain, self.provider)
     }
 
     /// Reject impossible deadlines and collateral before connecting or signing.
     pub fn validate(&self) -> Result<()> {
-        if !(self.acceptance_blocks > 0 && self.terminal_blocks > 0 && self.payment_blocks > 0) {
-            return Err(PaidClientError::InvalidOptions(
-                "deadline spans must be positive",
-            ));
-        }
-        if self.timeout.is_some_and(|timeout| timeout.is_zero()) {
-            return Err(PaidClientError::InvalidOptions("timeout must be positive"));
-        }
-
-        if self.expected_price == 0 {
-            return Err(PaidClientError::InvalidOptions("price must be positive"));
-        }
+        validate_terms(
+            self.expected_price,
+            self.acceptance_blocks,
+            self.terminal_blocks,
+            self.payment_blocks,
+            self.timeout,
+        )?;
         self.trust()?;
         Ok(())
     }
@@ -206,6 +209,29 @@ impl PaidWorkOptions {
             .provider
             .trust(self.assurance, self.apple_trust.as_ref())?)
     }
+}
+
+/// The store-free limit checks used by [`PaidWorkOptions::validate`].
+/// Provider identity and assurance are checked by [`hellas_client::ProviderAddress::trust`].
+pub fn validate_terms(
+    expected_price: u64,
+    acceptance_blocks: u64,
+    terminal_blocks: u64,
+    payment_blocks: u64,
+    timeout: Option<Duration>,
+) -> Result<()> {
+    if !(acceptance_blocks > 0 && terminal_blocks > 0 && payment_blocks > 0) {
+        return Err(PaidClientError::InvalidOptions(
+            "deadline spans must be positive",
+        ));
+    }
+    if timeout.is_some_and(|timeout| timeout.is_zero()) {
+        return Err(PaidClientError::InvalidOptions("timeout must be positive"));
+    }
+    if expected_price == 0 {
+        return Err(PaidClientError::InvalidOptions("price must be positive"));
+    }
+    Ok(())
 }
 
 async fn propose_client_payment(

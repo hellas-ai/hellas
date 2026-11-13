@@ -1,5 +1,5 @@
 use crate::{Chain, Genesis, TrustDocument};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
 
@@ -37,7 +37,7 @@ pub enum ChainProfileError {
 }
 
 /// Complete authenticated chain input, including the genesis document.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CustomChainFile {
     pub trust: TrustDocument,
@@ -81,6 +81,16 @@ fn validate_routes(routes: Vec<String>) -> Result<Vec<String>, ChainProfileError
 }
 
 impl ChainProfile {
+    /// The complete authenticated input, preserving the exact genesis bytes.
+    #[must_use]
+    pub fn to_file(&self) -> CustomChainFile {
+        CustomChainFile {
+            trust: self.trust.clone(),
+            validators: self.validators.clone(),
+            genesis_json: self.genesis_json.clone(),
+        }
+    }
+
     #[must_use]
     pub const fn known_chain(&self) -> Option<Chain> {
         self.known

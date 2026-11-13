@@ -124,6 +124,13 @@ pub async fn run(mut options: ServeOptions) -> CliResult<()> {
         .open(&options.home, ram, options.paid.is_none())
         .await?;
 
+    hellas_sdk::chain_home::recover_provider_chains(
+        &options.home,
+        &options.settlement_key,
+        &content,
+    )
+    .await?;
+
     // What the operator configured, said back once. A node with a
     // paid-work configuration serves its journals, answers every
     // contest, and countersigns new paid channels over the policy that

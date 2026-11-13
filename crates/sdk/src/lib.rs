@@ -39,6 +39,7 @@ pub mod local {
     pub use hellas_wire::local::{LOCAL_MUX_SLOTS, LocalControlServer, connect, transport};
 }
 
+pub mod chain_home;
 pub mod paid_provider;
 pub mod work_config;
 pub mod work_router;

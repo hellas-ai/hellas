@@ -1,5 +1,5 @@
 //! Native storage paths for one validated chain profile.
-use crate::genesis::{ChainProfile, ChainProfileError};
+use crate::genesis::{ChainProfile, ChainProfileError, CustomChainFile};
 use hellas_private::StoreLocation;
 use std::{io, path::Path};
 
@@ -15,13 +15,63 @@ impl ChainDir {
     /// Chain stores inherit `home`'s durability.
     pub fn open(home: &StoreLocation, profile: &ChainProfile) -> io::Result<Self> {
         let root = home.child("chains").child(profile.state_key());
-        hellas_private::create_dir_all_durable(&root)?;
+        let path = root.join("profile.json");
+        let bytes = serde_json::to_vec(&profile.to_file()).map_err(invalid_profile)?;
+        if bytes.len() > MAX_PROFILE_BYTES {
+            return Err(invalid_profile("chain profile is too large"));
+        }
+        root.durability().create_dir_all(&root)?;
+        root.durability()
+            .write_atomically(&path, ".profile", &bytes)?;
         tracing::info!("chain {} state: {}", profile.network_id(), root.display());
         Ok(Self {
             home: home.clone(),
             root,
             profile: profile.clone(),
         })
+    }
+
+    /// Read every retained chain without creating directories or rewriting profiles.
+    /// Missing or malformed profiles refuse recovery.
+    pub fn discover(home: &StoreLocation) -> io::Result<Vec<Self>> {
+        directories(&home.child("chains"))?
+            .into_iter()
+            .map(|root| {
+                let bytes = hellas_private::read_bounded_regular_file(
+                    &root.join("profile.json"),
+                    MAX_PROFILE_BYTES,
+                )
+                .map_err(|error| {
+                    if error.kind() == io::ErrorKind::NotFound {
+                        invalid_profile(format!(
+                            "chain directory {} predates chain profiles and must be removed",
+                            root.display()
+                        ))
+                    } else {
+                        error
+                    }
+                })?;
+                let file: CustomChainFile =
+                    serde_json::from_slice(&bytes).map_err(invalid_profile)?;
+                let profile = ChainProfile::custom(file).map_err(invalid_profile)?;
+                if root.file_name() != Some(std::ffi::OsStr::new(&profile.state_key())) {
+                    return Err(invalid_profile(format!(
+                        "chain profile does not match directory {}",
+                        root.display()
+                    )));
+                }
+                Ok(Self {
+                    home: home.clone(),
+                    root,
+                    profile,
+                })
+            })
+            .collect()
+    }
+
+    /// All provider roots sharing this chain's client content store.
+    pub fn client_journal_roots(&self) -> io::Result<Vec<StoreLocation>> {
+        directories(&self.client().child("channels"))
     }
 
     pub fn as_path(&self) -> &Path {
@@ -75,12 +125,81 @@ impl std::ops::Deref for ChainDir {
     }
 }
 
+const MAX_PROFILE_BYTES: usize = 4 << 20;
+
+fn invalid_profile(error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error)
+}
+
+fn directories(root: &StoreLocation) -> io::Result<Vec<StoreLocation>> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(error) => return Err(error),
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            return Err(invalid_profile(format!(
+                "expected directory: {}",
+                entry.path().display()
+            )));
+        }
+        paths.push(root.child(entry.file_name()));
+    }
+    paths.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+    Ok(paths)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::genesis::{Chain, CustomChainFile, Genesis};
     use hellas_private::Durability::Crash;
     use sha2::{Digest as _, Sha256};
+
+    #[test]
+    fn discovery_preserves_the_profile_and_refuses_missing_or_malformed_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = StoreLocation::from_home(&directory.path().join("home"), Crash);
+        assert!(ChainDir::discover(&home).unwrap().is_empty());
+        assert!(!home.exists(), "discovery must not create a home");
+        let profile = ChainProfile::known(Chain::Devnet)
+            .with_validators(vec!["wss://example.com/chain".into()])
+            .unwrap();
+        let chain = ChainDir::open(&home, &profile).unwrap();
+        let file = chain.as_path().join("profile.json");
+        let found = ChainDir::discover(&home).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            serde_json::to_vec(&found[0].to_file()).unwrap(),
+            serde_json::to_vec(&profile.to_file()).unwrap()
+        );
+        assert!(chain.client_journal_roots().unwrap().is_empty());
+        assert!(!chain.client().exists());
+        std::fs::remove_file(&file).unwrap();
+        let error = ChainDir::discover(&home).unwrap_err().to_string();
+        assert!(error.contains(&chain.as_path().display().to_string()));
+        assert!(error.contains("predates chain profiles and must be removed"));
+        std::fs::write(&file, b"invalid").unwrap();
+        assert!(ChainDir::discover(&home).is_err());
+        let mut swapped = profile.to_file();
+        let mut genesis = profile.genesis().clone();
+        genesis.network_id = "swapped-chain".into();
+        swapped.genesis_json = serde_json::to_string(&genesis).unwrap();
+        swapped.trust.network_id = genesis.network_id;
+        swapped.trust.genesis_sha256 = hex::encode(Sha256::digest(&swapped.genesis_json));
+        let swapped = ChainProfile::custom(swapped).unwrap();
+        assert_ne!(swapped.state_key(), profile.state_key());
+        std::fs::write(&file, serde_json::to_vec(&swapped.to_file()).unwrap()).unwrap();
+        assert!(
+            ChainDir::discover(&home)
+                .unwrap_err()
+                .to_string()
+                .contains("does not match directory")
+        );
+    }
 
     #[test]
     fn store_locations_keep_the_selected_durability() {

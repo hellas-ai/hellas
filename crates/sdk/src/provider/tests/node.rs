@@ -1348,7 +1348,7 @@ fn provider_journals(home: &Path) -> std::path::PathBuf {
     (crate::test_support::chain_dir(home, network()).provider_journals()).into_path_buf()
 }
 
-async fn write_setup_journal(root: &Path) {
+pub(crate) async fn write_setup_journal(root: &Path) {
     OfferFixture::first()
         .write_completed_setup_for(root, default_route_peer())
         .await;
@@ -1377,7 +1377,7 @@ async fn open_channel(root: &Path) -> ChannelStore {
 
 // ── One job, paid for, and then contested ─────────────────────────
 
-fn bundle() -> PreparedInvocation {
+pub(crate) fn bundle() -> PreparedInvocation {
     hellas_channel::test_support::channel::bundle(0x9e)
 }
 
@@ -1542,7 +1542,7 @@ async fn propose_and_accept(store: &mut ChannelStore) -> Digest {
 
 /// The provider journal a process can find after crashing between its
 /// durable acceptance and the detached backend task's first poll.
-async fn write_accepted_channel(root: &Path) -> Digest {
+pub(crate) async fn write_accepted_channel(root: &Path) -> Digest {
     let mut store = open_channel(root).await;
     let work = propose_and_accept(&mut store).await;
     store.content_store().close().await;
@@ -4873,6 +4873,61 @@ async fn offline_startup_restores_retained_pins_and_output_before_the_global_bar
     node.close().await;
 }
 
+async fn write_half_signed_client_job(
+    offer: OfferFixture,
+    path: &StoreLocation,
+    node: &hellas_store::content::DiskStore,
+) {
+    let verifier = Secp256k1Verifier::new();
+    offer.write_completed_client_setup(path).await;
+    let setup =
+        SetupStore::open_existing(path, network(), offer.bond_edge(), Role::Client, &verifier)
+            .await
+            .unwrap();
+    let origin = setup.state().origin().unwrap();
+    drop(setup);
+    let mut journal = ChannelStore::open(
+        path,
+        offer.descriptor().channel().clone(),
+        offer
+            .descriptor()
+            .funded_settlement(&offer.live_payment_value(PAYMENT_VALUE + 1))
+            .unwrap(),
+        Role::Client,
+        origin,
+        node.clone(),
+        &verifier,
+    )
+    .await
+    .unwrap();
+    let authorization = offer.authorization();
+    assert_eq!(authorization.retention, hellas_rpc::Retention::Retain);
+    let input = offer.prepared_bundle().canonical_bytes().unwrap();
+    hellas_channel::test_support::channel::seed_content(
+        &mut journal,
+        authorization,
+        input.clone().into(),
+    )
+    .await;
+    let work = work_id(journal.state().channel(), &authorization);
+    journal
+        .commit(
+            ChannelRecord::JobProposed {
+                authorization,
+                client_signature: offer.client().sign(signing_hash(work)),
+                prepared_input: input.into(),
+                retained_tree: None,
+            },
+            &verifier,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        journal.state().job_by_id(work).unwrap().phase(),
+        hellas_channel::work_store::JobPhase::HalfSigned
+    );
+}
+
 #[tokio::test]
 async fn offline_client_roots_restore_all_half_signed_obligations_before_collection() {
     use hellas_store::content::{
@@ -4897,53 +4952,7 @@ async fn offline_client_roots_restore_all_half_signed_obligations_before_collect
     node.finish_recovery().await.unwrap();
     let verifier = Secp256k1Verifier::new();
     for (offer, path) in offers.into_iter().zip(&paths) {
-        offer.write_completed_client_setup(path).await;
-        let setup =
-            SetupStore::open_existing(path, network(), offer.bond_edge(), Role::Client, &verifier)
-                .await
-                .unwrap();
-        let origin = setup.state().origin().unwrap();
-        drop(setup);
-        let mut journal = ChannelStore::open(
-            path,
-            offer.descriptor().channel().clone(),
-            offer
-                .descriptor()
-                .funded_settlement(&offer.live_payment_value(PAYMENT_VALUE + 1))
-                .unwrap(),
-            Role::Client,
-            origin,
-            node.clone(),
-            &verifier,
-        )
-        .await
-        .unwrap();
-        let authorization = offer.authorization();
-        assert_eq!(authorization.retention, hellas_rpc::Retention::Retain);
-        let input = offer.prepared_bundle().canonical_bytes().unwrap();
-        hellas_channel::test_support::channel::seed_content(
-            &mut journal,
-            authorization,
-            input.clone().into(),
-        )
-        .await;
-        let work = work_id(journal.state().channel(), &authorization);
-        journal
-            .commit(
-                ChannelRecord::JobProposed {
-                    authorization,
-                    client_signature: offer.client().sign(signing_hash(work)),
-                    prepared_input: input.into(),
-                    retained_tree: None,
-                },
-                &verifier,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            journal.state().job_by_id(work).unwrap().phase(),
-            hellas_channel::work_store::JobPhase::HalfSigned
-        );
+        write_half_signed_client_job(offer, path, &node).await;
     }
     let before = node.stats().unwrap().outstanding;
     assert!(before > 0);
@@ -5197,4 +5206,46 @@ async fn provider_stop_waits_for_unaccepted_content_and_reopens_with_old_handler
         .await
         .unwrap();
     content.close().await;
+}
+
+#[test]
+fn client_open_recovers_a_journal_created_before_store_lock_acquisition() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap()
+        .block_on(async {
+            let root = temp();
+            let chain = crate::test_support::chain_dir(root.path(), network());
+            let content = crate::chain_home::open_client_content(&chain)
+                .await
+                .unwrap();
+            let pending = StoreLocation::for_test(&root.path().join("pending-journal"));
+            write_half_signed_client_job(OfferFixture::first(), &pending, &content).await;
+            let outstanding = content.stats().unwrap().outstanding;
+            assert!(outstanding > 0);
+            content.close().await;
+
+            // Hold the only blocking worker: DiskStore::open has started, but
+            // cannot acquire its OS lock until this worker is released.
+            let (entered, ready) = tokio::sync::oneshot::channel();
+            let (release, held) = std::sync::mpsc::channel();
+            let worker = tokio::task::spawn_blocking(move || {
+                entered.send(()).unwrap();
+                held.recv().unwrap();
+            });
+            ready.await.unwrap();
+            let opening = crate::chain_home::open_client_content(&chain);
+            tokio::pin!(opening);
+            assert!(futures::poll!(&mut opening).is_pending());
+            let destination = chain.client_journals("late-provider");
+            std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            std::fs::rename(&pending, &destination).unwrap();
+            release.send(()).unwrap();
+            worker.await.unwrap();
+            let content = opening.await.unwrap();
+            assert_eq!(content.stats().unwrap().outstanding, outstanding);
+            content.close().await;
+        });
 }
