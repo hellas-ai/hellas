@@ -581,10 +581,7 @@ async fn an_unbound_daemon_can_install_its_iroh_listener_after_owner_binding() {
             rpc.configure(request(&stopped, 1)).await.unwrap().revision,
             2
         );
-        assert!(
-            bound.is_closed(),
-            "Configure joins the removed listener before returning"
-        );
+        bound.closed().await;
         assert_eq!(
             rpc.configure(request(&document, core.watch().0.revision.0))
                 .await
@@ -667,4 +664,91 @@ async fn rejected_profile(authorized: bool) {
     core.shutdown().await.unwrap();
     f.node.close().await;
     f.content.close().await;
+}
+
+#[tokio::test]
+async fn retired_listener_drain_does_not_block_configure_or_close_admission() {
+    hellas_authority::test_support::within(async {
+        let f = fixture().await;
+        let core = Core::open(options(&f), Document::default()).await.unwrap();
+        let (_client, _server, _connection, rpc, _served) = connect(&f, core.clone()).await;
+        let mut document = Document::default();
+        document.listeners.insert(
+            "api".into(),
+            Listener::Http {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                zdr: true,
+            },
+        );
+        assert_eq!(
+            rpc.configure(request(&document, 0)).await.unwrap().revision,
+            1
+        );
+        let address = core.http_addresses()["api"];
+        let mut stalled = tokio::net::TcpStream::connect(address).await.unwrap();
+        stalled
+            .write_all(b"POST /v1/responses HTTP/1.1\r\nHost: x\r\n")
+            .await
+            .unwrap();
+        // A completed request confirms the accept loop has serviced the socket queue.
+        let response = reqwest::get(format!("http://{address}/anything"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+        response.bytes().await.unwrap();
+        document.listeners.clear();
+        assert_eq!(
+            rpc.configure(request(&document, 1)).await.unwrap().revision,
+            2
+        );
+        assert_eq!(
+            rpc.configure(request(&document, 2)).await.unwrap().revision,
+            3
+        );
+        let stopping = core.shutdown();
+        tokio::pin!(stopping);
+        assert!(futures::poll!(&mut stopping).is_pending());
+        assert!(
+            core.jobs.is_closed(),
+            "shutdown closes admission before draining connections"
+        );
+        drop(stalled);
+        stopping.await.unwrap();
+        f.node.close().await;
+        f.content.close().await;
+    })
+    .await;
+}
+
+#[cfg(feature = "compute")]
+#[tokio::test]
+async fn unrelated_configure_keeps_the_local_backend_instance() {
+    hellas_authority::test_support::within(async {
+        let f = fixture().await;
+        let document: Document = serde_json::from_value(serde_json::json!({
+            "listeners": {}, "routes": [],
+            "backends": {"local": {"kind": "local", "runtime": "hip", "max_in_flight": 2}}
+        }))
+        .unwrap();
+        let core = Core::open(options(&f), document.clone()).await.unwrap();
+        let original = core.watch().0.backends[0].instance;
+        let (_client, _server, _connection, rpc, _served) = connect(&f, core.clone()).await;
+        let mut changed = document;
+        changed.listeners.insert(
+            "api".into(),
+            Listener::Http {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                zdr: true,
+            },
+        );
+        assert_eq!(
+            rpc.configure(request(&changed, 0)).await.unwrap().revision,
+            1
+        );
+        assert_eq!(core.watch().0.backends[0].instance, original);
+        core.shutdown().await.unwrap();
+        f.node.close().await;
+        f.content.close().await;
+    })
+    .await;
 }

@@ -311,3 +311,35 @@ async fn model_and_operator_inputs_keep_their_terms_in_one_configuration() {
         123_000
     );
 }
+
+#[test]
+fn changed_upstream_does_not_inherit_a_stored_key() {
+    let mut original = Document::default();
+    original
+        .add_upstream(
+            "api",
+            "https://api.good.example/v1",
+            Some("stored-key".into()),
+        )
+        .unwrap();
+    let mut edited = original.redacted().0;
+    edited.remove_backend("api").unwrap();
+    edited
+        .add_upstream("api", "https://collector.evil.example/v1", None)
+        .unwrap();
+    edited.retain_secrets(&original);
+    let BackendKind::Fetch {
+        upstream:
+            Upstream::Http {
+                allowed_hosts,
+                credentials,
+                ..
+            },
+        ..
+    } = &edited.backends["api"].kind
+    else {
+        unreachable!()
+    };
+    assert_eq!(allowed_hosts, &["collector.evil.example".to_string()]);
+    assert_eq!(credentials["api"].secret, None);
+}

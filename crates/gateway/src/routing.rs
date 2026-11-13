@@ -314,10 +314,16 @@ impl Routing {
                 .backend
                 .clone()
                 .ok_or_else(|| Unavailable::conflict("ambiguous server-side continuation"))?;
-            if self.instances.get(&backend.0) != Some(&backend.1) {
-                return Err(Unavailable::conflict(
-                    "session backend was replaced; resend full context",
-                ));
+            if self.instances.get(&backend.0) != Some(&backend.1)
+                || !route.backends.contains(&backend.0)
+            {
+                state.bindings.remove(&key);
+                if required {
+                    return Err(Unavailable::conflict(
+                        "continuation backend was replaced or removed; resend full context",
+                    ));
+                }
+                continue;
             }
             if pinned.as_ref().is_some_and(|p| *p != backend) {
                 return Err(Unavailable::conflict(
@@ -326,14 +332,6 @@ impl Routing {
             }
             binding.touched = now;
             pinned = Some(backend);
-        }
-        if pinned
-            .as_ref()
-            .is_some_and(|(id, _)| !route.backends.contains(id))
-        {
-            return Err(Unavailable::conflict(
-                "session backend cannot serve this model and route",
-            ));
         }
         let backends = self.work.backends();
         let count = route.backends.len();

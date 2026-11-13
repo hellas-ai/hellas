@@ -470,11 +470,8 @@ fn snapshot_replacement_retains_pending_sessions_and_continuations() {
     assert_eq!(order_of(continuation(&next).unwrap().1), ["a"]);
     let removed = Routing::new(vec![row(&["b"], None)], work, memory).unwrap();
     assert_eq!(
-        choose(&removed, None, Some("session"))
-            .err()
-            .unwrap()
-            .status,
-        StatusCode::CONFLICT
+        order_of(choose(&removed, None, Some("session")).unwrap()),
+        ["b"]
     );
     assert_eq!(
         continuation(&removed).err().unwrap().status,
@@ -483,7 +480,7 @@ fn snapshot_replacement_retains_pending_sessions_and_continuations() {
 }
 
 #[test]
-fn replacing_a_backend_name_rejects_old_sessions_and_continuations() {
+fn replacing_a_backend_reselects_sessions_and_discards_stale_continuations() {
     let memory = Arc::new(RoutingState::default());
     let work = Fake::new();
     let routes = vec![row(&["a", "b"], None)];
@@ -502,10 +499,8 @@ fn replacing_a_backend_name_rejects_old_sessions_and_continuations() {
     );
     let replaced = Routing::new(routes, Fake::new(), memory).unwrap();
     assert_eq!(
-        choose(&replaced, None, Some("account-session"))
-            .err()
-            .map(|e| e.status),
-        Some(StatusCode::CONFLICT)
+        order_of(choose(&replaced, None, Some("account-session")).unwrap()).len(),
+        2
     );
     assert_eq!(
         replaced
@@ -523,6 +518,17 @@ fn replacing_a_backend_name_rejects_old_sessions_and_continuations() {
             .map(|e| e.status),
         Some(StatusCode::CONFLICT)
     );
+    let key = replaced.key("response", &[family("/v1/responses"), "old-response"]);
+    assert!(
+        !replaced
+            .memory
+            .state
+            .lock()
+            .unwrap()
+            .bindings
+            .contains_key(&key)
+    );
+    assert!(choose(&replaced, None, Some("account-session")).is_ok());
 }
 
 #[test]
@@ -564,5 +570,52 @@ fn session_pin_outlives_http_selection_once_the_proposal_leaves() {
     assert_eq!(
         order_of(choose(&routing, None, Some("unproposed")).unwrap()).len(),
         2
+    );
+}
+
+#[test]
+fn stale_session_and_connection_pins_reselect_after_backend_replacement() {
+    let memory = Arc::new(RoutingState::default());
+    let routes = vec![row(&["a", "b"], None)];
+    let old = Routing::new(routes.clone(), Fake::new(), memory.clone()).unwrap();
+    let mut selection = choose(&old, None, Some("claude-session")).unwrap();
+    selection.next();
+    selection.accept("a");
+    drop(selection);
+    // keep-alive connection pin (no session header, several backends)
+    let connection = crate::ConnectionId {
+        id: 7,
+        alive: Arc::new(()),
+    };
+    let by_connection = |routing: &Arc<Routing>| {
+        routing.select(
+            "/v1/responses",
+            "POST",
+            Hints::default(),
+            Some(&connection),
+            crate::test_support::job(),
+        )
+    };
+    let (_, mut selection) = by_connection(&old).unwrap();
+    let first = selection.next().unwrap();
+    selection.accept(&first);
+    drop(selection);
+
+    // Any Configure that re-opens the backends gives them new instances.
+    let replaced = Routing::new(routes, Fake::new(), memory).unwrap();
+    let mut statuses = vec![];
+    for _ in 0..3 {
+        // full context, no previous_response_id: only the soft session hint
+        statuses.push(
+            choose(&replaced, None, Some("claude-session"))
+                .err()
+                .map(|e| e.status),
+        );
+        statuses.push(by_connection(&replaced).err().map(|e| e.status));
+    }
+    eprintln!("statuses after replacement: {statuses:?}");
+    assert!(
+        statuses.iter().all(Option::is_none),
+        "stale soft pins must select again: {statuses:?}"
     );
 }

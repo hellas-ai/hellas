@@ -356,7 +356,7 @@ impl Core {
         if current.revision != expected {
             return Err("configuration revision changed".into());
         }
-        document.restore_secrets(&current.document.redacted().1);
+        document.retain_secrets(&current.document);
         let revision = expected.next().ok_or("configuration revision overflow")?;
         let candidate = self.prepare(document, BTreeMap::new(), revision).await?;
         let (redacted, secrets) = candidate.document.redacted();
@@ -399,16 +399,6 @@ impl Core {
             if let Err(error) = previous.work.retire(&candidate.work).await {
                 tracing::warn!(%error, "retired backend retains recovery obligations");
             }
-            for (id, listener) in &previous.listeners {
-                if candidate
-                    .listeners
-                    .get(id)
-                    .is_some_and(|next| Arc::ptr_eq(listener, next))
-                {
-                    continue;
-                }
-                listener.stop.closed().await;
-            }
             Ok::<_, Error>(revision)
         })
         .await?
@@ -435,17 +425,13 @@ impl Core {
                 continue;
             }
             let unchanged = old.document.backends.get(id) == Some(backend);
-            let local = matches!(
-                backend.kind,
-                crate::daemon_config::BackendKind::Local { .. }
-            );
             let approved = match old.work.backend(id) {
                 Some(active) if unchanged => {
                     self.runtime.approval_current(&backend.kind, active)?
                 }
                 _ => false,
             };
-            if unchanged && approved && !local {
+            if unchanged && approved {
                 reuse.insert(id.clone());
             } else {
                 entries.insert(
@@ -650,8 +636,8 @@ impl Core {
     }
 
     pub async fn shutdown(&self) -> Result<()> {
-        let _serial = self.configuring.lock().await;
         self.jobs.close();
+        let _serial = self.configuring.lock().await;
         let snapshot = self.snapshot.load_full();
         for listener in snapshot.listeners.values() {
             listener.stop.send_replace(true);

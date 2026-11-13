@@ -159,7 +159,17 @@ impl Document {
         (document, secrets)
     }
 
-    /// An omitted key retains the previously supplied value for the same entry.
+    /// Omitted credentials survive only when the complete redacted entry is unchanged.
+    pub fn retain_secrets(&mut self, previous: &Self) {
+        let (old, mut secrets) = previous.redacted();
+        let next = self.redacted().0;
+        secrets
+            .0
+            .retain(|id, _| next.backends.get(id) == old.backends.get(id));
+        self.restore_secrets(&secrets);
+    }
+
+    /// Reconstitute the persisted document from its accompanying secret record.
     pub fn restore_secrets(
         &mut self,
         stored: &hellas_authority::model::grant::configuration::ConfigurationSecrets,

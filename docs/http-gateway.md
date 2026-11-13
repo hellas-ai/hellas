@@ -105,12 +105,16 @@ for the same model/API on the same accepted HTTP connection stay together.
 Connection-only bindings are reclaimed once that connection closes. Different
 explicit sessions may share that connection. Affinity is scoped by
 model and API family; Responses compaction and Messages token counting share
-their generation API's family.
+their generation API's family. Unchanged backends keep their instance across
+configuration edits. Replacing or removing a pinned backend drops session and
+connection affinity so a full-context request can select again.
 
 Responses API IDs observed in JSON or SSE bind `previous_response_id` and
 `conversation` continuations to the original backend, including continuations
 that omit the model. Unknown, expired or
-conflicting state returns 409 before contacting an upstream. Session identifiers
+conflicting state returns 409 before contacting an upstream. A continuation tied
+to a replaced backend returns 409 and its binding is discarded; resend full
+context without that continuation to establish fresh affinity. Session identifiers
 are held as salted hashes in a bounded memory table (16,384 entries, 24 hours
 idle). Unexpired entries are not evicted to admit new sessions; a full table
 returns 503. Restarting the gateway clears affinity. Server-side continuations
