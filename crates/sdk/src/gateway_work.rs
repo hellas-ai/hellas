@@ -460,12 +460,42 @@ pub enum BackendState {
 pub struct PaidBackend {
     /// Absent until quoted; saved jobs already carry their policy.
     pub(crate) policy: Option<InvocationPolicy>,
+    quote: Arc<tokio::sync::OnceCell<crate::paid_client::PaidQuote>>,
     pub options: crate::paid_client::PaidWorkOptions,
     pub endpoint: iroh::Endpoint,
     pub settlement_key: hellas_kernel::Secp256k1Signer,
     pub owner: Arc<crate::client_owner::ClientOwner>,
     pub(crate) session: Arc<tokio::sync::Mutex<Option<crate::paid_client::PaidWorkSession>>>,
     active: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl PaidBackend {
+    async fn quote(
+        &self,
+    ) -> Result<&crate::paid_client::PaidQuote, crate::paid_client::PaidClientError> {
+        self.quote
+            .get_or_try_init(|| {
+                crate::paid_client::request_paid_quote(
+                    &self.options,
+                    &self.endpoint,
+                    &self.settlement_key,
+                    self.owner.principal(),
+                )
+            })
+            .await
+    }
+
+    async fn terms(&self) -> Result<(InvocationPolicy, u64), crate::paid_client::PaidClientError> {
+        match &self.policy {
+            Some(policy) => Ok((policy.clone(), self.options.expected_price)),
+            None => {
+                let quote = self.quote().await?;
+                Ok((
+                    quote.policy.invocation_policy.clone(),
+                    quote.policy.payment_policy.fixed_price,
+                ))
+            }
+        }
+    }
 }
 #[derive(Clone)]
 pub struct GrantBackend {
@@ -542,6 +572,7 @@ impl Backend {
     ) -> Self {
         Self::new(BackendState::Paid(Box::new(PaidBackend {
             policy,
+            quote: Default::default(),
             options,
             endpoint,
             settlement_key,
@@ -599,13 +630,7 @@ impl Backend {
         let BackendState::Paid(paid) = &mut self.state else {
             return Ok(0);
         };
-        let quote = crate::paid_client::request_paid_quote(
-            &paid.options,
-            &paid.endpoint,
-            &paid.settlement_key,
-            paid.owner.principal(),
-        )
-        .await?;
+        let quote = paid.quote().await?.clone();
         paid.options.expected_price = quote.policy.payment_policy.fixed_price;
         paid.policy = Some(quote.policy.invocation_policy);
         Ok(paid.options.expected_price)
@@ -1149,22 +1174,7 @@ impl Backend {
                 stop,
                 None,
                 Box::pin(async {
-                    let (policy, price) = match &target.policy {
-                        Some(policy) => (policy.clone(), options.expected_price),
-                        None => {
-                            let quote = crate::paid_client::request_paid_quote(
-                                options,
-                                endpoint,
-                                settlement_key,
-                                owner.principal(),
-                            )
-                            .await?;
-                            (
-                                quote.policy.invocation_policy,
-                                quote.policy.payment_policy.fixed_price,
-                            )
-                        }
-                    };
+                    let (policy, price) = target.terms().await?;
                     let input = request.admitted(&policy, None, options.assurance, true)?;
                     let job = Job::from_input(price, input)?;
                     let mut options = options.clone();
@@ -1175,7 +1185,7 @@ impl Backend {
                         settlement_key.clone(),
                         owner.clone(),
                         Default::default(),
-                        PaidOpen::Job(&job),
+                        PaidOpen::Job(&job, target.quote.get()),
                         None,
                     )
                     .await?;
@@ -1357,19 +1367,18 @@ impl WorkExecutionBackend for ExecutorGateway {
                         session.descriptor().invocation_policy().limits.step_bound(),
                     ));
                 }
-                if paid.policy.is_none() {
-                    let mut quoted = backend.as_ref().clone();
-                    if let Err(error) = quoted.quote().await {
+                return match paid.terms().await {
+                    Ok((policy, _)) => Ok(Some(policy.limits.step_bound())),
+                    Err(error) => {
                         let error = ExecutionError::Paid(error);
                         if backend_failed(&error) {
                             backend.health(Some(error.to_string()));
                         }
-                        return Err(WorkGatewayError::PreProposal(Box::new(gateway_error(
+                        Err(WorkGatewayError::PreProposal(Box::new(gateway_error(
                             error,
-                        ))));
+                        ))))
                     }
-                    return Ok(quoted.policy().map(|policy| policy.limits.step_bound()));
-                }
+                };
             }
             Ok(backend.policy().map(|policy| policy.limits.step_bound()))
         })

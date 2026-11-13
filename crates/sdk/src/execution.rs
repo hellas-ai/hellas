@@ -497,7 +497,7 @@ pub(crate) async fn before_proposal<T>(
 /// What a paid session is opened for. Only a job may fund a new channel.
 pub enum PaidOpen<'a> {
     Retained,
-    Job(&'a Job),
+    Job(&'a Job, Option<&'a crate::paid_client::PaidQuote>),
     /// A tracked job: its target binds at the funding boundary, after quote
     /// and preflight. A bound attempt reopens its retained channel only.
     Attempt(&'a Job, &'a mut ExecutionAttempt),
@@ -516,9 +516,9 @@ pub async fn open_paid_session(
     connection_timeout: Option<std::time::Duration>,
 ) -> Result<PaidWorkSession> {
     let PaidOpen::Attempt(job, attempt) = open else {
-        let (job, allow_funding) = match open {
-            PaidOpen::Job(job) => (Some(job), true),
-            _ => (None, false),
+        let (job, quote, allow_funding) = match open {
+            PaidOpen::Job(job, quote) => (Some(job), quote.cloned(), true),
+            _ => (None, None, false),
         };
         return Ok(Box::pin(PaidWorkSession::open_inner(
             options,
@@ -528,6 +528,7 @@ pub async fn open_paid_session(
             crate::paid_client::OpenIntent {
                 job: job.map(|job| Box::new(job.clone())),
                 allow_funding,
+                quote,
                 before_open: None,
             },
             connection_timeout,
@@ -564,6 +565,7 @@ pub async fn open_paid_session(
         crate::paid_client::OpenIntent {
             job: fresh.then(|| Box::new(job.clone())),
             allow_funding: fresh,
+            quote: None,
             before_open: Some(Box::new(|| {
                 purchase.bind_target(target)?;
                 *newly_bound = false;
