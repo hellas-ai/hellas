@@ -41,12 +41,14 @@ impl Prepared {
             .document
             .listeners
             .values()
-            .filter_map(|listener| match listener {
+            .find_map(|listener| match listener {
                 Listener::Iroh { backends, .. } => Some(backends),
                 _ => None,
             })
-            .flatten()
-            .collect();
+            .map_or_else(
+                || self.document.backends.keys().collect(),
+                |backends| backends.iter().collect(),
+            );
         let mut executable: Vec<_> = self
             .entries
             .iter()
