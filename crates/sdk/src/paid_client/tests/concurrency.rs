@@ -371,6 +371,78 @@ async fn gateway_retires_an_idle_paid_channel_after_close() {
 async fn retire_closed_paid_channel() {
     use hellas_channel::work::ClientChannel as _;
     use hellas_gateway::WorkExecutionBackend as _;
+    let (_fixture, backend, endpoint, validator) = cached_paid_backend().await;
+    let crate::BackendState::Paid(paid) = &backend.state else {
+        unreachable!()
+    };
+    let cached = paid.session.clone();
+    let gateway = crate::ExecutorGateway::new(
+        [(
+            "paid".into(),
+            crate::BackendEntry {
+                backend,
+                evaluator: None,
+                max_in_flight: std::num::NonZeroUsize::new(1).unwrap(),
+            },
+        )]
+        .into(),
+        Arc::new(ProducerSigningKey::from_secret_bytes([1; 32]).unwrap()),
+    );
+    // Close the idle retained channel through its real journal and endpoint.
+    cached
+        .lock()
+        .await
+        .as_mut()
+        .unwrap()
+        .client
+        .client()
+        .await
+        .unwrap()
+        .prepare_close()
+        .await
+        .unwrap();
+    let request = || {
+        gateway
+            .fetch(
+                "paid",
+                crate::test_support::request_job(&gateway.jobs),
+                hellas_gateway::WorkFetchRequest {
+                    service: "openai".into(),
+                    method: "responses".into(),
+                    body: BODY.to_vec(),
+                },
+            )
+            .unwrap()
+    };
+    let mut stream = request();
+    let error = stream.next().await.unwrap().unwrap_err();
+    assert!(
+        format!("{error:?}").contains("Endpoint(NotAdmitting)"),
+        "{error:?}"
+    );
+    assert!(stream.next().await.is_none());
+    assert!(
+        cached.lock().await.is_none(),
+        "terminal session must leave the cache"
+    );
+    // The next demand enters fresh-session setup at the validator. The closed
+    // cached endpoint would refuse locally without making this connection.
+    let mut stream = request();
+    tokio::select! {
+        result = stream.next() => panic!("new demand reused the terminal endpoint: {result:?}"),
+        result = validator.accept() => { drop(result.unwrap()); },
+    }
+    drop(stream);
+    gateway.drain().await.unwrap();
+    endpoint.close().await;
+}
+
+pub(crate) async fn cached_paid_backend() -> (
+    PaidFixture,
+    crate::Backend,
+    Endpoint,
+    tokio::net::TcpListener,
+) {
     let fixture = PaidFixture::new();
     let validator = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut config = fixture.config.clone();
@@ -436,63 +508,5 @@ async fn retire_closed_paid_channel() {
         observer: None,
         needs_recovery: false,
     });
-    let gateway = crate::ExecutorGateway::new(
-        [(
-            "paid".into(),
-            crate::BackendEntry {
-                backend,
-                evaluator: None,
-                max_in_flight: std::num::NonZeroUsize::new(1).unwrap(),
-            },
-        )]
-        .into(),
-        Arc::new(ProducerSigningKey::from_secret_bytes([1; 32]).unwrap()),
-    );
-    // Close the idle retained channel through its real journal and endpoint.
-    cached
-        .lock()
-        .await
-        .as_mut()
-        .unwrap()
-        .client
-        .client()
-        .await
-        .unwrap()
-        .prepare_close()
-        .await
-        .unwrap();
-    let request = || {
-        gateway
-            .fetch(
-                "paid",
-                crate::test_support::request_job(&gateway.jobs),
-                hellas_gateway::WorkFetchRequest {
-                    service: "openai".into(),
-                    method: "responses".into(),
-                    body: BODY.to_vec(),
-                },
-            )
-            .unwrap()
-    };
-    let mut stream = request();
-    let error = stream.next().await.unwrap().unwrap_err();
-    assert!(
-        format!("{error:?}").contains("Endpoint(NotAdmitting)"),
-        "{error:?}"
-    );
-    assert!(stream.next().await.is_none());
-    assert!(
-        cached.lock().await.is_none(),
-        "terminal session must leave the cache"
-    );
-    // The next demand enters fresh-session setup at the validator. The closed
-    // cached endpoint would refuse locally without making this connection.
-    let mut stream = request();
-    tokio::select! {
-        result = stream.next() => panic!("new demand reused the terminal endpoint: {result:?}"),
-        result = validator.accept() => { drop(result.unwrap()); },
-    }
-    drop(stream);
-    gateway.drain().await.unwrap();
-    endpoint.close().await;
+    (fixture, backend, endpoint, validator)
 }

@@ -463,6 +463,7 @@ pub struct PaidBackend {
     pub settlement_key: hellas_kernel::Secp256k1Signer,
     pub owner: Arc<crate::client_owner::ClientOwner>,
     pub(crate) session: Arc<tokio::sync::Mutex<Option<crate::paid_client::PaidWorkSession>>>,
+    active: Arc<std::sync::atomic::AtomicUsize>,
 }
 #[derive(Clone)]
 pub struct GrantBackend {
@@ -475,17 +476,16 @@ pub struct GrantBackend {
 #[derive(Default)]
 pub(crate) struct GrantChannel {
     session: tokio::sync::Mutex<Option<crate::grant_client::GrantSession>>,
-    active: std::sync::atomic::AtomicUsize,
+    active: Arc<std::sync::atomic::AtomicUsize>,
+    members: std::sync::Mutex<std::collections::BTreeSet<String>>,
     retired: std::sync::atomic::AtomicBool,
     down: Arc<std::sync::atomic::AtomicBool>,
 }
 type GrantChannels = std::collections::BTreeMap<hellas_auth::Digest, std::sync::Weak<GrantChannel>>;
-struct GrantUse(Arc<GrantChannel>);
-impl Drop for GrantUse {
+struct SessionUse(Arc<std::sync::atomic::AtomicUsize>);
+impl Drop for SessionUse {
     fn drop(&mut self) {
-        self.0
-            .active
-            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 impl GrantBackend {
@@ -532,6 +532,7 @@ impl Backend {
             settlement_key,
             owner,
             session: Default::default(),
+            active: Default::default(),
         })))
     }
     pub fn grant(
@@ -850,6 +851,14 @@ impl ExecutorGateway {
             }
             (id, Arc::new(backend))
         }));
+        for channel in channels.values().filter_map(std::sync::Weak::upgrade) {
+            channel.members.lock().unwrap().clear();
+        }
+        for (id, backend) in &resolved {
+            if let BackendState::Grant(grant) = &backend.state {
+                grant.channel.members.lock().unwrap().insert(id.clone());
+            }
+        }
         drop(channels);
         Arc::new(Self {
             backends: resolved,
@@ -880,9 +889,7 @@ impl ExecutorGateway {
                     .retired
                     .store(!retained, std::sync::atomic::Ordering::Release);
             }
-            if backend.slots.available_permits() == backend.capacity
-                && let Err(error) = backend.close_sessions().await
-            {
+            if let Err(error) = backend.close_sessions().await {
                 failure.get_or_insert(error);
             }
         }
@@ -908,12 +915,16 @@ impl ExecutorGateway {
         let job = inner
             .job(&request)
             .map_err(|error| WorkGatewayError::PreProposal(Box::new(error)))?;
+        let session_use = inner.use_session();
         let (requester, stream) = Requester::<E, WorkGatewayError>::new(request_job.clone());
         let signer = self.signer.clone();
         request_job
             .spawn(id, async move {
                 let _permit = permit;
-                if let Err(error) = inner.run(job, requester.clone(), &signer).await {
+                if let Err(error) = inner
+                    .run(job, requester.clone(), &signer, session_use)
+                    .await
+                {
                     requester.emit(Err(error));
                 }
             })
@@ -945,7 +956,11 @@ impl Backend {
                 }
             }
             BackendState::Paid(target) => {
-                if let Some(mut session) = target.session.lock().await.take() {
+                let mut session = target.session.lock().await;
+                if (self.down.load(std::sync::atomic::Ordering::Acquire) || self.slots.is_closed())
+                    && target.active.load(std::sync::atomic::Ordering::Acquire) == 0
+                    && let Some(mut session) = session.take()
+                {
                     session.shutdown().await;
                 }
             }
@@ -953,11 +968,35 @@ impl Backend {
         }
         Ok(())
     }
+    fn use_session(&self) -> Option<SessionUse> {
+        let active = match &self.state {
+            BackendState::Paid(paid) => &paid.active,
+            BackendState::Grant(grant) => &grant.channel.active,
+            _ => return None,
+        };
+        active.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Some(SessionUse(active.clone()))
+    }
+
     fn health(&self, down: bool) {
         self.jobs.change(|| {
-            (self.down.swap(down, std::sync::atomic::Ordering::AcqRel) != down).then(|| {
-                hellas_gateway::jobs::Event::Backend {
-                    id: self.id.clone(),
+            if self.down.swap(down, std::sync::atomic::Ordering::AcqRel) == down {
+                return Vec::new();
+            }
+            let ids = match &self.state {
+                BackendState::Grant(grant) => grant
+                    .channel
+                    .members
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .cloned()
+                    .collect(),
+                _ => vec![self.id.clone()],
+            };
+            ids.into_iter()
+                .map(|id| hellas_gateway::jobs::Event::Backend {
+                    id,
                     down,
                     reason: if down {
                         "session failed"
@@ -965,8 +1004,8 @@ impl Backend {
                         "session opened"
                     }
                     .into(),
-                }
-            })
+                })
+                .collect()
         });
     }
 
@@ -975,17 +1014,9 @@ impl Backend {
         job: Job,
         requester: Requester<E, WorkGatewayError>,
         signer: &hellas_auth::ProducerSigningKey,
+        session_use: Option<SessionUse>,
     ) -> Result<(), WorkGatewayError> {
         use crate::execution::AttemptError;
-        let grant_use = if let BackendState::Grant(grant) = &self.state {
-            grant
-                .channel
-                .active
-                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-            Some(GrantUse(grant.channel.clone()))
-        } else {
-            None
-        };
         let stop = requester.stop();
         let request = WorkRequest::Job(job.input().clone());
         let run = match &self.state {
@@ -1027,24 +1058,11 @@ impl Backend {
             }
             Err(AttemptError::Stopped(error)) => Err(gateway_error(error.into())),
         };
-        drop(grant_use);
-        // Keep a healthy channel open. A failed channel closes after its last
-        // accepted job; the next demand opens it and performs recovery once.
-        if matches!(self.state, BackendState::Grant(_))
-            || ((self.down.load(std::sync::atomic::Ordering::Acquire) || self.slots.is_closed())
-                && self.slots.available_permits() + 1 == self.capacity)
-        {
-            self.close_sessions().await.map_err(output_error)?;
-        }
-        if !matches!(&result, Err(WorkGatewayError::PreProposal(_))) {
-            requester.job.finish(if result.is_ok() {
-                hellas_gateway::jobs::Outcome::Completed
-            } else {
-                hellas_gateway::jobs::Outcome::Failed
-            });
-        }
-        result
+        drop(session_use);
+        // Session ownership ends before the task releases its scheduling permit.
+        finish_job(&requester.job, result, self.close_sessions().await)
     }
+
     async fn run_here<E: GatewayEvent>(
         &self,
         job: &Job,
@@ -1142,9 +1160,6 @@ impl Backend {
                     .await
                     .ok();
                 let error = ExecutionError::from(error);
-                if backend_failed(&error) {
-                    self.health(true);
-                }
                 return Err(
                     if !proposed.load(Ordering::Acquire) && after == Some(floor) {
                         pre(error)
@@ -1171,9 +1186,6 @@ impl Backend {
             .ok_or_else(|| committed(ExecutionError::Identity))?
             .pay(collected)
             .await;
-        if result.is_err() {
-            self.health(true);
-        }
         let result = result.map_err(|error| committed(error.into()))?;
         drop(guard);
         let completed = crate::execution::paid_completed(result);
@@ -1292,6 +1304,24 @@ impl Backend {
         Ok(completed)
     }
 }
+fn finish_job(
+    job: &hellas_gateway::jobs::Job,
+    result: Result<(), WorkGatewayError>,
+    closed: Result<(), WorkShutdownError>,
+) -> Result<(), WorkGatewayError> {
+    if let Err(error) = closed {
+        tracing::warn!(%error, "session close retains recovery obligations");
+    }
+    if !matches!(&result, Err(WorkGatewayError::PreProposal(_))) {
+        job.finish(if result.is_ok() {
+            hellas_gateway::jobs::Outcome::Completed
+        } else {
+            hellas_gateway::jobs::Outcome::Failed
+        });
+    }
+    result
+}
+
 fn backend_failed(error: &ExecutionError) -> bool {
     use crate::grant_client::GrantClientError as G;
     use crate::paid_client::PaidClientError as P;
@@ -1616,6 +1646,60 @@ mod output_tests {
             delta: delta.into(),
             channel: hellas_rpc::output::TextChannel::Output,
         }
+    }
+
+    #[tokio::test]
+    async fn close_failure_preserves_a_delivered_result_and_finishes_the_job() {
+        let jobs = Arc::new(hellas_gateway::jobs::Jobs::default());
+        let job = crate::test_support::request_job(&jobs);
+        job.accepted();
+        let (_, mut events) = jobs.watch(|_| ());
+        assert!(finish_job(&job, Ok(()), Err(WorkShutdownError::Poisoned)).is_ok());
+        assert!(jobs.watch(|jobs| jobs).0.is_empty());
+        assert!(
+            matches!(events.try_recv().unwrap(), hellas_gateway::jobs::Event::Job { job } if job.outcome == Some(hellas_gateway::jobs::Outcome::Completed))
+        );
+        jobs.drain().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn completed_paid_users_close_even_before_their_permits_drop() {
+        let (_fixture, backend, endpoint, _validator) =
+            crate::paid_client::tests::concurrency::cached_paid_backend().await;
+        let gateway = ExecutorGateway::new(
+            [(
+                "paid".into(),
+                BackendEntry {
+                    backend,
+                    evaluator: None,
+                    max_in_flight: std::num::NonZeroUsize::new(2).unwrap(),
+                },
+            )]
+            .into(),
+            Arc::new(hellas_auth::ProducerSigningKey::from_secret_bytes([1; 32]).unwrap()),
+        );
+        let backend = gateway.backend("paid").unwrap();
+        let first = backend.slots.clone().acquire_owned().await.unwrap();
+        let second = backend.slots.clone().acquire_owned().await.unwrap();
+        // Completed users may still own their scheduling permits until their task returns.
+        let next = ExecutorGateway::prepare(
+            Default::default(),
+            gateway.signer.clone(),
+            gateway.jobs.clone(),
+            Some(&gateway),
+            &Default::default(),
+        );
+        gateway.retire(&next).await.unwrap();
+        let BackendState::Paid(paid) = &backend.state else {
+            unreachable!()
+        };
+        assert!(
+            paid.session.lock().await.is_none(),
+            "retired session must close once no user remains"
+        );
+        drop((first, second));
+        gateway.drain().await.unwrap();
+        endpoint.close().await;
     }
 
     #[tokio::test]

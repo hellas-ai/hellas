@@ -884,7 +884,12 @@ async fn queued_requests_wait_without_a_deadline_and_cancel_on_disconnect() {
             .unwrap();
         let (requester, stream) =
             Requester::<OutputEvent, WorkGatewayError>::new(crate::test_support::job());
-        let run = fixture.gateway.backends["test"].run(job, requester, &fixture.gateway.signer);
+        let run = fixture.gateway.backends["test"].run(
+            job,
+            requester,
+            &fixture.gateway.signer,
+            fixture.gateway.backends["test"].use_session(),
+        );
         tokio::pin!(run);
         assert!(futures::poll!(run.as_mut()).is_pending());
         tokio::time::pause();
@@ -955,7 +960,12 @@ async fn disconnect_during_control_does_not_propose() {
     let (requester, stream) =
         Requester::<OutputEvent, WorkGatewayError>::new(crate::test_support::job());
     {
-        let run = fixture.gateway.backends["test"].run(job, requester, &fixture.gateway.signer);
+        let run = fixture.gateway.backends["test"].run(
+            job,
+            requester,
+            &fixture.gateway.signer,
+            fixture.gateway.backends["test"].use_session(),
+        );
         tokio::pin!(run);
         assert!(futures::poll!(run.as_mut()).is_pending());
         drop(stream);
@@ -1468,4 +1478,35 @@ fn routes(backend: &super::Backend, id: &str) -> Vec<hellas_gateway::Route> {
         panic!("expected grant backend")
     };
     grant_routes(&grant.policy, id).unwrap()
+}
+
+#[tokio::test]
+async fn watch_reports_health_for_every_resource_on_a_shared_grant() {
+    let fixture = FixtureBuilder {
+        two_resources: true,
+        ..Fixture::builder().with_budget(100)
+    }
+    .build()
+    .await;
+    let (_, mut events) = fixture.gateway.jobs.watch(|_| ());
+    for down in [true, false] {
+        fixture.gateway.backend("test").unwrap().health(down);
+        let mut ids = std::collections::BTreeSet::new();
+        while let Ok(hellas_gateway::jobs::Event::Backend {
+            id, down: observed, ..
+        }) = events.try_recv()
+        {
+            assert_eq!(observed, down);
+            ids.insert(id);
+        }
+        assert_eq!(ids, ["test".into(), "second".into()].into());
+        assert!(
+            fixture
+                .gateway
+                .backends()
+                .iter()
+                .all(|backend| backend.down == down)
+        );
+    }
+    fixture.shutdown().await;
 }

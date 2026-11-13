@@ -214,9 +214,9 @@ impl Jobs {
     }
 
     /// A snapshot or backend state change and its event have one ordering point.
-    pub fn change(&self, change: impl FnOnce() -> Option<Event>) {
+    pub fn change<I: IntoIterator<Item = Event>>(&self, change: impl FnOnce() -> I) {
         let _state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(event) = change() {
+        for event in change() {
             let _ = self.events.send(event);
         }
     }

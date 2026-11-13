@@ -1567,4 +1567,4 @@ async fn exchange_setup(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
