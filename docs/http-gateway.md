@@ -49,11 +49,11 @@ tokenizer metadata and produce the same program, environment and call-plan
 bytes for the same request and evaluator. The descriptor directory name is
 the gateway's model name.
 
-Describing a package hashes its weights once. Direct package opens share the
-content store's file-identity cache across evaluators; daemon preparation also
-reuses inspected references for rendering, policy and indexing. A changed file
-invalidates the remembered identity. On platforms without a trustworthy file
-identity, content is rechecked.
+Describing a package hashes its weights once. Direct package opens cache the
+verified weights identity across evaluators; daemon preparation also reuses
+inspected references for rendering, policy and indexing. Keep packages immutable
+while loaded; replacing a file invalidates the remembered identity. On platforms
+without a trustworthy file identity, content is rechecked.
 
 A descriptor is for rendering remote jobs. A local executing backend requires
 the full package; the provider's content store verifies actual weight bytes
