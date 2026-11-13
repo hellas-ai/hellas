@@ -163,7 +163,12 @@ fn every_policy_term_changes_the_committed_identity() {
 
 #[test]
 fn policy_is_bounded_canonical_and_has_no_compile_budget() {
-    let p = policy();
+    let mut p = policy();
+    // Preserve the input of this canonical vector across runtime upgrades.
+    p.admissions[0] = Admission::Compute {
+        evaluator: "hellas/catena-dfad87438018".into(),
+        programs: ComputePrograms::Any {},
+    };
     let bytes = p.canonical_bytes().unwrap();
     assert_eq!(
         p.content_id().unwrap().to_string(),
