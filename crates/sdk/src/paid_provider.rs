@@ -42,6 +42,8 @@ use tracing::{Instrument as _, debug, info, warn};
 #[derive(Debug, thiserror::Error)]
 pub enum PaidProviderError {
     #[error(transparent)]
+    ContentBinding(#[from] std::io::Error),
+    #[error(transparent)]
     Store(#[from] hellas_channel::work_store::WorkStoreError),
     #[error("provider setup has no durable offer or its signing identity differs")]
     InvalidOffer,
@@ -1081,6 +1083,9 @@ impl WorkRunner {
         work_mount: MountedWork,
         setup_mount: MountedSetup,
     ) -> Result<Self, PaidProviderError> {
+        if let Some(content) = &setup_mount.2 {
+            crate::chain_home::bind_provider_content(&config.chain, content)?;
+        }
         let found = discover_setups(&config.journal_root(), config.network())
             .await
             .map_err(|source| PaidProviderError::Discover {

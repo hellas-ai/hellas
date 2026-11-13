@@ -56,10 +56,26 @@ impl ChainDir {
                 let bytes = hellas_private::read_bounded_regular_file(
                     &root.join("profile.json"),
                     MAX_PROFILE_BYTES,
-                )?;
+                )
+                .map_err(|error| {
+                    if error.kind() == io::ErrorKind::NotFound {
+                        invalid_profile(format!(
+                            "chain directory {} predates chain profiles and must be removed",
+                            root.display()
+                        ))
+                    } else {
+                        error
+                    }
+                })?;
                 let file: CustomChainFile =
                     serde_json::from_slice(&bytes).map_err(invalid_profile)?;
                 let profile = ChainProfile::custom(file).map_err(invalid_profile)?;
+                if root.file_name() != Some(std::ffi::OsStr::new(&profile.state_key())) {
+                    return Err(invalid_profile(format!(
+                        "chain profile does not match directory {}",
+                        root.display()
+                    )));
+                }
                 Ok(Self {
                     home: home.clone(),
                     root,
@@ -175,9 +191,26 @@ mod tests {
         assert!(chain.client_journal_roots().unwrap().is_empty());
         assert!(!chain.client().exists());
         std::fs::remove_file(&file).unwrap();
-        assert!(ChainDir::discover(&home).is_err());
+        let error = ChainDir::discover(&home).unwrap_err().to_string();
+        assert!(error.contains(&chain.as_path().display().to_string()));
+        assert!(error.contains("predates chain profiles and must be removed"));
         std::fs::write(&file, b"invalid").unwrap();
         assert!(ChainDir::discover(&home).is_err());
+        let mut swapped = profile.to_file();
+        let mut genesis = profile.genesis().clone();
+        genesis.network_id = "swapped-chain".into();
+        swapped.genesis_json = serde_json::to_string(&genesis).unwrap();
+        swapped.trust.network_id = genesis.network_id;
+        swapped.trust.genesis_sha256 = hex::encode(Sha256::digest(&swapped.genesis_json));
+        let swapped = ChainProfile::custom(swapped).unwrap();
+        assert_ne!(swapped.state_key(), profile.state_key());
+        std::fs::write(&file, serde_json::to_vec(&swapped.to_file()).unwrap()).unwrap();
+        assert!(
+            ChainDir::discover(&home)
+                .unwrap_err()
+                .to_string()
+                .contains("does not match directory")
+        );
     }
 
     #[test]

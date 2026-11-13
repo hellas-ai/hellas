@@ -43,6 +43,7 @@ pub struct DiskStore {
 }
 pub(crate) struct Disk {
     pub root: StoreLocation,
+    identity: [u8; 16],
     pub ram: Reservations,
     pub quota: Reservations,
     records: Arc<Records>,
@@ -170,6 +171,10 @@ impl Disk {
             }
             sqlx::raw_sql("CREATE TABLE IF NOT EXISTS pins (name TEXT PRIMARY KEY NOT NULL, value BLOB NOT NULL); CREATE TABLE IF NOT EXISTS head (id INTEGER PRIMARY KEY CHECK(id=1), generation BLOB NOT NULL); INSERT OR IGNORE INTO head VALUES(1, x'0000000000000000'); CREATE TABLE IF NOT EXISTS work_owned (id INTEGER PRIMARY KEY CHECK(id=1)); PRAGMA user_version=1;").execute(&db).await.map_err(database)?;
             sqlx::query("CREATE TABLE IF NOT EXISTS declarations (name TEXT PRIMARY KEY NOT NULL, digest BLOB NOT NULL)").execute(&db).await.map_err(database)?;
+            sqlx::raw_sql("CREATE TABLE IF NOT EXISTS identity (id INTEGER PRIMARY KEY CHECK(id=1), value BLOB NOT NULL CHECK(length(value)=16)); INSERT OR IGNORE INTO identity VALUES(1, randomblob(16));").execute(&db).await.map_err(database)?;
+            let identity: Vec<u8> = sqlx::query_scalar("SELECT value FROM identity WHERE id=1")
+                .fetch_one(&db).await.map_err(database)?;
+            let identity = identity.try_into().map_err(|_| Error::Invalid("content store identity"))?;
             let work_owned: bool =
                 sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM work_owned WHERE id=1)")
                     .fetch_one(&db)
@@ -198,6 +203,7 @@ impl Disk {
             .await
             .map_err(|_| Error::Invalid("incomplete staging cleanup worker"))??;
             Ok(Arc::new(Self {
+                identity,
                 quota: Reservations::disk(root.to_path_buf(), capacity, 0),
                 root,
                 ram,
@@ -756,6 +762,11 @@ impl FileObject {
     }
 }
 impl DiskStore {
+    /// Stable identity of this upper, retained across close, reopen and relocation.
+    pub fn identity(&self) -> [u8; 16] {
+        self.core.disk.as_ref().unwrap().identity
+    }
+
     pub fn durability(&self) -> Durability {
         self.core.disk.as_ref().unwrap().root.durability()
     }
