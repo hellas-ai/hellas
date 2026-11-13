@@ -78,13 +78,13 @@ async fn fixture(name: &str, request: Value, events: Vec<OutputEvent>, expected:
         calls: AtomicUsize::new(0),
     });
     let backend = FetchBackend {
-        work: crate::test_support::execution(work.clone(), presentation()).await,
-        selection: crate::test_support::selection(work.clone()),
-        options: crate::ResponsesFetch {
+        state: Arc::new(ResponsesState {
+            work: crate::test_support::execution(work.clone(), presentation()).await,
             service: "openai".into(),
             method: "responses".into(),
             overrides: serde_json::Map::new(),
-        },
+        }),
+        selection: crate::test_support::selection(work.clone()),
     };
     // Pin only rendering metadata; compare the actual SSE body without
     // parsing, normalizing, or reserializing any event bytes.

@@ -4,19 +4,20 @@ use hellas_client::model::{ModelKind, ModelPackage, ModelRequest};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Route {
     pub backends: Vec<String>,
     #[serde(flatten)]
     pub presentation: Presentation,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Presentation {
     Model {
         model: String,
         package: PathBuf,
+        modality: ModelKind,
         #[serde(default = "default_tokens")]
         max_tokens: u32,
     },
@@ -32,7 +33,7 @@ pub enum Presentation {
         targets: BTreeMap<String, HttpTarget>,
     },
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HttpTarget {
     pub service: String,
@@ -47,8 +48,10 @@ fn default_tokens() -> u32 {
 impl Route {
     pub fn keys(&self) -> Vec<(String, String, Option<String>)> {
         let (paths, method, models) = match &self.presentation {
-            Presentation::Model { model, package, .. } => (
-                match ModelKind::of(package) {
+            Presentation::Model {
+                model, modality, ..
+            } => (
+                match modality {
                     ModelKind::Text => crate::state::PATHS.to_vec(),
                     ModelKind::Transcription => vec![crate::audio::PATH],
                     ModelKind::Image => vec![crate::image::PATH],

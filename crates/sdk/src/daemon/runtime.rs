@@ -152,31 +152,26 @@ impl Runtime {
             .as_ref()
             .map(|trust| {
                 let store = crate::trust_policy::TrustPolicyStore::new(&trust.store);
-                let approved = store.load(&trust.policy)?;
-                let anchor = store.resolve(
+                Ok(store.approved(
                     &trust.policy,
-                    approved.policy.assurance,
                     Arc::new(crate::FilesystemAssertionCounterStore::in_home(
                         &self.options.home,
                     )),
-                )?;
-                let current = store.load(&trust.policy)?;
-                if current.revision != approved.revision || current.policy != approved.policy {
-                    return Err("trust approval changed during preparation".into());
-                }
-                Ok(anchor)
+                )?)
             })
             .transpose()
     }
 
     pub fn approval_current(&self, configured: &BackendKind, active: &Backend) -> Result<bool> {
         let (trust, active) = match (configured, active) {
-            (BackendKind::Grant { trust, .. }, Backend::Grant { options, .. }) => {
-                (trust, options.target.trust().clone())
-            }
-            (BackendKind::Paid { trust, .. }, Backend::Paid { options, .. }) => {
-                (trust, options.trust()?)
-            }
+            (
+                BackendKind::Grant { trust, .. },
+                Backend::Grant(crate::GrantBackend { options, .. }),
+            ) => (trust, options.target.trust().clone()),
+            (
+                BackendKind::Paid { trust, .. },
+                Backend::Paid(crate::PaidBackend { options, .. }),
+            ) => (trust, options.trust()?),
             _ => return Ok(true),
         };
         let Some(approved) = self.trust(trust)? else {
@@ -246,8 +241,9 @@ impl Runtime {
                         .pin(&trust)?;
                 let endpoint = self.consumer_endpoint().await?;
                 (
-                    Backend::Grant {
-                        options: crate::grant_client::GrantSessionOptions {
+                    Backend::grant(
+                        policy.clone(),
+                        crate::grant_client::GrantSessionOptions {
                             target,
                             principal,
                             signer: self.options.signer.clone(),
@@ -260,13 +256,17 @@ impl Runtime {
                                 .child("channels"),
                             control_timeout: std::time::Duration::from_secs(90),
                         },
-                        transport: crate::grant_client::GrantTransport::Remote(endpoint),
-                        policy: policy.clone(),
-                    },
+                        crate::grant_client::GrantTransport::Remote(endpoint),
+                    ),
                     evaluator.clone(),
                 )
             }
             BackendKind::Paid {
+                addresses,
+                acceptance_blocks,
+                terminal_blocks,
+                payment_blocks,
+                timeout_seconds,
                 chain,
                 provider,
                 max_price,
@@ -282,7 +282,7 @@ impl Runtime {
                     content,
                     config: crate::work_config::WorkConfig::from_chain_dir(chain)?,
                     provider,
-                    provider_addrs: vec![],
+                    provider_addrs: addresses.clone(),
                     assurance: apple_trust
                         .as_ref()
                         .map_or(hellas_rpc::Assurance::ProducerSigned, |trust| {
@@ -290,19 +290,19 @@ impl Runtime {
                         }),
                     apple_trust,
                     expected_price: *max_price,
-                    acceptance_blocks: 300,
-                    terminal_blocks: 3000,
-                    payment_blocks: 600,
-                    timeout: None,
+                    acceptance_blocks: *acceptance_blocks,
+                    terminal_blocks: *terminal_blocks,
+                    payment_blocks: *payment_blocks,
+                    timeout: timeout_seconds.map(std::time::Duration::from_secs),
                 };
                 (
-                    Backend::Paid {
+                    Backend::paid(
+                        None,
                         options,
-                        policy: None,
                         endpoint,
-                        settlement_key: self.options.settlement.clone(),
+                        self.options.settlement.clone(),
                         owner,
-                    },
+                    ),
                     evaluator.clone(),
                 )
             }

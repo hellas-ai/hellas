@@ -383,6 +383,7 @@ async fn exchange_routed_setup(
     let accepting = server.clone();
     let setup = setup.clone();
     let serving = tokio::spawn(async move {
+        let host = super::host::Host::builder().build().await;
         let incoming = accepting
             .accept()
             .await
@@ -395,9 +396,9 @@ async fn exchange_routed_setup(
         Services {
             open_identity: test_remote_execution(),
             node: handler,
-            setup: Some(setup),
-            work: None,
-            control: None,
+            setup,
+            work: WorkRouter::both(MountedWork::default(), host.world.service.clone()),
+            control: crate::node_control::NodeControl::new(host.world.service.node()),
             content,
         }
         .serve(connection, tokio::sync::watch::channel(false).1)
@@ -2757,7 +2758,7 @@ impl RunningPaidNode {
         };
 
         content.finish_recovery().await.unwrap();
-        let alpns = served_alpns(true, false, false);
+        let alpns = served_alpns(false);
         assert!(
             alpns.contains(&<WorkSetup as ServiceMarker>::ALPN.as_bytes().to_vec())
                 && alpns.contains(&<Work as ServiceMarker>::ALPN.as_bytes().to_vec()),
@@ -2818,6 +2819,8 @@ impl RunningPaidNode {
         let work_for_accept = work_mount.clone();
         let execution_for_accept = open;
         let accept_task = tokio::spawn(async move {
+            let host = super::host::Host::builder().build().await;
+            let control = crate::node_control::NodeControl::new(host.world.service.node());
             while let Some(incoming) = accepting_endpoint.accept().await {
                 let accepting = match incoming.accept() {
                     Ok(accepting) => accepting,
@@ -2828,6 +2831,7 @@ impl RunningPaidNode {
                 let work = work_for_accept.clone();
                 let execution = execution_for_accept.clone();
                 let content = content.clone();
+                let control = control.clone();
                 tokio::spawn(async move {
                     let connection = match accepting.await {
                         Ok(connection) => connection,
@@ -2836,9 +2840,9 @@ impl RunningPaidNode {
                     if let Err(error) = (Services {
                         open_identity: execution,
                         node: node_handler,
-                        setup: Some(setup),
-                        work: Some(WorkRouter::payment(work)),
-                        control: None,
+                        setup,
+                        work: WorkRouter::payment(work),
+                        control,
                         content,
                     })
                     .serve(connection, tokio::sync::watch::channel(false).1)

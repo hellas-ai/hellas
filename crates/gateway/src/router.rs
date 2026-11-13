@@ -22,36 +22,22 @@ pub async fn router(
                 model,
                 package,
                 max_tokens,
-            } => match hellas_client::model::ModelKind::of(package) {
+                modality,
+            } => match modality {
                 hellas_client::model::ModelKind::Text => crate::state::router(Arc::new(
                     crate::state::TextState::open(
-                        &crate::TextOptions {
-                            model: package.clone(),
-                            model_name: model.clone(),
-                            default_max_tokens: *max_tokens,
-                        },
+                        package.clone(),
+                        model.clone(),
+                        *max_tokens,
                         execution,
                     )
                     .await?,
                 )),
                 hellas_client::model::ModelKind::Transcription => {
-                    crate::audio::router(
-                        &crate::AudioOptions {
-                            model_name: model.clone(),
-                            default_max_tokens: *max_tokens as usize,
-                        },
-                        execution,
-                    )
-                    .await?
+                    crate::audio::router(model.clone(), *max_tokens as usize, execution).await?
                 }
                 hellas_client::model::ModelKind::Image => {
-                    crate::image::router(
-                        &crate::ImageOptions {
-                            model_name: model.clone(),
-                        },
-                        execution,
-                    )
-                    .await?
+                    crate::image::router(model.clone(), execution).await?
                 }
             },
             Presentation::Responses {
@@ -60,11 +46,9 @@ pub async fn router(
                 overrides,
                 ..
             } => crate::responses_fetch::router(
-                crate::ResponsesFetch {
-                    service: service.clone(),
-                    method: method.clone(),
-                    overrides: overrides.clone(),
-                },
+                service.clone(),
+                method.clone(),
+                overrides.clone(),
                 execution,
             ),
             Presentation::Http { targets } => {
@@ -116,7 +100,16 @@ async fn dispatch(
             );
         }
     };
-    let hints = if path == crate::audio::PATH && routing.routes.iter().any(|route| matches!(&route.presentation, Presentation::Model { package, .. } if matches!(hellas_client::model::ModelKind::of(package), hellas_client::model::ModelKind::Transcription))) {
+    let hints = if path == crate::audio::PATH
+        && routing.routes.iter().any(|route| {
+            matches!(
+                &route.presentation,
+                Presentation::Model {
+                    modality: hellas_client::model::ModelKind::Transcription,
+                    ..
+                }
+            )
+        }) {
         match crate::audio::multipart_model(Request::from_parts(
             parts.clone(),
             Body::from(body.clone()),

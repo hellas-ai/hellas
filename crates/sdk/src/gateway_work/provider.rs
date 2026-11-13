@@ -4,7 +4,7 @@ use crate::daemon::Core;
 use hellas_auth::PublicKey;
 use hellas_channel::work::{
     Admitted, BackendFault, PaidProgress, WorkBackend,
-    admission::{AdmissionError, BackendKey, WorkAdmission, WorkPermit},
+    admission::{AdmissionError, BackendKey, ReservedExecution, WorkAdmission, WorkPermit},
 };
 use hellas_gateway::jobs::{Job, Origin, Outcome, Request};
 use hellas_rpc::OutputEventEnvelope;
@@ -20,6 +20,13 @@ struct AdmittedBackend {
     inner: Arc<Inner>,
     job: Arc<Job>,
     _slot: tokio::sync::OwnedSemaphorePermit,
+}
+impl std::fmt::Debug for AdmittedBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdmittedBackend")
+            .field("backend", &self.inner.id)
+            .finish_non_exhaustive()
+    }
 }
 impl Inner {
     fn executor(&self) -> Result<&hellas_executor::ExecutorHandle, BackendFault> {
@@ -126,7 +133,7 @@ impl WorkBackend for IrohBackend {
                 "invocation assurance differs from this listener's prover",
             )));
         }
-        let input = if input.admission().backend::<AdmittedBackend>().is_some() {
+        let input = if input.admission().backend().is_some() {
             input
         } else {
             let key = BackendKey::of(input.invocation())?;
@@ -159,33 +166,37 @@ impl WorkBackend for IrohBackend {
                 WorkAdmission::reserved(permit),
             )
         };
-        let selected = input
-            .admission()
-            .backend::<AdmittedBackend>()
-            .ok_or(AdmissionError::Closed)?;
-        selected.job.running(&selected.inner.id);
-        selected.job.accepted();
-        let result = selected
-            .inner
-            .executor()?
-            .execute_stream(input, progress)
-            .await;
-        if selected.job.is_cancelled() {
-            selected.job.stopped();
-        } else {
-            selected.job.finish(
-                if result.as_ref().is_ok_and(|events| {
-                    events.last().is_some_and(|event| {
-                        event.event().body().kind()
-                            == hellas_rpc::protocol::invocation::output::TERMINAL
-                    })
-                }) {
-                    Outcome::Completed
-                } else {
-                    Outcome::Failed
-                },
-            );
-        }
-        result
+        let selected = input.admission().backend().ok_or(AdmissionError::Closed)?;
+        selected.execute(input, progress).await
+    }
+}
+impl ReservedExecution for AdmittedBackend {
+    fn execute<'a>(
+        &'a self,
+        input: Admitted,
+        progress: PaidProgress,
+    ) -> futures::future::BoxFuture<'a, Result<Vec<OutputEventEnvelope>, BackendFault>> {
+        Box::pin(async move {
+            self.job.running(&self.inner.id);
+            self.job.accepted();
+            let result = self.inner.executor()?.execute_stream(input, progress).await;
+            if self.job.is_cancelled() {
+                self.job.stopped();
+            } else {
+                self.job.finish(
+                    if result.as_ref().is_ok_and(|events| {
+                        events.last().is_some_and(|event| {
+                            event.event().body().kind()
+                                == hellas_rpc::protocol::invocation::output::TERMINAL
+                        })
+                    }) {
+                        Outcome::Completed
+                    } else {
+                        Outcome::Failed
+                    },
+                );
+            }
+            result
+        })
     }
 }

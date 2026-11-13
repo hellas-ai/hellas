@@ -122,7 +122,7 @@ and a malformed or unverifiable one with `InvalidArgument`. There is no unbind. 
 command prints the bound enrollment's content ID.
 
 `work` accepts [WorkControlCommand](../crates/authority/src/model/grant/admin.rs) JSON. It selects resources from
-the daemon's validated catalogue and uses the profile's authorization grant.
+the authority's current resource policies and uses the profile's authorization grant.
 These operations require distinct rights on this authority's Work machine resource:
 
 `List`, `Inspect`, `InspectResource`, `InspectBudget` and `Catalogue` use
@@ -166,13 +166,13 @@ levels are permitted. Parentage is immutable, and revisions start at one and inc
 by exactly one. Configuration returns the changed node and revision; `InspectBudget`
 requires the read permission and returns the current definition and accounting.
 
-The grant configuration also declares the resources the node serves, and the node
-commits them to its catalogue when the provider starts. Every policy has an explicit
-`resource` ID, `account` ID and positive `revision`. Both IDs use Auth's 32-byte
-ResourceId. A resource's account is immutable; a changed policy must raise its
-`revision` by exactly one, or startup refuses it. A resource removed from the file
-stays in the catalogue, because allowances pin it. `Catalogue` returns the durable
-catalogue through checked inspection.
+The daemon document declares resource inputs and budgets. Core derives their
+executable policies, and Configure commits the document and authority changes in
+one journal frame. The writer assigns policy revisions when terms change. Resource
+and account IDs are stable; a resource cannot move to another account. Removing a
+resource withdraws it from `Catalogue` and new grants. The authority retains its
+recorded terms for existing allowances and accepted work. Each resource chooses
+whether changed terms keep or release previously accepted work.
 
 Each Fetch admission in a resource's `invocation_policy` carries a required
 `contract` descriptor. The descriptor selects a compiled request/result

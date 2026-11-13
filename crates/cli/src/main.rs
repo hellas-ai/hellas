@@ -526,14 +526,7 @@ async fn async_main() {
             .await
         }
         Commands::Routes { control } => {
-            commands::admin::daemon(
-                control,
-                commands::daemon::Edit::List,
-                &local_identity,
-                passkey,
-                &home,
-            )
-            .await
+            commands::admin::routes(control, &local_identity, passkey, &home).await
         }
         Commands::Rpc {
             node_id,

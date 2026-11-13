@@ -1,5 +1,4 @@
 //! Both command forms translate into the SDK's single daemon document.
-mod resources;
 use anyhow::{Context, Result, ensure};
 use hellas_auth::authority::{NodeKey, PrincipalId};
 use hellas_authority::authenticator::Authenticator;
@@ -56,12 +55,10 @@ pub enum RouteCommand {
 pub enum Edit {
     Backend(BackendCommand),
     Route(RouteCommand),
-    List,
 }
 
 pub struct ModelContext {
     pub home: PathBuf,
-    pub catalogue: Vec<hellas_authority::model::grant::records::GrantPolicy>,
     pub local_evaluator: Option<String>,
     pub principal: Option<PrincipalId>,
     pub holder: NodeKey,
@@ -74,7 +71,6 @@ impl ModelContext {
     ) -> Result<Self> {
         Ok(Self {
             home: home.into(),
-            catalogue: vec![],
             local_evaluator: hellas_sdk::daemon::local_evaluator(),
             holder: NodeKey::from_public_key(identity.node_key.public_key())?,
             principal: owner
@@ -230,7 +226,9 @@ impl ModelContext {
                             target.route.models = Some(vec![name.into()]);
                         }
                     }
-                    _ => unreachable!(),
+                    Presentation::Model { .. } => {
+                        anyhow::bail!("model resource needs a local package")
+                    }
                 }
                 document
                     .add_route(route)
@@ -250,6 +248,7 @@ fn package_route(package: PathBuf, backend: &str) -> Result<Route> {
     Ok(Route {
         backends: vec![backend.into()],
         presentation: Presentation::Model {
+            modality: hellas_client::model::ModelKind::of(&package),
             model,
             package,
             max_tokens: 128,
@@ -260,12 +259,12 @@ fn package_route(package: PathBuf, backend: &str) -> Result<Route> {
 pub fn validate_name(name: &str) -> Result<()> {
     ensure!(
         !name.is_empty()
-            && name.len() <= 48
+            && name.len() <= 64
             && name.as_bytes()[0].is_ascii_alphanumeric()
             && name
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte)),
-        "name must use 1..48 ASCII letters, digits, dots, underscores or hyphens, starting with a letter or digit"
+        "name must use 1..64 ASCII letters, digits, dots, underscores or hyphens, starting with a letter or digit"
     );
     Ok(())
 }
@@ -332,19 +331,6 @@ pub async fn apply(document: &mut Document, edit: Edit, context: &ModelContext) 
             ensure!(removed, "route not found");
             document.routes.retain(|route| !route.backends.is_empty());
         }
-        Edit::List => {}
-    }
-    if document
-        .listeners
-        .values()
-        .any(|listener| matches!(listener, Listener::Iroh { .. }))
-    {
-        resources::refresh(
-            document,
-            context.local_evaluator.as_deref(),
-            &context.catalogue,
-        )
-        .await?;
     }
     for listener in document.listeners.values_mut() {
         if let Listener::Iroh { backends, .. } = listener {
@@ -368,13 +354,11 @@ pub fn print(view: &hellas_sdk::daemon::View) {
     println!("MODEL\tMODALITY\tAPI PATH\tBACKEND\tSTATE\tJOBS");
     for route in &view.document.routes {
         let modality = match &route.presentation {
-            Presentation::Model { package, .. } => {
-                match hellas_client::model::ModelKind::of(package) {
-                    hellas_client::model::ModelKind::Text => "text",
-                    hellas_client::model::ModelKind::Transcription => "audio",
-                    hellas_client::model::ModelKind::Image => "image",
-                }
-            }
+            Presentation::Model { modality, .. } => match modality {
+                hellas_client::model::ModelKind::Text => "text",
+                hellas_client::model::ModelKind::Transcription => "audio",
+                hellas_client::model::ModelKind::Image => "image",
+            },
             _ => "text",
         };
         for (path, _, model) in route.keys() {
@@ -405,6 +389,35 @@ where
     T: hellas_wire::StreamTransport + Send + Sync,
     T::Stream: Send + 'static,
 {
+    use hellas_rpc::pb::host::ConfigureRequest;
+    let view = view(client, authorization).await?;
+    context.local_evaluator = view
+        .backends
+        .iter()
+        .find(|backend| backend.id == "local")
+        .and_then(|backend| backend.evaluator.clone())
+        .or(view.local_evaluator);
+    let mut document = view.document;
+    apply(&mut document, edit, &context).await?;
+    let result = client
+        .configure(ConfigureRequest {
+            authorization: authorization.0.to_vec(),
+            expected_revision: view.revision.0,
+            document: serde_json::to_vec(&document)?,
+        })
+        .await?;
+    println!("Configured revision {}", result.revision);
+    Ok(())
+}
+
+pub async fn view<T>(
+    client: &hellas_rpc::services::host_control::HostControlClientImpl<T>,
+    authorization: hellas_auth::authority::GrantId,
+) -> Result<hellas_sdk::daemon::View>
+where
+    T: hellas_wire::StreamTransport + Send + Sync,
+    T::Stream: Send + 'static,
+{
     use futures::StreamExt;
     use hellas_rpc::pb::host::*;
     let mut watch = client
@@ -421,28 +434,7 @@ where
     };
     let view: hellas_sdk::daemon::View = serde_json::from_slice(&bytes)?;
     drop(watch);
-    if matches!(edit, Edit::List) {
-        print(&view);
-        return Ok(());
-    }
-    context.local_evaluator = view
-        .backends
-        .iter()
-        .find(|backend| backend.id == "local")
-        .and_then(|backend| backend.evaluator.clone())
-        .or(view.local_evaluator);
-    context.catalogue = view.catalogue;
-    let mut document = view.document;
-    apply(&mut document, edit, &context).await?;
-    let result = client
-        .configure(ConfigureRequest {
-            authorization: authorization.0.to_vec(),
-            expected_revision: document.revision.0,
-            document: serde_json::to_vec(&document)?,
-        })
-        .await?;
-    println!("Configured revision {}", result.revision);
-    Ok(())
+    Ok(view)
 }
 
 async fn options(
@@ -534,25 +526,18 @@ pub async fn gateway(
     let temporary = tempfile::Builder::new()
         .prefix(".gateway-")
         .tempdir_in(home)?;
-    let ephemeral = loop {
-        if let Ok(key) = hellas_kernel::SoftPasskey::from_secret_scalar(rand::random()) {
-            break key;
-        }
-    };
+    let ephemeral = hellas_kernel::SoftPasskey::from_secret_scalar(rand::random())
+        .map_err(|_| anyhow::anyhow!("invalid ephemeral key"))?;
     let (node, access) =
         super::admin::gateway_authority(&home.child(temporary.path()), identity, &ephemeral)
             .await?;
     let options = options(home.clone(), identity, owner, chain, node.clone(), None).await?;
-    let content = options.content.clone();
-    let serving = async {
-        let core = hellas_sdk::daemon::Core::open(options, document)
-            .await
-            .map_err(anyhow::Error::from_boxed)?;
-        let result = async {
-            #[cfg(feature = "otel")]
-            if let Some((address, bundle)) = metrics {
-                crate::metrics::spawn_metrics_server(address, bundle.with_core(&core)).await?;
-            }
+    run_daemon(
+        options,
+        Some(document),
+        #[cfg(feature = "otel")]
+        metrics,
+        async |core| {
             print(&core.watch().0);
             let address = core.http_addresses()["api"];
             if let Some(command) = args.wrap {
@@ -583,15 +568,9 @@ pub async fn gateway(
                 }
             }
             Ok(())
-        }
-        .await;
-        let drained = core.shutdown().await.map_err(anyhow::Error::from_boxed);
-        result.and(drained)
-    }
-    .await;
-    content.close().await;
-    node.close().await;
-    serving
+        },
+    )
+    .await
 }
 
 pub async fn serve(
@@ -621,35 +600,33 @@ pub async fn serve(
     );
     let mut options = options(home.clone(), identity, owner, chain, node.clone(), endpoint).await?;
     options.remote_control = hellas_sdk::node_control::RemoteControlAdmission::credential_gated();
-    let content = options.content.clone();
-    let serving = async {
-        let core = if node.configuration().await?.is_some() {
-            hellas_sdk::daemon::Core::restore(options).await
-        } else {
-            let mut document = Document::default();
-            document.listeners.insert(
-                "work".into(),
-                Listener::Iroh {
-                    chain: None,
-                    port: port.unwrap_or(0),
-                    backends: vec![],
-                },
-            );
-            document.listeners.insert(
-                "api".into(),
-                Listener::Http {
-                    bind: "127.0.0.1:8080".parse()?,
-                    zdr: true,
-                },
-            );
-            hellas_sdk::daemon::Core::open(options, document).await
-        }
-        .map_err(anyhow::Error::from_boxed)?;
-        let result = async {
-            #[cfg(feature = "otel")]
-            if let Some((address, bundle)) = metrics {
-                crate::metrics::spawn_metrics_server(address, bundle.with_core(&core)).await?;
-            }
+    let document = if node.configuration().await?.is_some() {
+        None
+    } else {
+        let mut document = Document::default();
+        document.listeners.insert(
+            "work".into(),
+            Listener::Iroh {
+                chain: None,
+                port: port.unwrap_or(0),
+                backends: vec![],
+            },
+        );
+        document.listeners.insert(
+            "api".into(),
+            Listener::Http {
+                bind: "127.0.0.1:8080".parse()?,
+                zdr: true,
+            },
+        );
+        Some(document)
+    };
+    run_daemon(
+        options,
+        document,
+        #[cfg(feature = "otel")]
+        metrics,
+        async |core| {
             let tls = hellas_sdk::node_control::profile::server_identity(
                 &home.join("provider/control.cert.der"),
                 &home.join("provider/control.key.der"),
@@ -667,10 +644,34 @@ pub async fn serve(
             signal?;
             stopped?;
             Ok(())
+        },
+    )
+    .await
+}
+
+async fn run_daemon(
+    options: hellas_sdk::daemon::Options,
+    document: Option<Document>,
+    #[cfg(feature = "otel")] metrics: Option<(std::net::SocketAddr, crate::metrics::MetricsBundle)>,
+    run: impl AsyncFnOnce(Arc<hellas_sdk::daemon::Core>) -> Result<()>,
+) -> Result<()> {
+    let content = options.content.clone();
+    let node = options.node.clone();
+    let serving = async {
+        let core = match document {
+            Some(document) => hellas_sdk::daemon::Core::open(options, document).await,
+            None => hellas_sdk::daemon::Core::restore(options).await,
+        }
+        .map_err(anyhow::Error::from_boxed)?;
+        let result = async {
+            #[cfg(feature = "otel")]
+            if let Some((address, bundle)) = metrics {
+                crate::metrics::spawn_metrics_server(address, bundle.with_core(&core)).await?;
+            }
+            run(core.clone()).await
         }
         .await;
-        let drained = core.shutdown().await.map_err(anyhow::Error::from_boxed);
-        result.and(drained)
+        result.and(core.shutdown().await.map_err(anyhow::Error::from_boxed))
     }
     .await;
     content.close().await;
@@ -751,8 +752,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let key_file = directory.path().join("key");
         std::fs::write(&key_file, "test-secret\n").unwrap();
-        let mut context = ModelContext {
-            catalogue: vec![],
+        let context = ModelContext {
             home: directory.path().into(),
             local_evaluator: None,
             principal: None,
@@ -795,7 +795,6 @@ mod tests {
             .unwrap();
         }
         assert_eq!(document.routes.len(), 3);
-        assert_eq!(document.authority.resources().len(), 2);
         let redacted = serde_json::to_string(&document.redacted().0).unwrap();
         assert!(!redacted.contains("test-secret"));
         let decoded: Document = serde_json::from_str(&redacted).unwrap();
@@ -807,7 +806,6 @@ mod tests {
             targets["second"].route.url,
             "https://second.example/api/v1/responses"
         );
-        let first = document.authority.resource("first").unwrap().clone();
         apply(
             &mut document,
             Edit::Route(RouteCommand::Add {
@@ -817,15 +815,6 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(
-            document.authority.resource("first").unwrap().revision,
-            first.revision.next().unwrap()
-        );
-        assert_eq!(
-            document.authority.resource("first").unwrap().account,
-            first.account
-        );
-        context.catalogue = document.authority.resources().to_vec();
         apply(
             &mut document,
             Edit::Backend(BackendCommand::Rm {
@@ -835,7 +824,6 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(document.authority.resources().len(), 1);
         assert!(
             document
                 .routes
@@ -863,9 +851,5 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(
-            document.authority.resource("first").unwrap().revision.0,
-            first.revision.0 + 2
-        );
     }
 }

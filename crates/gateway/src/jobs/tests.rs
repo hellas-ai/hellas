@@ -9,22 +9,11 @@ fn request() -> Request {
     }
 }
 
-struct Accounting(Arc<Mutex<Vec<Outcome>>>);
-impl Hook for Accounting {
-    fn admit(&self, _: &Request) -> Result<Box<dyn Reservation>, Refusal> {
-        Ok(Box::new(Self(self.0.clone())))
-    }
-}
-impl Reservation for Accounting {
-    fn finish(self: Box<Self>, outcome: Outcome) {
-        self.0.lock().unwrap().push(outcome);
-    }
-}
-
 #[tokio::test]
 async fn cancel_before_execution_never_starts_and_releases_once() {
-    let outcomes = Arc::new(Mutex::new(vec![]));
-    let jobs = Arc::new(Jobs::new(vec![Arc::new(Accounting(outcomes.clone()))]));
+    let limit = Arc::new(RequestLimit::default());
+    limit.configure(std::num::NonZeroU64::new(1));
+    let jobs = Arc::new(Jobs::new(limit));
     let job = jobs.admit(&request()).unwrap();
     let id = job.id();
     assert!(jobs.cancel(id));
@@ -34,7 +23,8 @@ async fn cancel_before_execution_never_starts_and_releases_once() {
     );
     drop(job);
     assert!(!jobs.cancel(id));
-    assert_eq!(*outcomes.lock().unwrap(), [Outcome::Cancelled]);
+    jobs.admit(&request())
+        .expect("cancelled work returns its quota");
     jobs.drain().await.unwrap();
 }
 
@@ -75,16 +65,7 @@ async fn watch_observes_admission_backend_acceptance_cancel_and_settlement_in_or
 }
 
 #[tokio::test]
-async fn a_refusing_hook_prevents_routing_and_releases_earlier_reservations() {
-    struct Refuse;
-    impl Hook for Refuse {
-        fn admit(&self, _: &Request) -> Result<Box<dyn Reservation>, Refusal> {
-            Err(Refusal {
-                status: axum::http::StatusCode::TOO_MANY_REQUESTS,
-                message: "quota exhausted".into(),
-            })
-        }
-    }
+async fn exhausted_quota_prevents_routing() {
     struct Unreachable;
     impl crate::WorkExecutionBackend for Unreachable {
         fn backends(&self) -> Vec<crate::BackendInfo> {
@@ -94,11 +75,10 @@ async fn a_refusing_hook_prevents_routing_and_releases_earlier_reservations() {
             Box::pin(async { Ok(()) })
         }
     }
-    let outcomes = Arc::new(Mutex::new(vec![]));
-    let jobs = Arc::new(Jobs::new(vec![
-        Arc::new(Accounting(outcomes.clone())),
-        Arc::new(Refuse),
-    ]));
+    let limit = Arc::new(RequestLimit::default());
+    limit.configure(std::num::NonZeroU64::new(1));
+    let jobs = Arc::new(Jobs::new(limit));
+    let first = jobs.admit(&request()).unwrap();
     let router = crate::router::router(
         vec![],
         Arc::new(Unreachable),
@@ -117,8 +97,8 @@ async fn a_refusing_hook_prevents_routing_and_releases_earlier_reservations() {
         .await
         .unwrap();
     assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(*outcomes.lock().unwrap(), [Outcome::Rejected]);
-    assert!(jobs.watch(|jobs| jobs).0.is_empty());
+    assert_eq!(jobs.watch(|jobs| jobs).0.len(), 1);
+    drop(first);
 }
 
 #[tokio::test]

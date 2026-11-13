@@ -23,13 +23,13 @@ fn gateway_waits_for_slow_funding_finality() {
                 [(
                     "test".into(),
                     hellas_sdk::BackendEntry {
-                        backend: hellas_sdk::Backend::Paid {
-                            options: case.options.clone(),
-                            policy: Some(quote.policy.invocation_policy),
-                            endpoint: case.endpoint.clone(),
-                            settlement_key: client_settlement(),
-                            owner: case.owner.clone(),
-                        },
+                        backend: hellas_sdk::Backend::paid(
+                            Some(quote.policy.invocation_policy),
+                            case.options.clone(),
+                            case.endpoint.clone(),
+                            client_settlement(),
+                            case.owner.clone(),
+                        ),
                         evaluator: None,
                         max_in_flight: std::num::NonZeroUsize::new(32).unwrap(),
                     },

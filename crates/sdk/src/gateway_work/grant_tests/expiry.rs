@@ -60,8 +60,9 @@ async fn ambiguous_acceptance_recovers_original_work_without_replacement() {
         .authorization()
         .acceptance_deadline_ms;
     drop(session);
-    fixture.gateway.backends["test"]
-        .grant
+    fixture
+        .backend()
+        .session
         .lock()
         .await
         .take()

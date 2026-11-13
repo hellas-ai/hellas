@@ -543,13 +543,13 @@ impl TargetArgs {
                 pay > 0,
                 "paid execution requires --pay MAX; select --access for grant work"
             );
-            return Ok(Backend::Paid {
-                options: client.options(context, pay, assurance).await?,
-                policy: None,
-                endpoint: context.paid_endpoint().await?,
-                settlement_key: context.settlement.clone(),
-                owner: client.owner(context)?,
-            }
+            return Ok(Backend::paid(
+                None,
+                client.options(context, pay, assurance).await?,
+                context.paid_endpoint().await?,
+                context.settlement.clone(),
+                client.owner(context)?,
+            )
             .into());
         };
         let principal = super::contributions::principal(context.owner()?)?;
@@ -588,8 +588,9 @@ impl TargetArgs {
         };
         let target = UnpinnedOffer::decode(&offer.encode()?, UnixMillis(0))?.pin(&trust)?;
         let policy = select_policy(&offer.offer().grant.policies, self.resource)?.clone();
-        let mut resolved = ResolvedBackend::from(Backend::Grant {
-            options: GrantSessionOptions {
+        let mut resolved = ResolvedBackend::from(Backend::grant(
+            policy,
+            GrantSessionOptions {
                 target,
                 principal,
                 signer: Arc::new(context.producer.clone()),
@@ -597,11 +598,8 @@ impl TargetArgs {
                 journal_root: super::contributions::client_journal_root(&context.home, &principal)?,
                 control_timeout: Duration::from_secs(90),
             },
-            policy,
-            transport: hellas_sdk::grant_client::GrantTransport::Remote(
-                context.grant_endpoint().await?,
-            ),
-        });
+            hellas_sdk::grant_client::GrantTransport::Remote(context.grant_endpoint().await?),
+        ));
         resolved.attempt = self.attempt;
         Ok(resolved)
     }
@@ -616,8 +614,10 @@ impl ResolvedBackend {
     )> {
         let price = self.backend.quote().await?;
         let policy = match &self.backend {
-            Backend::Paid { policy, .. } => policy.clone(),
-            Backend::Grant { policy, .. } => Some(policy.invocation_policy.clone()),
+            Backend::Paid(hellas_sdk::PaidBackend { policy, .. }) => policy.clone(),
+            Backend::Grant(hellas_sdk::GrantBackend { policy, .. }) => {
+                Some(policy.invocation_policy.clone())
+            }
             Backend::Fetch { policy, .. } => Some(policy.clone()),
             #[cfg(feature = "compute")]
             Backend::Local { .. } => None,
@@ -632,20 +632,18 @@ impl ResolvedBackend {
         context: &Context,
         job: &Job,
     ) -> super::CliResult<(Executor, String)> {
-        let mut executor = self.backend.executor(job)?;
-        let provider = match &mut executor {
-            Executor::Paid(execution) => {
-                execution.attempt =
-                    Some(client.purchase(context, job, &execution.options, &execution.owner)?);
-                execution.settle = client.settle;
-                execution.options.provider.to_string()
+        let mut executor = Executor::new(self.backend.clone());
+        let provider = match &executor.backend {
+            Backend::Paid(hellas_sdk::PaidBackend { options, owner, .. }) => {
+                executor.attempt = Some(client.purchase(context, job, options, owner)?);
+                executor.settle = client.settle;
+                options.provider.to_string()
             }
-            Executor::Grant(execution) => {
-                let Backend::Grant { policy, .. } = &self.backend else {
-                    unreachable!()
-                };
+            Backend::Grant(hellas_sdk::GrantBackend {
+                options, policy, ..
+            }) => {
                 job.input().admits(&policy.invocation_policy, false)?;
-                let offer = execution.options.target.offer();
+                let offer = options.target.offer();
                 let provider = hellas_sdk::client::ProviderAddress::of(&offer.provider)?;
                 let default_attempt = context
                     .home
@@ -665,20 +663,20 @@ impl ResolvedBackend {
                     network: offer.network,
                     provider,
                 })?;
-                execution.attempt = Some(attempt);
+                executor.attempt = Some(attempt);
                 provider.to_string()
             }
-            Executor::Fetch(..) => hex::encode(context.producer.public_key().bytes()),
+            Backend::Fetch { .. } => hex::encode(context.producer.public_key().bytes()),
             #[cfg(feature = "compute")]
-            Executor::Local(..) => hex::encode(context.producer.public_key().bytes()),
+            Backend::Local { .. } => hex::encode(context.producer.public_key().bytes()),
         };
         Ok((executor, provider))
     }
 
     async fn close(self) -> super::CliResult<()> {
         match self.backend {
-            Backend::Paid { options, .. } => options.content.close().await,
-            Backend::Grant { .. } | Backend::Fetch { .. } => {}
+            Backend::Paid(hellas_sdk::PaidBackend { options, .. }) => options.content.close().await,
+            Backend::Grant(hellas_sdk::GrantBackend { .. }) | Backend::Fetch { .. } => {}
             #[cfg(feature = "compute")]
             Backend::Local { execution, .. } => {
                 execution.content.close().await;

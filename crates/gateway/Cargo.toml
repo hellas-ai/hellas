@@ -9,6 +9,7 @@ documentation.workspace = true
 
 [features]
 default = []
+test-support = []
 otel = [
     "hellas-rpc/otel",
     "hellas-rpc/http-tracing",

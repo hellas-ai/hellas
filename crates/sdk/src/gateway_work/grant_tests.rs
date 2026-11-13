@@ -153,11 +153,11 @@ impl FixtureBuilder {
             [(
                 "test".into(),
                 BackendEntry {
-                    backend: crate::Backend::Grant {
-                        policy: options.target.offer().grant.policies[0].clone(),
+                    backend: crate::Backend::grant(
+                        options.target.offer().grant.policies[0].clone(),
                         options,
                         transport,
-                    },
+                    ),
                     evaluator: Some(hellas_channel::test_support::channel::evaluator()),
                     max_in_flight: std::num::NonZeroUsize::new(self.max_in_flight).unwrap(),
                 },
@@ -174,25 +174,22 @@ impl FixtureBuilder {
     }
 }
 impl Fixture {
-    fn options(&self) -> &crate::grant_client::GrantSessionOptions {
-        let crate::Backend::Grant { options, .. } = &self.gateway.backends["test"].target else {
-            unreachable!("a grant fixture")
+    fn backend(&self) -> &crate::GrantBackend {
+        let crate::Backend::Grant(backend) = &self.gateway.backends["test"].target else {
+            panic!("expected a grant fixture");
         };
-        options
+        backend
+    }
+    fn options(&self) -> &crate::grant_client::GrantSessionOptions {
+        &self.backend().options
     }
     /// Inspect the channel's one retained journal under its proposal mutex.
     async fn session(&self) -> tokio::sync::MappedMutexGuard<'_, GrantSession> {
-        let inner = &self.gateway.backends["test"];
-        let mut guard = inner.grant.lock().await;
+        let backend = self.backend();
+        let mut guard = backend.session.lock().await;
         if guard.is_none() {
-            let crate::Backend::Grant {
-                options, transport, ..
-            } = &inner.target
-            else {
-                unreachable!()
-            };
             *guard = Some(
-                GrantSession::open(options.clone(), transport.clone())
+                GrantSession::open(backend.options.clone(), backend.transport.clone())
                     .await
                     .unwrap(),
             );
@@ -230,6 +227,7 @@ impl Fixture {
         let bearer = access.bearer();
         let server = crate::test_support::server::serve(
             self.host.world.service.node(),
+            bearer.clone(),
             hellas_gateway::ArchiveOptions {
                 directory: self.host.root.path().join("archive"),
                 zdr: true,
@@ -477,7 +475,7 @@ async fn refreshed_https_bounds_are_checked_before_proposal() {
             3 => https.paths = vec!["/changed".into()],
             _ => https.max_response_bytes = 128,
         }
-        let guard = fixture.gateway.backends["test"].grant.lock().await;
+        let guard = fixture.backend().session.lock().await;
         let mut stream = fixture
             .gateway
             .fetch(
@@ -570,7 +568,7 @@ async fn reused_policy_name_cannot_retarget_an_in_flight_request() {
     let mut replacement = old.clone();
     replacement.resource =
         hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"replacement"));
-    let guard = fixture.gateway.backends["test"].grant.lock().await;
+    let guard = fixture.backend().session.lock().await;
     let mut stream = fixture
         .gateway
         .fetch(
@@ -861,7 +859,7 @@ async fn silent_work_still_ends_at_the_signed_deadline() {
 async fn queued_requests_wait_without_a_deadline_and_cancel_on_disconnect() {
     let fixture = Fixture::builder().build().await;
     for disconnect in [false, true] {
-        let held = fixture.gateway.backends["test"].grant.lock().await;
+        let held = fixture.backend().session.lock().await;
         let job = fixture.gateway.backends["test"]
             .target
             .job(&WorkRequest::Fetch(fixture.request(None)))
@@ -986,11 +984,11 @@ async fn single_signed_model_responses_route_tracks_continuation() {
         .await
         .unwrap();
     let gateway = crate::test_support::gateway(
-        crate::Backend::Grant {
-            policy: options.target.offer().grant.policies[0].clone(),
+        crate::Backend::grant(
+            options.target.offer().grant.policies[0].clone(),
             options,
-            transport: GrantTransport::Remote(endpoint),
-        },
+            GrantTransport::Remote(endpoint),
+        ),
         Some(hellas_channel::test_support::channel::evaluator()),
         Arc::new(ProducerSigningKey::from_secret_bytes([8; 32]).unwrap()),
     );
@@ -998,6 +996,7 @@ async fn single_signed_model_responses_route_tracks_continuation() {
     let bearer = access.bearer();
     let server = crate::test_support::server::serve(
         host.world.service.node(),
+        bearer.clone(),
         hellas_gateway::ArchiveOptions {
             directory: host.root.path().join("archive"),
             zdr: true,
@@ -1033,7 +1032,7 @@ async fn single_signed_model_responses_route_tracks_continuation() {
 /// a rerun of its attempt delivers the retained result without executing.
 #[tokio::test]
 async fn the_command_executor_runs_a_grant_once_and_replays_it() {
-    use crate::execution::{ExecutionAttempt, ExecutionTerms, Executor, GrantExecution, stop_on};
+    use crate::execution::{ExecutionAttempt, ExecutionTerms, Executor, stop_on};
     let template = chat_resource("https://private.fixture", 6);
     let mut allowance = Allowance::responses(ids::ALLOWANCE, FRIEND);
     use_https(&mut allowance.definition.policies[0], template.clone());
@@ -1083,12 +1082,16 @@ async fn the_command_executor_runs_a_grant_once_and_replays_it() {
     let signer = ProducerSigningKey::generate();
     let run = |attempt| {
         let delivered = delivered.clone();
-        Executor::Grant(GrantExecution {
-            options: options.clone(),
-            transport: GrantTransport::Local(host.world.service.clone()),
-            resource: policy.resource,
+        Executor {
+            backend: crate::Backend::grant(
+                policy.clone(),
+                options.clone(),
+                GrantTransport::Local(host.world.service.clone()),
+            ),
+            funding: Default::default(),
             attempt: Some(attempt),
-        })
+            settle: false,
+        }
         .run(
             &job,
             &signer,
@@ -1144,7 +1147,7 @@ async fn two_grant_nodes_fail_over_before_proposal_and_rejoin_on_demand() {
         .unwrap();
     let entry = |fixture: &Fixture| {
         let mut backend = fixture.gateway.backends["test"].target.clone();
-        if let crate::Backend::Grant { options, .. } = &mut backend {
+        if let crate::Backend::Grant(crate::GrantBackend { options, .. }) = &mut backend {
             options.control_timeout = Duration::from_millis(500);
         }
         crate::BackendEntry {
@@ -1175,6 +1178,7 @@ async fn two_grant_nodes_fail_over_before_proposal_and_rejoin_on_demand() {
     let bearer = access.bearer();
     let server = crate::test_support::server::serve(
         first.host.world.service.node(),
+        bearer.clone(),
         hellas_gateway::ArchiveOptions {
             directory: first.host.root.path().join("archive"),
             zdr: true,
@@ -1233,8 +1237,12 @@ async fn two_grant_nodes_fail_over_before_proposal_and_rejoin_on_demand() {
 }
 
 #[tokio::test]
-async fn grant_jobs_overlap_and_finish_after_disconnect_or_cancellation() {
+async fn grant_jobs_overlap_and_finish_after_disconnect() {
     grant_concurrency(false).await;
+}
+
+#[tokio::test]
+async fn cancelled_grant_delivery_keeps_accepted_work() {
     grant_concurrency(true).await;
 }
 

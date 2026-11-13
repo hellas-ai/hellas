@@ -9,23 +9,15 @@ use crate::gateway_work::WorkRequest;
 use crate::job::Job;
 use hellas_auth::ProducerSigningKey;
 
-/// Where one job runs. The caller bound the endpoint and closes it.
-pub enum Executor {
-    Paid(PaidExecution),
-    Grant(GrantExecution),
-    Fetch(
-        hellas_executor::ExecutorHandle,
-        hellas_rpc::protocol::invocation::InvocationPolicy,
-    ),
-    /// This machine, under the caller's own policy; nothing is tracked.
-    #[cfg(feature = "compute")]
-    Local(
-        super::local::LocalExecution,
-        hellas_rpc::protocol::invocation::InvocationPolicy,
-    ),
+/// One invocation's lifecycle options, independent of the backend kind.
+pub struct Executor {
+    pub backend: crate::Backend,
+    pub funding: crate::paid_client::SessionFundingOptions,
+    pub attempt: Option<ExecutionAttempt>,
+    pub settle: bool,
 }
 
-pub struct PaidExecution {
+struct PaidExecution {
     pub options: crate::paid_client::PaidWorkOptions,
     pub endpoint: iroh::Endpoint,
     pub settlement_key: hellas_kernel::Secp256k1Signer,
@@ -38,7 +30,7 @@ pub struct PaidExecution {
     pub settle: bool,
 }
 
-pub struct GrantExecution {
+struct GrantExecution {
     pub options: crate::grant_client::GrantSessionOptions,
     pub transport: crate::grant_client::GrantTransport,
     pub resource: hellas_auth::authority::ResourceId,
@@ -47,6 +39,15 @@ pub struct GrantExecution {
 }
 
 impl Executor {
+    pub fn new(backend: crate::Backend) -> Self {
+        Self {
+            backend,
+            funding: Default::default(),
+            attempt: None,
+            settle: false,
+        }
+    }
+
     /// Run `job` once. A retained result is delivered again without opening
     /// anything. One absolute `deadline` covers opening, queueing, execution,
     /// delivery, its report and settlement; `stop` abandons only unproposed
@@ -67,10 +68,45 @@ impl Executor {
             observers,
             deliver: Some(deliver),
         };
-        match self {
-            Self::Paid(target) => target.run(job, signer, stop, controls).await,
-            Self::Grant(target) => target.run(job, stop, controls).await,
-            Self::Fetch(backend, policy) => {
+        match self.backend {
+            crate::Backend::Paid(crate::PaidBackend {
+                options,
+                endpoint,
+                settlement_key,
+                owner,
+                ..
+            }) => {
+                PaidExecution {
+                    options,
+                    endpoint,
+                    settlement_key,
+                    owner,
+                    funding: self.funding,
+                    attempt: self.attempt,
+                    settle: self.settle,
+                }
+                .run(job, signer, stop, controls)
+                .await
+            }
+            crate::Backend::Grant(crate::GrantBackend {
+                options,
+                transport,
+                policy,
+                ..
+            }) => {
+                GrantExecution {
+                    options,
+                    transport,
+                    resource: policy.resource,
+                    attempt: self.attempt,
+                }
+                .run(job, stop, controls)
+                .await
+            }
+            crate::Backend::Fetch {
+                execution: backend,
+                policy,
+            } => {
                 let completed = super::local::run(
                     &backend,
                     job.input().content(),
@@ -89,7 +125,11 @@ impl Executor {
                 Ok(completed)
             }
             #[cfg(feature = "compute")]
-            Self::Local(target, policy) => {
+            crate::Backend::Local {
+                execution: target,
+                timeout,
+            } => {
+                let policy = super::local::policy(job.input(), timeout)?;
                 let Controls {
                     observers, deliver, ..
                 } = controls;

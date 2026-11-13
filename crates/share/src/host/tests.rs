@@ -202,6 +202,7 @@ impl ShareFixtureBuilder {
         let content = hellas_channel::test_support::channel::content_store(root.path()).await;
         content.finish_recovery().await.unwrap();
         let document = openai_document(share_options()).unwrap();
+        let configuration = hellas_sdk::daemon::testing::configuration(&document).await;
         let mut routes = FetchRouteRegistry::new();
         routes.register(FetchRoute::new("openai", "responses"), FetchRouteEntry::new(
             upstream.provider.clone(),
@@ -210,7 +211,7 @@ impl ShareFixtureBuilder {
         ).unwrap()).unwrap();
         let clock = TestClock::new(hellas_auth::authority::UnixMillis::now().unwrap_or_default());
         let mut allowance = Allowance::responses(ALLOWANCE, FRIEND);
-        allowance.definition.policies = document.authority.resources().to_vec();
+        allowance.definition.policies = configuration.resources().to_vec();
         allowance.definition.max_job_millis = NonZeroU64::new(60_000).unwrap();
         let location = StoreLocation::for_test(root.path());
         let world = Node::bootstrap(&location.child("provider").child("authority"))
@@ -245,11 +246,8 @@ impl ShareFixtureBuilder {
             world.store,
             Arc::new(|| hellas_auth::authority::UnixMillis::now().unwrap()),
         );
-        hellas_authority::test_support::common_node::apply_configuration(
-            &node,
-            &document.authority,
-        )
-        .await;
+        hellas_authority::test_support::common_node::apply_configuration(&node, &configuration)
+            .await;
         let mut executor = hellas_executor::ExecutorSpawnConfig::new(
             Arc::new(provider_identity.node_key().clone()),
             routes,
@@ -261,7 +259,7 @@ impl ShareFixtureBuilder {
                 execution: hellas_executor::Executor::spawn_configured(executor)
                     .await
                     .unwrap(),
-                policy: document.authority.resources()[0].invocation_policy.clone(),
+                policy: configuration.resources()[0].invocation_policy.clone(),
             },
             evaluator: None,
             max_in_flight: std::num::NonZeroUsize::new(2).unwrap(),
@@ -467,7 +465,6 @@ fn share_options() -> OpenAiShareOptions {
         account: ResourceId(hellas_auth::Digest::hash(b"test account")),
         machine: unlimited(),
         account_budget: unlimited(),
-        policy_revision: Revision(1),
         responses: responses_resource(),
         pricing: pricing(),
         max_job_millis: NonZeroU64::new(60_000).unwrap(),
@@ -481,8 +478,8 @@ fn openai_document_requires_a_key_and_redacts_it_from_the_echo() {
     assert!(openai_document(options).is_err());
     let document = openai_document(share_options()).unwrap();
     let (echo, secrets) = document.redacted();
-    assert_eq!(secrets.0["openai"][""], "fixture");
-    assert_eq!(document.authority.resources().len(), 1);
+    assert_eq!(secrets.0["openai"]["bearer"], "fixture");
+    assert_eq!(document.resources.len(), 1);
     let BackendKind::Fetch {
         upstream: hellas_sdk::daemon_config::Upstream::OpenaiResponses { secret },
         ..
@@ -539,11 +536,11 @@ async fn controlled_gateway(
     let endpoint = hellas_sdk::grant_client::bind_endpoint(identity.transport_key())
         .await
         .unwrap();
-    let target = hellas_sdk::Backend::Grant {
-        policy: session.target.offer().grant.policies[0].clone(),
-        options: session,
-        transport: hellas_sdk::grant_client::GrantTransport::Remote(endpoint.clone()),
-    };
+    let target = hellas_sdk::Backend::grant(
+        session.target.offer().grant.policies[0].clone(),
+        session,
+        hellas_sdk::grant_client::GrantTransport::Remote(endpoint.clone()),
+    );
     let document = Document {
         listeners: [(
             "api".into(),

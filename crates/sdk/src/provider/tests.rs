@@ -217,45 +217,6 @@ async fn paid_stream_outlives_the_idle_limit_but_idle_connections_close() {
     serving.await.unwrap().unwrap_err();
 }
 
-#[test]
-fn work_and_content_are_advertised_with_the_configured_control_services() {
-    use hellas_rpc::services::content::Content;
-    assert_eq!(
-        served_alpns(false, false, false),
-        [Node::ALPN.as_bytes(), Content::ALPN.as_bytes()]
-    );
-    assert_eq!(
-        served_alpns(false, true, false),
-        [
-            Node::ALPN.as_bytes(),
-            Content::ALPN.as_bytes(),
-            Work::ALPN.as_bytes()
-        ]
-    );
-    assert_eq!(
-        served_alpns(false, true, true),
-        [
-            Node::ALPN.as_bytes(),
-            Content::ALPN.as_bytes(),
-            Work::ALPN.as_bytes(),
-            hellas_rpc::services::host_control::HostControl::ALPN.as_bytes()
-        ]
-    );
-    assert_eq!(
-        served_alpns(true, true, true).len(),
-        served_alpns(true, false, false).len() + 1
-    );
-    assert_eq!(
-        served_alpns(true, false, false),
-        [
-            Node::ALPN.as_bytes(),
-            Content::ALPN.as_bytes(),
-            WorkSetup::ALPN.as_bytes(),
-            Work::ALPN.as_bytes()
-        ]
-    );
-}
-
 #[tokio::test(start_paused = true)]
 async fn cheap_streams_cannot_extend_the_connection_lifetime() {
     let (client, server) = mux_pair();

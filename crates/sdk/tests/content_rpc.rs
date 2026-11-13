@@ -268,7 +268,7 @@ async fn public_content_is_served_by_the_host_without_a_running_provider() {
     // the shared store used by all consumers, including this existing handle.
     let recipient = common::content_store(&root.path().join("recipient")).await;
     let lookup = iroh::address_lookup::MemoryLookup::new();
-    lookup.add_endpoint_info(host.iroh_endpoints()[0].addr());
+    lookup.add_endpoint_info(host.watch().0.iroh_addresses.into_values().next().unwrap());
     let recipient_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
         .secret_key(iroh::SecretKey::from_bytes(&[14; 32]))
         .relay_mode(iroh::RelayMode::Disabled)
@@ -343,16 +343,13 @@ async fn an_open_public_watch_cannot_delay_standalone_provider_shutdown() {
     let root = tempfile::tempdir().unwrap();
     let content = common::content_store(root.path()).await;
     let provider = content_daemon(root.path(), content.clone(), None, [13; 32]).await;
-    let address = iroh::EndpointAddr::new(provider.iroh_endpoints()[0].id()).with_addrs(
-        provider.iroh_endpoints()[0]
-            .bound_sockets()
-            .into_iter()
-            .filter(|address| address.is_ipv4())
-            .map(|mut address| {
-                address.set_ip(std::net::Ipv4Addr::LOCALHOST.into());
-                iroh::TransportAddr::Ip(address)
-            }),
-    );
+    let address = provider
+        .watch()
+        .0
+        .iroh_addresses
+        .into_values()
+        .next()
+        .unwrap();
     let client = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
         .relay_mode(iroh::RelayMode::Disabled)
         .bind()

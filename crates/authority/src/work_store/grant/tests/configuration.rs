@@ -176,7 +176,7 @@ async fn rejected_configuration_changes_nothing_in_memory_or_on_reopen() {
     let before = store.state().clone();
     let frames = store.journal_len();
     let mut invalid_resource = policy();
-    invalid_resource.name = "renamed-without-revision".into();
+    invalid_resource.account = ResourceId(hellas_auth::Digest::hash(b"another account"));
     let candidate = NodeConfiguration::new(
         Some(budget(9, vec![])),
         [(invalid_resource.account, budget(5, vec![]))].into(),

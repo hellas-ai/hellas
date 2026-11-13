@@ -238,10 +238,20 @@ impl TrustPolicyStore {
         assurance: Assurance,
         counters: Arc<dyn hellas_attestation::AssertionCounterStore + Send + Sync>,
     ) -> io::Result<ProviderTrustAnchor> {
-        let policy = self.load(id)?.policy;
-        if policy.assurance != assurance {
+        let anchor = self.approved(id, counters)?;
+        if anchor.required_assurance != assurance {
             return Err(invalid("execution is outside the approved trust policy"));
         }
+        Ok(anchor)
+    }
+
+    /// Resolve all pins from one owner approval read.
+    pub fn approved(
+        &self,
+        id: &str,
+        counters: Arc<dyn hellas_attestation::AssertionCounterStore + Send + Sync>,
+    ) -> io::Result<ProviderTrustAnchor> {
+        let policy = self.load(id)?.policy;
         Ok(ProviderTrustAnchor {
             expected_genesis: policy.provider_genesis,
             required_assurance: policy.assurance,

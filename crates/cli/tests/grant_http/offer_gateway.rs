@@ -146,7 +146,6 @@ impl OfferHost {
                 "model_policy":[{"path":"/v1/chat/completions","models":["m"]}]}
         })).unwrap();
         let mut document = Document {
-            revision: hellas_auth::authority::Revision(1),
             listeners: [
                 (
                     "work".into(),
@@ -195,22 +194,34 @@ impl OfferHost {
                 },
             )]
             .into(),
-            authority: NodeConfiguration::new(
-                Some(ConfiguredBudget {
-                    max_in_flight: std::num::NonZeroU16::new(2).unwrap(),
+            resources: vec![hellas_sdk::daemon_config::Resource {
+                name: resource.name.clone(),
+                backend: "http".into(),
+                resource: resource.resource,
+                account: resource.account,
+                config_change: Default::default(),
+                rates: resource.pricing.rates.clone(),
+                max_job_millis: resource
+                    .invocation_policy
+                    .limits
+                    .execution_timeout_ms
+                    .try_into()
+                    .unwrap(),
+                kind: hellas_sdk::daemon_config::ResourceKind::Https {
+                    https: resource.https.clone().unwrap(),
+                },
+            }],
+            machine: Some(ConfiguredBudget {
+                max_in_flight: 2.try_into().unwrap(),
+                limits: vec![],
+            }),
+            budgets: vec![(
+                resource.account,
+                ConfiguredBudget {
+                    max_in_flight: 256.try_into().unwrap(),
                     limits: vec![],
-                }),
-                [(
-                    resource.account,
-                    ConfiguredBudget {
-                        max_in_flight: std::num::NonZeroU16::new(256).unwrap(),
-                        limits: vec![],
-                    },
-                )]
-                .into(),
-                vec![resource],
-            )
-            .unwrap(),
+                },
+            )],
             ..Default::default()
         };
         if any_program {
@@ -240,7 +251,12 @@ impl OfferHost {
                     document: serde_json::to_string(&echo).unwrap(),
                     secrets,
                 },
-                &document.authority,
+                &NodeConfiguration::new(
+                    document.machine.clone(),
+                    document.budgets.iter().cloned().collect(),
+                    vec![resource],
+                )
+                .unwrap(),
             )
             .await
             .unwrap();

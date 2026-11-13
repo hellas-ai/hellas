@@ -11,7 +11,7 @@ impl Daemon {
         document: Document,
         backends: BTreeMap<String, BackendEntry>,
     ) -> Self {
-        let core = Core::open_prepared(options, document, backends)
+        let core = Core::open_with_backends(options, document, backends)
             .await
             .unwrap();
         let endpoint = core.iroh_endpoints().into_iter().next().unwrap();
@@ -35,4 +35,11 @@ impl Daemon {
         self.core.node().close().await;
         result
     }
+}
+
+/// Bootstrap fixture authority with the same inputs the daemon will restore.
+pub async fn configuration(
+    document: &Document,
+) -> hellas_authority::model::grant::configuration::NodeConfiguration {
+    document.configuration(&[]).await.unwrap()
 }

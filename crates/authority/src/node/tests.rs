@@ -412,8 +412,7 @@ async fn host_reads_require_their_own_operation() {
         NodeStoreError::Authority(AuthorityError::Denied)
     );
     assert_err!(
-        node.host_action(&reader, ids::OPERATOR_GRANT, HOST_CONFIGURE, |_| ())
-            .await,
+        configure(&node, &reader, ids::OPERATOR_GRANT).await,
         NodeStoreError::Authority(AuthorityError::Denied)
     );
 }
@@ -460,8 +459,7 @@ async fn queued_setting_and_revocation_use_the_same_writer_order() {
     let held = node.store.lock().await.unwrap();
     let mut revoke =
         Box::pin(node.revoke_credential(&root, ids::ROOT_GRANT, app_secret.id(), Revision(1)));
-    let mut setting =
-        Box::pin(node.host_action(&writer, ids::OPERATOR_GRANT, HOST_CONFIGURE, |_| ()));
+    let mut setting = Box::pin(configure(&node, &writer, ids::OPERATOR_GRANT));
     assert!(futures::poll!(&mut revoke).is_pending());
     assert!(futures::poll!(&mut setting).is_pending());
     drop(held);
@@ -474,8 +472,7 @@ async fn queued_setting_and_revocation_use_the_same_writer_order() {
     let (daily, secret) =
         application(&node, &root, ids::FRIEND_GRANT, FRIEND, &[HOST_CONFIGURE]).await;
     assert_err!(
-        node.host_action(&daily, ids::FRIEND_GRANT, HOST_CONFIGURE, |_| ())
-            .await,
+        configure(&node, &daily, ids::FRIEND_GRANT).await,
         NodeStoreError::Authority(AuthorityError::StepUp)
     );
     let writer = node
@@ -490,8 +487,7 @@ async fn queued_setting_and_revocation_use_the_same_writer_order() {
         .grant(ids::FRIEND_GRANT)
         .unwrap()
         .revision();
-    let mut setting =
-        Box::pin(node.host_action(&writer, ids::FRIEND_GRANT, HOST_CONFIGURE, |_| ()));
+    let mut setting = Box::pin(configure(&node, &writer, ids::FRIEND_GRANT));
     let mut revoke = Box::pin(node.grant(
         &root,
         GrantCommand::Revoke {
@@ -507,8 +503,7 @@ async fn queued_setting_and_revocation_use_the_same_writer_order() {
     changed.unwrap();
     revoked.unwrap();
     assert_err!(
-        node.host_action(&writer, ids::FRIEND_GRANT, HOST_CONFIGURE, |_| ())
-            .await,
+        configure(&node, &writer, ids::FRIEND_GRANT).await,
         NodeStoreError::Authority(AuthorityError::Revoked)
     );
 }
@@ -684,4 +679,22 @@ async fn runtime_budget_commands_cannot_replace_the_configured_tree() {
             .await
             .unwrap();
     }
+}
+
+async fn configure(
+    node: &NodeCoordinator,
+    caller: &AuthenticatedCaller,
+    authorization: GrantId,
+) -> Result<(), NodeStoreError> {
+    node.configure(
+        caller,
+        authorization,
+        crate::model::grant::configuration::ConfigurationDocument {
+            revision: Revision(0),
+            document: "{}".into(),
+            secrets: Default::default(),
+        },
+        &Default::default(),
+    )
+    .await
 }

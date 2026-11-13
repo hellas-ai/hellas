@@ -14,6 +14,7 @@ pub(super) struct Bound {
     pub port: u16,
     pub profile: Option<hellas_chain::genesis::CustomChainFile>,
     pub endpoint: iroh::Endpoint,
+    alpns: Vec<Vec<u8>>,
     open: Arc<ProviderOpen>,
     grants: GrantService,
     pub administration: WorkAdministration,
@@ -46,10 +47,10 @@ impl Bound {
         {
             return Err("iroh transport differs from the provider enrollment".into());
         }
-        let alpns = crate::provider::served_alpns(true, true, options.remote_control.enabled());
+        let alpns = crate::provider::served_alpns(options.remote_control.enabled());
         let endpoint = match core.runtime.endpoint.lock().await.take() {
             Some(endpoint) => {
-                endpoint.set_alpns(alpns);
+                endpoint.set_alpns(alpns.clone());
                 endpoint
             }
             None => {
@@ -57,7 +58,7 @@ impl Bound {
                     iroh::Endpoint::builder(iroh::endpoint::presets::N0)
                         .secret_key(options.transport.clone())
                         .hooks(options.remote_control.clone())
-                        .alpns(alpns),
+                        .alpns(alpns.clone()),
                     port,
                 )?
                 .bind()
@@ -103,6 +104,7 @@ impl Bound {
             .await?;
             Ok(Self {
                 port,
+                alpns,
                 profile: profile.clone(),
                 chain,
                 endpoint: endpoint.clone(),
@@ -154,14 +156,7 @@ impl Bound {
             .options
             .discovery
             .then(|| {
-                crate::provider::discovery::start_server_advertising(
-                    &self.endpoint,
-                    &crate::provider::served_alpns(
-                        true,
-                        true,
-                        control.remote_admission().enabled(),
-                    ),
-                )
+                crate::provider::discovery::start_server_advertising(&self.endpoint, &self.alpns)
             })
             .transpose()?;
         drop(core_options);
@@ -175,17 +170,17 @@ impl Bound {
             vec![],
             directory.clone(),
         );
-        node.service_alpns =
-            crate::provider::served_alpns(true, true, control.remote_admission().enabled())
-                .into_iter()
-                .map(|alpn| String::from_utf8_lossy(&alpn).into_owned())
-                .collect();
+        node.service_alpns = self
+            .alpns
+            .iter()
+            .map(|alpn| String::from_utf8_lossy(alpn).into_owned())
+            .collect();
         let services = crate::provider::Services {
             open_identity: self.open.clone(),
             node,
-            setup: Some(self.setup.clone()),
-            work: Some(WorkRouter::both(self.work.clone(), self.grants.clone())),
-            control: Some(control),
+            setup: self.setup.clone(),
+            work: WorkRouter::both(self.work.clone(), self.grants.clone()),
+            control,
             content,
         };
         let (quiesce, quiesced) = watch::channel(false);

@@ -15,8 +15,6 @@ use std::{
     sync::{Arc, Mutex},
 };
 use tower::ServiceExt;
-type Task<T> =
-    futures::future::Shared<futures::future::BoxFuture<'static, std::result::Result<T, String>>>;
 
 mod iroh_listener;
 mod runtime;
@@ -25,6 +23,7 @@ pub mod testing;
 pub use runtime::Options;
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 type Result<T> = std::result::Result<T, Error>;
+type ListenerExit = (String, std::sync::Weak<BoundListener>, Result<()>);
 
 /// The local runtime's registered evaluator, without starting a worker.
 pub fn local_evaluator() -> Option<String> {
@@ -45,16 +44,14 @@ pub struct Core {
     limit: Arc<RequestLimit>,
     routing: Arc<hellas_gateway::RoutingState>,
     configuring: Arc<tokio::sync::Mutex<()>>,
-    commit: Mutex<Option<Task<Revision>>>,
-    listeners: Mutex<Vec<Arc<BoundListener>>>,
-    closed: std::sync::atomic::AtomicBool,
+    listeners: Mutex<tokio::task::JoinSet<ListenerExit>>,
     #[cfg(test)]
     pub(crate) after_commit:
         Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
 }
 
 pub(crate) struct Snapshot {
-    catalogue: Vec<hellas_authority::model::grant::records::GrantPolicy>,
+    revision: Revision,
     pub(crate) document: Document,
     pub(crate) work: Arc<ExecutorGateway>,
     routers: BTreeMap<String, Router>,
@@ -64,7 +61,7 @@ pub(crate) struct Snapshot {
 struct BoundListener {
     bound: Bound,
     stop: tokio::sync::watch::Sender<bool>,
-    task: Mutex<Option<Task<()>>>,
+    started: std::sync::atomic::AtomicBool,
 }
 enum Bound {
     Http {
@@ -82,8 +79,7 @@ impl Drop for BoundListener {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct View {
-    /// Current policy for each resource identity; absent document entries are withdrawn.
-    pub catalogue: Vec<hellas_authority::model::grant::records::GrantPolicy>,
+    pub revision: Revision,
     pub local_evaluator: Option<String>,
     pub document: Document,
     pub backends: Vec<hellas_gateway::BackendInfo>,
@@ -98,16 +94,19 @@ impl Core {
         let (_, mut events) = self.jobs.watch(|_| ());
         loop {
             tokio::select! {
-                result = futures::future::poll_fn(|cx| {
-                    for (id, listener) in &self.snapshot.load().listeners {
-                        let mut task = listener.task.lock().unwrap_or_else(|error| error.into_inner());
-                        if let Some(task) = task.as_mut()
-                            && let std::task::Poll::Ready(result) = task.poll_unpin(cx) {
-                                return std::task::Poll::Ready(Err(format!("listener {id} stopped: {}", result.err().unwrap_or_else(|| "closed".into())).into()));
+                result = std::future::poll_fn(|cx| self.listeners.lock().unwrap_or_else(|e| e.into_inner()).poll_join_next(cx)) => {
+                    match result {
+                        Some(result) => {
+                            let (id, listener, result) = result?;
+                            if listener.upgrade().is_some_and(|listener| !*listener.stop.borrow()) {
+                                result?;
+                                return Err(format!("listener {id} stopped").into());
                             }
+                            if let Err(error) = result { tracing::warn!(%error, "retired listener stopped with an error"); }
+                        }
+                        None => { let _ = events.recv().await; }
                     }
-                    std::task::Poll::Pending
-                }) => return result,
+                }
                 _ = events.recv() => {},
             }
         }
@@ -115,7 +114,12 @@ impl Core {
 
     /// Both CLI forms enter here. A saved document is read from the authority journal.
     pub async fn open(options: Options, document: Document) -> Result<Arc<Self>> {
-        Self::open_prepared(options, document, BTreeMap::new()).await
+        let revision = options
+            .node
+            .configuration()
+            .await?
+            .map_or(Revision(0), |c| c.revision);
+        Self::open_prepared(options, document, BTreeMap::new(), revision).await
     }
 
     /// Use deterministic executors while exercising the real daemon and transports.
@@ -125,13 +129,19 @@ impl Core {
         document: Document,
         backends: BTreeMap<String, BackendEntry>,
     ) -> Result<Arc<Self>> {
-        Self::open_prepared(options, document, backends).await
+        let revision = options
+            .node
+            .configuration()
+            .await?
+            .map_or(Revision(0), |c| c.revision);
+        Self::open_prepared(options, document, backends, revision).await
     }
 
     async fn open_prepared(
         mut options: Options,
         document: Document,
         entries: BTreeMap<String, BackendEntry>,
+        revision: Revision,
     ) -> Result<Arc<Self>> {
         if options.node.provider().await?.is_some_and(|enrollment| {
             enrollment.genesis.statement.root_kind == hellas_rpc::RootKind::Software
@@ -139,7 +149,7 @@ impl Core {
             options.prover = None;
         }
         let limit = Arc::new(RequestLimit::default());
-        let jobs = Arc::new(Jobs::new(vec![limit.clone()]));
+        let jobs = Arc::new(Jobs::new(limit.clone()));
         let work = ExecutorGateway::prepare(
             BTreeMap::new(),
             options.signer.clone(),
@@ -150,7 +160,7 @@ impl Core {
         let core = Arc::new(Self {
             runtime: runtime::Runtime::new(options),
             snapshot: ArcSwap::from_pointee(Snapshot {
-                catalogue: vec![],
+                revision,
                 document: Document::default(),
                 work,
                 routers: BTreeMap::new(),
@@ -160,9 +170,7 @@ impl Core {
             limit,
             routing: Default::default(),
             configuring: Arc::new(tokio::sync::Mutex::new(())),
-            commit: Mutex::new(None),
-            listeners: Mutex::new(Vec::new()),
-            closed: Default::default(),
+            listeners: Mutex::new(tokio::task::JoinSet::new()),
             #[cfg(test)]
             after_commit: Mutex::new(None),
         });
@@ -172,52 +180,25 @@ impl Core {
             &core.runtime.options.content,
         )
         .await?;
-        let snapshot = core.prepare(document, entries).await?;
+        let (snapshot, _) = core.prepare(document, entries, revision).await?;
         core.publish(snapshot);
         Ok(core)
     }
 
     pub async fn restore(options: Options) -> Result<Arc<Self>> {
-        let document = match options.node.configuration().await? {
+        let (document, revision) = match options.node.configuration().await? {
             Some(stored) => {
                 let mut document: Document = serde_json::from_str(&stored.document)?;
-                if document.revision != stored.revision {
-                    return Err("stored configuration revision mismatch".into());
-                }
                 document.restore_secrets(&stored.secrets);
-                document
+                (document, stored.revision)
             }
-            None => Document::default(),
+            None => (Document::default(), Revision(0)),
         };
-        Self::open(options, document).await
+        Self::open_prepared(options, document, BTreeMap::new(), revision).await
     }
 
     pub fn node(&self) -> &NodeCoordinator {
         &self.runtime.options.node
-    }
-
-    /// Share wallet reservations and retained content with an embedded native client.
-    pub async fn client_resources(
-        &self,
-        chain: &hellas_chain::chain_dir::ChainDir,
-    ) -> Result<(
-        Arc<crate::client_owner::ClientOwner>,
-        hellas_store::content::DiskStore,
-    )> {
-        let _serial = self.configuring.lock().await;
-        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
-            return Err("daemon is closed".into());
-        }
-        self.runtime.client_resources(chain).await
-    }
-
-    /// Outgoing transport is shared across native requests and configured backends.
-    pub async fn client_endpoint(&self) -> Result<iroh::Endpoint> {
-        let _serial = self.configuring.lock().await;
-        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
-            return Err("daemon is closed".into());
-        }
-        self.runtime.consumer_endpoint().await
     }
 
     /// The same backends and job table used by listeners, for an embedded native UI.
@@ -237,7 +218,7 @@ impl Core {
             .collect()
     }
 
-    pub fn iroh_endpoints(&self) -> Vec<iroh::Endpoint> {
+    pub(crate) fn iroh_endpoints(&self) -> Vec<iroh::Endpoint> {
         self.snapshot
             .load()
             .listeners
@@ -291,7 +272,7 @@ impl Core {
         self.jobs.watch(|jobs| {
             let snapshot = self.snapshot.load();
             View {
-                catalogue: snapshot.catalogue.clone(),
+                revision: snapshot.revision,
                 local_evaluator: local_evaluator(),
                 document: snapshot.document.redacted().0,
                 backends: snapshot.work.backends(),
@@ -311,25 +292,16 @@ impl Core {
         mut document: Document,
     ) -> Result<Revision> {
         let serial = self.configuring.clone().lock_owned().await;
-        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+        if self.jobs.is_closed() {
             return Err("daemon is draining".into());
         }
-        let caller = self.node().session_caller(&session, binding).await?;
-        self.node()
-            .host_action(
-                caller,
-                authorization,
-                hellas_authority::node::HOST_CONFIGURE,
-                |_| (),
-            )
-            .await?;
         let current = self.snapshot.load_full();
-        if current.document.revision != expected || document.revision != expected {
+        if current.revision != expected {
             return Err("configuration revision changed".into());
         }
         document.restore_secrets(&current.document.redacted().1);
-        document.revision = expected.next().ok_or("configuration revision overflow")?;
-        let candidate = self.prepare(document, BTreeMap::new()).await?;
+        let revision = expected.next().ok_or("configuration revision overflow")?;
+        let (candidate, configuration) = self.prepare(document, BTreeMap::new(), revision).await?;
         let (redacted, secrets) = candidate.document.redacted();
         let stored = ConfigurationDocument {
             revision: expected,
@@ -337,69 +309,50 @@ impl Core {
             secrets,
         };
         let core = self.clone();
-        // The daemon retains this task; dropping the caller's cloned future cannot abort it.
-        let task = {
-            let mut retained = self
-                .commit
-                .lock()
-                .map_err(|_| "configuration task lock poisoned")?;
-            let task = tokio::spawn(async move {
-                let _serial = serial;
-                let caller = core.node().session_caller(&session, binding).await?;
-                core.node()
-                    .configure(caller, authorization, stored, &candidate.document.authority)
-                    .await?;
-                #[cfg(test)]
+        // Dropping the caller detaches this commit-and-publication task.
+        tokio::spawn(async move {
+            let _serial = serial;
+            let caller = core.node().session_caller(&session, binding).await?;
+            core.node()
+                .configure(caller, authorization, stored, &configuration)
+                .await?;
+            #[cfg(test)]
+            {
+                let barrier = core.after_commit.lock().unwrap().take();
+                if let Some((committed, resume)) = barrier {
+                    committed.add_permits(1);
+                    resume.acquire().await.unwrap().forget();
+                }
+            }
+            let revision = candidate.revision;
+            let previous = core.publish(candidate.clone());
+            if let Err(error) = previous.work.retire(&candidate.work).await {
+                tracing::warn!(%error, "retired backend retains recovery obligations");
+            }
+            for (id, listener) in &previous.listeners {
+                if candidate
+                    .listeners
+                    .get(id)
+                    .is_some_and(|next| Arc::ptr_eq(listener, next))
                 {
-                    let barrier = core.after_commit.lock().unwrap().take();
-                    if let Some((committed, resume)) = barrier {
-                        committed.add_permits(1);
-                        resume.acquire().await.unwrap().forget();
-                    }
+                    continue;
                 }
-                let revision = candidate.document.revision;
-                let previous = core.publish(candidate.clone());
-                if let Err(error) = previous.work.retire(&candidate.work).await {
-                    tracing::warn!(%error, "retired backend retains recovery obligations");
-                }
-                for (id, listener) in &previous.listeners {
-                    if candidate
-                        .listeners
-                        .get(id)
-                        .is_some_and(|next| Arc::ptr_eq(listener, next))
-                    {
-                        continue;
-                    }
-                    let task = listener
-                        .task
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .clone();
-                    if let Some(task) = task
-                        && let Err(error) = task.await
-                    {
-                        tracing::warn!(%error, "retired listener did not stop cleanly");
-                    }
-                }
-                Ok::<_, Error>(revision)
-            })
-            .map(|result| match result {
-                Ok(result) => result.map_err(|error| error.to_string()),
-                Err(error) => Err(error.to_string()),
-            })
-            .boxed()
-            .shared();
-            *retained = Some(task.clone());
-            task
-        };
-        task.await.map_err(Into::into)
+                listener.stop.closed().await;
+            }
+            Ok::<_, Error>(revision)
+        })
+        .await?
     }
 
     async fn prepare(
         self: &Arc<Self>,
         document: Document,
         mut entries: BTreeMap<String, BackendEntry>,
-    ) -> Result<Arc<Snapshot>> {
+        revision: Revision,
+    ) -> Result<(
+        Arc<Snapshot>,
+        hellas_authority::model::grant::configuration::NodeConfiguration,
+    )> {
         document.validate().map_err(Error::from)?;
         let old = self.snapshot.load_full();
         let mut reuse = BTreeSet::new();
@@ -407,13 +360,7 @@ impl Core {
             if entries.contains_key(id) {
                 continue;
             }
-            let unchanged = old
-                .document
-                .backends
-                .get(id)
-                .map(serde_json::to_value)
-                .transpose()?
-                == Some(serde_json::to_value(backend)?);
+            let unchanged = old.document.backends.get(id) == Some(backend);
             let local = matches!(
                 backend.kind,
                 crate::daemon_config::BackendKind::Local { .. }
@@ -440,7 +387,8 @@ impl Core {
             Some(&old.work),
             &reuse,
         );
-        work.validate_resources(document.authority.resources())
+        let configuration = document.configuration(&work.backends()).await?;
+        work.validate_resources(configuration.resources())
             .map_err(Error::from)?;
         document
             .validate_resolved(&work.backends())
@@ -461,9 +409,7 @@ impl Core {
                 .filter(|old| match (&old.bound, listener) {
                     (Bound::Http { bind: old, .. }, Listener::Http { bind, .. }) => old == bind,
                     (Bound::Iroh(old), Listener::Iroh { port, chain, .. }) => {
-                        old.port == *port
-                            && serde_json::to_value(&old.profile).ok()
-                                == serde_json::to_value(chain).ok()
+                        old.port == *port && old.profile == *chain
                     }
                     _ => false,
                 });
@@ -484,7 +430,7 @@ impl Core {
                         )),
                     },
                     stop: tokio::sync::watch::channel(false).0,
-                    task: Mutex::new(None),
+                    started: Default::default(),
                 }),
             };
             listeners.insert(id.clone(), bound);
@@ -504,28 +450,16 @@ impl Core {
                 .await?,
             );
         }
-        let mut catalogue: BTreeMap<_, _> = self
-            .node()
-            .resource_catalogue()
-            .await?
-            .into_iter()
-            .map(|policy| (policy.resource, policy))
-            .collect();
-        catalogue.extend(
-            document
-                .authority
-                .resources()
-                .iter()
-                .cloned()
-                .map(|policy| (policy.resource, policy)),
-        );
-        Ok(Arc::new(Snapshot {
-            catalogue: catalogue.into_values().collect(),
-            document,
-            work,
-            routers,
-            listeners,
-        }))
+        Ok((
+            Arc::new(Snapshot {
+                revision,
+                document,
+                work,
+                routers,
+                listeners,
+            }),
+            configuration,
+        ))
     }
 
     fn publish(self: &Arc<Self>, next: Arc<Snapshot>) -> Arc<Snapshot> {
@@ -535,7 +469,7 @@ impl Core {
                 .configure(next.document.limits.requests_per_minute);
             previous = Some(self.snapshot.swap(next.clone()));
             Some(Event::Revision {
-                revision: next.document.revision,
+                revision: next.revision,
             })
         });
         let previous = previous.expect("publication runs synchronously");
@@ -560,29 +494,15 @@ impl Core {
             }
         }
         let mut owned = self.listeners.lock().unwrap_or_else(|e| e.into_inner());
-        owned.retain(|listener| {
-            let task = listener
-                .task
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
-            match task.and_then(|task| task.now_or_never()) {
-                Some(result) => {
-                    if let Err(error) = result {
-                        tracing::warn!(%error, "listener ended with an error");
-                    }
-                    false
-                }
-                None => true,
-            }
-        });
         for (id, listener) in &next.listeners {
-            let mut task = listener.task.lock().unwrap_or_else(|e| e.into_inner());
-            if task.is_some() {
+            if listener
+                .started
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
+            {
                 continue;
             }
             let core = Arc::downgrade(self);
-            let handle = match &listener.bound {
+            let serve: futures::future::BoxFuture<'static, Result<()>> = match &listener.bound {
                 Bound::Http { socket, .. } => {
                     let socket = socket
                         .lock()
@@ -601,29 +521,23 @@ impl Core {
                         }
                     });
                     hellas_gateway::serve_listener(socket, router, listener.stop.subscribe())
-                        .map(|result| match result {
-                            Ok(result) => result.map_err(|error| error.to_string()),
-                            Err(error) => Err(error.to_string()),
-                        })
+                        .map(|result| result.map_err(Error::from))
                         .boxed()
-                        .shared()
                 }
                 Bound::Iroh(bound) => {
                     let bound = bound.clone();
                     let stop = listener.stop.subscribe();
-                    tokio::spawn(async move {
-                        bound
-                            .serve(core, stop)
-                            .await
-                            .map_err(|error| error.to_string())
-                    })
-                    .map(|result| result.unwrap_or_else(|error| Err(error.to_string())))
-                    .boxed()
-                    .shared()
+                    async move { bound.serve(core, stop).await }.boxed()
                 }
             };
-            *task = Some(handle);
-            owned.push(listener.clone());
+            let id = id.clone();
+            let stopped = listener.stop.subscribe();
+            let listener = Arc::downgrade(listener);
+            owned.spawn(async move {
+                // Keep the stop receiver alive through physical listener teardown.
+                let _stopped = stopped;
+                (id, listener, serve.await)
+            });
         }
         previous
     }
@@ -642,29 +556,25 @@ impl Core {
 
     pub async fn shutdown(&self) -> Result<()> {
         let _serial = self.configuring.lock().await;
-        self.closed
-            .store(true, std::sync::atomic::Ordering::Release);
         self.jobs.close();
         let snapshot = self.snapshot.load_full();
-        let listeners = self
-            .listeners
-            .lock()
-            .map_err(|_| "listener lock poisoned")?
-            .clone();
-        for listener in &listeners {
+        for listener in snapshot.listeners.values() {
             listener.stop.send_replace(true);
         }
         let mut failure = None;
-        for listener in listeners {
-            let task = listener
-                .task
+        while let Some(result) = std::future::poll_fn(|cx| {
+            self.listeners
                 .lock()
-                .map_err(|_| "listener task lock poisoned")?
-                .clone();
-            if let Some(task) = task
-                && let Err(error) = task.await
+                .unwrap_or_else(|e| e.into_inner())
+                .poll_join_next(cx)
+        })
+        .await
+        {
+            if let Err(error) = result
+                .map_err(Error::from)
+                .and_then(|(_, _, result)| result)
             {
-                failure.get_or_insert(Error::from(error));
+                failure.get_or_insert(error);
             }
         }
         if let Err(error) = snapshot.work.drain().await {
@@ -674,10 +584,6 @@ impl Core {
         if let Some(error) = failure {
             return Err(error);
         }
-        self.listeners
-            .lock()
-            .map_err(|_| "listener lock poisoned")?
-            .clear();
         Ok(())
     }
 }

@@ -1,5 +1,7 @@
 //! A vendor account contributes ordinary daemon entries and authority terms.
-use hellas_sdk::daemon_config::{Backend, BackendKind, Document, Listener, Upstream};
+use hellas_sdk::daemon_config::{
+    Backend, BackendKind, Document, Listener, Resource, ResourceKind, Upstream,
+};
 
 pub struct OpenAiShareOptions {
     pub port: u16,
@@ -10,7 +12,6 @@ pub struct OpenAiShareOptions {
     pub account: hellas_auth::authority::ResourceId,
     pub machine: hellas_authority::model::grant::configuration::ConfiguredBudget,
     pub account_budget: hellas_authority::model::grant::configuration::ConfiguredBudget,
-    pub policy_revision: hellas_auth::authority::Revision,
     pub responses: hellas_authority::model::grant::responses::ResponsesResource,
     pub pricing: hellas_authority::model::grant::pricing::Pricing,
     pub max_job_millis: std::num::NonZeroU64,
@@ -21,16 +22,6 @@ pub struct OpenAiShareOptions {
 pub fn openai_document(options: OpenAiShareOptions) -> Result<Document, hellas_sdk::daemon::Error> {
     // Reject an empty or malformed key before constructing a configuration candidate.
     hellas_providers::OpenAiResponsesFetchProvider::with_bearer(options.bearer_token.clone())?;
-    let policy = crate::responses_policy(crate::ResponsesPolicyOptions {
-        resource: options.resource,
-        account: options.account,
-        revision: options.policy_revision,
-        service: &options.service,
-        method: &options.method,
-        responses: options.responses,
-        pricing: options.pricing,
-        max_job_millis: options.max_job_millis,
-    })?;
     let id = options.service.clone();
     let document = Document {
         listeners: [(
@@ -43,7 +34,7 @@ pub fn openai_document(options: OpenAiShareOptions) -> Result<Document, hellas_s
         )]
         .into(),
         backends: [(
-            id,
+            id.clone(),
             Backend {
                 max_in_flight: options.max_in_flight,
                 kind: BackendKind::Fetch {
@@ -56,11 +47,20 @@ pub fn openai_document(options: OpenAiShareOptions) -> Result<Document, hellas_s
             },
         )]
         .into(),
-        authority: hellas_authority::model::grant::configuration::NodeConfiguration::new(
-            Some(options.machine),
-            [(options.account, options.account_budget)].into(),
-            vec![policy],
-        )?,
+        machine: Some(options.machine),
+        budgets: vec![(options.account, options.account_budget)],
+        resources: vec![Resource {
+            resource: options.resource,
+            account: options.account,
+            name: "responses".into(),
+            backend: id,
+            kind: ResourceKind::Responses {
+                responses: options.responses,
+            },
+            config_change: Default::default(),
+            rates: options.pricing.rates,
+            max_job_millis: options.max_job_millis,
+        }],
         ..Default::default()
     };
     document.validate()?;

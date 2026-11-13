@@ -1,5 +1,5 @@
 //! The text presentation: requests rendered locally into Compute text jobs.
-use super::{TextOptions, route::RouteExecution};
+use super::route::RouteExecution;
 use crate::ComputeEvent;
 use axum::Router;
 use axum::body::Bytes;
@@ -130,13 +130,14 @@ pub(super) struct PreparedGeneration {
 
 impl TextState {
     pub(super) async fn open(
-        options: &TextOptions,
+        path: std::path::PathBuf,
+        model_name: String,
+        default_max_tokens: u32,
         execution: Arc<RouteExecution>,
     ) -> crate::GatewayResult<Self> {
-        if options.default_max_tokens == 0 {
+        if default_max_tokens == 0 {
             return Err(crate::GatewayConfigError::MaxTokens.into());
         }
-        let path = options.model.clone();
         let presentation = tokio::task::spawn_blocking(move || {
             TextPresentation::from_gguf(&path)
                 .map(|presentation| presentation.with_chat_template(Some(ChatTemplate::Qwen3)))
@@ -146,8 +147,8 @@ impl TextState {
         .map_err(|error| crate::GatewayError::Presentation(error.into()))?;
         Ok(Self {
             inference_metrics: super::backend::telemetry::InferenceMetrics::new(),
-            default_max_tokens: options.default_max_tokens,
-            model_name: options.model_name.clone(),
+            default_max_tokens,
+            model_name,
             presentation: Arc::new(presentation),
             execution,
         })

@@ -30,9 +30,7 @@ use futures::Stream;
 use hellas_adaptors::BackendError;
 use hellas_auth::authority::UnixMillis;
 use serde::Serialize;
-use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::convert::Infallible;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -211,52 +209,21 @@ impl
     }
 }
 
-#[derive(Clone)]
-pub struct ImageOptions {
-    pub model_name: String,
-}
-
-#[derive(Clone)]
-pub struct AudioOptions {
-    pub model_name: String,
-    pub default_max_tokens: usize,
-}
-
-#[derive(Clone)]
-pub struct TextOptions {
-    /// Qwen3 GGUF whose rendered program, weights and tokenizer serve the
-    /// text routes; providers must already hold the file.
-    pub model: PathBuf,
-    /// The model name these routes answer to and report.
-    pub model_name: String,
-    pub default_max_tokens: u32,
-}
-
-#[derive(Clone)]
-pub struct ResponsesFetch {
-    pub service: String,
-    pub method: String,
-    /// Merged into every request body before signing.
-    pub overrides: JsonMap<String, JsonValue>,
-}
-
 /// Listener tasks belong to the daemon; accepted jobs belong to its job table.
-pub fn serve_listener(
+pub async fn serve_listener(
     listener: tokio::net::TcpListener,
     app: axum::Router,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
-) -> tokio::task::JoinHandle<GatewayResult<()>> {
-    tokio::spawn(async move {
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<ConnectionId>(),
-        )
-        .with_graceful_shutdown(async move {
-            let _ = shutdown.wait_for(|stop| *stop).await;
-        })
-        .await
-        .map_err(Into::into)
+) -> GatewayResult<()> {
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<ConnectionId>(),
+    )
+    .with_graceful_shutdown(async move {
+        let _ = shutdown.wait_for(|stop| *stop).await;
     })
+    .await
+    .map_err(Into::into)
 }
 
 pub async fn listener_router(
@@ -341,3 +308,6 @@ fn work_error(error: WorkGatewayError) -> Response {
 
 #[cfg(test)]
 mod test_support;
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_server;

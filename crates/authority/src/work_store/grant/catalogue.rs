@@ -8,10 +8,6 @@ use crate::model::grant::{
 use hellas_auth::authority::{ResourceId, Revision};
 
 impl State {
-    pub(crate) fn resource_catalogue(&self) -> impl Iterator<Item = &GrantPolicy> {
-        self.catalogue.values()
-    }
-
     pub fn catalogue(&self) -> impl Iterator<Item = &GrantPolicy> {
         self.catalogue.values().filter(|policy| {
             self.resources

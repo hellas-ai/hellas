@@ -68,11 +68,20 @@ pub enum AdmissionError {
     Cancelled,
 }
 
+/// Execution selected at admission, retained through physical worker teardown.
+pub trait ReservedExecution: Send + Sync + std::fmt::Debug {
+    fn execute<'a>(
+        &'a self,
+        input: super::Admitted,
+        progress: super::PaidProgress,
+    ) -> futures::future::BoxFuture<'a, Result<Vec<hellas_rpc::OutputEventEnvelope>, BackendFault>>;
+}
+
 #[derive(Debug)]
 pub struct WorkPermit {
     domain: CapacityDomain,
     _permit: OwnedSemaphorePermit,
-    backend: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    backend: Option<Arc<dyn ReservedExecution>>,
     stop: Option<Cancellation>,
 }
 impl WorkPermit {
@@ -88,7 +97,7 @@ impl WorkPermit {
         self.domain
     }
     /// Retain the selected backend through physical worker teardown, even after a config swap.
-    pub fn retaining(mut self, backend: Arc<dyn std::any::Any + Send + Sync>) -> Self {
+    pub fn retaining(mut self, backend: Arc<dyn ReservedExecution>) -> Self {
         self.backend = Some(backend);
         self
     }
@@ -107,7 +116,7 @@ pub struct WorkAdmission(Authorization);
 #[derive(Debug)]
 enum Authorization {
     Payment(hellas_auth::PublicKey),
-    Grant(AdmittedWork),
+    Reserved(AdmittedWork),
 }
 
 impl WorkAdmission {
@@ -118,18 +127,18 @@ impl WorkAdmission {
     pub fn caller(&self) -> Option<hellas_auth::PublicKey> {
         match self.0 {
             Authorization::Payment(caller) => Some(caller),
-            Authorization::Grant(_) => None,
+            Authorization::Reserved(_) => None,
         }
     }
-    pub fn backend<B: std::any::Any + Send + Sync>(&self) -> Option<Arc<B>> {
+    pub fn backend(&self) -> Option<Arc<dyn ReservedExecution>> {
         match &self.0 {
-            Authorization::Grant(admitted) => admitted.permit.backend.clone()?.downcast().ok(),
+            Authorization::Reserved(admitted) => admitted.permit.backend.clone(),
             Authorization::Payment(_) => None,
         }
     }
 
     pub fn reserved(permit: WorkPermit) -> Self {
-        Self(Authorization::Grant(AdmittedWork::payment(permit)))
+        Self(Authorization::Reserved(AdmittedWork::payment(permit)))
     }
 
     pub fn grant(
@@ -138,7 +147,7 @@ impl WorkAdmission {
         cancellation: Cancellation,
         dispatch: impl Future<Output = Result<(), BackendFault>> + Send + 'static,
     ) -> Self {
-        Self(Authorization::Grant(AdmittedWork {
+        Self(Authorization::Reserved(AdmittedWork {
             permit,
             funding: Funding::Grant {
                 deadline,
@@ -157,7 +166,7 @@ impl WorkAdmission {
     ) -> Result<AdmittedWork, BackendFault> {
         let admitted = match self.0 {
             Authorization::Payment(_) => AdmittedWork::payment(payment.await?),
-            Authorization::Grant(admitted) => admitted,
+            Authorization::Reserved(admitted) => admitted,
         };
         if admitted.permit.domain != domain {
             return Err(AdmissionError::WrongDomain {
@@ -335,40 +344,6 @@ mod tests {
 
     fn permit(capacity: &Arc<Semaphore>, domain: CapacityDomain) -> WorkPermit {
         WorkPermit::new(domain, capacity.clone().try_acquire_owned().unwrap())
-    }
-
-    #[tokio::test]
-    async fn operator_cancellation_retains_the_selected_backend_until_teardown() {
-        for dispatched in [false, true] {
-            let capacity = Arc::new(Semaphore::new(1));
-            let backend = Arc::new(42u64);
-            let retained = Arc::downgrade(&backend);
-            let stop = Cancellation::new();
-            let admitted = WorkAdmission::reserved(
-                permit(&capacity, CapacityDomain::Fetch)
-                    .retaining(backend)
-                    .cancellable(stop.clone()),
-            )
-            .reserve(CapacityDomain::Fetch, async { panic!("reserved twice") })
-            .await
-            .unwrap();
-            if dispatched {
-                let running = admitted.dispatch().await.unwrap();
-                stop.cancel();
-                running.cancelled().await;
-                assert!(running.check_active().is_err());
-                assert!(retained.upgrade().is_some());
-                assert_eq!(capacity.available_permits(), 0);
-                drop(running);
-            } else {
-                stop.cancel();
-                admitted.cancelled().await;
-                assert!(retained.upgrade().is_some());
-                assert!(admitted.dispatch().await.is_err());
-            }
-            assert!(retained.upgrade().is_none());
-            assert_eq!(capacity.available_permits(), 1);
-        }
     }
 
     #[tokio::test]

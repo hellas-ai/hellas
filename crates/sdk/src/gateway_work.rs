@@ -436,21 +436,8 @@ pub enum Backend {
         execution: hellas_executor::ExecutorHandle,
         policy: InvocationPolicy,
     },
-    /// Paid execution options and, after `quote`, the provider's terms.
-    /// A saved job already carries its price and needs no new quote.
-    Paid {
-        options: crate::paid_client::PaidWorkOptions,
-        policy: Option<InvocationPolicy>,
-        endpoint: iroh::Endpoint,
-        settlement_key: hellas_kernel::Secp256k1Signer,
-        owner: Arc<crate::client_owner::ClientOwner>,
-    },
-    /// One granted resource of an access file.
-    Grant {
-        options: crate::grant_client::GrantSessionOptions,
-        transport: crate::grant_client::GrantTransport,
-        policy: GrantPolicy,
-    },
+    Paid(PaidBackend),
+    Grant(GrantBackend),
     /// This machine, under the caller's own limits.
     #[cfg(feature = "compute")]
     Local {
@@ -459,15 +446,61 @@ pub enum Backend {
     },
 }
 
+#[derive(Clone)]
+pub struct PaidBackend {
+    pub options: crate::paid_client::PaidWorkOptions,
+    pub policy: Option<InvocationPolicy>,
+    pub endpoint: iroh::Endpoint,
+    pub settlement_key: hellas_kernel::Secp256k1Signer,
+    pub owner: Arc<crate::client_owner::ClientOwner>,
+    pub(crate) session: Arc<tokio::sync::Mutex<Option<crate::paid_client::PaidWorkSession>>>,
+}
+#[derive(Clone)]
+pub struct GrantBackend {
+    pub options: crate::grant_client::GrantSessionOptions,
+    pub transport: crate::grant_client::GrantTransport,
+    pub policy: GrantPolicy,
+    pub(crate) session: Arc<tokio::sync::Mutex<Option<crate::grant_client::GrantSession>>>,
+}
+
 impl Backend {
+    pub fn paid(
+        policy: Option<InvocationPolicy>,
+        options: crate::paid_client::PaidWorkOptions,
+        endpoint: iroh::Endpoint,
+        settlement_key: hellas_kernel::Secp256k1Signer,
+        owner: Arc<crate::client_owner::ClientOwner>,
+    ) -> Self {
+        Self::Paid(PaidBackend {
+            options,
+            policy,
+            endpoint,
+            settlement_key,
+            owner,
+            session: Default::default(),
+        })
+    }
+    pub fn grant(
+        policy: GrantPolicy,
+        options: crate::grant_client::GrantSessionOptions,
+        transport: crate::grant_client::GrantTransport,
+    ) -> Self {
+        Self::Grant(GrantBackend {
+            options,
+            transport,
+            policy,
+            session: Default::default(),
+        })
+    }
+
     /// The endpoint requests reach their provider through, if remote.
     pub fn endpoint(&self) -> Option<&iroh::Endpoint> {
         match self {
-            Self::Paid { endpoint, .. }
-            | Self::Grant {
+            Self::Paid(crate::PaidBackend { endpoint, .. })
+            | Self::Grant(crate::GrantBackend {
                 transport: crate::grant_client::GrantTransport::Remote(endpoint),
                 ..
-            } => Some(endpoint),
+            }) => Some(endpoint),
             _ => None,
         }
     }
@@ -476,13 +509,14 @@ impl Backend {
     /// price and can execute without requesting another quote.
     pub async fn quote(&mut self) -> Result<u64, crate::paid_client::PaidClientError> {
         match self {
-            Self::Paid {
+            Self::Paid(crate::PaidBackend {
                 options,
                 policy,
                 endpoint,
                 settlement_key,
                 owner,
-            } => {
+                ..
+            }) => {
                 let quote = crate::paid_client::request_paid_quote(
                     options,
                     endpoint,
@@ -504,17 +538,17 @@ impl Backend {
             Self::Fetch { policy, .. } => {
                 request.admitted(policy, None, hellas_rpc::Assurance::ProducerSigned, false)
             }
-            Self::Paid {
+            Self::Paid(crate::PaidBackend {
                 options, policy, ..
-            } => request.admitted(
+            }) => request.admitted(
                 policy.as_ref().ok_or(WorkGatewayError::Unsupported)?,
                 None,
                 options.assurance,
                 true,
             ),
-            Self::Grant {
+            Self::Grant(crate::GrantBackend {
                 options, policy, ..
-            } => request.admitted(
+            }) => request.admitted(
                 &policy.invocation_policy,
                 policy.https.as_ref(),
                 options.target.trust().required_assurance,
@@ -536,62 +570,18 @@ impl Backend {
         }
         .map_err(rejected)?;
         let price = match self {
-            Self::Paid { options, .. } => options.expected_price,
+            Self::Paid(crate::PaidBackend { options, .. }) => options.expected_price,
             _ => 0,
         };
         Job::from_input(price, input).map_err(rejected)
-    }
-
-    /// An untracked run of one job: the gateway process finishes what it proposes.
-    #[cfg_attr(
-        not(feature = "compute"),
-        expect(
-            unused_variables,
-            reason = "only local runs size their terms to the job"
-        )
-    )]
-    pub fn executor(&self, job: &Job) -> Result<Executor, ExecutionError> {
-        Ok(match self {
-            Self::Fetch { execution, policy } => Executor::Fetch(execution.clone(), policy.clone()),
-            Self::Paid {
-                options,
-                endpoint,
-                settlement_key,
-                owner,
-                ..
-            } => Executor::Paid(crate::execution::PaidExecution {
-                options: options.clone(),
-                endpoint: endpoint.clone(),
-                settlement_key: settlement_key.clone(),
-                owner: owner.clone(),
-                funding: Default::default(),
-                attempt: None,
-                settle: false,
-            }),
-            Self::Grant {
-                options,
-                transport,
-                policy,
-            } => Executor::Grant(crate::execution::GrantExecution {
-                options: options.clone(),
-                transport: transport.clone(),
-                resource: policy.resource,
-                attempt: None,
-            }),
-            #[cfg(feature = "compute")]
-            Self::Local { execution, timeout } => Executor::Local(
-                execution.clone(),
-                crate::execution::local::policy(job.input(), *timeout)?,
-            ),
-        })
     }
 
     /// The Fetch schemas and routes admitted by this backend, each once.
     pub fn fetch_routes(&self) -> Vec<(hellas_rpc::FetchSchema, FetchRoutePolicy)> {
         let policy = match self {
             Self::Fetch { policy, .. } => Some(policy),
-            Self::Paid { policy, .. } => policy.as_ref(),
-            Self::Grant { policy, .. } => Some(&policy.invocation_policy),
+            Self::Paid(crate::PaidBackend { policy, .. }) => policy.as_ref(),
+            Self::Grant(crate::GrantBackend { policy, .. }) => Some(&policy.invocation_policy),
             #[cfg(feature = "compute")]
             Self::Local { .. } => None,
         };
@@ -611,7 +601,7 @@ impl Backend {
 
     /// A grant contributes the HTTP routes its resource authorizes.
     pub fn routes(&self, id: &str) -> Result<Vec<hellas_gateway::Route>, WorkGatewayError> {
-        let Self::Grant { policy, .. } = self else {
+        let Self::Grant(crate::GrantBackend { policy, .. }) = self else {
             return Ok(vec![]);
         };
         grant_routes(policy, id)
@@ -751,12 +741,9 @@ struct Inner {
     target: Backend,
     evaluator: Option<String>,
     signer: Arc<hellas_auth::ProducerSigningKey>,
-    paid: tokio::sync::Mutex<Option<crate::paid_client::PaidWorkSession>>,
-    grant: tokio::sync::Mutex<Option<crate::grant_client::GrantSession>>,
     slots: Arc<Semaphore>,
     capacity: usize,
     down: std::sync::atomic::AtomicBool,
-    retired: std::sync::atomic::AtomicBool,
 }
 impl ExecutorGateway {
     pub fn backend(&self, id: &str) -> Option<&Backend> {
@@ -798,12 +785,9 @@ impl ExecutorGateway {
                     target: entry.backend,
                     evaluator: entry.evaluator,
                     signer: signer.clone(),
-                    paid: tokio::sync::Mutex::new(None),
-                    grant: tokio::sync::Mutex::new(None),
                     slots: Arc::new(Semaphore::new(entry.max_in_flight.get())),
                     capacity: entry.max_in_flight.get(),
                     down: Default::default(),
-                    retired: Default::default(),
                 }),
             )
         }));
@@ -823,9 +807,7 @@ impl ExecutorGateway {
             {
                 continue;
             }
-            backend
-                .retired
-                .store(true, std::sync::atomic::Ordering::Release);
+            backend.slots.close();
             if backend.slots.available_permits() == backend.capacity
                 && let Err(error) = backend.close_sessions().await
             {
@@ -869,14 +851,21 @@ impl ExecutorGateway {
 }
 impl Inner {
     async fn close_sessions(&self) -> Result<(), WorkShutdownError> {
-        if let Some(mut session) = self.grant.lock().await.take() {
-            session
-                .shutdown()
-                .await
-                .map_err(|error| WorkShutdownError::Recovery(Arc::new(error)))?;
-        }
-        if let Some(mut session) = self.paid.lock().await.take() {
-            session.shutdown().await;
+        match &self.target {
+            Backend::Grant(target) => {
+                if let Some(mut session) = target.session.lock().await.take() {
+                    session
+                        .shutdown()
+                        .await
+                        .map_err(|error| WorkShutdownError::Recovery(Arc::new(error)))?;
+                }
+            }
+            Backend::Paid(target) => {
+                if let Some(mut session) = target.session.lock().await.take() {
+                    session.shutdown().await;
+                }
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -907,8 +896,8 @@ impl Inner {
         let request = WorkRequest::Job(job.input().clone());
         let run = async {
             match &self.target {
-                Backend::Paid { .. } => self.run_paid(&job, &stop, &requester).await,
-                Backend::Grant { .. } => self.run_grant(&request, &stop, &requester).await,
+                Backend::Paid(target) => self.run_paid(target, &job, &stop, &requester).await,
+                Backend::Grant(target) => self.run_grant(target, &request, &stop, &requester).await,
                 Backend::Fetch { .. } => self.run_here(&job, stop, &requester).await,
                 #[cfg(feature = "compute")]
                 Backend::Local { .. } => self.run_here(&job, stop, &requester).await,
@@ -945,8 +934,7 @@ impl Inner {
         };
         // Keep a healthy channel open. A failed channel closes after its last
         // accepted job; the next demand opens it and performs recovery once.
-        if (self.down.load(std::sync::atomic::Ordering::Acquire)
-            || self.retired.load(std::sync::atomic::Ordering::Acquire))
+        if (self.down.load(std::sync::atomic::Ordering::Acquire) || self.slots.is_closed())
             && self.slots.available_permits() + 1 == self.capacity
         {
             self.close_sessions().await.map_err(output_error)?;
@@ -967,10 +955,7 @@ impl Inner {
         requester: &Requester<E, WorkGatewayError>,
     ) -> Result<crate::execution::Completed, crate::execution::AttemptError> {
         use crate::execution::AttemptError;
-        let result = self
-            .target
-            .executor(job)
-            .map_err(|error| AttemptError::PreProposal(Box::new(error)))?
+        let result = Executor::new(self.target.clone())
             .run(
                 job,
                 &self.signer,
@@ -988,6 +973,7 @@ impl Inner {
     }
     async fn run_paid<E: GatewayEvent>(
         &self,
+        target: &PaidBackend,
         job: &Job,
         stop: &crate::execution::Stop,
         requester: &Requester<E, WorkGatewayError>,
@@ -996,17 +982,14 @@ impl Inner {
         use std::sync::atomic::{AtomicBool, Ordering};
         let pre = |error: ExecutionError| AttemptError::PreProposal(Box::new(error));
         let committed = |error: ExecutionError| AttemptError::Committed(Box::new(error));
-        let Backend::Paid {
+        let PaidBackend {
             options,
             endpoint,
             settlement_key,
             owner,
             ..
-        } = &self.target
-        else {
-            unreachable!()
-        };
-        let mut guard = before_proposal(None, stop, None, self.paid.lock()).await?;
+        } = target;
+        let mut guard = before_proposal(None, stop, None, target.session.lock()).await?;
         if self.down.load(Ordering::Acquire) && guard.is_some() {
             return Err(pre(ExecutionError::RecoveryRequired));
         }
@@ -1083,7 +1066,7 @@ impl Inner {
             .map_err(|error| committed(error.into()))?;
         // Payment uses the proposal mutex: no new proposal can pass an
         // unacknowledged cumulative certificate.
-        let mut guard = self.paid.lock().await;
+        let mut guard = target.session.lock().await;
         let result = guard
             .as_mut()
             .ok_or_else(|| committed(ExecutionError::Identity))?
@@ -1102,6 +1085,7 @@ impl Inner {
 
     async fn run_grant<E: GatewayEvent>(
         &self,
+        target: &GrantBackend,
         request: &WorkRequest,
         stop: &crate::execution::Stop,
         requester: &Requester<E, WorkGatewayError>,
@@ -1109,15 +1093,13 @@ impl Inner {
         use crate::execution::{AttemptError, before_proposal, prepare_grant_input};
         let pre = |error: ExecutionError| AttemptError::PreProposal(Box::new(error));
         let committed = |error: ExecutionError| AttemptError::Committed(Box::new(error));
-        let Backend::Grant {
+        let GrantBackend {
             options,
             transport,
             policy,
-        } = &self.target
-        else {
-            unreachable!()
-        };
-        let mut guard = before_proposal(None, stop, None, self.grant.lock()).await?;
+            ..
+        } = target;
+        let mut guard = before_proposal(None, stop, None, target.session.lock()).await?;
         if self.down.load(std::sync::atomic::Ordering::Acquire) && guard.is_some() {
             return Err(pre(ExecutionError::RecoveryRequired));
         }
@@ -1176,8 +1158,8 @@ impl Inner {
             .collect(Some(requester.progress()), Some(requester.accepted()))
             .await
             .map_err(|error| committed(error.into()))?;
-        let result = self
-            .grant
+        let result = target
+            .session
             .lock()
             .await
             .as_mut()
@@ -1277,13 +1259,8 @@ impl WorkExecutionBackend for ExecutorGateway {
         Box::pin(async move {
             let mut drained = self.jobs.drain().await;
             for backend in self.backends.values() {
-                if let Some(mut session) = backend.grant.lock().await.take()
-                    && let Err(error) = session.shutdown().await
-                {
-                    drained = drained.and(Err(WorkShutdownError::Recovery(Arc::new(error))));
-                }
-                if let Some(mut session) = backend.paid.lock().await.take() {
-                    session.shutdown().await;
+                if let Err(error) = backend.close_sessions().await {
+                    drained = drained.and(Err(error));
                 }
             }
             drained

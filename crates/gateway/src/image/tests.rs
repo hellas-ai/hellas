@@ -97,6 +97,7 @@ impl WorkExecutionBackend for Fake {
 async fn app(work: Arc<Fake>) -> Router {
     crate::router::router(
         vec![crate::test_support::route(crate::Presentation::Model {
+            modality: hellas_client::model::ModelKind::Image,
             model: "klein".into(),
             package: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../client/src/model/flux/fixture"),

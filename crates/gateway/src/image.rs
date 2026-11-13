@@ -1,5 +1,5 @@
 //! Image preparation and PNG encoding stay on the caller's side of Compute.
-use super::{GatewayError, GatewayResult, ImageOptions, json_error, route::RouteExecution};
+use super::{GatewayError, GatewayResult, json_error, route::RouteExecution};
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, State, rejection::JsonRejection},
@@ -20,10 +20,7 @@ struct ImageState {
     name: String,
     work: Arc<RouteExecution>,
 }
-pub(super) async fn router(
-    options: &ImageOptions,
-    work: Arc<RouteExecution>,
-) -> GatewayResult<Router> {
+pub(super) async fn router(model_name: String, work: Arc<RouteExecution>) -> GatewayResult<Router> {
     let package = work
         .packages
         .values()
@@ -38,7 +35,7 @@ pub(super) async fn router(
         .route(PATH, post(handle))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(Arc::new(ImageState {
-            name: options.model_name.clone(),
+            name: model_name,
             work,
         })))
 }

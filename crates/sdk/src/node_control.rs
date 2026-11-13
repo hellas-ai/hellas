@@ -100,10 +100,6 @@ impl NodeControl {
         }
     }
 
-    pub(crate) fn remote_admission(&self) -> RemoteControlAdmission {
-        self.remote_admission.clone()
-    }
-
     /// Compose Work control and authentication from one writer, never two node handles.
     pub fn with_work(work: hellas_authority::grant_service::WorkAdministration) -> Self {
         let mut control = Self::new(work.node());

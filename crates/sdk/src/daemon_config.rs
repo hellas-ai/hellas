@@ -1,30 +1,37 @@
 //! The daemon's single configuration document. Runtime credentials are write-only.
-use hellas_auth::authority::{ResourceId, Revision};
+use hellas_auth::authority::ResourceId;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, net::SocketAddr, num::NonZeroUsize, path::PathBuf};
 mod entries;
 mod fetch;
+mod resources;
+pub use resources::{Resource, ResourceKind};
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Document {
-    #[serde(default = "initial_revision")]
-    pub revision: Revision,
     pub listeners: BTreeMap<String, Listener>,
     pub backends: BTreeMap<String, Backend>,
     #[serde(default)]
     pub routes: Vec<hellas_gateway::Route>,
     #[serde(default)]
-    pub authority: hellas_authority::model::grant::configuration::NodeConfiguration,
+    pub resources: Vec<Resource>,
+    #[serde(default)]
+    pub machine: Option<hellas_authority::model::grant::configuration::ConfiguredBudget>,
+    #[serde(default)]
+    pub budgets: Vec<(
+        ResourceId,
+        hellas_authority::model::grant::configuration::ConfiguredBudget,
+    )>,
     #[serde(default)]
     pub limits: Limits,
 }
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Limits {
     pub requests_per_minute: Option<std::num::NonZeroU64>,
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Listener {
     Http {
@@ -39,13 +46,13 @@ pub enum Listener {
         backends: Vec<String>,
     },
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Backend {
     pub max_in_flight: NonZeroUsize,
     #[serde(flatten)]
     pub kind: BackendKind,
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BackendKind {
     Local {
@@ -68,6 +75,16 @@ pub enum BackendKind {
     Paid {
         provider: String,
         #[serde(default)]
+        addresses: Vec<SocketAddr>,
+        #[serde(default = "acceptance_blocks")]
+        acceptance_blocks: u64,
+        #[serde(default = "terminal_blocks")]
+        terminal_blocks: u64,
+        #[serde(default = "payment_blocks")]
+        payment_blocks: u64,
+        #[serde(default)]
+        timeout_seconds: Option<u64>,
+        #[serde(default)]
         chain: Option<hellas_chain::genesis::CustomChainFile>,
         max_price: u64,
         #[serde(default)]
@@ -84,21 +101,16 @@ pub enum BackendKind {
 fn gpu() -> String {
     "auto".into()
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Trust {
     pub store: PathBuf,
     pub policy: String,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Upstream {
-    OpenaiHttp {
-        url: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        secret: Option<String>,
-    },
     Http {
         allowed_hosts: Vec<String>,
         #[serde(default)]
@@ -111,7 +123,7 @@ pub enum Upstream {
         secret: Option<String>,
     },
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Credential {
     #[serde(default = "web_pki")]
@@ -122,19 +134,6 @@ pub struct Credential {
     pub header_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<String>,
-}
-
-impl Default for Document {
-    fn default() -> Self {
-        Self {
-            revision: Revision(0),
-            listeners: BTreeMap::new(),
-            backends: BTreeMap::new(),
-            routes: vec![],
-            authority: Default::default(),
-            limits: Default::default(),
-        }
-    }
 }
 
 impl Document {
@@ -189,19 +188,15 @@ impl Document {
                     }
                 }
                 BackendKind::Fetch {
-                    upstream:
-                        Upstream::OpenaiResponses { secret } | Upstream::OpenaiHttp { secret, .. },
+                    upstream: Upstream::OpenaiResponses { secret },
                     ..
-                } => visit(id, "", secret),
+                } => visit(id, "bearer", secret),
                 _ => {}
             }
         }
     }
 
     pub fn validate(&self) -> Result<(), &'static str> {
-        self.authority
-            .validate()
-            .map_err(|_| "invalid authority configuration")?;
         // One provider enrollment owns one transport identity and set of paid journals.
         if self
             .listeners
@@ -241,11 +236,6 @@ impl Document {
                 }
             }
         }
-        for route in &self.routes {
-            for id in &route.backends {
-                self.backends.get(id).ok_or("unknown HTTP backend")?;
-            }
-        }
         Ok(())
     }
 
@@ -254,7 +244,6 @@ impl Document {
         &self,
         resolved: &[hellas_gateway::BackendInfo],
     ) -> Result<(), &'static str> {
-        self.validate()?;
         for listener in self.listeners.values() {
             let Listener::Iroh { backends, .. } = listener else {
                 continue;
@@ -284,13 +273,19 @@ impl Document {
     }
 }
 
-fn initial_revision() -> Revision {
-    Revision(0)
-}
-
 #[cfg(test)]
 mod tests;
 
 fn web_pki() -> hellas_rpc::http_fetch::HttpTrustRoots {
     hellas_rpc::http_fetch::HttpTrustRoots::WebPki
+}
+
+fn acceptance_blocks() -> u64 {
+    300
+}
+fn terminal_blocks() -> u64 {
+    3000
+}
+fn payment_blocks() -> u64 {
+    600
 }

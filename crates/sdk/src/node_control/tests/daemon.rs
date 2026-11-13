@@ -4,7 +4,6 @@ use crate::{
     daemon_config::{Document, Listener},
 };
 use futures::StreamExt;
-use hellas_gateway::WorkExecutionBackend as _;
 use hellas_private::StoreLocation;
 
 async fn fixture() -> Fixture {
@@ -112,10 +111,10 @@ async fn access(f: &Fixture) -> hellas_gateway::GatewayAccess {
         .unwrap()
 }
 
-fn request(document: &Document) -> ConfigureRequest {
+fn request(document: &Document, expected_revision: u64) -> ConfigureRequest {
     ConfigureRequest {
         authorization: ROOT_GRANT.0.to_vec(),
-        expected_revision: document.revision.0,
+        expected_revision,
         document: serde_json::to_vec(document).unwrap(),
     }
 }
@@ -161,7 +160,7 @@ async fn configure_commits_and_publishes_after_the_control_connection_closes() {
             },
         );
         let mut events = core.watch().1;
-        let mut pending = tokio::spawn(async move { rpc.configure(request(&document)).await });
+        let mut pending = tokio::spawn(async move { rpc.configure(request(&document, 0)).await });
         tokio::select! {
             permit = committed.acquire() => permit.unwrap().forget(),
             result = &mut pending => panic!("Configure ended before commit: {result:?}"),
@@ -170,7 +169,7 @@ async fn configure_commits_and_publishes_after_the_control_connection_closes() {
             f.node.configuration().await.unwrap().unwrap().revision,
             Revision(1)
         );
-        assert_eq!(core.watch().0.document.revision, Revision(0));
+        assert_eq!(core.watch().0.revision, Revision(0));
         assert!(core.http_addresses().is_empty());
         connection.close(0u32.into(), b"caller disconnected after commit");
         let _ = served.await.unwrap();
@@ -215,32 +214,32 @@ async fn watch_reports_configure_and_cancellation_without_echoing_keys() {
         let mut watch = rpc.watch(WatchRequest { authorization: ROOT_GRANT.0.to_vec() }).await.unwrap();
         assert!(matches!(watch.next().await.unwrap().unwrap().update, Some(watch_response::Update::Snapshot(_))));
         let mut document: Document = serde_json::from_value(serde_json::json!({
-            "revision": 0, "listeners": {}, "limits": { "requests_per_minute": 1 }, "backends": {
+            "listeners": {}, "limits": { "requests_per_minute": 1 }, "backends": {
                 "openai": { "kind": "fetch", "max_in_flight": 2, "service": "openai", "method": "responses", "upstream": {"kind": "openai_responses", "secret": "input-only-key"} }
             }
         })).unwrap();
-        assert_eq!(rpc.configure(request(&document)).await.unwrap().revision, 1);
+        assert_eq!(rpc.configure(request(&document, core.watch().0.revision.0)).await.unwrap().revision, 1);
         let event = watch.next().await.unwrap().unwrap();
         let Some(watch_response::Update::Event(bytes)) = event.update else { panic!("expected event") };
         assert!(matches!(serde_json::from_slice(&bytes).unwrap(), hellas_gateway::jobs::Event::Revision { revision: Revision(1) }));
         let stored = f.node.configuration().await.unwrap().unwrap();
         assert!(!stored.document.contains("input-only-key"));
-        assert_eq!(stored.secrets.0["openai"][""], "input-only-key");
+        assert_eq!(stored.secrets.0["openai"]["bearer"], "input-only-key");
         assert!(!serde_json::to_string(&core.watch().0).unwrap().contains("input-only-key"));
         let mut fresh = rpc.watch(WatchRequest { authorization: ROOT_GRANT.0.to_vec() }).await.unwrap();
         let Some(watch_response::Update::Snapshot(bytes)) = fresh.next().await.unwrap().unwrap().update else { panic!("initial snapshot") };
         assert!(!String::from_utf8(bytes).unwrap().contains("input-only-key"));
         drop(fresh);
-        assert!(rpc.configure(request(&document)).await.is_err());
+        assert!(rpc.configure(request(&document, 0)).await.is_err());
         document = core.watch().0.document;
         let old = serde_json::to_value(&document).unwrap();
         document.listeners.insert("invalid".into(), Listener::Iroh { chain: None,
 port: 0, backends: vec!["missing".into()] });
-        assert!(rpc.configure(request(&document)).await.is_err());
+        assert!(rpc.configure(request(&document, core.watch().0.revision.0)).await.is_err());
         assert_eq!(serde_json::to_value(&core.watch().0.document).unwrap(), old);
         assert_eq!(f.node.configuration().await.unwrap().unwrap(), stored);
         let document = core.watch().0.document;
-        assert_eq!(rpc.configure(request(&document)).await.unwrap().revision, 2);
+        assert_eq!(rpc.configure(request(&document, core.watch().0.revision.0)).await.unwrap().revision, 2);
         assert_eq!(f.node.configuration().await.unwrap().unwrap().secrets, stored.secrets);
         let _revision = watch.next().await.unwrap().unwrap();
         let job = core.jobs.admit(&hellas_gateway::jobs::Request { origin: hellas_gateway::jobs::Origin::Local, method: "POST".into(), path: "/held".into() }).unwrap();
@@ -256,7 +255,7 @@ port: 0, backends: vec!["missing".into()] });
         let _ = served.await.unwrap();
         core.shutdown().await.unwrap();
         let restored = Core::restore(options(&f)).await.unwrap();
-        assert_eq!(restored.watch().0.document.revision, Revision(2));
+        assert_eq!(restored.watch().0.revision, Revision(2));
         restored.shutdown().await.unwrap();
     }).await;
 }
@@ -389,7 +388,9 @@ async fn removing_a_backend_preserves_its_accepted_request_and_routes_the_next_o
                     .collect(),
             },
         });
-        rpc.configure(request(&document)).await.unwrap();
+        rpc.configure(request(&document, core.watch().0.revision.0))
+            .await
+            .unwrap();
         let execution = core.execution();
         let outgoing = execution.backend("first").unwrap().endpoint().unwrap();
         assert_eq!(
@@ -442,11 +443,11 @@ async fn removing_a_backend_preserves_its_accepted_request_and_routes_the_next_o
             .unwrap();
         let stored = f.node.configuration().await.unwrap();
         assert!(
-            rpc.configure(request(&core.watch().0.document))
+            rpc.configure(request(&core.watch().0.document, core.watch().0.revision.0))
                 .await
                 .is_err()
         );
-        assert_eq!(core.watch().0.document.revision, Revision(1));
+        assert_eq!(core.watch().0.revision, Revision(1));
         assert_eq!(f.node.configuration().await.unwrap(), stored);
         assert!(!held.is_finished());
         trust
@@ -459,7 +460,9 @@ async fn removing_a_backend_preserves_its_accepted_request_and_routes_the_next_o
             .unwrap();
         let mut document = core.watch().0.document;
         document.remove_backend("first").unwrap();
-        rpc.configure(request(&document)).await.unwrap();
+        rpc.configure(request(&document, core.watch().0.revision.0))
+            .await
+            .unwrap();
         assert!(!held.is_finished());
         assert_eq!(core.watch().0.jobs[0].backend.as_deref(), Some("first"));
         send().await;
@@ -473,7 +476,7 @@ async fn removing_a_backend_preserves_its_accepted_request_and_routes_the_next_o
         opts.owner = Some(Arc::new(FRIEND.passkey()));
         let restored = Core::restore(opts).await.unwrap();
         let view = restored.watch().0;
-        assert_eq!(view.document.revision, Revision(2));
+        assert_eq!(view.revision, Revision(2));
         assert_eq!(view.backends.len(), 1);
         assert!(matches!(
             &view.document.backends["second"].kind,
@@ -518,15 +521,25 @@ async fn an_unbound_daemon_can_install_its_iroh_listener_after_owner_binding() {
                 backends: vec![],
             },
         );
-        assert!(rpc.configure(request(&document)).await.is_err());
-        assert_eq!(core.watch().0.document.revision, Revision(0));
+        assert!(
+            rpc.configure(request(&document, core.watch().0.revision.0))
+                .await
+                .is_err()
+        );
+        assert_eq!(core.watch().0.revision, Revision(0));
         rpc.bind_provider(BindProviderRequest {
             authorization: ROOT_GRANT.0.to_vec(),
             enrollment: enrollment.canonical_bytes(),
         })
         .await
         .unwrap();
-        assert_eq!(rpc.configure(request(&document)).await.unwrap().revision, 1);
+        assert_eq!(
+            rpc.configure(request(&document, core.watch().0.revision.0))
+                .await
+                .unwrap()
+                .revision,
+            1
+        );
         assert_eq!(core.iroh_addresses().len(), 1);
         let bound = core.iroh_endpoints().pop().unwrap();
         let mut invalid = core.watch().0.document;
@@ -538,18 +551,26 @@ async fn an_unbound_daemon_can_install_its_iroh_listener_after_owner_binding() {
             unreachable!()
         };
         profile.genesis_json = "{}".into();
-        assert!(rpc.configure(request(&invalid)).await.is_err());
-        assert_eq!(core.watch().0.document.revision, Revision(1));
+        assert!(rpc.configure(request(&invalid, 1)).await.is_err());
+        assert_eq!(core.watch().0.revision, Revision(1));
         assert!(!bound.is_closed());
         let mut stopped = core.watch().0.document;
         stopped.listeners.clear();
-        assert_eq!(rpc.configure(request(&stopped)).await.unwrap().revision, 2);
+        assert_eq!(
+            rpc.configure(request(&stopped, 1)).await.unwrap().revision,
+            2
+        );
         assert!(
             bound.is_closed(),
             "Configure joins the removed listener before returning"
         );
-        document.revision = Revision(2);
-        assert_eq!(rpc.configure(request(&document)).await.unwrap().revision, 3);
+        assert_eq!(
+            rpc.configure(request(&document, core.watch().0.revision.0))
+                .await
+                .unwrap()
+                .revision,
+            3
+        );
         assert_eq!(core.iroh_addresses().len(), 1);
         assert_eq!(
             serde_json::to_value(&core.watch().0.document.listeners).unwrap(),
@@ -561,46 +582,6 @@ async fn an_unbound_daemon_can_install_its_iroh_listener_after_owner_binding() {
         core.shutdown().await.unwrap();
         client.close().await;
         server.close().await;
-        f.content.close().await;
-        f.node.close().await;
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn embedded_clients_share_the_daemons_funding_owner() {
-    hellas_authority::test_support::within(async {
-        let f = fixture().await;
-        let opts = options(&f);
-        let chain = opts.chain.clone();
-        let delegate = opts.settlement.party_key();
-        let core = Core::open(opts, Document::default()).await.unwrap();
-        let (first, second) =
-            tokio::join!(core.client_resources(&chain), core.client_resources(&chain));
-        let owner = first.unwrap().0;
-        assert!(Arc::ptr_eq(&owner, &second.unwrap().0));
-        // Independent owners cannot share the wallet's exclusive writer lock.
-        assert!(
-            crate::client_owner::ClientOwner::new(Arc::new(ROOT.passkey()), delegate, &chain,)
-                .is_err()
-        );
-        let endpoint = core.client_endpoint().await.unwrap();
-        assert_eq!(endpoint.id(), core.client_endpoint().await.unwrap().id());
-        core.execution().drain().await.unwrap();
-        assert!(
-            !endpoint.is_closed(),
-            "backend retirement does not close daemon transport"
-        );
-        core.shutdown().await.unwrap();
-        assert!(endpoint.is_closed());
-        assert!(core.client_endpoint().await.is_err());
-        assert!(core.client_resources(&chain).await.is_err());
-        drop(core);
-        drop(owner);
-        assert!(
-            crate::client_owner::ClientOwner::new(Arc::new(ROOT.passkey()), delegate, &chain,)
-                .is_ok()
-        );
         f.content.close().await;
         f.node.close().await;
     })

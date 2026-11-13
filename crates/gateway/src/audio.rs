@@ -2,7 +2,7 @@
 //! `hellas_adaptors::openai::audio_transcriptions`, and decoded through one
 //! Compute job.
 use super::backend::provenance::json_response;
-use super::{AudioOptions, GatewayError, GatewayResult, json_error, route::RouteExecution};
+use super::{GatewayError, GatewayResult, json_error, route::RouteExecution};
 use axum::{
     Router,
     extract::{DefaultBodyLimit, FromRequest, Multipart, Request, State},
@@ -17,14 +17,16 @@ pub(super) const PATH: &str = "/v1/audio/transcriptions";
 pub(super) const MAX_REQUEST_BYTES: usize = wav::MAX_WAV_BYTES + (64 << 10);
 
 struct AudioState {
-    options: AudioOptions,
+    model_name: String,
+    max_tokens: usize,
     work: Arc<RouteExecution>,
 }
 pub(super) async fn router(
-    options: &AudioOptions,
+    model_name: String,
+    max_tokens: usize,
     work: Arc<RouteExecution>,
 ) -> GatewayResult<Router> {
-    if options.default_max_tokens == 0 {
+    if max_tokens == 0 {
         return Err(super::GatewayConfigError::MaxTokens.into());
     }
     let package = work
@@ -35,11 +37,12 @@ pub(super) async fn router(
     let capacity = package
         .transcription_capacity()
         .ok_or_else(|| GatewayError::Presentation("audio route requires a Whisper model".into()))?;
-    if options.default_max_tokens > capacity {
+    if max_tokens > capacity {
         return Err(super::GatewayConfigError::MaxTokens.into());
     }
     let state = Arc::new(AudioState {
-        options: options.clone(),
+        model_name,
+        max_tokens,
         work,
     });
     Ok(Router::new()
@@ -92,7 +95,7 @@ async fn handle(
             return crate::request_error(error);
         }
     }
-    let (file, language, text) = match fields.finish(&state.options.model_name) {
+    let (file, language, text) = match fields.finish(&state.model_name) {
         Ok(fields) => fields,
         Err(error) => return crate::request_error(error),
     };
@@ -108,7 +111,7 @@ async fn handle(
             &ModelRequest::Transcription {
                 samples: &samples,
                 language: language.as_deref(),
-                max_new_tokens: state.options.default_max_tokens,
+                max_new_tokens: state.max_tokens,
             },
         )
         .await

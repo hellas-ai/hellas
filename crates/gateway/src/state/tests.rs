@@ -9,14 +9,13 @@ fn text_model() -> std::path::PathBuf {
 
 async fn open(work: Arc<dyn WorkExecutionBackend>) -> TextState {
     TextState::open(
-        &crate::TextOptions {
-            model: text_model(),
-            model_name: "mini-qwen3".into(),
-            default_max_tokens: 128,
-        },
+        text_model(),
+        "mini-qwen3".into(),
+        128,
         crate::test_support::execution(
             work,
             crate::Presentation::Model {
+                modality: hellas_client::model::ModelKind::Text,
                 model: "mini-qwen3".into(),
                 package: text_model(),
                 max_tokens: 128,

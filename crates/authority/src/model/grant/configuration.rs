@@ -24,7 +24,7 @@ pub struct ConfiguredBudget {
 #[serde(deny_unknown_fields)]
 pub struct NodeConfiguration {
     machine: Option<ConfiguredBudget>,
-    accounts: Vec<(ResourceId, ConfiguredBudget)>,
+    accounts: BTreeMap<ResourceId, ConfiguredBudget>,
     resources: Vec<GrantPolicy>,
 }
 
@@ -55,7 +55,7 @@ impl NodeConfiguration {
     ) -> Result<Self, GrantError> {
         let configuration = Self {
             machine,
-            accounts: accounts.into_iter().collect(),
+            accounts,
             resources,
         };
         configuration.validate()?;
@@ -76,15 +76,7 @@ impl NodeConfiguration {
                 .iter()
                 .any(|p| !names.insert(&p.name) || !ids.insert(p.resource))
             || (machine.is_none() && !resources.is_empty())
-            || accounts
-                .iter()
-                .map(|(id, _)| id)
-                .collect::<std::collections::BTreeSet<_>>()
-                .len()
-                != accounts.len()
-            || resources
-                .iter()
-                .any(|p| !accounts.iter().any(|(id, _)| *id == p.account))
+            || resources.iter().any(|p| !accounts.contains_key(&p.account))
             || accounts
                 .iter()
                 .any(|(account, _)| !resources.iter().any(|p| p.account == *account))
@@ -99,10 +91,6 @@ impl NodeConfiguration {
 
     pub fn machine(&self) -> Option<&ConfiguredBudget> {
         self.machine.as_ref()
-    }
-
-    pub fn accounts(&self) -> impl Iterator<Item = &(ResourceId, ConfiguredBudget)> {
-        self.accounts.iter()
     }
 
     pub fn resources(&self) -> &[GrantPolicy] {

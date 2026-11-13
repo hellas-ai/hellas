@@ -51,6 +51,10 @@ impl WorkBackend for Controlled {
 #[tokio::test]
 async fn paid_jobs_collect_concurrently_and_pay_in_completion_order() {
     paid_concurrency(false).await;
+}
+
+#[tokio::test]
+async fn cancelling_delivery_keeps_paid_work_and_credit_accounting() {
     paid_concurrency(true).await;
 }
 

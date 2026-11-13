@@ -90,6 +90,7 @@ hellas-chain = { workspace = true, features = ["test-support"] }
 hellas-channel = { workspace = true, features = ["test-support"] }
 # Provider fixtures run Compute in this test binary's Catena child.
 hellas-executor = { workspace = true, features = ["compute"] }
+hellas-gateway = { workspace = true, features = ["test-support"] }
 libloading = "0.9"
 rcgen = "0.14"
 reqwest = { workspace = true, features = ["json"] }

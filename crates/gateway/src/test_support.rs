@@ -62,4 +62,4 @@ pub fn job() -> Arc<crate::jobs::Job> {
         .unwrap()
 }
 
-pub(crate) mod server;
+pub(crate) use crate::test_server as server;

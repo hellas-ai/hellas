@@ -115,6 +115,7 @@ impl WorkExecutionBackend for Fake {
 }
 fn options(name: &str) -> crate::Route {
     crate::test_support::route(crate::Presentation::Model {
+        modality: hellas_client::model::ModelKind::Transcription,
         model: name.into(),
         package: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../client/src/model/whisper/mini"),

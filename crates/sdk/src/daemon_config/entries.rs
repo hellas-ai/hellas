@@ -1,7 +1,7 @@
 //! Document edits shared by the command line and embedding applications.
 use super::*;
 use hellas_gateway::{HttpRoute, HttpTarget, Presentation, Route};
-use hellas_rpc::http_fetch::{HttpTls, HttpTrustRoots};
+use hellas_rpc::http_fetch::HttpTls;
 
 impl Document {
     pub fn add_upstream(
@@ -13,11 +13,7 @@ impl Document {
         if self.backends.contains_key(name) {
             return Err("backend already exists".into());
         }
-        let upstream = Upstream::OpenaiHttp {
-            url: url.trim_end_matches('/').into(),
-            secret,
-        };
-        upstream.http_configuration()?;
+        let upstream = Upstream::openai_http(url, secret)?;
         self.backends.insert(
             name.into(),
             Backend {
@@ -40,39 +36,54 @@ impl Document {
         let BackendKind::Fetch {
             service,
             method,
-            upstream: Upstream::OpenaiHttp { url, secret: _ },
+            upstream: Upstream::Http { credentials, .. },
         } = &self.backends.get(id).ok_or("unknown upstream")?.kind
         else {
-            return Err("backend is not an OpenAI-compatible HTTP upstream".into());
+            return Err("backend is not an HTTP upstream".into());
         };
-        let base = url.strip_suffix("/v1").unwrap_or(url);
-        let routes =
-            ["/v1/responses", "/v1/chat/completions", "/v1/completions"].map(|path| Route {
-                backends: vec![id.into()],
-                presentation: Presentation::Http {
-                    targets: [(
-                        id.into(),
-                        HttpTarget {
-                            service: service.clone(),
-                            method: method.clone(),
-                            route: HttpRoute {
-                                path: path.into(),
-                                method: "POST".into(),
-                                url: format!("{base}{path}"),
-                                credential: Some("api".into()),
-                                tls: HttpTls {
-                                    roots: HttpTrustRoots::WebPki,
-                                    spki_sha256: vec![],
+        let api = credentials
+            .get("api")
+            .ok_or("upstream has no model API credential")?;
+        let [origin] = api.allowed_origins.as_slice() else {
+            return Err("model API needs one origin".into());
+        };
+        let routes = api
+            .allowed_paths
+            .iter()
+            .map(|upstream_path| {
+                let suffix = upstream_path
+                    .rsplit_once("/v1/")
+                    .ok_or("model API needs a /v1/ path")?
+                    .1;
+                Ok(Route {
+                    backends: vec![id.into()],
+                    presentation: Presentation::Http {
+                        targets: [(
+                            id.into(),
+                            HttpTarget {
+                                service: service.clone(),
+                                method: method.clone(),
+                                route: HttpRoute {
+                                    path: format!("/v1/{suffix}"),
+                                    method: "POST".into(),
+                                    url: format!("{origin}{upstream_path}"),
+                                    credential: Some("api".into()),
+                                    tls: HttpTls {
+                                        roots: api.trust_roots.clone(),
+                                        spki_sha256: vec![],
+                                    },
+                                    headers: vec![],
+                                    max_response_bytes:
+                                        hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES,
+                                    models: Some(vec![model.into()]),
                                 },
-                                headers: vec![],
-                                max_response_bytes: hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES,
-                                models: Some(vec![model.into()]),
                             },
-                        },
-                    )]
-                    .into(),
-                },
-            });
+                        )]
+                        .into(),
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>, crate::daemon::Error>>()?;
         for route in routes {
             self.add_route(route)?;
         }
@@ -100,7 +111,7 @@ impl Document {
             (Presentation::Http { targets }, Presentation::Http { targets: added }) => {
                 targets.extend(added.clone())
             }
-            (old, new) if serde_json::to_vec(old)? == serde_json::to_vec(new)? => {}
+            (old, new) if old == new => {}
             _ => return Err("route presentations disagree".into()),
         }
         existing.backends.extend(route.backends);
@@ -111,6 +122,7 @@ impl Document {
         if self.backends.remove(id).is_none() {
             return Err("unknown backend".into());
         }
+        self.resources.retain(|resource| resource.backend != id);
         for listener in self.listeners.values_mut() {
             if let Listener::Iroh { backends, .. } = listener {
                 backends.retain(|backend| backend != id);
@@ -128,10 +140,7 @@ impl Document {
 }
 
 impl Upstream {
-    pub(super) fn http_configuration(&self) -> Result<Self, crate::daemon::Error> {
-        let Self::OpenaiHttp { url, secret } = self else {
-            return Err("not an HTTP upstream".into());
-        };
+    fn openai_http(url: &str, secret: Option<String>) -> Result<Self, crate::daemon::Error> {
         let parsed = url::Url::parse(url)?;
         if parsed.scheme() != "https"
             || !parsed.username().is_empty()

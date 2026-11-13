@@ -87,16 +87,8 @@ impl From<WorkGatewayBusy> for Refusal {
     }
 }
 
-/// Embedders install a fixed list. Hooks can refuse or account, never route.
-pub trait Hook: Send + Sync {
-    fn admit(&self, request: &Request) -> Result<Box<dyn Reservation>, Refusal>;
-}
-pub trait Reservation: Send + Sync {
-    fn finish(self: Box<Self>, outcome: Outcome);
-}
-
 pub struct Jobs {
-    hooks: Vec<Arc<dyn Hook>>,
+    limit: Arc<RequestLimit>,
     state: Mutex<Table>,
     draining: tokio::sync::Mutex<()>,
     events: broadcast::Sender<Event>,
@@ -136,13 +128,13 @@ impl Table {
 }
 impl Default for Jobs {
     fn default() -> Self {
-        Self::new(vec![])
+        Self::new(Arc::new(RequestLimit::default()))
     }
 }
 impl Jobs {
-    pub fn new(hooks: Vec<Arc<dyn Hook>>) -> Self {
+    pub fn new(limit: Arc<RequestLimit>) -> Self {
         Self {
-            hooks,
+            limit,
             state: Mutex::default(),
             draining: Default::default(),
             events: broadcast::channel(1024).0,
@@ -150,18 +142,7 @@ impl Jobs {
     }
 
     pub fn admit(self: &Arc<Self>, request: &Request) -> Result<Arc<Job>, Refusal> {
-        let mut reservations = Vec::new();
-        for hook in &self.hooks {
-            match hook.admit(request) {
-                Ok(reservation) => reservations.push(reservation),
-                Err(error) => {
-                    for reservation in reservations {
-                        reservation.finish(Outcome::Rejected);
-                    }
-                    return Err(error);
-                }
-            }
-        }
+        let mut reservation = Some(self.limit.admit()?);
         let admitted = (|| {
             let mut state = self.state.lock().map_err(|_| WorkGatewayBusy)?;
             if state.closed {
@@ -178,7 +159,7 @@ impl Jobs {
                 jobs: self.clone(),
                 stop: Cancellation::new(),
                 accepted: AtomicBool::new(false),
-                reservations: Mutex::new(Some(std::mem::take(&mut reservations))),
+                reservation: Mutex::new(reservation.take()),
             });
             let info = Info {
                 id,
@@ -198,10 +179,8 @@ impl Jobs {
             );
             Ok(job)
         })();
-        if admitted.is_err() {
-            for reservation in reservations {
-                reservation.finish(Outcome::Rejected);
-            }
+        if let Some(reservation) = reservation {
+            reservation.finish(Outcome::Rejected);
         }
         admitted.map_err(Into::into)
     }
@@ -248,6 +227,13 @@ impl Jobs {
         true
     }
 
+    pub fn is_closed(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .closed
+    }
+
     pub fn close(&self) {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
     }
@@ -282,7 +268,7 @@ pub struct Job {
     jobs: Arc<Jobs>,
     stop: Cancellation,
     accepted: AtomicBool,
-    reservations: Mutex<Option<Vec<Box<dyn Reservation>>>>,
+    reservation: Mutex<Option<limits::Hold>>,
 }
 impl Job {
     pub fn id(&self) -> u64 {
@@ -358,19 +344,17 @@ impl Job {
         Ok(())
     }
     pub fn finish(&self, outcome: Outcome) {
-        let reservations = self
-            .reservations
+        let reservation = self
+            .reservation
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
-        if let Some(reservations) = reservations {
+        if let Some(reservation) = reservation {
             self.update(|info| {
                 info.state = State::Finished;
                 info.outcome = Some(outcome);
             });
-            for reservation in reservations {
-                reservation.finish(outcome);
-            }
+            reservation.finish(outcome);
         }
     }
 }

@@ -821,13 +821,13 @@ async fn check_gateway_quote(
         [(
             "test".into(),
             hellas_sdk::BackendEntry {
-                backend: hellas_sdk::Backend::Paid {
-                    options: options.clone(),
-                    policy: Some(quote.policy.invocation_policy),
+                backend: hellas_sdk::Backend::paid(
+                    Some(quote.policy.invocation_policy),
+                    options.clone(),
                     endpoint,
-                    settlement_key: settlement,
+                    settlement,
                     owner,
-                },
+                ),
                 evaluator: None,
                 max_in_flight: std::num::NonZeroUsize::new(32).unwrap(),
             },

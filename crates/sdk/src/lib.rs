@@ -57,7 +57,9 @@ pub mod node_control;
 pub mod daemon;
 pub mod daemon_config;
 mod gateway_work;
-pub use gateway_work::{Backend, BackendEntry, ExecutorGateway, WorkRequest, grant_routes};
+pub use gateway_work::{
+    Backend, BackendEntry, ExecutorGateway, GrantBackend, PaidBackend, WorkRequest, grant_routes,
+};
 
 mod resource_config;
 pub use resource_config::ResourceConfigError;

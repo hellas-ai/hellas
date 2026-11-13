@@ -357,6 +357,7 @@ async fn compute_is_rendered_for_each_selected_evaluator() {
     let route = Route {
         backends: vec!["hip".into(), "cuda".into()],
         presentation: Presentation::Model {
+            modality: hellas_client::model::ModelKind::Text,
             model: "tiny".into(),
             package: path.clone(),
             max_tokens: 1,

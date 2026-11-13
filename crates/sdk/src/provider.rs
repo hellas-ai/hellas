@@ -67,27 +67,18 @@ const MAX_RPC_IN_FLIGHT_PER_CONNECTION: usize = 16;
 
 const RPC_CONNECTION_IDLE_TIMEOUT: Duration = IDLE_TIMEOUT;
 
-pub(crate) fn served_alpns(
-    work_configured: bool,
-    grants_configured: bool,
-    remote_control: bool,
-) -> Vec<Vec<u8>> {
+pub(crate) fn served_alpns(remote_control: bool) -> Vec<Vec<u8>> {
     let mut alpns = vec![
         Node::ALPN.as_bytes().to_vec(),
         hellas_rpc::services::content::Content::ALPN
             .as_bytes()
             .to_vec(),
     ];
-    if work_configured {
-        alpns.extend([
-            WorkSetup::ALPN.as_bytes().to_vec(),
-            Work::ALPN.as_bytes().to_vec(),
-        ]);
-    }
-    if grants_configured && !work_configured {
-        alpns.push(Work::ALPN.as_bytes().to_vec());
-    }
-    if grants_configured && remote_control {
+    alpns.extend([
+        WorkSetup::ALPN.as_bytes().to_vec(),
+        Work::ALPN.as_bytes().to_vec(),
+    ]);
+    if remote_control {
         alpns.push(
             hellas_rpc::services::host_control::HostControl::ALPN
                 .as_bytes()
@@ -101,9 +92,9 @@ pub(crate) fn served_alpns(
 pub(crate) struct Services {
     pub open_identity: Arc<ProviderOpen>,
     pub node: NodeHandlerImpl,
-    pub setup: Option<MountedSetup>,
-    pub work: Option<WorkRouter>,
-    pub control: Option<crate::node_control::NodeControl>,
+    pub setup: MountedSetup,
+    pub work: WorkRouter,
+    pub control: crate::node_control::NodeControl,
     pub content: hellas_store::content::DiskStore,
 }
 impl Services {
@@ -126,9 +117,6 @@ impl Services {
             return serve_content(conn, content, quiesce).await;
         }
         if alpn == hellas_rpc::services::host_control::HostControl::ALPN.as_bytes() {
-            let admin = admin.ok_or_else(|| {
-                WireStatus::new(WireCode::Unavailable, "node control is unavailable")
-            })?;
             return tokio::select! {
                 _ = quiescing(&mut quiesce) => Ok(()),
                 result = admin.serve_iroh(conn) => result.map_err(ProviderError::from),
@@ -148,9 +136,7 @@ impl Services {
             )
             .await;
             Ok(())
-        } else if let Some(setup) =
-            setup.filter(|_| alpn == <WorkSetup as ServiceMarker>::ALPN.as_bytes())
-        {
+        } else if alpn == WorkSetup::ALPN.as_bytes() {
             let server = AccountingDispatcher::new(
                 OpenDispatcher::<_, _, hellas_rpc::services::work_setup::Open>::new(
                     WorkSetupServer(setup),
@@ -167,8 +153,7 @@ impl Services {
             )
             .await;
             Ok(())
-        } else if let Some(work) = work.filter(|_| alpn == <Work as ServiceMarker>::ALPN.as_bytes())
-        {
+        } else if alpn == Work::ALPN.as_bytes() {
             let connection = tokio::select! {
                 _ = quiescing(&mut quiesce) => return Ok(()),
                 connection = tokio::time::timeout(IDLE_TIMEOUT, work.accept_iroh(&transport, open_identity.clone())) => {

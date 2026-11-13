@@ -564,4 +564,4 @@ pub fn request_job(
     .unwrap()
 }
 
-pub(crate) mod server;
+pub(crate) use hellas_gateway::test_server as server;

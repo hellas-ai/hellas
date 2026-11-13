@@ -54,6 +54,11 @@ fn iroh_only_accepts_local_and_fetch_backends() {
             trust: None,
         },
         BackendKind::Paid {
+            addresses: vec![],
+            acceptance_blocks: 300,
+            terminal_blocks: 3000,
+            payment_blocks: 600,
+            timeout_seconds: None,
             chain: None,
             provider: "provider".into(),
             max_price: 1,
@@ -190,7 +195,7 @@ fn keys_are_inputs_and_only_omitted_keys_in_existing_entries_are_retained() {
     changed.restore_secrets(&secrets);
     let (_, retained) = changed.redacted();
     assert_eq!(retained.0.len(), 1);
-    assert_eq!(retained.0["responses"][""], "rotated-key");
+    assert_eq!(retained.0["responses"]["bearer"], "rotated-key");
 }
 
 #[test]

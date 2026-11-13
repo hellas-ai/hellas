@@ -55,14 +55,6 @@ impl NodeCoordinator {
         Ok(store.state().configuration().cloned())
     }
 
-    /// Latest resource policies, including withdrawn entries needed for revision checks.
-    pub async fn resource_catalogue(
-        &self,
-    ) -> Result<Vec<crate::model::grant::records::GrantPolicy>, NodeStoreError> {
-        let (store, _) = self.lock().await?;
-        Ok(store.state().resource_catalogue().cloned().collect())
-    }
-
     /// The whole daemon change has one authority check and one durable frame.
     pub async fn configure(
         &self,
@@ -195,7 +187,7 @@ impl NodeCoordinator {
         operation: &'static str,
         action: impl FnOnce(NodeStatus) -> T,
     ) -> Result<T, NodeStoreError> {
-        if !matches!(operation, HOST_STATUS | HOST_CONFIGURE | HOST_CANCEL_JOB) {
+        if !matches!(operation, HOST_STATUS | HOST_CANCEL_JOB) {
             return Err(AuthorityError::Denied.into());
         }
         self.checked(caller, authorization, operation, async |store, now| {
@@ -207,9 +199,6 @@ impl NodeCoordinator {
                 &Operation::named(operation)?.permission(authority.authority(), None)?,
                 now,
             )?;
-            if operation == HOST_CONFIGURE {
-                caller.session().step_up()?;
-            }
             Ok(action(NodeStatus {
                 authority: authority.authority(),
                 authority_revision: authority.revision(),

@@ -71,7 +71,7 @@ impl Default for ResourceHealth {
 /// It names the frame format, so a journal written under different semantics
 /// is refused at the boundary instead of being reinterpreted. Bump it with
 /// any change to [`Frame`] or [`Change`] that is not readable as written.
-pub(super) const JOURNAL_NAMESPACE: &str = "hellas.node.journal.v7";
+pub(super) const JOURNAL_NAMESPACE: &str = "hellas.node.journal.v8";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct Frame {
@@ -90,7 +90,6 @@ pub(super) enum Change {
         expected: Revision,
         document: String,
         secrets: crate::model::grant::configuration::ConfigurationSecrets,
-        configuration: crate::model::grant::configuration::NodeConfiguration,
     },
     Authority(AdministrationRecord),
     Recover(hellas_auth::authority::RecoveryCommand),
@@ -99,6 +98,10 @@ pub(super) enum Change {
     /// Every budget node, the machine included.
     Budget(BudgetDef),
     Resource(GrantPolicy),
+    ResourceAvailability {
+        resource: ResourceId,
+        available: bool,
+    },
     Work(super::WorkRecord),
     Generation {
         grant: GrantId,
@@ -311,7 +314,7 @@ impl State {
         if frame.namespace != JOURNAL_NAMESPACE
             || frame.now < self.now()
             || frame.changes.is_empty()
-            || frame.changes.len() > 16
+            || frame.changes.len() > 3 * MAX_RESOURCES + 2
         {
             return Err(NodeStoreError::Malformed);
         }
@@ -336,7 +339,6 @@ impl State {
                 expected,
                 document,
                 secrets,
-                configuration,
             } => {
                 if self
                     .configuration
@@ -345,47 +347,6 @@ impl State {
                     != *expected
                 {
                     return Err(hellas_auth::authority::AuthorityError::Revision.into());
-                }
-                configuration.validate()?;
-                if let Some(machine) = configuration.machine() {
-                    if usize::from(machine.max_in_flight.get()) > super::store::MAX_OPEN_JOBS {
-                        return Err(hellas_auth::authority::AuthorityError::Invalid.into());
-                    }
-                    let current = ledger::definition(&self.ledger, BudgetNode::Machine);
-                    if current.as_ref().is_none_or(|old| {
-                        old.limits != machine.limits || old.max_in_flight != machine.max_in_flight
-                    }) {
-                        self.apply_change(
-                            &Change::Budget(BudgetDef {
-                                node: BudgetNode::Machine,
-                                parent: None,
-                                revision: current
-                                    .map_or(Revision(0), |old| old.revision)
-                                    .next()
-                                    .ok_or(NodeStoreError::Malformed)?,
-                                limits: machine.limits.clone(),
-                                max_in_flight: machine.max_in_flight,
-                            }),
-                            now,
-                            replay,
-                        )?;
-                    }
-                }
-                for definition in
-                    configuration.account_changes(|node| ledger::definition(&self.ledger, node))?
-                {
-                    self.apply_change(&Change::Budget(definition), now, replay)?;
-                }
-                for policy in configuration.resources() {
-                    if self.resource(policy.resource) != Some(policy) {
-                        self.apply_change(&Change::Resource(policy.clone()), now, replay)?;
-                    }
-                }
-                for (id, health) in &mut self.resources {
-                    health.configured = configuration
-                        .resources()
-                        .iter()
-                        .any(|policy| policy.resource == *id);
                 }
                 self.configuration =
                     Some(crate::model::grant::configuration::ConfigurationDocument {
@@ -509,8 +470,21 @@ impl State {
                     ..Default::default()
                 };
             }
+            Change::ResourceAvailability {
+                resource,
+                available,
+            } => {
+                self.resources
+                    .get_mut(resource)
+                    .ok_or(GrantError::OutOfScope)?
+                    .configured = *available;
+            }
             Change::Resource(policy) => {
                 self.configure_resource(policy.clone())?;
+                self.resources
+                    .get_mut(&policy.resource)
+                    .ok_or(GrantError::OutOfScope)?
+                    .configured = true;
                 let queued: Vec<_> = self
                     .channels
                     .iter()
@@ -993,7 +967,7 @@ fn verify(
 
 /// Snapshots retain health decisions made under the frame accounting semantics.
 /// Refuse pre-v5 state even when rotation removed every old frame.
-const CHECKPOINT_NAMESPACE: &str = "hellas.node.checkpoint.v5";
+const CHECKPOINT_NAMESPACE: &str = "hellas.node.checkpoint.v6";
 
 #[derive(Serialize, Deserialize)]
 pub(super) struct Snapshot {

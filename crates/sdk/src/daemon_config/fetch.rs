@@ -18,9 +18,7 @@ impl super::Backend {
             return Err("not a Fetch backend".into());
         };
         let contract = match upstream {
-            Upstream::Http { .. } | Upstream::OpenaiHttp { .. } => {
-                hellas_rpc::FetchContract::http()?
-            }
+            Upstream::Http { .. } => hellas_rpc::FetchContract::http()?,
             Upstream::OpenaiResponses { .. } => {
                 hellas_adaptors::openai::responses::fetch::responses_contract()?
             }
@@ -62,7 +60,7 @@ impl super::Backend {
         else {
             return Err("not a Fetch backend".into());
         };
-        let (entry, _) = upstream.entry()?;
+        let entry = upstream.entry()?;
         let policy = self.fetch_policy()?;
         let mut routes = FetchRouteRegistry::new();
         routes.register(FetchRoute::new(service, method), entry)?;
@@ -77,39 +75,57 @@ impl super::Backend {
 }
 
 impl Upstream {
-    fn entry(
-        &self,
-    ) -> Result<
-        (FetchRouteEntry, hellas_rpc::FetchContract),
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
+    fn entry(&self) -> Result<FetchRouteEntry, Box<dyn std::error::Error + Send + Sync>> {
         let capabilities = Default::default();
         Ok(match self {
-            Self::OpenaiHttp { .. } => return self.http_configuration()?.entry(),
-            Self::Http { allowed_hosts, allow_private_addresses, credentials } => {
-                let credentials = credentials.iter().map(|(id, credential)| {
-                    Ok((id.clone(), hellas_providers::HttpCredential {
-                        allowed_origins: credential.allowed_origins.clone(),
-                        allowed_paths: credential.allowed_paths.clone(),
-                        allowed_methods: credential.allowed_methods.clone(),
-                        trust_roots: credential.trust_roots.clone(),
-                        header_name: credential.header_name.clone(),
-                        header_value: hellas_providers::HttpSecret::Value(credential.secret.clone().ok_or("missing upstream credential")?),
-                    }))
-                }).collect::<Result<_, Box<dyn std::error::Error + Send + Sync>>>()?;
-                (FetchRouteEntry::new(
-                    Arc::new(hellas_providers::HttpFetchProvider::new(hellas_providers::HttpEgressPolicy { allowed_hosts: allowed_hosts.clone(), allow_private_addresses: *allow_private_addresses }, credentials)?),
+            Self::Http {
+                allowed_hosts,
+                allow_private_addresses,
+                credentials,
+            } => {
+                let credentials = credentials
+                    .iter()
+                    .map(|(id, credential)| {
+                        Ok((
+                            id.clone(),
+                            hellas_providers::HttpCredential {
+                                allowed_origins: credential.allowed_origins.clone(),
+                                allowed_paths: credential.allowed_paths.clone(),
+                                allowed_methods: credential.allowed_methods.clone(),
+                                trust_roots: credential.trust_roots.clone(),
+                                header_name: credential.header_name.clone(),
+                                header_value: hellas_providers::HttpSecret::Value(
+                                    credential
+                                        .secret
+                                        .clone()
+                                        .ok_or("missing upstream credential")?,
+                                ),
+                            },
+                        ))
+                    })
+                    .collect::<Result<_, Box<dyn std::error::Error + Send + Sync>>>()?;
+                FetchRouteEntry::new(
+                    Arc::new(hellas_providers::HttpFetchProvider::new(
+                        hellas_providers::HttpEgressPolicy {
+                            allowed_hosts: allowed_hosts.clone(),
+                            allow_private_addresses: *allow_private_addresses,
+                        },
+                        credentials,
+                    )?),
                     Arc::new(hellas_providers::HttpFetchAdaptorFactory::new()?),
                     capabilities,
-                )?, hellas_rpc::FetchContract::http()?)
+                )?
             }
-            Self::OpenaiResponses { secret } => (
-                FetchRouteEntry::new(
-                    Arc::new(hellas_providers::OpenAiResponsesFetchProvider::with_bearer(secret.as_deref().ok_or("missing upstream credential")?)?),
-                    Arc::new(hellas_adaptors::openai::responses::fetch::OpenAiResponsesAdaptorFactory::new()?),
-                    capabilities,
-                )?, hellas_adaptors::openai::responses::fetch::responses_contract()?,
-            ),
+            Self::OpenaiResponses { secret } => FetchRouteEntry::new(
+                Arc::new(hellas_providers::OpenAiResponsesFetchProvider::with_bearer(
+                    secret.as_deref().ok_or("missing upstream credential")?,
+                )?),
+                Arc::new(
+                    hellas_adaptors::openai::responses::fetch::OpenAiResponsesAdaptorFactory::new(
+                    )?,
+                ),
+                capabilities,
+            )?,
         })
     }
 }

@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 mod executor;
-pub use executor::{Executor, GrantExecution, PaidExecution};
+pub use executor::Executor;
 pub mod local;
 
 /// Format tag of a persisted grant attempt record.
@@ -576,7 +576,8 @@ pub async fn open_paid_session(
     .await?;
     let descriptor = session.descriptor();
     let AttemptRecord::Paid(purchase) = &mut attempt.record else {
-        unreachable!("checked above");
+        session.shutdown().await;
+        return Err(ExecutionError::Identity);
     };
     if let Err(error) = purchase.ensure_channel(descriptor.channel().id(), descriptor.bond_edge()) {
         session.shutdown().await;

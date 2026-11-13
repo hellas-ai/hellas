@@ -61,31 +61,19 @@ async fn both_listeners_keep_admitted_backends_when_fetch_configuration_changes(
         });
         let mut allowance = Allowance::responses(ids::ALLOWANCE, FRIEND);
         use_https(&mut allowance.definition.policies[0], template.clone());
-        let host = crate::test_support::Host::builder()
-            .with_allowance(allowance)
-            .build()
-            .await;
-        let node = host.world.service.node();
-        let secret = host.world.secret(ROOT);
-        let f = Fixture {
-            directory: tempfile::tempdir().unwrap(),
-            content: host.content.clone(),
-            node: node.clone(),
-            service: NodeControl::new(node.clone()).with_remote_admission(
-                RemoteControlAdmission::new(vec![SecretKey::from_bytes(&[62; 32]).public()])
-                    .unwrap(),
-            ),
-            secret: CredentialSecret::from_parts(secret.id(), *secret.expose_secret()),
-        };
-        let provider_access = access(&f).await;
-        let mut opts = options(&f);
-        opts.signer = Arc::new(PROVIDER.node_key());
-        opts.transport = SecretKey::from_bytes(&[5; 32]);
         let mut document = Document {
-            revision: node.configuration().await.unwrap().unwrap().revision,
-            authority: hellas_authority::test_support::common_node::configuration(
-                host.allowance.policies.clone(),
-            ),
+            resources: vec![crate::daemon_config::Resource {
+                name: allowance.definition.policies[0].name.clone(),
+                backend: "upstream".into(),
+                resource: allowance.definition.policies[0].resource,
+                account: allowance.definition.policies[0].account,
+                config_change: Default::default(),
+                rates: allowance.definition.policies[0].pricing.rates.clone(),
+                max_job_millis: 300_000.try_into().unwrap(),
+                kind: crate::daemon_config::ResourceKind::Https {
+                    https: template.clone(),
+                },
+            }],
             ..Default::default()
         };
         document.backends.insert(
@@ -145,6 +133,32 @@ async fn both_listeners_keep_admitted_backends_when_fetch_configuration_changes(
                     .collect(),
             },
         });
+        allowance.definition.policies = document
+            .configuration(&[])
+            .await
+            .unwrap()
+            .resources()
+            .to_vec();
+        let host = crate::test_support::Host::builder()
+            .with_allowance(allowance)
+            .build()
+            .await;
+        let node = host.world.service.node();
+        let secret = host.world.secret(ROOT);
+        let f = Fixture {
+            directory: tempfile::tempdir().unwrap(),
+            content: host.content.clone(),
+            node: node.clone(),
+            service: NodeControl::new(node.clone()).with_remote_admission(
+                RemoteControlAdmission::new(vec![SecretKey::from_bytes(&[62; 32]).public()])
+                    .unwrap(),
+            ),
+            secret: CredentialSecret::from_parts(secret.id(), *secret.expose_secret()),
+        };
+        let provider_access = access(&f).await;
+        let mut opts = options(&f);
+        opts.signer = Arc::new(PROVIDER.node_key());
+        opts.transport = SecretKey::from_bytes(&[5; 32]);
         let provider = Core::open(opts, document).await.unwrap();
         let (_client, _server, connection, rpc, served) = connect(&f, provider.clone()).await;
         let consumer_fixture = fixture().await;
@@ -280,7 +294,9 @@ async fn both_listeners_keep_admitted_backends_when_fetch_configuration_changes(
         let mut target = targets.remove("upstream").unwrap();
         target.service = "added".into();
         targets.insert("added".into(), target);
-        rpc.configure(request(&document)).await.unwrap();
+        rpc.configure(request(&document, provider.watch().0.revision.0))
+            .await
+            .unwrap();
         let current = provider.iroh_addresses()["work"].clone();
         assert_eq!(current.id, address.id);
         assert_eq!(
