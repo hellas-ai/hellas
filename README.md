@@ -39,8 +39,10 @@ hellas gateway --model ./qwen3.gguf --model ./whisper-tiny --wrap claude
 
 `--wrap` gives the child its OpenAI and Anthropic URLs and a private bearer,
 then drains the gateway when the child exits. Without `--wrap`, the gateway
-runs in the foreground and prints its URL and bearer to the terminal. The
-routing configuration and bearer are not saved.
+runs in the foreground and prints its URL and bearer to the terminal. For
+headless use, `--bearer-file PATH` writes the bearer atomically with mode 0600;
+without a wrapper, file or terminal, startup fails. Routing configuration is
+not saved, and each start creates a new bearer.
 
 An upstream works without a GPU. The key file is read at startup:
 

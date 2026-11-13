@@ -4,6 +4,7 @@ use hellas_sdk::node_control::bootstrap::Invitation;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn paired_owner_configures_routes_and_restart_preserves_them() {
+    let occupied = std::net::TcpListener::bind("127.0.0.1:8080").unwrap();
     let root = tempfile::tempdir().unwrap();
     let owner = Cli::new(root.path(), "owner", AGENT_PASSKEY);
     owner.run(&["identity", "init"]).await;
@@ -26,6 +27,24 @@ async fn paired_owner_configures_routes_and_restart_preserves_them() {
     let paired: Value = serde_json::from_str(&paired).unwrap();
     assert_eq!(paired["node_id"], invitation.node.to_string());
     process.wait_for("Daemon ready;").await;
+    let profile_path = owner.home.join("nodes/worker/profile.json");
+    let mut local: Value = serde_json::from_slice(&std::fs::read(&profile_path).unwrap()).unwrap();
+    local.as_object_mut().unwrap().remove("remote_node");
+    local.as_object_mut().unwrap().remove("remote_addresses");
+    local["local"] = json!({"certificate": worker.home.join("provider/control.cert.der"), "server_name": "localhost"});
+    let local_path = profile_path.with_file_name("local.json");
+    hellas_private::write_atomically(&local_path, ".local", &serde_json::to_vec(&local).unwrap())
+        .unwrap();
+    owner
+        .run(&[
+            "routes",
+            "--profile",
+            string(&local_path),
+            "--control-socket",
+            string(&worker.home.join("provider/control.sock")),
+        ])
+        .await;
+    drop(occupied);
     let key = root.path().join("api.key");
     std::fs::write(&key, "write-only-fixture-key").unwrap();
     owner
@@ -39,6 +58,7 @@ async fn paired_owner_configures_routes_and_restart_preserves_them() {
         ])
         .await;
     owner.run(&["route", "add", "model@upstream"]).await;
+    owner.run(&["route", "listen", "127.0.0.1:0"]).await;
     let before = owner.run(&["routes"]).await;
     assert!(
         before.contains("model") && before.contains("upstream"),

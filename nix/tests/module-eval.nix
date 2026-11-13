@@ -206,6 +206,7 @@ in
       "--upstream"
       "upstream=https://api.example.com/v1,key-file=/run/secrets/upstream.key"
     ]) gateway.serviceConfig.ExecStart;
+    assert lib.hasInfix "--bearer-file /run/hellas-gateway/bearer" gateway.serviceConfig.ExecStart;
     assert !(lib.hasInfix "--config" gateway.serviceConfig.ExecStart);
     assert !(lib.hasInfix "--local" gateway.serviceConfig.ExecStart);
     assert lib.hasInfix "--metrics-port 9401 --metrics-addr 127.0.0.1" metrics.serviceConfig.ExecStart;

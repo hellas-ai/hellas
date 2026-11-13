@@ -204,6 +204,7 @@ rec {
     "--model"
     "--upstream"
     "--bind"
+    "--bearer-file"
     "--metrics-port"
     "--metrics-addr"
   ];
@@ -527,6 +528,7 @@ rec {
       lib,
       gateway,
       otel,
+      bearerFile ? null,
     }:
     let
       optArg =
@@ -563,5 +565,6 @@ rec {
       "--metrics-addr"
       gateway.metricsAddress
     ]
+    ++ optArg "--bearer-file" bearerFile
     ++ gateway.extraArgs;
 }

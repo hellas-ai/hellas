@@ -22,6 +22,9 @@ pub struct GatewayArgs {
     pub bind: std::net::SocketAddr,
     #[arg(long)]
     pub wrap: Option<String>,
+    /// Write the gateway bearer atomically to this private file (mode 0600).
+    #[arg(long)]
+    pub bearer_file: Option<PathBuf>,
     #[arg(last = true, allow_hyphen_values = true, requires = "wrap")]
     pub wrap_args: Vec<String>,
 }
@@ -48,8 +51,16 @@ pub enum BackendCommand {
 }
 #[derive(clap::Subcommand)]
 pub enum RouteCommand {
-    Add { model: String },
-    Rm { model: String },
+    Add {
+        model: String,
+    },
+    Rm {
+        model: String,
+    },
+    /// Add or move the stateful HTTP listener.
+    Listen {
+        bind: std::net::SocketAddr,
+    },
 }
 
 pub enum Edit {
@@ -299,6 +310,11 @@ pub async fn apply(document: &mut Document, edit: Edit, context: &ModelContext) 
             .remove_backend(&name)
             .map_err(anyhow::Error::from_boxed)?,
         Edit::Route(RouteCommand::Add { model }) => context.add(document, &model).await?,
+        Edit::Route(RouteCommand::Listen { bind }) => {
+            document
+                .listeners
+                .insert("api".into(), Listener::Http { bind, zdr: true });
+        }
         Edit::Route(RouteCommand::Rm { model }) => {
             let (name, destination) = model
                 .rsplit_once('@')
@@ -487,6 +503,17 @@ pub async fn gateway(
     chain: &hellas_chain::genesis::ChainProfile,
     #[cfg(feature = "otel")] metrics: Option<(std::net::SocketAddr, crate::metrics::MetricsBundle)>,
 ) -> Result<()> {
+    let mut tty = if args.wrap.is_none() && args.bearer_file.is_none() {
+        let terminal = if cfg!(windows) { "CONOUT$" } else { "/dev/tty" };
+        Some(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(terminal)
+                .context("gateway needs --wrap, --bearer-file PATH, or a controlling terminal")?,
+        )
+    } else {
+        None
+    };
     let context = ModelContext::new(
         home,
         identity,
@@ -544,6 +571,10 @@ pub async fn gateway(
         async |core| {
             print(&core.watch().0);
             let address = core.http_addresses()["api"];
+            if let Some(path) = args.bearer_file {
+                hellas_private::write_atomically(&path, ".bearer", access.bearer().as_bytes())?;
+            }
+            eprintln!("Gateway: http://{address}");
             if let Some(command) = args.wrap {
                 let mut child = crate::wrap::spawn(
                     &command,
@@ -558,8 +589,7 @@ pub async fn gateway(
                 }
             } else {
                 use std::io::Write;
-                let terminal = if cfg!(windows) { "CONOUT$" } else { "/dev/tty" };
-                if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open(terminal) {
+                if let Some(tty) = &mut tty {
                     writeln!(
                         tty,
                         "Gateway: http://{address}\nAuthorization: Bearer {}",
@@ -614,13 +644,6 @@ pub async fn serve(
                 chain: None,
                 port: port.unwrap_or(0),
                 backends: vec![],
-            },
-        );
-        document.listeners.insert(
-            "api".into(),
-            Listener::Http {
-                bind: "127.0.0.1:8080".parse()?,
-                zdr: true,
             },
         );
         Some(document)

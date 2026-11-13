@@ -340,6 +340,7 @@ in
           [ "${gateway.package}/bin/hellas" ]
           ++ hellas.mkGatewayArgs {
             inherit lib gateway;
+            bearerFile = "/run/hellas-gateway/bearer";
             inherit (cfg) otel;
           }
         );

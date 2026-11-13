@@ -37,18 +37,34 @@ hellas gateway --model ./qwen3.gguf --wrap claude
 ```
 
 `--wrap` supplies OpenAI and Anthropic URLs and tokens, and drains accepted
-work when the child exits. It does not write a bearer file.
+work when the child exits. For headless clients, use `--bearer-file PATH`:
+
+```sh
+hellas gateway --model ./qwen3.gguf --bearer-file "$HOME/gateway.bearer"
+# In another shell:
+curl -H "Authorization: Bearer $(cat "$HOME/gateway.bearer")" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen3","messages":[{"role":"user","content":"Hello"}]}' \
+  http://127.0.0.1:8080/v1/chat/completions
+```
+
+The parent directory must exist. The file is replaced atomically with mode
+0600 on each start. Without a wrapper, bearer file or controlling terminal,
+startup fails. The NixOS gateway unit writes `/run/hellas-gateway/bearer` inside
+its private runtime directory; an administrator can read it for an authorized
+client. The bearer changes on restart.
 
 ## Persistent service
 
 `hellas serve` runs the same core, restoring its document from the authority
-journal. It has no routing flags. Pair its printed invite first, then use the
+journal. A fresh node has no HTTP listener. Pair its printed invite first, then use the
 paired profile for edits:
 
 ```sh
 hellas backend add upstream https://api.example.com/v1 --key-file "$HOME/api.key"
 hellas route add gpt-5@upstream
 hellas route add /srv/models/qwen3.gguf
+hellas route listen 127.0.0.1:8081
 hellas routes
 hellas route rm gpt-5@upstream
 hellas backend rm upstream

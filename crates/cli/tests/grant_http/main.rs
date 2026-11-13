@@ -4,6 +4,7 @@
 )]
 #![cfg(unix)]
 mod contact;
+mod headless;
 mod local_compute;
 mod local_flux;
 mod local_text;

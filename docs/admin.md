@@ -608,7 +608,7 @@ cannot substitute its own pins. See [paid work trust](paid-gateway.md).
 ## HTTP gateway authority
 
 A stateless `gateway` creates an ephemeral authority and a bearer restricted to
-`gateway.invoke`. It prints the bearer to the terminal or passes it to its
+`gateway.invoke`. It writes the bearer privately with `--bearer-file PATH`, prints it to the terminal, or passes it to its
 wrapped child, and does not save it. A stateful or embedded HTTP listener uses
 its node's authority and explicitly issued bearer credentials.
 
