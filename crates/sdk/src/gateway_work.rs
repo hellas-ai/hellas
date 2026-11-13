@@ -431,6 +431,7 @@ fn repair(https: &HttpsResource, body: &[u8]) -> Result<Vec<u8>, JobError> {
 #[derive(Clone)]
 pub struct Backend {
     id: String,
+    instance: u64,
     jobs: Arc<hellas_gateway::jobs::Jobs>,
     evaluator: Option<String>,
     slots: Arc<Semaphore>,
@@ -475,6 +476,7 @@ impl Backend {
     fn new(state: BackendState) -> Self {
         Self {
             id: String::new(),
+            instance: 0,
             jobs: Default::default(),
             evaluator: None,
             slots: Arc::new(Semaphore::new(1)),
@@ -781,6 +783,7 @@ impl ExecutorGateway {
         resolved.extend(backends.into_iter().map(|(id, entry)| {
             let mut backend = entry.backend;
             backend.id = id.clone();
+            backend.instance = rand::random();
             backend.jobs = jobs.clone();
             backend.evaluator = entry.evaluator;
             backend.capacity = entry.max_in_flight.get();
@@ -981,7 +984,7 @@ impl Backend {
         signer: &hellas_auth::ProducerSigningKey,
     ) -> Result<crate::execution::Completed, crate::execution::AttemptError> {
         use crate::execution::{AttemptError, PaidOpen, before_proposal, open_paid_session};
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::Ordering;
         let pre = |error: ExecutionError| AttemptError::PreProposal(Box::new(error));
         let committed = |error: ExecutionError| AttemptError::Committed(Box::new(error));
         let PaidBackend {
@@ -1029,7 +1032,7 @@ impl Backend {
             .with_state(|state| state.proposal_nonce_high_water())
             .await
             .map_err(|error| pre(error.into()))?;
-        let proposed = Arc::new(AtomicBool::new(false));
+        let proposed = requester.job.proposal();
         let proposal = before_proposal(
             None,
             stop,
@@ -1121,7 +1124,7 @@ impl Backend {
         let session = guard
             .as_mut()
             .ok_or_else(|| pre(ExecutionError::Identity))?;
-        let proposed = std::sync::atomic::AtomicBool::new(false);
+        let proposed = requester.job.proposal();
         let proposal = before_proposal(None, stop, Some(&proposed), async {
             session.refresh().await?;
             let current = session
@@ -1215,6 +1218,7 @@ impl WorkExecutionBackend for ExecutorGateway {
             .iter()
             .map(|(id, backend)| hellas_gateway::BackendInfo {
                 id: id.clone(),
+                instance: backend.instance,
                 evaluator: backend.evaluator.clone(),
                 max_in_flight: backend.capacity,
                 in_flight: backend.capacity - backend.slots.available_permits(),

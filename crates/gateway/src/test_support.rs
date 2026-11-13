@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 pub fn backend(evaluator: Option<String>) -> Vec<BackendInfo> {
     vec![BackendInfo {
+        instance: 1,
         id: "test".into(),
         evaluator,
         max_in_flight: 4,

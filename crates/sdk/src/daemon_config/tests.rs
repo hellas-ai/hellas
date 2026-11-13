@@ -14,6 +14,7 @@ fn local(runtime: &str) -> Backend {
 }
 fn info(id: &str, evaluator: &str) -> hellas_gateway::BackendInfo {
     hellas_gateway::BackendInfo {
+        instance: 1,
         id: id.into(),
         evaluator: Some(evaluator.into()),
         max_in_flight: 1,

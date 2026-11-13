@@ -619,6 +619,7 @@ async fn failover_uses_each_backends_own_destination_and_credential() {
         fn backends(&self) -> Vec<crate::BackendInfo> {
             ["first", "second"]
                 .map(|id| crate::BackendInfo {
+                    instance: 1,
                     id: id.into(),
                     evaluator: None,
                     max_in_flight: 2,

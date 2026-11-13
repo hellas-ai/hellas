@@ -13,6 +13,7 @@ impl Fake {
             backends: Mutex::new(
                 ["a", "b", "c"]
                     .map(|id| BackendInfo {
+                        instance: rand::random(),
                         id: id.into(),
                         evaluator: None,
                         max_in_flight: 4,
@@ -321,6 +322,7 @@ async fn compute_is_rendered_for_each_selected_evaluator() {
         fn backends(&self) -> Vec<BackendInfo> {
             [("hip", GpuDialect::Hip), ("cuda", GpuDialect::Cuda)]
                 .map(|(id, dialect)| BackendInfo {
+                    instance: 1,
                     id: id.into(),
                     evaluator: Some(evaluator(dialect)),
                     max_in_flight: 2,
@@ -477,5 +479,90 @@ fn snapshot_replacement_retains_pending_sessions_and_continuations() {
     assert_eq!(
         continuation(&removed).err().unwrap().status,
         StatusCode::CONFLICT
+    );
+}
+
+#[test]
+fn replacing_a_backend_name_rejects_old_sessions_and_continuations() {
+    let memory = Arc::new(RoutingState::default());
+    let work = Fake::new();
+    let routes = vec![row(&["a", "b"], None)];
+    let old = Routing::new(routes.clone(), work.clone(), memory.clone()).unwrap();
+    let mut selection = choose(&old, None, Some("account-session")).unwrap();
+    selection.next();
+    selection.accept("a");
+    selection
+        .response_binding("/v1/responses")
+        .unwrap()
+        .observe(&serde_json::json!({"object":"response", "id":"old-response"}));
+    let reused = Routing::new(routes.clone(), work, memory.clone()).unwrap();
+    assert_eq!(
+        order_of(choose(&reused, None, Some("account-session")).unwrap()),
+        ["a"]
+    );
+    let replaced = Routing::new(routes, Fake::new(), memory).unwrap();
+    assert_eq!(
+        choose(&replaced, None, Some("account-session"))
+            .err()
+            .map(|e| e.status),
+        Some(StatusCode::CONFLICT)
+    );
+    assert_eq!(
+        replaced
+            .select(
+                "/v1/responses",
+                "POST",
+                Hints {
+                    previous: Some("old-response".into()),
+                    ..Default::default()
+                },
+                None,
+                crate::test_support::job(),
+            )
+            .err()
+            .map(|e| e.status),
+        Some(StatusCode::CONFLICT)
+    );
+}
+
+#[test]
+fn session_pin_outlives_http_selection_once_the_proposal_leaves() {
+    let routing = Routing::new(
+        vec![row(&["a", "b"], None)],
+        Fake::new(),
+        Default::default(),
+    )
+    .unwrap();
+    let mut selected = choose(&routing, None, Some("disconnected")).unwrap();
+    assert_eq!(selected.next().as_deref(), Some("a"));
+    let attempt = selected.job.clone();
+    attempt
+        .proposal()
+        .store(true, std::sync::atomic::Ordering::Release);
+    drop(selected);
+    assert_eq!(
+        order_of(choose(&routing, None, Some("disconnected")).unwrap()),
+        ["a"]
+    );
+    drop(attempt);
+    assert_eq!(
+        order_of(choose(&routing, None, Some("disconnected")).unwrap()),
+        ["a"]
+    );
+
+    let mut unproposed = choose(&routing, None, Some("unproposed")).unwrap();
+    unproposed.next();
+    let attempt = unproposed.job.clone();
+    drop(unproposed);
+    assert_eq!(
+        choose(&routing, None, Some("unproposed"))
+            .err()
+            .map(|e| e.status),
+        Some(StatusCode::SERVICE_UNAVAILABLE)
+    );
+    drop(attempt);
+    assert_eq!(
+        order_of(choose(&routing, None, Some("unproposed")).unwrap()).len(),
+        2
     );
 }

@@ -7,7 +7,10 @@ use hellas_auth::authority::UnixMillis;
 use hellas_rpc::ContentId;
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::{Arc, Mutex, Weak},
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant, UNIX_EPOCH},
 };
 
@@ -19,8 +22,8 @@ const SESSION_IDLE: Duration = Duration::from_secs(24 * 60 * 60);
 pub struct RoutingError(pub String);
 
 struct Binding {
-    backend: Option<String>,
-    pending: bool,
+    backend: Option<(String, u64)>,
+    pending: Option<Arc<AtomicBool>>,
     touched: Instant,
     connection: Option<Weak<()>>,
 }
@@ -50,6 +53,7 @@ pub(crate) struct Routing {
     keys: BTreeMap<(String, String, Option<String>), usize>,
     work: Arc<dyn WorkExecutionBackend>,
     memory: Arc<RoutingState>,
+    instances: BTreeMap<String, u64>,
 }
 
 #[derive(Clone)]
@@ -59,21 +63,29 @@ pub(crate) struct Selection {
     candidates: Vec<String>,
     cursor: usize,
     session: Option<ContentId>,
-    // A first request owns a tentative session binding until acceptance.
-    _pending: Option<Arc<Pending>>,
     pub backend: Option<String>,
     pub affinity: &'static str,
     pub model: Option<String>,
 }
-struct Pending {
+pub(crate) struct Pending {
     routing: Arc<Routing>,
     key: ContentId,
+    proposed: Arc<AtomicBool>,
 }
 impl Drop for Pending {
     fn drop(&mut self) {
         let mut state = self.routing.memory.state.lock().unwrap();
-        if state.bindings.get(&self.key).is_some_and(|b| b.pending) {
-            state.bindings.remove(&self.key);
+        if let Some(binding) = state.bindings.get_mut(&self.key)
+            && binding
+                .pending
+                .as_ref()
+                .is_some_and(|p| Arc::ptr_eq(p, &self.proposed))
+        {
+            if self.proposed.load(Ordering::Acquire) {
+                binding.pending = None;
+            } else {
+                state.bindings.remove(&self.key);
+            }
         }
     }
 }
@@ -82,6 +94,19 @@ impl Selection {
         let id = self.candidates.get(self.cursor)?.clone();
         self.cursor += 1;
         self.backend = Some(id.clone());
+        if let Some(key) = self.session
+            && let Some(binding) = self
+                .routing
+                .memory
+                .state
+                .lock()
+                .unwrap()
+                .bindings
+                .get_mut(&key)
+            && binding.pending.is_some()
+        {
+            binding.backend = Some((id.clone(), self.routing.instances[&id]));
+        }
         Some(id)
     }
     pub fn accept(&mut self, backend: &str) {
@@ -89,8 +114,8 @@ impl Selection {
         if let Some(key) = self.session
             && let Some(binding) = state.bindings.get_mut(&key)
         {
-            binding.backend = Some(backend.into());
-            binding.pending = false;
+            binding.backend = Some((backend.into(), self.routing.instances[backend]));
+            binding.pending = None;
         }
         state.next = state.next.wrapping_add(1);
     }
@@ -115,7 +140,10 @@ impl Selection {
         }
         Some(ResponseBinding {
             routing: self.routing.clone(),
-            backend: self.backend.clone()?,
+            backend: (
+                self.backend.clone()?,
+                self.routing.instances[self.backend.as_ref()?],
+            ),
             family: family(path).into(),
         })
     }
@@ -195,6 +223,7 @@ impl Routing {
             }
         }
         Ok(Arc::new(Self {
+            instances: backends.into_iter().map(|b| (b.id, b.instance)).collect(),
             routes,
             keys,
             work,
@@ -275,13 +304,21 @@ impl Routing {
                 }
                 continue;
             };
-            if binding.pending {
-                return Err(Unavailable::busy(503, Duration::ZERO));
+            if let Some(proposed) = &binding.pending {
+                if !proposed.load(Ordering::Acquire) {
+                    return Err(Unavailable::busy(503, Duration::ZERO));
+                }
+                binding.pending = None;
             }
             let backend = binding
                 .backend
                 .clone()
                 .ok_or_else(|| Unavailable::conflict("ambiguous server-side continuation"))?;
+            if self.instances.get(&backend.0) != Some(&backend.1) {
+                return Err(Unavailable::conflict(
+                    "session backend was replaced; resend full context",
+                ));
+            }
             if pinned.as_ref().is_some_and(|p| *p != backend) {
                 return Err(Unavailable::conflict(
                     "conflicting session or continuation backends",
@@ -292,7 +329,7 @@ impl Routing {
         }
         if pinned
             .as_ref()
-            .is_some_and(|id| !route.backends.contains(id))
+            .is_some_and(|(id, _)| !route.backends.contains(id))
         {
             return Err(Unavailable::conflict(
                 "session backend cannot serve this model and route",
@@ -304,7 +341,7 @@ impl Routing {
             .backends
             .iter()
             .enumerate()
-            .filter(|(_, id)| pinned.as_ref().is_none_or(|p| p == *id))
+            .filter(|(_, id)| pinned.as_ref().is_none_or(|p| p.0 == **id))
             .filter_map(|(position, id)| {
                 backends.iter().find(|b| b.id == *id).map(|b| (position, b))
             })
@@ -332,18 +369,20 @@ impl Routing {
                 key,
                 Binding {
                     backend: None,
-                    pending: true,
+                    pending: Some(job.proposal()),
                     touched: now,
                     connection: connection.map(|c| Arc::downgrade(&c.alive)),
                 },
             );
-            Some(Arc::new(Pending {
+            Some(Pending {
                 routing: self.clone(),
                 key,
-            }))
+                proposed: job.proposal(),
+            })
         } else {
             None
         };
+        *job.binding.lock().unwrap() = pending;
         Ok((
             row,
             Selection {
@@ -352,7 +391,6 @@ impl Routing {
                 candidates: candidates.into_iter().map(|(_, b)| b.id.clone()).collect(),
                 cursor: 0,
                 session,
-                _pending: pending,
                 backend: None,
                 affinity: if !continuations.is_empty() {
                     "continuation"
@@ -388,7 +426,7 @@ fn order(
 #[derive(Clone)]
 pub(crate) struct ResponseBinding {
     routing: Arc<Routing>,
-    backend: String,
+    backend: (String, u64),
     family: String,
 }
 impl ResponseBinding {
@@ -428,7 +466,7 @@ impl ResponseBinding {
                     key,
                     Binding {
                         backend: Some(self.backend.clone()),
-                        pending: false,
+                        pending: None,
                         touched: Instant::now(),
                         connection: None,
                     },

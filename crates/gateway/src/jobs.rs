@@ -159,6 +159,8 @@ impl Jobs {
                 jobs: self.clone(),
                 stop: Cancellation::new(),
                 accepted: AtomicBool::new(false),
+                proposed: Arc::new(AtomicBool::new(false)),
+                binding: Default::default(),
                 reservation: Mutex::new(reservation.take()),
             });
             let info = Info {
@@ -268,9 +270,14 @@ pub struct Job {
     jobs: Arc<Jobs>,
     stop: Cancellation,
     accepted: AtomicBool,
+    proposed: Arc<AtomicBool>,
+    pub(crate) binding: Mutex<Option<crate::routing::Pending>>,
     reservation: Mutex<Option<limits::Hold>>,
 }
 impl Job {
+    pub fn proposal(&self) -> Arc<AtomicBool> {
+        self.proposed.clone()
+    }
     pub fn id(&self) -> u64 {
         self.id
     }
@@ -298,6 +305,7 @@ impl Job {
         });
     }
     pub fn accepted(&self) {
+        self.proposed.store(true, Ordering::Release);
         self.accepted.store(true, Ordering::Release);
         self.update(|info| {
             if info.state != State::Cancelling {

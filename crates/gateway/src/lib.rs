@@ -151,6 +151,7 @@ pub enum WorkShutdownError {
 #[derive(Clone, Debug, Serialize, serde::Deserialize)]
 pub struct BackendInfo {
     pub id: String,
+    pub instance: u64,
     pub evaluator: Option<String>,
     pub max_in_flight: usize,
     pub in_flight: usize,
