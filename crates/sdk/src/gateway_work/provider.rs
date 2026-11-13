@@ -13,7 +13,6 @@ use std::sync::{Arc, Weak};
 #[derive(Clone)]
 pub(crate) struct IrohBackend {
     pub core: Weak<Core>,
-    pub listener: String,
     pub assurance: hellas_rpc::Assurance,
 }
 impl Backend {
@@ -75,12 +74,24 @@ impl IrohBackend {
         recovered: bool,
     ) -> Result<(Arc<Job>, Arc<Backend>), BackendFault> {
         let core = self.core.upgrade().ok_or(AdmissionError::Closed)?;
+        let snapshot = core.snapshot.load_full();
+        let Some((id, backends)) = snapshot
+            .document
+            .listeners
+            .iter()
+            .find_map(|(id, listener)| match listener {
+                crate::daemon_config::Listener::Iroh { backends, .. } => Some((id, backends)),
+                _ => None,
+            })
+        else {
+            return Err(AdmissionError::Closed.into());
+        };
         let request = Request {
             origin: Origin::Iroh {
                 peer: hex::encode(caller.bytes()),
             },
             method: "work.execute".into(),
-            path: self.listener.clone(),
+            path: id.clone(),
         };
         let job = if recovered {
             core.jobs.recover(&request)
@@ -88,12 +99,6 @@ impl IrohBackend {
             core.jobs.admit(&request)
         }
         .map_err(BackendFault::caused_by)?;
-        let snapshot = core.snapshot.load_full();
-        let Some(crate::daemon_config::Listener::Iroh { backends, .. }) =
-            snapshot.document.listeners.get(&self.listener)
-        else {
-            return Err(AdmissionError::Closed.into());
-        };
         let inner = snapshot.work.lookup(backends, key)?;
         Ok((job, inner))
     }

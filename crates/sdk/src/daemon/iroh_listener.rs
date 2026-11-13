@@ -7,7 +7,7 @@ use crate::{
 };
 use hellas_authority::grant_service::{GrantService, WorkAdministration};
 use hellas_wire::peers::{PeerDirectory, PeerId};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::sync::watch;
 
 pub(super) struct Bound {
@@ -18,15 +18,27 @@ pub(super) struct Bound {
     open: Arc<ProviderOpen>,
     grants: GrantService,
     pub administration: WorkAdministration,
+    paid: Arc<Paid>,
+    chain: crate::work_config::WorkConfig,
+}
+
+pub(super) struct Paid {
     work: MountedWork,
     setup: MountedSetup,
-    runner: Mutex<Option<WorkRunner>>,
-    chain: crate::work_config::WorkConfig,
+    watcher: tokio::sync::Mutex<Option<WorkWatcher>>,
+}
+impl Paid {
+    pub async fn shutdown(&self) -> Result<()> {
+        self.work.stop_pending();
+        if let Some(mut watcher) = self.watcher.lock().await.take() {
+            watcher.shutdown().await?;
+        }
+        Ok(())
+    }
 }
 impl Bound {
     pub async fn prepare(
         core: &Arc<Core>,
-        id: &str,
         port: u16,
         profile: &Option<hellas_chain::genesis::CustomChainFile>,
     ) -> Result<Self> {
@@ -67,7 +79,6 @@ impl Bound {
         };
         let backend = IrohBackend {
             core: Arc::downgrade(core),
-            listener: id.into(),
             assurance: match open.enrollment().genesis.statement.root_kind {
                 hellas_rpc::RootKind::Software => hellas_rpc::Assurance::ProducerSigned,
                 hellas_rpc::RootKind::SecureEnclave => hellas_rpc::Assurance::AppleAppAttest,
@@ -91,8 +102,20 @@ impl Bound {
                 grants.clone(),
                 std::num::NonZeroU64::new(u64::MAX).unwrap(),
             );
-            let work = MountedWork::with_backend(backend);
-            let setup = MountedSetup::with_content_store(options.content.clone());
+            let paid = core
+                .runtime
+                .paid
+                .lock()
+                .await
+                .get(chain.chain.as_path())
+                .cloned()
+                .unwrap_or_else(|| {
+                    Arc::new(Paid {
+                        work: MountedWork::with_backend(backend),
+                        setup: MountedSetup::with_content_store(options.content.clone()),
+                        watcher: Default::default(),
+                    })
+                });
             Ok(Self {
                 port,
                 alpns,
@@ -102,9 +125,7 @@ impl Bound {
                 open,
                 grants,
                 administration,
-                work,
-                setup,
-                runner: Mutex::new(None),
+                paid,
             })
         }
         .await;
@@ -116,19 +137,37 @@ impl Bound {
 
     pub async fn activate(&self, core: &Core) -> Result<()> {
         self.chain.chain.persist()?;
-        let runner = WorkRunner::discover(
-            WorkRunnerConfig {
-                chain: self.chain.chain.clone(),
-                settlement_key: core.runtime.options.settlement.clone(),
-            },
-            self.work.clone(),
-            self.setup.clone(),
-        )
-        .await?;
-        *self
-            .runner
-            .lock()
-            .map_err(|_| "iroh runner lock poisoned")? = Some(runner);
+        let mut watcher = self.paid.watcher.lock().await;
+        let addresses = self
+            .endpoint
+            .addr()
+            .ip_addrs()
+            .map(ToString::to_string)
+            .collect();
+        if let Some(watcher) = watcher.as_ref() {
+            watcher.configure(self.chain.clone(), addresses);
+        } else {
+            let runner = WorkRunner::discover(
+                WorkRunnerConfig {
+                    chain: self.chain.chain.clone(),
+                    settlement_key: core.runtime.options.settlement.clone(),
+                },
+                self.paid.work.clone(),
+                self.paid.setup.clone(),
+            )
+            .await?;
+            *watcher = Some(WorkWatcher::spawn(runner.on_chain(
+                self.chain.clone(),
+                core.node().clone(),
+                self.open.enrollment().clone(),
+                addresses,
+            )));
+            core.runtime
+                .paid
+                .lock()
+                .await
+                .insert(self.chain.chain.as_path().into(), self.paid.clone());
+        }
         Ok(())
     }
 
@@ -137,25 +176,7 @@ impl Bound {
         core: std::sync::Weak<Core>,
         mut stop: watch::Receiver<bool>,
     ) -> Result<()> {
-        let runner = self
-            .runner
-            .lock()
-            .map_err(|_| "iroh runner lock poisoned")?
-            .take()
-            .ok_or("iroh listener already running")?;
         let core_options = core.upgrade().ok_or("daemon stopped")?;
-        let mut watcher = WorkWatcher::spawn(
-            runner.on_chain(
-                self.chain.clone(),
-                core_options.node().clone(),
-                self.open.enrollment().clone(),
-                self.endpoint
-                    .addr()
-                    .ip_addrs()
-                    .map(ToString::to_string)
-                    .collect(),
-            ),
-        );
         let content = core_options.runtime.options.content.clone();
         let control = core_options
             .control()?
@@ -187,8 +208,8 @@ impl Bound {
         let services = crate::provider::Services {
             open_identity: self.open.clone(),
             node,
-            setup: self.setup.clone(),
-            work: WorkRouter::both(self.work.clone(), self.grants.clone()),
+            setup: self.paid.setup.clone(),
+            work: WorkRouter::both(self.paid.work.clone(), self.grants.clone()),
             control,
             content,
         };
@@ -228,7 +249,6 @@ impl Bound {
         if let Some(discovery) = discovery {
             discovery.shutdown().await;
         }
-        self.work.stop_pending();
         quiesce.send_replace(true);
         while let Some(result) = tasks.join_next().await {
             if let Err(error) = result {
@@ -236,10 +256,8 @@ impl Bound {
             }
         }
         let grants = self.grants.shutdown().await;
-        let paid = watcher.shutdown().await;
         self.endpoint.close().await;
         grants?;
-        paid?;
         Ok(())
     }
 }

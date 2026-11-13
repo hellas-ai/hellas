@@ -258,7 +258,6 @@ async fn both_listeners_keep_admitted_backends_when_fetch_configuration_changes(
         use hellas_channel::work::{WorkBackend, admission::BackendKey};
         let backend = crate::gateway_work::provider::IrohBackend {
             core: Arc::downgrade(&provider),
-            listener: "work".into(),
             assurance: hellas_rpc::Assurance::ProducerSigned,
         };
         let first = BackendKey::Fetch {
@@ -374,4 +373,78 @@ async fn both_listeners_keep_admitted_backends_when_fetch_configuration_changes(
         consumer_fixture.node.close().await;
     };
     hellas_authority::test_support::within(run).await;
+}
+
+#[tokio::test]
+async fn one_step_port_change_retains_the_live_paid_setup() {
+    hellas_authority::test_support::within(async {
+        let f = fixture().await;
+        let mut opts = options(&f);
+        opts.settlement = hellas_channel::test_support::channel::provider();
+        crate::provider::tests::node::write_setup_journal(opts.home.as_ref()).await;
+        opts.chain = crate::test_support::chain_dir(
+            opts.home.as_ref(),
+            hellas_kernel::NetworkId::new("hellas-devnet-1").unwrap(),
+        );
+        assert!(
+            !hellas_channel::work_store::journal::Journal::stems(&opts.chain.provider_journals())
+                .unwrap()
+                .is_empty()
+        );
+        let enrollment = hellas_channel::test_support::enrollment(
+            &hellas_auth::ProducerSigningKey::from_secret_bytes([55; 32]).unwrap(),
+            &opts.signer,
+            *opts.transport.public().as_bytes(),
+            [56; 32],
+        );
+        let core = Core::open(opts, Document::default()).await.unwrap();
+        let (client, server, connection, rpc, served) = connect(&f, core.clone()).await;
+        rpc.bind_provider(BindProviderRequest {
+            authorization: ROOT_GRANT.0.to_vec(),
+            enrollment: enrollment.canonical_bytes(),
+        })
+        .await
+        .unwrap();
+        let mut document = Document::default();
+        document.listeners.insert(
+            "work".into(),
+            Listener::Iroh {
+                chain: None,
+                port: 0,
+                backends: vec![],
+            },
+        );
+        rpc.configure(request(&document, 0)).await.unwrap();
+        let old = core.iroh_endpoints().pop().unwrap();
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = socket.local_addr().unwrap().port();
+        drop(socket);
+        let Listener::Iroh {
+            port: configured, ..
+        } = document.listeners.get_mut("work").unwrap()
+        else {
+            unreachable!()
+        };
+        *configured = port;
+        assert_eq!(
+            rpc.configure(request(&document, 1)).await.unwrap().revision,
+            2
+        );
+        assert!(core.watch().0.listener_errors.is_empty());
+        assert!(
+            core.iroh_endpoints()[0]
+                .bound_sockets()
+                .iter()
+                .any(|address| address.port() == port)
+        );
+        old.closed().await;
+        connection.close(0u32.into(), b"done");
+        let _ = served.await;
+        core.shutdown().await.unwrap();
+        client.close().await;
+        server.close().await;
+        f.content.close().await;
+        f.node.close().await;
+    })
+    .await;
 }

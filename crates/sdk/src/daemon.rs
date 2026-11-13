@@ -544,7 +544,7 @@ impl Core {
                             }
                         }
                         Listener::Iroh { port, chain, .. } => Bound::Iroh(Arc::new(
-                            iroh_listener::Bound::prepare(self, id, *port, chain).await?,
+                            iroh_listener::Bound::prepare(self, *port, chain).await?,
                         )),
                     },
                     stop: tokio::sync::watch::channel(false).0,
@@ -707,7 +707,9 @@ impl Core {
         if let Err(error) = snapshot.work.drain().await {
             failure.get_or_insert(Error::from(error));
         }
-        self.runtime.shutdown().await;
+        if let Err(error) = self.runtime.shutdown().await {
+            failure.get_or_insert(error);
+        }
         if let Some(error) = failure {
             return Err(error);
         }
