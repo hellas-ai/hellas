@@ -14,7 +14,7 @@ use hellas_adaptors::{
     BackendError, CanonicalExecution, ExecutionRequest as WireExecutionRequest, ResponseFormat,
     WireAdaptor,
 };
-use hellas_presentation::{ChatTemplate, TextPresentation};
+use hellas_presentation::TextPresentation;
 use hellas_rpc::provenance::ExecutionProvenance;
 use std::sync::Arc;
 
@@ -25,8 +25,15 @@ fn validate_native_text_request(canonical: &CanonicalExecution) -> Result<(), Ba
             "custom stop sequences are not supported by native text execution",
         ));
     }
+    // Native execution always takes the most likely token: temperature 0.
+    if let Some(temperature) = canonical.sampling.temperature
+        && temperature != 0.0
+    {
+        return Err(BackendError::rejected(format!(
+            "`temperature` {temperature} is not supported: native text execution decodes greedily, as at temperature 0"
+        )));
+    }
     for (name, present) in [
-        ("temperature", canonical.sampling.temperature.is_some()),
         ("top_p", canonical.sampling.top_p.is_some()),
         ("top_logprobs", canonical.sampling.top_logprobs.is_some()),
         ("truncation", canonical.sampling.truncation.is_some()),
@@ -100,10 +107,9 @@ where
         move |State(state): State<Arc<TextState>>,
               axum::Extension(selection): axum::Extension<crate::routing::Selection>,
               body: Bytes| async move {
-            let model = state.model_name.clone();
             let backend = super::backend::GatewayBackend::new(state, selection);
             let context = super::dispatch::render_context(id);
-            super::dispatch::serve(adaptor, surface, context, backend, Some(&model), &body).await
+            super::dispatch::serve(adaptor, surface, context, backend, &body).await
         },
     )
 }
@@ -111,7 +117,6 @@ where
 pub(super) struct TextState {
     pub(super) inference_metrics: super::backend::telemetry::InferenceMetrics,
     default_max_tokens: u32,
-    pub(super) model_name: String,
     presentation: Arc<TextPresentation>,
     execution: Arc<RouteExecution>,
 }
@@ -131,24 +136,19 @@ pub(super) struct PreparedGeneration {
 impl TextState {
     pub(super) async fn open(
         path: std::path::PathBuf,
-        model_name: String,
         default_max_tokens: u32,
         execution: Arc<RouteExecution>,
     ) -> crate::GatewayResult<Self> {
         if default_max_tokens == 0 {
             return Err(crate::GatewayConfigError::MaxTokens.into());
         }
-        let presentation = tokio::task::spawn_blocking(move || {
-            TextPresentation::from_gguf(&path)
-                .map(|presentation| presentation.with_chat_template(Some(ChatTemplate::Qwen3)))
-        })
-        .await
-        .map_err(crate::GatewayError::Task)?
-        .map_err(|error| crate::GatewayError::Presentation(error.into()))?;
+        let presentation = tokio::task::spawn_blocking(move || TextPresentation::from_gguf(&path))
+            .await
+            .map_err(crate::GatewayError::Task)?
+            .map_err(|error| crate::GatewayError::Presentation(error.into()))?;
         Ok(Self {
             inference_metrics: super::backend::telemetry::InferenceMetrics::new(),
             default_max_tokens,
-            model_name,
             presentation: Arc::new(presentation),
             execution,
         })
@@ -161,6 +161,8 @@ impl TextState {
     ) -> Result<PreparedGeneration, BackendError> {
         let canonical = &req.canonical;
         validate_native_text_request(canonical)?;
+        // A budget beyond the terms is cut to them; generation then ends
+        // with the format's ordinary length stop.
         let max_tokens = canonical
             .sampling
             .max_output_tokens

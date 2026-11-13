@@ -116,14 +116,14 @@ impl WireAdaptor for OpenAiResponsesAdaptor {
         context: RenderContext,
     ) -> AdaptorResult<WireResponse> {
         let failed = result.error.as_ref();
-        let body = response_json(ResponseJsonParts {
+        let mut body = response_json(ResponseJsonParts {
             response_id: &context.response_id,
             created_at: context.created_at,
             model: &request.model,
             status: if failed.is_some() {
                 "failed"
             } else {
-                "completed"
+                terminal_response_status(result.stop_reason)
             },
             output: output_items_json(
                 &context.message_id,
@@ -131,23 +131,21 @@ impl WireAdaptor for OpenAiResponsesAdaptor {
                 if failed.is_some() {
                     "incomplete"
                 } else {
-                    "completed"
+                    terminal_item_status(result.stop_reason)
                 },
             )?,
             usage: result.usage,
             metadata: request_metadata(request),
             provenance: result.provenance.as_ref(),
         });
-        let body = if let Some(error) = failed {
-            let mut body = body;
+        if let Some(error) = failed {
             body["error"] = json!({
                 "code": error.code.clone().unwrap_or_else(|| "server_error".to_string()),
                 "message": error.message.clone(),
             });
-            body
         } else {
-            body
-        };
+            apply_terminal_details(&mut body, result.stop_reason);
+        }
         Ok(WireResponse::json(200, body))
     }
 
@@ -177,6 +175,17 @@ impl WireAdaptor for OpenAiResponsesAdaptor {
 
     fn attest(&self, state: &mut Self::StreamState, provenance: crate::Provenance) {
         crate::execution::merge_provenance(&mut state.provenance, provenance);
+    }
+
+    /// Responses names no code for a request that fails the same way each
+    /// time; `invalid_prompt` is the one clients do not retry.
+    fn error_code(&self, status: u16) -> Option<String> {
+        let code = match status {
+            429 => "rate_limit_exceeded",
+            400..=499 => "invalid_prompt",
+            _ => "server_error",
+        };
+        Some(code.to_string())
     }
 
     fn render_stream_event(

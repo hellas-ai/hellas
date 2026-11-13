@@ -1,0 +1,304 @@
+{
+ "model": "gpt-4.1-mini",
+ "input": [
+  {
+   "role": "system",
+   "content": "You are opencode, an agent - please keep going until the user’s query is completely resolved, before ending your turn an…"
+  },
+  {
+   "role": "user",
+   "content": [
+    {
+     "type": "input_text",
+     "text": "\"create hello.py that prints hello, then run it\""
+    }
+   ]
+  }
+ ],
+ "store": false,
+ "prompt_cache_key": "fixture",
+ "tools": [
+  {
+   "type": "function",
+   "name": "bash",
+   "description": "Executes a given bash command in a persistent shell session with optional timeout, ensuring proper handling and security…",
+   "parameters": {
+    "properties": {
+     "command": {
+      "description": "The command to execute",
+      "type": "string"
+     },
+     "timeout": {
+      "description": "Optional timeout in milliseconds",
+      "type": "integer"
+     },
+     "workdir": {
+      "description": "The working directory to run the command in. Defaults to the current directory. Use this instead of 'cd' commands.",
+      "type": "string"
+     }
+    },
+    "required": [
+     "command"
+    ],
+    "type": "object"
+   },
+   "strict": false
+  },
+  {
+   "type": "function",
+   "name": "edit",
+   "description": "Performs exact string replacements in files. \n\nUsage:\n- You must use your `Read` tool at least once in the conversation …",
+   "parameters": {
+    "properties": {
+     "filePath": {
+      "description": "The absolute path to the file to modify",
+      "type": "string"
+     },
+     "oldString": {
+      "description": "The text to replace",
+      "type": "string"
+     },
+     "newString": {
+      "description": "The text to replace it with (must be different from oldString)",
+      "type": "string"
+     },
+     "replaceAll": {
+      "description": "Replace all occurrences of oldString (default false)",
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "filePath",
+     "oldString",
+     "newString"
+    ],
+    "type": "object"
+   },
+   "strict": false
+  },
+  {
+   "type": "function",
+   "name": "glob",
+   "description": "- Fast file pattern matching tool that works with any codebase size\n- Supports glob patterns like \"**/*.js\" or \"src/**/*…",
+   "parameters": {
+    "properties": {
+     "pattern": {
+      "description": "The glob pattern to match files against",
+      "type": "string"
+     },
+     "path": {
+      "description": "The directory to search in. If not specified, the current working directory will be used. IMPORTANT: Omit this field to …",
+      "type": "string"
+     }
+    },
+    "required": [
+     "pattern"
+    ],
+    "type": "object"
+   },
+   "strict": false
+  },
+  {
+   "type": "function",
+   "name": "grep",
+   "description": "- Fast content search tool that works with any codebase size\n- Searches file contents using regular expressions\n- Suppor…",
+   "parameters": {
+    "properties": {
+     "pattern": {
+      "description": "The regex pattern to search for in file contents",
+      "type": "string"
+     },
+     "path": {
+      "description": "The directory to search in. Defaults to the current working directory.",
+      "type": "string"
+     },
+     "include": {
+      "description": "File pattern to include in the search (e.g. \"*.js\", \"*.{ts,tsx}\")",
+      "type": "string"
+     }
+    },
+    "required": [
+     "pattern"
+    ],
+    "type": "object"
+   },
+   "strict": false
+  },
+  {
+   "type": "function",
+   "name": "read",
+   "description": "Read a file or directory from the local filesystem. If the path does not exist, an error is returned.\n\nUsage:\n- The file…",
+   "parameters": {
+    "properties": {
+     "filePath": {
+      "description": "The absolute path to the file or directory to read",
+      "type": "string"
+     },
+     "offset": {
+      "description": "The line number to start reading from (1-indexed)",
+      "type": "integer"
+     },
+     "limit": {
+      "description": "The maximum number of lines to read (defaults to 2000)",
+      "type": "integer"
+     }
+    },
+    "required": [
+     "filePath"
+    ],
+    "type": "object"
+   },
+   "strict": false
+  },
+  {
+   "type": "function",
+   "name": "skill",
+   "description": "Load a specialized skill when the task at hand matches one of the skills listed in the system prompt.\n\nUse this tool to …",
+   "parameters": {
+    "properties": {
+     "name": {
+      "description": "The name of the skill from available_skills",
+      "type": "string"
+     }
+    },
+    "required": [
+     "name"
+    ],
+    "type": "object"
+   },
+   "strict": false
+  },
+  {
+   "type": "function",
+   "name": "task",
+   "description": "Launch a new agent to handle complex, multistep tasks autonomously.\n\nWhen using the Task tool, you must specify a subage…",
+   "parameters": {
+    "properties": {
+     "description": {
+      "description": "A short (3-5 words) description of the task",
+      "type": "string"
+     },
+     "prompt": {
+      "description": "The task for the agent to perform",
+      "type": "string"
+     },
+     "subagent_type": {
+      "description": "The type of specialized agent to use for this task",
+      "type": "string"
+     },
+     "task_id": {
+      "description": "This should only be set if you mean to resume a previous task (you can pass a prior task_id and the task will continue t…",
+      "type": "string"
+     },
+     "command": {
+      "description": "The command that triggered this task",
+      "type": "string"
+     }
+    },
+    "required": [
+     "description",
+     "prompt",
+     "subagent_type"
+    ],
+    "type": "object"
+   },
+   "strict": false
+  },
+  {
+   "type": "function",
+   "name": "todowrite",
+   "description": "Create and maintain a structured task list for the current coding session. Tracks progress, organizes multi-step work, a…",
+   "parameters": {
+    "properties": {
+     "todos": {
+      "description": "The updated todo list",
+      "items": {
+       "properties": {
+        "content": {
+         "description": "Brief description of the task",
+         "type": "string"
+        },
+        "status": {
+         "description": "Current status of the task: pending, in_progress, completed, cancelled",
+         "type": "string"
+        },
+        "priority": {
+         "description": "Priority level of the task: high, medium, low",
+         "type": "string"
+        }
+       },
+       "required": [
+        "content",
+        "status",
+        "priority"
+       ],
+       "type": "object"
+      },
+      "type": "array"
+     }
+    },
+    "required": [
+     "todos"
+    ],
+    "type": "object"
+   },
+   "strict": false
+  },
+  {
+   "type": "function",
+   "name": "webfetch",
+   "description": "- Fetches content from a specified URL\n- Takes a URL and optional format as input\n- Fetches the URL content, converts to…",
+   "parameters": {
+    "properties": {
+     "url": {
+      "description": "The URL to fetch content from",
+      "type": "string"
+     },
+     "format": {
+      "description": "The format to return the content in (text, markdown, or html). Defaults to markdown.",
+      "enum": [
+       "text",
+       "markdown",
+       "html"
+      ],
+      "type": "string"
+     },
+     "timeout": {
+      "description": "Optional timeout in seconds (max 120)",
+      "type": "number"
+     }
+    },
+    "required": [
+     "url"
+    ],
+    "type": "object"
+   },
+   "strict": false
+  },
+  {
+   "type": "function",
+   "name": "write",
+   "description": "Writes a file to the local filesystem.\n\nUsage:\n- This tool will overwrite the existing file if there is one at the provi…",
+   "parameters": {
+    "properties": {
+     "content": {
+      "description": "The content to write to the file",
+      "type": "string"
+     },
+     "filePath": {
+      "description": "The absolute path to the file to write (must be absolute, not relative)",
+      "type": "string"
+     }
+    },
+    "required": [
+     "content",
+     "filePath"
+    ],
+    "type": "object"
+   },
+   "strict": false
+  }
+ ],
+ "tool_choice": "auto",
+ "stream": true
+}

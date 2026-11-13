@@ -52,6 +52,16 @@ pub struct Limits {
     pub execution_timeout_ms: u64,
 }
 impl Limits {
+    /// The most steps a Compute job emitting one 8-byte value per step, with
+    /// no other outputs, may take: [`compute::Plan::validate_bounds`] bounds
+    /// its steps and its output bytes.
+    pub fn step_bound(&self) -> u64 {
+        self.max_steps.min(
+            self.max_output_bytes
+                .min(super::MAX_INVOCATION_BYTES as u64)
+                / 8,
+        )
+    }
     pub fn validate(&self) -> Result<(), CanonicalDecodeError> {
         if self.max_upload_bytes == 0
             || self.max_output_bytes == 0

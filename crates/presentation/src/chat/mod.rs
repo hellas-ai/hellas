@@ -12,8 +12,9 @@ mod parser;
 mod sentinel_engine;
 mod tool_spec;
 
-use crate::{ChatTemplate, TextPresentation};
+use crate::TextPresentation;
 use anyhow::{Context, Result, ensure};
+use catena_models::spec::ModelArchitecture;
 use event::{DecodeEvent, SchemaError, StopReason};
 use hellas_adaptors::{CanonicalExecution, Input, OutputEvent, TextChannel, ToolChoice};
 use parser::{IncrementalToolCallParser, PassthroughParser};
@@ -40,15 +41,7 @@ impl TextPresentation {
             request.reasoning.is_none(),
             "reasoning options are not supported by the configured chat template"
         );
-        let supports_tools = matches!(
-            self.chat_template,
-            Some(ChatTemplate::Qwen3 | ChatTemplate::Qwen35)
-        );
-        let tools = if supports_tools {
-            input::chat_tools(request)?
-        } else {
-            Vec::new()
-        };
+        let tools = input::chat_tools(request)?;
         let selected = request
             .tools
             .iter()
@@ -63,20 +56,15 @@ impl TextPresentation {
             request.tool_choice,
             ToolChoice::Required | ToolChoice::Tool { .. }
         );
-        anyhow::ensure!(
-            supports_tools || !require_tool,
-            "the configured model adapter cannot satisfy a required tool choice"
-        );
         let parser: Box<dyn IncrementalToolCallParser> = if tools.is_empty() {
             Box::new(PassthroughParser)
         } else {
             let directory = Arc::new(ToolDirectory::new(selected)?);
-            let codec: Box<dyn sentinel_engine::PayloadCodec> = match self.chat_template {
-                Some(ChatTemplate::Qwen3) => Box::new(codecs::json::JsonObjectOrArrayCodec),
-                Some(ChatTemplate::Qwen35) => Box::new(
+            let codec: Box<dyn sentinel_engine::PayloadCodec> = match self.architecture {
+                ModelArchitecture::Qwen3Dense => Box::new(codecs::json::JsonObjectOrArrayCodec),
+                ModelArchitecture::Qwen35Dense | ModelArchitecture::Qwen35Moe => Box::new(
                     codecs::xml_function::XmlFunctionCodec::new(directory.clone()),
                 ),
-                _ => anyhow::bail!("tools require a model adapter supporting them"),
             };
             Box::new(sentinel_engine::SentinelEngine::new_pair(
                 directory,
@@ -90,19 +78,12 @@ impl TextPresentation {
                 self.encode(text)?
             }
             input => {
-                let mut messages =
-                    input::text_chat_messages(input, request.instructions.as_deref())?;
-                if require_tool {
-                    messages.insert(
-                        0,
-                        crate::ChatMessage {
-                            role: "system".into(),
-                            content: "Use one of the provided tools to answer this turn.".into(),
-                            ..Default::default()
-                        },
-                    );
-                }
-                self.encode_chat_with_tools(&messages, &tools)?
+                let messages = input::text_chat_messages(
+                    input,
+                    request.instructions.as_deref(),
+                    require_tool,
+                )?;
+                self.encode_chat(&messages, &tools)?
             }
         };
         Ok(PreparedChat {
@@ -234,7 +215,8 @@ mod tests {
             tokenizer: crate::tests::tokenizer(
                 r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"<unk>":0},"unk_token":"<unk>"}}"#,
             ),
-            chat_template: Some(ChatTemplate::Qwen3),
+            chat_template: crate::tests::template(false),
+            architecture: ModelArchitecture::Qwen3Dense,
         }
     }
 
@@ -281,12 +263,12 @@ mod tests {
                 json!({"role": "tool", "tool_call_id": "call_1", "content": "/home: 74% used"}),
             ),
         ]);
-        let messages = input::text_chat_messages(&input, None).unwrap();
-        let rendered = ChatTemplate::Qwen3
-            .render_with_tools(&messages, &input::chat_tools(&request()).unwrap())
+        let messages = input::text_chat_messages(&input, None, false).unwrap();
+        let rendered = crate::tests::template(false)
+            .render(&messages, &input::chat_tools(&request()).unwrap())
             .unwrap();
         assert!(rendered.contains(
-            "<tool_call>\n{\"arguments\":{\"command\":\"df -h\"},\"name\":\"bash\"}\n</tool_call>"
+            "<tool_call>\n{\"name\": \"bash\", \"arguments\": {\"command\":\"df -h\"}}\n</tool_call>"
         ));
         assert!(rendered.contains("<tool_response>\n/home: 74% used\n</tool_response>"));
     }
@@ -294,7 +276,8 @@ mod tests {
     #[test]
     fn qwen36_fragmented_xml_preserves_string_arguments_and_tool_history() {
         let mut presentation = presentation();
-        presentation.chat_template = Some(ChatTemplate::Qwen35);
+        presentation.chat_template = crate::tests::template(true);
+        presentation.architecture = ModelArchitecture::Qwen35Dense;
         for command in ["df -h", "true", "123", "echo café"] {
             let mut turn = presentation.prepare(&request()).unwrap().turn;
             let output = format!(
@@ -323,9 +306,9 @@ mod tests {
                     json!({"role": "tool", "tool_call_id": "call_1", "content": "/home: 74% used"}),
                 ),
             ]);
-            let messages = input::text_chat_messages(&input, None).unwrap();
-            let rendered = ChatTemplate::Qwen35
-                .render_with_tools(&messages, &input::chat_tools(&request()).unwrap())
+            let messages = input::text_chat_messages(&input, None, false).unwrap();
+            let rendered = crate::tests::template(true)
+                .render(&messages, &input::chat_tools(&request()).unwrap())
                 .unwrap();
             assert!(rendered.contains(&output));
             assert!(rendered.ends_with("<|im_start|>user\n<tool_response>\n/home: 74% used\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"));
@@ -420,7 +403,8 @@ mod tests {
                 "required": ["command", "count"], "additionalProperties": false
             });
             let mut presentation = presentation();
-            presentation.chat_template = Some(ChatTemplate::Qwen35);
+            presentation.chat_template = crate::tests::template(true);
+            presentation.architecture = ModelArchitecture::Qwen35Dense;
             for text in ["123", "true", "null"] {
                 let mut turn = presentation.prepare(&request).unwrap().turn;
                 let events = turn.feed(&format!("<tool_call><function=bash><parameter=command>{text}</parameter><parameter=count>2</parameter></function></tool_call>")).unwrap();
@@ -447,7 +431,8 @@ mod tests {
                 (combinator): [{"properties": properties}]
             });
             let mut presentation = presentation();
-            presentation.chat_template = Some(ChatTemplate::Qwen35);
+            presentation.chat_template = crate::tests::template(true);
+            presentation.architecture = ModelArchitecture::Qwen35Dense;
             let mut turn = presentation.prepare(&request).unwrap().turn;
             let events = turn.feed("<tool_call><function=bash><parameter=a>1</parameter><parameter=b>2</parameter><parameter=c>3</parameter></function></tool_call>").unwrap();
             let args = events
@@ -474,7 +459,8 @@ mod tests {
             ]
         });
         let mut presentation = presentation();
-        presentation.chat_template = Some(ChatTemplate::Qwen35);
+        presentation.chat_template = crate::tests::template(true);
+        presentation.architecture = ModelArchitecture::Qwen35Dense;
         let mut turn = presentation.prepare(&request).unwrap().turn;
         let events = turn.feed("<tool_call><function=bash><parameter=a>1</parameter><parameter=b>2</parameter></function></tool_call>").unwrap();
         let args = events

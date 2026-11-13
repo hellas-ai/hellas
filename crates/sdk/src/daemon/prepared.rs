@@ -167,6 +167,12 @@ impl WorkExecutionBackend for PreparedWork {
             .get()
             .map_or_else(|| self.info.clone(), |work| work.backends())
     }
+    fn max_steps<'a>(
+        &'a self,
+        backend: &'a str,
+    ) -> futures::future::BoxFuture<'a, std::result::Result<Option<u64>, WorkGatewayError>> {
+        self.active().max_steps(backend)
+    }
     fn fetch(
         &self,
         backend: &str,

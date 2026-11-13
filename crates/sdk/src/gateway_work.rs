@@ -1345,6 +1345,35 @@ impl WorkExecutionBackend for ExecutorGateway {
             })
             .collect()
     }
+    fn max_steps<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> futures::future::BoxFuture<'a, Result<Option<u64>, WorkGatewayError>> {
+        Box::pin(async move {
+            let backend = self.backends.get(id).ok_or(WorkGatewayError::Unsupported)?;
+            if let BackendState::Paid(paid) = &backend.state {
+                if let Some(session) = paid.session.lock().await.as_ref() {
+                    return Ok(Some(
+                        session.descriptor().invocation_policy().limits.step_bound(),
+                    ));
+                }
+                if paid.policy.is_none() {
+                    let mut quoted = backend.as_ref().clone();
+                    if let Err(error) = quoted.quote().await {
+                        let error = ExecutionError::Paid(error);
+                        if backend_failed(&error) {
+                            backend.health(Some(error.to_string()));
+                        }
+                        return Err(WorkGatewayError::PreProposal(Box::new(gateway_error(
+                            error,
+                        ))));
+                    }
+                    return Ok(quoted.policy().map(|policy| policy.limits.step_bound()));
+                }
+            }
+            Ok(backend.policy().map(|policy| policy.limits.step_bound()))
+        })
+    }
     fn fetch(
         &self,
         backend: &str,

@@ -49,7 +49,6 @@ async fn handle(
         "OpenAI Responses",
         super::dispatch::render_context("resp"),
         FetchBackend { state, selection },
-        None,
         &body,
     )
     .await

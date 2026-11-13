@@ -99,6 +99,7 @@ pub(crate) fn backend_status(error: &BackendError) -> StatusCode {
         BackendError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
         BackendError::Unavailable(_) => StatusCode::BAD_GATEWAY,
         BackendError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        BackendError::Output(_) => StatusCode::UNPROCESSABLE_ENTITY,
     }
 }
 
@@ -184,6 +185,14 @@ pub trait WorkExecutionBackend: Send + Sync {
         _job: hellas_client::model::ComputeJob,
     ) -> Result<WorkOutputStream<ComputeEvent>, WorkGatewayError> {
         Err(WorkGatewayError::Unsupported)
+    }
+
+    /// The selected backend's Compute step bound, resolved before rendering.
+    fn max_steps<'a>(
+        &'a self,
+        _backend: &'a str,
+    ) -> futures::future::BoxFuture<'a, Result<Option<u64>, WorkGatewayError>> {
+        Box::pin(async { Ok(None) })
     }
 
     /// Finish accepted work and its funding obligations during graceful shutdown.
