@@ -196,6 +196,18 @@ impl Core {
         &self.runtime.options.node
     }
 
+    /// Share the daemon's wallet reservations with an embedded native client.
+    pub async fn funding_owner(
+        &self,
+        chain: &hellas_chain::chain_dir::ChainDir,
+    ) -> Result<Arc<crate::client_owner::ClientOwner>> {
+        let _serial = self.configuring.lock().await;
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("daemon is closed".into());
+        }
+        Ok(self.runtime.client_resources(chain).await?.0)
+    }
+
     pub fn http_addresses(&self) -> BTreeMap<String, std::net::SocketAddr> {
         self.snapshot
             .load()

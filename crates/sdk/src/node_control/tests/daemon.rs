@@ -502,3 +502,33 @@ async fn an_unbound_daemon_can_install_its_iroh_listener_after_owner_binding() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn embedded_clients_share_the_daemons_funding_owner() {
+    hellas_authority::test_support::within(async {
+        let f = fixture().await;
+        let opts = options(&f);
+        let chain = opts.chain.clone();
+        let delegate = opts.settlement.party_key();
+        let core = Core::open(opts, Document::default()).await.unwrap();
+        let (first, second) = tokio::join!(core.funding_owner(&chain), core.funding_owner(&chain));
+        let owner = first.unwrap();
+        assert!(Arc::ptr_eq(&owner, &second.unwrap()));
+        // Independent owners cannot share the wallet's exclusive writer lock.
+        assert!(
+            crate::client_owner::ClientOwner::new(Arc::new(ROOT.passkey()), delegate, &chain,)
+                .is_err()
+        );
+        core.shutdown().await.unwrap();
+        assert!(core.funding_owner(&chain).await.is_err());
+        drop(core);
+        drop(owner);
+        assert!(
+            crate::client_owner::ClientOwner::new(Arc::new(ROOT.passkey()), delegate, &chain,)
+                .is_ok()
+        );
+        f.content.close().await;
+        f.node.close().await;
+    })
+    .await;
+}

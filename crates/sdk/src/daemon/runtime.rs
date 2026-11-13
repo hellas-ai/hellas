@@ -90,6 +90,29 @@ impl Runtime {
         }
     }
 
+    pub async fn client_resources(
+        &self,
+        chain: &hellas_chain::chain_dir::ChainDir,
+    ) -> Result<(Arc<crate::client_owner::ClientOwner>, DiskStore)> {
+        let mut clients = self.clients.lock().await;
+        if let Some(existing) = clients.get(chain.as_path()) {
+            return Ok(existing.clone());
+        }
+        let principal = self
+            .options
+            .owner
+            .clone()
+            .ok_or("a paid backend requires the owner identity")?;
+        let owner = Arc::new(crate::client_owner::ClientOwner::new(
+            principal,
+            self.options.settlement.party_key(),
+            chain,
+        )?);
+        let content = crate::chain_home::open_client_content(chain).await?;
+        clients.insert(chain.as_path().to_owned(), (owner.clone(), content.clone()));
+        Ok((owner, content))
+    }
+
     pub(super) fn chain(
         &self,
         profile: &Option<hellas_chain::genesis::CustomChainFile>,
@@ -218,28 +241,8 @@ impl Runtime {
                 trust,
             } => {
                 let provider = provider.parse()?;
-                let principal = self
-                    .options
-                    .owner
-                    .clone()
-                    .ok_or("a paid backend requires the owner identity")?;
                 let chain = self.chain(chain)?;
-                let (owner, content) = {
-                    let mut clients = self.clients.lock().await;
-                    if let Some(existing) = clients.get(chain.as_path()) {
-                        existing.clone()
-                    } else {
-                        let owner = Arc::new(crate::client_owner::ClientOwner::new(
-                            principal,
-                            self.options.settlement.party_key(),
-                            &chain,
-                        )?);
-                        let content = crate::chain_home::open_client_content(&chain).await?;
-                        clients
-                            .insert(chain.as_path().to_owned(), (owner.clone(), content.clone()));
-                        (owner, content)
-                    }
-                };
+                let (owner, content) = self.client_resources(&chain).await?;
                 let endpoint = self
                     .paid
                     .get_or_try_init(|| {
