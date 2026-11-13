@@ -21,27 +21,15 @@ pub(crate) struct LocalArgs {
 #[cfg(feature = "compute")]
 #[derive(Args, Debug)]
 pub(crate) struct GpuArgs {
-    /// GPU runtime: auto, hip, or cuda.
-    #[arg(long = "gpu-backend", default_value = "auto", value_parser = parse_gpu_backend)]
-    pub(crate) gpu_backend: hellas_executor::GpuDialect,
+    /// Registered local evaluator id; omitted selects the native executor.
+    #[arg(long = "evaluator", value_parser = hellas_executor::catena::registered_evaluator)]
+    pub(crate) evaluator: Option<hellas_executor::GpuDialect>,
     /// Maximum programs retained in a GPU worker session.
     #[arg(long = "gpu-session-programs", default_value_t = hellas_executor::DEFAULT_GPU_SESSION_PROGRAMS, value_parser = crate::parsers::parse_positive_usize)]
     pub(crate) gpu_session_programs: usize,
     /// Maximum static asset bytes retained across GPU jobs.
     #[arg(long = "gpu-session-asset-bytes", default_value_t = hellas_executor::DEFAULT_GPU_SESSION_ASSET_BYTES, value_parser = crate::parsers::parse_positive_u64)]
     pub(crate) gpu_session_asset_bytes: u64,
-}
-
-#[cfg(feature = "compute")]
-pub(crate) fn parse_gpu_backend(value: &str) -> Result<hellas_executor::GpuDialect, String> {
-    use hellas_executor::GpuDialect;
-    match value {
-        "hip" => Ok(GpuDialect::Hip),
-        "cuda" => Ok(GpuDialect::Cuda),
-        "auto" if std::path::Path::new("/dev/nvidiactl").exists() => Ok(GpuDialect::Cuda),
-        "auto" => Ok(GpuDialect::Hip),
-        _ => Err("GPU runtime must be auto, hip, or cuda".into()),
-    }
 }
 
 /// One-shot local execution uses the same native constructor as the daemon.
@@ -72,7 +60,10 @@ pub(crate) async fn local(
         let backend = hellas_sdk::execution::local::spawn(
             signer,
             hellas_executor::GpuConfig {
-                backend: native.gpu.gpu_backend,
+                backend: native
+                    .gpu
+                    .evaluator
+                    .unwrap_or_else(hellas_executor::catena::default_gpu),
                 session_programs: native.gpu.gpu_session_programs,
                 session_asset_bytes: native.gpu.gpu_session_asset_bytes,
             },

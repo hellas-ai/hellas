@@ -56,8 +56,8 @@ pub struct Backend {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BackendKind {
     Local {
-        #[serde(default = "gpu")]
-        runtime: String,
+        #[serde(default)]
+        evaluator: Option<String>,
         #[serde(default)]
         content: Vec<PathBuf>,
     },
@@ -97,9 +97,6 @@ pub enum BackendKind {
         method: String,
         upstream: Upstream,
     },
-}
-fn gpu() -> String {
-    "auto".into()
 }
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

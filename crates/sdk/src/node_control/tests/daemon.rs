@@ -727,7 +727,7 @@ async fn unrelated_configure_keeps_the_local_backend_instance() {
         let f = fixture().await;
         let document: Document = serde_json::from_value(serde_json::json!({
             "listeners": {}, "routes": [],
-            "backends": {"local": {"kind": "local", "runtime": "hip", "max_in_flight": 2}}
+            "backends": {"local": {"kind": "local", "evaluator": hellas_executor::catena::evaluator(hellas_executor::GpuDialect::Hip), "max_in_flight": 2}}
         }))
         .unwrap();
         let core = Core::open(options(&f), document.clone()).await.unwrap();
@@ -829,4 +829,22 @@ async fn resources_require_a_backend_allowed_by_the_iroh_listener() {
     core.shutdown().await.unwrap();
     connection.close(0u32.into(), b"test complete");
     let _ = served.await.unwrap();
+}
+
+#[cfg(feature = "compute")]
+#[tokio::test]
+async fn local_backends_register_by_evaluator_id() {
+    let f = fixture().await;
+    let evaluator = hellas_executor::catena::evaluator(hellas_executor::GpuDialect::Hip);
+    let document: Document = serde_json::from_value(serde_json::json!({
+        "listeners": {},
+        "backends": {"local": {"kind": "local", "evaluator": evaluator, "max_in_flight": 2}}
+    }))
+    .unwrap();
+    let core = Core::open(options(&f), document).await.unwrap();
+    assert_eq!(
+        core.watch().0.backends[0].evaluator.as_deref(),
+        Some(evaluator.as_str())
+    );
+    core.shutdown().await.unwrap();
 }

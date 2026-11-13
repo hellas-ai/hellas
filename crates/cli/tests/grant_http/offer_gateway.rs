@@ -230,7 +230,7 @@ impl OfferHost {
                 Backend {
                     max_in_flight: std::num::NonZeroUsize::MIN,
                     kind: BackendKind::Local {
-                        runtime: "auto".into(),
+                        evaluator: None,
                         content: vec![],
                     },
                 },

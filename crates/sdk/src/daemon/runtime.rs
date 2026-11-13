@@ -41,19 +41,10 @@ pub(super) struct Runtime {
     >,
     consumer: tokio::sync::OnceCell<iroh::Endpoint>,
     #[cfg(feature = "compute")]
-    hip: tokio::sync::OnceCell<hellas_executor::ExecutorHandle>,
-    #[cfg(feature = "compute")]
-    cuda: tokio::sync::OnceCell<hellas_executor::ExecutorHandle>,
+    executors:
+        tokio::sync::Mutex<std::collections::BTreeMap<String, hellas_executor::ExecutorHandle>>,
     #[cfg(feature = "compute")]
     indexed: tokio::sync::Mutex<BTreeSet<PathBuf>>,
-}
-#[cfg(feature = "compute")]
-pub(super) fn automatic_gpu() -> hellas_executor::GpuDialect {
-    if Path::new("/dev/nvidiactl").exists() {
-        hellas_executor::GpuDialect::Cuda
-    } else {
-        hellas_executor::GpuDialect::Hip
-    }
 }
 
 pub(super) enum PreparedBackend {
@@ -138,9 +129,7 @@ impl Runtime {
             clients: Default::default(),
             consumer: Default::default(),
             #[cfg(feature = "compute")]
-            hip: Default::default(),
-            #[cfg(feature = "compute")]
-            cuda: Default::default(),
+            executors: Default::default(),
             #[cfg(feature = "compute")]
             indexed: Default::default(),
         }
@@ -396,37 +385,37 @@ impl Runtime {
                     capacity: configured.max_in_flight,
                 });
             }
-            BackendKind::Local { runtime, content } => {
+            BackendKind::Local { evaluator, content } => {
                 #[cfg(not(feature = "compute"))]
                 {
-                    let _ = (id, document, runtime, content);
+                    let _ = (id, document, evaluator, content);
                     return Err("local backends require the compute build".into());
                 }
                 #[cfg(feature = "compute")]
                 {
-                    let dialect = match runtime.as_str() {
-                        "cuda" => hellas_executor::GpuDialect::Cuda,
-                        "hip" => hellas_executor::GpuDialect::Hip,
-                        "auto" => automatic_gpu(),
-                        _ => return Err("GPU runtime must be auto, hip, or cuda".into()),
-                    };
-                    let executor = match dialect {
-                        hellas_executor::GpuDialect::Hip => &self.hip,
-                        hellas_executor::GpuDialect::Cuda => &self.cuda,
-                    };
-                    let backend = executor
-                        .get_or_try_init(|| async {
-                            crate::execution::local::spawn(
-                                self.options.signer.clone(),
-                                hellas_executor::GpuConfig {
-                                    backend: dialect,
-                                    ..Default::default()
-                                },
+                    let dialect = evaluator
+                        .as_deref()
+                        .map(hellas_executor::catena::registered_evaluator)
+                        .transpose()?
+                        .unwrap_or_else(hellas_executor::catena::default_gpu);
+                    let evaluator = hellas_executor::catena::evaluator(dialect);
+                    let mut executors = self.executors.lock().await;
+                    let backend = match executors.entry(evaluator.clone()) {
+                        std::collections::btree_map::Entry::Occupied(entry) => entry.get().clone(),
+                        std::collections::btree_map::Entry::Vacant(entry) => entry
+                            .insert(
+                                crate::execution::local::spawn(
+                                    self.options.signer.clone(),
+                                    hellas_executor::GpuConfig {
+                                        backend: dialect,
+                                        ..Default::default()
+                                    },
+                                )
+                                .await?,
                             )
-                            .await
-                        })
-                        .await?
-                        .clone();
+                            .clone(),
+                    };
+                    drop(executors);
                     let mut paths = content.clone();
                     paths.extend(
                         document
@@ -459,7 +448,7 @@ impl Runtime {
                             },
                             std::time::Duration::from_secs(86_400),
                         ),
-                        Some(hellas_executor::catena::evaluator(dialect)),
+                        Some(evaluator),
                     )
                 }
             }

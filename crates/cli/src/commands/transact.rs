@@ -503,7 +503,10 @@ impl TargetArgs {
         #[cfg(feature = "compute")]
         if self.local {
             return Some(hellas_executor::catena::evaluator(
-                self.native.gpu.gpu_backend,
+                self.native
+                    .gpu
+                    .evaluator
+                    .unwrap_or_else(hellas_executor::catena::default_gpu),
             ));
         }
         self.backend.clone()

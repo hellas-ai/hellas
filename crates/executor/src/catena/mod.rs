@@ -16,6 +16,25 @@ pub fn evaluator(dialect: catena_lang::codegen::GpuDialect) -> String {
         hellas_rpc::protocol::invocation::compute::EVALUATOR
     )
 }
+/// Resolve an opaque evaluator id registered by this executor build.
+pub fn registered_evaluator(id: &str) -> Result<catena_lang::codegen::GpuDialect, String> {
+    use catena_lang::codegen::GpuDialect;
+    [GpuDialect::Hip, GpuDialect::Cuda]
+        .into_iter()
+        .find(|dialect| evaluator(*dialect) == id)
+        .ok_or_else(|| format!("unregistered evaluator: {id}"))
+}
+
+/// Select the native executor once, at its boundary with the host platform.
+pub fn default_gpu() -> catena_lang::codegen::GpuDialect {
+    use catena_lang::codegen::GpuDialect;
+    if std::path::Path::new("/dev/nvidiactl").exists() {
+        GpuDialect::Cuda
+    } else {
+        GpuDialect::Hip
+    }
+}
+
 mod memory;
 pub mod validate;
 

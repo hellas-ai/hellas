@@ -102,7 +102,7 @@ impl ModelContext {
                 .or_insert_with(|| Backend {
                     max_in_flight: std::num::NonZeroUsize::new(8).unwrap(),
                     kind: BackendKind::Local {
-                        runtime: "auto".into(),
+                        evaluator: None,
                         content: vec![],
                     },
                 });
@@ -789,6 +789,22 @@ mod tests {
             grant_backend(&mut document, &other, resource, "other".into(), None, None),
             id
         );
+    }
+
+    #[cfg(feature = "compute")]
+    #[test]
+    fn local_commands_accept_registered_evaluator_ids() {
+        use clap::CommandFactory;
+        let evaluator = hellas_executor::catena::evaluator(hellas_executor::GpuDialect::Hip);
+        let command = clap::Command::new("test");
+        use clap::Args;
+        let matches = crate::compute::GpuArgs::augment_args(command).try_get_matches_from([
+            "test",
+            "--evaluator",
+            &evaluator,
+        ]);
+        assert!(matches.is_ok(), "{matches:?}");
+        crate::Cli::command().debug_assert();
     }
 
     #[test]

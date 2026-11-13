@@ -6,9 +6,9 @@ fn backend(kind: BackendKind) -> Backend {
         kind,
     }
 }
-fn local(runtime: &str) -> Backend {
+fn local(evaluator: &str) -> Backend {
     backend(BackendKind::Local {
-        runtime: runtime.into(),
+        evaluator: Some(evaluator.into()),
         content: vec![],
     })
 }
@@ -27,7 +27,7 @@ fn info(id: &str, evaluator: &str) -> hellas_gateway::BackendInfo {
 fn empty_daemon_is_valid_but_impossible_capacity_is_not() {
     let mut document = Document::default();
     document.validate().unwrap();
-    let mut gpu = local("auto");
+    let mut gpu = local("opaque/first");
     gpu.max_in_flight = NonZeroUsize::new(tokio::sync::Semaphore::MAX_PERMITS + 1).unwrap();
     document.backends.insert("gpu".into(), gpu);
     assert_eq!(
@@ -79,8 +79,8 @@ fn iroh_only_accepts_local_and_fetch_backends() {
 fn iroh_duplicate_keys_use_resolved_evaluator_ids() {
     let mut document = Document {
         backends: [
-            ("first".into(), local("auto")),
-            ("second".into(), local("cuda")),
+            ("first".into(), local("opaque/first")),
+            ("second".into(), local("opaque/second")),
         ]
         .into(),
         ..Default::default()
@@ -240,7 +240,9 @@ async fn model_and_operator_inputs_keep_their_terms_in_one_configuration() {
     );
     resource.max_job_millis = std::num::NonZeroU64::new(123_000).unwrap();
     document.resources.push(resource);
-    document.backends.insert("gpu".into(), local("cuda"));
+    document
+        .backends
+        .insert("gpu".into(), local("opaque/second"));
     document.routes.push(hellas_gateway::Route {
         backends: vec!["gpu".into()],
         presentation: hellas_gateway::Presentation::Model {
