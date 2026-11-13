@@ -8,10 +8,7 @@ use hellas_rpc::protocol::invocation::{
 use std::sync::Arc;
 
 impl super::Backend {
-    pub async fn open_fetch(
-        &self,
-        signer: Arc<hellas_auth::ProducerSigningKey>,
-    ) -> Result<Backend, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn fetch_policy(&self) -> Result<InvocationPolicy, crate::daemon::Error> {
         let BackendKind::Fetch {
             service,
             method,
@@ -20,8 +17,15 @@ impl super::Backend {
         else {
             return Err("not a Fetch backend".into());
         };
-        let (entry, contract) = upstream.entry()?;
-        let policy = InvocationPolicy {
+        let contract = match upstream {
+            Upstream::Http { .. } | Upstream::OpenaiHttp { .. } => {
+                hellas_rpc::FetchContract::http()?
+            }
+            Upstream::OpenaiResponses { .. } => {
+                hellas_adaptors::openai::responses::fetch::responses_contract()?
+            }
+        };
+        Ok(InvocationPolicy {
             admissions: vec![Admission::Fetch {
                 admission: FetchAdmission {
                     contract,
@@ -44,7 +48,22 @@ impl super::Backend {
                 max_steps: 1,
                 execution_timeout_ms: 86_400_000,
             },
+        })
+    }
+    pub async fn open_fetch(
+        &self,
+        signer: Arc<hellas_auth::ProducerSigningKey>,
+    ) -> Result<Backend, Box<dyn std::error::Error + Send + Sync>> {
+        let BackendKind::Fetch {
+            service,
+            method,
+            upstream,
+        } = &self.kind
+        else {
+            return Err("not a Fetch backend".into());
         };
+        let (entry, _) = upstream.entry()?;
+        let policy = self.fetch_policy()?;
         let mut routes = FetchRouteRegistry::new();
         routes.register(FetchRoute::new(service, method), entry)?;
         let mut config = ExecutorSpawnConfig::new(signer, routes);
@@ -66,6 +85,7 @@ impl Upstream {
     > {
         let capabilities = Default::default();
         Ok(match self {
+            Self::OpenaiHttp { .. } => return self.http_configuration()?.entry(),
             Self::Http { allowed_hosts, allow_private_addresses, credentials } => {
                 let credentials = credentials.iter().map(|(id, credential)| {
                     Ok((id.clone(), hellas_providers::HttpCredential {

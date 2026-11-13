@@ -360,3 +360,34 @@ async fn interrupted_configuration_reopens_as_one_complete_version() {
         other => panic!("unexpected revision {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn withdrawing_resources_hides_the_catalogue_and_preserves_existing_ownership() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = store(directory.path()).await;
+    let configured = configuration(budget(3, vec![]), budget(2, vec![]));
+    store
+        .apply_configuration(&configured, UnixMillis(1001))
+        .await
+        .unwrap();
+    store
+        .apply_configuration(&NodeConfiguration::default(), UnixMillis(1002))
+        .await
+        .unwrap();
+    assert_eq!(store.state().catalogue().count(), 0);
+    assert_eq!(store.state().resource(policy().resource), Some(&policy()));
+    drop(store);
+    let location = StoreLocation::for_test(directory.path());
+    let mut reopened = NodeStore::open(&location, network(), None, UnixMillis(1003))
+        .await
+        .unwrap();
+    assert_eq!(reopened.state().catalogue().count(), 0);
+    reopened
+        .apply_configuration(&configured, UnixMillis(1004))
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened.state().catalogue().cloned().collect::<Vec<_>>(),
+        vec![policy()]
+    );
+}

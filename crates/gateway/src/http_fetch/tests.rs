@@ -584,17 +584,112 @@ async fn duplicate_session_header_never_discards_an_unknown_continuation() {
 
 fn http(path: &str, models: Option<Vec<String>>, credential: Option<&str>) -> crate::Route {
     crate::test_support::route(crate::Presentation::Http {
-        service: "http".into(),
-        method: "request".into(),
-        route: HttpRoute {
-            path: path.into(),
-            method: "POST".into(),
-            url: format!("https://example.com{path}"),
-            credential: credential.map(str::to_owned),
-            tls: public_tls(),
-            headers: vec![],
-            max_response_bytes: hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES,
-            models,
-        },
+        targets: ["test"]
+            .into_iter()
+            .map(|id| {
+                (
+                    id.into(),
+                    crate::HttpTarget {
+                        service: "http".into(),
+                        method: "request".into(),
+                        route: HttpRoute {
+                            path: path.into(),
+                            method: "POST".into(),
+                            url: format!("https://example.com{path}"),
+                            credential: credential.map(str::to_owned),
+                            tls: public_tls(),
+                            headers: vec![],
+                            max_response_bytes: hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES,
+                            models: models.clone(),
+                        },
+                    },
+                )
+            })
+            .collect(),
     })
+}
+
+#[tokio::test]
+async fn failover_uses_each_backends_own_destination_and_credential() {
+    use tower::ServiceExt;
+    struct Targets(std::sync::Mutex<Vec<String>>);
+    impl crate::WorkExecutionBackend for Targets {
+        fn backends(&self) -> Vec<crate::BackendInfo> {
+            ["first", "second"]
+                .map(|id| crate::BackendInfo {
+                    id: id.into(),
+                    evaluator: None,
+                    max_in_flight: 2,
+                    in_flight: 0,
+                    down: false,
+                })
+                .into()
+        }
+        fn fetch(
+            &self,
+            id: &str,
+            job: Arc<crate::jobs::Job>,
+            request: WorkFetchRequest,
+        ) -> Result<crate::WorkFetchStream, crate::WorkGatewayError> {
+            self.0.lock().unwrap().push(id.into());
+            assert_eq!(request.service, id);
+            let upstream: hellas_rpc::http_fetch::HttpFetchRequest =
+                serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(
+                upstream.url,
+                format!("https://{id}.example/v1/responses?stream=true")
+            );
+            assert_eq!(upstream.credential.as_deref(), Some(id));
+            assert!(
+                !upstream
+                    .headers
+                    .iter()
+                    .any(|(name, _)| name == "authorization")
+            );
+            if id == "first" {
+                return Err(crate::WorkGatewayError::PreProposal(Box::new(
+                    crate::WorkGatewayBusy.into(),
+                )));
+            }
+            ContinuationBackend { calls: 0.into() }.fetch(id, job, request)
+        }
+        fn drain(&self) -> futures::future::BoxFuture<'_, Result<(), crate::WorkShutdownError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+    let mut route = http("/v1/responses", Some(vec!["m".into()]), None);
+    let crate::Presentation::Http { targets } = &mut route.presentation else {
+        unreachable!()
+    };
+    let original = targets.remove("test").unwrap();
+    for id in ["first", "second"] {
+        let mut target = original.clone();
+        target.service = id.into();
+        target.route.url = format!("https://{id}.example/v1/responses");
+        target.route.credential = Some(id.into());
+        targets.insert(id.into(), target);
+    }
+    route.backends = vec!["first".into(), "second".into()];
+    let work = Arc::new(Targets(Default::default()));
+    let app = crate::router::router(
+        vec![route],
+        work.clone(),
+        Arc::new(crate::jobs::Jobs::default()),
+    )
+    .await
+    .unwrap();
+    let response = app
+        .oneshot(
+            axum::http::Request::post("/v1/responses?stream=true")
+                .header("authorization", "Bearer client-only")
+                .body(Body::from(r#"{"model":"m"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    assert_eq!(*work.0.lock().unwrap(), ["first", "second"]);
 }

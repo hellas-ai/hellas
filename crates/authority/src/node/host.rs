@@ -58,6 +58,14 @@ impl NodeCoordinator {
         Ok(store.state().configuration().cloned())
     }
 
+    /// Latest resource policies, including withdrawn entries needed for revision checks.
+    pub async fn resource_catalogue(
+        &self,
+    ) -> Result<Vec<crate::model::grant::records::GrantPolicy>, NodeStoreError> {
+        let (store, _) = self.lock().await?;
+        Ok(store.state().resource_catalogue().cloned().collect())
+    }
+
     /// The whole daemon change has one authority check and one durable frame.
     pub async fn configure(
         &self,

@@ -2,6 +2,7 @@
 use hellas_auth::authority::{ResourceId, Revision};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, net::SocketAddr, num::NonZeroUsize, path::PathBuf};
+mod entries;
 mod fetch;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -87,6 +88,11 @@ pub struct Trust {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Upstream {
+    OpenaiHttp {
+        url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        secret: Option<String>,
+    },
     Http {
         allowed_hosts: Vec<String>,
         #[serde(default)]
@@ -174,7 +180,8 @@ impl Document {
                     }
                 }
                 BackendKind::Fetch {
-                    upstream: Upstream::OpenaiResponses { secret },
+                    upstream:
+                        Upstream::OpenaiResponses { secret } | Upstream::OpenaiHttp { secret, .. },
                     ..
                 } => visit(id, "", secret),
                 _ => {}

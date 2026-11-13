@@ -7,7 +7,7 @@ mod affinity;
 mod route;
 mod routing;
 pub use access::GatewayAccess;
-pub use route::{Presentation, Route};
+pub use route::{HttpTarget, Presentation, Route};
 mod archive;
 mod audio;
 mod backend;
@@ -343,7 +343,7 @@ async fn start_gateway(options: GatewayOptions) -> crate::GatewayResult<GatewayH
     let app = app.layer(axum::middleware::from_fn(
         hellas_rpc::telemetry::http::trace_request,
     ));
-    let app = app.layer(access::BearerLayer::new(bearer.clone()));
+    let app = app.layer(access::BearerLayer::new(bearer.node()));
     let bound_addr = listener.local_addr()?;
     info!("gateway listening on {bound_addr}");
     bearer.announce();
@@ -392,10 +392,9 @@ pub fn serve_listener(
 
 pub async fn listener_router(
     app: axum::Router,
-    access: GatewayAccess,
+    node: hellas_authority::node::NodeCoordinator,
     archive: ArchiveOptions,
 ) -> GatewayResult<axum::Router> {
-    access.validate().await?;
     let policy = archive::Policy::new(archive);
     policy.prepare();
     let app =
@@ -408,7 +407,7 @@ pub async fn listener_router(
     let app = app.layer(axum::middleware::from_fn(
         hellas_rpc::telemetry::http::trace_request,
     ));
-    Ok(app.layer(access::BearerLayer::new(access)))
+    Ok(app.layer(access::BearerLayer::new(node)))
 }
 
 fn finish_cleanup<T>(

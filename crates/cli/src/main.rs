@@ -22,19 +22,6 @@ mod owner;
 mod platform_hardening;
 mod tracing_config;
 
-fn validate_serve_assurance(
-    assurance: hellas_rpc::Assurance,
-    root_kind: hellas_rpc::RootKind,
-) -> Result<(), String> {
-    if assurance == hellas_rpc::Assurance::AppleAppAttest
-        && root_kind != hellas_rpc::RootKind::SecureEnclave
-    {
-        Err("Apple App Attest assurance requires a Secure Enclave root".to_owned())
-    } else {
-        Ok(())
-    }
-}
-
 /// Commands that act for the principal create its home key on first use.
 /// Job commands create it only when they pay or use a grant.
 fn acts_for_principal(command: &Commands) -> bool {
@@ -96,20 +83,6 @@ enum IdentityCommand {
     },
 }
 
-#[derive(Subcommand)]
-enum CodexAuthCommand {
-    /// Sign in to Codex with device-code OAuth and store credentials locally
-    Login,
-    /// Import credentials from an existing Codex CLI auth file
-    Import {
-        /// Source auth file (default: $HOME/.codex/auth.json)
-        #[arg(long = "from")]
-        source_path: Option<PathBuf>,
-    },
-    /// Show whether local Codex credentials are configured
-    Status,
-}
-
 // Parsed once at startup and immediately destructured; boxing the large
 // variants would buy nothing.
 #[allow(clippy::large_enum_variant)]
@@ -139,91 +112,43 @@ enum Commands {
     },
     /// Administer node authority and settings.
     Admin(commands::admin::AdminArgs),
-    /// Run the RPC server
+    /// Run the stateful daemon, configured live through backend and route verbs.
     Serve {
-        #[command(flatten)]
-        native: compute::ServeArgs,
-        /// Assurance offered by this provider.
-        #[arg(long, default_value = "producer-signed", value_parser = parse_assurance)]
-        assurance: hellas_rpc::Assurance,
-        /// Port to listen on. Omit it to let the OS select an available port.
         #[arg(long)]
         port: Option<u16>,
-        /// Disable mDNS and DHT service advertising; clients must use direct addresses.
-        #[arg(long)]
-        no_discovery: bool,
-        /// Maximum number of queued executions waiting behind the active worker
-        #[arg(
-            long = "queue-size",
-            default_value_t = hellas_rpc::DEFAULT_EXECUTION_QUEUE_CAPACITY
-        )]
-        queue_size: usize,
-        /// Paid terms (TOML). With the principal key, approve and fund them
-        /// at startup; without one, require the exact remotely approved policy
-        /// and stake already delegated by the owner. Without paid terms, an
-        /// uninitialized node prints an invite and waits for `hellas pair`.
-        #[arg(long = "paid-work-config", value_name = "FILE")]
-        work_config_file: Option<PathBuf>,
-        /// Resources and listeners for an explicitly initialized authority store.
-        #[arg(long = "grant-config")]
-        grant_config_file: Option<PathBuf>,
-        /// Admit this exact Compute program (an id from `hellas program`) in the
-        /// one shared `compute` resource; repeat for each program.
-        #[arg(long = "program", value_name = "PROGRAM", conflicts_with_all = ["grant_config_file", "work_config_file"])]
-        programs: Vec<hellas_rpc::protocol::invocation::compute::ProgramId>,
-        /// Serve a configuration that admits any Compute program (`any` in
-        /// paid terms, or `Any` in a grant resource); without it
-        /// such a node refuses to start. Compiling and running a program from
-        /// an unknown author hands that author roughly root on this host.
-        #[arg(long)]
-        knowingly_unsafe: bool,
         #[cfg(feature = "otel")]
-        /// Prometheus metrics port (e.g. 9090)
-        #[arg(long = "metrics-port")]
+        #[arg(long)]
         metrics_port: Option<u16>,
         #[cfg(feature = "otel")]
-        /// IP address for unauthenticated metrics; non-loopback exposes them to the network.
         #[arg(long, default_value = "127.0.0.1")]
         metrics_addr: std::net::IpAddr,
-        /// Operator graffiti tag (up to 16 bytes, padded/truncated)
-        #[arg(long = "graffiti", default_value = "")]
-        graffiti: String,
-        /// Fetch configuration file: sealed upstream destinations and
-        /// credentials and route capabilities. No file
-        /// means this node serves no Fetch routes.
-        #[arg(long = "fetch-config")]
-        fetch_config_file: Option<PathBuf>,
-        /// Validate Fetch and grant resources without starting a node.
-        #[arg(long)]
-        check_config: bool,
-        /// Maximum number of Fetch provider streams running at once.
-        #[arg(
-            long = "fetch-max-in-flight",
-            default_value_t = hellas_rpc::DEFAULT_FETCH_MAX_IN_FLIGHT,
-            value_parser = parse_positive_usize
-        )]
-        fetch_max_in_flight: usize,
-        /// Maximum number of Fetch executions waiting behind active provider streams.
-        #[arg(
-            long = "fetch-queue-size",
-            default_value_t = hellas_rpc::DEFAULT_FETCH_QUEUE_CAPACITY
-        )]
-        fetch_queue_size: usize,
     },
-    /// Run the HTTP listeners in a daemon configuration document.
+    /// Serve models and upstreams from flags, without saving routing configuration.
     Gateway {
-        #[arg(long, value_name = "FILE")]
-        config: PathBuf,
+        #[command(flatten)]
+        args: commands::daemon::GatewayArgs,
         #[cfg(feature = "otel")]
         #[arg(long)]
         metrics_port: Option<u16>,
         #[cfg(feature = "otel")]
         #[arg(long, default_value = "127.0.0.1")]
         metrics_addr: std::net::IpAddr,
-        #[arg(long)]
-        wrap: Option<String>,
-        #[arg(last = true, allow_hyphen_values = true, requires = "wrap")]
-        wrap_args: Vec<String>,
+    },
+    Backend {
+        #[command(flatten)]
+        control: commands::daemon::ControlArgs,
+        #[command(subcommand)]
+        command: commands::daemon::BackendCommand,
+    },
+    Route {
+        #[command(flatten)]
+        control: commands::daemon::ControlArgs,
+        #[command(subcommand)]
+        command: commands::daemon::RouteCommand,
+    },
+    Routes {
+        #[command(flatten)]
+        control: commands::daemon::ControlArgs,
     },
     /// Query a remote node via RPC
     Rpc {
@@ -286,11 +211,6 @@ enum Commands {
     Identity {
         #[command(subcommand)]
         command: IdentityCommand,
-    },
-    /// Manage Codex OAuth credentials
-    CodexAuth {
-        #[command(subcommand)]
-        command: CodexAuthCommand,
     },
     /// Discover peers and log network events
     Monitor {
@@ -403,31 +323,6 @@ async fn async_main() {
         }
         return;
     }
-    if let Commands::Serve {
-        check_config: true,
-        fetch_config_file,
-        grant_config_file,
-        native,
-        ..
-    } = &cli.command
-    {
-        let result = async {
-            anyhow::ensure!(fetch_config_file.is_some() || grant_config_file.is_some() || native.content_config.is_some() || !native.content.is_empty(), "--check-config requires --content, --content-config, --fetch-config or --grant-config");
-            commands::serve::validate_provider_config(
-                fetch_config_file.as_deref(),
-                grant_config_file.as_deref(),
-                native.content_config.as_deref(),
-                &home,
-            )
-        }.await;
-        tracer_provider.shutdown();
-        if let Err(error) = result {
-            eprintln!("error: {error:#}");
-            std::process::exit(1);
-        }
-        return;
-    }
-
     let owner = match cli.owner.load(&home).and_then(|owner| match owner {
         None if acts_for_principal(&cli.command) => owner::principal(&home).map(Some),
         owner => Ok(owner),
@@ -441,25 +336,6 @@ async fn async_main() {
     let passkey = owner
         .as_ref()
         .map(|key| key as &dyn hellas_authority::authenticator::Authenticator);
-
-    if let Commands::CodexAuth { command } = &cli.command {
-        let result = match command {
-            CodexAuthCommand::Login => {
-                commands::codex_auth::login(&home.join("codex-auth.json")).await
-            }
-            CodexAuthCommand::Import { source_path } => commands::codex_auth::import_codex_cli(
-                &home.join("codex-auth.json"),
-                source_path.as_deref(),
-            ),
-            CodexAuthCommand::Status => commands::codex_auth::status(&home.join("codex-auth.json")),
-        };
-        tracer_provider.shutdown();
-        if let Err(err) = result {
-            eprintln!("error: {err:#}");
-            std::process::exit(1);
-        }
-        return;
-    }
 
     // Chain commands carry their own authentication material and transport.
     // Running them must not create an unrelated provider identity as a side
@@ -569,15 +445,6 @@ async fn async_main() {
         }
     };
     let secret_key = local_identity.transport_key.clone();
-    if let Commands::Serve { assurance, .. } = &command
-        && let Err(error) = validate_serve_assurance(
-            *assurance,
-            local_identity.enrollment.genesis.statement.root_kind,
-        )
-    {
-        eprintln!("error: {error}");
-        std::process::exit(1);
-    }
 
     let result = match command {
         Commands::Contact { name } => {
@@ -608,219 +475,64 @@ async fn async_main() {
             commands::store::run(args, &home, Some(&local_identity), passkey).await
         }
 
-        Commands::Serve {
-            native,
-            assurance,
-            port,
-            no_discovery,
-            queue_size,
-            work_config_file,
-            grant_config_file,
-            programs,
-            knowingly_unsafe,
-            #[cfg(feature = "otel")]
-                metrics_port: _,
-            #[cfg(feature = "otel")]
-                metrics_addr: _,
-            graffiti,
-            fetch_config_file,
-            check_config: _,
-            fetch_max_in_flight,
-            fetch_queue_size,
-        } => {
-            // Loaded before anything binds: a work configuration that
-            // will not load is a node that would advertise two paid
-            // ALPNs and then have nothing to mount behind them.
-            match work_config_file
-                .as_deref()
-                .map(|path| {
-                    commands::serve::paid::PaidWork::load(
-                        path,
-                        home.clone(),
-                        owner.clone(),
-                        fetch_config_file.as_deref(),
-                        selected_chain.clone(),
-                    )
-                })
-                .transpose()
-            {
-                Err(error) => Err(error),
-                Ok(paid) => {
-                    async {
-                        // The key every settlement this node signs is signed
-                        // with, taken from the identity loaded above and
-                        // never made here.
-                        let settlement_key = identity::settlement_signer(&local_identity)?;
-                        let open_identity = local_identity.open_identity();
-                        let grants = if let Some(path) = grant_config_file.as_deref() {
-                            anyhow::ensure!(
-                                assurance == hellas_rpc::Assurance::ProducerSigned,
-                                "grants require producer-signed assurance"
-                            );
-                            let config = hellas_sdk::grant_config::GrantConfig::load(path, &home)?;
-                            Some(config)
-                        } else if !programs.is_empty() {
-                            anyhow::ensure!(
-                                assurance == hellas_rpc::Assurance::ProducerSigned,
-                                "grants require producer-signed assurance"
-                            );
-                            Some(hellas_sdk::grant_config::GrantConfig::compute(
-                                &home,
-                                hellas_rpc::protocol::invocation::Admission::compute_only(
-                                    &programs,
-                                )?,
-                            )?)
-                        } else {
-                            None
-                        };
-                        let admits_any =
-                            paid.as_ref().is_some_and(|paid| paid.admits_any_program())
-                                || grants.as_ref().is_some_and(|grants| {
-                                    grants.configuration.resources().iter().any(|resource| {
-                                        resource.invocation_policy.admits_any_program()
-                                    })
-                                });
-                        anyhow::ensure!(
-                            !admits_any || knowingly_unsafe,
-                            "this configuration admits any Compute program, which hands anyone \
-                             who can submit jobs roughly root on this host; pass \
-                             --knowingly-unsafe to serve it anyway"
-                        );
-                        commands::serve::run(commands::serve::ServeOptions {
-                            home: home.clone(),
-                            port,
-                            discovery: !no_discovery,
-                            queue_size,
-                            native,
-                            paid,
-                            grants,
-                            #[cfg(feature = "otel")]
-                            metrics,
-                            graffiti,
-                            fetch_config_file,
-                            fetch_max_in_flight,
-                            fetch_queue_size,
-                            secret_key,
-                            producer_key: local_identity.node_key,
-                            settlement_key,
-                            open_identity,
-                        })
-                        .await
-                    }
-                    .await
-                }
-            }
-        }
-        Commands::Gateway {
-            config,
-            wrap,
-            wrap_args,
-            #[cfg(feature = "otel")]
-                metrics_port: _,
-            #[cfg(feature = "otel")]
-                metrics_addr: _,
-        } => {
+        Commands::Serve { port, .. } => {
             async {
-                let bytes = commands::read_bounded_regular_file(&config, "daemon config", 4 << 20)?;
-                let document: hellas_sdk::daemon_config::Document = serde_json::from_slice(&bytes)?;
-                document.validate().map_err(anyhow::Error::msg)?;
-                anyhow::ensure!(
-                    document
-                        .listeners
-                        .values()
-                        .all(|l| matches!(l, hellas_sdk::daemon_config::Listener::Http { .. })),
-                    "gateway requires HTTP listeners"
-                );
-                anyhow::ensure!(
-                    wrap.is_none() || document.listeners.len() == 1,
-                    "wrapping requires one HTTP listener"
-                );
-                let principal = match owner.as_ref() {
-                    Some(owner) => owner.clone(),
-                    None => owner::principal(&home)?,
-                };
-                let context = commands::transact::Context::new(
-                    &local_identity,
-                    Some(&principal),
+                commands::daemon::serve(
                     &home,
+                    &local_identity,
+                    owner.as_ref(),
                     &selected_chain,
-                )?;
-                commands::transact::gateway(document.clone(), context, async |work, routes| {
+                    port,
                     #[cfg(feature = "otel")]
-                    if let Some((address, bundle)) = metrics {
-                        metrics::spawn_metrics_server(address, bundle).await?;
-                    }
-                    let mut gateways = Vec::new();
-                    let mut authorities = Vec::new();
-                    let serving = async {
-                        for listener in document.listeners.values() {
-                            let hellas_sdk::daemon_config::Listener::Http { bind, zdr } = listener
-                            else {
-                                unreachable!()
-                            };
-                            let directory = home.join("gateway");
-                            let profile = commands::admin::gateway_profile(
-                                &directory,
-                                &home,
-                                &local_identity,
-                                &principal,
-                            )
-                            .await?;
-                            let host = hellas_sdk::node_control::profile::GatewayProfile::load(
-                                &home.child(profile),
-                            )
-                            .await?;
-                            let server = hellas_gateway::ServerOptions {
-                                access: host.access,
-                                archive: hellas_gateway::ArchiveOptions {
-                                    directory: home.join("gateway-archive"),
-                                    zdr: *zdr,
-                                },
-                                allow_remote: !bind.ip().is_loopback(),
-                                host: bind.ip().to_string(),
-                                port: Some(bind.port()),
-                            };
-                            authorities.push((host.node, host.control));
-                            gateways.push(
-                                hellas_gateway::start(hellas_gateway::GatewayOptions {
-                                    jobs: work.jobs.clone(),
-                                    server,
-                                    work: work.clone(),
-                                    routes: routes.clone(),
-                                })
-                                .await?,
-                            );
-                        }
-                        if let Some(wrap) = wrap.as_deref() {
-                            wrap::wait(gateways.pop().unwrap(), Some(wrap), &wrap_args).await
-                        } else {
-                            futures::future::select_all(
-                                gateways.iter_mut().map(|handle| {
-                                    Box::pin(hellas_gateway::wait_for_shutdown(handle))
-                                }),
-                            )
-                            .await
-                            .0
-                            .map_err(anyhow::Error::from)
-                        }
-                    }
-                    .await;
-                    for gateway in &gateways {
-                        gateway.request_shutdown();
-                    }
-                    for gateway in gateways {
-                        let _ = gateway.shutdown().await;
-                    }
-                    for (node, control) in authorities {
-                        if let Some(control) = control {
-                            control.shutdown().await?;
-                        }
-                        node.close().await;
-                    }
-                    serving
-                })
+                    metrics,
+                )
                 .await
             }
+            .await
+        }
+        Commands::Gateway { args, .. } => {
+            async {
+                commands::daemon::gateway(
+                    args,
+                    &home,
+                    &local_identity,
+                    owner.as_ref(),
+                    &selected_chain,
+                    #[cfg(feature = "otel")]
+                    metrics,
+                )
+                .await
+            }
+            .await
+        }
+        Commands::Backend { control, command } => {
+            commands::admin::daemon(
+                control,
+                commands::daemon::Edit::Backend(command),
+                &local_identity,
+                passkey,
+                &home,
+            )
+            .await
+        }
+        Commands::Route { control, command } => {
+            commands::admin::daemon(
+                control,
+                commands::daemon::Edit::Route(command),
+                &local_identity,
+                passkey,
+                &home,
+            )
+            .await
+        }
+        Commands::Routes { control } => {
+            commands::admin::daemon(
+                control,
+                commands::daemon::Edit::List,
+                &local_identity,
+                passkey,
+                &home,
+            )
             .await
         }
         Commands::Rpc {
@@ -940,7 +652,6 @@ async fn async_main() {
                 commands::identity::export_enrollment(&local_identity.enrollment, out.as_deref())
             }
         },
-        Commands::CodexAuth { .. } => unreachable!("codex-auth handled before identity load"),
         Commands::Monitor {
             timeout_secs,
             no_interrogate,
@@ -958,5 +669,3 @@ async fn async_main() {
 mod parsers;
 #[cfg(test)]
 mod tests;
-
-use parsers::*;

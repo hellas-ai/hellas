@@ -5,11 +5,11 @@ use std::path::Path;
 
 pub mod admin;
 pub mod chain;
-pub(crate) mod codex_auth;
 pub mod contributions;
 pub mod convert;
 pub mod faucet;
 
+pub mod daemon;
 pub mod identity;
 pub mod monitor;
 pub mod rpc;

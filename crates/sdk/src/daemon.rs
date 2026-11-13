@@ -24,6 +24,18 @@ pub use runtime::Options;
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 type Result<T> = std::result::Result<T, Error>;
 
+/// The local runtime's registered evaluator, without starting a worker.
+pub fn local_evaluator() -> Option<String> {
+    #[cfg(feature = "compute")]
+    {
+        Some(hellas_executor::catena::evaluator(runtime::automatic_gpu()))
+    }
+    #[cfg(not(feature = "compute"))]
+    {
+        None
+    }
+}
+
 pub struct Core {
     runtime: runtime::Runtime,
     pub(crate) snapshot: ArcSwap<Snapshot>,
@@ -39,6 +51,7 @@ pub struct Core {
 }
 
 pub(crate) struct Snapshot {
+    catalogue: Vec<hellas_authority::model::grant::records::GrantPolicy>,
     pub(crate) document: Document,
     pub(crate) work: Arc<ExecutorGateway>,
     routers: BTreeMap<String, Router>,
@@ -66,9 +79,14 @@ impl Drop for BoundListener {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct View {
+    /// Current policy for each resource identity; absent document entries are withdrawn.
+    pub catalogue: Vec<hellas_authority::model::grant::records::GrantPolicy>,
+    pub local_evaluator: Option<String>,
     pub document: Document,
     pub backends: Vec<hellas_gateway::BackendInfo>,
     pub jobs: Vec<hellas_gateway::jobs::Info>,
+    pub http_addresses: BTreeMap<String, std::net::SocketAddr>,
+    pub iroh_addresses: BTreeMap<String, iroh::EndpointAddr>,
 }
 
 impl Core {
@@ -86,6 +104,7 @@ impl Core {
         let core = Arc::new(Self {
             runtime: runtime::Runtime::new(options),
             snapshot: ArcSwap::from_pointee(Snapshot {
+                catalogue: vec![],
                 document: Document::default(),
                 work,
                 routers: BTreeMap::new(),
@@ -101,6 +120,7 @@ impl Core {
             after_commit: Mutex::new(None),
         });
         let snapshot = core.prepare(document).await?;
+        core.runtime.options.content.finish_recovery().await?;
         core.publish(snapshot);
         Ok(core)
     }
@@ -132,6 +152,18 @@ impl Core {
             .filter_map(|(id, listener)| match &listener.bound {
                 Bound::Http { address, .. } => Some((id.clone(), *address)),
                 Bound::Iroh(_) => None,
+            })
+            .collect()
+    }
+
+    pub fn iroh_endpoints(&self) -> Vec<iroh::Endpoint> {
+        self.snapshot
+            .load()
+            .listeners
+            .values()
+            .filter_map(|listener| match &listener.bound {
+                Bound::Iroh(bound) => Some(bound.endpoint.clone()),
+                _ => None,
             })
             .collect()
     }
@@ -168,9 +200,13 @@ impl Core {
         self.jobs.watch(|jobs| {
             let snapshot = self.snapshot.load();
             View {
+                catalogue: snapshot.catalogue.clone(),
+                local_evaluator: local_evaluator(),
                 document: snapshot.document.redacted().0,
                 backends: snapshot.work.backends(),
                 jobs,
+                http_addresses: self.http_addresses(),
+                iroh_addresses: self.iroh_addresses(),
             }
         })
     }
@@ -326,20 +362,11 @@ impl Core {
             let Listener::Http { zdr, .. } = listener else {
                 continue;
             };
-            let access = self
-                .runtime
-                .options
-                .access
-                .clone()
-                .ok_or("HTTP listener requires provisioned gateway access")?;
-            if !access.shares_writer(self.node()) {
-                return Err("HTTP listener must share the daemon authority".into());
-            }
             routers.insert(
                 id.clone(),
                 hellas_gateway::listener_router(
                     router.clone(),
-                    access,
+                    self.node().clone(),
                     hellas_gateway::ArchiveOptions {
                         directory: self.runtime.options.home.join("gateway-archive"),
                         zdr: *zdr,
@@ -348,7 +375,23 @@ impl Core {
                 .await?,
             );
         }
+        let mut catalogue: BTreeMap<_, _> = self
+            .node()
+            .resource_catalogue()
+            .await?
+            .into_iter()
+            .map(|policy| (policy.resource, policy))
+            .collect();
+        catalogue.extend(
+            document
+                .authority
+                .resources()
+                .iter()
+                .cloned()
+                .map(|policy| (policy.resource, policy)),
+        );
         Ok(Arc::new(Snapshot {
+            catalogue: catalogue.into_values().collect(),
             document,
             work,
             routers,

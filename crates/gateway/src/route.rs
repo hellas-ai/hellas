@@ -29,17 +29,23 @@ pub enum Presentation {
         overrides: serde_json::Map<String, serde_json::Value>,
     },
     Http {
-        service: String,
-        method: String,
-        route: crate::HttpRoute,
+        targets: BTreeMap<String, HttpTarget>,
     },
 }
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpTarget {
+    pub service: String,
+    pub method: String,
+    pub route: crate::HttpRoute,
+}
+
 fn default_tokens() -> u32 {
     128
 }
 
 impl Route {
-    pub(crate) fn keys(&self) -> Vec<(String, String, Option<String>)> {
+    pub fn keys(&self) -> Vec<(String, String, Option<String>)> {
         let (paths, method, models) = match &self.presentation {
             Presentation::Model { model, package, .. } => (
                 match ModelKind::of(package) {
@@ -53,11 +59,17 @@ impl Route {
             Presentation::Responses { models, .. } => {
                 (vec![crate::responses_fetch::PATH], "POST", models.clone())
             }
-            Presentation::Http { route, .. } => (
-                vec![route.path.as_str()],
-                route.method.as_str(),
-                route.models.clone().unwrap_or_default(),
-            ),
+            Presentation::Http { targets } => {
+                let Some(target) = targets.values().next() else {
+                    return vec![];
+                };
+                let route = &target.route;
+                (
+                    vec![route.path.as_str()],
+                    route.method.as_str(),
+                    route.models.clone().unwrap_or_default(),
+                )
+            }
         };
         paths
             .into_iter()
@@ -153,11 +165,11 @@ impl RouteExecution {
     pub async fn fetch(
         &self,
         selection: &mut crate::routing::Selection,
-        request: WorkFetchRequest,
+        request: impl Fn(&str) -> Result<WorkFetchRequest, WorkGatewayError>,
     ) -> Result<crate::WorkFetchStream, WorkGatewayError> {
         let mut last = WorkGatewayError::Busy(crate::WorkGatewayBusy);
         while let Some(id) = selection.next() {
-            match first(self.work.fetch(&id, selection.job.clone(), request.clone())).await {
+            match first(self.work.fetch(&id, selection.job.clone(), request(&id)?)).await {
                 Ok(stream) => {
                     selection.accept(&id);
                     return Ok(stream);

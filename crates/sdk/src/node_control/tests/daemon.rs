@@ -57,6 +57,8 @@ async fn fixture() -> Fixture {
 fn options(f: &Fixture) -> Options {
     let home = StoreLocation::for_test(&f.directory.path().join("runtime"));
     Options {
+        endpoint: None,
+        remote_control: Default::default(),
         prover: None,
         chain: crate::test_support::chain_dir(
             home.as_ref(),
@@ -66,10 +68,9 @@ fn options(f: &Fixture) -> Options {
         signer: Arc::new(ROOT.node_key()),
         transport: SecretKey::from_bytes(&[63; 32]),
         settlement: hellas_kernel::Secp256k1Signer::from_secret_scalar([64; 32]).unwrap(),
-        owner: Arc::new(ROOT.passkey()),
+        owner: Some(Arc::new(ROOT.passkey())),
         node: f.node.clone(),
         content: f.content.clone(),
-        access: None,
     }
 }
 
@@ -143,9 +144,7 @@ async fn connect(
 async fn configure_commits_and_publishes_after_the_control_connection_closes() {
     hellas_authority::test_support::within(async {
         let f = fixture().await;
-        let access = access(&f).await;
-        let mut opts = options(&f);
-        opts.access = Some(access.clone());
+        let opts = options(&f);
         let core = Core::open(opts, Document::default()).await.unwrap();
         let (_client, _server, connection, rpc, served) = connect(&f, core.clone()).await;
         let committed = Arc::new(Semaphore::new(0));
@@ -194,8 +193,7 @@ async fn configure_commits_and_publishes_after_the_control_connection_closes() {
         assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
         response.bytes().await.unwrap();
         core.shutdown().await.unwrap();
-        let mut opts = options(&f);
-        opts.access = Some(access);
+        let opts = options(&f);
         let restored = Core::restore(opts).await.unwrap();
         assert_eq!(
             serde_json::to_value(&restored.watch().0.document).unwrap(),
@@ -272,9 +270,8 @@ async fn removing_a_backend_preserves_its_accepted_request_and_routes_the_next_o
         let f = fixture().await;
         let access = access(&f).await;
         let mut opts = options(&f);
-        opts.access = Some(access.clone());
         opts.signer = Arc::new(FRIEND.node_key());
-        opts.owner = Arc::new(FRIEND.passkey());
+        opts.owner = Some(Arc::new(FRIEND.passkey()));
         let core = Core::open(opts, Document::default()).await.unwrap();
         let (_client, _server, connection, rpc, served) = connect(&f, core.clone()).await;
         let mut document = Document::default();
@@ -344,18 +341,28 @@ async fn removing_a_backend_preserves_its_accepted_request_and_routes_the_next_o
         document.routes.push(hellas_gateway::Route {
             backends: vec!["first".into(), "second".into()],
             presentation: hellas_gateway::Presentation::Http {
-                service: "openai".into(),
-                method: "responses".into(),
-                route: hellas_gateway::HttpRoute {
-                    path: template.paths[0].clone(),
-                    method: "POST".into(),
-                    url: format!("{}{}", template.origin, template.paths[0]),
-                    credential: None,
-                    tls: template.tls.clone(),
-                    headers: vec![],
-                    max_response_bytes: template.max_response_bytes,
-                    models: None,
-                },
+                targets: ["first", "second"]
+                    .into_iter()
+                    .map(|id| {
+                        (
+                            id.into(),
+                            hellas_gateway::HttpTarget {
+                                service: "openai".into(),
+                                method: "responses".into(),
+                                route: hellas_gateway::HttpRoute {
+                                    path: template.paths[0].clone(),
+                                    method: "POST".into(),
+                                    url: format!("{}{}", template.origin, template.paths[0]),
+                                    credential: None,
+                                    tls: template.tls.clone(),
+                                    headers: vec![],
+                                    max_response_bytes: template.max_response_bytes,
+                                    models: None,
+                                },
+                            },
+                        )
+                    })
+                    .collect(),
             },
         });
         rpc.configure(request(&document)).await.unwrap();
@@ -384,8 +391,7 @@ async fn removing_a_backend_preserves_its_accepted_request_and_routes_the_next_o
         providers[0].0.backend.started.notified().await;
         assert_eq!(core.watch().0.jobs.len(), 1);
         let mut document = core.watch().0.document;
-        document.backends.remove("first");
-        document.routes[0].backends = vec!["second".into()];
+        document.remove_backend("first").unwrap();
         rpc.configure(request(&document)).await.unwrap();
         assert!(!held.is_finished());
         assert_eq!(core.watch().0.jobs[0].backend.as_deref(), Some("first"));

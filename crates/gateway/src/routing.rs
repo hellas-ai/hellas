@@ -153,6 +153,14 @@ impl Routing {
                     "a route needs distinct configured backends".into(),
                 ));
             }
+            if let crate::Presentation::Http { targets } = &route.presentation
+                && (targets.len() != route.backends.len()
+                    || route.backends.iter().any(|id| !targets.contains_key(id)))
+            {
+                return Err(RoutingError(
+                    "HTTP targets must name exactly the route's backends".into(),
+                ));
+            }
             for key in route.keys() {
                 if !key.0.starts_with('/')
                     || key.0.contains(['?', '#', '{', '}'])

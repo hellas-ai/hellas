@@ -248,14 +248,13 @@ async fn failover_stops_at_the_proposal_boundary() {
             .unwrap();
         let mut selection = choose(&routing, None, None).unwrap();
         let result = execution
-            .fetch(
-                &mut selection,
-                WorkFetchRequest {
+            .fetch(&mut selection, |_| {
+                Ok(WorkFetchRequest {
                     service: "test".into(),
                     method: "responses".into(),
                     body: vec![],
-                },
-            )
+                })
+            })
             .await;
         assert_eq!(result.is_err(), committed);
         assert_eq!(
@@ -285,14 +284,11 @@ async fn pinned_pre_proposal_failure_is_not_retried_on_another_backend() {
     let mut pinned = choose(&routing, None, Some("session")).unwrap();
     assert!(
         execution
-            .fetch(
-                &mut pinned,
-                WorkFetchRequest {
-                    service: "test".into(),
-                    method: "responses".into(),
-                    body: vec![],
-                }
-            )
+            .fetch(&mut pinned, |_| Ok(WorkFetchRequest {
+                service: "test".into(),
+                method: "responses".into(),
+                body: vec![],
+            }))
             .await
             .is_err()
     );

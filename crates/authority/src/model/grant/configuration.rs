@@ -101,6 +101,10 @@ impl NodeConfiguration {
         self.machine.as_ref()
     }
 
+    pub fn accounts(&self) -> impl Iterator<Item = &(ResourceId, ConfiguredBudget)> {
+        self.accounts.iter()
+    }
+
     pub fn resources(&self) -> &[GrantPolicy] {
         &self.resources
     }

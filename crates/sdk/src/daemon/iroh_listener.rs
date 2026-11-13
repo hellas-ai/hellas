@@ -35,14 +35,24 @@ impl Bound {
         {
             return Err("iroh transport differs from the provider enrollment".into());
         }
-        let endpoint = crate::provider::bind_port(
-            iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-                .secret_key(options.transport.clone())
-                .alpns(crate::provider::served_alpns(true, true, false)),
-            port,
-        )?
-        .bind()
-        .await?;
+        let alpns = crate::provider::served_alpns(true, true, options.remote_control.enabled());
+        let endpoint = match core.runtime.endpoint.lock().await.take() {
+            Some(endpoint) => {
+                endpoint.set_alpns(alpns);
+                endpoint
+            }
+            None => {
+                crate::provider::bind_port(
+                    iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+                        .secret_key(options.transport.clone())
+                        .hooks(options.remote_control.clone())
+                        .alpns(alpns),
+                    port,
+                )?
+                .bind()
+                .await?
+            }
+        };
         let backend = IrohBackend {
             core: Arc::downgrade(core),
             listener: id.into(),
@@ -129,6 +139,9 @@ impl Bound {
             ),
         );
         let content = core_options.runtime.options.content.clone();
+        let control = core_options
+            .control()?
+            .with_remote_admission(core_options.runtime.options.remote_control.clone());
         drop(core_options);
         let directory = Arc::new(PeerDirectory::with_config(
             PeerId::from_bytes(*self.endpoint.id().as_bytes()),
@@ -140,10 +153,11 @@ impl Bound {
             vec![],
             directory.clone(),
         );
-        node.service_alpns = crate::provider::served_alpns(true, true, false)
-            .into_iter()
-            .map(|alpn| String::from_utf8_lossy(&alpn).into_owned())
-            .collect();
+        node.service_alpns =
+            crate::provider::served_alpns(true, true, control.remote_admission().enabled())
+                .into_iter()
+                .map(|alpn| String::from_utf8_lossy(&alpn).into_owned())
+                .collect();
         let router = WorkRouter::both(self.work.clone(), self.grants.clone());
         let (quiesce, quiesced) = watch::channel(false);
         let mut tasks = tokio::task::JoinSet::new();
@@ -174,13 +188,14 @@ impl Bound {
                 content.clone(),
                 quiesced.clone(),
             );
+            let control = control.clone();
             tasks.spawn(async move {
                 let admitted = tokio::select! {
                     _ = stopped.wait_for(|stop| *stop) => return,
                     admitted = pending.finish() => match admitted { Some(admitted) => admitted, None => return },
                 };
                 let connection = admitted.connection.clone();
-                if let Some(Err(error)) = admitted.run(crate::provider::serve_connection(connection.alpn().to_vec(), connection, open, node, manager, Some(setup), Some(router), None, content, stopped)).await {
+                if let Some(Err(error)) = admitted.run(crate::provider::serve_connection(connection.alpn().to_vec(), connection, open, node, manager, Some(setup), Some(router), Some(control), content, stopped)).await {
                     tracing::warn!(%error, "iroh request failed");
                 }
             });

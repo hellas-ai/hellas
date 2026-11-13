@@ -15,21 +15,23 @@ use std::{
 };
 
 pub struct Options {
+    pub endpoint: Option<iroh::Endpoint>,
+    pub remote_control: crate::node_control::RemoteControlAdmission,
     pub prover: Option<Arc<crate::ProviderOpen>>,
     pub home: hellas_private::StoreLocation,
     pub signer: Arc<hellas_auth::ProducerSigningKey>,
     pub transport: iroh::SecretKey,
     pub settlement: hellas_kernel::Secp256k1Signer,
-    pub owner: Arc<dyn hellas_authority::authenticator::Authenticator>,
+    pub owner: Option<Arc<dyn hellas_authority::authenticator::Authenticator>>,
     pub chain: hellas_chain::chain_dir::ChainDir,
     pub node: hellas_authority::node::NodeCoordinator,
-    pub access: Option<hellas_gateway::GatewayAccess>,
     /// The host restores all Work roots before opening this recovery barrier.
     pub content: DiskStore,
 }
 
 pub(super) struct Runtime {
     pub options: Options,
+    pub endpoint: tokio::sync::Mutex<Option<iroh::Endpoint>>,
     owner: tokio::sync::OnceCell<Arc<crate::client_owner::ClientOwner>>,
     grant: tokio::sync::OnceCell<iroh::Endpoint>,
     paid: tokio::sync::OnceCell<iroh::Endpoint>,
@@ -40,9 +42,19 @@ pub(super) struct Runtime {
     #[cfg(feature = "compute")]
     indexed: tokio::sync::Mutex<BTreeSet<PathBuf>>,
 }
+#[cfg(feature = "compute")]
+pub(super) fn automatic_gpu() -> hellas_executor::GpuDialect {
+    if Path::new("/dev/nvidiactl").exists() {
+        hellas_executor::GpuDialect::Cuda
+    } else {
+        hellas_executor::GpuDialect::Hip
+    }
+}
+
 impl Runtime {
-    pub fn new(options: Options) -> Self {
+    pub fn new(mut options: Options) -> Self {
         Self {
+            endpoint: tokio::sync::Mutex::new(options.endpoint.take()),
             options,
             owner: Default::default(),
             grant: Default::default(),
@@ -64,7 +76,12 @@ impl Runtime {
 
     fn principal(&self) -> Result<PrincipalId> {
         Ok(PrincipalId::from_public_key(hellas_auth::PublicKey::P256(
-            self.options.owner.public_key()?.to_compressed(),
+            self.options
+                .owner
+                .as_ref()
+                .ok_or("a consumer backend requires the owner identity")?
+                .public_key()?
+                .to_compressed(),
         ))?)
     }
 
@@ -165,11 +182,16 @@ impl Runtime {
                 trust,
             } => {
                 let provider = provider.parse()?;
+                let principal = self
+                    .options
+                    .owner
+                    .clone()
+                    .ok_or("a paid backend requires the owner identity")?;
                 let owner = self
                     .owner
                     .get_or_try_init(|| async {
                         crate::client_owner::ClientOwner::new(
-                            self.options.owner.clone(),
+                            principal,
                             self.options.settlement.party_key(),
                             &self.options.chain,
                         )
@@ -227,10 +249,7 @@ impl Runtime {
                     let dialect = match runtime.as_str() {
                         "cuda" => hellas_executor::GpuDialect::Cuda,
                         "hip" => hellas_executor::GpuDialect::Hip,
-                        "auto" if Path::new("/dev/nvidiactl").exists() => {
-                            hellas_executor::GpuDialect::Cuda
-                        }
-                        "auto" => hellas_executor::GpuDialect::Hip,
+                        "auto" => automatic_gpu(),
                         _ => return Err("GPU runtime must be auto, hip, or cuda".into()),
                     };
                     let executor = match dialect {

@@ -102,7 +102,7 @@ fn router(access: GatewayAccess) -> Router {
                 "reached"
             }),
         )
-        .layer(BearerLayer::new(access))
+        .layer(BearerLayer::new(access.node()))
 }
 async fn status(router: &Router, token: Option<&str>) -> StatusCode {
     let mut request = Request::builder().uri("/invoke");

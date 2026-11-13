@@ -15,6 +15,7 @@ use std::{
 };
 
 pub(super) struct ShareRequest {
+    pub knowingly_unsafe: bool,
     pub contact: ContactCard,
     /// The contact's device, which holds the shared credential.
     pub holder: hellas_auth::authority::NodeKey,
@@ -195,6 +196,10 @@ where
                 })?
         }
     };
+    ensure!(
+        request.knowingly_unsafe || !policy.invocation_policy.admits_any_program(),
+        "this resource admits arbitrary Compute programs; sharing it requires --knowingly-unsafe"
+    );
     let max_job_millis = match request.max_job {
         Some(max_job) => u64::try_from(max_job.as_millis()).context("--max-job is too long")?,
         None => policy.invocation_policy.limits.execution_timeout_ms,

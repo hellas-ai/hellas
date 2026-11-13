@@ -47,7 +47,7 @@ pub struct NodeControl {
     node: NodeCoordinator,
     work: Option<hellas_authority::grant_service::WorkAdministration>,
     host: Option<host::Runtime>,
-    core: Option<Arc<crate::daemon::Core>>,
+    core: Option<Weak<crate::daemon::Core>>,
     content: Option<hellas_store::content::DiskStore>,
     local_slots: Arc<Semaphore>,
     remote_capacity: Arc<RemoteCapacity>,
@@ -83,7 +83,7 @@ impl NodeControl {
         if !self.node.shares_writer(core.node()) {
             return Err(unsupported());
         }
-        self.core = Some(core);
+        self.core = Some(Arc::downgrade(&core));
         Ok(self)
     }
 
@@ -434,7 +434,7 @@ struct ControlSession {
     node: NodeCoordinator,
     work: Option<hellas_authority::grant_service::WorkAdministration>,
     host: Option<host::Runtime>,
-    core: Option<Arc<crate::daemon::Core>>,
+    core: Option<Weak<crate::daemon::Core>>,
     content: Option<hellas_store::content::DiskStore>,
     session: Arc<AuthenticatedSession>,
     binding: Digest,

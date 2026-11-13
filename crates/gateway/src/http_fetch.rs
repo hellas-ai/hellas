@@ -27,7 +27,7 @@ use futures::StreamExt;
 use hellas_rpc::output::{AdaptorEvent, HttpResponseEvent, OutputEvent, StopReason};
 use hellas_rpc::provenance::{ExecutionProvenance, TRANSCRIPT_DIGEST_KEY, TRANSCRIPT_KEY};
 use http_body::Frame;
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 use tracing::Instrument;
 
 use super::{WorkEvent, WorkFetchRequest, json_error};
@@ -43,9 +43,8 @@ fn attributed(mut response: Response, name: &str) -> Response {
 }
 
 struct HttpState {
-    fetch_route: (String, String),
+    targets: BTreeMap<String, crate::HttpTarget>,
     paid: Arc<crate::route::RouteExecution>,
-    route: HttpRoute,
     metrics: observation::Metrics,
 }
 
@@ -60,19 +59,29 @@ enum HttpOpenError {
 }
 
 pub(super) fn router(
-    route: HttpRoute,
-    service: String,
-    method: String,
+    targets: BTreeMap<String, crate::HttpTarget>,
     paid: Arc<crate::route::RouteExecution>,
 ) -> crate::GatewayResult<Router> {
-    route.validate()?;
-    let path = route.path.clone();
+    let first = &targets
+        .values()
+        .next()
+        .ok_or_else(|| RoutingError("HTTP route has no targets".into()))?
+        .route;
+    let path = first.path.clone();
+    for target in targets.values() {
+        target.route.validate()?;
+        if target.route.path != first.path
+            || target.route.method != first.method
+            || target.route.models != first.models
+        {
+            return Err(RoutingError("HTTP targets must have the same route key".into()).into());
+        }
+    }
     Ok(Router::new()
         .route(&path, axum::routing::any(handle))
         .with_state(Arc::new(HttpState {
-            fetch_route: (service, method),
+            targets,
             paid,
-            route,
             metrics: observation::Metrics::new(),
         })))
 }
@@ -97,33 +106,34 @@ async fn handle(
             );
         }
     };
-    let route = &state.route;
     observed.model(selected.model.as_deref());
-    let mut upstream = match route.request(body, &parts.headers) {
-        Ok(upstream) => upstream,
-        Err(_) => {
-            observed.status(400);
-            observed.complete();
-            return json_error(StatusCode::BAD_REQUEST, "unsupported HTTP header encoding");
+    let result = open(&state, &mut selected, |id| {
+        let target = state
+            .targets
+            .get(id)
+            .ok_or(super::WorkGatewayError::Unsupported)?;
+        let mut upstream = target
+            .route
+            .request(body.clone(), &parts.headers)
+            .map_err(|e| super::WorkGatewayError::Rejected(e.into()))?;
+        if let Some(query) = parts.uri.query() {
+            upstream
+                .url
+                .push(if upstream.url.contains('?') { '&' } else { '?' });
+            upstream.url.push_str(query);
         }
-    };
-    if let Some(query) = parts.uri.query() {
         upstream
-            .url
-            .push(if upstream.url.contains('?') { '&' } else { '?' });
-        upstream.url.push_str(query);
-    }
-    let payload = match serde_json::to_vec(&upstream) {
-        Ok(payload) if upstream.validate().is_ok() => payload,
-        _ => {
-            observed.status(400);
-            observed.complete();
-            return json_error(StatusCode::BAD_REQUEST, "invalid HTTP request");
-        }
-    };
-    let result = open(&state, &mut selected, payload)
-        .instrument(observed.span.clone())
-        .await;
+            .validate()
+            .map_err(|e| super::WorkGatewayError::Rejected(e.into()))?;
+        Ok(WorkFetchRequest {
+            service: target.service.clone(),
+            method: target.method.clone(),
+            body: serde_json::to_vec(&upstream)
+                .map_err(|e| super::WorkGatewayError::Rejected(e.into()))?,
+        })
+    })
+    .instrument(observed.span.clone())
+    .await;
     let (accepted, status, headers, mut events) = match result {
         Ok(value) => value,
         Err(failure) => {
@@ -157,6 +167,8 @@ async fn handle(
         }
     };
     let backend = selected.backend.as_deref().unwrap_or("");
+    let route = &state.targets[backend].route;
+    let max_response_bytes = route.max_response_bytes;
     observed.backend(backend, selected.affinity);
     observed.bind_response(selected.response_binding(&route.path));
     observed.status(status);
@@ -231,7 +243,7 @@ async fn handle(
                     let bytes = hellas_rpc::http_fetch::decode_base64(&base64)
                         .map_err(|_| std::io::Error::other("invalid HTTP response encoding"))?;
                     size = size.saturating_add(bytes.len());
-                    if size > upstream.max_response_bytes as usize {
+                    if size > max_response_bytes as usize {
                         Err(std::io::Error::other("HTTP response exceeds Fetch limit"))?;
                     }
                     if bytes.is_empty() {
@@ -288,20 +300,9 @@ type Opened = (
 async fn open(
     state: &HttpState,
     selection: &mut routing::Selection,
-    payload: Vec<u8>,
+    request: impl Fn(&str) -> Result<WorkFetchRequest, super::WorkGatewayError>,
 ) -> Result<Opened, HttpOpenError> {
-    let (service, method) = &state.fetch_route;
-    let mut stream = state
-        .paid
-        .fetch(
-            selection,
-            WorkFetchRequest {
-                service: service.clone(),
-                method: method.clone(),
-                body: payload,
-            },
-        )
-        .await?;
+    let mut stream = state.paid.fetch(selection, request).await?;
     let accepted = super::accepted(&mut stream).await;
     match stream.next().await.transpose()? {
         Some(WorkEvent::Output(OutputEvent::Adaptor(AdaptorEvent::Http(

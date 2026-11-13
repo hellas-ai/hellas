@@ -8,7 +8,11 @@ impl ControlSession {
         request: ConfigureRequest,
     ) -> Result<ConfigureResponse, WireStatus> {
         self.caller().await?;
-        let core = self.core.as_ref().ok_or_else(unsupported)?;
+        let core = self
+            .core
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .ok_or_else(unsupported)?;
         if request.document.len() > MAX_COMMAND_BYTES {
             return Err(invalid());
         }
@@ -41,7 +45,11 @@ impl ControlSession {
         request: WatchRequest,
     ) -> Result<hellas_rpc::call::ResponseStream<WatchResponse>, WireStatus> {
         let authorization = grant_id(&request.authorization)?;
-        let core = self.core.as_ref().ok_or_else(unsupported)?;
+        let core = self
+            .core
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .ok_or_else(unsupported)?;
         let (view, mut events) = self
             .node
             .host_action(self.caller().await?, authorization, HOST_STATUS, |_| {
@@ -68,7 +76,11 @@ impl ControlSession {
         &self,
         request: CancelJobRequest,
     ) -> Result<CancelJobResponse, WireStatus> {
-        let core = self.core.as_ref().ok_or_else(unsupported)?;
+        let core = self
+            .core
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .ok_or_else(unsupported)?;
         let cancelled = self
             .node
             .host_action(

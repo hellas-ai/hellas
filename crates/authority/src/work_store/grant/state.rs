@@ -47,11 +47,23 @@ pub struct State {
 }
 /// Three consecutive unknown accounting results quarantine a route. A verified
 /// overrun quarantines immediately; time and grant revisions cannot clear it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceHealth {
+    pub configured: bool,
     pub revision: u64,
     pub consecutive_faults: u16,
     pub quarantined: bool,
+}
+
+impl Default for ResourceHealth {
+    fn default() -> Self {
+        Self {
+            configured: true,
+            revision: 0,
+            consecutive_faults: 0,
+            quarantined: false,
+        }
+    }
 }
 
 /// Namespace of the authority's journal frames.
@@ -59,7 +71,7 @@ pub struct ResourceHealth {
 /// It names the frame format, so a journal written under different semantics
 /// is refused at the boundary instead of being reinterpreted. Bump it with
 /// any change to [`Frame`] or [`Change`] that is not readable as written.
-pub(super) const JOURNAL_NAMESPACE: &str = "hellas.node.journal.v6";
+pub(super) const JOURNAL_NAMESPACE: &str = "hellas.node.journal.v7";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct Frame {
@@ -369,6 +381,12 @@ impl State {
                         self.apply_change(&Change::Resource(policy.clone()), now, replay)?;
                     }
                 }
+                for (id, health) in &mut self.resources {
+                    health.configured = configuration
+                        .resources()
+                        .iter()
+                        .any(|policy| policy.resource == *id);
+                }
                 self.configuration =
                     Some(crate::model::grant::configuration::ConfigurationDocument {
                         revision: expected.next().ok_or(NodeStoreError::Malformed)?,
@@ -483,6 +501,7 @@ impl State {
             Change::RepairResource(id) => {
                 let health = self.resources.get_mut(id).ok_or(GrantError::OutOfScope)?;
                 *health = ResourceHealth {
+                    configured: health.configured,
                     revision: health
                         .revision
                         .checked_add(1)

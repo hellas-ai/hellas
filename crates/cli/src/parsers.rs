@@ -13,11 +13,3 @@ pub(crate) fn parse_positive_u64(s: &str) -> Result<u64, String> {
         .then_some(value)
         .ok_or_else(|| "value must be greater than zero".to_string())
 }
-
-pub(crate) fn parse_assurance(s: &str) -> Result<hellas_rpc::Assurance, String> {
-    match s {
-        "producer-signed" => Ok(hellas_rpc::Assurance::ProducerSigned),
-        "apple-app-attest" => Ok(hellas_rpc::Assurance::AppleAppAttest),
-        _ => Err("assurance must be producer-signed or apple-app-attest".to_string()),
-    }
-}

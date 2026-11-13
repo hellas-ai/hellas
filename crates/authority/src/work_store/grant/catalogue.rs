@@ -8,8 +8,16 @@ use crate::model::grant::{
 use hellas_auth::authority::{ResourceId, Revision};
 
 impl State {
-    pub fn catalogue(&self) -> impl Iterator<Item = &GrantPolicy> {
+    pub(crate) fn resource_catalogue(&self) -> impl Iterator<Item = &GrantPolicy> {
         self.catalogue.values()
+    }
+
+    pub fn catalogue(&self) -> impl Iterator<Item = &GrantPolicy> {
+        self.catalogue.values().filter(|policy| {
+            self.resources
+                .get(&policy.resource)
+                .is_some_and(|health| health.configured)
+        })
     }
 
     pub fn resource(&self, id: ResourceId) -> Option<&GrantPolicy> {
@@ -63,6 +71,14 @@ impl State {
         let pool = super::ledger::definition(&self.ledger, BudgetNode::Pool(pool))
             .ok_or(GrantError::OutOfScope)?;
         for policy in &grant.policies {
+            if current
+                && !self
+                    .resources
+                    .get(&policy.resource)
+                    .is_some_and(|health| health.configured)
+            {
+                return Err(GrantError::OutOfScope.into());
+            }
             let configured = self
                 .resource(policy.resource)
                 .ok_or(GrantError::OutOfScope)?;
@@ -102,7 +118,11 @@ impl State {
         {
             return Ok(());
         }
-        if current != accepted
+        if !self
+            .resources
+            .get(&a.resource_id)
+            .is_some_and(|health| health.configured)
+            || current != accepted
             || self
                 .grant(a.grant_id)
                 .is_none_or(|g| !g.policies.contains(accepted))

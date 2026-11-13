@@ -380,9 +380,10 @@ async fn resource_repair_precedes_client_signing() {
         .target
         .routes("test")
         .unwrap();
-    let hellas_gateway::Presentation::Http { route, .. } = &config[0].presentation else {
+    let hellas_gateway::Presentation::Http { targets } = &config[0].presentation else {
         panic!("HTTP route")
     };
+    let route = &targets["test"].route;
     assert_eq!(route.max_response_bytes, 4096);
     assert_eq!(route.tls, fixture.template.tls);
     fixture.result(None).await.unwrap();
@@ -1179,6 +1180,9 @@ async fn two_grant_nodes_fail_over_before_proposal_and_rejoin_on_demand() {
         .unwrap();
     for route in &mut routes {
         route.backends.push("second".into());
+        if let hellas_gateway::Presentation::Http { targets } = &mut route.presentation {
+            targets.insert("second".into(), targets.values().next().unwrap().clone());
+        }
     }
     let access = first.host.gateway_access().await;
     let bearer = access.bearer();

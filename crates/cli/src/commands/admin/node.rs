@@ -3,7 +3,7 @@ use crate::{commands::contributions::offer_fingerprints, identity::LocalIdentity
 use anyhow::{Context, Result, ensure};
 use hellas_auth::authority::{
     AdministrationCommand, AdministrationRecord, Credential, CredentialCommand, CredentialHolder,
-    CredentialId, GrantCommand, GrantId, GrantSpec, Ownership, Revision, ownership_digest,
+    CredentialId, GrantCommand, GrantId, GrantSpec, NodeKey, Ownership, Revision, ownership_digest,
 };
 use hellas_authority::model::grant::admin::{
     MAX_ADMIN_BYTES, WorkControlCommand, WorkControlReply,
@@ -101,6 +101,7 @@ pub async fn share(
 ) -> Result<()> {
     let contact = hellas_sdk::contact::Contact::decode(&args.to)?;
     let request = ShareRequest {
+        knowingly_unsafe: args.knowingly_unsafe,
         contact: contact.card,
         holder: contact.holder,
         resource: args.resource,
@@ -125,6 +126,29 @@ pub async fn share(
     .await
 }
 
+pub async fn daemon(
+    args: super::super::daemon::ControlArgs,
+    edit: super::super::daemon::Edit,
+    identity: &LocalIdentity,
+    passkey: Option<&dyn Authenticator>,
+    home: &StoreLocation,
+) -> Result<()> {
+    let context = super::super::daemon::ModelContext::new(home, identity, passkey)?;
+    connected(
+        Connection {
+            profile: args.profile,
+            control_socket: args.control_socket,
+            node_enrollment: None,
+            addresses: vec![],
+        },
+        Operation::Daemon(edit, context),
+        identity,
+        passkey,
+        home,
+    )
+    .await
+}
+
 struct Connection {
     profile: Option<std::path::PathBuf>,
     control_socket: Option<std::path::PathBuf>,
@@ -133,6 +157,10 @@ struct Connection {
 }
 
 enum Operation {
+    Daemon(
+        super::super::daemon::Edit,
+        super::super::daemon::ModelContext,
+    ),
     Admin(AdminCommand),
     Share(ShareRequest),
 }
@@ -270,12 +298,23 @@ where
     T::Stream: Send + 'static,
 {
     let command = match operation {
+        Operation::Daemon(edit, context) => {
+            return super::super::daemon::control(&client, authorization, edit, context).await;
+        }
         Operation::Share(request) => {
             return share::share(&client, authorization, generation, request).await;
         }
         Operation::Admin(command) => command,
     };
     match command {
+        AdminCommand::Status => {
+            let status = client
+                .get_host_status(GetHostStatusRequest {
+                    authorization: authorization.0.to_vec(),
+                })
+                .await?;
+            print_status(status)?;
+        }
         AdminCommand::Inspect { command } => {
             let query: hellas_auth::authority::InspectionQuery = read(&command)?;
             let response = client
@@ -291,33 +330,6 @@ where
             let inspection: hellas_auth::authority::AuthorityInspection =
                 decode_dag_cbor(&response.reply)?;
             println!("{}", serde_json::to_string(&inspection)?);
-        }
-        AdminCommand::ConfigureProvider { command } => {
-            let update: node_control::configuration::ProviderUpdate = read(&command)?;
-            let status = client
-                .configure_provider(hellas_rpc::pb::host::ConfigureProviderRequest {
-                    authorization: authorization.0.to_vec(),
-                    update: Some(update),
-                })
-                .await?;
-            print_status(status)?;
-        }
-        AdminCommand::SetProviderState { enabled } => {
-            let status = client
-                .set_provider_state(hellas_rpc::pb::host::SetProviderStateRequest {
-                    authorization: authorization.0.to_vec(),
-                    enabled,
-                })
-                .await?;
-            print_status(status)?;
-        }
-        AdminCommand::Status => {
-            let status = client
-                .get_host_status(GetHostStatusRequest {
-                    authorization: authorization.0.to_vec(),
-                })
-                .await?;
-            print_status(status)?;
         }
         AdminCommand::BindProvider { enrollment } => {
             let response = client
@@ -408,19 +420,6 @@ where
                 offer_fingerprints(offer)?;
                 hellas_private::write_atomically(&path, ".writing", &offer.encode()?)?;
             }
-            println!("{}", serde_json::to_string(&reply)?);
-        }
-        AdminCommand::SetPaidPolicy {
-            terms,
-            expected_revision,
-            fetch_config,
-        } => {
-            let value = crate::commands::serve::paid::PaidWork::approval(
-                &terms,
-                fetch_config.as_deref(),
-                Revision(expected_revision),
-            )?;
-            let reply = work(&client, authorization, &value).await?;
             println!("{}", serde_json::to_string(&reply)?);
         }
         _ => anyhow::bail!("this command requires its offline or management entrypoint"),
@@ -622,32 +621,19 @@ async fn owner_approval(
     })
 }
 
-/// The loopback gateway's own HTTP authority in `directory`, created on first
-/// use and owned by the home principal. Its one bearer credential may only
-/// invoke the gateway; the profile is written last, so a profile names a
-/// complete authority.
-pub async fn gateway_profile(
-    directory: &Path,
-    home: &StoreLocation,
+/// A foreground gateway has an ephemeral HTTP authority and keeps its bearer in memory.
+pub async fn gateway_authority(
+    journal: &StoreLocation,
     identity: &LocalIdentity,
     passkey: &dyn Authenticator,
-) -> Result<std::path::PathBuf> {
-    let profile = directory.join("profile.json");
-    if profile.try_exists()? {
-        return Ok(profile);
-    }
-    hellas_private::create_dir_all_durable(directory)?;
-    hellas_private::restrict_directory(directory)?;
-    let journal = directory.join("authority");
-    ensure!(
-        !journal.try_exists()?,
-        "{} holds an authority without its profile; remove the directory to create a new one",
-        directory.display()
-    );
+) -> Result<(
+    hellas_authority::node::NodeCoordinator,
+    hellas_gateway::GatewayAccess,
+)> {
     let administrator = super::owner_scope::administrator(passkey.public_key()?)?;
     let authority = administrator.authority;
     let root = GrantId([0; 16]);
-    let holder = hellas_auth::authority::NodeKey::from_public_key(identity.node_key.public_key())?;
+    let holder = NodeKey::from_public_key(identity.node_key.public_key())?;
     let approval = owner_approval(
         passkey,
         Ownership::Bootstrap { root, target: None },
@@ -658,7 +644,7 @@ pub async fn gateway_profile(
     .await?;
     let now = hellas_auth::authority::UnixMillis::now()?;
     let (store, secret) = NodeStore::bootstrap(
-        &home.child(&journal),
+        journal,
         hellas_authority::model::grant::grant_network(),
         root,
         approval,
@@ -670,44 +656,26 @@ pub async fn gateway_profile(
         store,
         std::sync::Arc::new(|| hellas_auth::authority::UnixMillis::now().unwrap_or_default()),
     );
-    let issued = async {
-        let caller = node
-            .authenticate_session(&secret, SessionKey::Passkey(passkey))
-            .await?;
-        let invoke =
-            hellas_authority::operations::Operation::named(hellas_authority::node::GATEWAY_INVOKE)
-                .context("gateway.invoke is a known operation")?
-                .permission(authority, None)?;
-        let scope = GrantSpec {
-            authority,
-            subject: administrator.subject,
-            permissions: [invoke].into(),
-            issuance: None,
-            delegation_depth: 0,
-            not_before: now,
-            expires: administrator.expires,
-        };
-        let (credential, bearer) =
-            Credential::prepare(scope, CredentialHolder::Bearer, caller.generation())?;
-        let path = directory.join("credential");
-        profile::save_credential(credential_output(&path)?, &path, &bearer)?;
-        node.issue_credential(&caller, root, credential).await?;
-        anyhow::Ok(())
-    }
-    .await;
-    node.close().await;
-    issued?;
-    hellas_private::write_atomically(
-        &profile,
-        ".writing",
-        &serde_json::to_vec(&serde_json::json!({
-            "journal": "authority",
-            "authority": authority,
-            "authorization": root,
-            "credential": "credential",
-        }))?,
-    )?;
-    Ok(profile)
+    let caller = node
+        .authenticate_session(&secret, SessionKey::Passkey(passkey))
+        .await?;
+    let invoke =
+        hellas_authority::operations::Operation::named(hellas_authority::node::GATEWAY_INVOKE)?
+            .permission(authority, None)?;
+    let scope = GrantSpec {
+        authority,
+        subject: administrator.subject,
+        permissions: [invoke].into(),
+        issuance: None,
+        delegation_depth: 0,
+        not_before: now,
+        expires: administrator.expires,
+    };
+    let (credential, bearer) =
+        Credential::prepare(scope, CredentialHolder::Bearer, caller.generation())?;
+    node.issue_credential(&caller, root, credential).await?;
+    let access = hellas_gateway::GatewayAccess::new(node.clone(), root, bearer).await?;
+    Ok((node, access))
 }
 
 /// Claim a fresh node with the invite it printed, as its administrator with
@@ -719,6 +687,33 @@ pub async fn pair(
     passkey: &dyn Authenticator,
     home: &Path,
 ) -> Result<()> {
+    super::super::daemon::validate_name(name)?;
+    if !invite.starts_with("hellas-invite:") {
+        let principal = hellas_auth::authority::PrincipalId::from_public_key(
+            hellas_auth::PublicKey::P256(passkey.public_key()?.to_compressed()),
+        )?;
+        let holder = NodeKey::from_public_key(identity.node_key.public_key())?;
+        let bundle =
+            hellas_sdk::access_bundle::AccessBundle::load(Path::new(invite), &principal, &holder)?;
+        let directory = super::paired_nodes(home).join(name);
+        if directory.join("profile.json").try_exists()? {
+            let pin = profile::ClientProfile::remote_node(&directory.join("profile.json"))?;
+            let provider = bundle
+                .offers
+                .first()
+                .context("empty access bundle")?
+                .offer();
+            ensure!(
+                pin.is_some_and(|(node, _)| node.as_bytes()
+                    == &grant_transport(&provider.provider).unwrap_or_default()),
+                "contact name belongs to another node"
+            );
+        }
+        hellas_private::create_dir_all_durable(&directory)?;
+        bundle.save(&directory.join("access"))?;
+        println!("Paired {name}");
+        return Ok(());
+    }
     let invitation = node_control::bootstrap::Invitation::decode(invite)?;
     ensure!(
         !name.is_empty()

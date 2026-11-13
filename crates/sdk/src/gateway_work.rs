@@ -614,46 +614,69 @@ impl Backend {
         let Self::Grant { policy, .. } = self else {
             return Ok(vec![]);
         };
-        if policy.https.is_some() {
-            let (service, method, routes) = policy_http_routes(policy)?;
-            return Ok(routes
-                .into_iter()
-                .map(|route| hellas_gateway::Route {
-                    backends: vec![id.into()],
-                    presentation: hellas_gateway::Presentation::Http {
-                        service: service.clone(),
-                        method: method.clone(),
-                        route,
-                    },
-                })
-                .collect());
-        }
-        let Some(resource) = &policy.responses else {
-            return Ok(vec![]);
-        };
-        let routes = self.fetch_routes();
-        let mut sealed = routes.iter().filter_map(|(schema, route)| match route {
-            FetchRoutePolicy::SealedRoute { service, method }
-                if *schema == hellas_rpc::FetchSchema::StatelessResponsesV1 =>
-            {
-                Some((service, method))
+        grant_routes(policy, id)
+    }
+}
+
+pub fn grant_routes(
+    policy: &GrantPolicy,
+    id: &str,
+) -> Result<Vec<hellas_gateway::Route>, WorkGatewayError> {
+    if policy.https.is_some() {
+        let (service, method, routes) = policy_http_routes(policy)?;
+        return Ok(routes
+            .into_iter()
+            .map(|route| hellas_gateway::Route {
+                backends: vec![id.into()],
+                presentation: hellas_gateway::Presentation::Http {
+                    targets: [(
+                        id.into(),
+                        hellas_gateway::HttpTarget {
+                            service: service.clone(),
+                            method: method.clone(),
+                            route,
+                        },
+                    )]
+                    .into(),
+                },
+            })
+            .collect());
+    }
+    let Some(resource) = &policy.responses else {
+        return Ok(vec![]);
+    };
+    let routes: Vec<_> = policy
+        .invocation_policy
+        .admissions
+        .iter()
+        .filter_map(|admission| match admission {
+            Admission::Fetch { admission } => {
+                Some((admission.contract.schema(), admission.route.clone()))
             }
             _ => None,
-        });
-        let (service, method) = sealed.next().ok_or(WorkGatewayError::Unsupported)?;
-        if sealed.next().is_some() {
-            return Err(WorkGatewayError::Unsupported);
+        })
+        .collect();
+    let mut sealed = routes.iter().filter_map(|(schema, route)| match route {
+        FetchRoutePolicy::SealedRoute { service, method }
+            if *schema == hellas_rpc::FetchSchema::StatelessResponsesV1 =>
+        {
+            Some((service, method))
         }
-        Ok(vec![hellas_gateway::Route {
-            backends: vec![id.into()],
-            presentation: hellas_gateway::Presentation::Responses {
-                service: service.clone(),
-                method: method.clone(),
-                models: vec![resource.model.clone()],
-                overrides: Default::default(),
-            },
-        }])
+        _ => None,
+    });
+    let (service, method) = sealed.next().ok_or(WorkGatewayError::Unsupported)?;
+    if sealed.next().is_some() {
+        return Err(WorkGatewayError::Unsupported);
     }
+    Ok(vec![hellas_gateway::Route {
+        backends: vec![id.into()],
+        presentation: hellas_gateway::Presentation::Responses {
+            service: service.clone(),
+            method: method.clone(),
+            models: vec![resource.model.clone()],
+            overrides: Default::default(),
+        },
+    }])
 }
 
 /// A granted HTTPS resource as HTTP presentation routes on its one sealed route.

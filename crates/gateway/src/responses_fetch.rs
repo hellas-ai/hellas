@@ -73,15 +73,14 @@ impl ExecutionBackend for FetchBackend {
             body.insert("store".into(), Value::Bool(false));
             let mut events = self
                 .work
-                .fetch(
-                    &mut self.selection.clone(),
-                    WorkFetchRequest {
+                .fetch(&mut self.selection.clone(), |_| {
+                    Ok(WorkFetchRequest {
                         service: self.options.service.clone(),
                         method: self.options.method.clone(),
                         body: serde_json::to_vec(&body)
-                            .map_err(|e| BackendError::rejected(e.to_string()))?,
-                    },
-                )
+                            .map_err(|e| crate::WorkGatewayError::Rejected(e.into()))?,
+                    })
+                })
                 .await
                 .map_err(BackendError::from)?;
             let accepted = crate::accepted(&mut events).await;

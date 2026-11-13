@@ -38,6 +38,10 @@ impl GatewayAccess {
         Ok(access)
     }
 
+    pub(crate) fn node(&self) -> NodeCoordinator {
+        self.node.clone()
+    }
+
     pub fn shares_writer(&self, node: &NodeCoordinator) -> bool {
         self.node.shares_writer(node)
     }
@@ -49,22 +53,6 @@ impl GatewayAccess {
             .authorize_gateway(&caller, self.authorization)
             .await
             .map_err(Into::into)
-    }
-
-    async fn authenticate(
-        &self,
-        credential: &CredentialSecret,
-    ) -> Result<(), hellas_authority::work_store::grant::NodeStoreError> {
-        let caller = self.node.authenticate(credential).await?;
-        if self
-            .node
-            .authorize_gateway(&caller, self.authorization)
-            .await
-            .is_ok()
-        {
-            return Ok(());
-        }
-        self.node.authorize_gateway_bearer(&caller).await.map(drop)
     }
 
     /// Secret material for an explicitly authorized control response or child.
@@ -92,37 +80,39 @@ impl GatewayAccess {
             Err(error) => warn!(%error, "gateway credential not shown: no controlling terminal"),
         }
     }
+}
 
-    async fn authorizes(&self, headers: &HeaderMap) -> Option<crate::jobs::Origin> {
-        let mut values = headers.get_all(header::AUTHORIZATION).iter();
-        let value = values.next()?;
-        if values.next().is_some() {
-            return None;
-        }
-        let value = value.as_bytes();
-        let (scheme, text) = value.split_at_checked(7)?;
-        if !scheme.eq_ignore_ascii_case(b"bearer ") {
-            return None;
-        }
-        let Ok(text) = std::str::from_utf8(text) else {
-            return None;
-        };
-        let Ok(bytes) = hellas_auth::hex::parse_lower::<48>(text) else {
-            return None;
-        };
-        let Ok(id) = CredentialId::try_from(&bytes[..16]) else {
-            return None;
-        };
-        let Ok(secret) = bytes[16..].try_into() else {
-            return None;
-        };
-        self.authenticate(&CredentialSecret::from_parts(id, secret))
-            .await
-            .ok()?;
-        Some(crate::jobs::Origin::Http {
-            credential: id.to_string(),
-        })
+async fn authorizes(node: &NodeCoordinator, headers: &HeaderMap) -> Option<crate::jobs::Origin> {
+    let mut values = headers.get_all(header::AUTHORIZATION).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
     }
+    let value = value.as_bytes();
+    let (scheme, text) = value.split_at_checked(7)?;
+    if !scheme.eq_ignore_ascii_case(b"bearer ") {
+        return None;
+    }
+    let Ok(text) = std::str::from_utf8(text) else {
+        return None;
+    };
+    let Ok(bytes) = hellas_auth::hex::parse_lower::<48>(text) else {
+        return None;
+    };
+    let Ok(id) = CredentialId::try_from(&bytes[..16]) else {
+        return None;
+    };
+    let Ok(secret) = bytes[16..].try_into() else {
+        return None;
+    };
+    let caller = node
+        .authenticate(&CredentialSecret::from_parts(id, secret))
+        .await
+        .ok()?;
+    node.authorize_gateway_bearer(&caller).await.ok()?;
+    Some(crate::jobs::Origin::Http {
+        credential: id.to_string(),
+    })
 }
 impl fmt::Debug for GatewayAccess {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -132,11 +122,11 @@ impl fmt::Debug for GatewayAccess {
 
 #[derive(Clone)]
 pub(crate) struct BearerLayer {
-    access: GatewayAccess,
+    node: NodeCoordinator,
 }
 impl BearerLayer {
-    pub(crate) fn new(access: GatewayAccess) -> Self {
-        Self { access }
+    pub(crate) fn new(node: NodeCoordinator) -> Self {
+        Self { node }
     }
 }
 impl<S> Layer<S> for BearerLayer {
@@ -144,14 +134,14 @@ impl<S> Layer<S> for BearerLayer {
     fn layer(&self, inner: S) -> Self::Service {
         BearerService {
             inner,
-            access: self.access.clone(),
+            node: self.node.clone(),
         }
     }
 }
 #[derive(Clone)]
 pub(crate) struct BearerService<S> {
     inner: S,
-    access: GatewayAccess,
+    node: NodeCoordinator,
 }
 impl<S, B> Service<Request<B>> for BearerService<S>
 where
@@ -166,11 +156,11 @@ where
         self.inner.poll_ready(cx)
     }
     fn call(&mut self, mut request: Request<B>) -> Self::Future {
-        let access = self.access.clone();
+        let node = self.node.clone();
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
         Box::pin(async move {
-            let Some(origin) = access.authorizes(request.headers()).await else {
+            let Some(origin) = authorizes(&node, request.headers()).await else {
                 return Ok(unauthorized(request.uri().path()));
             };
             request.extensions_mut().insert(origin);

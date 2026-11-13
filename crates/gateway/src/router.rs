@@ -66,16 +66,9 @@ pub async fn router(
                 },
                 execution,
             ),
-            Presentation::Http {
-                service,
-                method,
-                route,
-            } => crate::http_fetch::router(
-                route.clone(),
-                service.clone(),
-                method.clone(),
-                execution,
-            )?,
+            Presentation::Http { targets } => {
+                crate::http_fetch::router(targets.clone(), execution)?
+            }
         };
         presentations.push(router);
     }

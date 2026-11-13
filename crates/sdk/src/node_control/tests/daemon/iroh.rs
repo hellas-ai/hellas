@@ -89,7 +89,6 @@ async fn both_listeners_keep_admitted_backends_when_fetch_configuration_changes(
             )
             .unwrap(),
         ));
-        opts.access = Some(provider_access.clone());
         let mut document = Document {
             revision: node.configuration().await.unwrap().unwrap().revision,
             authority: hellas_authority::test_support::common_node::configuration(
@@ -129,18 +128,28 @@ async fn both_listeners_keep_admitted_backends_when_fetch_configuration_changes(
         document.routes.push(hellas_gateway::Route {
             backends: vec!["upstream".into()],
             presentation: hellas_gateway::Presentation::Http {
-                service: "openai".into(),
-                method: "responses".into(),
-                route: hellas_gateway::HttpRoute {
-                    path: template.paths[0].clone(),
-                    method: "POST".into(),
-                    url: format!("{}{}", template.origin, template.paths[0]),
-                    credential: None,
-                    tls: template.tls.clone(),
-                    headers: vec![],
-                    max_response_bytes: template.max_response_bytes,
-                    models: None,
-                },
+                targets: ["upstream"]
+                    .into_iter()
+                    .map(|id| {
+                        (
+                            id.into(),
+                            hellas_gateway::HttpTarget {
+                                service: "openai".into(),
+                                method: "responses".into(),
+                                route: hellas_gateway::HttpRoute {
+                                    path: template.paths[0].clone(),
+                                    method: "POST".into(),
+                                    url: format!("{}{}", template.origin, template.paths[0]),
+                                    credential: None,
+                                    tls: template.tls.clone(),
+                                    headers: vec![],
+                                    max_response_bytes: template.max_response_bytes,
+                                    models: None,
+                                },
+                            },
+                        )
+                    })
+                    .collect(),
             },
         });
         let provider = Core::open(opts, document).await.unwrap();
@@ -149,8 +158,7 @@ async fn both_listeners_keep_admitted_backends_when_fetch_configuration_changes(
         let consumer_access = access(&consumer_fixture).await;
         let mut consumer_options = options(&consumer_fixture);
         consumer_options.signer = Arc::new(FRIEND.node_key());
-        consumer_options.owner = Arc::new(FRIEND.passkey());
-        consumer_options.access = Some(consumer_access.clone());
+        consumer_options.owner = Some(Arc::new(FRIEND.passkey()));
         let session = host.options(
             provider.iroh_addresses()["work"]
                 .ip_addrs()
@@ -197,6 +205,12 @@ async fn both_listeners_keep_admitted_backends_when_fetch_configuration_changes(
         );
         document.routes = provider.watch().0.document.routes;
         document.routes[0].backends = vec!["friend".into()];
+        let hellas_gateway::Presentation::Http { targets } = &mut document.routes[0].presentation
+        else {
+            unreachable!()
+        };
+        let target = targets.remove("upstream").unwrap();
+        targets.insert("friend".into(), target);
         let consumer = Core::open(consumer_options, document).await.unwrap();
         let send = |core: &Core, access: &hellas_gateway::GatewayAccess| {
             let url = format!(
@@ -265,12 +279,13 @@ async fn both_listeners_keep_admitted_backends_when_fetch_configuration_changes(
         };
         backends.push("added".into());
         document.routes[0].backends = vec!["added".into()];
-        let hellas_gateway::Presentation::Http { service, .. } =
-            &mut document.routes[0].presentation
+        let hellas_gateway::Presentation::Http { targets } = &mut document.routes[0].presentation
         else {
             unreachable!()
         };
-        *service = "added".into();
+        let mut target = targets.remove("upstream").unwrap();
+        target.service = "added".into();
+        targets.insert("added".into(), target);
         rpc.configure(request(&document)).await.unwrap();
         assert_eq!(provider.iroh_addresses()["work"], address);
         send(&provider, &provider_access).await;
