@@ -151,6 +151,7 @@ impl OfferHost {
                 (
                     "work".into(),
                     Listener::Iroh {
+                        chain: None,
                         port: 0,
                         backends: vec!["http".into()],
                     },
@@ -359,6 +360,8 @@ impl OfferHost {
             .client
             .gateway(&["m@provider".into()], "gateway.log")
             .await;
+        #[cfg(feature = "otel")]
+        let mut process = process;
         #[cfg(feature = "otel")]
         let metrics = process
             .wait_for("prometheus metrics server listening on ")

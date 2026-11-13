@@ -41,6 +41,7 @@ fn iroh_only_accepts_local_and_fetch_backends() {
     document.listeners.insert(
         "work".into(),
         Listener::Iroh {
+            chain: None,
             port: 0,
             backends: vec!["remote".into()],
         },
@@ -53,6 +54,7 @@ fn iroh_only_accepts_local_and_fetch_backends() {
             trust: None,
         },
         BackendKind::Paid {
+            chain: None,
             provider: "provider".into(),
             max_price: 1,
             evaluator: None,
@@ -80,6 +82,7 @@ fn iroh_duplicate_keys_use_resolved_evaluator_ids() {
     document.listeners.insert(
         "work".into(),
         Listener::Iroh {
+            chain: None,
             port: 0,
             backends: vec!["first".into(), "second".into()],
         },
@@ -124,6 +127,7 @@ fn direct_http_fetch_is_allowed_and_iroh_fetch_keys_must_be_unique() {
     document.listeners.insert(
         "work".into(),
         Listener::Iroh {
+            chain: None,
             port: 0,
             backends: vec!["first".into(), "second".into()],
         },

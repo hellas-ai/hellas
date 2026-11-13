@@ -1,4 +1,4 @@
-//! A server without paid configuration cannot recover a previously paid upper.
+//! A standalone store command cannot clean content owned by daemon work.
 use hellas_auth::Digest;
 use hellas_rpc::ContentRef;
 use hellas_store::content::*;
@@ -7,7 +7,7 @@ const CANARY: &[u8] = b"paid private input before its journal pin";
 const CRASH_UPPER: &str = "HELLAS_TEST_CRASH_UPPER";
 
 #[tokio::test]
-async fn no_paid_serve_refuses_a_work_owned_upper_before_any_cleanup() {
+async fn standalone_store_refuses_a_work_owned_upper_before_any_cleanup() {
     if let Some(root) = std::env::var_os(CRASH_UPPER) {
         let store = DiskStore::open(
             hellas_private::StoreLocation::for_test(std::path::Path::new(&root)),
@@ -49,7 +49,7 @@ async fn no_paid_serve_refuses_a_work_owned_upper_before_any_cleanup() {
     let child = tokio::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "no_paid_serve_refuses_a_work_owned_upper_before_any_cleanup",
+            "standalone_store_refuses_a_work_owned_upper_before_any_cleanup",
             "--nocapture",
         ])
         .env(CRASH_UPPER, &upper)
@@ -90,13 +90,14 @@ async fn no_paid_serve_refuses_a_work_owned_upper_before_any_cleanup() {
         tokio::process::Command::new(env!("CARGO_BIN_EXE_hellas"))
             .arg("--home")
             .arg(root.path())
-            .args(["serve", "--no-discovery", "--port", "0", "--content-config"])
+            .args(["store", "--content-config"])
             .arg(config)
+            .args(["stat", "missing"])
             .kill_on_drop(true)
             .output(),
     )
     .await
-    .expect("serve failed to refuse")
+    .expect("standalone store failed to refuse")
     .unwrap();
     assert!(!output.status.success());
     assert!(

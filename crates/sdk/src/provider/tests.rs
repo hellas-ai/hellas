@@ -357,9 +357,7 @@ async fn daemon(
             discovery: false,
             endpoint: None,
             remote_control: Default::default(),
-            prover: Some(Arc::new(
-                ProviderOpen::new(signer.clone(), enrollment, prover).unwrap(),
-            )),
+            prover,
             chain: chain.unwrap_or_else(|| {
                 crate::test_support::chain_dir(root, hellas_channel::test_support::network())
             }),
@@ -378,6 +376,7 @@ async fn daemon(
             listeners: [(
                 "work".into(),
                 Listener::Iroh {
+                    chain: None,
                     port,
                     backends: vec![],
                 },

@@ -147,7 +147,7 @@ impl WorkHandler for ConnectionWork {
         request: GetStandingRequest,
         context: TransportContext,
     ) -> Result<impl Into<WithTrailer<GetStandingResponse>> + Send, WireStatus> {
-        match self.handler(&context, request.route.as_ref())? {
+        match self.handler(&context, request.route.as_ref()).await? {
             Handler::Grants(service) => wt(service.get_standing(request, context)).await,
             Handler::Payment(service) => wt(service.get_standing(request, context)).await,
             Handler::Unavailable => wt(UnmountedWork.get_standing(request, context)).await,
@@ -158,7 +158,7 @@ impl WorkHandler for ConnectionWork {
         request: AcceptWorkRequest,
         context: TransportContext,
     ) -> Result<impl Into<WithTrailer<AcceptWorkResponse>> + Send, WireStatus> {
-        match self.handler(&context, request.route.as_ref())? {
+        match self.handler(&context, request.route.as_ref()).await? {
             Handler::Grants(service) => wt(service.accept_work(request, context)).await,
             Handler::Payment(service) => {
                 let response = wt(service.accept_work(request, context)).await?;
@@ -183,7 +183,7 @@ impl WorkHandler for ConnectionWork {
         request: AdmitCertificateRequest,
         context: TransportContext,
     ) -> Result<impl Into<WithTrailer<AdmitCertificateResponse>> + Send, WireStatus> {
-        match self.handler(&context, request.route.as_ref())? {
+        match self.handler(&context, request.route.as_ref()).await? {
             Handler::Grants(service) => wt(service.admit_certificate(request, context)).await,
             Handler::Payment(service) => wt(service.admit_certificate(request, context)).await,
             Handler::Unavailable => wt(UnmountedWork.admit_certificate(request, context)).await,
@@ -194,7 +194,7 @@ impl WorkHandler for ConnectionWork {
         request: StreamResultRequest,
         context: TransportContext,
     ) -> Result<hellas_channel::work::PaidResultStream, WireStatus> {
-        match self.handler(&context, request.route.as_ref())? {
+        match self.handler(&context, request.route.as_ref()).await? {
             Handler::Grants(service) => service.stream_result(request, context).await,
             Handler::Payment(service) => service.stream_result(request, context).await,
             Handler::Unavailable => UnmountedWork.stream_result(request, context).await,

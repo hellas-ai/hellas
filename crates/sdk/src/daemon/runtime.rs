@@ -18,7 +18,7 @@ pub struct Options {
     pub discovery: bool,
     pub endpoint: Option<iroh::Endpoint>,
     pub remote_control: crate::node_control::RemoteControlAdmission,
-    pub prover: Option<Arc<crate::ProviderOpen>>,
+    pub prover: Option<Arc<dyn hellas_attestation::RootProver>>,
     pub home: hellas_private::StoreLocation,
     pub signer: Arc<hellas_auth::ProducerSigningKey>,
     pub transport: iroh::SecretKey,
@@ -33,8 +33,12 @@ pub struct Options {
 pub(super) struct Runtime {
     pub options: Options,
     pub endpoint: tokio::sync::Mutex<Option<iroh::Endpoint>>,
-    owner: tokio::sync::OnceCell<Arc<crate::client_owner::ClientOwner>>,
-    client_content: tokio::sync::OnceCell<DiskStore>,
+    clients: tokio::sync::Mutex<
+        std::collections::BTreeMap<
+            std::path::PathBuf,
+            (Arc<crate::client_owner::ClientOwner>, DiskStore),
+        >,
+    >,
     grant: tokio::sync::OnceCell<iroh::Endpoint>,
     paid: tokio::sync::OnceCell<iroh::Endpoint>,
     #[cfg(feature = "compute")]
@@ -58,8 +62,7 @@ impl Runtime {
         Self {
             endpoint: tokio::sync::Mutex::new(options.endpoint.take()),
             options,
-            owner: Default::default(),
-            client_content: Default::default(),
+            clients: Default::default(),
             grant: Default::default(),
             paid: Default::default(),
             #[cfg(feature = "compute")]
@@ -79,11 +82,24 @@ impl Runtime {
     }
 
     pub async fn shutdown(&self) {
-        if let Some(content) = self.client_content.get() {
+        for (_, content) in self.clients.lock().await.values() {
             content.close().await;
         }
         for endpoint in [self.grant.get(), self.paid.get()].into_iter().flatten() {
             endpoint.close().await;
+        }
+    }
+
+    pub(super) fn chain(
+        &self,
+        profile: &Option<hellas_chain::genesis::CustomChainFile>,
+    ) -> Result<hellas_chain::chain_dir::ChainDir> {
+        match profile {
+            Some(profile) => Ok(hellas_chain::chain_dir::ChainDir::open(
+                &self.options.home,
+                &hellas_chain::genesis::ChainProfile::custom(profile.clone())?,
+            )?),
+            None => Ok(self.options.chain.clone()),
         }
     }
 
@@ -189,6 +205,7 @@ impl Runtime {
                 )
             }
             BackendKind::Paid {
+                chain,
                 provider,
                 max_price,
                 evaluator,
@@ -200,18 +217,23 @@ impl Runtime {
                     .owner
                     .clone()
                     .ok_or("a paid backend requires the owner identity")?;
-                let owner = self
-                    .owner
-                    .get_or_try_init(|| async {
-                        crate::client_owner::ClientOwner::new(
+                let chain = self.chain(chain)?;
+                let (owner, content) = {
+                    let mut clients = self.clients.lock().await;
+                    if let Some(existing) = clients.get(chain.as_path()) {
+                        existing.clone()
+                    } else {
+                        let owner = Arc::new(crate::client_owner::ClientOwner::new(
                             principal,
                             self.options.settlement.party_key(),
-                            &self.options.chain,
-                        )
-                        .map(Arc::new)
-                    })
-                    .await?
-                    .clone();
+                            &chain,
+                        )?);
+                        let content = crate::chain_home::open_client_content(&chain).await?;
+                        clients
+                            .insert(chain.as_path().to_owned(), (owner.clone(), content.clone()));
+                        (owner, content)
+                    }
+                };
                 let endpoint = self
                     .paid
                     .get_or_try_init(|| {
@@ -220,15 +242,10 @@ impl Runtime {
                     .await?
                     .clone();
                 let apple_trust = self.trust(trust)?;
-                let content = self.client_content.get_or_try_init(|| {
-                    crate::chain_home::open_client_content(&self.options.chain)
-                }).await?.clone();
                 let options = crate::paid_client::PaidWorkOptions {
                     content,
                     journal_kind: crate::paid_client::PaidJournalKind::Client,
-                    config: crate::work_config::WorkConfig::from_chain_dir(
-                        self.options.chain.clone(),
-                    )?,
+                    config: crate::work_config::WorkConfig::from_chain_dir(chain)?,
                     provider,
                     provider_addrs: vec![],
                     assurance: if apple_trust.is_some() {

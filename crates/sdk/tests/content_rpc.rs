@@ -451,9 +451,7 @@ async fn content_daemon(
             discovery: false,
             endpoint,
             remote_control: Default::default(),
-            prover: Some(Arc::new(
-                hellas_sdk::ProviderOpen::new(signer.clone(), enrollment, None).unwrap(),
-            )),
+            prover: None,
             home,
             signer,
             transport,
@@ -467,6 +465,7 @@ async fn content_daemon(
             listeners: [(
                 "work".into(),
                 Listener::Iroh {
+                    chain: None,
                     port: 0,
                     backends: vec![],
                 },

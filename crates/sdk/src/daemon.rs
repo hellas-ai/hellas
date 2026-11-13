@@ -129,10 +129,15 @@ impl Core {
     }
 
     async fn open_prepared(
-        options: Options,
+        mut options: Options,
         document: Document,
         entries: BTreeMap<String, BackendEntry>,
     ) -> Result<Arc<Self>> {
+        if options.node.provider().await?.is_some_and(|enrollment| {
+            enrollment.genesis.statement.root_kind == hellas_rpc::RootKind::Software
+        }) {
+            options.prover = None;
+        }
         let limit = Arc::new(RequestLimit::default());
         let jobs = Arc::new(Jobs::new(vec![limit.clone()]));
         let work = ExecutorGateway::prepare(
@@ -165,7 +170,8 @@ impl Core {
             &core.runtime.options.home,
             &core.runtime.options.settlement,
             &core.runtime.options.content,
-        ).await?;
+        )
+        .await?;
         let snapshot = core.prepare(document, entries).await?;
         core.publish(snapshot);
         Ok(core)
@@ -327,6 +333,25 @@ impl Core {
                 if let Err(error) = previous.work.retire(&candidate.work).await {
                     tracing::warn!(%error, "retired backend retains recovery obligations");
                 }
+                for (id, listener) in &previous.listeners {
+                    if candidate
+                        .listeners
+                        .get(id)
+                        .is_some_and(|next| Arc::ptr_eq(listener, next))
+                    {
+                        continue;
+                    }
+                    let task = listener
+                        .task
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
+                    if let Some(task) = task
+                        && let Err(error) = task.await
+                    {
+                        tracing::warn!(%error, "retired listener did not stop cleanly");
+                    }
+                }
                 Ok::<_, Error>(revision)
             })
             .map(|result| match result {
@@ -400,7 +425,11 @@ impl Core {
                 .get(id)
                 .filter(|old| match (&old.bound, listener) {
                     (Bound::Http { bind: old, .. }, Listener::Http { bind, .. }) => old == bind,
-                    (Bound::Iroh(old), Listener::Iroh { port, .. }) => old.port == *port,
+                    (Bound::Iroh(old), Listener::Iroh { port, chain, .. }) => {
+                        old.port == *port
+                            && serde_json::to_value(&old.profile).ok()
+                                == serde_json::to_value(chain).ok()
+                    }
                     _ => false,
                 });
             let bound = match reusable {
@@ -415,8 +444,8 @@ impl Core {
                                 socket: Mutex::new(Some(socket)),
                             }
                         }
-                        Listener::Iroh { port, .. } => Bound::Iroh(Arc::new(
-                            iroh_listener::Bound::prepare(self, id, *port).await?,
+                        Listener::Iroh { port, chain, .. } => Bound::Iroh(Arc::new(
+                            iroh_listener::Bound::prepare(self, id, *port, chain).await?,
                         )),
                     },
                     stop: tokio::sync::watch::channel(false).0,

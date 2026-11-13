@@ -470,7 +470,7 @@ async fn options(
         signer: Arc::new(identity.node_key.clone()),
         transport: identity.transport_key.clone(),
         settlement,
-        prover: Some(identity.open_identity()),
+        prover: None,
         owner: owner
             .cloned()
             .map(|owner| Arc::new(owner) as Arc<dyn Authenticator>),
@@ -628,6 +628,7 @@ pub async fn serve(
             document.listeners.insert(
                 "work".into(),
                 Listener::Iroh {
+                    chain: None,
                     port: port.unwrap_or(0),
                     backends: vec![],
                 },
@@ -764,6 +765,7 @@ mod tests {
         document.listeners.insert(
             "work".into(),
             Listener::Iroh {
+                chain: None,
                 port: 0,
                 backends: vec![],
             },

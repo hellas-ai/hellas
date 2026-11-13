@@ -34,6 +34,8 @@ pub enum Listener {
     },
     Iroh {
         port: u16,
+        #[serde(default)]
+        chain: Option<hellas_chain::genesis::CustomChainFile>,
         backends: Vec<String>,
     },
 }
@@ -63,6 +65,8 @@ pub enum BackendKind {
     },
     Paid {
         provider: String,
+        #[serde(default)]
+        chain: Option<hellas_chain::genesis::CustomChainFile>,
         max_price: u64,
         #[serde(default)]
         evaluator: Option<String>,

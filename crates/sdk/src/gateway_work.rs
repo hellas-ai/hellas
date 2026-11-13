@@ -1007,22 +1007,27 @@ impl Inner {
             return Err(pre(ExecutionError::RecoveryRequired));
         }
         if guard.is_none() {
-            let opened = before_proposal(None, stop, None, async {
-                let mut session = open_paid_session(
-                    options.clone(),
-                    endpoint.clone(),
-                    settlement_key.clone(),
-                    owner.clone(),
-                    Default::default(),
-                    PaidOpen::Job(job),
-                    None,
-                )
-                .await?;
-                session
-                    .run(None, &crate::paid_client::empty_content(), true, None)
+            let opened = before_proposal(
+                None,
+                stop,
+                None,
+                Box::pin(async {
+                    let mut session = open_paid_session(
+                        options.clone(),
+                        endpoint.clone(),
+                        settlement_key.clone(),
+                        owner.clone(),
+                        Default::default(),
+                        PaidOpen::Job(job),
+                        None,
+                    )
                     .await?;
-                Ok::<_, ExecutionError>(session)
-            })
+                    session
+                        .run(None, &crate::paid_client::empty_content(), true, None)
+                        .await?;
+                    Ok::<_, ExecutionError>(session)
+                }),
+            )
             .await?
             .map_err(pre)?;
             *guard = Some(opened);

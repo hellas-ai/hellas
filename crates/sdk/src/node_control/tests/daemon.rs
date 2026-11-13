@@ -233,7 +233,8 @@ async fn watch_reports_configure_and_cancellation_without_echoing_keys() {
         assert!(rpc.configure(request(&document)).await.is_err());
         document = core.watch().0.document;
         let old = serde_json::to_value(&document).unwrap();
-        document.listeners.insert("invalid".into(), Listener::Iroh { port: 0, backends: vec!["missing".into()] });
+        document.listeners.insert("invalid".into(), Listener::Iroh { chain: None,
+port: 0, backends: vec!["missing".into()] });
         assert!(rpc.configure(request(&document)).await.is_err());
         assert_eq!(serde_json::to_value(&core.watch().0.document).unwrap(), old);
         assert_eq!(f.node.configuration().await.unwrap().unwrap(), stored);
@@ -412,3 +413,79 @@ async fn removing_a_backend_preserves_its_accepted_request_and_routes_the_next_o
 }
 
 mod iroh;
+
+#[tokio::test]
+async fn an_unbound_daemon_can_install_its_iroh_listener_after_owner_binding() {
+    hellas_authority::test_support::within(async {
+        let f = fixture().await;
+        let opts = options(&f);
+        let enrollment = hellas_channel::test_support::enrollment(
+            &hellas_auth::ProducerSigningKey::from_secret_bytes([55; 32]).unwrap(),
+            &opts.signer,
+            *opts.transport.public().as_bytes(),
+            [56; 32],
+        );
+        let core = Core::open(opts, Document::default()).await.unwrap();
+        let (client, server, connection, rpc, served) = connect(&f, core.clone()).await;
+        let mut document = Document::default();
+        document.listeners.insert(
+            "work".into(),
+            Listener::Iroh {
+                chain: Some(
+                    hellas_chain::genesis::ChainProfile::known(
+                        hellas_chain::genesis::Chain::Devnet,
+                    )
+                    .to_file(),
+                ),
+                port: 0,
+                backends: vec![],
+            },
+        );
+        assert!(rpc.configure(request(&document)).await.is_err());
+        assert_eq!(core.watch().0.document.revision, Revision(0));
+        rpc.bind_provider(BindProviderRequest {
+            authorization: ROOT_GRANT.0.to_vec(),
+            enrollment: enrollment.canonical_bytes(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(rpc.configure(request(&document)).await.unwrap().revision, 1);
+        assert_eq!(core.iroh_addresses().len(), 1);
+        let bound = core.iroh_endpoints().pop().unwrap();
+        let mut invalid = core.watch().0.document;
+        let Listener::Iroh {
+            chain: Some(profile),
+            ..
+        } = invalid.listeners.get_mut("work").unwrap()
+        else {
+            unreachable!()
+        };
+        profile.genesis_json = "{}".into();
+        assert!(rpc.configure(request(&invalid)).await.is_err());
+        assert_eq!(core.watch().0.document.revision, Revision(1));
+        assert!(!bound.is_closed());
+        let mut stopped = core.watch().0.document;
+        stopped.listeners.clear();
+        assert_eq!(rpc.configure(request(&stopped)).await.unwrap().revision, 2);
+        assert!(
+            bound.is_closed(),
+            "Configure joins the removed listener before returning"
+        );
+        document.revision = Revision(2);
+        assert_eq!(rpc.configure(request(&document)).await.unwrap().revision, 3);
+        assert_eq!(core.iroh_addresses().len(), 1);
+        assert_eq!(
+            serde_json::to_value(&core.watch().0.document.listeners).unwrap(),
+            serde_json::to_value(&document.listeners).unwrap()
+        );
+
+        connection.close(0u32.into(), b"done");
+        let _ = served.await;
+        core.shutdown().await.unwrap();
+        client.close().await;
+        server.close().await;
+        f.content.close().await;
+        f.node.close().await;
+    })
+    .await;
+}

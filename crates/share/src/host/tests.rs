@@ -272,14 +272,7 @@ impl ShareFixtureBuilder {
                 &provider_identity,
                 node,
                 content,
-                Some(Arc::new(
-                    hellas_sdk::ProviderOpen::new(
-                        Arc::new(provider_identity.node_key().clone()),
-                        provider_bundle.clone(),
-                        Some(Arc::new(UnusedRoot)),
-                    )
-                    .unwrap(),
-                )),
+                Some(Arc::new(UnusedRoot)),
             ),
             document,
             [("openai".into(), backend)].into(),
@@ -616,7 +609,7 @@ fn runtime(
     identity: &NodeIdentity,
     node: hellas_authority::node::NodeCoordinator,
     content: hellas_store::content::DiskStore,
-    prover: Option<Arc<hellas_sdk::ProviderOpen>>,
+    prover: Option<Arc<dyn hellas_attestation::RootProver>>,
 ) -> hellas_sdk::daemon::Options {
     let home = StoreLocation::for_test(root);
     hellas_sdk::daemon::Options {

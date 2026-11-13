@@ -142,8 +142,8 @@ table below is checked against the implementation by the Work tests.
 | `content.resolve` | Host | Host |
 | `host.status` | Host | Host |
 | `host.configure` | Host | Host |
-| `host.provider.bind` | Host | Host |
 | `host.job.cancel` | Host | Host |
+| `host.provider.bind` | Host | Host |
 | `gateway.invoke` | Host | Host |
 | `work.allowance.read` | Work machine | Provider |
 | `work.allowance.configure` | Work machine | Provider |

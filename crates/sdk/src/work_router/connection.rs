@@ -252,7 +252,7 @@ impl Dispatcher<IrohTransport> for WorkConnection {
 }
 
 impl ConnectionWork {
-    pub(super) fn handler<'a>(
+    pub(super) async fn handler<'a>(
         &'a self,
         context: &TransportContext,
         route: Option<&WorkRoute>,
@@ -262,7 +262,7 @@ impl ConnectionWork {
         match (&self.funding, FundingKind::try_from(route.funding_kind)) {
             (Funding::Grants(grants), Ok(FundingKind::Grant)) => Ok(Handler::Grants(grants)),
             (Funding::Payment(payment), Ok(FundingKind::Payment)) => {
-                Ok(match payment.handler(context, Some(route))? {
+                Ok(match payment.wait_handler(context, Some(route)).await? {
                     Some(service) => Handler::Payment(service),
                     None => Handler::Unavailable,
                 })

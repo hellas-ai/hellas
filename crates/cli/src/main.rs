@@ -666,6 +666,7 @@ async fn async_main() {
     }
 }
 
+#[cfg(feature = "compute")]
 mod parsers;
 #[cfg(test)]
 mod tests;

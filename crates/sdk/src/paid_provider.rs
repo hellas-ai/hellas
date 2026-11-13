@@ -167,6 +167,8 @@ pub struct MountedWork {
     mounted: Arc<Mutex<MountedChannels>>,
     changes: Arc<tokio::sync::Mutex<()>>,
     driver: Option<AcceptedWorkDriver>,
+    setups: Arc<std::sync::OnceLock<MountedSetup>>,
+    mounted_changed: tokio::sync::watch::Sender<bool>,
 }
 
 impl Default for MountedWork {
@@ -175,6 +177,8 @@ impl Default for MountedWork {
             mounted: Arc::new(Mutex::new(BTreeMap::new())),
             changes: Arc::new(tokio::sync::Mutex::new(())),
             driver: None,
+            setups: Default::default(),
+            mounted_changed: tokio::sync::watch::channel(true).0,
         }
     }
 }
@@ -387,7 +391,8 @@ impl MountedWork {
         let request =
             AcceptWorkRequest::decode(opening.signed_opening.as_slice()).map_err(|_| denied())?;
         let service = self
-            .handler(&context, request.route.as_ref())
+            .wait_handler(&context, request.route.as_ref())
+            .await
             .map_err(|_| denied())?
             .ok_or_else(denied)?;
         service
@@ -407,6 +412,7 @@ impl MountedWork {
             mounted: Arc::new(Mutex::new(BTreeMap::new())),
             changes: Arc::new(tokio::sync::Mutex::new(())),
             driver: Some(AcceptedWorkDriver::new(backend)),
+            ..Self::default()
         }
     }
 
@@ -453,6 +459,63 @@ impl MountedWork {
         Ok(held
             .get(&channel)
             .and_then(|(owner, mounted)| (*owner == peer).then(|| mounted.clone())))
+    }
+
+    /// A signed setup may finalize on the client before this clock mounts it.
+    /// Only that authenticated peer's already-countersigned channel may wait.
+    /// Unknown channels are refused immediately; no proposal is sent twice.
+    pub async fn wait_handler(
+        &self,
+        context: &TransportContext,
+        route: Option<&WorkRoute>,
+    ) -> Result<Option<MountedWorkService>, MountError> {
+        let mut changed = self.mounted_changed.subscribe();
+        loop {
+            if !*changed.borrow_and_update() {
+                return Ok(None);
+            }
+            let mounted = self.handler(context, route)?;
+            let pending = match (self.setups.get(), context.vouched_peer(), route) {
+                (Some(setups), Some(peer), Some(route)) => {
+                    let peer = PeerId::from_bytes(peer.0);
+                    let services: Vec<_> = setups
+                        .0
+                        .lock()
+                        .map_err(|_| MountError::Poisoned)?
+                        .iter()
+                        .filter(|((owner, _), _)| *owner == peer)
+                        .map(|(_, service)| service.clone())
+                        .collect();
+                    let mut pending = false;
+                    for service in services {
+                        if let Ok(state) = service.state().await {
+                            pending |= matches!(
+                                state.end(),
+                                None | Some(hellas_channel::work_store::setup::SetupEnd::Complete)
+                            ) && state.close_descriptor().is_some_and(|descriptor| {
+                                descriptor.channel().id().as_bytes() == route.channel_id.as_slice()
+                            });
+                        }
+                    }
+                    pending
+                }
+                _ => false,
+            };
+            if !pending {
+                // Mounting can have completed while the setup was read.
+                return self.handler(context, route);
+            }
+            if let Some(service) = mounted
+                && service.service.readiness().await.is_ok()
+            {
+                return Ok(Some(service));
+            }
+            changed.changed().await.map_err(|_| MountError::Poisoned)?;
+        }
+    }
+
+    pub(crate) fn stop_pending(&self) {
+        self.mounted_changed.send_replace(false);
     }
 
     /// Returns a specific local payment service for journal inspection.
@@ -642,7 +705,7 @@ impl WorkHandler for MountedWork {
         request: AcceptWorkRequest,
         context: TransportContext,
     ) -> Result<impl Into<WithTrailer<AcceptWorkResponse>> + Send, WireStatus> {
-        match self.handler(&context, request.route.as_ref())? {
+        match self.wait_handler(&context, request.route.as_ref()).await? {
             Some(service) => wt(service.accept_work(request, context)).await,
             None => wt(UnmountedWork.accept_work(request, context)).await,
         }
@@ -886,11 +949,6 @@ impl SetupClock {
                                 return true;
                             }
                         };
-                        if let Some(peer) = self.route_peer
-                            && let Err(error) = setup_mount.clear(peer, self.bond_edge).await
-                        {
-                            warn!(%error, "setup could not be unmounted");
-                        }
                         if let Err(error) = self
                             .take_mount(store, signer, &policy, work_mount, origin)
                             .await
@@ -904,7 +962,7 @@ impl SetupClock {
                         // The read that completed the setup is the channel's
                         // own first read: admit from it now rather than a poll
                         // later, while the buyer is waiting on its first job.
-                        match &self.driven {
+                        let answered = match &self.driven {
                             Driven::Channel(channel) => {
                                 let (answered, busy) =
                                     drive_channel(channel, snapshot, sink, &bond).await;
@@ -912,7 +970,13 @@ impl SetupClock {
                                 answered
                             }
                             _ => true,
+                        };
+                        if let Some(peer) = self.route_peer
+                            && let Err(error) = setup_mount.clear(peer, self.bond_edge).await
+                        {
+                            warn!(%error, "setup could not be unmounted");
                         }
+                        answered
                     }
                     Ok(SetupAdvance { progress, .. }) => {
                         if matches!(
@@ -1104,6 +1168,10 @@ impl WorkRunner {
         if let Some((_, path)) = unmatched.into_iter().next() {
             return Err(PaidProviderError::UnmatchedChannel { path });
         }
+        work_mount
+            .setups
+            .set(setup_mount.clone())
+            .map_err(|_| MountError::Poisoned)?;
         let (sender, adopt) = tokio::sync::mpsc::channel(16);
         Ok(Self {
             signer: config.settlement_key.clone(),
@@ -1195,7 +1263,7 @@ impl WorkRunner {
             let Some(clock) = self.clocks.get_mut(*index) else {
                 continue;
             };
-            if !clock
+            let answered = clock
                 .tick(
                     question,
                     &snapshot,
@@ -1205,8 +1273,9 @@ impl WorkRunner {
                     &self.setup_mount,
                 )
                 .instrument(hellas_rpc::request_span!(target: "hellas_request", parent: None, "paid.channel.observe", hellas.channel.role = "provider"))
-                .await
-            {
+                .await;
+            self.work_mount.mounted_changed.send_modify(|_| {});
+            if !answered {
                 // The source failed: stop here and let the loop redial
                 // rather than wait it out once per journal.
                 return false;

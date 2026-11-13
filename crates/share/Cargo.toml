@@ -20,15 +20,15 @@ hellas-store.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-hellas-chain = { workspace = true, features = ["chain-dir"] }
-hellas-sdk = { workspace = true, features = ["integration-tests"] }
 axum.workspace = true
 futures.workspace = true
 hellas-attestation.workspace = true
 hellas-authority = { workspace = true, features = ["test-support"] }
+hellas-chain = { workspace = true, features = ["chain-dir"] }
 hellas-channel = { workspace = true, features = ["test-support"] }
 hellas-kernel.workspace = true
 hellas-providers = { workspace = true, features = ["test-support"] }
+hellas-sdk = { workspace = true, features = ["integration-tests"] }
 iroh.workspace = true
 rcgen = "0.14"
 reqwest = { workspace = true, features = ["json"] }

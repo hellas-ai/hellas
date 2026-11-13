@@ -36,6 +36,7 @@ pub fn openai_document(options: OpenAiShareOptions) -> Result<Document, hellas_s
         listeners: [(
             "work".into(),
             Listener::Iroh {
+                chain: None,
                 port: options.port,
                 backends: vec![id.clone()],
             },

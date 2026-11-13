@@ -81,14 +81,6 @@ async fn both_listeners_keep_admitted_backends_when_fetch_configuration_changes(
         let mut opts = options(&f);
         opts.signer = Arc::new(PROVIDER.node_key());
         opts.transport = SecretKey::from_bytes(&[5; 32]);
-        opts.prover = Some(Arc::new(
-            crate::ProviderOpen::new(
-                opts.signer.clone(),
-                crate::test_support::provider_enrollment(),
-                None,
-            )
-            .unwrap(),
-        ));
         let mut document = Document {
             revision: node.configuration().await.unwrap().unwrap().revision,
             authority: hellas_authority::test_support::common_node::configuration(
@@ -114,6 +106,7 @@ async fn both_listeners_keep_admitted_backends_when_fetch_configuration_changes(
         document.listeners.insert(
             "work".into(),
             Listener::Iroh {
+                chain: None,
                 port: 0,
                 backends: vec!["upstream".into()],
             },

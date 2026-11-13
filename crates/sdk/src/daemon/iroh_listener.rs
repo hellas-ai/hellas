@@ -12,6 +12,7 @@ use tokio::sync::watch;
 
 pub(super) struct Bound {
     pub port: u16,
+    pub profile: Option<hellas_chain::genesis::CustomChainFile>,
     pub endpoint: iroh::Endpoint,
     open: Arc<ProviderOpen>,
     grants: GrantService,
@@ -22,13 +23,24 @@ pub(super) struct Bound {
     chain: crate::work_config::WorkConfig,
 }
 impl Bound {
-    pub async fn prepare(core: &Arc<Core>, id: &str, port: u16) -> Result<Self> {
+    pub async fn prepare(
+        core: &Arc<Core>,
+        id: &str,
+        port: u16,
+        profile: &Option<hellas_chain::genesis::CustomChainFile>,
+    ) -> Result<Self> {
         let options = &core.runtime.options;
-        let chain = crate::work_config::WorkConfig::from_chain_dir(options.chain.clone())?;
-        let open = options
-            .prover
-            .clone()
-            .ok_or("iroh listener requires its enrollment and prover")?;
+        let chain = crate::work_config::WorkConfig::from_chain_dir(core.runtime.chain(profile)?)?;
+        let enrollment = options
+            .node
+            .provider()
+            .await?
+            .ok_or("bind a provider enrollment before adding an iroh listener")?;
+        let open = Arc::new(ProviderOpen::new(
+            options.signer.clone(),
+            enrollment,
+            options.prover.clone(),
+        )?);
         if hellas_authority::model::grant::records::grant_transport(open.enrollment())?
             != *options.transport.public().as_bytes()
         {
@@ -82,7 +94,7 @@ impl Bound {
             let setup = MountedSetup::with_content_store(options.content.clone());
             let runner = WorkRunner::discover(
                 WorkRunnerConfig {
-                    chain: options.chain.clone(),
+                    chain: chain.chain.clone(),
                     settlement_key: options.settlement.clone(),
                 },
                 work.clone(),
@@ -91,6 +103,7 @@ impl Bound {
             .await?;
             Ok(Self {
                 port,
+                profile: profile.clone(),
                 chain,
                 endpoint: endpoint.clone(),
                 open,
@@ -211,6 +224,7 @@ impl Bound {
         if let Some(discovery) = discovery {
             discovery.shutdown().await;
         }
+        self.work.stop_pending();
         quiesce.send_replace(true);
         while let Some(result) = tasks.join_next().await {
             if let Err(error) = result {
