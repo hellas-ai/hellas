@@ -201,6 +201,35 @@ fn quote(
     })
 }
 
+fn offer_is_live(
+    state: &SetupState,
+    snapshot: &hellas_chain::WorkChannelSnapshot,
+) -> Result<bool, WireStatus> {
+    let bundle = state
+        .bundle()
+        .ok_or_else(|| unavailable("offer journal has no proposal"))?;
+    let released = matches!(
+        state.end(),
+        Some(
+            hellas_channel::work_store::SetupEnd::Complete
+                | hellas_channel::work_store::SetupEnd::Aborted(
+                    hellas_channel::work_store::SetupAbort::BondReclaimed
+                )
+        )
+    );
+    let funding = state.funding_coins();
+    let live_funding = snapshot
+        .live_funding_of(&funding)
+        .ok_or_else(|| unavailable("offer snapshot funding differs"))?;
+    Ok(snapshot.bond().is_some()
+        || snapshot.payment().is_some()
+        // An unobserved setup can outlive settlement. Without either edge, its
+        // old Opens are possible only while every original input is unspent.
+        || (!released
+            && snapshot.block().height < bundle.bond_terms().timeout.get()
+            && live_funding == &funding))
+}
+
 impl OfferAllocator {
     pub async fn request(
         &self,
@@ -306,18 +335,7 @@ impl OfferAllocator {
                 .await
                 .map_err(unavailable)?
                 .ok_or_else(|| unavailable("finalized offer snapshot unavailable"))?;
-            let released = matches!(
-                state.end(),
-                Some(
-                    hellas_channel::work_store::SetupEnd::Complete
-                        | hellas_channel::work_store::SetupEnd::Aborted(
-                            hellas_channel::work_store::SetupAbort::BondReclaimed
-                        )
-                )
-            );
-            let live = snapshot.bond().is_some()
-                || snapshot.payment().is_some()
-                || (!released && snapshot.block().height < bundle.bond_terms().timeout.get());
+            let live = offer_is_live(&state, &snapshot)?;
             if live {
                 open += 1;
                 reserved.extend(bundle.bond_funding().maker().iter().copied());

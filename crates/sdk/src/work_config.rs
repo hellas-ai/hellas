@@ -19,25 +19,30 @@ pub struct WorkConfig {
 
 impl WorkConfig {
     pub fn for_chain(chain: ChainProfile, root: &StoreLocation) -> Result<Self> {
-        Self::from_chain_dir(ChainDir::open(root, &chain)?)
+        Self::validate_profile(&chain)?;
+        Ok(Self {
+            chain: ChainDir::open(root, &chain)?,
+        })
     }
 
     pub fn from_chain_dir(chain: ChainDir) -> Result<Self> {
-        Self { chain }.validate()
+        Self::validate_profile(&chain)?;
+        Ok(Self { chain })
     }
 
     pub fn network(&self) -> hellas_kernel::NetworkId {
         self.chain.network()
     }
 
-    fn validate(self) -> Result<Self> {
-        hellas_chain::proof_verify::ProofVerifier::for_profile(&self.chain).map_err(|_| {
+    /// Validate a paid profile without opening a chain home.
+    pub fn validate_profile(profile: &ChainProfile) -> Result<()> {
+        hellas_chain::proof_verify::ProofVerifier::for_profile(profile).map_err(|_| {
             WorkConfigError::Invalid {
                 field: "chain.trust",
                 reason: "trusted epoch schedule and consensus digest must be usable",
             }
         })?;
-        Ok(self)
+        Ok(())
     }
 }
 
