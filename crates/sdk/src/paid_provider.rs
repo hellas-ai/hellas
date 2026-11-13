@@ -523,6 +523,33 @@ impl MountedWork {
         }
     }
 
+    #[cfg(any(test, feature = "integration-tests"))]
+    pub(crate) async fn wait_ready(&self, channel: Digest, height: u64) {
+        let mut changed = self.mounted_changed.subscribe();
+        loop {
+            assert!(*changed.borrow_and_update(), "paid watcher stopped");
+            let service = self
+                .mounted
+                .lock()
+                .unwrap()
+                .get(&channel)
+                .map(|(_, mounted)| mounted.service.clone());
+            if let Some(service) = service
+                && service
+                    .with_state(|state| state.cursor().0 >= height)
+                    .await
+                    .unwrap()
+                && service.readiness().await.is_ok()
+            {
+                return;
+            }
+            changed
+                .changed()
+                .await
+                .expect("paid watcher remains running");
+        }
+    }
+
     pub(crate) fn stop_pending(&self) {
         self.mounted_changed.send_replace(false);
     }
