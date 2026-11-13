@@ -193,7 +193,7 @@ impl GrantTarget {
         check_grant_provider(&self.provider)?;
         match transport {
             GrantTransport::Local(service) => Ok(SessionTransport::Local {
-                service: Box::new(service.clone()),
+                service: service.clone(),
                 application: application.clone(),
                 signer: signer.clone(),
             }),
@@ -258,7 +258,7 @@ pub struct GrantSessionOptions {
 #[derive(Clone)]
 pub enum GrantTransport {
     Remote(Endpoint),
-    Local(GrantService),
+    Local(Box<GrantService>),
 }
 /// Bind a client endpoint for `GrantTransport::Remote`.
 pub async fn bind_endpoint(

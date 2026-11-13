@@ -1130,7 +1130,7 @@ async fn the_command_executor_runs_a_grant_once_and_replays_it() {
             backend: crate::Backend::grant(
                 policy.clone(),
                 options.clone(),
-                GrantTransport::Local(host.world.service.clone()),
+                GrantTransport::Local(host.world.service.clone().into()),
             ),
             funding: Default::default(),
             attempt: Some(attempt),

@@ -160,8 +160,10 @@ async fn send_request<S: SendHalf, R: RecvHalf, Q: Message>(
     let written = async {
         send.send_body(buf.freeze())
             .await
-            .map_err(write_to_status)?;
-        send.close_send(None).await.map_err(write_to_status)
+            .map_err(|error| write_to_status("send", error))?;
+        send.close_send(None)
+            .await
+            .map_err(|error| write_to_status("close_send", error))
     }
     .await;
     if let Err(error) = written {
@@ -285,7 +287,7 @@ where
     result
 }
 
-fn write_to_status<E: std::error::Error + 'static>(error: E) -> WireStatus {
+fn write_to_status<E: std::error::Error + 'static>(operation: &str, error: E) -> WireStatus {
     let code = if (&error as &dyn std::error::Error)
         .downcast_ref::<std::io::Error>()
         .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
@@ -294,7 +296,7 @@ fn write_to_status<E: std::error::Error + 'static>(error: E) -> WireStatus {
     } else {
         WireCode::Internal
     };
-    WireStatus::new(code, error.to_string())
+    WireStatus::new(code, format!("{operation}: {error}"))
 }
 
 fn transport_to_status<E: std::error::Error>(err: E) -> WireStatus {
@@ -394,7 +396,12 @@ where
         payload: Bytes,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<(), WireStatus>> + Send + 'a>> {
         let this = self.get_mut();
-        Box::pin(async move { this.send.send_body(payload).await.map_err(write_to_status) })
+        Box::pin(async move {
+            this.send
+                .send_body(payload)
+                .await
+                .map_err(|error| write_to_status("send", error))
+        })
     }
 
     fn close_send<'a>(
@@ -402,7 +409,12 @@ where
         trailer: Option<Trailer>,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<(), WireStatus>> + Send + 'a>> {
         let this = self.get_mut();
-        Box::pin(async move { this.send.close_send(trailer).await.map_err(write_to_status) })
+        Box::pin(async move {
+            this.send
+                .close_send(trailer)
+                .await
+                .map_err(|error| write_to_status("close_send", error))
+        })
     }
 
     fn reset(self: Pin<&mut Self>, code: WireCode) {

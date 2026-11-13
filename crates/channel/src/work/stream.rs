@@ -1208,7 +1208,13 @@ mod tests {
             .await
             .unwrap();
         let service = WorkService::new(provider);
-        let response = fixture::accept_uploaded_service(&service, &proposal).await;
+        fixture::seed_content(
+            &mut service.endpoint().await.unwrap().close.store,
+            PaidJobAuthorizationV2::decode(&proposal.authorization).unwrap(),
+            fixture::bundle(1).canonical_bytes().unwrap().into(),
+        )
+        .await;
+        let response = service.accept(&proposal, None).await;
         let work = client.accepted(&response).await.unwrap();
         service.begin_run(work, &ready).await.unwrap();
         let request = client.request_delivery(work, &[7; 32]).unwrap();

@@ -332,7 +332,7 @@ async fn child(root: &Path, funding: &str, phase: &str, seed: &str) -> ! {
             grant_content::Fixture::with_reply(false, Some(Reply::events(prefixes))).await;
         let mut session = GrantSession::open(
             fixture.options(vec![]),
-            GrantTransport::Local(fixture.service.clone()),
+            GrantTransport::Local(fixture.service.clone().into()),
         )
         .await
         .unwrap();
