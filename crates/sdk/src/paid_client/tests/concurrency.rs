@@ -362,3 +362,133 @@ async fn funded_capacity_refuses_before_signing_or_consuming_a_nonce() {
     assert_eq!(reopened.state().proposal_nonce_high_water(), limit);
     assert_eq!(reopened.state().jobs().count() as u64, limit);
 }
+
+#[tokio::test]
+async fn gateway_retires_an_idle_paid_channel_after_close() {
+    use hellas_channel::work::ClientChannel as _;
+    use hellas_gateway::WorkExecutionBackend as _;
+    let fixture = PaidFixture::new();
+    let validator = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut config = fixture.config.clone();
+    config.chain = config
+        .chain
+        .with_validators(vec![format!("ws://{}", validator.local_addr().unwrap())])
+        .unwrap();
+    let endpoint = bind_paid_endpoint(SecretKey::from_bytes(&[1; 32]))
+        .await
+        .unwrap();
+    let mut client = fixture.client().await;
+    let content = client
+        .client()
+        .await
+        .unwrap()
+        .store()
+        .await
+        .unwrap()
+        .content_store();
+    let options = PaidWorkOptions {
+        content,
+        config,
+        provider: crate::test_support::address(endpoint.id()),
+        provider_addrs: vec![],
+        apple_trust: None,
+        assurance: Assurance::ProducerSigned,
+        expected_price: PRICE,
+        acceptance_blocks: 49,
+        terminal_blocks: 99,
+        payment_blocks: 199,
+        timeout: None,
+    };
+    let owner = Arc::new(
+        crate::client_owner::ClientOwner::new(
+            Arc::new(hellas_kernel::SoftPasskey::from_secret_scalar([0x11; 32]).unwrap()),
+            crate::test_support::signer(1).party_key(),
+            &options.config.chain,
+        )
+        .unwrap(),
+    );
+    let backend = crate::Backend::paid(
+        Some(fixture.policy.invocation_policy.clone()),
+        options.clone(),
+        endpoint.clone(),
+        crate::test_support::signer(1),
+        owner,
+    );
+    let crate::BackendState::Paid(paid) = &backend.state else {
+        unreachable!()
+    };
+    let cached = paid.session.clone();
+    *cached.lock().await = Some(PaidWorkSession {
+        dialer: Arc::new(ProviderDialer::new(
+            endpoint.id(),
+            vec![],
+            endpoint.clone(),
+            options.trust().unwrap(),
+        )),
+        args: options,
+        descriptor: fixture.descriptor.clone(),
+        policy: fixture.policy.clone(),
+        client,
+        observer: None,
+        needs_recovery: false,
+    });
+    let gateway = crate::ExecutorGateway::new(
+        [(
+            "paid".into(),
+            crate::BackendEntry {
+                backend,
+                evaluator: None,
+                max_in_flight: std::num::NonZeroUsize::new(1).unwrap(),
+            },
+        )]
+        .into(),
+        Arc::new(ProducerSigningKey::from_secret_bytes([1; 32]).unwrap()),
+    );
+    // Close the idle retained channel through its real journal and endpoint.
+    cached
+        .lock()
+        .await
+        .as_mut()
+        .unwrap()
+        .client
+        .client()
+        .await
+        .unwrap()
+        .prepare_close()
+        .await
+        .unwrap();
+    let request = || {
+        gateway
+            .fetch(
+                "paid",
+                crate::test_support::request_job(&gateway.jobs),
+                hellas_gateway::WorkFetchRequest {
+                    service: "openai".into(),
+                    method: "responses".into(),
+                    body: BODY.to_vec(),
+                },
+            )
+            .unwrap()
+    };
+    let mut stream = request();
+    let error = stream.next().await.unwrap().unwrap_err();
+    assert!(
+        format!("{error:?}").contains("Endpoint(NotAdmitting)"),
+        "{error:?}"
+    );
+    assert!(stream.next().await.is_none());
+    assert!(
+        cached.lock().await.is_none(),
+        "terminal session must leave the cache"
+    );
+    // The next demand enters fresh-session setup at the validator. The closed
+    // cached endpoint would refuse locally without making this connection.
+    let mut stream = request();
+    tokio::select! {
+        result = stream.next() => panic!("new demand reused the terminal endpoint: {result:?}"),
+        result = validator.accept() => { drop(result.unwrap()); },
+    }
+    drop(stream);
+    gateway.drain().await.unwrap();
+    endpoint.close().await;
+}

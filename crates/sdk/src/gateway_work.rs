@@ -1299,6 +1299,7 @@ fn backend_failed(error: &ExecutionError) -> bool {
                 | P::OfferUnavailable { .. }
                 | P::OfferRefused(_)
                 | P::SetupEnded(_)
+                | P::Endpoint(_)
                 | P::ProviderIdentityPoisoned
                 | P::Store(_)
                 | P::Client(_)
