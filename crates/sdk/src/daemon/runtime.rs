@@ -76,7 +76,7 @@ impl Runtime {
         self.consumer.get().cloned().into_iter()
     }
 
-    async fn consumer_endpoint(&self) -> Result<iroh::Endpoint> {
+    pub(super) async fn consumer_endpoint(&self) -> Result<iroh::Endpoint> {
         // Outgoing sessions share one endpoint, distinct from the enrolled listener.
         let key = hellas_auth::hash_tuple(
             "hellas.daemon.client-transport.v1",

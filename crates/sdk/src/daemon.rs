@@ -211,6 +211,15 @@ impl Core {
         self.runtime.client_resources(chain).await
     }
 
+    /// Outgoing transport is shared across native requests and configured backends.
+    pub async fn client_endpoint(&self) -> Result<iroh::Endpoint> {
+        let _serial = self.configuring.lock().await;
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("daemon is closed".into());
+        }
+        self.runtime.consumer_endpoint().await
+    }
+
     /// The same backends and job table used by listeners, for an embedded native UI.
     pub fn execution(&self) -> Arc<ExecutorGateway> {
         self.snapshot.load().work.clone()

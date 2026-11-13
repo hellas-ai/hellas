@@ -4,6 +4,7 @@ use crate::{
     daemon_config::{Document, Listener},
 };
 use futures::StreamExt;
+use hellas_gateway::WorkExecutionBackend as _;
 use hellas_private::StoreLocation;
 
 async fn fixture() -> Fixture {
@@ -583,7 +584,16 @@ async fn embedded_clients_share_the_daemons_funding_owner() {
             crate::client_owner::ClientOwner::new(Arc::new(ROOT.passkey()), delegate, &chain,)
                 .is_err()
         );
+        let endpoint = core.client_endpoint().await.unwrap();
+        assert_eq!(endpoint.id(), core.client_endpoint().await.unwrap().id());
+        core.execution().drain().await.unwrap();
+        assert!(
+            !endpoint.is_closed(),
+            "backend retirement does not close daemon transport"
+        );
         core.shutdown().await.unwrap();
+        assert!(endpoint.is_closed());
+        assert!(core.client_endpoint().await.is_err());
         assert!(core.client_resources(&chain).await.is_err());
         drop(core);
         drop(owner);

@@ -1285,11 +1285,6 @@ impl WorkExecutionBackend for ExecutorGateway {
                 if let Some(mut session) = backend.paid.lock().await.take() {
                     session.shutdown().await;
                 }
-                if let Some(endpoint) = backend.target.endpoint()
-                    && !endpoint.is_closed()
-                {
-                    endpoint.close().await;
-                }
             }
             drained
         })
