@@ -23,7 +23,7 @@ pub(super) struct Bound {
 }
 
 pub(super) struct Paid {
-    pub(super) work: MountedWork,
+    work: MountedWork,
     setup: MountedSetup,
     watcher: tokio::sync::Mutex<Option<WorkWatcher>>,
 }

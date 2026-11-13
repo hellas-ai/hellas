@@ -71,12 +71,18 @@ struct Confirmed {
 
 impl Confirmed {
     fn certified_at_ms_now(self) -> Option<u64> {
-        let wall = UnixMillis::now().ok()?.0.checked_sub(self.wall.0)?;
-        let elapsed = Duration::from_millis(wall).max(self.monotonic.elapsed());
-        let elapsed = u64::try_from(elapsed.as_millis()).ok()?;
-        // Shift the block's stamp back by the time since confirmation, so
-        // the one check sees the age it has reached now.
-        Some(self.certified_at_ms.saturating_sub(elapsed))
+        self.certified_at_ms_at(UnixMillis::now().ok()?, Instant::now())
+    }
+
+    fn certified_at_ms_at(self, wall: UnixMillis, monotonic: Instant) -> Option<u64> {
+        let wall = wall.0.checked_sub(self.wall.0)?;
+        let uncounted = monotonic
+            .duration_since(self.monotonic)
+            .saturating_sub(Duration::from_millis(wall));
+        let uncounted = u64::try_from(uncounted.as_millis()).ok()?;
+        // The age check already counts wall time. Only monotonic progress
+        // beyond that wall time needs an adjustment to the certified stamp.
+        Some(self.certified_at_ms.saturating_sub(uncounted))
     }
 }
 
@@ -194,19 +200,34 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_time_counts_elapsed_time_once() {
+        let start = Instant::now();
+        let confirmed = Confirmed {
+            certified_at_ms: 1_000,
+            wall: UnixMillis(2_000),
+            monotonic: start,
+        };
+        // Ten seconds passed on both clocks: the block is eleven seconds old.
+        assert_eq!(
+            confirmed.certified_at_ms_at(UnixMillis(12_000), start + Duration::from_secs(10)),
+            Some(1_000)
+        );
+        // Monotonic progress beyond wall time still counts against freshness.
+        assert_eq!(
+            confirmed.certified_at_ms_at(UnixMillis(12_000), start + Duration::from_millis(10_500)),
+            Some(500)
+        );
+        assert_eq!(confirmed.certified_at_ms_at(UnixMillis(1_999), start), None);
+    }
+
+    #[test]
     fn a_confirmed_read_ages_out_on_the_same_bound() {
         let mut observation = Observation::default();
-        let nearly = now_ms() - ms(MAX_CERTIFIED_AGE) + 50;
-        observation.confirm(1, nearly).unwrap();
-        // Confirmed 100 ms ago by both clocks: the age it has reached now
-        // is past the bound.
+        observation.confirm(1, now_ms()).unwrap();
         let Freshness::Fresh(confirmed) = &mut observation.freshness else {
             panic!("the read was confirmed");
         };
-        confirmed.monotonic = Instant::now()
-            .checked_sub(Duration::from_millis(100))
-            .unwrap();
-        confirmed.wall = UnixMillis(confirmed.wall.0 - 100);
+        confirmed.certified_at_ms = now_ms() - ms(MAX_CERTIFIED_AGE) - 1;
         assert_eq!(observation.check(), Err(EndpointError::ObservationStale));
         assert_eq!(observation.remaining(), Some(Duration::ZERO));
     }

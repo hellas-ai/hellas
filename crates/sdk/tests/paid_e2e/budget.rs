@@ -90,7 +90,8 @@ fn consecutive_jobs_reuse_bounded_funding_and_closing_channels_never_refund_it()
                     },
                 );
                 // Only the first opening funds a channel. Reconnecting to it
-                // needs no funding transaction.
+                // needs no blocks: sealing on a wall-clock timer here would
+                // age the bond according to the CI runner's network speed.
                 let opened = if n == 0 {
                     sealing_while(&mut case.devnet, Duration::from_millis(100), open).await
                 } else {
@@ -103,13 +104,6 @@ fn consecutive_jobs_reuse_bounded_funding_and_closing_channels_never_refund_it()
                     *bond.get_or_insert(session.descriptor().bond_edge()),
                     session.descriptor().bond_edge()
                 );
-                // Synchronize on certified progress before each purchase. The
-                // budget assertion must not depend on beating the observer's
-                // freshness bound while other integration tests are running.
-                case.devnet.seal().await;
-                case.provider
-                    .wait_paid_ready(session.descriptor().channel().id(), case.devnet.height())
-                    .await;
                 let result = tokio::time::timeout(
                     Duration::from_secs(30),
                     hellas_sdk::transact::transact(

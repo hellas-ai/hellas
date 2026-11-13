@@ -29,14 +29,6 @@ impl Daemon {
     pub fn administration(&self) -> Option<hellas_authority::grant_service::WorkAdministration> {
         self.core.administration()
     }
-    /// Waits until this fixture's paid watcher has admitted from the sealed tip.
-    pub async fn wait_paid_ready(&self, channel: hellas_auth::Digest, height: u64) {
-        let paid = self.core.runtime.paid.lock().await;
-        assert_eq!(paid.len(), 1, "fixture has one paid chain");
-        let work = paid.values().next().unwrap().work.clone();
-        drop(paid);
-        work.wait_ready(channel, height).await;
-    }
     pub async fn shutdown(self) -> Result<()> {
         let result = self.core.shutdown().await;
         self.core.runtime.options.content.close().await;
