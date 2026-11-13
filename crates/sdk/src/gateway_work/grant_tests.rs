@@ -175,7 +175,7 @@ impl FixtureBuilder {
 }
 impl Fixture {
     fn backend(&self) -> &crate::GrantBackend {
-        let crate::Backend::Grant(backend) = &self.gateway.backends["test"].target else {
+        let Some(backend) = &self.gateway.backends["test"].grant else {
             panic!("expected a grant fixture");
         };
         backend
@@ -234,7 +234,7 @@ impl Fixture {
             },
             self.gateway.clone(),
             self.gateway.jobs.clone(),
-            self.gateway.backends["test"].target.routes("test").unwrap(),
+            self.gateway.backends["test"].routes("test").unwrap(),
         )
         .await
         .unwrap();
@@ -366,10 +366,7 @@ async fn resource_repair_precedes_client_signing() {
         .inspect_request(inspect_chat)
         .build()
         .await;
-    let config = fixture.gateway.backends["test"]
-        .target
-        .routes("test")
-        .unwrap();
+    let config = fixture.gateway.backends["test"].routes("test").unwrap();
     let hellas_gateway::Presentation::Http { targets } = &config[0].presentation else {
         panic!("HTTP route")
     };
@@ -861,12 +858,11 @@ async fn queued_requests_wait_without_a_deadline_and_cancel_on_disconnect() {
     for disconnect in [false, true] {
         let held = fixture.backend().session.lock().await;
         let job = fixture.gateway.backends["test"]
-            .target
             .job(&WorkRequest::Fetch(fixture.request(None)))
             .unwrap();
         let (requester, stream) =
             Requester::<OutputEvent, WorkGatewayError>::new(crate::test_support::job());
-        let run = fixture.gateway.backends["test"].run(job, requester);
+        let run = fixture.gateway.backends["test"].run(job, requester, &fixture.gateway.signer);
         tokio::pin!(run);
         assert!(futures::poll!(run.as_mut()).is_pending());
         tokio::time::pause();
@@ -932,13 +928,12 @@ async fn disconnect_during_control_does_not_propose() {
     let node = fixture.host.world.service.node();
     let held = hellas_authority::test_support::hold_writer(&node).await;
     let job = fixture.gateway.backends["test"]
-        .target
         .job(&WorkRequest::Fetch(fixture.request(None)))
         .unwrap();
     let (requester, stream) =
         Requester::<OutputEvent, WorkGatewayError>::new(crate::test_support::job());
     {
-        let run = fixture.gateway.backends["test"].run(job, requester);
+        let run = fixture.gateway.backends["test"].run(job, requester, &fixture.gateway.signer);
         tokio::pin!(run);
         assert!(futures::poll!(run.as_mut()).is_pending());
         drop(stream);
@@ -1003,7 +998,7 @@ async fn single_signed_model_responses_route_tracks_continuation() {
         },
         gateway.clone(),
         gateway.jobs.clone(),
-        gateway.backends["test"].target.routes("test").unwrap(),
+        gateway.backends["test"].routes("test").unwrap(),
     )
     .await
     .unwrap();
@@ -1146,8 +1141,8 @@ async fn two_grant_nodes_fail_over_before_proposal_and_rejoin_on_demand() {
         .next()
         .unwrap();
     let entry = |fixture: &Fixture| {
-        let mut backend = fixture.gateway.backends["test"].target.clone();
-        if let crate::Backend::Grant(crate::GrantBackend { options, .. }) = &mut backend {
+        let mut backend = fixture.gateway.backends["test"].as_ref().clone();
+        if let Some(crate::GrantBackend { options, .. }) = &mut backend.grant {
             options.control_timeout = Duration::from_millis(500);
         }
         crate::BackendEntry {
@@ -1164,10 +1159,7 @@ async fn two_grant_nodes_fail_over_before_proposal_and_rejoin_on_demand() {
         .into(),
         first.options().signer.clone(),
     );
-    let mut routes = first.gateway.backends["test"]
-        .target
-        .routes("first")
-        .unwrap();
+    let mut routes = first.gateway.backends["test"].routes("first").unwrap();
     for route in &mut routes {
         route.backends.push("second".into());
         if let hellas_gateway::Presentation::Http { targets } = &mut route.presentation {

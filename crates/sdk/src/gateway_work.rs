@@ -2,6 +2,7 @@
 //! commands' target, run by the same [`Executor`]. Admission, streamed
 //! output and shutdown are shared here.
 pub(crate) mod provider;
+use crate::daemon_config::BackendKind;
 use crate::execution::{ExecutionError, Executor};
 use crate::grant_client::GrantClientError;
 use crate::job::{Job, JobError, JobInput};
@@ -427,29 +428,27 @@ fn repair(https: &HttpsResource, body: &[u8]) -> Result<Vec<u8>, JobError> {
     Ok(serde_json::to_vec(&http)?)
 }
 
-/// Where every request of one gateway runs: the job commands' targets.
+/// Declared backend kind and the runtime handles resolved from it.
 #[derive(Clone)]
-#[expect(clippy::large_enum_variant, reason = "one per backend")]
-pub enum Backend {
-    /// One upstream endpoint under its own per-backend admission capacity.
-    Fetch {
-        execution: hellas_executor::ExecutorHandle,
-        policy: InvocationPolicy,
-    },
-    Paid(PaidBackend),
-    Grant(GrantBackend),
-    /// This machine, under the caller's own limits.
-    #[cfg(feature = "compute")]
-    Local {
-        execution: crate::execution::local::LocalExecution,
-        timeout: std::time::Duration,
-    },
+pub struct Backend {
+    id: String,
+    jobs: Arc<hellas_gateway::jobs::Jobs>,
+    evaluator: Option<String>,
+    slots: Arc<Semaphore>,
+    capacity: usize,
+    down: Arc<std::sync::atomic::AtomicBool>,
+    pub kind: BackendKind,
+    pub paid: Option<PaidBackend>,
+    pub grant: Option<GrantBackend>,
+    pub content: Option<hellas_store::content::DiskStore>,
+    pub(crate) execution: Option<hellas_executor::ExecutorHandle>,
+    policy: Option<InvocationPolicy>,
+    pub timeout: std::time::Duration,
 }
 
 #[derive(Clone)]
 pub struct PaidBackend {
     pub options: crate::paid_client::PaidWorkOptions,
-    pub policy: Option<InvocationPolicy>,
     pub endpoint: iroh::Endpoint,
     pub settlement_key: hellas_kernel::Secp256k1Signer,
     pub owner: Arc<crate::client_owner::ClientOwner>,
@@ -464,6 +463,23 @@ pub struct GrantBackend {
 }
 
 impl Backend {
+    fn new(kind: BackendKind) -> Self {
+        Self {
+            id: String::new(),
+            jobs: Default::default(),
+            evaluator: None,
+            slots: Arc::new(Semaphore::new(1)),
+            capacity: 1,
+            down: Default::default(),
+            kind,
+            paid: None,
+            grant: None,
+            content: None,
+            execution: None,
+            policy: None,
+            timeout: std::time::Duration::from_secs(86_400),
+        }
+    }
     pub fn paid(
         policy: Option<InvocationPolicy>,
         options: crate::paid_client::PaidWorkOptions,
@@ -471,120 +487,150 @@ impl Backend {
         settlement_key: hellas_kernel::Secp256k1Signer,
         owner: Arc<crate::client_owner::ClientOwner>,
     ) -> Self {
-        Self::Paid(PaidBackend {
-            options,
+        let kind = BackendKind::Paid {
+            provider: options.provider.to_string(),
+            addresses: options.provider_addrs.clone(),
+            acceptance_blocks: options.acceptance_blocks,
+            terminal_blocks: options.terminal_blocks,
+            payment_blocks: options.payment_blocks,
+            timeout_seconds: options.timeout.map(|t| t.as_secs()),
+            chain: None,
+            max_price: options.expected_price,
+            evaluator: None,
+            trust: None,
+        };
+        Self {
             policy,
-            endpoint,
-            settlement_key,
-            owner,
-            session: Default::default(),
-        })
+            paid: Some(PaidBackend {
+                options,
+                endpoint,
+                settlement_key,
+                owner,
+                session: Default::default(),
+            }),
+            ..Self::new(kind)
+        }
     }
     pub fn grant(
         policy: GrantPolicy,
         options: crate::grant_client::GrantSessionOptions,
         transport: crate::grant_client::GrantTransport,
     ) -> Self {
-        Self::Grant(GrantBackend {
-            options,
-            transport,
-            policy,
-            session: Default::default(),
-        })
+        let kind = BackendKind::Grant {
+            access: None,
+            resource: Some(policy.resource),
+            evaluator: None,
+            trust: None,
+        };
+        Self {
+            grant: Some(GrantBackend {
+                options,
+                transport,
+                policy,
+                session: Default::default(),
+            }),
+            ..Self::new(kind)
+        }
     }
-
+    pub fn local(
+        kind: BackendKind,
+        execution: crate::execution::local::LocalExecution,
+        timeout: std::time::Duration,
+    ) -> Self {
+        Self {
+            execution: Some(execution.backend),
+            content: Some(execution.content),
+            timeout,
+            ..Self::new(kind)
+        }
+    }
+    pub fn fetch(
+        kind: BackendKind,
+        execution: hellas_executor::ExecutorHandle,
+        policy: InvocationPolicy,
+    ) -> Self {
+        Self {
+            execution: Some(execution),
+            policy: Some(policy),
+            ..Self::new(kind)
+        }
+    }
+    pub fn policy(&self) -> Option<&InvocationPolicy> {
+        self.grant
+            .as_ref()
+            .map(|grant| &grant.policy.invocation_policy)
+            .or(self.policy.as_ref())
+    }
     /// The endpoint requests reach their provider through, if remote.
     pub fn endpoint(&self) -> Option<&iroh::Endpoint> {
-        match self {
-            Self::Paid(crate::PaidBackend { endpoint, .. })
-            | Self::Grant(crate::GrantBackend {
-                transport: crate::grant_client::GrantTransport::Remote(endpoint),
-                ..
-            }) => Some(endpoint),
-            _ => None,
-        }
+        self.paid.as_ref().map(|paid| &paid.endpoint).or_else(|| {
+            match self.grant.as_ref().map(|grant| &grant.transport) {
+                Some(crate::grant_client::GrantTransport::Remote(endpoint)) => Some(endpoint),
+                _ => None,
+            }
+        })
     }
 
     /// Quote paid work before rendering a job. Saved jobs already carry their
     /// price and can execute without requesting another quote.
     pub async fn quote(&mut self) -> Result<u64, crate::paid_client::PaidClientError> {
-        match self {
-            Self::Paid(crate::PaidBackend {
-                options,
-                policy,
-                endpoint,
-                settlement_key,
-                owner,
-                ..
-            }) => {
-                let quote = crate::paid_client::request_paid_quote(
-                    options,
-                    endpoint,
-                    settlement_key,
-                    owner.principal(),
-                )
-                .await?;
-                options.expected_price = quote.policy.payment_policy.fixed_price;
-                *policy = Some(quote.policy.invocation_policy);
-                Ok(options.expected_price)
-            }
-            _ => Ok(0),
-        }
+        let Some(paid) = &mut self.paid else {
+            return Ok(0);
+        };
+        let quote = crate::paid_client::request_paid_quote(
+            &paid.options,
+            &paid.endpoint,
+            &paid.settlement_key,
+            paid.owner.principal(),
+        )
+        .await?;
+        paid.options.expected_price = quote.policy.payment_policy.fixed_price;
+        self.policy = Some(quote.policy.invocation_policy);
+        Ok(paid.options.expected_price)
     }
 
     /// The one job `request` becomes under this target's terms.
     fn job(&self, request: &WorkRequest) -> Result<Job, WorkGatewayError> {
-        let input = match self {
-            Self::Fetch { policy, .. } => {
-                request.admitted(policy, None, hellas_rpc::Assurance::ProducerSigned, false)
+        let local_policy = match (&self.kind, request) {
+            (BackendKind::Local { .. }, WorkRequest::Job(input)) => {
+                Some(crate::execution::local::policy(input, self.timeout).map_err(rejected)?)
             }
-            Self::Paid(crate::PaidBackend {
-                options, policy, ..
-            }) => request.admitted(
-                policy.as_ref().ok_or(WorkGatewayError::Unsupported)?,
-                None,
-                options.assurance,
-                true,
-            ),
-            Self::Grant(crate::GrantBackend {
-                options, policy, ..
-            }) => request.admitted(
-                &policy.invocation_policy,
-                policy.https.as_ref(),
-                options.target.trust().required_assurance,
-                false,
-            ),
-            #[cfg(feature = "compute")]
-            Self::Local { timeout, .. } => match request {
-                WorkRequest::Job(input) => crate::execution::local::policy(input, *timeout)
-                    .and_then(|policy| {
-                        request.admitted(
-                            &policy,
-                            None,
-                            hellas_rpc::Assurance::ProducerSigned,
-                            false,
-                        )
-                    }),
-                WorkRequest::Fetch(_) => return Err(WorkGatewayError::Unsupported),
-            },
-        }
-        .map_err(rejected)?;
-        let price = match self {
-            Self::Paid(crate::PaidBackend { options, .. }) => options.expected_price,
-            _ => 0,
+            (BackendKind::Local { .. }, WorkRequest::Fetch(_)) => {
+                return Err(WorkGatewayError::Unsupported);
+            }
+            _ => None,
         };
+        let policy = local_policy
+            .as_ref()
+            .or(self.policy())
+            .ok_or(WorkGatewayError::Unsupported)?;
+        let assurance = self
+            .paid
+            .as_ref()
+            .map(|paid| paid.options.assurance)
+            .or_else(|| {
+                self.grant
+                    .as_ref()
+                    .map(|grant| grant.options.target.trust().required_assurance)
+            })
+            .unwrap_or(hellas_rpc::Assurance::ProducerSigned);
+        let price = self
+            .paid
+            .as_ref()
+            .map_or(0, |paid| paid.options.expected_price);
+        let https = self
+            .grant
+            .as_ref()
+            .and_then(|grant| grant.policy.https.as_ref());
+        let input = request
+            .admitted(policy, https, assurance, self.paid.is_some())
+            .map_err(rejected)?;
         Job::from_input(price, input).map_err(rejected)
     }
 
     /// The Fetch schemas and routes admitted by this backend, each once.
     pub fn fetch_routes(&self) -> Vec<(hellas_rpc::FetchSchema, FetchRoutePolicy)> {
-        let policy = match self {
-            Self::Fetch { policy, .. } => Some(policy),
-            Self::Paid(crate::PaidBackend { policy, .. }) => policy.as_ref(),
-            Self::Grant(crate::GrantBackend { policy, .. }) => Some(&policy.invocation_policy),
-            #[cfg(feature = "compute")]
-            Self::Local { .. } => None,
-        };
+        let policy = self.policy();
         let mut routes = Vec::new();
         if let Some(policy) = policy {
             for admission in &policy.admissions {
@@ -601,7 +647,7 @@ impl Backend {
 
     /// A grant contributes the HTTP routes its resource authorizes.
     pub fn routes(&self, id: &str) -> Result<Vec<hellas_gateway::Route>, WorkGatewayError> {
-        let Self::Grant(crate::GrantBackend { policy, .. }) = self else {
+        let Some(crate::GrantBackend { policy, .. }) = &self.grant else {
             return Ok(vec![]);
         };
         grant_routes(policy, id)
@@ -732,22 +778,13 @@ pub struct BackendEntry {
 }
 
 pub struct ExecutorGateway {
-    backends: std::collections::BTreeMap<String, Arc<Inner>>,
-    pub jobs: Arc<hellas_gateway::jobs::Jobs>,
-}
-struct Inner {
-    id: String,
-    jobs: Arc<hellas_gateway::jobs::Jobs>,
-    target: Backend,
-    evaluator: Option<String>,
+    backends: std::collections::BTreeMap<String, Arc<Backend>>,
     signer: Arc<hellas_auth::ProducerSigningKey>,
-    slots: Arc<Semaphore>,
-    capacity: usize,
-    down: std::sync::atomic::AtomicBool,
+    pub jobs: Arc<hellas_gateway::jobs::Jobs>,
 }
 impl ExecutorGateway {
     pub fn backend(&self, id: &str) -> Option<&Backend> {
-        self.backends.get(id).map(|backend| &backend.target)
+        self.backends.get(id).map(AsRef::as_ref)
     }
 
     pub fn new(
@@ -777,22 +814,18 @@ impl ExecutorGateway {
             .map(|(id, inner)| (id.clone(), inner.clone()))
             .collect();
         resolved.extend(backends.into_iter().map(|(id, entry)| {
-            (
-                id.clone(),
-                Arc::new(Inner {
-                    id,
-                    jobs: jobs.clone(),
-                    target: entry.backend,
-                    evaluator: entry.evaluator,
-                    signer: signer.clone(),
-                    slots: Arc::new(Semaphore::new(entry.max_in_flight.get())),
-                    capacity: entry.max_in_flight.get(),
-                    down: Default::default(),
-                }),
-            )
+            let mut backend = entry.backend;
+            backend.id = id.clone();
+            backend.jobs = jobs.clone();
+            backend.evaluator = entry.evaluator;
+            backend.capacity = entry.max_in_flight.get();
+            backend.slots = Arc::new(Semaphore::new(backend.capacity));
+            backend.down = Default::default();
+            (id, Arc::new(backend))
         }));
         Arc::new(Self {
             backends: resolved,
+            signer,
             jobs,
         })
     }
@@ -834,14 +867,14 @@ impl ExecutorGateway {
             .try_acquire_owned()
             .map_err(|_| WorkGatewayError::PreProposal(Box::new(WorkGatewayBusy.into())))?;
         let job = inner
-            .target
             .job(&request)
             .map_err(|error| WorkGatewayError::PreProposal(Box::new(error)))?;
         let (requester, stream) = Requester::<E, WorkGatewayError>::new(request_job.clone());
+        let signer = self.signer.clone();
         request_job
             .spawn(id, async move {
                 let _permit = permit;
-                if let Err(error) = inner.run(job, requester.clone()).await {
+                if let Err(error) = inner.run(job, requester.clone(), &signer).await {
                     requester.emit(Err(error));
                 }
             })
@@ -849,23 +882,20 @@ impl ExecutorGateway {
         Ok(stream)
     }
 }
-impl Inner {
+impl Backend {
     async fn close_sessions(&self) -> Result<(), WorkShutdownError> {
-        match &self.target {
-            Backend::Grant(target) => {
-                if let Some(mut session) = target.session.lock().await.take() {
-                    session
-                        .shutdown()
-                        .await
-                        .map_err(|error| WorkShutdownError::Recovery(Arc::new(error)))?;
-                }
-            }
-            Backend::Paid(target) => {
-                if let Some(mut session) = target.session.lock().await.take() {
-                    session.shutdown().await;
-                }
-            }
-            _ => {}
+        if let Some(target) = &self.grant
+            && let Some(mut session) = target.session.lock().await.take()
+        {
+            session
+                .shutdown()
+                .await
+                .map_err(|error| WorkShutdownError::Recovery(Arc::new(error)))?;
+        }
+        if let Some(target) = &self.paid
+            && let Some(mut session) = target.session.lock().await.take()
+        {
+            session.shutdown().await;
         }
         Ok(())
     }
@@ -890,17 +920,39 @@ impl Inner {
         &self,
         job: Job,
         requester: Requester<E, WorkGatewayError>,
+        signer: &hellas_auth::ProducerSigningKey,
     ) -> Result<(), WorkGatewayError> {
         use crate::execution::AttemptError;
         let stop = requester.stop();
         let request = WorkRequest::Job(job.input().clone());
         let run = async {
-            match &self.target {
-                Backend::Paid(target) => self.run_paid(target, &job, &stop, &requester).await,
-                Backend::Grant(target) => self.run_grant(target, &request, &stop, &requester).await,
-                Backend::Fetch { .. } => self.run_here(&job, stop, &requester).await,
-                #[cfg(feature = "compute")]
-                Backend::Local { .. } => self.run_here(&job, stop, &requester).await,
+            match &self.kind {
+                BackendKind::Paid { .. } => {
+                    self.run_paid(
+                        self.paid.as_ref().ok_or_else(|| {
+                            AttemptError::PreProposal(Box::new(ExecutionError::Identity))
+                        })?,
+                        &job,
+                        &stop,
+                        &requester,
+                        signer,
+                    )
+                    .await
+                }
+                BackendKind::Grant { .. } => {
+                    self.run_grant(
+                        self.grant.as_ref().ok_or_else(|| {
+                            AttemptError::PreProposal(Box::new(ExecutionError::Identity))
+                        })?,
+                        &request,
+                        &stop,
+                        &requester,
+                    )
+                    .await
+                }
+                BackendKind::Fetch { .. } | BackendKind::Local { .. } => {
+                    self.run_here(&job, stop, &requester, signer).await
+                }
             }
         }
         .await;
@@ -953,12 +1005,13 @@ impl Inner {
         job: &Job,
         stop: crate::execution::Stop,
         requester: &Requester<E, WorkGatewayError>,
+        signer: &hellas_auth::ProducerSigningKey,
     ) -> Result<crate::execution::Completed, crate::execution::AttemptError> {
         use crate::execution::AttemptError;
-        let result = Executor::new(self.target.clone())
+        let result = Executor::new(self.clone())
             .run(
                 job,
-                &self.signer,
+                signer,
                 None,
                 stop,
                 requester.observers(),
@@ -977,6 +1030,7 @@ impl Inner {
         job: &Job,
         stop: &crate::execution::Stop,
         requester: &Requester<E, WorkGatewayError>,
+        signer: &hellas_auth::ProducerSigningKey,
     ) -> Result<crate::execution::Completed, crate::execution::AttemptError> {
         use crate::execution::{AttemptError, PaidOpen, before_proposal, open_paid_session};
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -1032,7 +1086,7 @@ impl Inner {
             None,
             stop,
             Some(&proposed),
-            session.propose_job(job, &self.signer, &proposed),
+            session.propose_job(job, signer, &proposed),
         )
         .await?;
         let delivery = match proposal {

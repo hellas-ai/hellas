@@ -99,63 +99,29 @@ impl NodeStore {
             document,
             secrets,
         }];
-        if let Some(machine) = configuration.machine() {
-            if usize::from(machine.max_in_flight.get()) > super::store::MAX_OPEN_JOBS {
-                return Err(hellas_auth::authority::AuthorityError::Invalid.into());
-            }
-            let current = super::ledger::definition(
-                state.ledger(),
-                crate::model::grant::budget::BudgetNode::Machine,
-            );
-            if current.as_ref().is_none_or(|old| {
-                old.limits != machine.limits || old.max_in_flight != machine.max_in_flight
-            }) {
-                changes.push(Change::Budget(BudgetDef {
-                    node: crate::model::grant::budget::BudgetNode::Machine,
-                    parent: None,
-                    revision: current
-                        .map_or(Revision(0), |old| old.revision)
-                        .next()
-                        .ok_or(NodeStoreError::Malformed)?,
-                    limits: machine.limits.clone(),
-                    max_in_flight: machine.max_in_flight,
-                }));
-            }
+        if configuration.machine().is_some_and(|machine| {
+            usize::from(machine.max_in_flight.get()) > super::store::MAX_OPEN_JOBS
+        }) {
+            return Err(hellas_auth::authority::AuthorityError::Invalid.into());
         }
         changes.extend(
             configuration
-                .account_changes(|node| super::ledger::definition(state.ledger(), node))?
+                .budget_changes(|node| super::ledger::definition(state.ledger(), node))?
                 .into_iter()
                 .map(Change::Budget),
         );
         for input in configuration.resources() {
-            let mut policy = input.clone();
-            if let Some(old) = state.resource(policy.resource) {
-                policy.revision = old.revision;
-                policy.pricing.revision = old.pricing.revision;
-                if policy.pricing != old.pricing {
-                    policy.pricing.revision = old
-                        .pricing
-                        .revision
-                        .next()
-                        .ok_or(NodeStoreError::Malformed)?;
-                }
-                if policy == *old {
-                    if state
-                        .resource_health(policy.resource)
-                        .is_some_and(|health| !health.configured)
-                    {
-                        changes.push(Change::ResourceAvailability {
-                            resource: policy.resource,
-                            available: true,
-                        });
-                    }
-                    continue;
-                } else {
-                    policy.revision = old.revision.next().ok_or(NodeStoreError::Malformed)?;
-                }
+            if let Some(policy) = input.changed(state.resource(input.resource))? {
+                changes.push(Change::Resource(policy));
+            } else if state
+                .resource_health(input.resource)
+                .is_some_and(|health| !health.configured)
+            {
+                changes.push(Change::ResourceAvailability {
+                    resource: input.resource,
+                    available: true,
+                });
             }
-            changes.push(Change::Resource(policy));
         }
         changes.extend(
             state

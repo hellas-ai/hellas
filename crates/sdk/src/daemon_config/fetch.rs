@@ -67,10 +67,11 @@ impl super::Backend {
         let mut config = ExecutorSpawnConfig::new(signer, routes);
         config.fetch_max_in_flight = self.max_in_flight.get();
         config.fetch_queue_capacity = 0;
-        Ok(Backend::Fetch {
-            execution: hellas_executor::Executor::spawn_configured(config).await?,
+        Ok(Backend::fetch(
+            self.kind.clone(),
+            hellas_executor::Executor::spawn_configured(config).await?,
             policy,
-        })
+        ))
     }
 }
 

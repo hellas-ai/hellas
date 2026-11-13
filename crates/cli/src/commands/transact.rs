@@ -6,6 +6,7 @@ use hellas_auth::authority::{NodeKey, ResourceId, UnixMillis};
 use hellas_kernel::Secp256k1Signer;
 use hellas_private::StoreLocation;
 use hellas_rpc::Assurance;
+use hellas_sdk::daemon_config::BackendKind;
 use hellas_sdk::{
     Backend,
     execution::{
@@ -531,10 +532,14 @@ impl TargetArgs {
                 crate::compute::local(&context.home, native, Arc::new(context.producer.clone()))
                     .await?;
             return Ok(ResolvedBackend {
-                backend: Backend::Local {
+                backend: Backend::local(
+                    BackendKind::Local {
+                        runtime: "auto".into(),
+                        content: vec![],
+                    },
                     execution,
-                    timeout: client.timeout.unwrap_or(Duration::from_secs(86_400)),
-                },
+                    client.timeout.unwrap_or(Duration::from_secs(86_400)),
+                ),
                 attempt: None,
             });
         }
@@ -613,15 +618,7 @@ impl ResolvedBackend {
         u64,
     )> {
         let price = self.backend.quote().await?;
-        let policy = match &self.backend {
-            Backend::Paid(hellas_sdk::PaidBackend { policy, .. }) => policy.clone(),
-            Backend::Grant(hellas_sdk::GrantBackend { policy, .. }) => {
-                Some(policy.invocation_policy.clone())
-            }
-            Backend::Fetch { policy, .. } => Some(policy.clone()),
-            #[cfg(feature = "compute")]
-            Backend::Local { .. } => None,
-        };
+        let policy = self.backend.policy().cloned();
         Ok((policy, price))
     }
 
@@ -633,15 +630,25 @@ impl ResolvedBackend {
         job: &Job,
     ) -> super::CliResult<(Executor, String)> {
         let mut executor = Executor::new(self.backend.clone());
-        let provider = match &executor.backend {
-            Backend::Paid(hellas_sdk::PaidBackend { options, owner, .. }) => {
+        let provider = match &executor.backend.kind {
+            BackendKind::Paid { .. } => {
+                let hellas_sdk::PaidBackend { options, owner, .. } = executor
+                    .backend
+                    .paid
+                    .as_ref()
+                    .context("missing paid session")?;
                 executor.attempt = Some(client.purchase(context, job, options, owner)?);
                 executor.settle = client.settle;
                 options.provider.to_string()
             }
-            Backend::Grant(hellas_sdk::GrantBackend {
-                options, policy, ..
-            }) => {
+            BackendKind::Grant { .. } => {
+                let hellas_sdk::GrantBackend {
+                    options, policy, ..
+                } = executor
+                    .backend
+                    .grant
+                    .as_ref()
+                    .context("missing grant session")?;
                 job.input().admits(&policy.invocation_policy, false)?;
                 let offer = options.target.offer();
                 let provider = hellas_sdk::client::ProviderAddress::of(&offer.provider)?;
@@ -666,21 +673,19 @@ impl ResolvedBackend {
                 executor.attempt = Some(attempt);
                 provider.to_string()
             }
-            Backend::Fetch { .. } => hex::encode(context.producer.public_key().bytes()),
-            #[cfg(feature = "compute")]
-            Backend::Local { .. } => hex::encode(context.producer.public_key().bytes()),
+            BackendKind::Fetch { .. } | BackendKind::Local { .. } => {
+                hex::encode(context.producer.public_key().bytes())
+            }
         };
         Ok((executor, provider))
     }
 
     async fn close(self) -> super::CliResult<()> {
-        match self.backend {
-            Backend::Paid(hellas_sdk::PaidBackend { options, .. }) => options.content.close().await,
-            Backend::Grant(hellas_sdk::GrantBackend { .. }) | Backend::Fetch { .. } => {}
-            #[cfg(feature = "compute")]
-            Backend::Local { execution, .. } => {
-                execution.content.close().await;
-            }
+        if let Some(paid) = self.backend.paid {
+            paid.options.content.close().await;
+        }
+        if let Some(content) = self.backend.content {
+            content.close().await;
         }
         Ok(())
     }

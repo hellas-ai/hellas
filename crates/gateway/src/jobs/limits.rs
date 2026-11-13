@@ -9,50 +9,20 @@ use std::{
     },
 };
 
+#[derive(Default)]
 pub struct RequestLimit {
+    rate: AtomicU64,
     next: AtomicU64,
     book: Arc<Mutex<Book>>,
 }
 
-impl Default for RequestLimit {
-    fn default() -> Self {
-        let limit = Self {
-            next: AtomicU64::new(0),
-            book: Default::default(),
-        };
-        limit.configure(None);
-        limit
-    }
-}
-
 impl RequestLimit {
-    /// Called at the snapshot commit point. Existing holds retain their charge.
+    /// Existing holds keep their charge; admission installs a changed rate lazily.
     pub fn configure(&self, requests_per_minute: Option<NonZeroU64>) {
-        let rate = requests_per_minute.map_or(0, NonZeroU64::get);
-        let limits = if rate == 0 {
-            vec![]
-        } else {
-            vec![Limit {
-                meter: Meter::Requests,
-                window: Window::Bucket {
-                    every: 60_000u64.div_ceil(rate),
-                },
-                amount: rate,
-                reserve: 0,
-                pace: None,
-            }]
-        };
-        self.book
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .configure(
-                Key::Machine,
-                Some(Spec {
-                    limits,
-                    ..Default::default()
-                }),
-            )
-            .expect("valid request quota");
+        self.rate.store(
+            requests_per_minute.map_or(0, NonZeroU64::get),
+            Ordering::Release,
+        );
     }
 }
 
@@ -71,6 +41,34 @@ fn unavailable() -> Refusal {
 impl RequestLimit {
     pub(super) fn admit(&self) -> Result<Hold, Refusal> {
         let mut book = self.book.lock().map_err(|_| unavailable())?;
+        let rate = self.rate.load(Ordering::Acquire);
+        if book
+            .node(Key::Machine)
+            .is_none_or(|node| node.spec().limits.first().map_or(0, |limit| limit.amount) != rate)
+        {
+            let limits = if rate == 0 {
+                vec![]
+            } else {
+                vec![Limit {
+                    meter: Meter::Requests,
+                    window: Window::Bucket {
+                        every: 60_000u64.div_ceil(rate),
+                    },
+                    amount: rate,
+                    reserve: 0,
+                    pace: None,
+                }]
+            };
+            book.configure(
+                Key::Machine,
+                Some(Spec {
+                    limits,
+                    ..Default::default()
+                }),
+            )
+            .map_err(|_| unavailable())?;
+        }
+
         let mut bytes = [0; 32];
         let sequence = self
             .next

@@ -413,14 +413,6 @@ async fn start_provider(
     let execution = hellas_executor::Executor::spawn_configured(executor)
         .await
         .unwrap();
-    let backend = hellas_sdk::BackendEntry {
-        backend: hellas_sdk::Backend::Fetch {
-            execution,
-            policy: work_policy(),
-        },
-        evaluator: None,
-        max_in_flight: std::num::NonZeroUsize::MIN,
-    };
     let document = Document {
         listeners: [(
             "work".into(),
@@ -446,6 +438,15 @@ async fn start_provider(
         )]
         .into(),
         ..Default::default()
+    };
+    let backend = hellas_sdk::BackendEntry {
+        backend: hellas_sdk::Backend::fetch(
+            document.backends["fetch"].kind.clone(),
+            execution,
+            work_policy(),
+        ),
+        evaluator: None,
+        max_in_flight: std::num::NonZeroUsize::MIN,
     };
     let provider = hellas_sdk::daemon::testing::Daemon::open(
         hellas_sdk::daemon::Options {

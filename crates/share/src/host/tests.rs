@@ -255,12 +255,13 @@ impl ShareFixtureBuilder {
         executor.fetch_max_in_flight = 2;
         executor.fetch_queue_capacity = 0;
         let backend = hellas_sdk::BackendEntry {
-            backend: hellas_sdk::Backend::Fetch {
-                execution: hellas_executor::Executor::spawn_configured(executor)
+            backend: hellas_sdk::Backend::fetch(
+                document.backends["openai"].kind.clone(),
+                hellas_executor::Executor::spawn_configured(executor)
                     .await
                     .unwrap(),
-                policy: configuration.resources()[0].invocation_policy.clone(),
-            },
+                configuration.resources()[0].invocation_policy.clone(),
+            ),
             evaluator: None,
             max_in_flight: std::num::NonZeroUsize::new(2).unwrap(),
         };

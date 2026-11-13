@@ -382,7 +382,7 @@ pub fn print(view: &hellas_sdk::daemon::View) {
 pub async fn control<T>(
     client: &hellas_rpc::services::host_control::HostControlClientImpl<T>,
     authorization: hellas_auth::authority::GrantId,
-    edit: Edit,
+    edit: Option<Edit>,
     mut context: ModelContext,
 ) -> Result<()>
 where
@@ -391,6 +391,10 @@ where
 {
     use hellas_rpc::pb::host::ConfigureRequest;
     let view = view(client, authorization).await?;
+    let Some(edit) = edit else {
+        print(&view);
+        return Ok(());
+    };
     context.local_evaluator = view
         .backends
         .iter()

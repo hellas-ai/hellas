@@ -121,6 +121,22 @@ pub struct GrantPolicy {
     pub pricing: super::pricing::Pricing,
 }
 impl GrantPolicy {
+    pub(crate) fn changed(&self, previous: Option<&Self>) -> Result<Option<Self>, GrantError> {
+        let mut next = self.clone();
+        if let Some(old) = previous {
+            next.revision = old.revision;
+            next.pricing.revision = old.pricing.revision;
+            if next.pricing != old.pricing {
+                next.pricing.revision = old.pricing.revision.next().ok_or(GrantError::Limits)?;
+            }
+            if next == *old {
+                return Ok(None);
+            }
+            next.revision = old.revision.next().ok_or(GrantError::Limits)?;
+        }
+        Ok(Some(next))
+    }
+
     pub fn validate(&self) -> Result<(), GrantError> {
         if self.revision.0 == 0 || self.name.is_empty() || self.name.len() > 64 {
             return Err(GrantError::Malformed);

@@ -69,19 +69,28 @@ pub enum AdmissionError {
 }
 
 /// Execution selected at admission, retained through physical worker teardown.
-pub trait ReservedExecution: Send + Sync + std::fmt::Debug {
-    fn execute<'a>(
-        &'a self,
-        input: super::Admitted,
-        progress: super::PaidProgress,
-    ) -> futures::future::BoxFuture<'a, Result<Vec<hellas_rpc::OutputEventEnvelope>, BackendFault>>;
+type Execute = dyn Fn(
+        super::Admitted,
+        super::PaidProgress,
+    ) -> futures::future::BoxFuture<
+        'static,
+        Result<Vec<hellas_rpc::OutputEventEnvelope>, BackendFault>,
+    > + Send
+    + Sync;
+pub struct ReservedExecution {
+    pub execute: Box<Execute>,
+}
+impl std::fmt::Debug for ReservedExecution {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReservedExecution")
+    }
 }
 
 #[derive(Debug)]
 pub struct WorkPermit {
     domain: CapacityDomain,
     _permit: OwnedSemaphorePermit,
-    backend: Option<Arc<dyn ReservedExecution>>,
+    backend: Option<Arc<ReservedExecution>>,
     stop: Option<Cancellation>,
 }
 impl WorkPermit {
@@ -97,7 +106,7 @@ impl WorkPermit {
         self.domain
     }
     /// Retain the selected backend through physical worker teardown, even after a config swap.
-    pub fn retaining(mut self, backend: Arc<dyn ReservedExecution>) -> Self {
+    pub fn retaining(mut self, backend: Arc<ReservedExecution>) -> Self {
         self.backend = Some(backend);
         self
     }
@@ -130,7 +139,7 @@ impl WorkAdmission {
             Authorization::Reserved(_) => None,
         }
     }
-    pub fn backend(&self) -> Option<Arc<dyn ReservedExecution>> {
+    pub fn backend(&self) -> Option<Arc<ReservedExecution>> {
         match &self.0 {
             Authorization::Reserved(admitted) => admitted.permit.backend.clone(),
             Authorization::Payment(_) => None,
@@ -553,5 +562,46 @@ mod tests {
             Some(AdmissionError::WrongDomain { .. })
         ));
         assert_eq!(capacity.available_permits(), 1);
+    }
+    #[tokio::test]
+    async fn operator_cancellation_retains_the_selected_backend_until_teardown() {
+        for dispatched in [false, true] {
+            let capacity = Arc::new(Semaphore::new(1));
+            let backend = Arc::new(42u64);
+            let retained = Arc::downgrade(&backend);
+            let stop = Cancellation::new();
+            let admitted = WorkAdmission::reserved(
+                permit(&capacity, CapacityDomain::Fetch)
+                    .retaining(Arc::new(ReservedExecution {
+                        execute: Box::new(move |_, _| {
+                            let backend = backend.clone();
+                            Box::pin(async move {
+                                drop(backend);
+                                Ok(vec![])
+                            })
+                        }),
+                    }))
+                    .cancellable(stop.clone()),
+            )
+            .reserve(CapacityDomain::Fetch, async { panic!("reserved twice") })
+            .await
+            .unwrap();
+            if dispatched {
+                let running = admitted.dispatch().await.unwrap();
+                stop.cancel();
+                running.cancelled().await;
+                assert!(running.check_active().is_err());
+                assert!(retained.upgrade().is_some());
+                assert_eq!(capacity.available_permits(), 0);
+                drop(running);
+            } else {
+                stop.cancel();
+                admitted.cancelled().await;
+                assert!(retained.upgrade().is_some());
+                assert!(admitted.dispatch().await.is_err());
+            }
+            assert!(retained.upgrade().is_none());
+            assert_eq!(capacity.available_permits(), 1);
+        }
     }
 }

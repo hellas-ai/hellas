@@ -128,7 +128,7 @@ pub async fn share(
 
 pub async fn daemon(
     args: super::super::daemon::ControlArgs,
-    edit: super::super::daemon::Edit,
+    edit: Option<super::super::daemon::Edit>,
     identity: &LocalIdentity,
     passkey: Option<&dyn Authenticator>,
     home: &StoreLocation,
@@ -149,27 +149,6 @@ pub async fn daemon(
     .await
 }
 
-pub async fn routes(
-    args: super::super::daemon::ControlArgs,
-    identity: &LocalIdentity,
-    passkey: Option<&dyn Authenticator>,
-    home: &StoreLocation,
-) -> Result<()> {
-    connected(
-        Connection {
-            profile: args.profile,
-            control_socket: args.control_socket,
-            node_enrollment: None,
-            addresses: vec![],
-        },
-        Operation::Routes,
-        identity,
-        passkey,
-        home,
-    )
-    .await
-}
-
 struct Connection {
     profile: Option<std::path::PathBuf>,
     control_socket: Option<std::path::PathBuf>,
@@ -178,9 +157,8 @@ struct Connection {
 }
 
 enum Operation {
-    Routes,
     Daemon(
-        super::super::daemon::Edit,
+        Option<super::super::daemon::Edit>,
         super::super::daemon::ModelContext,
     ),
     Admin(AdminCommand),
@@ -320,10 +298,6 @@ where
     T::Stream: Send + 'static,
 {
     let command = match operation {
-        Operation::Routes => {
-            super::super::daemon::print(&super::super::daemon::view(&client, authorization).await?);
-            return Ok(());
-        }
         Operation::Daemon(edit, context) => {
             return super::super::daemon::control(&client, authorization, edit, context).await;
         }

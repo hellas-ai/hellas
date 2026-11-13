@@ -205,3 +205,108 @@ fn flattened_backend_and_route_reject_unknown_fields() {
     let route = serde_json::json!({"kind":"responses", "backends":["a"], "service":"openai", "method":"responses", "typo":true});
     assert!(serde_json::from_value::<hellas_gateway::Route>(route).is_err());
 }
+
+#[tokio::test]
+async fn model_and_operator_inputs_keep_their_terms_in_one_configuration() {
+    use hellas_authority::model::grant::responses::ResponsesResource;
+    use hellas_rpc::protocol::invocation::Admission;
+    let mut document = Document::default();
+    document
+        .add_upstream("models", "https://example.com/api", Some("key".into()))
+        .unwrap();
+    document.add_upstream_model("one", "models").unwrap();
+    document.add_upstream_model("two", "models").unwrap();
+    document.backends.insert(
+        "operator".into(),
+        backend(BackendKind::Fetch {
+            service: "openai".into(),
+            method: "responses".into(),
+            upstream: Upstream::OpenaiResponses {
+                secret: Some("key".into()),
+            },
+        }),
+    );
+    let mut resource = Resource::new(
+        "operator".into(),
+        "operator".into(),
+        ResourceKind::Responses {
+            responses: ResponsesResource {
+                model: "one".into(),
+                max_output_tokens: 64,
+                settings: Default::default(),
+            },
+        },
+    );
+    resource.max_job_millis = std::num::NonZeroU64::new(123_000).unwrap();
+    document.resources.push(resource);
+    document.backends.insert("gpu".into(), local("cuda"));
+    document.routes.push(hellas_gateway::Route {
+        backends: vec!["gpu".into()],
+        presentation: hellas_gateway::Presentation::Model {
+            model: "tiny".into(),
+            modality: hellas_client::model::ModelKind::Text,
+            package: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../client/src/model/package/mini-qwen3.gguf"),
+            max_tokens: 1,
+        },
+    });
+    document.listeners.insert(
+        "work".into(),
+        Listener::Iroh {
+            port: 0,
+            chain: None,
+            backends: vec!["models".into(), "operator".into(), "gpu".into()],
+        },
+    );
+    let evaluator = hellas_client::model::evaluator(hellas_client::model::GpuDialect::Cuda);
+    let configuration = document
+        .configuration(&[info("gpu", &evaluator)])
+        .await
+        .unwrap();
+    assert_eq!(configuration.machine().unwrap().max_in_flight.get(), 64);
+    assert_eq!(configuration.resources().len(), 3);
+    let model = configuration.resource("models").unwrap();
+    assert_eq!(model.pricing.rates, Some(vec![]));
+    let paths = model.https.as_ref().unwrap().model_policy.as_ref().unwrap();
+    assert_eq!(paths.len(), 3);
+    assert!(paths.iter().all(|path| path.models == ["one", "two"]));
+    assert_eq!(
+        model.invocation_policy.limits.execution_timeout_ms,
+        86_400_000
+    );
+    let operator = configuration.resource("operator").unwrap();
+    assert_eq!(operator.pricing.rates, None);
+    assert_eq!(
+        operator.invocation_policy.limits.execution_timeout_ms,
+        123_000
+    );
+    assert_eq!(operator.invocation_policy.limits.max_output_bytes, 1 << 20);
+    let compute = configuration.resource("tiny").unwrap();
+    assert_eq!(compute.pricing.rates, Some(vec![]));
+    assert_eq!(
+        compute.invocation_policy.limits.execution_timeout_ms,
+        900_000
+    );
+    assert!(
+        matches!(&compute.invocation_policy.admissions[..], [Admission::Compute { evaluator: actual, .. }] if actual == &evaluator)
+    );
+    let mut explicit = Resource::new(
+        "models".into(),
+        "models".into(),
+        ResourceKind::Https {
+            https: model.https.clone().unwrap(),
+        },
+    );
+    explicit.max_job_millis = std::num::NonZeroU64::new(123_000).unwrap();
+    document.resources.push(explicit);
+    let configured = document
+        .configuration(&[info("gpu", &evaluator)])
+        .await
+        .unwrap();
+    let explicit = configured.resource("models").unwrap();
+    assert_eq!(explicit.invocation_policy.limits.max_output_bytes, 4 << 20);
+    assert_eq!(
+        explicit.invocation_policy.limits.execution_timeout_ms,
+        123_000
+    );
+}

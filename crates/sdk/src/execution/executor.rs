@@ -5,8 +5,8 @@ use super::{
     ExecutionObservers, ExecutionSession, ExecutionTarget, ExecutionTerms, PaidOpen, Result, Stop,
     Terminal, before_proposal, open_paid_session, within,
 };
-use crate::gateway_work::WorkRequest;
 use crate::job::Job;
+use crate::{daemon_config::BackendKind, gateway_work::WorkRequest};
 use hellas_auth::ProducerSigningKey;
 
 /// One invocation's lifecycle options, independent of the backend kind.
@@ -15,27 +15,6 @@ pub struct Executor {
     pub funding: crate::paid_client::SessionFundingOptions,
     pub attempt: Option<ExecutionAttempt>,
     pub settle: bool,
-}
-
-struct PaidExecution {
-    pub options: crate::paid_client::PaidWorkOptions,
-    pub endpoint: iroh::Endpoint,
-    pub settlement_key: hellas_kernel::Secp256k1Signer,
-    pub owner: std::sync::Arc<crate::client_owner::ClientOwner>,
-    pub funding: crate::paid_client::SessionFundingOptions,
-    /// A command's durable attempt; a gateway request has none and its
-    /// proposed work is finished by the running process.
-    pub attempt: Option<ExecutionAttempt>,
-    /// Settle the channel after delivery, within the same deadline.
-    pub settle: bool,
-}
-
-struct GrantExecution {
-    pub options: crate::grant_client::GrantSessionOptions,
-    pub transport: crate::grant_client::GrantTransport,
-    pub resource: hellas_auth::authority::ResourceId,
-    /// As for [`PaidExecution::attempt`].
-    pub attempt: Option<ExecutionAttempt>,
 }
 
 impl Executor {
@@ -68,50 +47,30 @@ impl Executor {
             observers,
             deliver: Some(deliver),
         };
-        match self.backend {
-            crate::Backend::Paid(crate::PaidBackend {
-                options,
-                endpoint,
-                settlement_key,
-                owner,
-                ..
-            }) => {
-                PaidExecution {
-                    options,
-                    endpoint,
-                    settlement_key,
-                    owner,
-                    funding: self.funding,
-                    attempt: self.attempt,
-                    settle: self.settle,
-                }
-                .run(job, signer, stop, controls)
-                .await
-            }
-            crate::Backend::Grant(crate::GrantBackend {
-                options,
-                transport,
-                policy,
-                ..
-            }) => {
-                GrantExecution {
-                    options,
-                    transport,
-                    resource: policy.resource,
-                    attempt: self.attempt,
-                }
-                .run(job, stop, controls)
-                .await
-            }
-            crate::Backend::Fetch {
-                execution: backend,
-                policy,
-            } => {
+        match &self.backend.kind {
+            BackendKind::Paid { .. } => self.run_paid(job, signer, stop, controls).await,
+            BackendKind::Grant { .. } => self.run_grant(job, stop, controls).await,
+            BackendKind::Fetch { .. } | BackendKind::Local { .. } => {
+                let local_policy;
+                let policy = if let Some(policy) = self.backend.policy() {
+                    policy
+                } else {
+                    local_policy = super::local::policy(job.input(), self.backend.timeout)?;
+                    &local_policy
+                };
+                let content = if let Some(content) = &self.backend.content {
+                    super::local::prepare(content, job.input()).await?
+                } else {
+                    job.input().content()
+                };
                 let completed = super::local::run(
-                    &backend,
-                    job.input().content(),
+                    self.backend
+                        .execution
+                        .as_ref()
+                        .ok_or(ExecutionError::Identity)?,
+                    content,
                     job.input(),
-                    &policy,
+                    policy,
                     signer,
                     deadline,
                     &stop,
@@ -120,23 +79,6 @@ impl Executor {
                 .await?;
                 controls
                     .deliver
-                    .map_or(Ok(()), |deliver| deliver(&completed))
-                    .map_err(ExecutionError::Delivery)?;
-                Ok(completed)
-            }
-            #[cfg(feature = "compute")]
-            crate::Backend::Local {
-                execution: target,
-                timeout,
-            } => {
-                let policy = super::local::policy(job.input(), timeout)?;
-                let Controls {
-                    observers, deliver, ..
-                } = controls;
-                let completed = target
-                    .run(job.input(), &policy, signer, deadline, &stop, observers)
-                    .await?;
-                deliver
                     .map_or(Ok(()), |deliver| deliver(&completed))
                     .map_err(ExecutionError::Delivery)?;
                 Ok(completed)
@@ -158,23 +100,21 @@ fn replay(
     Ok(completed)
 }
 
-impl PaidExecution {
-    async fn run(
+impl Executor {
+    async fn run_paid(
         self,
         job: &Job,
         signer: &ProducerSigningKey,
         stop: Stop,
         controls: Controls<'_>,
     ) -> Result<Completed> {
-        let Self {
+        let crate::PaidBackend {
             options,
             endpoint,
             settlement_key,
             owner,
-            funding,
-            attempt,
-            settle,
-        } = self;
+            ..
+        } = self.backend.paid.as_ref().ok_or(ExecutionError::Identity)?;
         let deadline = controls.deadline;
         let open = |open| {
             open_paid_session(
@@ -182,14 +122,14 @@ impl PaidExecution {
                 endpoint.clone(),
                 settlement_key.clone(),
                 owner.clone(),
-                funding,
+                self.funding,
                 open,
                 None,
             )
         };
         let request = WorkRequest::Job(job.input().clone());
         let terms = ExecutionTerms::Paid { price: job.price() };
-        let mut completed = match attempt {
+        let mut completed = match self.attempt {
             None => {
                 let mut session =
                     before_proposal(deadline, &stop, None, open(PaidOpen::Job(job))).await??;
@@ -232,14 +172,16 @@ impl PaidExecution {
                 }
             },
         };
-        if settle && let Some(paid) = &mut completed.paid {
+        if self.settle
+            && let Some(paid) = &mut completed.paid
+        {
             let receipt = within(
                 deadline,
                 crate::paid_client::settle_channel(
-                    &options,
+                    options,
                     paid.bond_edge,
                     owner.principal(),
-                    &settlement_key,
+                    settlement_key,
                 ),
             )
             .await??;
@@ -252,23 +194,29 @@ impl PaidExecution {
     }
 }
 
-impl GrantExecution {
-    async fn run(self, job: &Job, stop: Stop, controls: Controls<'_>) -> Result<Completed> {
-        let Self {
+impl Executor {
+    async fn run_grant(self, job: &Job, stop: Stop, controls: Controls<'_>) -> Result<Completed> {
+        let crate::GrantBackend {
             options,
             transport,
-            resource,
-            attempt,
-        } = self;
+            policy,
+            ..
+        } = self
+            .backend
+            .grant
+            .as_ref()
+            .ok_or(ExecutionError::Identity)?;
         let deadline = controls.deadline;
         let request = WorkRequest::Job(job.input().clone());
-        let terms = ExecutionTerms::Grant { resource };
-        let Some(mut attempt) = attempt else {
+        let terms = ExecutionTerms::Grant {
+            resource: policy.resource,
+        };
+        let Some(mut attempt) = self.attempt else {
             let mut session = before_proposal(
                 deadline,
                 &stop,
                 None,
-                crate::grant_client::GrantSession::open(options, transport),
+                crate::grant_client::GrantSession::open(options.clone(), transport.clone()),
             )
             .await??;
             let signer = session.execution_signer().clone();
@@ -302,7 +250,7 @@ impl GrantExecution {
             deadline,
             &stop,
             None,
-            attempt.open_grant_session(options, transport),
+            attempt.open_grant_session(options.clone(), transport.clone()),
         )
         .await??;
         let signer = session.execution_signer().clone();

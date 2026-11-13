@@ -1,6 +1,7 @@
 //! Provider-side exact lookup. An admitted permit owns its selected snapshot entry.
-use super::{Backend, ExecutorGateway, Inner};
+use super::{Backend, ExecutorGateway};
 use crate::daemon::Core;
+use crate::daemon_config::BackendKind;
 use hellas_auth::PublicKey;
 use hellas_channel::work::{
     Admitted, BackendFault, PaidProgress, WorkBackend,
@@ -16,28 +17,11 @@ pub(crate) struct IrohBackend {
     pub listener: String,
     pub assurance: hellas_rpc::Assurance,
 }
-struct AdmittedBackend {
-    inner: Arc<Inner>,
-    job: Arc<Job>,
-    _slot: tokio::sync::OwnedSemaphorePermit,
-}
-impl std::fmt::Debug for AdmittedBackend {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AdmittedBackend")
-            .field("backend", &self.inner.id)
-            .finish_non_exhaustive()
-    }
-}
-impl Inner {
+impl Backend {
     fn executor(&self) -> Result<&hellas_executor::ExecutorHandle, BackendFault> {
-        match &self.target {
-            Backend::Fetch { execution, .. } => Ok(execution),
-            #[cfg(feature = "compute")]
-            Backend::Local { execution, .. } => Ok(&execution.backend),
-            _ => Err(BackendFault::caused_by(std::io::Error::other(
-                "iroh cannot forward work",
-            ))),
-        }
+        self.execution.as_ref().ok_or_else(|| {
+            BackendFault::caused_by(std::io::Error::other("iroh cannot forward work"))
+        })
     }
 }
 impl ExecutorGateway {
@@ -48,13 +32,13 @@ impl ExecutorGateway {
         use hellas_rpc::protocol::invocation::{Admission, fetch::FetchRoutePolicy};
         for resource in resources {
             for admission in &resource.invocation_policy.admissions {
-                let available = self.backends.values().any(|inner| match (admission, &inner.target) {
+                let available = self.backends.values().any(|inner| match (admission, &inner.kind) {
                     #[cfg(feature = "compute")]
-                    (Admission::Compute { evaluator, .. }, Backend::Local { .. }) => inner.evaluator.as_ref() == Some(evaluator),
-                    (Admission::Fetch { admission }, Backend::Fetch { policy, .. }) =>
-                        matches!(admission.route, FetchRoutePolicy::SealedRoute { .. }) && policy.admissions.iter().any(|offered| {
+                    (Admission::Compute { evaluator, .. }, BackendKind::Local { .. }) => inner.evaluator.as_ref() == Some(evaluator),
+                    (Admission::Fetch { admission }, BackendKind::Fetch { .. }) =>
+                        matches!(admission.route, FetchRoutePolicy::SealedRoute { .. }) && inner.policy().is_some_and(|policy| policy.admissions.iter().any(|offered| {
                             matches!(offered, Admission::Fetch { admission: offered } if offered.route == admission.route && offered.contract == admission.contract)
-                        }),
+                        })),
                     _ => false,
                 });
                 if !available {
@@ -64,12 +48,12 @@ impl ExecutorGateway {
         }
         Ok(())
     }
-    fn lookup(&self, allowed: &[String], key: &BackendKey) -> Result<Arc<Inner>, BackendFault> {
+    fn lookup(&self, allowed: &[String], key: &BackendKey) -> Result<Arc<Backend>, BackendFault> {
         self.backends.iter().find_map(|(id, inner)| {
             if !allowed.contains(id) { return None; }
             let matches = match key {
                 BackendKey::Compute(evaluator) => inner.evaluator.as_ref() == Some(evaluator),
-                BackendKey::Fetch { service, method } => inner.target.fetch_routes().iter().any(|(_, route)| {
+                BackendKey::Fetch { service, method } => inner.fetch_routes().iter().any(|(_, route)| {
                     matches!(route, hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy::SealedRoute { service: offered_service, method: offered_method } if service == offered_service && method == offered_method)
                 }),
             };
@@ -82,7 +66,7 @@ impl IrohBackend {
         &self,
         key: &BackendKey,
         caller: PublicKey,
-    ) -> Result<(Arc<Job>, Arc<Inner>), BackendFault> {
+    ) -> Result<(Arc<Job>, Arc<Backend>), BackendFault> {
         let core = self.core.upgrade().ok_or(AdmissionError::Closed)?;
         let job = core
             .jobs
@@ -116,11 +100,7 @@ impl WorkBackend for IrohBackend {
             .executor()?
             .try_admit(key, caller)?
             .cancellable(job.cancellation());
-        Ok(permit.retaining(Arc::new(AdmittedBackend {
-            inner,
-            job,
-            _slot: slot,
-        })))
+        Ok(permit.retaining(reserved(inner, job, slot)))
     }
 
     async fn execute_stream(
@@ -151,11 +131,7 @@ impl WorkBackend for IrohBackend {
                 .reserve(&key)
                 .await?
                 .cancellable(job.cancellation());
-            let permit = permit.retaining(Arc::new(AdmittedBackend {
-                inner,
-                job,
-                _slot: slot,
-            }));
+            let permit = permit.retaining(reserved(inner, job, slot));
             let domain = input.capacity_domain();
             let (prepared, limits, content, _) = input.into_parts_and_admission();
             Admitted::new(
@@ -167,36 +143,41 @@ impl WorkBackend for IrohBackend {
             )
         };
         let selected = input.admission().backend().ok_or(AdmissionError::Closed)?;
-        selected.execute(input, progress).await
+        (selected.execute)(input, progress).await
     }
 }
-impl ReservedExecution for AdmittedBackend {
-    fn execute<'a>(
-        &'a self,
-        input: Admitted,
-        progress: PaidProgress,
-    ) -> futures::future::BoxFuture<'a, Result<Vec<OutputEventEnvelope>, BackendFault>> {
-        Box::pin(async move {
-            self.job.running(&self.inner.id);
-            self.job.accepted();
-            let result = self.inner.executor()?.execute_stream(input, progress).await;
-            if self.job.is_cancelled() {
-                self.job.stopped();
-            } else {
-                self.job.finish(
-                    if result.as_ref().is_ok_and(|events| {
-                        events.last().is_some_and(|event| {
-                            event.event().body().kind()
-                                == hellas_rpc::protocol::invocation::output::TERMINAL
-                        })
-                    }) {
-                        Outcome::Completed
-                    } else {
-                        Outcome::Failed
-                    },
-                );
-            }
-            result
-        })
-    }
+fn reserved(
+    inner: Arc<Backend>,
+    job: Arc<Job>,
+    slot: tokio::sync::OwnedSemaphorePermit,
+) -> Arc<ReservedExecution> {
+    let selected = Arc::new((inner, job, slot));
+    Arc::new(ReservedExecution {
+        execute: Box::new(move |input, progress| {
+            let selected = selected.clone();
+            Box::pin(async move {
+                let (inner, job, _) = &*selected;
+                job.running(&inner.id);
+                job.accepted();
+                let result = inner.executor()?.execute_stream(input, progress).await;
+                if job.is_cancelled() {
+                    job.stopped();
+                } else {
+                    job.finish(
+                        if result.as_ref().is_ok_and(|events| {
+                            events.last().is_some_and(|event| {
+                                event.event().body().kind()
+                                    == hellas_rpc::protocol::invocation::output::TERMINAL
+                            })
+                        }) {
+                            Outcome::Completed
+                        } else {
+                            Outcome::Failed
+                        },
+                    );
+                }
+                result
+            })
+        }),
+    })
 }

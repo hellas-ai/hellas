@@ -162,16 +162,28 @@ impl Runtime {
             .transpose()
     }
 
-    pub fn approval_current(&self, configured: &BackendKind, active: &Backend) -> Result<bool> {
-        let (trust, active) = match (configured, active) {
-            (
-                BackendKind::Grant { trust, .. },
-                Backend::Grant(crate::GrantBackend { options, .. }),
-            ) => (trust, options.target.trust().clone()),
-            (
-                BackendKind::Paid { trust, .. },
-                Backend::Paid(crate::PaidBackend { options, .. }),
-            ) => (trust, options.trust()?),
+    pub fn approval_current(&self, active: &Backend) -> Result<bool> {
+        let (trust, active) = match &active.kind {
+            BackendKind::Grant { trust, .. } => (
+                trust,
+                active
+                    .grant
+                    .as_ref()
+                    .ok_or("missing grant session")?
+                    .options
+                    .target
+                    .trust()
+                    .clone(),
+            ),
+            BackendKind::Paid { trust, .. } => (
+                trust,
+                active
+                    .paid
+                    .as_ref()
+                    .ok_or("missing paid session")?
+                    .options
+                    .trust()?,
+            ),
             _ => return Ok(true),
         };
         let Some(approved) = self.trust(trust)? else {
@@ -355,18 +367,20 @@ impl Runtime {
                     );
                     self.index(paths).await?;
                     (
-                        Backend::Local {
-                            execution: crate::execution::local::LocalExecution {
+                        Backend::local(
+                            configured.kind.clone(),
+                            crate::execution::local::LocalExecution {
                                 backend,
                                 content: self.options.content.clone(),
                             },
-                            timeout: std::time::Duration::from_secs(86_400),
-                        },
+                            std::time::Duration::from_secs(86_400),
+                        ),
                         Some(hellas_executor::catena::evaluator(dialect)),
                     )
                 }
             }
         };
+        backend.kind = configured.kind.clone();
         let price = backend.quote().await?;
         if let BackendKind::Paid { max_price, .. } = configured.kind
             && price > max_price

@@ -49,56 +49,38 @@ pub fn policy(
     })
 }
 
-impl LocalExecution {
-    /// Run `input` under `policy` and verify its signed transcript. `stop`
-    /// cancels at any point: nothing was proposed to anyone.
-    pub async fn run(
-        &self,
-        input: &JobInput,
-        policy: &InvocationPolicy,
-        signer: &ProducerSigningKey,
-        deadline: Option<tokio::time::Instant>,
-        stop: &Stop,
-        observers: ExecutionObservers,
-    ) -> Result<Completed> {
-        let JobInput::Compute {
-            environment,
-            content: job,
-            ..
-        } = input
-        else {
-            return Err(JobError::Invalid("local execution runs Compute jobs".into()).into());
-        };
-        let content = |error| ExecutionError::Job(JobError::Content(error));
-        let root = environment.canonical_bytes().map_err(JobError::from)?;
-        hellas_channel::content::upload_object(&self.content, &root)
-            .await
-            .map_err(content)?;
-        for source in &environment.sources {
-            let bytes = hellas_channel::content::read(
-                &job.0,
-                &job.1,
-                *source,
-                hellas_rpc::protocol::invocation::compute::MAX_SOURCE_BYTES,
-            )
-            .await
-            .map_err(content)?;
-            hellas_channel::content::upload_object(&self.content, &bytes)
-                .await
-                .map_err(content)?;
-        }
-        run(
-            &self.backend,
-            (LocalStore::Disk(self.content.clone()), Scope::Owner),
-            input,
-            policy,
-            signer,
-            deadline,
-            stop,
-            observers,
+/// Copy the admitted program into the local model content store.
+pub(crate) async fn prepare(
+    content_store: &DiskStore,
+    input: &JobInput,
+) -> Result<(LocalStore, Scope)> {
+    let JobInput::Compute {
+        environment,
+        content: job,
+        ..
+    } = input
+    else {
+        return Err(JobError::Invalid("local execution runs Compute jobs".into()).into());
+    };
+    let content = |error| ExecutionError::Job(JobError::Content(error));
+    let root = environment.canonical_bytes().map_err(JobError::from)?;
+    hellas_channel::content::upload_object(content_store, &root)
+        .await
+        .map_err(content)?;
+    for source in &environment.sources {
+        let bytes = hellas_channel::content::read(
+            &job.0,
+            &job.1,
+            *source,
+            hellas_rpc::protocol::invocation::compute::MAX_SOURCE_BYTES,
         )
         .await
+        .map_err(content)?;
+        hellas_channel::content::upload_object(content_store, &bytes)
+            .await
+            .map_err(content)?;
     }
+    Ok((LocalStore::Disk(content_store.clone()), Scope::Owner))
 }
 
 /// Local Compute and Fetch have the same admission, cancellation and signed result path.

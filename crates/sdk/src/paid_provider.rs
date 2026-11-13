@@ -1146,16 +1146,10 @@ impl WorkRunner {
                 .map(|store| (store, origin)),
                 _ => None,
             };
-            let mut clock = Self::adopt_setup(&config, store, &setup_mount)?;
-            if let Driven::Setup { service, .. } = &clock.driven {
-                registry.insert(setup.bond_edge, service.clone());
-            }
+            let (mut clock, service, policy) = Self::adopt_setup(&config, store, &setup_mount)?;
+            registry.insert(setup.bond_edge, service);
             if let Some((store, origin)) = recovered {
                 unmatched.remove(&ChannelStore::journal_key(store.state().channel()));
-                let policy = match &clock.driven {
-                    Driven::Setup { policy, .. } => policy.clone(),
-                    _ => unreachable!(),
-                };
                 clock
                     .take_mount(store, &config.settlement_key, &policy, &work_mount, origin)
                     .await?;
@@ -1189,7 +1183,7 @@ impl WorkRunner {
         config: &WorkRunnerConfig,
         mut store: SetupStore,
         setup_mount: &MountedSetup,
-    ) -> Result<SetupClock, PaidProviderError> {
+    ) -> Result<(SetupClock, SetupService, Box<ProviderChannelPolicy>), PaidProviderError> {
         let (peer, offer) = store
             .state()
             .offer()
@@ -1211,12 +1205,19 @@ impl WorkRunner {
             PaymentAdmission::Admits(policy.clone()),
         ));
         setup_mount.mount(peer, bond_edge, &service)?;
-        Ok(SetupClock {
-            busy: false,
-            bond_edge,
-            route_peer: Some(peer),
-            driven: Driven::Setup { service, policy },
-        })
+        Ok((
+            SetupClock {
+                busy: false,
+                bond_edge,
+                route_peer: Some(peer),
+                driven: Driven::Setup {
+                    service: service.clone(),
+                    policy: policy.clone(),
+                },
+            },
+            service,
+            policy,
+        ))
     }
 
     /// One poll: every journal's read in as few proof reads as the key

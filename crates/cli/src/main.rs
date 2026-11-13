@@ -508,7 +508,7 @@ async fn async_main() {
         Commands::Backend { control, command } => {
             commands::admin::daemon(
                 control,
-                commands::daemon::Edit::Backend(command),
+                Some(commands::daemon::Edit::Backend(command)),
                 &local_identity,
                 passkey,
                 &home,
@@ -518,7 +518,7 @@ async fn async_main() {
         Commands::Route { control, command } => {
             commands::admin::daemon(
                 control,
-                commands::daemon::Edit::Route(command),
+                Some(commands::daemon::Edit::Route(command)),
                 &local_identity,
                 passkey,
                 &home,
@@ -526,7 +526,7 @@ async fn async_main() {
             .await
         }
         Commands::Routes { control } => {
-            commands::admin::routes(control, &local_identity, passkey, &home).await
+            commands::admin::daemon(control, None, &local_identity, passkey, &home).await
         }
         Commands::Rpc {
             node_id,

@@ -467,11 +467,9 @@ impl OfferAllocator {
         )
         .await
         .map_err(unavailable)?;
-        let clock = WorkRunner::adopt_setup(&self.config, store, mount).map_err(unavailable)?;
-        let Driven::Setup { service, .. } = &clock.driven else {
-            unreachable!()
-        };
-        registry.insert(provisioned.bond_edge, service.clone());
+        let (clock, service, _) =
+            WorkRunner::adopt_setup(&self.config, store, mount).map_err(unavailable)?;
+        registry.insert(provisioned.bond_edge, service);
         adoption.send(clock);
         if self.adopt.is_closed() {
             return Err(unavailable("paid observer stopped"));

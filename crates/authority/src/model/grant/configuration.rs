@@ -101,14 +101,22 @@ impl NodeConfiguration {
         self.resources.iter().find(|p| p.name == name)
     }
 
-    /// The account definitions to apply, given each account's current one.
-    pub fn account_changes(
+    /// The budget definitions to apply, given each node's current one.
+    pub fn budget_changes(
         &self,
         current: impl Fn(BudgetNode) -> Option<BudgetDef>,
     ) -> Result<Vec<BudgetDef>, GrantError> {
         let mut changes = Vec::new();
-        for (account, budget) in &self.accounts {
-            let node = BudgetNode::Account(*account);
+        for (node, budget) in self
+            .machine
+            .iter()
+            .map(|budget| (BudgetNode::Machine, budget))
+            .chain(
+                self.accounts
+                    .iter()
+                    .map(|(id, budget)| (BudgetNode::Account(*id), budget)),
+            )
+        {
             let revision = match current(node) {
                 None => Revision(1),
                 Some(old)
@@ -120,7 +128,7 @@ impl NodeConfiguration {
             };
             changes.push(BudgetDef {
                 node,
-                parent: Some(BudgetNode::Machine),
+                parent: (node != BudgetNode::Machine).then_some(BudgetNode::Machine),
                 revision,
                 limits: budget.limits.clone(),
                 max_in_flight: budget.max_in_flight,
