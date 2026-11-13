@@ -20,6 +20,8 @@ type Task<T> =
 
 mod iroh_listener;
 mod runtime;
+#[cfg(any(test, feature = "integration-tests"))]
+pub mod testing;
 pub use runtime::Options;
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 type Result<T> = std::result::Result<T, Error>;
@@ -41,6 +43,7 @@ pub struct Core {
     pub(crate) snapshot: ArcSwap<Snapshot>,
     pub jobs: Arc<Jobs>,
     limit: Arc<RequestLimit>,
+    routing: Arc<hellas_gateway::RoutingState>,
     configuring: Arc<tokio::sync::Mutex<()>>,
     commit: Mutex<Option<Task<Revision>>>,
     listeners: Mutex<Vec<Arc<BoundListener>>>,
@@ -90,8 +93,46 @@ pub struct View {
 }
 
 impl Core {
+    /// Observe listener termination without lending it the caller's lifetime.
+    pub async fn wait(&self) -> Result<()> {
+        let (_, mut events) = self.jobs.watch(|_| ());
+        loop {
+            tokio::select! {
+                result = futures::future::poll_fn(|cx| {
+                    for (id, listener) in &self.snapshot.load().listeners {
+                        let mut task = listener.task.lock().unwrap_or_else(|error| error.into_inner());
+                        if let Some(task) = task.as_mut()
+                            && let std::task::Poll::Ready(result) = task.poll_unpin(cx) {
+                                return std::task::Poll::Ready(Err(format!("listener {id} stopped: {}", result.err().unwrap_or_else(|| "closed".into())).into()));
+                            }
+                    }
+                    std::task::Poll::Pending
+                }) => return result,
+                _ = events.recv() => {},
+            }
+        }
+    }
+
     /// Both CLI forms enter here. A saved document is read from the authority journal.
     pub async fn open(options: Options, document: Document) -> Result<Arc<Self>> {
+        Self::open_prepared(options, document, BTreeMap::new()).await
+    }
+
+    /// Use deterministic executors while exercising the real daemon and transports.
+    #[cfg(any(test, feature = "integration-tests"))]
+    pub async fn open_with_backends(
+        options: Options,
+        document: Document,
+        backends: BTreeMap<String, BackendEntry>,
+    ) -> Result<Arc<Self>> {
+        Self::open_prepared(options, document, backends).await
+    }
+
+    async fn open_prepared(
+        options: Options,
+        document: Document,
+        entries: BTreeMap<String, BackendEntry>,
+    ) -> Result<Arc<Self>> {
         let limit = Arc::new(RequestLimit::default());
         let jobs = Arc::new(Jobs::new(vec![limit.clone()]));
         let work = ExecutorGateway::prepare(
@@ -112,6 +153,7 @@ impl Core {
             }),
             jobs,
             limit,
+            routing: Default::default(),
             configuring: Arc::new(tokio::sync::Mutex::new(())),
             commit: Mutex::new(None),
             listeners: Mutex::new(Vec::new()),
@@ -119,7 +161,7 @@ impl Core {
             #[cfg(test)]
             after_commit: Mutex::new(None),
         });
-        let snapshot = core.prepare(document).await?;
+        let snapshot = core.prepare(document, entries).await?;
         core.runtime.options.content.finish_recovery().await?;
         core.publish(snapshot);
         Ok(core)
@@ -168,6 +210,13 @@ impl Core {
             .collect()
     }
 
+    /// Bound provider and consumer endpoints for transport telemetry.
+    pub fn transport_endpoints(&self) -> Vec<iroh::Endpoint> {
+        let mut endpoints = self.iroh_endpoints();
+        endpoints.extend(self.runtime.consumer_endpoints());
+        endpoints
+    }
+
     pub fn iroh_addresses(&self) -> BTreeMap<String, ::iroh::EndpointAddr> {
         self.snapshot
             .load()
@@ -181,19 +230,22 @@ impl Core {
     }
 
     pub fn control(self: &Arc<Self>) -> Result<crate::node_control::NodeControl> {
-        let control = self
-            .snapshot
+        Ok(crate::node_control::NodeControl::new(self.node().clone())
+            .with_content_store(self.runtime.options.content.clone())
+            .with_core(self.clone())?)
+    }
+
+    pub(crate) fn administration(
+        &self,
+    ) -> Option<hellas_authority::grant_service::WorkAdministration> {
+        self.snapshot
             .load()
             .listeners
             .values()
             .find_map(|listener| match &listener.bound {
-                Bound::Iroh(bound) => Some(bound.control()),
+                Bound::Iroh(bound) => Some(bound.administration.clone()),
                 Bound::Http { .. } => None,
             })
-            .unwrap_or_else(|| crate::node_control::NodeControl::new(self.node().clone()));
-        Ok(control
-            .with_content_store(self.runtime.options.content.clone())
-            .with_core(self.clone())?)
     }
 
     pub fn watch(&self) -> (View, tokio::sync::broadcast::Receiver<Event>) {
@@ -238,7 +290,7 @@ impl Core {
         }
         document.restore_secrets(&current.document.redacted().1);
         document.revision = expected.next().ok_or("configuration revision overflow")?;
-        let candidate = self.prepare(document).await?;
+        let candidate = self.prepare(document, BTreeMap::new()).await?;
         let (redacted, secrets) = candidate.document.redacted();
         let stored = ConfigurationDocument {
             revision: expected,
@@ -285,12 +337,18 @@ impl Core {
         task.await.map_err(Into::into)
     }
 
-    async fn prepare(self: &Arc<Self>, document: Document) -> Result<Arc<Snapshot>> {
+    async fn prepare(
+        self: &Arc<Self>,
+        document: Document,
+        mut entries: BTreeMap<String, BackendEntry>,
+    ) -> Result<Arc<Snapshot>> {
         document.validate().map_err(Error::from)?;
         let old = self.snapshot.load_full();
-        let mut entries = BTreeMap::<String, BackendEntry>::new();
         let mut reuse = BTreeSet::new();
         for (id, backend) in &document.backends {
+            if entries.contains_key(id) {
+                continue;
+            }
             let unchanged = old
                 .document
                 .backends
@@ -318,6 +376,8 @@ impl Core {
             Some(&old.work),
             &reuse,
         );
+        work.validate_resources(document.authority.resources())
+            .map_err(Error::from)?;
         document
             .validate_resolved(&work.backends())
             .map_err(Error::from)?;
@@ -325,6 +385,7 @@ impl Core {
             document.routes.clone(),
             work.clone(),
             self.jobs.clone(),
+            self.routing.clone(),
         )
         .await?;
         let mut listeners = BTreeMap::new();
@@ -410,6 +471,17 @@ impl Core {
             })
         });
         let previous = previous.expect("publication runs synchronously");
+        if let Some(endpoint) = self.iroh_endpoints().into_iter().next() {
+            self.runtime.options.content.clone().with_peers(
+                hellas_wire::iroh::Pool::for_service::<hellas_rpc::services::content::Content>(
+                    endpoint,
+                    Default::default(),
+                ),
+            );
+        } else {
+            self.runtime.options.content.clear_peers();
+        }
+
         for (id, listener) in &previous.listeners {
             if next
                 .listeners

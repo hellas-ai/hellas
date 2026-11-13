@@ -1099,47 +1099,19 @@ impl GrantService {
             }
         }
     }
-    /// Cancel queued grants, then keep execution owners alive until physical
-    /// completion. No endpoint or journal is dropped ahead of these duties.
+    /// Stop admission and finish accepted work before releasing its journal.
     pub async fn drain(&self) -> Result<(), NodeStoreError> {
         let _draining = self.draining.lock().await;
         {
+            // Wait for an acceptance already holding the writer before closing admission.
             let store = self.node.store.lock().await;
-            let accepted = {
-                let mut held = self.lock_for_shutdown();
-                held.reap();
-                if matches!(held.status, ServiceStatus::Serving) {
-                    held.status = ServiceStatus::Draining;
-                    held.contents.clear();
-                }
-                match &store {
-                    Ok(store) if held.status.check().is_ok() => held
-                        .live
-                        .iter()
-                        .filter_map(|(id, live)| {
-                            store
-                                .state()
-                                .channel(live.authorization.channel_id)?
-                                .job_book()
-                                .job_by_id(*id)
-                                .filter(|job| job.phase() == JobPhase::Accepted)
-                                .map(|_| (live.authorization.channel_id, *id))
-                        })
-                        .collect::<Vec<_>>(),
-                    Err(_) => {
-                        held.fail(NodeStoreError::WriterPoisoned);
-                        Vec::new()
-                    }
-                    _ => Vec::new(),
-                }
-            };
-            if let Ok(mut store) = store {
-                for (channel, id) in accepted {
-                    if let Err(error) = store.release(channel, id, (self.node.clock)()).await {
-                        self.lock_for_shutdown().fail(error);
-                        break;
-                    }
-                }
+            let mut held = self.lock_for_shutdown();
+            held.reap();
+            if store.is_err() {
+                held.fail(NodeStoreError::WriterPoisoned);
+            } else if matches!(held.status, ServiceStatus::Serving) {
+                held.status = ServiceStatus::Draining;
+                held.contents.clear();
             }
         }
         self.node.changed.notify_waiters();

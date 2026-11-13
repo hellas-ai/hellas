@@ -69,7 +69,7 @@ fn append_iroh_metrics(buf: &mut String, bundle: &MetricsBundle) -> std::fmt::Re
         return Ok(());
     };
     let mut registry = iroh_metrics::Registry::default();
-    for endpoint in core.iroh_endpoints() {
+    for endpoint in core.transport_endpoints() {
         registry.register_all_prefixed(endpoint.metrics());
     }
     let mut encoded = String::new();

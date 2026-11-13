@@ -124,6 +124,17 @@ impl ModelContext {
                 .context("a grant requires the contact's principal key")?,
             &self.holder,
         )?;
+        let trust = bundle
+            .offers
+            .first()
+            .filter(|offer| {
+                offer.offer().provider.genesis.statement.root_kind
+                    == hellas_rpc::RootKind::SecureEnclave
+            })
+            .map(|_| hellas_sdk::daemon_config::Trust {
+                store: self.home.join("trust"),
+                policy: destination.into(),
+            });
         let package = Path::new(name)
             .exists()
             .then(|| std::fs::canonicalize(name))
@@ -192,7 +203,7 @@ impl ModelContext {
                     access: path,
                     resource: Some(policy.resource),
                     evaluator,
-                    trust: None,
+                    trust,
                 },
             });
         if let Some(package) = package {
@@ -453,6 +464,7 @@ async fn options(
     )
     .await?;
     Ok(hellas_sdk::daemon::Options {
+        discovery: true,
         chain: hellas_chain::chain_dir::ChainDir::open(&home, profile)?,
         home,
         signer: Arc::new(identity.node_key.clone()),
@@ -534,13 +546,13 @@ pub async fn gateway(
         let core = hellas_sdk::daemon::Core::open(options, document)
             .await
             .map_err(anyhow::Error::from_boxed)?;
-        #[cfg(feature = "otel")]
-        if let Some((address, bundle)) = metrics {
-            crate::metrics::spawn_metrics_server(address, bundle.with_core(&core)).await?;
-        }
-        print(&core.watch().0);
-        let address = core.http_addresses()["api"];
         let result = async {
+            #[cfg(feature = "otel")]
+            if let Some((address, bundle)) = metrics {
+                crate::metrics::spawn_metrics_server(address, bundle.with_core(&core)).await?;
+            }
+            print(&core.watch().0);
+            let address = core.http_addresses()["api"];
             if let Some(command) = args.wrap {
                 let mut child = crate::wrap::spawn(
                     &command,
@@ -550,6 +562,7 @@ pub async fn gateway(
                 )?;
                 tokio::select! {
                     result = shutdown_signal()? => result?,
+                    result = core.wait() => result.map_err(anyhow::Error::from_boxed)?,
                     status = child.wait() => ensure!(status?.success(), "wrapped command failed"),
                 }
             } else {
@@ -562,7 +575,10 @@ pub async fn gateway(
                         access.bearer()
                     )?;
                 }
-                shutdown_signal()?.await?;
+                tokio::select! {
+                    result = shutdown_signal()? => result?,
+                    result = core.wait() => result.map_err(anyhow::Error::from_boxed)?,
+                }
             }
             Ok(())
         }
@@ -586,12 +602,12 @@ pub async fn serve(
 ) -> Result<()> {
     let shutdown = shutdown_signal()?;
     tokio::pin!(shutdown);
-    let (config, endpoint) = tokio::select! {
-        result = super::serve::bootstrap::prepare(home, &identity.transport_key, &identity.enrollment, port, None) => result?,
+    let endpoint = tokio::select! {
+        result = super::serve::bootstrap::prepare(home, &identity.transport_key, &identity.enrollment, port) => result?,
         signal = &mut shutdown => return Ok(signal?),
     };
     let store = hellas_authority::work_store::grant::NodeStore::open(
-        &config.journal_root(),
+        &home.child("provider").child("authority"),
         hellas_authority::model::grant::grant_network(),
         Some(identity.enrollment.clone()),
         hellas_auth::authority::UnixMillis::now()?,
@@ -602,7 +618,7 @@ pub async fn serve(
         Arc::new(|| hellas_auth::authority::UnixMillis::now().unwrap_or_default()),
     );
     let mut options = options(home.clone(), identity, owner, chain, node.clone(), endpoint).await?;
-    options.remote_control = config.remote_control.clone();
+    options.remote_control = hellas_sdk::node_control::RemoteControlAdmission::credential_gated();
     let content = options.content.clone();
     let serving = async {
         let core = if node.configuration().await?.is_some() {
@@ -626,25 +642,32 @@ pub async fn serve(
             hellas_sdk::daemon::Core::open(options, document).await
         }
         .map_err(anyhow::Error::from_boxed)?;
-        #[cfg(feature = "otel")]
-        if let Some((address, bundle)) = metrics {
-            crate::metrics::spawn_metrics_server(address, bundle.with_core(&core)).await?;
+        let result = async {
+            #[cfg(feature = "otel")]
+            if let Some((address, bundle)) = metrics {
+                crate::metrics::spawn_metrics_server(address, bundle.with_core(&core)).await?;
+            }
+            let tls = hellas_sdk::node_control::profile::server_identity(
+                &home.join("provider/control.cert.der"),
+                &home.join("provider/control.key.der"),
+            )?;
+            let control = core
+                .control()
+                .map_err(anyhow::Error::from_boxed)?
+                .bind_local(home.join("provider/control.sock"), tls)?;
+            eprintln!("Daemon ready; configure it with hellas backend and hellas route.");
+            let signal: Result<()> = tokio::select! {
+                result = &mut shutdown => result.map_err(Into::into),
+                result = core.wait() => result.map_err(anyhow::Error::from_boxed),
+            };
+            let stopped = control.shutdown().await;
+            signal?;
+            stopped?;
+            Ok(())
         }
-        let tls = hellas_sdk::node_control::profile::server_identity(
-            &config.control_certificate(),
-            &config.control_private_key(),
-        )?;
-        let control = core
-            .control()
-            .map_err(anyhow::Error::from_boxed)?
-            .bind_local(config.control_socket(), tls)?;
-        eprintln!("Daemon ready; configure it with hellas backend and hellas route.");
-        let signal = (&mut shutdown).await;
-        let stopped = control.shutdown().await;
+        .await;
         let drained = core.shutdown().await.map_err(anyhow::Error::from_boxed);
-        signal?;
-        stopped?;
-        drained
+        result.and(drained)
     }
     .await;
     content.close().await;

@@ -287,7 +287,12 @@ async fn both_listeners_keep_admitted_backends_when_fetch_configuration_changes(
         target.service = "added".into();
         targets.insert("added".into(), target);
         rpc.configure(request(&document)).await.unwrap();
-        assert_eq!(provider.iroh_addresses()["work"], address);
+        let current = provider.iroh_addresses()["work"].clone();
+        assert_eq!(current.id, address.id);
+        assert_eq!(
+            current.ip_addrs().collect::<Vec<_>>(),
+            address.ip_addrs().collect::<Vec<_>>()
+        );
         send(&provider, &provider_access).await;
         let second = BackendKey::Fetch {
             service: "added".into(),

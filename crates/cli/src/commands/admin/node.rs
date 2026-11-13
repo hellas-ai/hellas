@@ -274,7 +274,7 @@ pub(in crate::commands) async fn connect_local(
         .context("profile requires local daemon trust")?;
     let socket = match socket {
         Some(socket) => socket,
-        None => hellas_sdk::grant_config::GrantConfig::provider_dir(home).join("control.sock"),
+        None => home.child("provider").join("control.sock"),
     };
     Ok(node_control::connect_local(
         socket,
@@ -671,10 +671,20 @@ pub async fn gateway_authority(
         not_before: now,
         expires: administrator.expires,
     };
+    let authorization = GrantId(rand::random());
+    node.grant(
+        &caller,
+        hellas_auth::authority::GrantCommand::Issue {
+            authorization: root,
+            id: authorization,
+            spec: scope.clone(),
+        },
+    )
+    .await?;
     let (credential, bearer) =
         Credential::prepare(scope, CredentialHolder::Bearer, caller.generation())?;
     node.issue_credential(&caller, root, credential).await?;
-    let access = hellas_gateway::GatewayAccess::new(node.clone(), root, bearer).await?;
+    let access = hellas_gateway::GatewayAccess::new(node.clone(), authorization, bearer).await?;
     Ok((node, access))
 }
 
@@ -761,7 +771,6 @@ pub async fn pair(
 }
 
 fn print_status(status: hellas_rpc::pb::host::HostStatus) -> Result<()> {
-    let configuration = status.provider_configuration;
     let machine = status.machine.map(|m| -> Result<_> {
                 let limits: Vec<hellas_authority::model::grant::budget::Limit> = decode_dag_cbor(&m.limits)?;
                 Ok(serde_json::json!({"revision": m.revision, "max_in_flight": m.max_in_flight, "limits": limits}))
@@ -772,11 +781,7 @@ fn print_status(status: hellas_rpc::pb::host::HostStatus) -> Result<()> {
             "authority": hex::encode(status.authority),
             "revision": status.authority_revision,
             "generation": status.generation,
-            "provider_configured": status.provider_configured,
             "machine": machine,
-            "endpoint": status.endpoint,
-            "provider_state": status.provider.map(|provider| provider.state),
-            "configuration": configuration,
         })
     );
     Ok(())

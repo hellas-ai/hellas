@@ -23,59 +23,24 @@ let
     normalizedRoot == "/"
     || normalizedPath == normalizedRoot
     || lib.hasPrefix "${normalizedRoot}/" normalizedPath;
-  pathsOverlap = first: second: pathWithin first second || pathWithin second first;
   outsideManagedRoots = roots: path: !(lib.any (root: pathWithin root path) roots);
-  gatewayManagedWritableRoots = [
-    "/var/lib/hellas-gateway"
-    gateway.home
-    "/var/cache/hellas-gateway"
-  ];
-  providerContentPaths = lib.unique (map normalizeRuntimePath (cfg.content.lower or [ ]));
-  providerUpper = normalizeRuntimePath (cfg.content.upper or "${cfg.home}/store");
-  providerWriteRoots = lib.unique [
-    (normalizeRuntimePath cfg.home)
-    providerUpper
-  ];
-  providerWritablePaths = lib.unique (
-    lib.optional (outsideManagedRoots [ hellasLib.defaultStateDir ] cfg.home) (
-      normalizeRuntimePath cfg.home
-    )
-    ++ lib.optional (outsideManagedRoots [
-      hellasLib.defaultStateDir
-      cfg.home
-    ] providerUpper) providerUpper
+  providerWritablePaths = lib.optional (outsideManagedRoots [ hellasLib.defaultStateDir ] cfg.home) (
+    normalizeRuntimePath cfg.home
   );
-  gatewayContentPaths = lib.unique (map normalizeRuntimePath (gateway.content.lower or [ ]));
-  gatewayWriteRoots = lib.unique (
-    map normalizeRuntimePath (
-      [ gateway.home ]
-      ++ lib.optional (gateway.content ? upper) gateway.content.upper
-      ++ lib.optional (gateway.authorityJournal != null) gateway.authorityJournal
-    )
+  gatewayContentPaths = lib.filter (lib.hasPrefix "/") (
+    map (model: builtins.head (lib.splitString "@" model)) gateway.models
   );
-  gatewayWritablePaths = lib.unique (
-    lib.optional (outsideManagedRoots [ "/var/lib/hellas-gateway" ] gateway.home) (
-      normalizeRuntimePath gateway.home
-    )
-    ++ lib.filter (outsideManagedRoots gatewayManagedWritableRoots) gatewayWriteRoots
+  gatewayWritablePaths = lib.optional (!(pathWithin "/var/lib/hellas-gateway" gateway.home)) (
+    normalizeRuntimePath gateway.home
   );
-  providerWritablePathsAreDisjoint = lib.all (
-    writable: lib.all (content: !pathsOverlap writable content) providerContentPaths
-  ) providerWriteRoots;
-  providerCatenaConfigured = hellas.catenaConfigured cfg;
-  # Every provider runs Compute: paid, or granted by the owner it pairs with.
-  providerLocalExecutionEnabled = hellas.catenaConfigured cfg;
-  providerGpuConfigured = hellas.catenaPlatform pkgs && providerLocalExecutionEnabled;
-  # The gateway runs the same native executor in process for --local.
-  gatewayGpuConfigured = hellas.catenaPlatform pkgs && gateway.local;
-  defaultGpuSessionAssetBytes = 128 * 1024 * 1024 * 1024;
-  effectiveGpuSessionAssetBytes =
-    if cfg.gpuSessionAssetBytes == null then defaultGpuSessionAssetBytes else cfg.gpuSessionAssetBytes;
+  providerGpuConfigured = hellas.catenaPlatform pkgs && cfg.enable;
+  gatewayGpuConfigured =
+    hellas.catenaPlatform pkgs && lib.any (model: !(lib.hasInfix "@" model)) gateway.models;
   inherit (hellasLib) cudaToolkit;
   rocmToolkit = hellasLib.mkRocmToolkit cfg.rocmPackages;
   nvidiaDriverEnabled = builtins.elem "nvidia" config.services.xserver.videoDrivers;
-  useCuda = cfg.gpuBackend == "cuda" || (cfg.gpuBackend == null && nvidiaDriverEnabled);
-  useHip = cfg.gpuBackend == "hip" || (cfg.gpuBackend == null && !nvidiaDriverEnabled);
+  useCuda = nvidiaDriverEnabled;
+  useHip = !nvidiaDriverEnabled;
   gpuPackages =
     lib.optionals useHip [ rocmToolkit ]
     ++ lib.optionals useCuda [
@@ -112,26 +77,16 @@ let
   providerRuntimePaths = [
     cfg.home
   ]
-  ++ (cfg.content.lower or [ ])
-  ++ lib.optional (cfg.content ? upper) cfg.content.upper
-  ++ lib.optional (cfg.workConfigFile != null) cfg.workConfigFile
   ++ lib.optional (cfg.chainConfig != null) cfg.chainConfig
-  ++ lib.optional (cfg.grantConfigFile != null) cfg.grantConfigFile
   ++ lib.optional (cfg.passkey != null) cfg.passkey
-  ++ lib.optional (cfg.fetchConfigFile != null) cfg.fetchConfigFile
   ++ lib.optional (cfg.environmentFile != null) cfg.environmentFile;
   gatewayRuntimePaths = lib.optionals gateway.enable (
-    gateway.models
-    ++ [ gateway.home ]
-    ++ (gateway.content.lower or [ ])
-    ++ lib.optional (gateway.content ? upper) gateway.content.upper
+    [ gateway.home ]
+    ++ gatewayContentPaths
+    ++ lib.mapAttrsToList (_: upstream: upstream.keyFile) gateway.upstreams
     ++ lib.optional (gateway.environmentFile != null) gateway.environmentFile
-    ++ lib.optional (gateway.access != null) gateway.access
     ++ lib.optional (gateway.chainConfig != null) gateway.chainConfig
-    ++ lib.optional (gateway.trustStore != null) gateway.trustStore
     ++ lib.optional (gateway.passkey != null) gateway.passkey
-    ++ lib.optional (gateway.gatewayProfile != null) gateway.gatewayProfile
-    ++ lib.optional (gateway.authorityJournal != null) gateway.authorityJournal
   );
   gpuDeviceAccess = {
     # DynamicUser does not inherit an interactive user's device groups.
@@ -168,7 +123,7 @@ in
     }
     // hellas.serveOptions { inherit lib pkgs; }
     // {
-      gateway = hellas.gatewayOptions { inherit lib pkgs; } // {
+      gateway = hellas.gatewayOptions { inherit lib; } // {
         package = mkOption {
           type = types.package;
           default = cfg.package;
@@ -211,8 +166,8 @@ in
         example = 137438953472;
         description = ''
           Optional systemd MemoryMax byte ceiling for the complete provider
-          unit. When set, it must exceed the effective gpuSessionAssetBytes
-          value (128 GiB when that option is null) so the runtime, compiler,
+          unit. When set, it must exceed the native executor asset bound
+          default (128 GiB) so the runtime, compiler,
           child workers, and non-asset allocations have headroom. The service
           never uses swap and an OOM kills the whole unit before
           Restart=on-failure restarts it.
@@ -227,20 +182,12 @@ in
         message = "services.hellas metrics ports require otel.enable and packages built with the otel feature.";
       }
       {
-        assertion = !gateway.allowRemote || gateway.gatewayProfile != null;
-        message = "services.hellas.gateway.allowRemote requires gatewayProfile for its explicitly provisioned HTTP authority.";
-      }
-      {
         assertion = pkgs.stdenv.hostPlatform.isLinux;
         message = "services.hellas is only supported on Linux.";
       }
       {
-        assertion = !cfg.enable || cfg.assurance == "producer-signed";
-        message = "services.hellas cannot serve apple-app-attest assurance on NixOS; Apple App Attest requires a Secure Enclave provider.";
-      }
-      {
         assertion = lib.all outsideStorePath (providerRuntimePaths ++ gatewayRuntimePaths);
-        message = "services.hellas content, identity, artifact store, environment, work config, Fetch config, EnvironmentFile, and text model paths must be runtime data outside the Nix store.";
+        message = "services.hellas home, identity, key files, environment and model paths must be runtime data outside the Nix store.";
       }
       {
         assertion = lib.all outsideStoreString userEnvironmentStrings;
@@ -248,31 +195,11 @@ in
       }
       {
         assertion = !cfg.enable || lib.all (path: path != "/") providerWritablePaths;
-        message = "services.hellas.home and content.upper must not expose the filesystem root as writable.";
+        message = "services.hellas.home must not expose the filesystem root as writable.";
       }
       {
         assertion = !gateway.enable || lib.all (path: path != "/") gatewayWritablePaths;
         message = "services.hellas.gateway writable journal paths must not expose the filesystem root as writable.";
-      }
-      {
-        assertion =
-          !gateway.enable
-          || lib.all (
-            writable: lib.all (lower: !pathsOverlap writable lower) (gateway.content.lower or [ ])
-          ) gatewayWriteRoots;
-        message = "services.hellas.gateway content.lower must be disjoint from writable journal and upper paths.";
-      }
-      {
-        assertion = gateway.content == { } || gateway.local;
-        message = "services.hellas.gateway.content requires local.";
-      }
-      {
-        assertion = !cfg.enable || providerWritablePathsAreDisjoint;
-        message = "services.hellas.home and content.upper must be disjoint from content.lower.";
-      }
-      {
-        assertion = cfg.memoryMaxBytes == null || cfg.memoryMaxBytes > effectiveGpuSessionAssetBytes;
-        message = "services.hellas.memoryMaxBytes must exceed gpuSessionAssetBytes so the provider has non-asset memory headroom.";
       }
       {
         assertion = hellas.extraArgsAreSafe lib hellas.protectedServeExtraArgs cfg.extraArgs;
@@ -291,27 +218,16 @@ in
         message = "services.hellas.gateway.extraArgs may not override module-managed runtime, content, identity, trust, or configuration flags; use the corresponding option instead.";
       }
       {
-        assertion = hellas.catenaPlatform pkgs || !providerCatenaConfigured;
-        message = "Local Catena execution is supported only on x86_64-linux; omit GPU backend and resource bounds on this platform.";
+        assertion = !gateway.enable || gateway.models != [ ];
+        message = "services.hellas.gateway.models must name at least one model.";
       }
       {
-        assertion =
-          !gateway.enable
-          ||
-            lib.count lib.id [
-              (gateway.access != null)
-              (gateway.pay != null)
-              gateway.local
-            ] == 1;
-        message = "services.hellas.gateway execution requires exactly one of access, pay or local.";
+        assertion = lib.all (model: lib.hasPrefix "/" model || lib.hasInfix "@" model) gateway.models;
+        message = "services.hellas.gateway.models local packages must use absolute runtime paths.";
       }
       {
-        assertion = (gateway.pay == null) == (gateway.provider == null);
-        message = "services.hellas.gateway.pay and provider must be configured together.";
-      }
-      {
-        assertion = (gateway.trustStore == null) == (gateway.trustPolicy == null);
-        message = "services.hellas.gateway.trustStore and trustPolicy must be configured together.";
+        assertion = !gateway.openFirewall || gateway.port != 0;
+        message = "services.hellas.gateway.openFirewall requires a fixed port.";
       }
     ];
 
@@ -348,7 +264,7 @@ in
         ExecStart = lib.escapeShellArgs (
           [ "${cfg.package}/bin/hellas" ]
           ++ hellas.mkServeArgs {
-            inherit lib pkgs;
+            inherit lib;
             serve = cfg;
             inherit (cfg) otel;
           }
@@ -374,12 +290,6 @@ in
         # grant Unix ownership, so operators must provision the external paths
         # as described by the corresponding options.
         ReadWritePaths = providerWritablePaths;
-      }
-      // lib.optionalAttrs (providerContentPaths != [ ]) {
-        # Content is adopted as input, never service-owned state. Keep it
-        # read-only even when an operator places it below StateDirectory,
-        # CacheDirectory, or a broader custom writable mount.
-        ReadOnlyPaths = providerContentPaths;
       }
       // lib.optionalAttrs (cfg.memoryMaxBytes != null) {
         MemoryMax = toString cfg.memoryMaxBytes;
@@ -416,6 +326,8 @@ in
         // cfg.environment
         // {
           HOME = "/var/lib/hellas-gateway";
+          TMPDIR = "/run/hellas-gateway";
+          XDG_CACHE_HOME = "/var/cache/hellas-gateway";
         }
         // lib.optionalAttrs cfg.otel.enable {
           # Distinguish gateway spans from the node's in shared trace storage.
@@ -427,12 +339,16 @@ in
         ExecStart = lib.escapeShellArgs (
           [ "${gateway.package}/bin/hellas" ]
           ++ hellas.mkGatewayArgs {
-            inherit lib pkgs gateway;
+            inherit lib gateway;
             inherit (cfg) otel;
           }
         );
         Restart = "on-failure";
         DynamicUser = true;
+        RuntimeDirectory = "hellas-gateway";
+        RuntimeDirectoryMode = "0700";
+        CacheDirectory = "hellas-gateway";
+        CacheDirectoryMode = "0700";
         StateDirectory = "hellas-gateway";
         StateDirectoryMode = "0700";
         WorkingDirectory = "/var/lib/hellas-gateway";
@@ -459,7 +375,7 @@ in
 
     networking.firewall = {
       allowedUDPPorts = lib.optionals (cfg.enable && cfg.openFirewall && cfg.port != null) [ cfg.port ];
-      allowedTCPPorts = lib.optionals (gateway.enable && gateway.openFirewall && gateway.port != null) [
+      allowedTCPPorts = lib.optionals (gateway.enable && gateway.openFirewall && gateway.port != 0) [
         gateway.port
       ];
     };

@@ -215,9 +215,6 @@ impl Fixture {
     async fn command(&self, command: WorkControlCommand) -> WorkControlReply {
         hellas_authority::grant_service::WorkAdministration::new(
             self.host.world.service.clone(),
-            hellas_authority::test_support::common_node::configuration(
-                self.host.allowance.policies.clone(),
-            ),
             self.host.allowance.max_job_millis,
         )
         .execute(
@@ -231,21 +228,16 @@ impl Fixture {
     async fn http(&self) -> Http {
         let access = self.host.gateway_access().await;
         let bearer = access.bearer();
-        let server = hellas_gateway::start(hellas_gateway::GatewayOptions {
-            jobs: self.gateway.jobs.clone(),
-            server: hellas_gateway::ServerOptions {
-                archive: hellas_gateway::ArchiveOptions {
-                    directory: self.host.root.path().join("archive"),
-                    zdr: true,
-                },
-                host: "127.0.0.1".into(),
-                port: Some(0),
-                access,
-                allow_remote: false,
+        let server = crate::test_support::server::serve(
+            self.host.world.service.node(),
+            hellas_gateway::ArchiveOptions {
+                directory: self.host.root.path().join("archive"),
+                zdr: true,
             },
-            work: self.gateway.clone(),
-            routes: self.gateway.backends["test"].target.routes("test").unwrap(),
-        })
+            self.gateway.clone(),
+            self.gateway.jobs.clone(),
+            self.gateway.backends["test"].target.routes("test").unwrap(),
+        )
         .await
         .unwrap();
         Http {
@@ -616,7 +608,7 @@ async fn reused_policy_name_cannot_retarget_an_in_flight_request() {
 }
 
 struct Http {
-    server: hellas_gateway::GatewayHandle,
+    server: crate::test_support::server::Server,
     bearer: String,
     client: reqwest::Client,
 }
@@ -1004,21 +996,16 @@ async fn single_signed_model_responses_route_tracks_continuation() {
     );
     let access = host.gateway_access().await;
     let bearer = access.bearer();
-    let server = hellas_gateway::start(hellas_gateway::GatewayOptions {
-        jobs: gateway.jobs.clone(),
-        server: hellas_gateway::ServerOptions {
-            archive: hellas_gateway::ArchiveOptions {
-                directory: host.root.path().join("archive"),
-                zdr: true,
-            },
-            host: "127.0.0.1".into(),
-            port: Some(0),
-            access,
-            allow_remote: false,
+    let server = crate::test_support::server::serve(
+        host.world.service.node(),
+        hellas_gateway::ArchiveOptions {
+            directory: host.root.path().join("archive"),
+            zdr: true,
         },
-        work: gateway.clone(),
-        routes: gateway.backends["test"].target.routes("test").unwrap(),
-    })
+        gateway.clone(),
+        gateway.jobs.clone(),
+        gateway.backends["test"].target.routes("test").unwrap(),
+    )
     .await
     .unwrap();
     let client = reqwest::Client::new();
@@ -1186,21 +1173,16 @@ async fn two_grant_nodes_fail_over_before_proposal_and_rejoin_on_demand() {
     }
     let access = first.host.gateway_access().await;
     let bearer = access.bearer();
-    let server = hellas_gateway::start(hellas_gateway::GatewayOptions {
-        jobs: work.jobs.clone(),
-        server: hellas_gateway::ServerOptions {
-            access,
-            allow_remote: false,
-            host: "127.0.0.1".into(),
-            port: Some(0),
-            archive: hellas_gateway::ArchiveOptions {
-                directory: first.host.root.path().join("archive"),
-                zdr: true,
-            },
+    let server = crate::test_support::server::serve(
+        first.host.world.service.node(),
+        hellas_gateway::ArchiveOptions {
+            directory: first.host.root.path().join("archive"),
+            zdr: true,
         },
-        work: work.clone(),
+        work.clone(),
+        work.jobs.clone(),
         routes,
-    })
+    )
     .await
     .unwrap();
     first.remote.shutdown().await;

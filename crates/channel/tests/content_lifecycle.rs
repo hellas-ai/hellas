@@ -701,7 +701,7 @@ async fn accepted_work_releases_disconnected_upload_claim_before_completion() {
     )
     .await
     .unwrap();
-    let response = service.accept(&request).await;
+    let response = service.accept(&request, None).await;
     assert!(
         matches!(
             response.outcome,

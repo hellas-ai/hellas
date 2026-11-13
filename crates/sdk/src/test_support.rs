@@ -481,7 +481,7 @@ pub async fn accept_uploaded(
     })
     .await
     .expect("fresh positive acceptance completes its content upload");
-    let response = service.accept(&wire).await;
+    let response = service.accept(&wire, None).await;
     connection.cancel();
     tokio::time::timeout(hellas_channel::test_support::HANG_GUARD, async {
         while service.content_upload_count().await.unwrap() != 0 {
@@ -563,3 +563,5 @@ pub fn request_job(
     })
     .unwrap()
 }
+
+pub(crate) mod server;

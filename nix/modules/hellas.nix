@@ -188,59 +188,29 @@ rec {
     "--durability"
     "--home"
     "--log-file"
-    "--assurance"
     "--port"
-    "--queue-size"
-    "--content-config"
-    "--gpu-backend"
-    "--gpu-session-programs"
-    "--gpu-session-asset-bytes"
-    "--paid-work-config"
     "--chain"
     "--chain-config"
-    "--grant-config"
-    "--knowingly-unsafe"
     "--passkey"
     "--metrics-port"
     "--metrics-addr"
-    "--graffiti"
-    "--fetch-config"
-    "--fetch-max-in-flight"
-    "--fetch-queue-size"
   ];
-
   protectedGatewayExtraArgs = [
-    "--content-config"
-    "--metrics-port"
-    "--metrics-addr"
-    "--chain"
-    "--chain-config"
-    "--access"
-    "--pay"
-    "--provider"
-    "--local"
-    "--backend"
-    "--model"
-    "--gateway-profile"
     "--home"
     "--log-file"
-    "--host"
-    "--port"
-    "--default-max-tokens"
-    "--responses-overrides"
-    "--responses-model"
-    "--trust-store"
-    "--trust-policy"
+    "--chain"
+    "--chain-config"
     "--passkey"
+    "--model"
+    "--upstream"
+    "--bind"
+    "--metrics-port"
+    "--metrics-addr"
   ];
 
   extraArgsAreSafe =
     lib: protected: args:
     lib.all (arg: lib.all (flag: arg != flag && !(lib.hasPrefix "${flag}=" arg)) protected) args;
-
-  catenaConfigured =
-    serve:
-    serve.gpuBackend != null || serve.gpuSessionPrograms != null || serve.gpuSessionAssetBytes != null;
 
   commonOptions =
     {
@@ -344,14 +314,6 @@ rec {
       inherit (lib) mkOption types;
       hellasLib = import ../lib { inherit pkgs; };
       runtimePath = types.strMatching "/.*";
-      catenaMaxResidentAssetBytes = 4 * 1024 * 1024 * 1024 * 1024;
-      positiveLimitOption =
-        description:
-        mkOption {
-          type = types.nullOr types.ints.positive;
-          default = null;
-          inherit description;
-        };
     in
     {
       port = mkOption {
@@ -373,62 +335,6 @@ rec {
         default = "crash";
         description = "Crash survives process crashes; OS crashes or power loss may roll back recent payment and authority commits with no time bound. Power flushes journal commits and content publication.";
       };
-      queueSize = mkOption {
-        type = types.nullOr types.ints.unsigned;
-        default = null;
-        description = "Maximum number of queued executions waiting behind the active worker.";
-      };
-      content = mkOption {
-        inherit (pkgs.formats.toml { }) type;
-        default = { };
-        example = {
-          upper = "/var/lib/hellas/content-store";
-          lower = [ "/srv/models" ];
-          index = "resume";
-        };
-        description = ''
-          The [content] declaration: upper, lower, index, capacity, pins and
-          policy. Rendered as one TOML file passed through --content-config.
-          An absent upper uses the store below home. Model bytes stay in
-          runtime lower directories; use absolute string paths outside the
-          Nix store. Pins default to Jobs.
-        '';
-      };
-      gpuBackend = mkOption {
-        type = types.nullOr (
-          types.enum [
-            "auto"
-            "hip"
-            "cuda"
-          ]
-        );
-        default = null;
-        description = "GPU backend selected inside Catena's isolated worker. Null uses automatic detection.";
-      };
-      gpuSessionPrograms = positiveLimitOption "Maximum distinct Catena programs retained in one resident GPU session. Null uses the CLI default.";
-      gpuSessionAssetBytes = mkOption {
-        type = types.nullOr (types.ints.between 1 catenaMaxResidentAssetBytes);
-        default = null;
-        description = ''
-          Logical admission limit for aggregate static bytes retained by the
-          shared VRAM owner across execution-worker restarts (at most
-          4398046511104 bytes, Catena's 4 TiB hard ceiling). Execution workers
-          map these assets read-only and keep generation state private.
-          Physical VRAM also includes allocation-granularity padding, private
-          generation allocations, and driver overhead. Set memoryMaxBytes
-          separately to bound host RAM. Null uses the CLI default.
-        '';
-      };
-      workConfigFile = mkOption {
-        type = types.nullOr runtimePath;
-        default = null;
-        example = "/var/lib/hellas/paid-work.toml";
-        description = ''
-          Runtime TOML paid terms passed as --paid-work-config. The owner
-          selected by passkey approves exactly these terms at startup; paid
-          work is sold only with this file. Keep it outside the Nix store.
-        '';
-      };
       chain = mkOption {
         type = types.nullOr (types.enum [ "devnet" ]);
         default = null;
@@ -439,49 +345,10 @@ rec {
         default = null;
         description = "Authenticated custom chain profile passed as --chain-config.";
       };
-      grantConfigFile = mkOption {
-        type = types.nullOr runtimePath;
-        default = null;
-        example = "/var/lib/hellas/grant.json";
-        description = ''
-          Runtime JSON grant resources and listener configuration passed as
-          --grant-config. Native Compute runs through grants without paid
-          work, so this file enables the same content and GPU service setup as
-          workConfigFile. Keep it outside the Nix store.
-        '';
-      };
-      knowinglyUnsafe = lib.mkEnableOption ''
-        serving workConfigFile or grantConfigFile when it admits any Compute
-        program (`mode = "any"`, or `Any` in a resource). Without this the node
-        refuses to start on such a configuration: compiling and running a
-        program from an unknown author hands that author roughly root on the
-        host
-      '';
       passkey = mkOption {
         type = types.nullOr runtimePath;
         default = null;
-        description = "Private software passkey of the provider's owner, passed as --passkey. Without it, workConfigFile uses the principal key in the provider's home, or an owner-approved policy.";
-      };
-      fetchConfigFile = mkOption {
-        type = types.nullOr runtimePath;
-        default = null;
-        example = "/run/secrets/hellas-fetch.json";
-        description = ''
-          Runtime JSON file containing sealed Fetch destinations, credential
-          references and capabilities. Passed as
-          --fetch-config without copying its contents into the Nix store.
-          Null disables Fetch serving.
-        '';
-      };
-      fetchMaxInFlight = mkOption {
-        type = types.nullOr types.ints.positive;
-        default = null;
-        description = "Maximum number of Fetch provider streams running at once.";
-      };
-      fetchQueueSize = mkOption {
-        type = types.nullOr types.ints.unsigned;
-        default = null;
-        description = "Maximum number of Fetch executions waiting behind active provider streams.";
+        description = "Private software passkey of the provider owner, passed as --passkey.";
       };
       metricsAddress = mkOption {
         type = types.str;
@@ -493,19 +360,6 @@ rec {
         default = null;
         description = "Optional unauthenticated Prometheus metrics port. Requires otel.enable and a package built with the otel feature.";
       };
-      assurance = mkOption {
-        type = types.enum [
-          "producer-signed"
-          "apple-app-attest"
-        ];
-        default = "producer-signed";
-        description = "Assurance requested from and served by the execution provider.";
-      };
-      graffiti = mkOption {
-        type = types.nullOr types.str;
-        default = null;
-        description = "Operator graffiti tag (up to 16 bytes, padded/truncated). Self-reported to peers.";
-      };
       extraArgs = mkOption {
         type = types.listOf types.str;
         default = [ ];
@@ -514,54 +368,13 @@ rec {
     };
 
   gatewayOptions =
-    { lib, pkgs }:
+    { lib }:
     let
       inherit (lib) mkEnableOption mkOption types;
       runtimePath = types.strMatching "/.*";
-      positiveU32 = types.ints.between 1 4294967295;
     in
     {
       enable = mkEnableOption "Hellas HTTP gateway";
-      content = mkOption {
-        inherit (pkgs.formats.toml { }) type;
-        default = { };
-        description = "The local [content] declaration, rendered as one --content-config file. An absent upper keeps the dedicated authority-local upper. Use runtime lower paths outside the Nix store.";
-      };
-      access = mkOption {
-        type = types.nullOr runtimePath;
-        default = null;
-        example = "/run/secrets/friend.access";
-        description = "Access file someone shared with this gateway's principal and device, passed as --access. Requests run under its grant.";
-      };
-      pay = mkOption {
-        type = types.nullOr positiveU32;
-        default = null;
-        description = "Most the gateway pays `provider` per request, passed as --pay. The provider's quoted price applies.";
-      };
-      provider = mkOption {
-        type = types.nullOr types.str;
-        default = null;
-        example = "ENROLLMENT_ID@NODE_ID";
-        description = "Paid provider address passed as --provider with pay.";
-      };
-      local = mkEnableOption "running requests on this machine's executor (--local), with the native content and GPU flags";
-      backend = mkOption {
-        type = types.nullOr types.str;
-        default = null;
-        example = "hellas/catena-dfad87438018-hip";
-        description = "Renderer (evaluator id) that remote requests' programs are rendered for, passed as --backend: the id the provider's GPU runtime registers. Local requests render for this machine's GPU runtime.";
-      };
-      models = mkOption {
-        type = types.listOf (types.strMatching "/.*");
-        default = [ ];
-        example = [ "/srv/hellas/models/qwen3.gguf" ];
-        description = ''
-          Model paths passed as --model: a Qwen GGUF file, or a converted
-          Whisper or Flux package directory. The gateway renders jobs from
-          them; providers must hold the same converted weights. This is
-          operator-managed runtime data, not a Nix-store artifact.
-        '';
-      };
       chain = mkOption {
         type = types.nullOr (types.enum [ "devnet" ]);
         default = null;
@@ -572,27 +385,15 @@ rec {
         default = null;
         description = "Authenticated custom chain profile passed as --chain-config.";
       };
-      allowRemote = mkEnableOption "non-loopback gateway listening";
-      gatewayProfile = mkOption {
-        type = types.nullOr runtimePath;
-        default = null;
-        example = "/var/lib/hellas-gateway/gateway-profile.json";
-        description = "Private runtime profile selecting an explicitly provisioned HTTP authority, grant and gateway.invoke bearer credential; required with allowRemote. Without it, a loopback gateway creates its own authority under home and keeps its bearer in home/gateway/bearer.";
-      };
-      authorityJournal = mkOption {
-        type = types.nullOr runtimePath;
-        default = null;
-        description = "Authority journal named in gatewayProfile. Set this when it is outside the managed state directory so the service sandbox permits durable writes.";
-      };
       host = mkOption {
         type = types.str;
         default = "127.0.0.1";
         description = "Host interface for the HTTP gateway to bind.";
       };
       port = mkOption {
-        type = types.nullOr types.port;
+        type = types.port;
         default = 8080;
-        description = "HTTP gateway port. Null lets the CLI auto-select.";
+        description = "HTTP gateway port; zero chooses a free port.";
       };
       metricsAddress = mkOption {
         type = types.str;
@@ -608,31 +409,6 @@ rec {
         type = types.nullOr runtimePath;
         default = null;
         description = "Private software passkey of the principal the gateway acts for, outside home.";
-      };
-      defaultMaxTokens = mkOption {
-        type = types.nullOr positiveU32;
-        default = null;
-        description = "Fallback max output tokens when a request omits a limit.";
-      };
-      responsesOverrides = mkOption {
-        type = types.attrsOf types.anything;
-        default = { };
-        description = "JSON object merged into OpenAI Responses requests before they are signed and sent as a Fetch.";
-      };
-      responsesModels = mkOption {
-        type = types.listOf types.str;
-        default = [ ];
-        description = "Models the Responses Fetch answers to when /v1/responses is shared with the text routes.";
-      };
-      trustStore = mkOption {
-        type = types.nullOr runtimePath;
-        default = null;
-        description = "Caller-owned native trust directory, provisioned separately by trust approve.";
-      };
-      trustPolicy = mkOption {
-        type = types.nullOr (types.strMatching "[a-z0-9_-]{1,64}");
-        default = null;
-        description = "Previously approved enrollment, assurance, manifest and software policy ID.";
       };
       home = mkOption {
         type = runtimePath;
@@ -654,6 +430,34 @@ rec {
         type = types.listOf types.str;
         default = [ ];
         description = "Extra arguments to pass to `hellas gateway`. They may add unsupported harmless switches such as `--wrap`, but may not override module-managed runtime, content, identity, trust, or configuration flags (including `--flag=value`).";
+      };
+      models = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        example = [
+          "/srv/models/qwen3.gguf"
+          "flux@alice"
+          "gpt-5@openrouter"
+        ];
+        description = "Ordered --model entries: local package paths, PATH@CONTACT, or NAME@UPSTREAM.";
+      };
+      upstreams = mkOption {
+        type = types.attrsOf (
+          types.submodule {
+            options = {
+              url = mkOption {
+                type = types.str;
+                description = "OpenAI-compatible HTTPS API base URL.";
+              };
+              keyFile = mkOption {
+                type = runtimePath;
+                description = "API key file read at service startup, outside the Nix store.";
+              };
+            };
+          }
+        );
+        default = { };
+        description = "Named upstreams rendered as --upstream flags; keys remain runtime files.";
       };
     };
 
@@ -685,13 +489,9 @@ rec {
       }
     );
 
-  # `hellas serve ...` argv from a resolved serve cfg. The cfg shape is
-  # whatever attrset carries `serveOptions` keys — for NixOS that's the top-
-  # level `services.hellas`, for HM-darwin it's `programs.hellas.serve`.
   mkServeArgs =
     {
       lib,
-      pkgs,
       serve,
       otel,
     }:
@@ -704,28 +504,15 @@ rec {
         ];
     in
     [
-      "serve"
       "--home"
       serve.home
-    ]
-    ++ [
       "--durability"
       serve.durability
+      "serve"
     ]
     ++ optArg "--port" serve.port
-    ++ optArg "--queue-size" serve.queueSize
-    ++ lib.optionals (serve.content != { }) [
-      "--content-config"
-      ((pkgs.formats.toml { }).generate "hellas-content.toml" { inherit (serve) content; })
-    ]
-    ++ optArg "--gpu-backend" serve.gpuBackend
-    ++ optArg "--gpu-session-programs" serve.gpuSessionPrograms
-    ++ optArg "--gpu-session-asset-bytes" serve.gpuSessionAssetBytes
-    ++ optArg "--paid-work-config" serve.workConfigFile
     ++ optArg "--chain" serve.chain
     ++ optArg "--chain-config" serve.chainConfig
-    ++ optArg "--grant-config" serve.grantConfigFile
-    ++ lib.optional serve.knowinglyUnsafe "--knowingly-unsafe"
     ++ optArg "--passkey" serve.passkey
     ++ lib.optionals (otel.enable && serve.metricsPort != null) [
       "--metrics-port"
@@ -733,20 +520,11 @@ rec {
       "--metrics-addr"
       serve.metricsAddress
     ]
-    ++ [
-      "--assurance"
-      serve.assurance
-    ]
-    ++ optArg "--graffiti" serve.graffiti
-    ++ optArg "--fetch-config" serve.fetchConfigFile
-    ++ optArg "--fetch-max-in-flight" serve.fetchMaxInFlight
-    ++ optArg "--fetch-queue-size" serve.fetchQueueSize
     ++ serve.extraArgs;
 
   mkGatewayArgs =
     {
       lib,
-      pkgs,
       gateway,
       otel,
     }:
@@ -757,51 +535,33 @@ rec {
           flag
           (toString value)
         ];
+      host = if lib.hasInfix ":" gateway.host then "[${gateway.host}]" else gateway.host;
     in
     [
       "--home"
       gateway.home
       "gateway"
+      "--bind"
+      "${host}:${toString gateway.port}"
     ]
-    ++ lib.optionals (gateway.content != { }) [
-      "--content-config"
-      ((pkgs.formats.toml { }).generate "hellas-gateway-content.toml" { inherit (gateway) content; })
-    ]
-    ++ optArg "--trust-store" gateway.trustStore
-    ++ optArg "--trust-policy" gateway.trustPolicy
-    ++ optArg "--access" gateway.access
-    ++ optArg "--pay" gateway.pay
-    ++ optArg "--provider" gateway.provider
-    ++ lib.optional gateway.local "--local"
-    ++ optArg "--backend" gateway.backend
-    ++ optArg "--passkey" gateway.passkey
     ++ lib.concatMap (model: [
       "--model"
       model
     ]) gateway.models
+    ++ lib.concatLists (
+      lib.mapAttrsToList (name: upstream: [
+        "--upstream"
+        "${name}=${upstream.url},key-file=${upstream.keyFile}"
+      ]) gateway.upstreams
+    )
     ++ optArg "--chain" gateway.chain
     ++ optArg "--chain-config" gateway.chainConfig
-    ++ lib.optional gateway.allowRemote "--allow-remote"
-    ++ optArg "--gateway-profile" gateway.gatewayProfile
-    ++ [
-      "--host"
-      gateway.host
-    ]
-    ++ optArg "--port" gateway.port
+    ++ optArg "--passkey" gateway.passkey
     ++ lib.optionals (otel.enable && gateway.metricsPort != null) [
       "--metrics-port"
       (toString gateway.metricsPort)
       "--metrics-addr"
       gateway.metricsAddress
-    ]
-    ++ optArg "--default-max-tokens" gateway.defaultMaxTokens
-    ++ lib.optionals (gateway.responsesOverrides != { }) [
-      "--responses-overrides"
-      (builtins.toJSON gateway.responsesOverrides)
-    ]
-    ++ lib.optionals (gateway.responsesModels != [ ]) [
-      "--responses-model"
-      (lib.concatStringsSep "," gateway.responsesModels)
     ]
     ++ gateway.extraArgs;
 }

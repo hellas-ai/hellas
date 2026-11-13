@@ -99,9 +99,14 @@ async fn a_refusing_hook_prevents_routing_and_releases_earlier_reservations() {
         Arc::new(Accounting(outcomes.clone())),
         Arc::new(Refuse),
     ]));
-    let router = crate::router::router(vec![], Arc::new(Unreachable), jobs.clone())
-        .await
-        .unwrap();
+    let router = crate::router::router(
+        vec![],
+        Arc::new(Unreachable),
+        jobs.clone(),
+        Default::default(),
+    )
+    .await
+    .unwrap();
     use tower::ServiceExt;
     let response = router
         .oneshot(

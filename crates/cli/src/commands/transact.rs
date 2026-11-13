@@ -482,12 +482,10 @@ async fn within<T>(
     }
 }
 
-/// A resolved backend and the command-owned attempt and content reload.
+/// A resolved backend and the command-owned attempt.
 struct ResolvedBackend {
     backend: Backend,
     attempt: Option<PathBuf>,
-    #[cfg(feature = "compute")]
-    reload: Option<crate::content_configuration::ContentReload>,
 }
 
 impl From<Backend> for ResolvedBackend {
@@ -495,8 +493,6 @@ impl From<Backend> for ResolvedBackend {
         Self {
             backend,
             attempt: None,
-            #[cfg(feature = "compute")]
-            reload: None,
         }
     }
 }
@@ -532,7 +528,7 @@ impl TargetArgs {
             ensure!(pay == 0, "local work is not paid; drop --pay");
             let mut native = self.native;
             native.content.extend(self.models);
-            let (execution, reload) =
+            let execution =
                 crate::compute::local(&context.home, native, Arc::new(context.producer.clone()))
                     .await?;
             return Ok(ResolvedBackend {
@@ -541,7 +537,6 @@ impl TargetArgs {
                     timeout: client.timeout.unwrap_or(Duration::from_secs(86_400)),
                 },
                 attempt: None,
-                reload: Some(reload),
             });
         }
         let Some(access) = self.access.as_deref() else {
@@ -687,12 +682,7 @@ impl ResolvedBackend {
             Backend::Grant { .. } | Backend::Fetch { .. } => {}
             #[cfg(feature = "compute")]
             Backend::Local { execution, .. } => {
-                let stopped = match self.reload {
-                    Some(reload) => reload.shutdown().await,
-                    None => Ok(()),
-                };
                 execution.content.close().await;
-                stopped?;
             }
         }
         Ok(())

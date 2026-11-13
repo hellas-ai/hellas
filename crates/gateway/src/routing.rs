@@ -31,12 +31,25 @@ struct State {
     next: usize,
 }
 
+/// Session and continuation bindings shared by successive daemon snapshots.
+pub struct RoutingState {
+    salt: [u8; 32],
+    state: Mutex<State>,
+}
+impl Default for RoutingState {
+    fn default() -> Self {
+        Self {
+            salt: rand::random(),
+            state: Mutex::new(State::default()),
+        }
+    }
+}
+
 pub(crate) struct Routing {
     pub routes: Vec<Route>,
     keys: BTreeMap<(String, String, Option<String>), usize>,
     work: Arc<dyn WorkExecutionBackend>,
-    salt: [u8; 32],
-    state: Mutex<State>,
+    memory: Arc<RoutingState>,
 }
 
 #[derive(Clone)]
@@ -58,7 +71,7 @@ struct Pending {
 }
 impl Drop for Pending {
     fn drop(&mut self) {
-        let mut state = self.routing.state.lock().unwrap();
+        let mut state = self.routing.memory.state.lock().unwrap();
         if state.bindings.get(&self.key).is_some_and(|b| b.pending) {
             state.bindings.remove(&self.key);
         }
@@ -72,7 +85,7 @@ impl Selection {
         Some(id)
     }
     pub fn accept(&mut self, backend: &str) {
-        let mut state = self.routing.state.lock().unwrap();
+        let mut state = self.routing.memory.state.lock().unwrap();
         if let Some(key) = self.session
             && let Some(binding) = state.bindings.get_mut(&key)
         {
@@ -86,7 +99,7 @@ impl Selection {
             && (status == 429 || status >= 500)
         {
             let until = Instant::now() + delay.min(Duration::from_secs(u32::MAX as u64));
-            let mut state = self.routing.state.lock().unwrap();
+            let mut state = self.routing.memory.state.lock().unwrap();
             let previous = state
                 .cooldown
                 .entry(backend.clone())
@@ -138,6 +151,7 @@ impl Routing {
     pub fn new(
         routes: Vec<Route>,
         work: Arc<dyn WorkExecutionBackend>,
+        memory: Arc<RoutingState>,
     ) -> Result<Arc<Self>, RoutingError> {
         let backends = work.backends();
         let mut keys = BTreeMap::new();
@@ -184,12 +198,11 @@ impl Routing {
             routes,
             keys,
             work,
-            salt: rand::random(),
-            state: Mutex::new(State::default()),
+            memory,
         }))
     }
     fn key(&self, domain: &str, parts: &[&str]) -> ContentId {
-        let mut fields: Vec<&[u8]> = vec![&self.salt];
+        let mut fields: Vec<&[u8]> = vec![&self.memory.salt];
         fields.extend(parts.iter().map(|s| s.as_bytes()));
         ContentId::from_bytes(*hellas_auth::hash_tuple(domain, &fields).as_bytes())
     }
@@ -242,7 +255,7 @@ impl Routing {
         .into_iter()
         .filter_map(|(kind, id)| id.as_ref().map(|id| self.key(kind, &[family, id])))
         .collect();
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.memory.state.lock().unwrap();
         let now = Instant::now();
         state.bindings.retain(|_, b| {
             now.duration_since(b.touched) < SESSION_IDLE
@@ -404,7 +417,7 @@ impl ResponseBinding {
                 continue;
             };
             let key = self.routing.key(kind, &[&self.family, id]);
-            let mut state = self.routing.state.lock().unwrap();
+            let mut state = self.routing.memory.state.lock().unwrap();
             if let Some(binding) = state.bindings.get_mut(&key) {
                 if binding.backend.as_ref() != Some(&self.backend) {
                     binding.backend = None;

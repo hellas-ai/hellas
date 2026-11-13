@@ -170,3 +170,14 @@ pub(crate) async fn run(
         live: None,
     })
 }
+
+/// The native runtime used by both one-shot jobs and daemon local backends.
+#[cfg(feature = "compute")]
+pub async fn spawn(
+    signer: std::sync::Arc<ProducerSigningKey>,
+    gpu: hellas_executor::GpuConfig,
+) -> std::result::Result<hellas_executor::ExecutorHandle, hellas_executor::ExecutorError> {
+    let mut config = hellas_executor::ExecutorSpawnConfig::new(signer, Default::default());
+    config.gpu_config = gpu;
+    hellas_executor::Executor::spawn_configured(config).await
+}

@@ -151,6 +151,7 @@ impl Upstream {
             credentials: [(
                 "api".into(),
                 Credential {
+                    trust_roots: hellas_rpc::http_fetch::HttpTrustRoots::WebPki,
                     allowed_origins: vec![parsed.origin().ascii_serialization()],
                     allowed_paths: ["responses", "chat/completions", "completions"]
                         .map(|path| format!("{base}/v1/{path}"))

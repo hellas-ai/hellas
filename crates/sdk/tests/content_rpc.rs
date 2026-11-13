@@ -198,7 +198,6 @@ async fn owner_content_uses_the_authenticated_providerless_control_connection() 
 #[tokio::test]
 async fn public_content_is_served_by_the_host_without_a_running_provider() {
     use hellas_rpc::services::content::Content;
-    use hellas_sdk::node_control::host::{HostHandle, HostOptions};
     use hellas_wire::{
         ServiceMarker,
         iroh::{Pool, PoolOptions},
@@ -229,6 +228,7 @@ async fn public_content_is_served_by_the_host_without_a_running_provider() {
         .unwrap();
     }
     let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .secret_key(iroh::SecretKey::from_bytes(&[13; 32]))
         .relay_mode(iroh::RelayMode::Disabled)
         .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
         .unwrap()
@@ -236,16 +236,7 @@ async fn public_content_is_served_by_the_host_without_a_running_provider() {
         .await
         .unwrap();
     let address = endpoint.addr();
-    let host = HostHandle::start(HostOptions {
-        content: store.clone(),
-        transport: Some(endpoint),
-        start_provider: false,
-        control: None,
-        provider: None,
-        gateway: None,
-    })
-    .await
-    .unwrap();
+    let host = content_daemon(root.path(), store.clone(), Some(endpoint), [13; 32]).await;
     let client = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
         .relay_mode(iroh::RelayMode::Disabled)
         .bind()
@@ -277,23 +268,21 @@ async fn public_content_is_served_by_the_host_without_a_running_provider() {
     // the shared store used by all consumers, including this existing handle.
     let recipient = common::content_store(&root.path().join("recipient")).await;
     let lookup = iroh::address_lookup::MemoryLookup::new();
-    lookup.add_endpoint_info(host.endpoint().unwrap().addr());
+    lookup.add_endpoint_info(host.iroh_endpoints()[0].addr());
     let recipient_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .secret_key(iroh::SecretKey::from_bytes(&[14; 32]))
         .relay_mode(iroh::RelayMode::Disabled)
         .address_lookup(lookup)
         .bind()
         .await
         .unwrap();
-    let recipient_host = HostHandle::start(HostOptions {
-        content: recipient.clone(),
-        transport: Some(recipient_endpoint),
-        start_provider: false,
-        control: None,
-        provider: None,
-        gateway: None,
-    })
-    .await
-    .unwrap();
+    let recipient_host = content_daemon(
+        &root.path().join("recipient"),
+        recipient.clone(),
+        Some(recipient_endpoint),
+        [14; 32],
+    )
+    .await;
     let acquired = recipient
         .acquire(
             &Scope::Owner,
@@ -351,29 +340,11 @@ async fn public_content_is_served_by_the_host_without_a_running_provider() {
 async fn an_open_public_watch_cannot_delay_standalone_provider_shutdown() {
     use hellas_rpc::services::content::Content;
     use hellas_wire::{ServiceMarker, iroh::IrohTransport};
-    use std::sync::Arc;
     let root = tempfile::tempdir().unwrap();
     let content = common::content_store(root.path()).await;
-    let secret_key = iroh::SecretKey::from_bytes(&[13; 32]);
-    let enrollment =
-        hellas_channel::test_support::software_enrollment(2, *secret_key.public().as_bytes());
-    let signer = Arc::new(hellas_auth::ProducerSigningKey::from_secret_bytes([2; 32]).unwrap());
-    let provider = hellas_sdk::start_fetch_provider(hellas_sdk::ProviderOptions {
-        executor: hellas_executor::ExecutorSpawnConfig::new(signer.clone(), Default::default()),
-        content: content.clone(),
-        grants: None,
-        port: Some(0),
-        build: String::new(),
-        graffiti: vec![],
-        discovery: false,
-        work: None,
-        secret_key,
-        open_identity: Arc::new(hellas_sdk::ProviderOpen::new(signer, enrollment, None).unwrap()),
-    })
-    .await
-    .unwrap();
-    let address = iroh::EndpointAddr::new(provider.node_id()).with_addrs(
-        provider
+    let provider = content_daemon(root.path(), content.clone(), None, [13; 32]).await;
+    let address = iroh::EndpointAddr::new(provider.iroh_endpoints()[0].id()).with_addrs(
+        provider.iroh_endpoints()[0]
             .bound_sockets()
             .into_iter()
             .filter(|address| address.is_ipv4())
@@ -440,4 +411,70 @@ async fn an_open_public_watch_cannot_delay_standalone_provider_shutdown() {
     drop(remote);
     client.close().await;
     content.close().await;
+}
+
+async fn content_daemon(
+    root: &std::path::Path,
+    content: DiskStore,
+    endpoint: Option<iroh::Endpoint>,
+    key: [u8; 32],
+) -> std::sync::Arc<hellas_sdk::daemon::Core> {
+    use hellas_sdk::{
+        daemon::{Core, Options},
+        daemon_config::{Document, Listener},
+    };
+    use std::sync::Arc;
+    let home = hellas_private::StoreLocation::for_test(&root.join("daemon"));
+    let transport = iroh::SecretKey::from_bytes(&key);
+    let signer = Arc::new(hellas_auth::ProducerSigningKey::from_secret_bytes([2; 32]).unwrap());
+    let enrollment =
+        hellas_channel::test_support::software_enrollment(2, *transport.public().as_bytes());
+    let store = common::common_node::bootstrap_node(
+        &home.child("authority"),
+        hellas_authority::model::grant::grant_network(),
+        Some(enrollment.clone()),
+        hellas_auth::authority::UnixMillis::now().unwrap(),
+    )
+    .await
+    .unwrap();
+    let node = NodeCoordinator::new(
+        store,
+        Arc::new(|| hellas_auth::authority::UnixMillis::now().unwrap()),
+    );
+    let chain = hellas_chain::chain_dir::ChainDir::open(
+        &home,
+        &hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet),
+    )
+    .unwrap();
+    Core::open(
+        Options {
+            discovery: false,
+            endpoint,
+            remote_control: Default::default(),
+            prover: Some(Arc::new(
+                hellas_sdk::ProviderOpen::new(signer.clone(), enrollment, None).unwrap(),
+            )),
+            home,
+            signer,
+            transport,
+            settlement: hellas_kernel::Secp256k1Signer::from_secret_scalar([2; 32]).unwrap(),
+            owner: None,
+            chain,
+            node,
+            content,
+        },
+        Document {
+            listeners: [(
+                "work".into(),
+                Listener::Iroh {
+                    port: 0,
+                    backends: vec![],
+                },
+            )]
+            .into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap()
 }

@@ -1,7 +1,7 @@
 //! Node content configuration carrier and, with `compute`, GPU session configuration.
+#[cfg(feature = "compute")]
 use crate::commands::CliResult;
 use clap::Args;
-use hellas_executor::ExecutorSpawnConfig;
 use std::path::PathBuf;
 
 #[derive(Args, Debug)]
@@ -32,25 +32,6 @@ pub(crate) struct GpuArgs {
     pub(crate) gpu_session_asset_bytes: u64,
 }
 
-impl ServeArgs {
-    pub(crate) fn configure(
-        self,
-        executor: &mut ExecutorSpawnConfig,
-    ) -> CliResult<crate::content_configuration::ContentConfiguration> {
-        #[cfg(feature = "compute")]
-        {
-            executor.gpu_config = hellas_executor::GpuConfig {
-                backend: self.gpu.gpu_backend,
-                session_programs: self.gpu.gpu_session_programs,
-                session_asset_bytes: self.gpu.gpu_session_asset_bytes,
-            };
-        }
-        #[cfg(not(feature = "compute"))]
-        let _ = executor;
-        crate::content_configuration::ContentConfiguration::load(self.content_config, self.content)
-    }
-}
-
 #[cfg(feature = "compute")]
 pub(crate) fn parse_gpu_backend(value: &str) -> Result<hellas_executor::GpuDialect, String> {
     use hellas_executor::GpuDialect;
@@ -63,47 +44,18 @@ pub(crate) fn parse_gpu_backend(value: &str) -> Result<hellas_executor::GpuDiale
     }
 }
 
-/// This machine's executor, signing as `signer`, over the node content store
-/// the configuration declares. The caller stops the reload, then closes the
-/// content, after the work that reads it.
+/// One-shot local execution uses the same native constructor as the daemon.
 #[cfg(feature = "compute")]
 pub(crate) async fn local(
     home: &hellas_private::StoreLocation,
     native: ServeArgs,
     signer: std::sync::Arc<hellas_auth::ProducerSigningKey>,
-) -> CliResult<(
-    hellas_sdk::execution::local::LocalExecution,
-    crate::content_configuration::ContentReload,
-)> {
-    let mut executor =
-        ExecutorSpawnConfig::new(signer, hellas_executor::FetchRouteRegistry::default());
-    let (content, reload) = prepare_content(home, native, &mut executor).await?;
-    let backend = match hellas_executor::Executor::spawn_configured(executor).await {
-        Ok(backend) => backend,
-        Err(error) => {
-            reload.shutdown().await?;
-            content.close().await;
-            return Err(anyhow::Error::from(error).context("start local Work executor"));
-        }
-    };
-    Ok((
-        hellas_sdk::execution::local::LocalExecution { backend, content },
-        reload,
-    ))
-}
-
-#[cfg(feature = "compute")]
-async fn prepare_content(
-    home: &hellas_private::StoreLocation,
-    native: ServeArgs,
-    executor: &mut ExecutorSpawnConfig,
-) -> CliResult<(
-    hellas_store::content::DiskStore,
-    crate::content_configuration::ContentReload,
-)> {
-    let configuration = native.configure(executor)?.with_default_upper(
-        hellas_sdk::grant_config::GrantConfig::provider_dir(home).join("content"),
-    );
+) -> CliResult<hellas_sdk::execution::local::LocalExecution> {
+    let configuration = crate::content_configuration::ContentConfiguration::load(
+        native.content_config,
+        native.content,
+    )?
+    .with_default_upper(home.join("provider/content"));
     let content = configuration
         .config()
         .open(
@@ -114,8 +66,26 @@ async fn prepare_content(
             true,
         )
         .await?;
-    // Local jobs are ephemeral; this host has no paid channel journals.
-    content.finish_recovery().await?;
-    let reload = configuration.start(content.clone()).await?;
-    Ok((content, reload))
+    let prepared = async {
+        content.finish_recovery().await?;
+        configuration.apply(&content).await?;
+        let backend = hellas_sdk::execution::local::spawn(
+            signer,
+            hellas_executor::GpuConfig {
+                backend: native.gpu.gpu_backend,
+                session_programs: native.gpu.gpu_session_programs,
+                session_asset_bytes: native.gpu.gpu_session_asset_bytes,
+            },
+        )
+        .await?;
+        Ok::<_, anyhow::Error>(hellas_sdk::execution::local::LocalExecution {
+            backend,
+            content: content.clone(),
+        })
+    }
+    .await;
+    if prepared.is_err() {
+        content.close().await;
+    }
+    prepared
 }

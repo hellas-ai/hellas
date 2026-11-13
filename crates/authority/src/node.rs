@@ -8,9 +8,8 @@ use hellas_channel::endpoint_lock::{EndpointGuard, EndpointLock};
 use std::sync::Arc;
 mod host;
 pub use host::{
-    GATEWAY_INVOKE, HOST_CANCEL_JOB, HOST_CONFIGURE, HOST_GATEWAY_ACCESS, HOST_GATEWAY_CONFIGURE,
-    HOST_PROVIDER_BIND, HOST_PROVIDER_CONFIGURE, HOST_STATUS, MachineCapacity, NodeStatus,
-    host_resource, machine_resource,
+    GATEWAY_INVOKE, HOST_CANCEL_JOB, HOST_CONFIGURE, HOST_PROVIDER_BIND, HOST_STATUS,
+    MachineCapacity, NodeStatus, host_resource, machine_resource,
 };
 
 /// The key a client proves an authority session with.

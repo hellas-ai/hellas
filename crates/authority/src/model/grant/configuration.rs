@@ -62,7 +62,7 @@ impl NodeConfiguration {
         Ok(configuration)
     }
 
-    pub(crate) fn validate(&self) -> Result<(), GrantError> {
+    pub fn validate(&self) -> Result<(), GrantError> {
         let Self {
             machine,
             accounts,

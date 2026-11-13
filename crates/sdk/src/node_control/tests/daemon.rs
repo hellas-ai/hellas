@@ -57,6 +57,7 @@ async fn fixture() -> Fixture {
 fn options(f: &Fixture) -> Options {
     let home = StoreLocation::for_test(&f.directory.path().join("runtime"));
     Options {
+        discovery: false,
         endpoint: None,
         remote_control: Default::default(),
         prover: None,

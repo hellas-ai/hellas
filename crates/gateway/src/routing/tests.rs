@@ -95,7 +95,12 @@ fn order_of(mut selection: Selection) -> Vec<String> {
 #[test]
 fn routes_match_exact_keys_and_order_by_load_then_rotating_ties() {
     let work = Fake::new();
-    let routing = Routing::new(vec![row(&["b", "a", "c"], Some("model"))], work.clone()).unwrap();
+    let routing = Routing::new(
+        vec![row(&["b", "a", "c"], Some("model"))],
+        work.clone(),
+        Default::default(),
+    )
+    .unwrap();
     assert_eq!(
         choose(&routing, None, None).err().unwrap().status,
         StatusCode::BAD_REQUEST
@@ -156,11 +161,12 @@ fn duplicate_unknown_and_ambiguous_rows_are_invalid() {
         vec![row(&["a"], None), row(&["b"], None)],
         vec![row(&["a"], None), row(&["b"], Some("model"))],
     ] {
-        assert!(Routing::new(rows, work.clone()).is_err());
+        assert!(Routing::new(rows, work.clone(), Default::default()).is_err());
     }
     let routing = Routing::new(
         vec![row(&["a"], Some("one")), row(&["b"], Some("two"))],
         work,
+        Default::default(),
     )
     .unwrap();
     assert_eq!(
@@ -171,7 +177,12 @@ fn duplicate_unknown_and_ambiguous_rows_are_invalid() {
 #[test]
 fn first_session_selection_is_reserved_until_acceptance_and_pins_thereafter() {
     let work = Fake::new();
-    let routing = Routing::new(vec![row(&["a", "b"], None)], work.clone()).unwrap();
+    let routing = Routing::new(
+        vec![row(&["a", "b"], None)],
+        work.clone(),
+        Default::default(),
+    )
+    .unwrap();
     let pending = choose(&routing, None, Some("session")).unwrap();
     assert_eq!(
         choose(&routing, None, Some("session"))
@@ -201,7 +212,12 @@ fn first_session_selection_is_reserved_until_acceptance_and_pins_thereafter() {
 }
 #[test]
 fn continuation_keys_and_upstream_cooldown_never_move_a_pinned_request() {
-    let routing = Routing::new(vec![row(&["a", "b"], None)], Fake::new()).unwrap();
+    let routing = Routing::new(
+        vec![row(&["a", "b"], None)],
+        Fake::new(),
+        Default::default(),
+    )
+    .unwrap();
     let mut first = choose(&routing, None, None).unwrap();
     first.next();
     first.accept("a");
@@ -242,7 +258,7 @@ async fn failover_stops_at_the_proposal_boundary() {
         let mut work = Fake::new();
         Arc::get_mut(&mut work).unwrap().committed = committed;
         let route = row(&["a", "b"], None);
-        let routing = Routing::new(vec![route.clone()], work.clone()).unwrap();
+        let routing = Routing::new(vec![route.clone()], work.clone(), Default::default()).unwrap();
         let execution = crate::route::RouteExecution::open(&route, work.clone())
             .await
             .unwrap();
@@ -274,7 +290,7 @@ async fn failover_stops_at_the_proposal_boundary() {
 async fn pinned_pre_proposal_failure_is_not_retried_on_another_backend() {
     let work = Fake::new();
     let route = row(&["a", "b"], None);
-    let routing = Routing::new(vec![route.clone()], work.clone()).unwrap();
+    let routing = Routing::new(vec![route.clone()], work.clone(), Default::default()).unwrap();
     let mut first = choose(&routing, None, Some("session")).unwrap();
     first.next();
     first.accept("a");
@@ -349,7 +365,7 @@ async fn compute_is_rendered_for_each_selected_evaluator() {
     let work = Arc::new(Renderers {
         calls: Default::default(),
     });
-    let routing = Routing::new(vec![route.clone()], work.clone()).unwrap();
+    let routing = Routing::new(vec![route.clone()], work.clone(), Default::default()).unwrap();
     let execution = crate::route::RouteExecution::open(&route, work.clone())
         .await
         .unwrap();
@@ -384,7 +400,7 @@ async fn compute_is_rendered_for_each_selected_evaluator() {
 
 #[test]
 fn throttling_without_retry_after_does_not_invent_a_cooldown() {
-    let routing = Routing::new(vec![row(&["a"], None)], Fake::new()).unwrap();
+    let routing = Routing::new(vec![row(&["a"], None)], Fake::new(), Default::default()).unwrap();
     let mut selection = choose(&routing, None, None).unwrap();
     selection.next();
     for headers in [
@@ -412,4 +428,53 @@ fn retry_after_uses_only_valid_upstream_durations_and_dates() {
     let date = httpdate::fmt_http_date(std::time::SystemTime::now() + Duration::from_secs(60));
     let headers = HeaderMap::from_iter([("retry-after".parse().unwrap(), date.parse().unwrap())]);
     assert!((59..=60).contains(&retry_delay(&headers).unwrap().as_secs()));
+}
+
+#[test]
+fn snapshot_replacement_retains_pending_sessions_and_continuations() {
+    let memory = Arc::new(RoutingState::default());
+    let work = Fake::new();
+    let old = Routing::new(vec![row(&["a", "b"], None)], work.clone(), memory.clone()).unwrap();
+    let mut pending = choose(&old, None, Some("session")).unwrap();
+    let next = Routing::new(vec![row(&["b", "a"], None)], work.clone(), memory.clone()).unwrap();
+    assert_eq!(
+        choose(&next, None, Some("session")).err().unwrap().status,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(pending.next().as_deref(), Some("a"));
+    pending.accept("a");
+    pending
+        .response_binding("/v1/responses")
+        .unwrap()
+        .observe(&serde_json::json!({"object":"response", "id":"retained"}));
+    drop(pending);
+    assert_eq!(
+        order_of(choose(&next, None, Some("session")).unwrap()),
+        ["a"]
+    );
+    let continuation = |routing: &Arc<Routing>| {
+        routing.select(
+            "/v1/responses",
+            "POST",
+            Hints {
+                previous: Some("retained".into()),
+                ..Default::default()
+            },
+            None,
+            crate::test_support::job(),
+        )
+    };
+    assert_eq!(order_of(continuation(&next).unwrap().1), ["a"]);
+    let removed = Routing::new(vec![row(&["b"], None)], work, memory).unwrap();
+    assert_eq!(
+        choose(&removed, None, Some("session"))
+            .err()
+            .unwrap()
+            .status,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        continuation(&removed).err().unwrap().status,
+        StatusCode::CONFLICT
+    );
 }

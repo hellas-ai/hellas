@@ -6,5 +6,5 @@
 
 mod host;
 mod policy;
-pub use host::{OpenAiProviderError, OpenAiProviderOptions, start_openai_provider};
+pub use host::{OpenAiShareOptions, openai_document};
 pub use policy::{ResponsesPolicyOptions, responses_policy};

@@ -24,13 +24,7 @@ async fn local_gateway_whisper_matches_reference_tokens_without_a_chain() {
         tokens.len() < 64,
         "reference must finish before the token budget"
     );
-    let weights = model.join("weights.bf16");
-    let mut node = super::local_compute::LocalCompute::start(
-        &model,
-        Some(&weights),
-        &["--default-max-tokens", "64"],
-    )
-    .await;
+    let mut node = super::local_compute::LocalCompute::start(&model).await;
     let http = &node.http;
     let address = &node.address;
     let label = model.file_name().unwrap().to_string_lossy();

@@ -448,7 +448,7 @@ async fn child(root: &Path, funding: &str, phase: &str, seed: &str) -> ! {
             calls: calls.clone(),
         };
         assert!(matches!(
-            hellas_channel::work::run_accepted_work(&service, &channel, &backend, work)
+            hellas_channel::work::run_accepted_work(&service, &channel, &backend, work, None)
                 .await
                 .unwrap(),
             RunOutcome::Completed { .. }

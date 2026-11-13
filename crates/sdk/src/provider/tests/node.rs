@@ -1,4 +1,4 @@
-use hellas_auth::authority::GrantId;
+use crate::paid_provider::{MountedWork, WorkRunner, WorkRunnerConfig};
 use hellas_chain::FinalizedWorkView;
 use hellas_channel::test_support::channel::{
     client, provider, provider_producer, signer, work_policy,
@@ -7,7 +7,6 @@ use hellas_channel::work::WorkBackend;
 use hellas_channel::work_close::TxSink;
 use hellas_channel::work_handshake::{PaymentAdmission, SetupEndpoint};
 use hellas_channel::work_store::{ChannelStore, JobPhase, Role, SetupStore};
-use hellas_executor::FetchRouteRegistry;
 use hellas_kernel::{EdgeId, NetworkId, PartyKeys, Secp256k1Signer, Secp256k1Verifier};
 use hellas_private::StoreLocation;
 use hellas_rpc::pb::work::{
@@ -16,7 +15,9 @@ use hellas_rpc::pb::work::{
     accept_work_response, admit_certificate_response, exchange_setup_response,
 };
 use hellas_rpc::services::{work::WorkHandler, work_setup::WorkSetupHandler};
+use hellas_wire::peers::{PeerDirectory, PeerId};
 use hellas_wire::{TransportContext, WireStatus};
+use iroh::{Endpoint, endpoint::presets};
 use std::sync::Mutex;
 use tokio::sync::oneshot;
 
@@ -391,18 +392,15 @@ async fn exchange_routed_setup(
             .expect("the routed setup connection starts")
             .await
             .expect("the routed setup handshake completes");
-        serve_connection(
-            connection.alpn().to_vec(),
-            connection,
-            test_remote_execution(),
-            handler,
-            directory.manager(),
-            Some(setup),
-            None,
-            None,
+        Services {
+            open_identity: test_remote_execution(),
+            node: handler,
+            setup: Some(setup),
+            work: None,
+            control: None,
             content,
-            tokio::sync::watch::channel(false).1,
-        )
+        }
+        .serve(connection, tokio::sync::watch::channel(false).1)
         .await
         .expect("the routed setup connection is served");
     });
@@ -1426,8 +1424,10 @@ impl WorkBackend for AnsweringPaidBackend {
         _caller: hellas_auth::PublicKey,
     ) -> Result<hellas_channel::work::admission::WorkPermit, hellas_channel::work::BackendFault>
     {
-        let domain = backend.domain();
-        Err(hellas_channel::work::admission::AdmissionError::Unsupported(domain).into())
+        Ok(hellas_channel::work::admission::WorkPermit::new(
+            backend.domain(),
+            Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+        ))
     }
 
     async fn execute(
@@ -1478,8 +1478,10 @@ impl WorkBackend for BlockingPaidBackend {
         _caller: hellas_auth::PublicKey,
     ) -> Result<hellas_channel::work::admission::WorkPermit, hellas_channel::work::BackendFault>
     {
-        let domain = backend.domain();
-        Err(hellas_channel::work::admission::AdmissionError::Unsupported(domain).into())
+        Ok(hellas_channel::work::admission::WorkPermit::new(
+            backend.domain(),
+            Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+        ))
     }
 
     async fn execute_stream(
@@ -2822,7 +2824,6 @@ impl RunningPaidNode {
                     Err(error) => panic!("the test node accepts an incoming: {error}"),
                 };
                 let node_handler = node_handler.clone();
-                let manager = directory.manager();
                 let setup = setup_for_accept.clone();
                 let work = work_for_accept.clone();
                 let execution = execution_for_accept.clone();
@@ -2832,19 +2833,15 @@ impl RunningPaidNode {
                         Ok(connection) => connection,
                         Err(error) => panic!("the test node negotiates a connection: {error}"),
                     };
-                    let alpn = connection.alpn().to_vec();
-                    if let Err(error) = serve_connection(
-                        alpn,
-                        connection,
-                        execution,
-                        node_handler,
-                        manager,
-                        Some(setup),
-                        Some(WorkRouter::payment(work)),
-                        None,
+                    if let Err(error) = (Services {
+                        open_identity: execution,
+                        node: node_handler,
+                        setup: Some(setup),
+                        work: Some(WorkRouter::payment(work)),
+                        control: None,
                         content,
-                        tokio::sync::watch::channel(false).1,
-                    )
+                    })
+                    .serve(connection, tokio::sync::watch::channel(false).1)
                     .await
                     {
                         panic!("the test node serves its connection: {error}");
@@ -3767,15 +3764,21 @@ async fn open_result_stream_stops(shutdown: bool) {
                 .is_err(),
             "transient suspension pauses the open stream"
         );
-        mount.clear_all().await.unwrap();
+        let mut clearing = Box::pin(mount.clear_all());
+        assert!(
+            futures::poll!(clearing.as_mut()).is_pending(),
+            "shutdown retains the paused invocation"
+        );
+        backend.finish();
+        clearing.await.unwrap();
     } else {
         chain.set_snapshot(ready_channel_snapshot(
             ORIGIN + 1,
             Some(pending_contest(false)),
         ));
         assert!(runner.tick(&chain).await);
+        backend.finish();
     }
-    backend.finish();
     let next = tokio::time::timeout(HANG_GUARD, &mut next)
         .await
         .unwrap()
@@ -4199,140 +4202,6 @@ async fn one_peer_routes_distinct_channels_without_crossing_journals() {
     );
     assert_eq!(a.with_state(Channel::checkpoint).await.unwrap(), before_a);
     assert_eq!(b.with_state(Channel::checkpoint).await.unwrap(), before_b);
-}
-
-#[tokio::test]
-async fn provider_startup_preserves_explicit_allowances_and_machine_limits() {
-    use crate::grant_provider::ProviderResources;
-    use hellas_authority::model::grant::{budget::*, records::*, *};
-    let root = temp();
-    let (enrollment, producer_key) =
-        crate::test_identity::enrollment(SecretKey::from_bytes(&[0x63; 32]).public());
-    let provider = enrollment;
-    let location = StoreLocation::for_test(root.path());
-    let journal = crate::grant_config::GrantConfig::journal_dir(&location);
-    let config = || ProviderGrants {
-        config: crate::GrantProviderOptions {
-            configuration: Default::default(),
-            max_job_millis: std::num::NonZeroU64::MIN,
-        },
-        authority: ProviderAuthority::Journal {
-            root: journal.clone(),
-        },
-    };
-    let (store, secret) = common_node::bootstrap_node_with_credential(
-        &journal,
-        grant_network(),
-        Some(provider.clone()),
-        hellas_auth::authority::UnixMillis::now().unwrap_or_default(),
-    )
-    .await
-    .unwrap();
-    let routes = FetchRouteRegistry::default();
-    let limit = Limit::new(Meter::Requests, Window::Day, 7);
-    let id = GrantId([8; 16]);
-    let definition = common_node::allowance(
-        id,
-        hellas_channel::test_support::actors::ROOT.principal(),
-        vec![GrantPolicy {
-            config_change: Default::default(),
-            resource: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(
-                b"test resource",
-            )),
-            account: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),
-            revision: hellas_auth::authority::Revision(1),
-            name: "initial".into(),
-            invocation_policy: work_policy(),
-            https: None,
-            pricing: hellas_authority::model::grant::pricing::Pricing {
-                revision: hellas_auth::authority::Revision(1),
-                rates: None,
-            },
-            responses: None,
-        }],
-    );
-    let store = common_node::provision(
-        &journal,
-        store,
-        &secret,
-        producer_key.clone(),
-        (2, vec![limit]),
-        definition,
-        (vec![], 256),
-    )
-    .await;
-    drop(store);
-    let mut changed = config();
-    changed.config.configuration =
-        hellas_authority::test_support::common_node::configuration(vec![GrantPolicy {
-            config_change: Default::default(),
-            resource: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(
-                b"test resource",
-            )),
-            account: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),
-            revision: hellas_auth::authority::Revision(1),
-            name: "evaluate".into(),
-            invocation_policy: work_policy(),
-            https: None,
-            pricing: hellas_authority::model::grant::pricing::Pricing {
-                revision: hellas_auth::authority::Revision(1),
-                rates: None,
-            },
-            responses: None,
-        }]);
-    let content =
-        hellas_authority::test_support::content_store(&root.path().join("grant-content")).await;
-    for options in [config(), changed, config()] {
-        let node = options
-            .open(ProviderResources::ComputeAndFetch(&routes), &provider)
-            .await
-            .unwrap();
-        let caller = hellas_authority::test_support::session(&node, &secret).await;
-        let status = node.status(&caller, GrantId([0; 16])).await.unwrap();
-        let machine = status.machine.unwrap();
-        assert_eq!(machine.max_in_flight.get(), 2);
-        assert_eq!(machine.limits, vec![limit]);
-        let service = hellas_authority::grant_service::GrantService::from_node(
-            node,
-            &provider,
-            Arc::new(producer_key.clone()),
-            common_node::NoBackend,
-            vec![],
-            content.clone(),
-        )
-        .await
-        .unwrap();
-        let admin = hellas_authority::grant_service::WorkAdministration::new(
-            service,
-            options.config.configuration,
-            options.config.max_job_millis,
-        );
-        let hellas_authority::model::grant::admin::WorkControlReply::Allowances(allowances) = admin
-            .execute(
-                &caller,
-                GrantId([0; 16]),
-                hellas_authority::model::grant::admin::WorkControlCommand::List,
-            )
-            .await
-            .unwrap()
-        else {
-            panic!("allowances")
-        };
-        assert_eq!(allowances.len(), 1);
-        assert_eq!(allowances[0].id, id);
-        assert_eq!(allowances[0].revision, hellas_auth::authority::Revision(1));
-        assert_eq!(allowances[0].policies, vec!["initial".to_owned()]);
-    }
-    // The local-grant CLI opens this same authority journal after provider restart.
-    let local = hellas_authority::work_store::grant::NodeStore::open(
-        &crate::grant_config::GrantConfig::journal_dir(&location),
-        grant_network(),
-        Some(provider),
-        hellas_auth::authority::UnixMillis::now().unwrap_or_default(),
-    )
-    .await
-    .unwrap();
-    assert!(local.state().generation(id).is_some());
 }
 
 #[tokio::test]
@@ -5194,7 +5063,7 @@ async fn provider_stop_waits_for_unaccepted_content_and_reopens_with_old_handler
             .unwrap()
     );
     assert!(matches!(
-        held.accept(&request).await.outcome,
+        held.accept(&request, None).await.outcome,
         Some(accept_work_response::Outcome::Refused(_))
     ));
     connection.cancel();

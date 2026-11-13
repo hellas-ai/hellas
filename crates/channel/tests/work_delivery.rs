@@ -381,7 +381,7 @@ async fn a_failed_job_returns_its_terminal_after_authentication() {
     let (id, _) = accept(&work_policy(), &mut [&mut ps], 1).await;
     let service = WorkService::new(ProviderEndpoint::new(ready.clone(), ps, provider()).unwrap());
     assert!(matches!(
-        run_accepted_work(&service, &ready, &FailingBackend, id).await,
+        run_accepted_work(&service, &ready, &FailingBackend, id, None).await,
         Err(RunError::Backend(_))
     ));
     close_service(&service).await;
@@ -453,7 +453,7 @@ async fn a_released_timeout_ends_the_job_and_reserves_nothing() {
     let service = WorkService::new(ProviderEndpoint::new(ready.clone(), ps, provider()).unwrap());
     let backend = AnsweringBackend::with_transcript(timed_out);
     assert!(matches!(
-        run_accepted_work(&service, &ready, &backend, id).await,
+        run_accepted_work(&service, &ready, &backend, id, None).await,
         Ok(RunOutcome::Completed { .. })
     ));
     assert_eq!(
@@ -782,7 +782,7 @@ async fn a_provider_signs_no_result_the_frame_would_not_carry() {
         .accepted(&response)
         .await
         .unwrap();
-    let result = run_accepted_work(&service, &ready, &FetchBackend, id).await;
+    let result = run_accepted_work(&service, &ready, &FetchBackend, id, None).await;
     // RPC's shared result check enforces the signed frame ceiling before a receipt is made.
     assert!(
         matches!(result,Err(RunError::Transcript(ref error)) if error.to_string().contains("invocation output frame exceeds its bound")),
@@ -910,7 +910,7 @@ async fn live_prefix_precedes_terminal_and_reserves_delivery_credit() {
     let running_service = service.clone();
     let running_ready = ready.clone();
     let computation = tokio::spawn(async move {
-        run_accepted_work(&running_service, &running_ready, &backend, id).await
+        run_accepted_work(&running_service, &running_ready, &backend, id, None).await
     });
     let (transport, server_transport) = transport_pair();
     let serving = serve(server_transport, service.clone());
@@ -1078,7 +1078,7 @@ async fn one_channel_runs_fetch_then_compute_with_per_job_retention_and_durable_
             .accepted(&reply)
             .await
             .unwrap();
-        run_accepted_work(&service, &ready, &Backend, id)
+        run_accepted_work(&service, &ready, &Backend, id, None)
             .await
             .unwrap();
         let delivered =

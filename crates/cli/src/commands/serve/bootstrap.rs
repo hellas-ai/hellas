@@ -1,28 +1,20 @@
 //! Normal node startup: an uninitialized node waits for its owner to pair.
 use anyhow::{Context, Result};
 use hellas_private::StoreLocation;
-use hellas_sdk::{
-    grant_config::GrantConfig,
-    node_control::{RemoteControlAdmission, bootstrap},
-};
+use hellas_sdk::node_control::{RemoteControlAdmission, bootstrap};
 
 pub async fn prepare(
     home: &StoreLocation,
     transport_key: &iroh::SecretKey,
     enrollment: &hellas_rpc::ProviderEnrollmentBundle,
     port: Option<u16>,
-    configured: Option<GrantConfig>,
-) -> Result<(GrantConfig, Option<iroh::Endpoint>)> {
-    let root = GrantConfig::provider_dir(home);
-    let mut config = configured.unwrap_or_else(|| GrantConfig::unconfigured(home));
-    // The owner administers the node through credential-gated remote ingress.
-    // An existing allowlist remains a narrower operator-selected restriction.
-    if !config.remote_control.enabled() {
-        config.remote_control = RemoteControlAdmission::credential_gated();
-    }
+) -> Result<Option<iroh::Endpoint>> {
+    let root = home.child("provider");
+    let journal = root.child("authority");
+    let remote_control = RemoteControlAdmission::credential_gated();
     let now = hellas_auth::authority::UnixMillis::now()?;
     match hellas_authority::work_store::grant::NodeStore::open(
-        &config.journal_root(),
+        &journal,
         hellas_authority::model::grant::grant_network(),
         Some(enrollment.clone()),
         now,
@@ -31,7 +23,7 @@ pub async fn prepare(
     {
         Ok(mut store) => {
             store.close().await;
-            return Ok((config, None));
+            return Ok(None);
         }
         Err(hellas_authority::work_store::grant::NodeStoreError::Uninitialized) => {}
         Err(error) => return Err(error.into()),
@@ -40,25 +32,26 @@ pub async fn prepare(
     // No client trusts local TLS before initialization. Generate it before the
     // authority commit; after a crash, committed store state skips regeneration.
     let tls = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
-    hellas_private::write_atomically(&config.control_certificate(), ".writing", tls.cert.der())?;
+    hellas_private::write_atomically(&root.child("control.cert.der"), ".writing", tls.cert.der())?;
     hellas_private::write_atomically(
-        &config.control_private_key(),
+        &root.child("control.key.der"),
         ".writing",
         &tls.signing_key.serialize_der(),
     )?;
-    let endpoint = hellas_sdk::node_control::host::bind_transport(
+    let endpoint = hellas_sdk::node_control::bootstrap::bind_transport(
         transport_key.clone(),
         port,
-        config.remote_control.clone(),
+        remote_control,
     )
     .await?;
-    hellas_wire::iroh::close_on_error(&endpoint, pair(&endpoint, &config, enrollment, now)).await?;
-    Ok((config, Some(endpoint)))
+    hellas_wire::iroh::close_on_error(&endpoint, pair(&endpoint, &journal, enrollment, now))
+        .await?;
+    Ok(Some(endpoint))
 }
 
 async fn pair(
     endpoint: &iroh::Endpoint,
-    config: &GrantConfig,
+    journal: &StoreLocation,
     enrollment: &hellas_rpc::ProviderEnrollmentBundle,
     now: hellas_auth::authority::UnixMillis,
 ) -> Result<()> {
@@ -72,7 +65,7 @@ async fn pair(
     let result = bootstrap::accept(
         endpoint,
         &invitation,
-        &config.journal_root(),
+        journal,
         hellas_authority::model::grant::grant_network(),
         Some(enrollment.clone()),
     )

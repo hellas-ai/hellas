@@ -1,7 +1,7 @@
-# Paid terms for `hellas serve --knowingly-unsafe --paid-work-config
-# faucet-provider.toml`, after `hellas faucet` funds this home's principal. The principal approves exactly
-# these terms at startup and delegates the stake its offers bond. Nothing
-# here has a built-in default; every field is required unless noted.
+# Paid terms for `hellas admin set-paid-policy --terms faucet-provider.toml
+# --expected-revision 0`, after pairing the daemon and funding/delegating stake.
+# The owner approves these exact terms; existing offers retain their policy.
+# Every field is required unless noted.
 
 # Omit to use the shipped devnet. Select a custom authenticated JSON chain
 # profile on the command line with --chain-config chain.json.

@@ -104,6 +104,7 @@ async fn app(work: Arc<Fake>) -> Router {
         })],
         work,
         Arc::new(crate::jobs::Jobs::default()),
+        Default::default(),
     )
     .await
     .unwrap()

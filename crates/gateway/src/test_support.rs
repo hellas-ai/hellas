@@ -29,6 +29,7 @@ pub fn selection(work: Arc<dyn WorkExecutionBackend>) -> Selection {
             overrides: Default::default(),
         })],
         work,
+        Default::default(),
     )
     .unwrap();
     routing
@@ -60,3 +61,5 @@ pub fn job() -> Arc<crate::jobs::Job> {
         })
         .unwrap()
 }
+
+pub(crate) mod server;

@@ -116,16 +116,15 @@ rejects a weaker output scheme.
   and paid gateway use this same session. `hellas_sdk::transact` executes folders and helper-built jobs.
 - `grant_client::GrantSession` owns a private grant channel and its proposal
   journal. Both session types use `WorkLink` for authenticated transport and the
-  common Work policy and transcript verification code. Grant Responses startup
-  lives in `grant_gateway::responses`; `gateway` always names `hellas-gateway`.
+  common Work policy and transcript verification code.
 - `PreparedInvocation` and `InvocationPolicy` select Compute or Fetch. Each
   profile validates its own canonical input, bounds and terminal result; the
   payment lifecycle does not interpret HTTP or model output.
-- `FetchProviderOptions` and `start_fetch_provider` take an operator's route
-  registry, enrollment and root prover. The host owns its identity and credentials;
-  the SDK validates resources before opening journals and builds a `WorkRouter`
-  for grants, payment channels, or both. `GrantProviderOptions` supplies available
-  resource policies and job bounds. Only payment channels start a chain observer.
+- `daemon::Core` runs the same document for the CLI and embedding hosts. It
+  validates local/Fetch resources before binding iroh, retains admitted backends
+  across configuration changes, and uses the host's enrollment and root prover.
+  Resources and budgets commit atomically with that document. Grant and Paid
+  work share the provider listener and its authority.
 - `HttpFetchRequest` and `HttpFetchResponse` express HTTPS semantics. The Fetch
   backend executes an admitted request; canonical transcript verification checks
   its result under the assurance requested by the caller.
@@ -136,8 +135,8 @@ ledger can use `hellas-rpc` and `hellas-channel` and `hellas-authority` without 
 
 Both funding paths reserve a `WorkPermit` before entering the executor queue.
 `AdmittedWork` carries that permit into `RunningWork`, which owns it until the
-physical invocation ends. Grant acceptance reserves capacity before co-signing;
-payment obligations wait for capacity. Grant execution and gateway tasks are
+physical invocation ends. Live Grant and Paid acceptance reserve their selected backend before co-signing;
+recovered paid obligations wait for capacity. Grant execution and gateway tasks are
 joined at shutdown, including after a journal failure. Provider and gateway
 shutdown return errors after cleanup, so callers must handle the result.
 

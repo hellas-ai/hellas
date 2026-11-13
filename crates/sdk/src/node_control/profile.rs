@@ -4,7 +4,6 @@
 
 use super::HostControl;
 use hellas_auth::authority::{AuthorityId, CredentialId, CredentialSecret, GrantId};
-use hellas_private::StoreLocation;
 use hellas_wire::ServiceMarker;
 use rustls::{ClientConfig, RootCertStore, ServerConfig, pki_types::*};
 use serde::{Deserialize, Serialize};
@@ -247,82 +246,6 @@ fn invalid(message: &'static str) -> io::Error {
 
 /// Explicit local HTTP authority. Embedded hosts pass their existing coordinator
 /// directly instead of opening its journal a second time.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GatewayProfile {
-    pub journal: PathBuf,
-    pub authority: AuthorityId,
-    pub authorization: GrantId,
-    pub credential: PathBuf,
-    /// Optional local HostControl on this writer, so credentials can be issued
-    /// and revoked while the gateway runs. Omit it to serve no administration.
-    pub control: Option<GatewayControl>,
-}
-
-/// Private socket and independently provisioned TLS identity for local control.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GatewayControl {
-    pub socket: PathBuf,
-    pub certificate: PathBuf,
-    pub private_key: PathBuf,
-}
-
-/// HTTP admission and, when configured, the control listener sharing its writer.
-/// Shut the listener down after the gateway stops.
-pub struct GatewayHost {
-    /// The same live authority writer used by HTTP admission and HostControl.
-    pub node: hellas_authority::node::NodeCoordinator,
-    pub access: hellas_gateway::GatewayAccess,
-    pub control: Option<hellas_wire::local::LocalControlServer>,
-}
-
-impl GatewayProfile {
-    pub async fn load(path: &StoreLocation) -> hellas_gateway::GatewayResult<GatewayHost> {
-        let profile: Self = serde_json::from_slice(&read_private(path)?)
-            .map_err(|_| invalid("invalid gateway profile"))?;
-        let parent = path.child(
-            path.parent()
-                .ok_or_else(|| invalid("profile needs a parent"))?,
-        );
-        let store = hellas_authority::work_store::grant::NodeStore::open(
-            &parent.child(profile.journal),
-            hellas_authority::model::grant::grant_network(),
-            None,
-            hellas_auth::authority::UnixMillis::now().unwrap_or_default(),
-        )
-        .await?;
-        if store.state().authority().authority() != profile.authority {
-            return Err(invalid("gateway profile authority mismatch").into());
-        }
-        let node = hellas_authority::node::NodeCoordinator::new(
-            store,
-            Arc::new(|| hellas_auth::authority::UnixMillis::now().unwrap_or_default()),
-        );
-        let access = hellas_gateway::GatewayAccess::new(
-            node.clone(),
-            profile.authorization,
-            read_credential(&parent.join(profile.credential))?,
-        )
-        .await?;
-        let control = profile
-            .control
-            .map(|control| {
-                let tls = server_identity(
-                    &parent.join(control.certificate),
-                    &parent.join(control.private_key),
-                )?;
-                super::NodeControl::new(node.clone()).bind_local(parent.join(control.socket), tls)
-            })
-            .transpose()?;
-        Ok(GatewayHost {
-            node,
-            access,
-            control,
-        })
-    }
-}
-
 #[cfg(test)]
 mod pin_tests {
     use super::*;

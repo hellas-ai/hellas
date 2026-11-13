@@ -108,6 +108,8 @@ pub enum Upstream {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Credential {
+    #[serde(default = "web_pki")]
+    pub trust_roots: hellas_rpc::http_fetch::HttpTrustRoots,
     pub allowed_origins: Vec<String>,
     pub allowed_paths: Vec<String>,
     pub allowed_methods: Vec<String>,
@@ -190,6 +192,19 @@ impl Document {
     }
 
     pub fn validate(&self) -> Result<(), &'static str> {
+        self.authority
+            .validate()
+            .map_err(|_| "invalid authority configuration")?;
+        // One provider enrollment owns one transport identity and set of paid journals.
+        if self
+            .listeners
+            .values()
+            .filter(|listener| matches!(listener, Listener::Iroh { .. }))
+            .count()
+            > 1
+        {
+            return Err("a daemon has one iroh provider identity");
+        }
         if self
             .backends
             .keys()
@@ -268,3 +283,7 @@ fn initial_revision() -> Revision {
 
 #[cfg(test)]
 mod tests;
+
+fn web_pki() -> hellas_rpc::http_fetch::HttpTrustRoots {
+    hellas_rpc::http_fetch::HttpTrustRoots::WebPki
+}

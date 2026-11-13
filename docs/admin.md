@@ -9,25 +9,23 @@ use by every command that acts for a principal. `--passkey FILE` (32 raw bytes
 or 64 hex digits) points at a key held outside the home instead, as services do
 with secrets under `/run`.
 
-Start a worker with `--program PROGRAM` for each Compute program it admits,
-plus `--content PATH` for the files those programs read. `hellas program
---backend EVALUATOR PATH` prints the id of a converted Whisper package or a Qwen
-GGUF rendered for the evaluator a GPU runtime registers, such as
-`hellas/catena-dfad87438018-hip`. That
-configures one `compute` resource with a machine/account budget; one job runs at
-a time. Use `--grant-config` instead for custom resources or budgets. A
-resource or paid terms may admit any program; compiling and running a program
-from an unknown author hands that author roughly root on the host, so `serve`
-refuses such a configuration unless `--knowingly-unsafe` acknowledges it.
+Start the daemon with `hellas serve`, pair its invite, then configure packages
+with `hellas route add PATH`. Fetch upstreams use `hellas backend add NAME URL
+--key-file FILE` and `hellas route add MODEL@NAME`. The verbs build one complete
+document and send one atomic `Configure`; `hellas routes` reads `Watch`.
+Each configured package or upstream publishes bounded resources that allowances
+can select. A program executes with the provider user's permissions; process
+isolation contains failures but is not a sandbox. Sharing a resource that admits
+arbitrary Compute requires `share --knowingly-unsafe`.
 
-A node with no paid terms and no owner prints one `hellas-invite:` line and
+A node with no owner prints one `hellas-invite:` line and
 waits. `hellas pair INVITE [--name NAME]` claims it with the home principal key.
 The pairing owner receives one year of full node administration, and the
 profile, kept at `<home>/nodes/NAME/profile.json` (`NAME` defaults to
 `default`), retains the node pin from the authenticated invite. `admin` and
 `share` use the only paired node unless `--profile` names another; an explicit
 different `--node` is rejected. See the
-[sharing section](../README.md#2-share-your-gpu-with-a-friend).
+[sharing section](../README.md#2-share-your-gpu).
 
 Node administration requires a scoped application credential and explicit
 operation grants. A credential is issued to a principal and held by a device: it
@@ -68,8 +66,8 @@ provider's price, execution limits and automatic-offer bounds. It requires the
 authority owner's passkey session and `work.paid.configure` on the machine
 resource. The node generates the policy salt and retains the original terms
 with each signed offer; changing the standing policy does not alter open channels.
-`serve --paid-work-config FILE` approves a file's policy this way at startup; see
-the [paid gateway guide](paid-gateway.md). The provider runs each Catena job in a
+Use `admin set-paid-policy --terms FILE --expected-revision REVISION` to approve
+paid terms; see the [paid work guide](paid-gateway.md). The provider runs each Catena job in a
 separate worker process. That isolation is crash/timeout containment, not a
 sandbox, and there is no memory metering. Requesters pay only for a result
 signed by this provider that matches their job; Hellas does not re-run it.
@@ -143,10 +141,9 @@ table below is checked against the implementation by the Work tests.
 | `content.collect` | Host | Host |
 | `content.resolve` | Host | Host |
 | `host.status` | Host | Host |
-| `host.provider.configure` | Host | Host |
+| `host.configure` | Host | Host |
 | `host.provider.bind` | Host | Host |
-| `host.gateway.configure` | Host | Host |
-| `host.gateway.access` | Host | Host |
+| `host.job.cancel` | Host | Host |
 | `gateway.invoke` | Host | Host |
 | `work.allowance.read` | Work machine | Provider |
 | `work.allowance.configure` | Work machine | Provider |
@@ -490,32 +487,23 @@ PKCS#8 `control.key.der` under `<home>/provider`. The control socket and TLS fil
 use that directory; the grant authority journal is `<home>/provider/authority`.
 The daemon validates TLS identity before
 opening the provider and binding listeners. Startup does not generate trust files.
-After explicit initialization, start the daemon with `--grant-config`. Its file
-contains `max_job_millis`, optional listener settings, machine/account budgets
-and complete resource policies. Resource entries require the full invocation
-policy and pricing fields accepted by the strict grant-config loader. The
-[sharing section](../README.md#2-share-your-gpu-with-a-friend) shows the
-ordinary setup, which needs no file.
+After explicit initialization, start `hellas serve`. Routing and resource
+configuration live in the authority journal. `Configure` validates the whole
+candidate, including resource revisions, then commits the document, machine
+budget, accounts and resources in one frame. A rejected update leaves all of
+them unchanged in memory and after restart. Budget edits preserve usage and
+reservations. Configuration never issues allowances or credentials.
 
-Serving resources requires `machine`; every resource's account must be declared in
-`accounts`, and every declared account must be used. Limits use the same
-`{"meter","window","amount"}` form as budgets. Whenever the provider starts with an
-initialized authority, including just after first pairing, the node applies this
-file: the machine first, then accounts, then resources, each committed only if it
-differs from the durable state. Budget changes preserve counters, reservations and
-outstanding work. The file never issues allowances, grants or credentials, and it
-cannot revise, revoke or renew an existing allowance; those remain checked
-administration commands, beginning with `work` and `Create`.
+A resource's `config_change` is `keep` by default: accepted jobs retain their
+original policy through execution and delivery. `release` ends accepted work
+as Released and cancels running work and delivery. Grant revocation, expiry
+and resource quarantine stop work under either option. There is no separate
+resource history or document file.
 
-The SDK Fetch provider follows the same sequence: initialize offline, start, then
-use its checked administration service. Its options describe available policies and
-maximum job duration; there is no contact list that silently grants execution.
-
-Embedding hosts now use `hellas_share::start_openai_provider` for the OpenAI
-Responses adapter. Its explicit account/resource configuration uses SDK's same
-checked service; no resources or allowances are created at startup. The core CLI's
-`openai-responses` serving destination is removed. Ordinary Fetch clients and gateways
-continue to consume the protocol independently of this hosting library.
+Embedders can build OpenAI Responses resources with
+`hellas_share::openai_document`, then open the same `hellas_sdk::daemon::Core`
+used by the CLI. The iroh listener uses the host's supplied enrollment and root
+prover, including App Attest in Gate.
 
 OpenAI grant resources require a `responses` block, also supplied by the `hellas-share` host
 options. For example, this resource fragment permits text requests for one exact model:
@@ -532,7 +520,7 @@ explicit fields through `temperature`, `top_p`, `tools`, `parallel_tool_calls` a
 `automatic_truncation`. `output_formats` selects `text`, `json_object` or `json_schema`.
 Nonempty `reasoning_efforts` and `reasoning_summaries` sets require an explicit supported
 choice in every request; empty sets forbid explicit values. Configure revised limits
-through the normal resource revision command, then revise the allowance's selection.
+through `Configure` with the next resource revision, then revise the allowance's selection.
 Work reserves each signed `max_output_tokens` against the output-token meter at every
 shared budget ancestor. After complete transcript verification, it charges the final
 output count and releases the unused reservation. Missing or invalid usage keeps the
@@ -549,8 +537,7 @@ Provisioning uses the client-side `machines --credential-source FILE
 shown in [machine provider configuration](machine-provider-config.md). Provisioning
 passes no owner credential or transport secret to the provider.
 
-The ordinary node image runs `serve --port 31145`. A node with no paid terms
-and no owner prints one `hellas-invite:` line: its public transport pin, direct
+The ordinary node image runs `serve --port 31145`. A node with no owner prints one `hellas-invite:` line: its public transport pin, direct
 addresses, expiry and a fresh random secret. Copy it from the node's own
 console or output and keep it private. Before ownership, only the bounded
 one-shot bootstrap exchange is available. Eight incorrect pairing proofs
@@ -581,100 +568,57 @@ the prior configuration and keys and reports failed until
 I/O failure is reported as a failure, never as successful recovery.
 
 Share execution with `hellas share`; the recipient passes the access file to
-job commands or `gateway --access FILE`.
+job commands. Import it with `pair FILE --name CONTACT` for gateway
+`--model NAME@CONTACT` or `--model PATH@CONTACT`.
 
 
 ## Embedded host lifecycle
 
-`sdk::node_control::host::HostHandle::start` owns an existing `NodeCoordinator`,
-an authenticated local control listener and a bounded lifecycle supervisor. Provider startup is selected with `start_provider`; the gateway begins stopped. `hellas-share`'s `OpenAiProviderOptions::into_factory()` returns a provider
-factory for the OpenAI Responses adapter that keeps the caller's root prover and
-enrollment as supplied. Other providers prepare the shared SDK provider options
-and select `on_host(control)` before startup. That attaches the existing writer;
-it cannot open a second journal.
+`hellas_sdk::daemon::Core` owns one snapshot, backend sessions, listeners and
+admitted jobs. Open it with the host's `NodeCoordinator`, content store,
+identity and optional iroh prover; `restore` reads its document from the
+journal. The local HostControl listener attaches to `core.control()`.
 
-`SetProviderState` and `SetGatewayState` carry an `authorization` grant and require
-`host.provider.configure` and `host.gateway.configure`, respectively. Their
-bounded enqueue is checked under the authority writer. The host owns completion
-if the requesting RPC disappears; revocation does not undo an already accepted
-command. Replies recheck current rights. A full eight-command queue refuses
-further commands, and service errors require an explicit subsequent request.
+`Configure(expected_revision, document)` requires `host.configure`. Preparation
+may be cancelled, but journal commit and publication form one daemon-owned
+task that survives the requesting connection. `Watch` requires `host.status`
+and streams the initial document, backend health and jobs followed by changes.
+Secrets are redacted. `CancelJob` requires `host.job.cancel`: it stops an
+unproposed job, cancels local execution, or stops remote delivery while retaining
+collection and settlement. `GetHostStatus` reports identity and authority
+metadata; runtime state comes from `Watch`.
 
-A host can start on an authority with no bound provider. It serves control,
-grants and credentials; its provider status reads `provider is not bound`, and
-`SetProviderState` refuses to start the provider with `FailedPrecondition` until
-`bind-provider` succeeds. No restart is needed after binding.
+An unchanged entry is reused by ID. Preparation errors retain the old snapshot;
+a removed backend survives until its accepted jobs end. A daemon owns one iroh
+provider identity and may bind several HTTP listeners. Iroh accepts only local
+Compute and Fetch backends, with unambiguous evaluator or service/method keys.
+Remote Grant and Paid backends serve HTTP requests, never forwarded prepared
+invocations. Shutdown drains accepted work before closing transports and stores.
 
-`GetHostStatus` reports the bound provider's identity, provider/gateway states and
-the running provider endpoint. Stop drains accepted Work; local control and its writer
-remain alive. Work administration remains available after the provider stops.
-Full host shutdown joins its local listener and both services.
-`GetGatewayAccess` separately requires `host.gateway.access`; it returns an address
-and the current scoped HTTP Auth credential only while the gateway is running.
-Remote control is disabled by default. Explicit credential-gated ingress permits
-application authentication from any transport key; a configured endpoint allowlist
-restricts it further. A node started by `serve` without paid terms uses
-credential-gated ingress so its owner can administer it after pairing.
-A standalone `NodeControl` without a host supervisor leaves lifecycle operations
-unmounted; constructing the composed host supplies their implementation.
+Remote control remains credential-gated; an optional transport allowlist
+further limits ingress. Neither a local socket nor an allowed transport key
+grants application authority. A standalone `NodeControl` has no daemon methods
+until it is attached to a `Core`.
 
-
-Caller trust for paid and grant execution is configured separately with `hellas trust`.
-`approve` requires a reviewed policy file, expected revision (zero for creation) and
-reason; `show` reports current pins and latest approval. Paid and granted jobs and
-gateways select `--trust-store` and `--trust-policy`; an access file cannot replace
-the approved pins.
-See [paid gateway trust configuration](paid-gateway.md) for the file format and
-replacement procedure. This does not grant provider administration rights.
-
-Restart the gateway to use an updated caller policy.
-Nix gateway services use `trustStore`, `trustPolicy` and the principal's
-`passkey` file, plus `access`, or `pay` with `provider`.
-Provision these private files for the service user before startup; Nix declarations
-do not approve trust or create grants.
+Caller trust remains separate from administration. `hellas trust approve`
+requires a reviewed policy, expected revision and reason. SDK Grant and Paid
+backend entries select that policy with their `trust` field; an access bundle
+cannot substitute its own pins. See [paid work trust](paid-gateway.md).
 
 ## HTTP gateway authority
 
-A loopback gateway provisions its own authority on first start: under
-`<home>/gateway`, owned by the home principal, with one bearer credential that
-may only invoke the gateway, kept in `<home>/gateway/bearer`. Local clients read
-it and `--wrap` hands it to its child.
+A stateless `gateway` creates an ephemeral authority and a bearer restricted to
+`gateway.invoke`. It prints the bearer to the terminal or passes it to its
+wrapped child, and does not save it. A stateful or embedded HTTP listener uses
+its node's authority and explicitly issued bearer credentials.
 
-A gateway with `--allow-remote` requires `--gateway-profile FILE`, an explicitly
-provisioned authority: a private JSON file with
-`journal`, `authority`, `authorization`, and `credential` fields. `journal` names
-an explicitly bootstrapped local NodeStore; `authority` and `authorization` are its
-Auth AuthorityId and selected GrantId in their usual JSON forms. `credential` names
-the private 48-byte bearer credential file written by `issue-credential --holder`
-with the `"Bearer"` holder, or by bootstrap's `--bearer-out`.
-An optional `control` object with `socket`, `certificate` and `private_key` serves
-local HostControl on that writer. Credential issuance and revocation then work while
-the gateway runs, using the same `admin --profile ... --control-socket` commands
-and checks as a daemon. Omit it to serve no administration.
-Relative paths are resolved from the profile directory. The journal has one writer;
-an embedded gateway receives its host's existing NodeCoordinator instead of opening
-that journal again. Missing, mismatched or corrupt state fails startup.
-
-Provision a grant for `gateway.invoke` on the authority's host resource. Issue a
-bearer credential scoped only to that permission, with no issuance ceiling or
-delegation. The selected grant must name the same subject and remain current.
-Device-held and administrator credentials are rejected as HTTP credentials; the
-bootstrap credential is never the bearer. The profile's `authorization` names the grant that
-authorizes the gateway's own bearer. An HTTP request may present a bearer that grant
-authorizes, or one whose subject holds its own current grant of `gateway.invoke`
-alone on this authority, so each principal using the gateway can have its own grant
-and credential.
-Existing offline bootstrap and checked `issue-credential` commands own provisioning;
-starting a listener does not create authority or credentials.
-
-Clients send the credential's 16-byte ID followed by its 32-byte secret, encoded as
-96 lowercase hex characters, in one `Authorization: Bearer` header. The gateway
-shows it on the controlling terminal and supplies it to explicitly wrapped children.
-It strips the local authorization header before forwarding. Query parameters,
-cookies, duplicate authorization headers and old 64-character static tokens are
-refused. Every new HTTP request authenticates against current Auth state; revoking
-its credential or grant, or reaching expiry, refuses subsequent requests. Accepted
-Work keeps its separate application authority and recovery/settlement obligations.
+Provision a grant for `gateway.invoke` on the authority's host resource. Issue
+a bearer credential containing only that permission, with no issuance ceiling
+or delegation, for the same subject. Its selected grant must remain current.
+Device-held and administrator credentials are rejected as HTTP credentials.
+Every new request authenticates against current authority state; revocation or
+expiry refuses subsequent requests. Accepted Work retains its independent
+execution authority and settlement obligations.
 
 ### Inspecting and reconciling administration
 

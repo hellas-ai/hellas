@@ -1,129 +1,83 @@
-# HTTP APIs through Fetch
+# HTTP gateway
 
-`gateway --http-fetch-config FILE` exposes exact HTTP routes over HTTPS Fetch,
-paid with `--pay MAX --provider ENROLLMENT_ID@NODE_ID` or granted with
-`--access FILE`. Request and response bodies keep the upstream format,
-including SSE, tool calls and non-2xx errors. Every request runs as one Fetch
-job on the gateway's one provider, through the same `Executor` as the job
-commands. See [provider account and egress configuration](../crates/providers/HTTPS.md).
-
-The gateway's standard API paths can serve several accounts or provider nodes.
-It reads the requested model, finds backends configured to serve that model and
-route, and keeps an existing session on its assigned backend. Model names and
-request/response bodies are forwarded unchanged.
-
-Example with two Kimi accounts behind one endpoint:
-
-```json
-{
-  "service": "https",
-  "method": "request",
-  "max_in_flight": 2,
-  "backends": {
-    "kimi-a": {
-      "models": ["k3"],
-      "credential": "kimi-a",
-      "routes": [{
-        "path": "/v1/chat/completions",
-        "method": "POST",
-        "url": "https://api.kimi.com/coding/v1/chat/completions"
-      }]
-    },
-    "kimi-b": {
-      "models": ["k3"],
-      "credential": "kimi-b",
-      "routes": [{
-        "path": "/v1/chat/completions",
-        "method": "POST",
-        "url": "https://api.kimi.com/coding/v1/chat/completions"
-      }]
-    }
-  }
-}
-```
-
-Both accounts use the same client base URL, such as `http://127.0.0.1:8080/v1`.
-Add backends with their exact supported models and API routes for other accounts.
-The configured service and method must match the provider's Fetch route. An
-optional backend `max_in_flight` overrides the global per-account limit. Routes
-sharing a credential alias on the same provider share capacity and cooldown;
-duplicating that alias does not multiply its allowance.
-
-A backend's optional `provider` is an endpoint ID; it may be omitted, and must
-then be the gateway's provider. Addresses, funding, journals and enrollment/Apple
-trust pins come from the gateway's `--pay`/`--provider` or `--access`, and
-`--trust-store`/`--trust-policy`. The provider must expose the configured
-service/method.
-
-The gateway bearer authorizes access to the gateway's payment or grant
-identity. The router selects an account, then the client signs the exact Fetch
-request and proposes it on the provider's channel. The provider checks the funded edge,
-credit, deadlines, signature and Fetch policy before durably accepting work;
-only that accepted job can invoke the upstream. The credential's origin, path
-and method restrictions remain enforced by the provider. Every execution is authorized by Work.
-
-The SDK Fetch provider advertises only Work and WorkSetup when configured for
-paid work. Accepted paid Fetch jobs wait in a bounded provider queue when upstream
-concurrency is full. Further submissions wait at the executor mailbox while
-completion handling remains available. Provider validator connections check the
-configured genesis digest before advancing payment state; this check runs on
-connection, not per HTTP request.
-
-Signed response prefixes stream as they arrive. Successful HTTP completion
-follows verification of the complete result and the provider's durable payment
-acknowledgement. Each accepted valid terminal costs the channel's agreed fixed
-price, including HTTP error statuses. Already available prefixes share bounded
-wire frames, with a local observer-readiness check before each frame and individual
-signature checks for every event. Batching does not wait for more upstream data.
-Requests are not retried after account selection. The gateway runs one
-request at a time: a channel journal, a funding wallet and a machine each have
-one owner. Concurrent requests queue, including requests for different accounts.
-
-Paths and methods match exactly; query parameters retain their order, repeats
-and percent encoding. Ordinary client headers, including idempotency keys and
-vendor extensions, pass through. Connection-specific headers, credentials,
-cookies and gateway control headers are removed; the caller's gateway bearer
-never becomes an upstream credential. Optional route `headers` holds operator
-`[name, value]` pairs, with lowercase names. Configured values override the
-corresponding client header. Account credentials belong on the backend.
-
-For opaque HTTP passthrough without model selection, configure top-level `routes`
-instead of `backends`.
-
-Omit `credential` for an unauthenticated upstream. Such routes share admission
-by origin. Optional `tls` uses the [Fetch TLS vocabulary](../crates/providers/HTTPS.md)
-for exact trust anchors and pins, defaulting to WebPKI. Custom roots cannot be
-combined with a provider credential; that restriction remains enforced by the
-provider. Private destinations also require its explicit egress opt-in.
+`hellas gateway` builds one daemon document from repeatable flags and runs in
+the foreground. It saves no routing configuration. Local models, friends'
+grants and API upstreams can appear together:
 
 ```sh
-hellas gateway --http-fetch-config ./http-gateway.json \
-  --pay 20 --provider ENROLLMENT_ID@NODE_ID --port 8080
+hellas gateway \
+  --model ./qwen3.gguf --model ./whisper-tiny --model ./flux \
+  --model ./qwen3.gguf@alice \
+  --upstream openrouter=https://openrouter.ai/api,key-file="$HOME/or.key" \
+  --model gpt-5@openrouter
 ```
 
-A loopback gateway keeps its own bearer in `<home>/gateway/bearer`; a remote
-one needs an explicitly provisioned
-[HTTP authority profile](admin.md#http-gateway-authority). The client signs the request and verifies each response chunk before forwarding
-it. Provider-owned credentials require public WebPKI roots. The gateway asks the
-provider for ephemeral retention and disables inference replay. Its own archive
-policy is independent of provider retention and upstream `store` fields.
+A local path accepts the existing `ModelPackage` formats: Qwen GGUF and
+converted Whisper or Flux directories. The package determines the modality
+and API paths. Remote Compute uses `PATH@CONTACT`: the gateway needs that
+local package to render the invocation for the contact's evaluator. A Fetch
+grant uses `NAME@CONTACT`, checked against the models in its signed offer.
+Import contacts and access with `hellas pair … --name CONTACT`. For an App
+Attest provider, independently approve its pins under the same contact name:
+`hellas trust --store "$HELLAS_HOME/trust" approve CONTACT --policy POLICY.json
+--expected-revision 0 --reason REASON` (use `~/.hellas/trust` for the default
+home). The bundle cannot approve or replace those pins.
 
-For Kimi Code, set `KIMI_MODEL_NAME` to an available model and use `--wrap kimi`;
-the wrapper supplies `KIMI_MODEL_BASE_URL` and `KIMI_MODEL_API_KEY`. A separately
-launched client can use the same variables and the bearer in `<home>/gateway/bearer`.
-Choose a context size that fits the byte limits below.
+`NAME@UPSTREAM` selects a named OpenAI-compatible HTTPS endpoint. Its key file
+is read once and the key remains write-only in the configuration. Startup
+prints a table of model, modality, API path, backend, state and jobs in flight.
+There are no routing files or per-modality flags.
 
-## Model selection and session affinity
+The default HTTP address is `127.0.0.1:8080`; `--bind ADDRESS:PORT` changes it.
+Every request requires a scoped `gateway.invoke` bearer. The foreground
+command prints its bearer to the terminal, or passes it directly to a child:
 
-New sessions use an eligible account outside cooldown with available capacity.
-The gateway chooses the least occupied account, rotating ties. Existing sessions
-stay pinned even when that account becomes busy or rate-limited: they receive a
-retry response; new sessions can use another account. A request is sent once.
-Neither a transport failure nor an upstream error causes automatic replay on a
-different backend. A transport failure briefly excludes that backend from new
-sessions. Quota polling remains monitoring; selection uses configured model
-capabilities, current capacity and observed response cooldowns, not estimates
-from token usage or external quota scrapes.
+```sh
+hellas gateway --model ./qwen3.gguf --wrap claude
+```
+
+`--wrap` supplies OpenAI and Anthropic URLs and tokens, and drains accepted
+work when the child exits. It does not write a bearer file.
+
+## Persistent service
+
+`hellas serve` runs the same core, restoring its document from the authority
+journal. It has no routing flags. Pair its printed invite first, then use the
+paired profile for edits:
+
+```sh
+hellas backend add upstream https://api.example.com/v1 --key-file "$HOME/api.key"
+hellas route add gpt-5@upstream
+hellas route add /srv/models/qwen3.gguf
+hellas routes
+hellas route rm gpt-5@upstream
+hellas backend rm upstream
+```
+
+Each mutation reads `Watch`, changes the complete document and sends one
+`Configure` with its expected revision. A stale revision or invalid candidate
+changes nothing. The authority journal commits the document, resources and
+budgets in one frame; the serving snapshot changes only after durability.
+Commit and publication survive the control caller disconnecting. `Watch`
+reports the result to other callers. Keys are never echoed.
+
+Local package paths must be readable at the same path by the editing CLI and
+the daemon. A removed backend stays alive for admitted work. Resource edits
+keep accepted terms by default; a resource's `release` option instead cancels
+its existing work. Revocation, expiry and quarantine always stop work.
+
+The stateful HTTP listener uses explicitly issued HTTP credentials from the
+node authority; a control credential is not an HTTP bearer. Embedders use
+`Configure`, `Watch` and `CancelJob` for the same operations.
+
+## Routing and sessions
+
+Repeating a model for several backends preserves their order. Selection skips
+unavailable or full candidates before a proposal. After a proposal, the job
+belongs to that backend: errors and connection loss never replay it elsewhere.
+Several jobs can run on the same Grant or Paid backend within its capacity.
+An iroh listener makes one exact lookup by Compute evaluator or Fetch service
+and method, and can serve only local and Fetch backends.
 
 Affinity recognizes `x-hellas-session-id`, Claude Code's
 `x-claude-code-session-id`, Codex's `session-id`/`thread-id`, Claude's session ID
@@ -151,135 +105,31 @@ model receives 404; malformed or unsupported routing input receives 400. These
 checks precede upstream execution. Model-less, empty-body auxiliary requests use
 an eligible backend; account-specific quota endpoints are not aggregated.
 
-## Archives and ZDR
+## Payloads and cancellation
 
-Fetch payment journals on both endpoints retain hashes, signatures and accounting
-records, with payloads held in memory. After a restart they can re-send an existing
-payment certificate, but cannot reconstruct or replay a lost request/response.
-Unpaid work with a lost payload keeps its channel reserved until its payment
-deadline; it is never re-executed from a new request. Existing payload-bearing
-Fetch journals are refused instead of silently changing their retention policy.
-The HTTP archive below is the gateway's separate payload persistence policy.
+The CLI's HTTP listeners use ZDR: request and response payloads are not
+archived. This governs application writes, not OS swap, upstream retention or
+a coding client's session logs. Embedders can configure an HTTP listener's
+archive policy; archives then live under `<home>/gateway-archive` and exclude
+authentication headers. A request can further restrict persistence with
+`x-hellas-zdr: true`.
 
-CLI gateways archive authenticated requests and responses by default under
-`<home>/gateway-archive`. This applies to the
-existing inference routes as well as HTTP Fetch. Each exchange has owner-only
-`request.bin`, `response.bin` and `metadata.json` files. Metadata records status,
-size, content type/encoding, elapsed time, completion, selected backend and trace context; it excludes authentication
-headers. `x-hellas-request-id` identifies the exchange. Failed or cancelled
-streams retain an incomplete archive. Archiving is best-effort: failures during
-setup, request/response writes or finalization are reported without replacing
-the upstream status or interrupting its response. After a write fails, archiving
-stops for that exchange; the next ordinary request attempts a fresh archive.
-Once an archive has been created, `x-hellas-request-id` remains present even if
-saving its response metadata fails. It identifies an archive attempt, not a
-guarantee of a complete durable record. There is no automatic archive pruning.
+Before proposal, disconnect or `CancelJob` prevents execution. After a remote
+proposal, cancellation stops delivery while collection and settlement remain
+owned by the daemon. Shutdown drains these obligations. Fetch payloads held
+only in memory cannot be reconstructed after restart; retained signatures and
+payment evidence still support recovery without replaying the request.
 
-Archive failures emit a `hellas_archive` warning with the operation, I/O error
-kind and OS error code, without payloads, credentials, paths or raw error text.
-With `otel`, `hellas.gateway.archive.failures` counts failures by `archive.stage`
-(`prepare`, `request`, `response_head`, `response_body`, `finish`) and `error.type`.
-The Prometheus name is `hellas_gateway_archive_failures_total`. Successful HTTP
-responses remain successful in request telemetry even when their archive fails;
-monitor the archive counter separately. ZDR requests do not attempt archival or
-increment this counter.
+Upstream HTTP status and allowed end-to-end headers reach the caller. Cookies,
+hop-by-hop headers and gateway credentials are removed. Responses obey the
+signed Fetch envelope and transcript limits as well as the granted or paid
+policy. Bodies that exceed those limits fail as incomplete rather than being
+silently truncated into a successful result.
 
-`x-hellas-zdr: true` disables application payload persistence for that request.
-`--zdr` enforces this for all requests. Ambiguous flags, `store: true`, and ZDR
-with inference caching enabled are rejected before archive writes. The
-`store: true` check reads the decoded body, so a gzip or zstd request cannot
-smuggle the flag past it. A non-ZDR
-request may be archived even when its upstream `store` is false. Unauthorized,
-invalid ZDR requests and bodies exceeding the 2 MiB ingress limit are rejected
-without payload archives. Non-ZDR requests that pass ingress but exceed the
-smaller Fetch envelope limit are archived with their 413 response.
+## Telemetry
 
-These switches govern this gateway's application writes. They do not establish
-OS swap/dump protection, a remote provider's host policy, upstream retention,
-or the coding client's own session-log policy. Software identities do not
-attest those properties.
-
-## Responses grants
-
-An access file whose resource seals one stateless Responses route serves
-`/v1/responses`:
-
-```sh
-hellas gateway --access friend.access \
-  --trust-store ./trust --trust-policy PROVIDER --port 8080 --zdr
-```
-
-Requests are authenticated by the gateway's bearer. The granted policy
-determines the sealed route and environment. With a text `--model` as well,
-`/v1/responses` is split by model: `--responses-model` names the models the
-Fetch answers to. Archive/ZDR, `--allow-remote`, `--responses-overrides` and
-`--wrap` use the shared gateway behavior. A granted HTTPS resource likewise
-presents its own routes without `--http-fetch-config`. Shutdown drains accepted
-Work and closes its endpoint.
-
-## Limits and telemetry
-
-HTTP input is limited to 1,523,712 bytes, reserving envelope space inside the
-2 MiB signed Fetch request. Responses are limited to 8 MiB and the Fetch stream
-to 32,768 events and 16 MiB of signed payload. The paid policy can impose tighter
-limits; its transcript spool is capped at 32 MiB. Configure the spool and output
-budgets for the encoded HTTP response (including base64 and signed envelopes).
-Each wire frame remains bounded independently: Fetch completion authenticates
-all preceding prefixes without packing the full response back into one frame.
-
-The provider has a 20 minute total HTTP deadline and a 90 second response idle
-timeout. The gateway's on-chain block deadlines (`--acceptance-blocks`,
-`--terminal-blocks`, `--payment-blocks`) must also fit the expected execution
-time. Exceeding a stream limit closes it as incomplete.
-Individual upstream deliveries are forwarded promptly, split at 16 KiB.
-Before proposal, a disconnect cancels the request. After proposal, collection and
-payment continue independently of the HTTP reader. The bounded HTTP output queue
-reports an error to a stalled reader without stopping settlement; graceful
-shutdown drains accepted operations. Unfinished operations retain their accounting
-evidence for recovery, subject to Fetch's in-memory payload lifetime.
-
-No generation is automatically retried upstream. Upstream status and end-to-end
-response headers reach the client, including Location, ETag, `Retry-After`,
-request IDs and rate limits. Hop-by-hop headers and cookies are removed. Body
-framing is regenerated; representation Content-Length is retained for HEAD/304.
-A 429, or a 5xx carrying `Retry-After`, starts a shared account cooldown;
-delta seconds and HTTP dates are accepted. Requests during cooldown receive
-the status that established the longest remaining delay: a 503 remains a 503,
-so clients can keep retrying overloads. Missing or invalid delays on a 429 use one second. Excess
-concurrency returns 503 with `Retry-After: 1`.
-
-An `otel` build exposes these metrics at `/metrics` when `--metrics-port` is set.
-`--metrics-addr IP` selects the interface (default `127.0.0.1`); the response is
-unauthenticated. The same instruments can also be pushed through OTLP.
-Default builds omit both metrics flags and the instrumentation.
-
-With `otel`, traces connect HTTP ingress, Fetch RPCs, credential refresh and
-upstream HTTP. Span attributes exclude request/response bodies and credentials.
-`hellas.backend` and `gen_ai.request.model` identify configured backend/model
-choices in request metrics and traces; `hellas.routing.affinity` records the
-selection reason in traces. Raw session IDs are not exported.
-Outbound trace context replaces the caller's propagation headers instead of
-appending duplicates. Upstream response `traceparent` and `tracestate` are
-preserved; `x-hellas-trace-id` identifies the gateway's trace independently.
-Pooled QUIC connections have separate root spans so their lifetime cannot delay
-exporting the first request's trace.
-`hellas.gateway.http.requests`, `.duration`, `.time_to_first_byte` and `.tokens`
-record status, completion, timings and standard OpenAI/Anthropic usage fields.
-SSE usage is recognized even when the upstream omits Content-Type. Cache reads
-and writes are reported separately as `cache_read` and `cache_write` token kinds;
-the input/output counts retain the upstream's meaning. Usage is unknown when
-upstream omits it.
-Bodies remain encoded on the wire and in archives. Usage observation accepts
-plain JSON/SSE and gzip, with a 32 MiB decoded-byte budget and a 512 KiB pending
-JSON/line budget. Invalid compression, unsupported encodings or exceeded budgets
-leave usage unknown without affecting delivery.
-Account quota windows still come from the upstream quota exporter. Request
-token totals alone cannot determine subscription quota or billing.
-
-This is an HTTP API bridge with explicit routes, authentication and resource
-limits. It does not implement CONNECT, WebSocket upgrades, streaming uploads,
-HTTP trailers or automatic rewriting of redirect URLs. Clients using Responses
-WebSockets must select their HTTP/SSE transport. Archive I/O remains on the
-response path, although its errors do not fail requests. These are contract
-differences from a general transparent HTTP proxy, even when inference and
-tool-call payloads are preserved exactly.
+An `otel` build enables `--metrics-port` and `--metrics-addr` for Prometheus.
+The metrics endpoint is unauthenticated and binds to loopback by default.
+`hellas routes` reads current backend health and jobs from `Watch`. Trace
+attributes name configured backends and models; they exclude payloads,
+credentials and raw session identifiers.

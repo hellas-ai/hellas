@@ -70,21 +70,17 @@ async fn http_uses_the_paid_backend_and_waits_for_its_payment_completion() {
         let config = vec![http("/v1/responses", None, Some("account"))];
         let archive = tempfile::tempdir().unwrap();
         let fixture = crate::access::tests::Fixture::new().await;
-        let handle = crate::start(crate::GatewayOptions {
-            jobs: Arc::new(crate::jobs::Jobs::default()),
-            server: crate::ServerOptions {
-                archive: crate::ArchiveOptions {
-                    directory: archive.path().into(),
-                    zdr: true,
-                },
-                host: "127.0.0.1".into(),
-                port: Some(0),
-                access: fixture.access,
-                allow_remote: false,
+        let handle = crate::test_support::server::serve(
+            fixture.access.node(),
+            fixture.access.bearer(),
+            crate::ArchiveOptions {
+                directory: archive.path().into(),
+                zdr: true,
             },
-            work: paid.clone(),
-            routes: config,
-        })
+            paid.clone(),
+            Arc::new(crate::jobs::Jobs::default()),
+            config,
+        )
         .await
         .unwrap();
         let client = reqwest::Client::new();
@@ -320,25 +316,21 @@ async fn exchange(address: std::net::SocketAddr, bearer: &str) -> String {
 
 /// A gateway serving the HTTP Fetch presentation, with archiving enabled so
 /// trailers must pass through it too. The directory stays alive with the test.
-async fn proxy(paid: Arc<Proxied>) -> (crate::GatewayHandle, tempfile::TempDir) {
+async fn proxy(paid: Arc<Proxied>) -> (crate::test_support::server::Server, tempfile::TempDir) {
     let config = vec![http("/v1/responses", None, None)];
     let archive = tempfile::tempdir().unwrap();
     let fixture = crate::access::tests::Fixture::new().await;
-    let handle = crate::start(crate::GatewayOptions {
-        jobs: Arc::new(crate::jobs::Jobs::default()),
-        server: crate::ServerOptions {
-            archive: crate::ArchiveOptions {
-                directory: archive.path().into(),
-                zdr: false,
-            },
-            host: "127.0.0.1".into(),
-            port: Some(0),
-            access: fixture.access,
-            allow_remote: false,
+    let handle = crate::test_support::server::serve(
+        fixture.access.node(),
+        fixture.access.bearer(),
+        crate::ArchiveOptions {
+            directory: archive.path().into(),
+            zdr: false,
         },
-        work: paid,
-        routes: config,
-    })
+        paid,
+        Arc::new(crate::jobs::Jobs::default()),
+        config,
+    )
     .await
     .unwrap();
     (handle, archive)
@@ -485,9 +477,14 @@ async fn signed_single_route_registers_response_for_followup() {
     use tower::ServiceExt;
     let work = Arc::new(ContinuationBackend { calls: 0.into() });
     let config = vec![http("/v1/responses", Some(vec!["m".into()]), None)];
-    let app = crate::router::router(config, work.clone(), Arc::new(crate::jobs::Jobs::default()))
-        .await
-        .unwrap();
+    let app = crate::router::router(
+        config,
+        work.clone(),
+        Arc::new(crate::jobs::Jobs::default()),
+        Default::default(),
+    )
+    .await
+    .unwrap();
     for body in [
         r#"{"model":"m"}"#,
         r#"{"model":"m","previous_response_id":"resp_1"}"#,
@@ -518,9 +515,14 @@ async fn duplicate_session_header_never_discards_an_unknown_continuation() {
         http("/v1/responses", None, None),
         http("/v1/audio/transcriptions", None, None),
     ];
-    let app = crate::router::router(config, work.clone(), Arc::new(crate::jobs::Jobs::default()))
-        .await
-        .unwrap();
+    let app = crate::router::router(
+        config,
+        work.clone(),
+        Arc::new(crate::jobs::Jobs::default()),
+        Default::default(),
+    )
+    .await
+    .unwrap();
     let response = app
         .clone()
         .oneshot(
@@ -675,6 +677,7 @@ async fn failover_uses_each_backends_own_destination_and_credential() {
         vec![route],
         work.clone(),
         Arc::new(crate::jobs::Jobs::default()),
+        Default::default(),
     )
     .await
     .unwrap();

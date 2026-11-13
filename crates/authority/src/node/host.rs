@@ -9,10 +9,7 @@ use std::num::NonZeroU16;
 pub const HOST_STATUS: &str = "host.status";
 pub const HOST_CONFIGURE: &str = "host.configure";
 pub const HOST_CANCEL_JOB: &str = "host.job.cancel";
-pub const HOST_PROVIDER_CONFIGURE: &str = "host.provider.configure";
 pub const HOST_PROVIDER_BIND: &str = "host.provider.bind";
-pub const HOST_GATEWAY_CONFIGURE: &str = "host.gateway.configure";
-pub const HOST_GATEWAY_ACCESS: &str = "host.gateway.access";
 pub use hellas_auth::authority::GATEWAY_INVOKE;
 
 pub fn host_resource(authority: AuthorityId) -> ResourceId {
@@ -197,15 +194,7 @@ impl NodeCoordinator {
         operation: &'static str,
         action: impl FnOnce(NodeStatus) -> T,
     ) -> Result<T, NodeStoreError> {
-        if !matches!(
-            operation,
-            HOST_STATUS
-                | HOST_CONFIGURE
-                | HOST_CANCEL_JOB
-                | HOST_PROVIDER_CONFIGURE
-                | HOST_GATEWAY_CONFIGURE
-                | HOST_GATEWAY_ACCESS
-        ) {
+        if !matches!(operation, HOST_STATUS | HOST_CONFIGURE | HOST_CANCEL_JOB) {
             return Err(AuthorityError::Denied.into());
         }
         self.checked(caller, authorization, operation, async |store, now| {

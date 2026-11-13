@@ -1682,7 +1682,7 @@ async fn expired_upload_returns_the_typed_refusal_and_preserves_the_signed_propo
     );
     // Clear the resumed exchange through the same real expired provider, then
     // reopen the journal to prove the refusal was durable without abandonment.
-    let response = service.accept(&signed).await;
+    let response = service.accept(&signed, None).await;
     assert!(matches!(
         endpoint.client().await.unwrap().accepted(&response).await,
         Err(ProposeError::Refused {

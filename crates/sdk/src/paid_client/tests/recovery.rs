@@ -135,7 +135,7 @@ async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
             .unwrap();
         assert_ne!(lost, delivered);
         let backend = Backend::default();
-        run_accepted_work(&provider, &fixture.ready, &backend, delivered)
+        run_accepted_work(&provider, &fixture.ready, &backend, delivered, None)
             .await
             .unwrap();
         let (transport, server) =

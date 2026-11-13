@@ -1,123 +1,69 @@
-//! Vendor composition uses SDK's checked Fetch service and its existing authority store.
-use hellas_private::StoreLocation;
-use hellas_rpc::ProviderEnrollmentBundle;
-use hellas_sdk::{
-    FetchProviderOptions, FetchRoute, FetchRouteEntry, FetchRoutePolicy, FetchRouteRegistry,
-    GrantProviderOptions, NodeIdentity, ProviderError, ProviderHandle, RootProver,
-    start_fetch_provider,
-};
-use std::sync::Arc;
+//! A vendor account contributes ordinary daemon entries and authority terms.
+use hellas_sdk::daemon_config::{Backend, BackendKind, Document, Listener, Upstream};
 
-#[derive(Debug, thiserror::Error)]
-pub enum OpenAiProviderError {
-    #[error(transparent)]
-    Config(#[from] hellas_providers::OpenAiConfigError),
-    #[error(transparent)]
-    Grant(#[from] hellas_authority::model::grant::records::GrantError),
-    #[error(transparent)]
-    Route(#[from] hellas_executor::FetchRouteBindingError),
-    #[error(transparent)]
-    Duplicate(#[from] hellas_executor::DuplicateFetchRoute),
-    #[error(transparent)]
-    Provider(#[from] ProviderError),
-}
-
-pub struct OpenAiProviderOptions<R> {
-    pub port: Option<u16>,
-    pub identity: NodeIdentity,
-    pub enrollment: ProviderEnrollmentBundle,
-    pub root: Arc<R>,
-    /// Process home; the SDK derives chain-agnostic grant state beneath it.
-    pub home: StoreLocation,
-    pub content: hellas_store::content::DiskStore,
+pub struct OpenAiShareOptions {
+    pub port: u16,
     pub service: String,
     pub method: String,
     pub bearer_token: String,
     pub resource: hellas_auth::authority::ResourceId,
     pub account: hellas_auth::authority::ResourceId,
-    /// The machine and account budgets this host configures for its resource.
     pub machine: hellas_authority::model::grant::configuration::ConfiguredBudget,
     pub account_budget: hellas_authority::model::grant::configuration::ConfiguredBudget,
     pub policy_revision: hellas_auth::authority::Revision,
     pub responses: hellas_authority::model::grant::responses::ResponsesResource,
     pub pricing: hellas_authority::model::grant::pricing::Pricing,
     pub max_job_millis: std::num::NonZeroU64,
-    pub fetch_max_in_flight: usize,
-    pub fetch_queue_capacity: usize,
+    pub max_in_flight: std::num::NonZeroUsize,
 }
 
-pub async fn start_openai_provider<R>(
-    options: &OpenAiProviderOptions<R>,
-    host: Option<hellas_sdk::node_control::NodeControl>,
-) -> Result<ProviderHandle, OpenAiProviderError>
-where
-    R: RootProver + Send + Sync + 'static,
-{
+/// The embedder supplies its enrollment and App Attest prover to the daemon's iroh listener.
+pub fn openai_document(options: OpenAiShareOptions) -> Result<Document, hellas_sdk::daemon::Error> {
+    // Reject an empty or malformed key before constructing a configuration candidate.
+    hellas_providers::OpenAiResponsesFetchProvider::with_bearer(options.bearer_token.clone())?;
     let policy = crate::responses_policy(crate::ResponsesPolicyOptions {
         resource: options.resource,
         account: options.account,
         revision: options.policy_revision,
         service: &options.service,
         method: &options.method,
-        responses: options.responses.clone(),
-        pricing: options.pricing.clone(),
+        responses: options.responses,
+        pricing: options.pricing,
         max_job_millis: options.max_job_millis,
     })?;
-    let upstream = Arc::new(hellas_providers::OpenAiResponsesFetchProvider::with_bearer(
-        options.bearer_token.clone(),
-    )?);
-    let adaptor = Arc::new(
-        hellas_adaptors::openai::responses::fetch::OpenAiResponsesAdaptorFactory::new()
-            .map_err(hellas_providers::OpenAiConfigError::from)?,
-    );
-    let mut routes = FetchRouteRegistry::new();
-    routes.register(
-        FetchRoute::new(options.service.clone(), options.method.clone()),
-        FetchRouteEntry::new(upstream, adaptor, FetchRoutePolicy::default())?,
-    )?;
-    let config = FetchProviderOptions {
-        port: options.port,
-        identity: options.identity.clone(),
-        enrollment: options.enrollment.clone(),
-        root: options.root.clone(),
-        home: options.home.clone(),
-        content: options.content.clone(),
-        routes,
-        grants: Some(GrantProviderOptions {
-            configuration: hellas_authority::model::grant::configuration::NodeConfiguration::new(
-                Some(options.machine.clone()),
-                [(options.account, options.account_budget.clone())].into(),
-                vec![policy],
-            )?,
-            max_job_millis: options.max_job_millis,
-        }),
-        fetch_max_in_flight: options.fetch_max_in_flight,
-        fetch_queue_capacity: options.fetch_queue_capacity,
-        paid_work: None,
-    }
-    .prepare()
-    .await?;
-    let config = match host {
-        Some(host) => config.on_host(host)?,
-        None => config,
+    let id = options.service.clone();
+    let document = Document {
+        listeners: [(
+            "work".into(),
+            Listener::Iroh {
+                port: options.port,
+                backends: vec![id.clone()],
+            },
+        )]
+        .into(),
+        backends: [(
+            id,
+            Backend {
+                max_in_flight: options.max_in_flight,
+                kind: BackendKind::Fetch {
+                    service: options.service,
+                    method: options.method,
+                    upstream: Upstream::OpenaiResponses {
+                        secret: Some(options.bearer_token),
+                    },
+                },
+            },
+        )]
+        .into(),
+        authority: hellas_authority::model::grant::configuration::NodeConfiguration::new(
+            Some(options.machine),
+            [(options.account, options.account_budget)].into(),
+            vec![policy],
+        )?,
+        ..Default::default()
     };
-    Ok(start_fetch_provider(config).await?)
-}
-
-impl<R: RootProver + Send + Sync + 'static> OpenAiProviderOptions<R> {
-    /// Wraps these options as a host provider factory. The caller's root prover
-    /// and enrollment are kept as supplied; SDK owns the shared writer, control
-    /// listener and serialized service lifetime.
-    pub fn into_factory(self) -> hellas_sdk::node_control::host::ProviderFactory {
-        let options = Arc::new(self);
-        hellas_sdk::node_control::host::ProviderFactory {
-            prepare: None,
-            start: Arc::new(move |host| {
-                let options = options.clone();
-                Box::pin(async move { Ok(start_openai_provider(&options, host).await?) })
-            }),
-        }
-    }
+    document.validate()?;
+    Ok(document)
 }
 
 #[cfg(test)]

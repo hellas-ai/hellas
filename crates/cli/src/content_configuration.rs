@@ -1,24 +1,16 @@
-//! The node's declared content file and its filesystem reload trigger.
+//! Static content declarations for explicit local store and job commands.
 use anyhow::{Context, Result};
-use hellas_store::content::{
-    DiskStore,
-    config::{Config, Reconciler},
-};
-use notify::{EventKind, RecursiveMode, Watcher};
+use hellas_store::content::config::Config;
+#[cfg(feature = "compute")]
+use hellas_store::content::{DiskStore, config::Reconciler};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
-use tokio::{sync::watch, task::JoinHandle};
 
 /// A file or directory served to jobs, and every object it holds.
 type Content = (PathBuf, Vec<hellas_rpc::ContentRef>);
 
 pub(crate) struct ContentConfiguration {
-    path: Option<PathBuf>,
-    content: Vec<Content>,
     config: Config,
-    default_upper: Option<PathBuf>,
-    watcher: Option<notify::RecommendedWatcher>,
-    changes: watch::Receiver<()>,
 }
 
 impl ContentConfiguration {
@@ -41,39 +33,8 @@ impl ContentConfiguration {
                 Ok((root, objects))
             })
             .collect::<Result<_>>()?;
-        let (changed, changes) = watch::channel(());
-        let watcher = if let Some(path) = &path {
-            let file = path.clone();
-            let mut watcher = notify::recommended_watcher(
-                move |event: notify::Result<notify::Event>| match event {
-                    Ok(event)
-                        if !matches!(event.kind, EventKind::Access(_))
-                            && event.paths.iter().any(|path| path == &file) =>
-                    {
-                        changed.send_replace(());
-                    }
-                    Err(error) => tracing::warn!(%error, "content configuration watch failed"),
-                    _ => {}
-                },
-            )?;
-            // Watch the parent so atomic replacement keeps the trigger alive.
-            watcher.watch(
-                path.parent()
-                    .context("content configuration needs a parent")?,
-                RecursiveMode::NonRecursive,
-            )?;
-            Some(watcher)
-        } else {
-            None
-        };
-        let config = read(path.as_deref(), &content)?;
         Ok(Self {
-            path,
-            content,
-            config,
-            default_upper: None,
-            watcher,
-            changes,
+            config: read(path.as_deref(), &content)?,
         })
     }
 
@@ -82,7 +43,6 @@ impl ContentConfiguration {
         if self.config.upper.is_none() {
             self.config.upper = Some(upper.clone());
         }
-        self.default_upper = Some(upper);
         self
     }
 
@@ -90,51 +50,11 @@ impl ContentConfiguration {
         &self.config
     }
 
-    pub(crate) async fn start(self, store: DiskStore) -> Result<ContentReload> {
-        let reconciler = Reconciler::new(self.config.clone())?;
-        reconciler.apply(&store, self.config.clone()).await?;
-        let (stop, stopped) = watch::channel(false);
-        let task = tokio::spawn(self.run(store, reconciler, stopped));
-        Ok(ContentReload { stop, task })
-    }
-
-    async fn run(
-        self,
-        store: DiskStore,
-        reconciler: Reconciler,
-        mut stopped: watch::Receiver<bool>,
-    ) {
-        let _watcher = self.watcher;
-        let mut changes = self.changes;
-        loop {
-            tokio::select! {
-                _ = stopped.changed() => break,
-                changed = changes.changed() => if changed.is_err() { break; },
-            }
-            let result = async {
-                let mut config = read(self.path.as_deref(), &self.content)?;
-                if config.upper.is_none() {
-                    config.upper = self.default_upper.clone();
-                }
-                reconciler.apply(&store, config).await?;
-                Ok::<_, anyhow::Error>(())
-            }
-            .await;
-            if let Err(error) = result {
-                tracing::warn!(%error, "content configuration reload failed");
-            }
-        }
-    }
-}
-
-pub(crate) struct ContentReload {
-    stop: watch::Sender<bool>,
-    task: JoinHandle<()>,
-}
-impl ContentReload {
-    pub(crate) async fn shutdown(self) -> Result<()> {
-        self.stop.send_replace(true);
-        self.task.await?;
+    #[cfg(feature = "compute")]
+    pub(crate) async fn apply(&self, store: &DiskStore) -> Result<()> {
+        Reconciler::new(self.config.clone())?
+            .apply(store, self.config.clone())
+            .await?;
         Ok(())
     }
 }

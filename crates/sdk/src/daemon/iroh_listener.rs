@@ -2,7 +2,6 @@ use super::{Core, Result};
 use crate::{
     ProviderOpen,
     gateway_work::provider::IrohBackend,
-    node_control::NodeControl,
     paid_provider::{MountedSetup, MountedWork, WorkRunner, WorkRunnerConfig, WorkWatcher},
     work_router::WorkRouter,
 };
@@ -16,7 +15,7 @@ pub(super) struct Bound {
     pub endpoint: iroh::Endpoint,
     open: Arc<ProviderOpen>,
     grants: GrantService,
-    administration: WorkAdministration,
+    pub administration: WorkAdministration,
     work: MountedWork,
     setup: MountedSetup,
     runner: Mutex<Option<WorkRunner>>,
@@ -77,7 +76,6 @@ impl Bound {
             .await?;
             let administration = WorkAdministration::new(
                 grants.clone(),
-                Default::default(),
                 std::num::NonZeroU64::new(u64::MAX).unwrap(),
             );
             let work = MountedWork::with_backend(backend);
@@ -110,10 +108,6 @@ impl Bound {
         prepare
     }
 
-    pub fn control(&self) -> NodeControl {
-        NodeControl::with_work(self.administration.clone())
-    }
-
     pub async fn serve(
         &self,
         core: std::sync::Weak<Core>,
@@ -142,6 +136,21 @@ impl Bound {
         let control = core_options
             .control()?
             .with_remote_admission(core_options.runtime.options.remote_control.clone());
+        let discovery = core_options
+            .runtime
+            .options
+            .discovery
+            .then(|| {
+                crate::provider::discovery::start_server_advertising(
+                    &self.endpoint,
+                    &crate::provider::served_alpns(
+                        true,
+                        true,
+                        control.remote_admission().enabled(),
+                    ),
+                )
+            })
+            .transpose()?;
         drop(core_options);
         let directory = Arc::new(PeerDirectory::with_config(
             PeerId::from_bytes(*self.endpoint.id().as_bytes()),
@@ -158,7 +167,14 @@ impl Bound {
                 .into_iter()
                 .map(|alpn| String::from_utf8_lossy(&alpn).into_owned())
                 .collect();
-        let router = WorkRouter::both(self.work.clone(), self.grants.clone());
+        let services = crate::provider::Services {
+            open_identity: self.open.clone(),
+            node,
+            setup: Some(self.setup.clone()),
+            work: Some(WorkRouter::both(self.work.clone(), self.grants.clone())),
+            control: Some(control),
+            content,
+        };
         let (quiesce, quiesced) = watch::channel(false);
         let mut tasks = tokio::task::JoinSet::new();
         let mut admission = crate::transport_admission::Admission::new();
@@ -179,35 +195,30 @@ impl Bound {
             let Some(pending) = admission.accept(incoming) else {
                 continue;
             };
-            let (open, node, manager, setup, router, content, mut stopped) = (
-                self.open.clone(),
-                node.clone(),
-                directory.manager(),
-                self.setup.clone(),
-                router.clone(),
-                content.clone(),
-                quiesced.clone(),
-            );
-            let control = control.clone();
+            let services = services.clone();
+            let mut stopped = quiesced.clone();
             tasks.spawn(async move {
                 let admitted = tokio::select! {
                     _ = stopped.wait_for(|stop| *stop) => return,
                     admitted = pending.finish() => match admitted { Some(admitted) => admitted, None => return },
                 };
                 let connection = admitted.connection.clone();
-                if let Some(Err(error)) = admitted.run(crate::provider::serve_connection(connection.alpn().to_vec(), connection, open, node, manager, Some(setup), Some(router), Some(control), content, stopped)).await {
+                if let Some(Err(error)) = admitted.run(services.serve(connection, stopped)).await {
                     tracing::warn!(%error, "iroh request failed");
                 }
             });
         }
-        let grants = self.grants.shutdown().await;
-        let paid = watcher.shutdown().await;
+        if let Some(discovery) = discovery {
+            discovery.shutdown().await;
+        }
         quiesce.send_replace(true);
         while let Some(result) = tasks.join_next().await {
             if let Err(error) = result {
                 tracing::warn!(%error, "iroh connection failed while draining");
             }
         }
+        let grants = self.grants.shutdown().await;
+        let paid = watcher.shutdown().await;
         self.endpoint.close().await;
         grants?;
         paid?;

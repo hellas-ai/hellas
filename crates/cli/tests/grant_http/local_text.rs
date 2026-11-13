@@ -1,4 +1,4 @@
-//! `gateway --local` serves Qwen3 text on this machine, with no chain and no
+//! `gateway --model` serves Qwen3 text on this machine, with no chain and no
 //! remote provider. The real-model check is manual:
 //!
 //! ```sh
@@ -12,7 +12,7 @@ use super::*;
 async fn local_gateway_serves_a_text_model_without_a_chain() {
     let model =
         PathBuf::from(std::env::var("HELLAS_TEST_TEXT_MODEL").expect("HELLAS_TEST_TEXT_MODEL"));
-    let mut node = super::local_compute::LocalCompute::start(&model, Some(&model), &[]).await;
+    let mut node = super::local_compute::LocalCompute::start(&model).await;
     let http = &node.http;
     let address = &node.address;
     let url = format!("http://{address}/v1/completions");
@@ -43,7 +43,7 @@ async fn local_gateway_serves_a_text_model_without_a_chain() {
     node.gateway.stop().await;
 }
 
-/// `gateway --local --model` and nothing else: the job reads its weights
+/// `gateway --model --model` and nothing else: the job reads its weights
 /// from the model, and the caller gets the executor's outcome. A host
 /// without a HIP runtime signs an execution failure, which reaches the
 /// caller as that failure.
@@ -51,7 +51,7 @@ async fn local_gateway_serves_a_text_model_without_a_chain() {
 async fn local_gateway_runs_jobs_on_its_model_and_reports_their_outcome() {
     let model =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../client/src/model/package/mini-qwen3.gguf");
-    let mut node = super::local_compute::LocalCompute::start(&model, None, &[]).await;
+    let mut node = super::local_compute::LocalCompute::start(&model).await;
     let response = post(
         &node.http,
         &format!("http://{}/v1/completions", node.address),

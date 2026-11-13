@@ -66,8 +66,7 @@ use hellas_sdk::paid_client::{
 };
 use hellas_sdk::work_config::WorkConfig;
 use hellas_sdk::{
-    FetchProviderOptions, FetchRoute, FetchRouteEntry, FetchRoutePolicy, FetchRouteRegistry,
-    NodeIdentity, PaidProviderOptions, RootProver, start_fetch_provider,
+    FetchRoute, FetchRouteEntry, FetchRoutePolicy, FetchRouteRegistry, NodeIdentity, RootProver,
 };
 use hellas_store::content::{LocalStore, MemoryStore, Reservations, Scope};
 use invocation::fetch::{FetchAdmission, FetchLimits, FetchRoutePolicy as PaidRoute};
@@ -385,7 +384,7 @@ async fn start_provider(
     config: WorkConfig,
     identity: &NodeIdentity,
 ) -> (
-    hellas_sdk::ProviderHandle,
+    hellas_sdk::daemon::testing::Daemon,
     PausedFetch,
     hellas_store::content::DiskStore,
 ) {
@@ -393,33 +392,90 @@ async fn start_provider(
     let content =
         hellas_channel::test_support::channel::content_store(&root.join("provider-state")).await;
     let location = StoreLocation::for_test(&root.join("provider-state"));
-    let provider = start_fetch_provider(
-        FetchProviderOptions {
-            port: Some(0),
-            identity: identity.clone(),
-            enrollment: provider_enrollment(identity),
-            root: Arc::new(SoftwareRoot),
-            home: location,
-            content: content.clone(),
-            grants: Some(hellas_sdk::GrantProviderOptions {
-                configuration: Default::default(),
-                max_job_millis: std::num::NonZeroU64::new(5000).unwrap(),
-            }),
-            routes,
-            fetch_max_in_flight: 1,
-            fetch_queue_capacity: 1,
-            paid_work: Some(PaidProviderOptions::new(config)),
-        }
-        .prepare()
-        .await
-        .unwrap(),
+    use hellas_sdk::daemon_config::{BackendKind, Document, Listener, Upstream};
+    let signer = Arc::new(identity.node_key().clone());
+    let enrollment = provider_enrollment(identity);
+    let store = hellas_authority::work_store::grant::NodeStore::open(
+        &location.child("provider").child("authority"),
+        hellas_authority::model::grant::grant_network(),
+        Some(enrollment.clone()),
+        UnixMillis::now().unwrap(),
     )
     .await
     .unwrap();
+    let node = hellas_authority::node::NodeCoordinator::new(
+        store,
+        Arc::new(|| UnixMillis::now().unwrap()),
+    );
+    let mut executor = hellas_executor::ExecutorSpawnConfig::new(signer.clone(), routes);
+    executor.fetch_max_in_flight = 1;
+    executor.fetch_queue_capacity = 1;
+    let execution = hellas_executor::Executor::spawn_configured(executor)
+        .await
+        .unwrap();
+    let backend = hellas_sdk::BackendEntry {
+        backend: hellas_sdk::Backend::Fetch {
+            execution,
+            policy: work_policy(),
+        },
+        evaluator: None,
+        max_in_flight: std::num::NonZeroUsize::MIN,
+    };
+    let document = Document {
+        listeners: [(
+            "work".into(),
+            Listener::Iroh {
+                port: 0,
+                backends: vec!["fetch".into()],
+            },
+        )]
+        .into(),
+        backends: [(
+            "fetch".into(),
+            hellas_sdk::daemon_config::Backend {
+                max_in_flight: std::num::NonZeroUsize::MIN,
+                kind: BackendKind::Fetch {
+                    service: "openai".into(),
+                    method: "responses".into(),
+                    upstream: Upstream::OpenaiResponses {
+                        secret: Some("fixture".into()),
+                    },
+                },
+            },
+        )]
+        .into(),
+        ..Default::default()
+    };
+    let provider = hellas_sdk::daemon::testing::Daemon::open(
+        hellas_sdk::daemon::Options {
+            discovery: false,
+            endpoint: None,
+            remote_control: Default::default(),
+            prover: Some(Arc::new(
+                hellas_sdk::ProviderOpen::new(
+                    signer.clone(),
+                    enrollment,
+                    Some(Arc::new(SoftwareRoot)),
+                )
+                .unwrap(),
+            )),
+            home: location,
+            signer,
+            transport: identity.transport_key(),
+            settlement: Secp256k1Signer::from_secret_scalar(identity.node_secret_bytes()).unwrap(),
+            owner: None,
+            chain: config.chain.clone(),
+            node,
+            content: content.clone(),
+        },
+        document,
+        [("fetch".into(), backend)].into(),
+    )
+    .await;
     (provider, upstream, content)
 }
 
-fn addresses(provider: &hellas_sdk::ProviderHandle) -> Vec<std::net::SocketAddr> {
+fn addresses(provider: &hellas_sdk::daemon::testing::Daemon) -> Vec<std::net::SocketAddr> {
     provider
         .bound_sockets()
         .into_iter()
@@ -871,7 +927,7 @@ struct PaidScenario<S = PaidWorkSession> {
     /// The devnet's own executing node, which tests read the chain through;
     /// the provider itself reads by proof.
     provider_node: hellas_chain::node::FullNode,
-    provider: hellas_sdk::ProviderHandle,
+    provider: hellas_sdk::daemon::testing::Daemon,
     provider_content: hellas_store::content::DiskStore,
     relays: remote::Relays,
     approvals: Arc<Approvals>,
@@ -950,7 +1006,7 @@ async fn paid_fixture(runtime: commonware_runtime::tokio::Context) -> PaidScenar
     let location = StoreLocation::for_test(&root.path().join("provider-state"));
     let (store, secret) =
         hellas_authority::test_support::common_node::bootstrap_node_with_credential(
-            &hellas_sdk::grant_config::GrantConfig::journal_dir(&location),
+            &location.child("provider").child("authority"),
             hellas_authority::model::grant::grant_network(),
             Some(provider_enrollment(&identity)),
             now,

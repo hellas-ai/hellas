@@ -9,9 +9,8 @@ use hellas_auth::Digest;
 use hellas_chain::work_blocks::advance_paid_work_clock;
 use hellas_chain::{FinalizedWorkView, WorkBlocks, WorkChannelQuery, WorkChannelSnapshot};
 use hellas_channel::model::setup::{ProviderChannelPolicy, ReadyChannel, WorkChannelDescriptor};
-use hellas_channel::model::work::{
-    PaidJobAuthorizationV2, PrivateRecord as _, work_id as accepted_work_id,
-};
+use hellas_channel::work::admission::{BackendKey, WorkPermit};
+use hellas_channel::work::{AcceptExecution, BackendFault};
 use hellas_channel::work::{
     CloseEndpoint, MAX_CERTIFIED_AGE, POLL, RunError, RunOutcome, SETUP_POLL, WorkBackend,
     WorkService, check_certified_age, run_accepted_work,
@@ -26,7 +25,6 @@ use hellas_rpc::pb::work::{
     AcceptWorkRequest, AcceptWorkResponse, AdmitCertificateRequest, AdmitCertificateResponse,
     ExchangeSetupRequest, ExchangeSetupResponse, FundingKind, GetStandingRequest,
     GetStandingResponse, StreamResultRequest, WorkRefusalCode, WorkRefused, WorkRoute,
-    accept_work_response,
 };
 use hellas_rpc::services::work::WorkHandler;
 use hellas_rpc::services::work_setup::WorkSetupHandler;
@@ -182,14 +180,25 @@ impl Default for MountedWork {
 }
 
 /// Type-erased runner for an accepted job.
-type RunAcceptedWork = dyn Fn(WorkService, ReadyChannel, Digest) -> BoxFuture<'static, Result<RunOutcome, RunError>>
+type RunAcceptedWork = dyn Fn(
+        WorkService,
+        ReadyChannel,
+        Digest,
+        Option<WorkPermit>,
+    ) -> BoxFuture<'static, Result<RunOutcome, RunError>>
     + Send
     + Sync;
 
-/// Runs accepted jobs detached from requests and the clock; provider shutdown
-/// aborts them, which cancels their backend work (including compilation).
+type ReserveWork =
+    dyn Fn(&BackendKey, hellas_auth::PublicKey) -> Result<WorkPermit, BackendFault> + Send + Sync;
+
+/// Owns each accepted execution independently of requests and clock observations.
 #[derive(Clone)]
-struct AcceptedWorkDriver(Arc<RunAcceptedWork>, Arc<Mutex<tokio::task::JoinSet<()>>>);
+struct AcceptedWorkDriver {
+    run: Arc<RunAcceptedWork>,
+    reserve: Arc<ReserveWork>,
+    tasks: Arc<Mutex<BTreeMap<Digest, tokio::task::JoinHandle<()>>>>,
+}
 
 impl AcceptedWorkDriver {
     fn new<B>(backend: B) -> Self
@@ -197,66 +206,94 @@ impl AcceptedWorkDriver {
         B: WorkBackend + Send + Sync + 'static,
     {
         let backend = Arc::new(backend);
-        Self(
-            Arc::new(move |service, ready, work_id| {
+        let reserve = backend.clone();
+        Self {
+            run: Arc::new(move |service, ready, work_id, permit| {
                 let backend = Arc::clone(&backend);
                 Box::pin(async move {
-                    run_accepted_work(&service, &ready, backend.as_ref(), work_id).await
+                    run_accepted_work(&service, &ready, backend.as_ref(), work_id, permit).await
                 })
             }),
-            Default::default(),
-        )
+            reserve: Arc::new(move |key, caller| reserve.try_admit(key, caller)),
+            tasks: Default::default(),
+        }
     }
 
-    /// Aborts every accepted job and waits until each has been dropped.
+    fn admission(&self, service: WorkService, ready: ReadyChannel) -> AcceptExecution {
+        let driver = self.clone();
+        Box::new(move |input, caller| {
+            let permit = (driver.reserve)(&BackendKey::of(input)?, caller)?;
+            Ok(Box::new(move |work| {
+                driver.spawn(service, ready, work, Some(permit))
+            }))
+        })
+    }
+
+    /// Keep execution owners in the driver even if the draining caller disconnects.
     async fn shutdown(&self) {
-        let mut tasks = match self.1.lock() {
-            Ok(mut tasks) => std::mem::take(&mut *tasks),
-            Err(error) => std::mem::take(&mut *error.into_inner()),
-        };
-        tasks.shutdown().await;
+        use std::{future::Future as _, pin::Pin, task::Poll};
+        futures::future::poll_fn(|cx| {
+            let mut tasks = self.tasks.lock().unwrap_or_else(|error| error.into_inner());
+            tasks.retain(|_, task| Pin::new(task).poll(cx).is_pending());
+            if tasks.is_empty() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
     }
 
-    /// Starts one accepted job without lending its lifetime to either the
-    /// request path or the close clock.
-    fn spawn(&self, service: WorkService, ready: ReadyChannel, work_id: Digest) {
-        let running = (self.0)(service, ready, work_id);
+    fn spawn(
+        &self,
+        service: WorkService,
+        ready: ReadyChannel,
+        work_id: Digest,
+        permit: Option<WorkPermit>,
+    ) {
+        let running = (self.run)(service, ready, work_id, permit);
         let span = hellas_rpc::request_span!(target: "hellas_request", "paid.provider.execute", hellas.work.id = ?work_id, otel.status_code = tracing::field::Empty);
-        let mut tasks = match self.1.lock() {
+        let mut tasks = match self.tasks.lock() {
             Ok(tasks) => tasks,
             Err(error) => error.into_inner(),
         };
-        while tasks.try_join_next().is_some() {}
-        tasks.spawn(tracing::Instrument::instrument(
-            async move {
-                match running.await {
-                    Ok(RunOutcome::Completed { .. }) => {
-                        debug!(?work_id, "the accepted paid job completed")
+        tasks.retain(|_, task| !task.is_finished());
+        if tasks.contains_key(&work_id) {
+            return;
+        }
+        tasks.insert(
+            work_id,
+            tokio::spawn(tracing::Instrument::instrument(
+                async move {
+                    match running.await {
+                        Ok(RunOutcome::Completed { .. }) => {
+                            debug!(?work_id, "the accepted paid job completed")
+                        }
+                        Ok(RunOutcome::Ready { .. }) => {
+                            debug!(?work_id, "the accepted paid job was already complete")
+                        }
+                        Ok(RunOutcome::Running) => {
+                            debug!(?work_id, "the accepted paid job was already running")
+                        }
+                        Ok(RunOutcome::Indeterminate) => {
+                            warn!(
+                                ?work_id,
+                                "the accepted paid job is indeterminate after restart"
+                            )
+                        }
+                        // `run_accepted_work` has already made backend and
+                        // transcript faults terminal before returning them. The
+                        // remaining errors have no node-local terminal policy;
+                        // keep the exact failure visible to the operator.
+                        Err(error) => {
+                            tracing::Span::current().record("otel.status_code", "ERROR");
+                            warn!(?work_id, %error, "the accepted paid job did not complete");
+                        }
                     }
-                    Ok(RunOutcome::Ready { .. }) => {
-                        debug!(?work_id, "the accepted paid job was already complete")
-                    }
-                    Ok(RunOutcome::Running) => {
-                        debug!(?work_id, "the accepted paid job was already running")
-                    }
-                    Ok(RunOutcome::Indeterminate) => {
-                        warn!(
-                            ?work_id,
-                            "the accepted paid job is indeterminate after restart"
-                        )
-                    }
-                    // `run_accepted_work` has already made backend and
-                    // transcript faults terminal before returning them. The
-                    // remaining errors have no node-local terminal policy;
-                    // keep the exact failure visible to the operator.
-                    Err(error) => {
-                        tracing::Span::current().record("otel.status_code", "ERROR");
-                        warn!(?work_id, %error, "the accepted paid job did not complete");
-                    }
-                }
-            },
-            span,
-        ));
+                },
+                span,
+            )),
+        );
     }
 }
 
@@ -295,35 +332,11 @@ impl WorkHandler for MountedWorkService {
                 }));
             }
         };
-        // Derive the id from the request while the accepted response
-        // is still only a possibility. The response carries only the
-        // provider signature, and consulting `state.jobs().next()` after it
-        // leaves would race the clock terminalizing that same job.
-        let work_id = self
-            .service
-            .with_state(|state| {
-                PaidJobAuthorizationV2::decode(&request.authorization)
-                    .ok()
-                    .map(|authorization| accepted_work_id(state.channel(), &authorization))
-            })
-            .await
-            .ok()
-            .flatten();
-        let response = self.service.accept(&request).await;
-        if matches!(
-            response.outcome.as_ref(),
-            Some(accept_work_response::Outcome::Accepted(_))
-        ) {
-            match (self.driver.as_ref(), work_id) {
-                (Some(driver), Some(work_id)) => {
-                    driver.spawn(self.service.clone(), ready, work_id);
-                }
-                (None, Some(work_id)) => {
-                    warn!(?work_id, "accepted paid work has no execution backend")
-                }
-                (_, None) => warn!("accepted paid work has no mounted job to execute"),
-            }
-        }
+        let execution = self
+            .driver
+            .as_ref()
+            .map(|driver| driver.admission(self.service.clone(), ready));
+        let response = self.service.accept(&request, execution).await;
         Ok(response)
     }
 
@@ -453,7 +466,7 @@ impl MountedWork {
             .map(|mounted| mounted.service))
     }
 
-    /// Stops admission and waits out journal writes before aborting accepted jobs.
+    /// Stops admission, finishes accepted work, then closes the journals.
     /// Cancellation retains the mounts so shutdown can resume.
     pub async fn clear_all(&self) -> Result<(), MountError> {
         let _changes = self.changes.lock().await;
@@ -470,23 +483,18 @@ impl MountedWork {
             )
         };
         for service in &channels {
-            service.stop().await?;
+            service.quiesce().await?;
         }
         use hellas_channel::work_close::CloseChannel as _;
         let mut drivers = channels
             .iter()
             .map(WorkService::drive)
             .collect::<Result<Vec<_>, _>>()?;
-        {
-            // Hold every journal writer while aborting; queued writers are
-            // cancelled before these guards are released.
-            let mut writers = Vec::new();
-            for driver in &mut drivers {
-                writers.push(driver.store().await.map_err(|_| MountError::Poisoned)?);
-            }
-            if let Some(driver) = &self.driver {
-                driver.shutdown().await;
-            }
+        if let Some(driver) = &self.driver {
+            driver.shutdown().await;
+        }
+        for service in &channels {
+            service.stop().await?;
         }
         for driver in &mut drivers {
             let closed = async {
@@ -728,7 +736,7 @@ impl DrivenChannel {
         let driver = self.driver.as_ref().ok_or(PaidProviderError::NoBackend)?;
         let ready = self.service.readiness().await?;
         for work_id in work_ids {
-            driver.spawn(self.service.clone(), ready.clone(), work_id);
+            driver.spawn(self.service.clone(), ready.clone(), work_id, None);
         }
         Ok(true)
     }
@@ -1430,16 +1438,17 @@ mod tests {
         );
 
         let (seen, mut dispatched) = tokio::sync::mpsc::unbounded_channel();
-        let driver = AcceptedWorkDriver(
-            Arc::new(move |_service, _ready, work_id| {
+        let driver = AcceptedWorkDriver {
+            run: Arc::new(move |_service, _ready, work_id, _permit| {
                 let seen = seen.clone();
                 Box::pin(async move {
                     seen.send(work_id).unwrap();
                     Ok(RunOutcome::Running)
                 })
             }),
-            Default::default(),
-        );
+            reserve: Arc::new(|_, _| panic!("recovery does not reserve new acceptance")),
+            tasks: Default::default(),
+        };
         let channel = DrivenChannel {
             service,
             descriptor: Some(fixture.descriptor.clone()),

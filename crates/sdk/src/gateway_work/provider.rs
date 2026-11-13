@@ -34,6 +34,29 @@ impl Inner {
     }
 }
 impl ExecutorGateway {
+    pub(crate) fn validate_resources(
+        &self,
+        resources: &[hellas_authority::model::grant::records::GrantPolicy],
+    ) -> Result<(), &'static str> {
+        use hellas_rpc::protocol::invocation::{Admission, fetch::FetchRoutePolicy};
+        for resource in resources {
+            for admission in &resource.invocation_policy.admissions {
+                let available = self.backends.values().any(|inner| match (admission, &inner.target) {
+                    #[cfg(feature = "compute")]
+                    (Admission::Compute { evaluator, .. }, Backend::Local { .. }) => inner.evaluator.as_ref() == Some(evaluator),
+                    (Admission::Fetch { admission }, Backend::Fetch { policy, .. }) =>
+                        matches!(admission.route, FetchRoutePolicy::SealedRoute { .. }) && policy.admissions.iter().any(|offered| {
+                            matches!(offered, Admission::Fetch { admission: offered } if offered.route == admission.route && offered.contract == admission.contract)
+                        }),
+                    _ => false,
+                });
+                if !available {
+                    return Err("resource has no backend with its evaluator or Fetch contract");
+                }
+            }
+        }
+        Ok(())
+    }
     fn lookup(&self, allowed: &[String], key: &BackendKey) -> Result<Arc<Inner>, BackendFault> {
         self.backends.iter().find_map(|(id, inner)| {
             if !allowed.contains(id) { return None; }

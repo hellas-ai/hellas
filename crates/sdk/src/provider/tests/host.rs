@@ -128,21 +128,6 @@ impl Host {
             .await
             .unwrap()
     }
-    pub async fn responses_options(&self, addresses: Vec<String>) -> GrantGateway {
-        GrantGateway {
-            serve: hellas_gateway::ServerOptions {
-                access: self.gateway_access().await,
-                archive: hellas_gateway::ArchiveOptions {
-                    directory: self.root.path().join("archive"),
-                    zdr: true,
-                },
-                host: "127.0.0.1".into(),
-                port: Some(0),
-                allow_remote: false,
-            },
-            session: self.options(addresses),
-        }
-    }
     /// The real provider dispatch loop, with a deterministic backend and pinned proof.
     pub async fn remote(&self) -> RemoteHost {
         self.remote_at("127.0.0.1:0".parse().unwrap()).await
@@ -270,43 +255,5 @@ impl RemoteHost {
     pub async fn shutdown(self) {
         self.endpoint.close().await;
         self.task.await.unwrap();
-    }
-}
-
-/// A grant gateway the host starts: each start binds its own endpoint.
-#[derive(Clone)]
-pub struct GrantGateway {
-    pub serve: hellas_gateway::ServerOptions,
-    pub session: crate::grant_client::GrantSessionOptions,
-}
-impl GrantGateway {
-    /// The host supplies the access it validated; the configured access is replaced.
-    pub fn into_factory(self, key: iroh::SecretKey) -> crate::node_control::host::GatewayFactory {
-        std::sync::Arc::new(move |access| {
-            let (mut options, key) = (self.clone(), key.clone());
-            options.serve.access = access;
-            Box::pin(async move {
-                let endpoint = crate::grant_client::bind_endpoint(key).await?;
-                let signer = options.session.signer.clone();
-                let target = crate::Backend::Grant {
-                    policy: options.session.target.offer().grant.policies[0].clone(),
-                    options: options.session,
-                    transport: crate::grant_client::GrantTransport::Remote(endpoint),
-                };
-                let routes = target.routes("test")?;
-                let work = crate::test_support::gateway(
-                    target,
-                    Some(hellas_channel::test_support::channel::evaluator()),
-                    signer,
-                );
-                Ok(hellas_gateway::start(hellas_gateway::GatewayOptions {
-                    jobs: work.jobs.clone(),
-                    server: options.serve,
-                    work,
-                    routes,
-                })
-                .await?)
-            })
-        })
     }
 }

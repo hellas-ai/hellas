@@ -1,5 +1,3 @@
-use std::net::SocketAddr;
-
 pub type GatewayResult<T> = Result<T, GatewayError>;
 
 #[derive(Debug, thiserror::Error)]
@@ -10,31 +8,12 @@ pub enum GatewayError {
     Work(#[from] crate::WorkGatewayError),
     #[error(transparent)]
     Shutdown(#[from] crate::WorkShutdownError),
-    #[error("{primary}; cleanup also failed: {cleanup}")]
-    Cleanup {
-        #[source]
-        primary: Box<GatewayError>,
-        cleanup: crate::WorkShutdownError,
-    },
     #[error(transparent)]
     Authority(#[from] hellas_authority::work_store::grant::NodeStoreError),
     #[error("gateway task failed")]
     Task(#[from] tokio::task::JoinError),
     #[error("gateway I/O failed")]
     Io(#[from] std::io::Error),
-    #[error("failed to bind gateway on {address}")]
-    Bind {
-        address: SocketAddr,
-        source: std::io::Error,
-    },
-    #[error("failed to resolve gateway bind address {host}:{port}")]
-    Resolve {
-        host: String,
-        port: u16,
-        source: std::io::Error,
-    },
-    #[error("gateway bind address {host}:{port} resolved to no address")]
-    NoAddress { host: String, port: u16 },
     #[error("model presentation failed: {0}")]
     Presentation(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error(transparent)]
@@ -61,8 +40,6 @@ pub enum GatewayConfigError {
     CredentialAlias,
     #[error("default maximum tokens must be positive and fit the model capacity")]
     MaxTokens,
-    #[error("non-loopback gateway binding requires --allow-remote")]
-    RemoteBinding,
     #[error("the gateway serves no presentation")]
     NoPresentation,
 }

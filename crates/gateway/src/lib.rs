@@ -8,6 +8,7 @@ mod route;
 mod routing;
 pub use access::GatewayAccess;
 pub use route::{HttpTarget, Presentation, Route};
+pub use routing::RoutingState;
 mod archive;
 mod audio;
 mod backend;
@@ -31,7 +32,6 @@ use hellas_auth::authority::UnixMillis;
 use serde::Serialize;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::convert::Infallible;
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -39,8 +39,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub use archive::ArchiveOptions;
 pub use hellas_rpc::compute_event::ComputeEvent;
 pub use http_fetch::{HttpRoute, RoutingError};
-
-const DEFAULT_HTTP_PORT: u16 = 8080;
 
 /// A Fetch run under the selected backend's policy.
 #[derive(Clone)]
@@ -213,26 +211,6 @@ impl
     }
 }
 
-/// Where and to whom the gateway listens, and what it keeps.
-#[derive(Clone)]
-pub struct ServerOptions {
-    /// Provisioned Auth credential and the host authority that admits HTTP requests.
-    pub access: GatewayAccess,
-    pub archive: ArchiveOptions,
-    /// Permit a non-loopback listener.
-    pub allow_remote: bool,
-    pub host: String,
-    pub port: Option<u16>,
-}
-
-/// One gateway: HTTP presentations over one work source.
-pub struct GatewayOptions {
-    pub jobs: Arc<jobs::Jobs>,
-    pub server: ServerOptions,
-    pub work: Arc<dyn WorkExecutionBackend>,
-    pub routes: Vec<Route>,
-}
-
 #[derive(Clone)]
 pub struct ImageOptions {
     pub model_name: String,
@@ -260,115 +238,6 @@ pub struct ResponsesFetch {
     pub method: String,
     /// Merged into every request body before signing.
     pub overrides: JsonMap<String, JsonValue>,
-}
-
-/// A running authenticated HTTP gateway owned by its embedding process.
-pub struct GatewayHandle {
-    address: SocketAddr,
-    bearer: String,
-    shutdown: tokio::sync::watch::Sender<bool>,
-    task: tokio::task::JoinHandle<crate::GatewayResult<()>>,
-}
-
-impl GatewayHandle {
-    pub const fn address(&self) -> SocketAddr {
-        self.address
-    }
-
-    /// Return the provisioned credential for an explicit local UI/control
-    /// surface. The value is never included in `Debug` or logs.
-    pub fn bearer(&self) -> &str {
-        &self.bearer
-    }
-
-    pub fn request_shutdown(&self) {
-        self.shutdown.send_replace(true);
-    }
-
-    pub fn is_finished(&self) -> bool {
-        self.task.is_finished()
-    }
-
-    pub async fn shutdown(mut self) -> crate::GatewayResult<()> {
-        self.request_shutdown();
-        (&mut self.task)
-            .await
-            .map_err(GatewayError::Task)
-            .and_then(|result| result)
-    }
-}
-
-impl Drop for GatewayHandle {
-    fn drop(&mut self) {
-        self.shutdown.send_replace(true);
-    }
-}
-
-/// Start a gateway without installing process signal handlers. A failed
-/// start still drains the work source.
-pub async fn start(options: GatewayOptions) -> crate::GatewayResult<GatewayHandle> {
-    let work = options.work.clone();
-    let result = start_gateway(options).await;
-    if result.is_err() {
-        return finish_cleanup(result, work.drain().await);
-    }
-    result
-}
-
-async fn start_gateway(options: GatewayOptions) -> crate::GatewayResult<GatewayHandle> {
-    let GatewayOptions {
-        server,
-        work,
-        routes,
-        jobs,
-    } = options;
-    let listener = bind_gateway(&server.host, server.port, server.allow_remote).await?;
-    let bearer = server.access.clone();
-    bearer.validate().await?;
-    let archive_policy = archive::Policy::new(server.archive.clone());
-    archive_policy.prepare();
-
-    let app = router::router(routes, work.clone(), jobs).await?;
-    // Every route reaches a work source, so every route is behind the
-    // provisioned Auth credential. The layer goes on last, which in axum
-    // puts it outermost: a request without the credential is answered
-    // before a handler, the provenance layer, or the source sees it.
-    let app =
-        app.layer(provenance_layer::ProvenanceLayer)
-            .layer(axum::middleware::from_fn_with_state(
-                archive_policy,
-                archive::record,
-            ));
-    #[cfg(feature = "otel")]
-    let app = app.layer(axum::middleware::from_fn(
-        hellas_rpc::telemetry::http::trace_request,
-    ));
-    let app = app.layer(access::BearerLayer::new(bearer.node()));
-    let bound_addr = listener.local_addr()?;
-    info!("gateway listening on {bound_addr}");
-    bearer.announce();
-    let bearer_value = bearer.bearer();
-    let (shutdown, mut server_shutdown) = tokio::sync::watch::channel(false);
-    let server = std::future::IntoFuture::into_future(
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<ConnectionId>(),
-        )
-        .with_graceful_shutdown(async move {
-            let _ = server_shutdown.wait_for(|stopped| *stopped).await;
-        }),
-    );
-
-    let task = tokio::spawn(async move {
-        finish_cleanup(server.await.map_err(GatewayError::from), work.drain().await)
-    });
-
-    Ok(GatewayHandle {
-        address: bound_addr,
-        bearer: bearer_value,
-        shutdown,
-        task,
-    })
 }
 
 /// Listener tasks belong to the daemon; accepted jobs belong to its job table.
@@ -408,62 +277,6 @@ pub async fn listener_router(
         hellas_rpc::telemetry::http::trace_request,
     ));
     Ok(app.layer(access::BearerLayer::new(node)))
-}
-
-fn finish_cleanup<T>(
-    result: GatewayResult<T>,
-    drained: Result<(), WorkShutdownError>,
-) -> GatewayResult<T> {
-    match (result, drained) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Ok(_), Err(error)) => Err(error.into()),
-        (Err(error), Ok(())) => Err(error),
-        (Err(primary), Err(cleanup)) => Err(GatewayError::Cleanup {
-            primary: Box::new(primary),
-            cleanup,
-        }),
-    }
-}
-
-/// Wait for a process signal, then join the gateway listener.
-pub async fn wait_for_shutdown(handle: &mut GatewayHandle) -> crate::GatewayResult<()> {
-    tokio::select! {
-        signal = shutdown_signal() => {
-            handle.request_shutdown();
-            let stopped = (&mut handle.task).await.map_err(GatewayError::Task).and_then(|result| result);
-            signal.and(stopped)
-        }
-        result = &mut handle.task => {
-            result.map_err(GatewayError::Task).and_then(|result| result)
-        }
-    }
-}
-
-async fn shutdown_signal() -> crate::GatewayResult<()> {
-    #[cfg(unix)]
-    {
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => result?,
-            _ = terminate.recv() => {},
-        }
-    }
-    #[cfg(not(unix))]
-    tokio::signal::ctrl_c().await?;
-    Ok(())
-}
-
-/// Bind exactly the configured interface, using port 8080 when omitted.
-async fn bind_gateway(
-    host: &str,
-    port: Option<u16>,
-    allow_remote: bool,
-) -> crate::GatewayResult<tokio::net::TcpListener> {
-    let address = access::bind_addr(host, port.unwrap_or(DEFAULT_HTTP_PORT), allow_remote).await?;
-    tokio::net::TcpListener::bind(address)
-        .await
-        .map_err(|source| GatewayError::Bind { address, source })
 }
 
 /// A refusal or failure in the OpenAI error shape.
@@ -519,25 +332,6 @@ fn next_id(prefix: &str) -> String {
 
 fn now_unix() -> i64 {
     (UnixMillis::now().unwrap_or_default().0 / 1_000) as i64
-}
-
-#[cfg(test)]
-mod paid_shutdown_tests {
-    use super::*;
-
-    #[test]
-    fn cleanup_errors_reach_the_caller_and_preserve_the_primary_failure() {
-        assert!(matches!(
-            finish_cleanup(Ok(()), Err(WorkShutdownError::Poisoned)),
-            Err(GatewayError::Shutdown(WorkShutdownError::Poisoned))
-        ));
-        let primary = GatewayError::Io(std::io::Error::other("injected server failure"));
-        let error =
-            finish_cleanup::<()>(Err(primary), Err(WorkShutdownError::Poisoned)).unwrap_err();
-        assert!(
-            matches!(error, GatewayError::Cleanup { primary, cleanup: WorkShutdownError::Poisoned } if matches!(*primary, GatewayError::Io(_)))
-        );
-    }
 }
 
 fn work_error(error: WorkGatewayError) -> Response {

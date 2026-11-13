@@ -11,8 +11,9 @@ pub async fn router(
     routes: Vec<Route>,
     work: Arc<dyn WorkExecutionBackend>,
     jobs: Arc<crate::jobs::Jobs>,
+    memory: Arc<crate::RoutingState>,
 ) -> GatewayResult<Router> {
-    let routing = Routing::new(routes, work.clone())?;
+    let routing = Routing::new(routes, work.clone(), memory)?;
     let mut presentations = Vec::new();
     for route in &routing.routes {
         let execution = RouteExecution::open(route, work.clone()).await?;

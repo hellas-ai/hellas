@@ -20,6 +20,8 @@ hellas-store.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+hellas-chain = { workspace = true, features = ["chain-dir"] }
+hellas-sdk = { workspace = true, features = ["integration-tests"] }
 axum.workspace = true
 futures.workspace = true
 hellas-attestation.workspace = true

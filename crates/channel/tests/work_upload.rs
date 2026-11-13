@@ -283,7 +283,7 @@ async fn failed_cosign_journal_append_never_pins_and_reupload_after_restart_reco
         panic!("work scope")
     };
     assert!(matches!(
-        service.accept(&request).await.outcome,
+        service.accept(&request, None).await.outcome,
         Some(accept_work_response::Outcome::Refused(_))
     ));
     assert!(
@@ -380,7 +380,7 @@ async fn failed_cosign_journal_append_never_pins_and_reupload_after_restart_reco
     }
     let connection = Cancellation::new();
     upload(&service, frames, &connection).await.unwrap();
-    let response = service.accept(&request).await;
+    let response = service.accept(&request, None).await;
     caller
         .client()
         .await
@@ -466,7 +466,7 @@ async fn twelve_mib_compute_input_retries_accepts_reopens_and_reuses_verified_co
             .pins
             .is_empty()
     );
-    let response = service.accept(&request).await;
+    let response = service.accept(&request, None).await;
     let work = caller
         .client()
         .await
@@ -540,7 +540,7 @@ async fn twelve_mib_compute_input_retries_accepts_reopens_and_reuses_verified_co
         "cached root and input complete on Open, without any payload transfer"
     );
     assert!(matches!(
-        service.accept(&next).await.outcome,
+        service.accept(&next, None).await.outcome,
         Some(accept_work_response::Outcome::Accepted(_))
     ));
     connection.cancel();
@@ -642,7 +642,7 @@ async fn unseen_program_requires_complete_verified_source_and_asset_closure() {
             matches!(fault, "missing" | "corrupt"),
             "{fault}: {uploaded:?}"
         );
-        let response = service.accept(&request).await;
+        let response = service.accept(&request, None).await;
         if matches!(fault, "missing" | "corrupt") {
             assert!(
                 matches!(
@@ -858,7 +858,7 @@ async fn a_valid_second_proposal_cannot_replace_the_first_completed_unaccepted_s
         .client()
         .await
         .unwrap()
-        .accepted(&service.accept(&first).await)
+        .accepted(&service.accept(&first, None).await)
         .await
         .unwrap();
     assert!(

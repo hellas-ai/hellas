@@ -126,6 +126,7 @@ async fn app(names: &[&str], work: Arc<Fake>) -> Router {
         names.iter().map(|n| options(n)).collect(),
         work,
         Arc::new(crate::jobs::Jobs::default()),
+        Default::default(),
     )
     .await
     .unwrap()
@@ -378,7 +379,8 @@ async fn invalid_family_and_capacity_are_startup_errors() {
         crate::router::router(
             vec![route],
             Arc::new(Fake::default()),
-            Arc::new(crate::jobs::Jobs::default())
+            Arc::new(crate::jobs::Jobs::default()),
+            Default::default()
         )
         .await
         .is_err()

@@ -3,7 +3,14 @@ use hellas_authority::model::grant::budget::*;
 use hellas_executor::{FetchProvider, FetchProviderFuture, PreparedFetchRequest};
 use hellas_private::StoreLocation;
 use hellas_rpc::Assurance;
-use hellas_sdk::{GrantProviderOptions, grant_client::UnpinnedOffer};
+use hellas_rpc::ProviderEnrollmentBundle;
+use hellas_sdk::daemon::{Core, testing::Daemon};
+use hellas_sdk::daemon_config::{BackendKind, Document, Listener};
+use hellas_sdk::{
+    FetchRoute, FetchRouteEntry, FetchRoutePolicy, FetchRouteRegistry, NodeIdentity, RootProver,
+    grant_client::UnpinnedOffer,
+};
+use std::sync::Arc;
 use std::{
     num::NonZeroU64,
     sync::atomic::{AtomicUsize, Ordering},
@@ -173,7 +180,7 @@ struct ShareFixtureBuilder {
 struct ShareFixture {
     _root: tempfile::TempDir,
     upstream: TlsFixture,
-    provider: ProviderHandle,
+    provider: Daemon,
     gateway: ControlledGateway,
     administrator: CredentialSecret,
     application: Arc<hellas_sdk::node_control::profile::ClientProfile>,
@@ -194,82 +201,37 @@ impl ShareFixtureBuilder {
         let upstream = tls_fixture(self.upstream).await;
         let content = hellas_channel::test_support::channel::content_store(root.path()).await;
         content.finish_recovery().await.unwrap();
-        let options = || {
-            let mut routes = FetchRouteRegistry::new();
-            routes
-                .register(
-                    FetchRoute::new("openai", "responses"),
-                    FetchRouteEntry::new(
-                        upstream.provider.clone(),
-                        Arc::new(hellas_adaptors::openai::responses::fetch::OpenAiResponsesAdaptorFactory::new().unwrap()),
-                        FetchRoutePolicy::default(),
-                    )
-                    .unwrap(),
-                )
-                .unwrap();
-            let location = StoreLocation::for_test(root.path());
-            FetchProviderOptions {
-                port: Some(0),
-                identity: provider_identity.clone(),
-                enrollment: provider_bundle.clone(),
-                root: Arc::new(UnusedRoot),
-                home: location,
-                content: content.clone(),
-                routes,
-                fetch_max_in_flight: 2,
-                fetch_queue_capacity: 2,
-                paid_work: None,
-                grants: Some(GrantProviderOptions {
-                    configuration: hellas_authority::test_support::common_node::configuration(
-                        vec![
-                            crate::responses_policy(crate::ResponsesPolicyOptions {
-                                resource: hellas_auth::authority::ResourceId(
-                                    hellas_auth::Digest::hash(b"test resource"),
-                                ),
-                                account: hellas_auth::authority::ResourceId(
-                                    hellas_auth::Digest::hash(b"test account"),
-                                ),
-                                revision: hellas_auth::authority::Revision(1),
-                                service: "openai",
-                                method: "responses",
-                                responses: responses_resource(),
-                                pricing: pricing(),
-                                max_job_millis: NonZeroU64::new(60_000).unwrap(),
-                            })
-                            .unwrap(),
-                        ],
-                    ),
-                    max_job_millis: NonZeroU64::new(60_000).unwrap(),
-                }),
-            }
-        };
+        let document = openai_document(share_options()).unwrap();
+        let mut routes = FetchRouteRegistry::new();
+        routes.register(FetchRoute::new("openai", "responses"), FetchRouteEntry::new(
+            upstream.provider.clone(),
+            Arc::new(hellas_adaptors::openai::responses::fetch::OpenAiResponsesAdaptorFactory::new().unwrap()),
+            FetchRoutePolicy::default(),
+        ).unwrap()).unwrap();
         let clock = TestClock::new(hellas_auth::authority::UnixMillis::now().unwrap_or_default());
         let mut allowance = Allowance::responses(ALLOWANCE, FRIEND);
-        allowance.definition.policies =
-            options().grants.unwrap().configuration.resources().to_vec();
+        allowance.definition.policies = document.authority.resources().to_vec();
         allowance.definition.max_job_millis = NonZeroU64::new(60_000).unwrap();
         let location = StoreLocation::for_test(root.path());
-        let world = Node::bootstrap(&hellas_sdk::grant_config::GrantConfig::journal_dir(
-            &location,
-        ))
-        .with_network(hellas_authority::model::grant::grant_network())
-        .with_provider(provider_bundle.clone())
-        .with_clock(clock.clone())
-        .with_capacity(Capacity::new(1))
-        .with_allowance(allowance)
-        .with_grant(
-            ids::FRIEND_GRANT,
-            Rights::new(authority(), FRIEND)
-                .allow(
-                    hellas_authority::grant_service::WORK_EXECUTE,
-                    hellas_authority::grant_service::allowance_resource(authority(), ALLOWANCE),
-                )
-                .valid_from(clock.now())
-                .valid_until(hellas_auth::authority::UnixMillis(u64::MAX))
-                .build(),
-        )
-        .build()
-        .await;
+        let world = Node::bootstrap(&location.child("provider").child("authority"))
+            .with_network(hellas_authority::model::grant::grant_network())
+            .with_provider(provider_bundle.clone())
+            .with_clock(clock.clone())
+            .with_capacity(Capacity::new(1))
+            .with_allowance(allowance)
+            .with_grant(
+                ids::FRIEND_GRANT,
+                Rights::new(authority(), FRIEND)
+                    .allow(
+                        hellas_authority::grant_service::WORK_EXECUTE,
+                        hellas_authority::grant_service::allowance_resource(authority(), ALLOWANCE),
+                    )
+                    .valid_from(clock.now())
+                    .valid_until(hellas_auth::authority::UnixMillis(u64::MAX))
+                    .build(),
+            )
+            .build()
+            .await;
         let root_secret = world.secret(ROOT);
         let secret = CredentialSecret::from_parts(root_secret.id(), *root_secret.expose_secret());
         let app_secret = world.secret(FRIEND);
@@ -279,10 +241,50 @@ impl ShareFixtureBuilder {
             credential: CredentialSecret::from_parts(app_secret.id(), *app_secret.expose_secret()),
             local: None,
         });
-        drop(world);
-        let provider = start_fetch_provider(options().prepare().await.unwrap())
-            .await
-            .unwrap();
+        let node = hellas_authority::node::NodeCoordinator::new(
+            world.store,
+            Arc::new(|| hellas_auth::authority::UnixMillis::now().unwrap()),
+        );
+        hellas_authority::test_support::common_node::apply_configuration(
+            &node,
+            &document.authority,
+        )
+        .await;
+        let mut executor = hellas_executor::ExecutorSpawnConfig::new(
+            Arc::new(provider_identity.node_key().clone()),
+            routes,
+        );
+        executor.fetch_max_in_flight = 2;
+        executor.fetch_queue_capacity = 0;
+        let backend = hellas_sdk::BackendEntry {
+            backend: hellas_sdk::Backend::Fetch {
+                execution: hellas_executor::Executor::spawn_configured(executor)
+                    .await
+                    .unwrap(),
+                policy: document.authority.resources()[0].invocation_policy.clone(),
+            },
+            evaluator: None,
+            max_in_flight: std::num::NonZeroUsize::new(2).unwrap(),
+        };
+        let provider = Daemon::open(
+            runtime(
+                root.path(),
+                &provider_identity,
+                node,
+                content,
+                Some(Arc::new(
+                    hellas_sdk::ProviderOpen::new(
+                        Arc::new(provider_identity.node_key().clone()),
+                        provider_bundle.clone(),
+                        Some(Arc::new(UnusedRoot)),
+                    )
+                    .unwrap(),
+                )),
+            ),
+            document,
+            [("openai".into(), backend)].into(),
+        )
+        .await;
         let caller = hellas_authority::test_support::session(
             &provider.administration().unwrap().node(),
             &secret,
@@ -333,6 +335,17 @@ impl ShareFixtureBuilder {
                 not_before: UnixMillis::now().unwrap_or_default(),
                 expires: UnixMillis(UnixMillis::now().unwrap_or_default().0 + 60_000),
             };
+            let grant = hellas_auth::authority::GrantId([0xa7; 16]);
+            node.grant(
+                &caller,
+                hellas_auth::authority::GrantCommand::Issue {
+                    authorization,
+                    id: grant,
+                    spec: scope.clone(),
+                },
+            )
+            .await
+            .unwrap();
             let (_, credential) = hellas_authority::test_support::credentials::issue_one(
                 &node,
                 &caller,
@@ -342,38 +355,26 @@ impl ShareFixtureBuilder {
             )
             .await
             .unwrap();
-            hellas_sdk::gateway::GatewayAccess::new(node, authorization, credential)
+            hellas_sdk::gateway::GatewayAccess::new(node, grant, credential)
                 .await
                 .unwrap()
         };
         let other_location = StoreLocation::for_test(&root.path().join("client"));
         let gateway = controlled_gateway(
-            GrantServeOptions {
-                serve: hellas_sdk::gateway::ServerOptions {
-                    access,
-                    host: "127.0.0.1".into(),
-                    port: Some(0),
-                    archive: hellas_sdk::gateway::ArchiveOptions {
-                        directory: root.path().join("archive"),
-                        zdr: true,
-                    },
-                    allow_remote: false,
-                },
-                session: hellas_sdk::grant_client::GrantSessionOptions {
-                    control_timeout: std::time::Duration::from_millis(
-                        pinned.offer().grant.max_job_millis.get(),
-                    ),
-                    target: pinned,
-                    principal: hellas_channel::test_support::subject_of(client_identity.node_key()),
-                    signer: Arc::new(client_identity.node_key().clone()),
-                    application: application.clone(),
-                    journal_root: other_location,
-                },
+            access,
+            hellas_sdk::grant_client::GrantSessionOptions {
+                control_timeout: std::time::Duration::from_millis(
+                    pinned.offer().grant.max_job_millis.get(),
+                ),
+                target: pinned,
+                principal: hellas_channel::test_support::subject_of(client_identity.node_key()),
+                signer: Arc::new(client_identity.node_key().clone()),
+                application: application.clone(),
+                journal_root: other_location,
             },
-            client_identity.transport_key(),
+            &client_identity,
             root.path(),
             admin.node(),
-            &secret,
         )
         .await;
         ShareFixture {
@@ -462,113 +463,42 @@ fn software_enrollment(identity: &NodeIdentity) -> ProviderEnrollmentBundle {
     )
 }
 
-struct OpenAiFixture {
-    root: tempfile::TempDir,
-    identity: NodeIdentity,
-    enrollment: ProviderEnrollmentBundle,
-}
-impl OpenAiFixture {
-    fn new() -> Self {
-        let root = tempfile::tempdir().unwrap();
-        let identity =
-            NodeIdentity::from_secret_bytes([5; 32], PROVIDER.node_key().to_secret_bytes())
-                .unwrap();
-        let enrollment = software_enrollment(&identity);
-        Self {
-            root,
-            identity,
-            enrollment,
-        }
-    }
-    async fn options(&self) -> OpenAiProviderOptions<UnusedRoot> {
-        use hellas_auth::authority::ResourceId;
-        let root = self.root.path();
-        let identity = &self.identity;
-        let enrollment = &self.enrollment;
-        let location = StoreLocation::for_test(root);
-        OpenAiProviderOptions {
-            port: Some(0),
-            identity: identity.clone(),
-            enrollment: enrollment.clone(),
-            root: Arc::new(UnusedRoot),
-            home: location,
-            content: {
-                let content = hellas_channel::test_support::channel::content_store(root).await;
-                content.finish_recovery().await.unwrap();
-                content
-            },
-            service: "openai".into(),
-            method: "responses".into(),
-            bearer_token: "fixture".into(),
-            resource: ResourceId(hellas_auth::Digest::hash(b"test resource")),
-            account: ResourceId(hellas_auth::Digest::hash(b"test account")),
-            machine: unlimited(),
-            account_budget: unlimited(),
-            policy_revision: Revision(1),
-            pricing: hellas_authority::model::grant::pricing::Pricing {
-                revision: hellas_auth::authority::Revision(1),
-                rates: None,
-            },
-            responses: responses_resource(),
-            max_job_millis: NonZeroU64::new(60_000).unwrap(),
-            fetch_max_in_flight: 1,
-            fetch_queue_capacity: 1,
-        }
+fn share_options() -> OpenAiShareOptions {
+    use hellas_auth::authority::ResourceId;
+    OpenAiShareOptions {
+        port: 0,
+        service: "openai".into(),
+        method: "responses".into(),
+        bearer_token: "fixture".into(),
+        resource: ResourceId(hellas_auth::Digest::hash(b"test resource")),
+        account: ResourceId(hellas_auth::Digest::hash(b"test account")),
+        machine: unlimited(),
+        account_budget: unlimited(),
+        policy_revision: Revision(1),
+        responses: responses_resource(),
+        pricing: pricing(),
+        max_job_millis: NonZeroU64::new(60_000).unwrap(),
+        max_in_flight: std::num::NonZeroUsize::new(2).unwrap(),
     }
 }
-#[tokio::test]
-async fn openai_host_refuses_an_empty_upstream_key() {
-    let fixture = OpenAiFixture::new();
-    let mut options = fixture.options().await;
+#[test]
+fn openai_document_requires_a_key_and_redacts_it_from_the_echo() {
+    let mut options = share_options();
     options.bearer_token.clear();
-    hellas_auth::assert_err!(
-        start_openai_provider(&options, None).await,
-        OpenAiProviderError::Config(hellas_providers::OpenAiConfigError::EmptyKey)
-    );
-}
-#[tokio::test]
-async fn host_control_starts_the_shared_openai_factory() {
-    let fixture = OpenAiFixture::new();
-    let location = StoreLocation::for_test(fixture.root.path());
-    let world = Node::bootstrap(&hellas_sdk::grant_config::GrantConfig::journal_dir(
-        &location,
-    ))
-    .with_provider(fixture.enrollment.clone())
-    .with_clock(TestClock::new(
-        hellas_auth::authority::UnixMillis::now().unwrap_or_default(),
-    ))
-    .build()
-    .await;
-    let secret = world.secret(ROOT);
-    let secret = CredentialSecret::from_parts(secret.id(), *secret.expose_secret());
-    let node = hellas_authority::node::NodeCoordinator::new(
-        world.store,
-        Arc::new(|| hellas_auth::authority::UnixMillis::now().unwrap_or_default()),
-    );
-    let options = fixture.options().await;
-    let content = options.content.clone();
-    let (host, control) = controlled_host(
-        fixture.root.path(),
-        node,
-        &secret,
-        Some(options.into_factory()),
-        None,
-        content,
-    )
-    .await;
-    let reply = control
-        .set_provider_state(hellas_rpc::pb::host::SetProviderStateRequest {
-            enabled: true,
-            authorization: ROOT_GRANT.0.to_vec(),
-        })
-        .await
-        .unwrap();
-    assert_eq!(
-        reply.provider.unwrap().state,
-        hellas_rpc::pb::host::RuntimeState::Running as i32
-    );
-    drop(control);
-    host.shutdown().await.unwrap();
+    assert!(openai_document(options).is_err());
+    let document = openai_document(share_options()).unwrap();
+    let (echo, secrets) = document.redacted();
+    assert_eq!(secrets.0["openai"][""], "fixture");
+    assert_eq!(document.authority.resources().len(), 1);
+    let BackendKind::Fetch {
+        upstream: hellas_sdk::daemon_config::Upstream::OpenaiResponses { secret },
+        ..
+    } = &echo.backends["openai"].kind
+    else {
+        panic!("OpenAI fetch backend")
+    };
+    assert!(secret.is_none());
+    echo.validate().unwrap();
 }
 
 fn responses_resource() -> hellas_authority::model::grant::responses::ResponsesResource {
@@ -599,193 +529,116 @@ fn pricing() -> hellas_authority::model::grant::pricing::Pricing {
     }
 }
 
-type TestControl =
-    hellas_rpc::services::host_control::HostControlClientImpl<hellas_sdk::wire::mux::MuxTransport>;
-async fn controlled_host(
-    root: &std::path::Path,
-    node: hellas_authority::node::NodeCoordinator,
-    secret: &hellas_auth::authority::CredentialSecret,
-    provider: Option<hellas_sdk::node_control::host::ProviderFactory>,
-    gateway: Option<(
-        hellas_sdk::gateway::GatewayAccess,
-        hellas_sdk::node_control::host::GatewayFactory,
-    )>,
-    content: hellas_store::content::DiskStore,
-) -> (hellas_sdk::node_control::host::HostHandle, TestControl) {
-    use hellas_sdk::wire::ServiceMarker;
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-    let crypto = Arc::new(rustls::crypto::ring::default_provider());
-    let mut tls = rustls::ServerConfig::builder_with_provider(crypto.clone())
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(
-            vec![cert.cert.der().clone()],
-            rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()).into(),
-        )
-        .unwrap();
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(cert.cert.der().clone()).unwrap();
-    let mut trust = rustls::ClientConfig::builder_with_provider(crypto)
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    tls.alpn_protocols = vec![
-        hellas_rpc::services::host_control::HostControl::ALPN
-            .as_bytes()
-            .to_vec(),
-    ];
-    trust.alpn_protocols = tls.alpn_protocols.clone();
-    let authority = hellas_authority::test_support::session(&node, secret)
-        .await
-        .authority();
-    let socket = root.join("control/host.socket");
-    let host = hellas_sdk::node_control::host::HostHandle::start(
-        hellas_sdk::node_control::host::HostOptions {
-            content,
-            transport: None,
-            start_provider: false,
-            provider,
-            gateway,
-            control: Some((
-                node,
-                hellas_sdk::ProviderControl {
-                    socket: socket.clone(),
-                    tls: Arc::new(tls),
-                    remote: Default::default(),
-                },
-            )),
-        },
-    )
-    .await
-    .unwrap();
-    let (control, _) = hellas_sdk::node_control::connect_local(
-        socket,
-        Arc::new(trust),
-        "localhost".try_into().unwrap(),
-        authority,
-        secret,
-        hellas_authority::node::SessionKey::Passkey(&ROOT.passkey()),
-    )
-    .await
-    .unwrap();
-    (host, control)
-}
 struct ControlledGateway {
-    host: hellas_sdk::node_control::host::HostHandle,
-    control: TestControl,
-    access: hellas_rpc::pb::host::GatewayAccess,
+    core: Arc<Core>,
+    endpoint: iroh::Endpoint,
+    address: String,
+    bearer: String,
 }
-/// A grant gateway the host starts: each start binds its own endpoint.
-#[derive(Clone)]
-struct GrantServeOptions {
-    serve: hellas_sdk::gateway::ServerOptions,
-    session: hellas_sdk::grant_client::GrantSessionOptions,
-}
-impl GrantServeOptions {
-    fn into_factory(self, key: iroh::SecretKey) -> hellas_sdk::node_control::host::GatewayFactory {
-        Arc::new(move |access| {
-            let (mut options, key) = (self.clone(), key.clone());
-            options.serve.access = access;
-            Box::pin(async move {
-                let endpoint = hellas_sdk::grant_client::bind_endpoint(key).await?;
-                let signer = options.session.signer.clone();
-                let target = hellas_sdk::Backend::Grant {
-                    policy: options.session.target.offer().grant.policies[0].clone(),
-                    options: options.session,
-                    transport: hellas_sdk::grant_client::GrantTransport::Remote(endpoint),
-                };
-                let routes = target.routes("test")?;
-                let work = hellas_sdk::ExecutorGateway::new(
-                    [(
-                        "test".into(),
-                        hellas_sdk::BackendEntry {
-                            backend: target,
-                            evaluator: Some(hellas_channel::test_support::channel::evaluator()),
-                            max_in_flight: std::num::NonZeroUsize::new(32).unwrap(),
-                        },
-                    )]
-                    .into(),
-                    signer,
-                );
-                Ok(
-                    hellas_sdk::gateway::start(hellas_sdk::gateway::GatewayOptions {
-                        jobs: work.jobs.clone(),
-                        server: options.serve,
-                        work,
-                        routes,
-                    })
-                    .await?,
-                )
-            })
-        })
-    }
-}
-
 async fn controlled_gateway(
-    gateway: GrantServeOptions,
-    key: iroh::SecretKey,
+    access: hellas_sdk::gateway::GatewayAccess,
+    session: hellas_sdk::grant_client::GrantSessionOptions,
+    identity: &NodeIdentity,
     root: &std::path::Path,
     node: hellas_authority::node::NodeCoordinator,
-    secret: &hellas_auth::authority::CredentialSecret,
 ) -> ControlledGateway {
-    let content = hellas_channel::test_support::channel::content_store(&root.join("host")).await;
-    content.finish_recovery().await.unwrap();
-    let (host, control) = controlled_host(
-        root,
-        node,
-        secret,
-        None,
-        Some((gateway.serve.access.clone(), gateway.into_factory(key))),
-        content,
+    let content = hellas_channel::test_support::channel::content_store(&root.join("gateway")).await;
+    let endpoint = hellas_sdk::grant_client::bind_endpoint(identity.transport_key())
+        .await
+        .unwrap();
+    let target = hellas_sdk::Backend::Grant {
+        policy: session.target.offer().grant.policies[0].clone(),
+        options: session,
+        transport: hellas_sdk::grant_client::GrantTransport::Remote(endpoint.clone()),
+    };
+    let document = Document {
+        listeners: [(
+            "api".into(),
+            Listener::Http {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                zdr: true,
+            },
+        )]
+        .into(),
+        routes: target.routes("friend").unwrap(),
+        backends: [(
+            "friend".into(),
+            hellas_sdk::daemon_config::Backend {
+                max_in_flight: std::num::NonZeroUsize::new(2).unwrap(),
+                kind: BackendKind::Grant {
+                    access: root.join("unused-test-offer"),
+                    resource: None,
+                    evaluator: None,
+                    trust: None,
+                },
+            },
+        )]
+        .into(),
+        ..Default::default()
+    };
+    let core = Core::open_with_backends(
+        runtime(&root.join("gateway"), identity, node, content, None),
+        document,
+        [(
+            "friend".into(),
+            hellas_sdk::BackendEntry {
+                backend: target,
+                evaluator: None,
+                max_in_flight: std::num::NonZeroUsize::new(2).unwrap(),
+            },
+        )]
+        .into(),
     )
-    .await;
-    let status = control
-        .set_gateway_state(hellas_rpc::pb::host::SetGatewayStateRequest {
-            enabled: true,
-            authorization: ROOT_GRANT.0.to_vec(),
-        })
-        .await
-        .unwrap();
-    assert_eq!(
-        status.gateway.unwrap().state,
-        hellas_rpc::pb::host::RuntimeState::Running as i32
-    );
-    let access = control
-        .get_gateway_access(hellas_rpc::pb::host::GetGatewayAccessRequest {
-            authorization: ROOT_GRANT.0.to_vec(),
-        })
-        .await
-        .unwrap();
+    .await
+    .unwrap();
     ControlledGateway {
-        host,
-        control,
-        access,
+        address: core.http_addresses()["api"].to_string(),
+        bearer: access.bearer(),
+        core,
+        endpoint,
     }
 }
 impl ControlledGateway {
     fn address(&self) -> &str {
-        self.access.address.strip_prefix("http://").unwrap()
+        &self.address
     }
     fn bearer(&self) -> &str {
-        &self.access.bearer
+        &self.bearer
     }
-    async fn shutdown(self) -> Result<(), hellas_sdk::node_control::host::HostError> {
-        let status = self
-            .control
-            .set_gateway_state(hellas_rpc::pb::host::SetGatewayStateRequest {
-                enabled: false,
-                authorization: ROOT_GRANT.0.to_vec(),
-            })
-            .await
-            .unwrap();
-        assert_eq!(
-            status.gateway.unwrap().state,
-            hellas_rpc::pb::host::RuntimeState::Stopped as i32
-        );
-        drop(self.control);
-        self.host.shutdown().await
+    async fn shutdown(self) -> Result<(), hellas_sdk::daemon::Error> {
+        let result = self.core.shutdown().await;
+        self.endpoint.close().await;
+        result
+    }
+}
+fn runtime(
+    root: &std::path::Path,
+    identity: &NodeIdentity,
+    node: hellas_authority::node::NodeCoordinator,
+    content: hellas_store::content::DiskStore,
+    prover: Option<Arc<hellas_sdk::ProviderOpen>>,
+) -> hellas_sdk::daemon::Options {
+    let home = StoreLocation::for_test(root);
+    hellas_sdk::daemon::Options {
+        discovery: false,
+        endpoint: None,
+        remote_control: Default::default(),
+        prover,
+        chain: hellas_chain::chain_dir::ChainDir::open(
+            &home,
+            &hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet),
+        )
+        .unwrap(),
+        home,
+        signer: Arc::new(identity.node_key().clone()),
+        transport: identity.transport_key(),
+        settlement: hellas_kernel::Secp256k1Signer::from_secret_scalar(
+            identity.node_secret_bytes(),
+        )
+        .unwrap(),
+        owner: None,
+        node,
+        content,
     }
 }
 

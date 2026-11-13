@@ -454,7 +454,7 @@ pub async fn accept_uploaded(
     {
         seed_content(endpoint.fixture_store(), authorization, bytes.into()).await;
     }
-    endpoint.accept(&wire).await
+    endpoint.accept(&wire, None).await
 }
 
 pub async fn accept_uploaded_service(
@@ -462,7 +462,7 @@ pub async fn accept_uploaded_service(
     request: &hellas_rpc::pb::work::AcceptWorkRequest,
 ) -> hellas_rpc::pb::work::AcceptWorkResponse {
     let Ok(channel) = service.with_state(|state| state.channel().clone()).await else {
-        return service.accept(request).await;
+        return service.accept(request, None).await;
     };
     let (wire, frames) = fixture_uploads(&channel, request);
     send_frames(service, &wire, frames).await
@@ -496,7 +496,7 @@ async fn send_frames(
         // when this connection cannot open a fresh upload scope.
         let _ = super::drive_upload(stream).await;
     }
-    let response = service.accept(wire).await;
+    let response = service.accept(wire, None).await;
     connection.cancel();
     tokio::time::timeout(crate::test_support::HANG_GUARD, async {
         while service.content_upload_count().await.unwrap() != 0 {
@@ -731,7 +731,7 @@ pub async fn accept_uploaded_client(
 ) -> hellas_rpc::pb::work::AcceptWorkResponse {
     use crate::model::work::{PaidJobAuthorizationV2, PrivateRecord as _, work_id};
     let Ok(a) = PaidJobAuthorizationV2::decode(&request.authorization) else {
-        return service.accept(request).await;
+        return service.accept(request, None).await;
     };
     let frames = client
         .with_state(|state| {
@@ -744,7 +744,7 @@ pub async fn accept_uploaded_client(
         .unwrap();
     match frames {
         Some((wire, frames)) => send_frames(service, &wire, frames).await,
-        None => service.accept(request).await,
+        None => service.accept(request, None).await,
     }
 }
 
@@ -858,7 +858,7 @@ impl WorkBackend for AnsweringBackend {
 /// Runs one accepted job to a signed, durable result.
 pub async fn run_to_result(service: &WorkService, ready: &ReadyChannel, id: Digest) {
     let backend = AnsweringBackend::new();
-    let outcome = run_accepted_work(service, ready, &backend, id).await;
+    let outcome = run_accepted_work(service, ready, &backend, id, None).await;
     assert!(
         matches!(outcome, Ok(RunOutcome::Completed { .. })),
         "the fixture job completes: {outcome:?}",

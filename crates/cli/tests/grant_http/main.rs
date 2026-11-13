@@ -3,7 +3,6 @@
     reason = "inventory class A/B/C: test timing fixtures pending their rollout"
 )]
 #![cfg(unix)]
-use hellas_private::StoreLocation;
 mod contact;
 mod local_compute;
 mod local_flux;
@@ -146,7 +145,6 @@ impl Https {
 const ROOT_PASSKEY: [u8; 32] = [0x11; 32];
 const FRIEND_PASSKEY: [u8; 32] = [0x13; 32];
 const AGENT_PASSKEY: [u8; 32] = [0x14; 32];
-const STRANGER_PASSKEY: [u8; 32] = [0x16; 32];
 
 /// One CLI user: a node identity, acting for the principal of its own
 /// software passkey file.
@@ -227,6 +225,7 @@ impl Cli {
             .kill_on_drop(true);
         if let Some(address) = &self.metrics_address
             && args.contains(&"--metrics-port")
+            && !args.contains(&"--wrap")
         {
             command.args(["--metrics-addr", address]);
         }
@@ -255,11 +254,29 @@ impl Cli {
         );
         String::from_utf8(output.stdout).unwrap()
     }
+    async fn gateway(&self, models: &[String], log: &str) -> (Process, String, String) {
+        let mut args = vec!["gateway", "--bind", "127.0.0.1:0"];
+        #[cfg(feature = "otel")]
+        args.extend(["--metrics-port", "0"]);
+        #[cfg(feature = "otel")]
+        if let Some(address) = &self.metrics_address {
+            args.extend(["--metrics-addr", address]);
+        }
+        for model in models {
+            args.extend(["--model", model]);
+        }
+        args.extend(["--wrap", "sh", "--", "-c", "printf 'gateway listening on %s\n' \"$ANTHROPIC_BASE_URL\"; printf 'gateway token %s\n' \"$OPENAI_API_KEY\"; exec cat"]);
+        let mut process = self.spawn(&args, log);
+        let url = process.wait_for("gateway listening on ").await;
+        let token = process.wait_for("gateway token ").await;
+        (process, url.strip_prefix("http://").unwrap().into(), token)
+    }
     fn spawn(&self, args: &[&str], name: &str) -> Process {
         let log = self.root.join(name);
         let file = std::fs::File::create(&log).unwrap();
         let child = self
             .command(args)
+            .stdin(Stdio::piped())
             .stdout(file.try_clone().unwrap())
             .stderr(file)
             .spawn()
@@ -495,77 +512,6 @@ async fn issue_work_profile_at(
 }
 /// An HTTP authority whose administrator issues the gateway a separate
 /// bearer credential; the bootstrap credential is never the bearer.
-async fn gateway_profile(root: &Path) -> (PathBuf, String) {
-    use hellas_auth::{Digest, authority::*};
-    let authority = AuthorityId(Digest::hash(b"CLI HTTP authority"));
-    let subject = hellas_channel::test_support::actors::OPERATOR.principal();
-    let now = UnixMillis::now().unwrap_or_default();
-    let permission =
-        hellas_authority::operations::Operation::named(hellas_authority::node::GATEWAY_INVOKE)
-            .unwrap()
-            .permission(authority, None)
-            .unwrap();
-    let administrator = common_node::admin_spec(
-        authority,
-        subject,
-        &[(hellas_authority::node::GATEWAY_INVOKE, permission.resource)],
-        (now, UnixMillis(now.0 + 600_000)),
-        (600_000, 0),
-        &[],
-    );
-    let scope = GrantSpec {
-        authority,
-        subject,
-        permissions: [permission].into(),
-        issuance: None,
-        delegation_depth: 0,
-        not_before: now,
-        expires: UnixMillis(now.0 + 600_000),
-    };
-    let journal = root.join("gateway-authority");
-    let root_grant = GrantId([0; 16]);
-    let location = StoreLocation::for_test(&journal);
-    let (store, admin) = hellas_authority::work_store::grant::NodeStore::bootstrap(
-        &location,
-        hellas_authority::model::grant::grant_network(),
-        root_grant,
-        common_node::approval(
-            Ownership::Bootstrap {
-                root: root_grant,
-                target: None,
-            },
-            administrator,
-        ),
-        None,
-        now,
-    )
-    .await
-    .unwrap();
-    let node = hellas_authority::node::NodeCoordinator::new(
-        store,
-        Arc::new(|| UnixMillis::now().unwrap_or_default()),
-    );
-    let caller = hellas_authority::test_support::session(&node, &admin).await;
-    let (_, credential) = hellas_authority::test_support::credentials::issue_one(
-        &node,
-        &caller,
-        root_grant,
-        scope,
-        CredentialHolder::Bearer,
-    )
-    .await
-    .unwrap();
-    drop(node);
-    let mut bytes = credential.id().0.to_vec();
-    bytes.extend_from_slice(credential.expose_secret());
-    let credential_path = root.join("gateway.credential");
-    hellas_private::write_atomically(&credential_path, ".writing", &bytes).unwrap();
-    let profile = root.join("gateway-profile.json");
-    hellas_private::write_atomically(&profile,".writing",&serde_json::to_vec(&json!({
-        "journal":journal,"authority":authority,"authorization":root_grant,"credential":credential_path
-    })).unwrap()).unwrap();
-    (profile, hex::encode(bytes))
-}
 fn gateway_client(token: &str) -> reqwest::Client {
     let bearer = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")).unwrap();
     reqwest::Client::builder()

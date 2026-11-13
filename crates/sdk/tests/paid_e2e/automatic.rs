@@ -427,7 +427,6 @@ impl Provider {
         .unwrap();
         let admin = hellas_authority::grant_service::WorkAdministration::new(
             grants.clone(),
-            hellas_authority::test_support::common_node::configuration(composition_policies()),
             std::num::NonZeroU64::new(5000).unwrap(),
         );
         let endpoint = Endpoint::builder(presets::Minimal)

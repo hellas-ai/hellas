@@ -15,6 +15,7 @@ use std::{
 };
 
 pub struct Options {
+    pub discovery: bool,
     pub endpoint: Option<iroh::Endpoint>,
     pub remote_control: crate::node_control::RemoteControlAdmission,
     pub prover: Option<Arc<crate::ProviderOpen>>,
@@ -66,6 +67,13 @@ impl Runtime {
             #[cfg(feature = "compute")]
             indexed: Default::default(),
         }
+    }
+
+    pub fn consumer_endpoints(&self) -> impl Iterator<Item = iroh::Endpoint> {
+        [self.grant.get(), self.paid.get()]
+            .into_iter()
+            .flatten()
+            .cloned()
     }
 
     pub async fn shutdown(&self) {
@@ -258,12 +266,14 @@ impl Runtime {
                     };
                     let backend = executor
                         .get_or_try_init(|| async {
-                            let mut config = hellas_executor::ExecutorSpawnConfig::new(
+                            crate::execution::local::spawn(
                                 self.options.signer.clone(),
-                                Default::default(),
-                            );
-                            config.gpu_config.backend = dialect;
-                            hellas_executor::Executor::spawn_configured(config).await
+                                hellas_executor::GpuConfig {
+                                    backend: dialect,
+                                    ..Default::default()
+                                },
+                            )
+                            .await
                         })
                         .await?
                         .clone();

@@ -201,6 +201,7 @@ async fn responses_carry_provenance_at_start_and_end() {
             vec![crate::test_support::route(presentation())],
             work,
             Arc::new(crate::jobs::Jobs::default()),
+            Default::default(),
         )
         .await
         .unwrap()

@@ -6,8 +6,6 @@ use hellas_auth::authority::{CredentialId, CredentialSecret, GrantId};
 use hellas_authority::node::NodeCoordinator;
 use std::{
     fmt,
-    io::Write,
-    net::SocketAddr,
     sync::Arc,
     task::{Context, Poll},
 };
@@ -38,12 +36,9 @@ impl GatewayAccess {
         Ok(access)
     }
 
+    #[cfg(test)]
     pub(crate) fn node(&self) -> NodeCoordinator {
         self.node.clone()
-    }
-
-    pub fn shares_writer(&self, node: &NodeCoordinator) -> bool {
-        self.node.shares_writer(node)
     }
 
     /// The gateway's own credential, under its configured grant.
@@ -62,23 +57,6 @@ impl GatewayAccess {
             self.credential.id(),
             hellas_rpc::provenance::encode_hex(self.credential.expose_secret())
         )
-    }
-
-    pub(crate) fn announce(&self) {
-        let terminal = if cfg!(windows) { "CONOUT$" } else { "/dev/tty" };
-        // Never fall back to stdout/stderr, which are routinely captured.
-        match std::fs::OpenOptions::new().write(true).open(terminal) {
-            Ok(mut tty) => {
-                if let Err(error) = writeln!(
-                    tty,
-                    "gateway bearer: Authorization: Bearer {}",
-                    self.bearer()
-                ) {
-                    warn!(%error, "gateway credential could not be written to the controlling terminal");
-                }
-            }
-            Err(error) => warn!(%error, "gateway credential not shown: no controlling terminal"),
-        }
     }
 }
 
@@ -181,31 +159,6 @@ fn unauthorized(path: &str) -> Response<Body> {
         header::HeaderValue::from_static("Bearer"),
     );
     response
-}
-
-pub(crate) async fn bind_addr(
-    host: &str,
-    port: u16,
-    allow_remote: bool,
-) -> crate::GatewayResult<SocketAddr> {
-    let resolved: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|source| crate::GatewayError::Resolve {
-            host: host.into(),
-            port,
-            source,
-        })?
-        .collect();
-    let Some(first) = resolved.first().copied() else {
-        return Err(crate::GatewayError::NoAddress {
-            host: host.into(),
-            port,
-        });
-    };
-    if !(allow_remote || resolved.iter().all(|addr| addr.ip().is_loopback())) {
-        return Err(crate::GatewayConfigError::RemoteBinding.into());
-    }
-    Ok(first)
 }
 
 #[cfg(test)]
