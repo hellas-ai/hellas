@@ -55,6 +55,47 @@ impl NodeCoordinator {
         Ok(store.state().configuration().cloned())
     }
 
+    /// Trusted restart view of the authority terms already committed with the document.
+    pub async fn resource_configuration(
+        &self,
+    ) -> Result<crate::model::grant::configuration::NodeConfiguration, NodeStoreError> {
+        use crate::model::grant::configuration::{ConfiguredBudget, NodeConfiguration};
+        let (store, _) = self.lock().await?;
+        let state = store.state();
+        let budget = |node: BudgetNode| -> Result<Option<ConfiguredBudget>, NodeStoreError> {
+            state
+                .ledger()
+                .node(node.key())
+                .map(|node| {
+                    let spec = node.spec();
+                    Ok(ConfiguredBudget {
+                        limits: crate::work_store::grant::ledger::limits(spec).to_vec(),
+                        max_in_flight: NonZeroU16::new(
+                            crate::work_store::grant::ledger::concurrent(spec),
+                        )
+                        .ok_or(NodeStoreError::Malformed)?,
+                    })
+                })
+                .transpose()
+        };
+        let resources: Vec<_> = state.catalogue().cloned().collect();
+        let accounts = resources
+            .iter()
+            .map(|policy| {
+                Ok((
+                    policy.account,
+                    budget(BudgetNode::Account(policy.account))?
+                        .ok_or(NodeStoreError::Malformed)?,
+                ))
+            })
+            .collect::<Result<_, NodeStoreError>>()?;
+        Ok(NodeConfiguration::new(
+            budget(BudgetNode::Machine)?,
+            accounts,
+            resources,
+        )?)
+    }
+
     /// Apply trusted process startup options before exposing control transports.
     /// Remote callers must use `configure`, which requires permission and step-up.
     pub async fn configure_startup(

@@ -118,6 +118,12 @@ budgets in one frame; the serving snapshot changes only after durability.
 Commit and publication survive the control caller disconnecting. `Watch`
 reports the result to other callers. Keys are never echoed.
 
+A missing model or failed backend activation appears as Down with its error;
+the control service remains available to repair the document. A failure after
+the journal commit returns an error naming the committed revision and is also
+visible on Watch. Paid backends contact their provider on the first request.
+An unreachable provider marks that backend Down; other routes remain usable.
+
 Local package paths must be readable at the same path by the editing CLI and
 the daemon. A removed backend stays alive for admitted work. Resource edits
 keep accepted terms by default; a resource's `release` option instead cancels

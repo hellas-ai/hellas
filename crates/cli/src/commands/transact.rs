@@ -636,6 +636,7 @@ impl ResolvedBackend {
     ) -> super::CliResult<(Executor, String)> {
         let mut executor = Executor::new(self.backend.clone());
         let provider = match &executor.backend.state {
+            BackendState::Unavailable(error) => anyhow::bail!("{error}"),
             BackendState::Paid(paid) => {
                 let hellas_sdk::PaidBackend { options, owner, .. } = paid.as_ref();
                 executor.attempt = Some(client.purchase(context, job, options, owner)?);
@@ -681,7 +682,7 @@ impl ResolvedBackend {
         match self.backend.state {
             BackendState::Paid(paid) => paid.options.content.close().await,
             BackendState::Local { execution, .. } => execution.content.close().await,
-            BackendState::Fetch { .. } | BackendState::Grant(_) => {}
+            BackendState::Unavailable(_) | BackendState::Fetch { .. } | BackendState::Grant(_) => {}
         }
         Ok(())
     }

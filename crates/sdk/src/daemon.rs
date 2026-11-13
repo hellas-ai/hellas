@@ -34,6 +34,7 @@ pub struct Core {
     routing: Arc<hellas_gateway::RoutingState>,
     configuring: Arc<tokio::sync::Mutex<()>>,
     listeners: Mutex<tokio::task::JoinSet<ListenerExit>>,
+    listeners_changed: tokio::sync::Notify,
     #[cfg(test)]
     pub(crate) after_commit:
         Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
@@ -51,6 +52,7 @@ struct BoundListener {
     bound: Bound,
     stop: tokio::sync::watch::Sender<bool>,
     started: std::sync::atomic::AtomicBool,
+    failure: std::sync::OnceLock<String>,
 }
 enum Bound {
     Http {
@@ -74,6 +76,7 @@ pub struct View {
     pub jobs: Vec<hellas_gateway::jobs::Info>,
     pub http_addresses: BTreeMap<String, std::net::SocketAddr>,
     pub iroh_addresses: BTreeMap<String, iroh::EndpointAddr>,
+    pub listener_errors: BTreeMap<String, String>,
 }
 
 impl Core {
@@ -85,19 +88,20 @@ impl Core {
                 return Err("daemon admission stopped".into());
             }
             tokio::select! {
-                result = std::future::poll_fn(|cx| self.listeners.lock().unwrap_or_else(|e| e.into_inner()).poll_join_next(cx)) => {
-                    match result {
-                        Some(result) => {
-                            let (id, listener, result) = result?;
-                            if listener.upgrade().is_some_and(|listener| !*listener.stop.borrow()) {
-                                result?;
-                                return Err(format!("listener {id} stopped").into());
-                            }
-                            if let Err(error) = result { tracing::warn!(%error, "retired listener stopped with an error"); }
-                        }
-                        None => { let _ = events.recv().await; }
+                result = std::future::poll_fn(|cx| {
+                    match self.listeners.lock().unwrap_or_else(|e| e.into_inner()).poll_join_next(cx) {
+                        std::task::Poll::Ready(Some(result)) => std::task::Poll::Ready(result),
+                        _ => std::task::Poll::Pending,
                     }
+                }) => {
+                    let (id, listener, result) = result?;
+                    if listener.upgrade().is_some_and(|listener| !*listener.stop.borrow()) {
+                        result?;
+                        return Err(format!("listener {id} stopped").into());
+                    }
+                    if let Err(error) = result { tracing::warn!(%error, "retired listener stopped with an error"); }
                 }
+                _ = self.listeners_changed.notified() => {},
                 _ = events.recv() => {},
             }
         }
@@ -110,7 +114,7 @@ impl Core {
             .configuration()
             .await?
             .map_or(Revision(0), |c| c.revision);
-        Self::open_prepared(options, document, BTreeMap::new(), revision, false).await
+        Self::open_prepared(options, document, BTreeMap::new(), revision).await
     }
 
     /// Use deterministic executors while exercising the real daemon and transports.
@@ -125,16 +129,22 @@ impl Core {
             .configuration()
             .await?
             .map_or(Revision(0), |c| c.revision);
-        Self::open_prepared(options, document, backends, revision, false).await
+        Self::open_prepared(options, document, backends, revision).await
     }
 
     async fn open_prepared(
-        mut options: Options,
+        options: Options,
         document: Document,
         entries: BTreeMap<String, BackendEntry>,
         revision: Revision,
-        commit: bool,
     ) -> Result<Arc<Self>> {
+        let core = Self::new(options, revision).await?;
+        let candidate = core.prepare(document, entries, revision).await?;
+        core.publish(candidate.activate(&core).await);
+        Ok(core)
+    }
+
+    async fn new(mut options: Options, revision: Revision) -> Result<Arc<Self>> {
         if options.node.provider().await?.is_some_and(|enrollment| {
             enrollment.genesis.statement.root_kind == hellas_rpc::RootKind::Software
         }) {
@@ -163,6 +173,7 @@ impl Core {
             routing: Default::default(),
             configuring: Arc::new(tokio::sync::Mutex::new(())),
             listeners: Mutex::new(tokio::task::JoinSet::new()),
+            listeners_changed: Default::default(),
             #[cfg(test)]
             after_commit: Mutex::new(None),
         });
@@ -172,36 +183,11 @@ impl Core {
             &core.runtime.options.content,
         )
         .await?;
-        let next = if commit {
-            revision.next().ok_or("configuration revision overflow")?
-        } else {
-            revision
-        };
-        let candidate = core.prepare(document, entries, next).await?;
-        if commit {
-            let (redacted, secrets) = candidate.document.redacted();
-            core.node()
-                .configure_startup(
-                    ConfigurationDocument {
-                        revision,
-                        document: serde_json::to_string(&redacted)?,
-                        secrets,
-                    },
-                    &candidate.configuration,
-                )
-                .await?;
-        }
-        let snapshot = candidate.activate(&core).await?;
-        core.publish(snapshot);
         Ok(core)
     }
 
-    pub async fn restore(options: Options) -> Result<Arc<Self>> {
-        Self::restore_on_port(options, None).await
-    }
-
     /// Apply an explicit process startup port as a journaled edit before listening.
-    pub async fn restore_on_port(options: Options, port: Option<u16>) -> Result<Arc<Self>> {
+    pub async fn restore(options: Options, port: Option<u16>) -> Result<Arc<Self>> {
         let (mut document, revision) = match options.node.configuration().await? {
             Some(stored) => {
                 let mut document: Document = serde_json::from_str(&stored.document)?;
@@ -234,7 +220,29 @@ impl Core {
                 }
             }
         }
-        Self::open_prepared(options, document, BTreeMap::new(), revision, changed).await
+        let core = Self::new(options, revision).await?;
+        let next = if changed {
+            revision.next().ok_or("configuration revision overflow")?
+        } else {
+            revision
+        };
+        let candidate = core.prepare(document, BTreeMap::new(), next).await?;
+        if changed {
+            let (redacted, secrets) = candidate.document.redacted();
+            let configuration = core.node().resource_configuration().await?;
+            core.node()
+                .configure_startup(
+                    ConfigurationDocument {
+                        revision,
+                        document: serde_json::to_string(&redacted)?,
+                        secrets,
+                    },
+                    &configuration,
+                )
+                .await?;
+        }
+        core.publish(candidate.activate(&core).await);
+        Ok(core)
     }
 
     pub fn node(&self) -> &NodeCoordinator {
@@ -318,6 +326,16 @@ impl Core {
                 jobs,
                 http_addresses: self.http_addresses(),
                 iroh_addresses: self.iroh_addresses(),
+                listener_errors: snapshot
+                    .listeners
+                    .iter()
+                    .filter_map(|(id, listener)| {
+                        listener
+                            .failure
+                            .get()
+                            .map(|error| (id.clone(), error.clone()))
+                    })
+                    .collect(),
             }
         })
     }
@@ -349,6 +367,9 @@ impl Core {
             .prepare(document, BTreeMap::new(), revision)
             .await
             .map_err(|error| configuration_error(error, &secrets))?;
+        let configuration = candidate
+            .configuration(self)
+            .map_err(|error| configuration_error(error, &secrets))?;
         let (redacted, secrets) = candidate.document.redacted();
         let stored = ConfigurationDocument {
             revision: expected,
@@ -361,7 +382,7 @@ impl Core {
             let _serial = serial;
             let caller = core.node().session_caller(&session, binding).await?;
             core.node()
-                .configure(caller, authorization, stored, &candidate.configuration)
+                .configure(caller, authorization, stored, &configuration)
                 .await?;
             #[cfg(test)]
             {
@@ -372,22 +393,34 @@ impl Core {
                 }
             }
             let revision = candidate.revision;
-            let candidate = match candidate.activate(&core).await {
-                Ok(candidate) => candidate,
-                Err(error) => {
-                    // The journal is authoritative. Stop admission until restart
-                    // can restore it; never continue serving an older document.
-                    core.jobs.close();
-                    for listener in core.snapshot.load().listeners.values() {
-                        listener.stop.send_replace(true);
-                    }
-                    tracing::error!(%error, revision = revision.0, "committed configuration could not activate; restart required");
-                    return Ok(revision);
-                }
-            };
+            let candidate = candidate.activate(&core).await;
+            let failures: Vec<_> = candidate
+                .work
+                .backends()
+                .into_iter()
+                .filter_map(|backend| {
+                    backend
+                        .error
+                        .map(|error| format!("backend {}: {error}", backend.id))
+                })
+                .chain(candidate.listeners.iter().filter_map(|(id, listener)| {
+                    listener
+                        .failure
+                        .get()
+                        .map(|error| format!("listener {id}: {error}"))
+                }))
+                .collect();
             let previous = core.publish(candidate.clone());
             if let Err(error) = previous.work.retire(&candidate.work).await {
                 tracing::warn!(%error, "retired backend retains recovery obligations");
+            }
+            if !failures.is_empty() {
+                return Err(format!(
+                    "configuration revision {} committed with activation failures: {}",
+                    revision.0,
+                    failures.join("; ")
+                )
+                .into());
             }
             Ok::<_, Error>(revision)
         })
@@ -407,18 +440,21 @@ impl Core {
         document.validate().map_err(Error::from)?;
         let old = self.snapshot.load_full();
         let mut reuse = BTreeSet::new();
-        let counters = Arc::new(crate::counter_store::PreparedCounters::new(
-            &self.runtime.options.home,
-        ));
+        let counters = Arc::new(
+            crate::counter_store::FilesystemAssertionCounterStore::in_home(
+                &self.runtime.options.home,
+            ),
+        );
         for (id, backend) in &document.backends {
             if entries.contains_key(id) {
                 continue;
             }
             let unchanged = old.document.backends.get(id) == Some(backend);
             let approved = match old.work.backend(id) {
-                Some(active) if unchanged => {
-                    self.runtime.approval_current(&backend.kind, active)?
-                }
+                Some(active) if unchanged => self
+                    .runtime
+                    .approval_current(&backend.kind, active)
+                    .unwrap_or(false),
                 _ => false,
             };
             if unchanged && approved {
@@ -427,65 +463,67 @@ impl Core {
                 entries.insert(
                     id.clone(),
                     self.runtime
-                        .open_backend(id, backend, &document, counters.clone())
-                        .await?,
+                        .open_backend(backend, counters.clone())
+                        .await
+                        .unwrap_or_else(|error| {
+                            runtime::PreparedBackend::unavailable(
+                                backend,
+                                configuration_error(error, &document.redacted().1).to_string(),
+                            )
+                        }),
                 );
             }
         }
-        let mut info: Vec<_> = old
-            .work
-            .backends()
-            .into_iter()
+        let old_info = old.work.backends();
+        let mut info: Vec<_> = old_info
+            .iter()
             .filter(|backend| reuse.contains(&backend.id))
+            .cloned()
             .collect();
         info.extend(entries.iter().map(|(id, backend)| backend.info(id)));
-        let work = prepared::PreparedWork::new(info);
-        let configuration = document.configuration(&work.info).await?;
-        let allowed: BTreeSet<_> = document
-            .listeners
-            .values()
-            .filter_map(|listener| match listener {
-                Listener::Iroh { backends, .. } => Some(backends),
-                _ => None,
-            })
-            .flatten()
-            .collect();
-        let mut executable: Vec<_> = entries
-            .iter()
-            .filter(|(id, _)| allowed.contains(id))
-            .filter_map(|(_, entry)| match entry {
-                runtime::PreparedBackend::Ready { entry, .. } => {
-                    Some((&entry.backend, entry.evaluator.as_deref()))
-                }
-                runtime::PreparedBackend::Paid { .. } => None,
-            })
-            .collect();
-        for info in &work.info {
-            if reuse.contains(&info.id) && allowed.contains(&info.id) {
-                executable.push((
-                    old.work.backend(&info.id).expect("reused backend"),
-                    info.evaluator.as_deref(),
-                ));
+        for backend in &mut info {
+            if matches!(
+                document.backends[&backend.id].kind,
+                crate::daemon_config::BackendKind::Local { .. }
+            ) && old.document.backends.get(&backend.id) == document.backends.get(&backend.id)
+                && let Some(previous) = old_info.iter().find(|old| old.id == backend.id)
+            {
+                backend.instance = previous.instance;
             }
         }
-        crate::gateway_work::provider::validate_resources(&executable, configuration.resources())
-            .map_err(Error::from)?;
-        document
-            .validate_resolved(&work.backends())
-            .map_err(Error::from)?;
-        let router = hellas_gateway::router::router(
+        let (models, mut index) = self.runtime.models(&document, &info).await;
+        let work = prepared::PreparedWork::new(info.clone());
+        document.validate_resolved(&info).map_err(Error::from)?;
+        let (router, mut failures) = hellas_gateway::router::with_models(
             document.routes.clone(),
             work.clone(),
             self.jobs.clone(),
             self.routing.clone(),
+            &models,
         )
         .await?;
+        for (id, files) in &index {
+            if let Err(error) = files {
+                failures.insert(id.clone(), error.clone());
+            }
+        }
+        for (id, error) in failures {
+            let error = configuration_error(error.into(), &document.redacted().1).to_string();
+            let configured = &document.backends[&id];
+            entries.insert(
+                id.clone(),
+                runtime::PreparedBackend::unavailable(configured, error.clone()),
+            );
+            reuse.remove(&id);
+            index.remove(&id);
+        }
         let mut listeners = BTreeMap::new();
         let mut routers = BTreeMap::new();
         for (id, listener) in &document.listeners {
             let reusable = old
                 .listeners
                 .get(id)
+                .filter(|old| old.failure.get().is_none())
                 .filter(|old| match (&old.bound, listener) {
                     (Bound::Http { bind: old, .. }, Listener::Http { bind, .. }) => old == bind,
                     (Bound::Iroh(old), Listener::Iroh { port, chain, .. }) => {
@@ -511,6 +549,7 @@ impl Core {
                     },
                     stop: tokio::sync::watch::channel(false).0,
                     started: Default::default(),
+                    failure: Default::default(),
                 }),
             };
             listeners.insert(id.clone(), bound);
@@ -533,11 +572,14 @@ impl Core {
         Ok(prepared::Prepared {
             revision,
             document,
-            configuration,
+            models,
+            index: index
+                .into_iter()
+                .filter_map(|(id, files)| files.ok().map(|files| (id, files)))
+                .collect(),
             entries,
             reuse,
             work,
-            counters,
             routers,
             listeners,
         })
@@ -576,6 +618,9 @@ impl Core {
         }
         let mut owned = self.listeners.lock().unwrap_or_else(|e| e.into_inner());
         for (id, listener) in &next.listeners {
+            if listener.failure.get().is_some() {
+                continue;
+            }
             if listener
                 .started
                 .swap(true, std::sync::atomic::Ordering::AcqRel)
@@ -620,6 +665,7 @@ impl Core {
                 (id, listener, serve.await)
             });
         }
+        self.listeners_changed.notify_one();
         previous
     }
 
@@ -687,4 +733,72 @@ fn configuration_error(
         }
     }
     message.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn wait_observes_a_listener_added_after_the_last_job_event() {
+        use hellas_channel::test_support::actors::{PROVIDER, ROOT};
+        let host = crate::test_support::Host::builder().build().await;
+        let root = tempfile::tempdir().unwrap();
+        let home = hellas_private::StoreLocation::for_test(root.path());
+        let core = Core::open(
+            Options {
+                discovery: false,
+                endpoint: None,
+                remote_control: Default::default(),
+                prover: None,
+                chain: crate::test_support::chain_dir(
+                    root.path(),
+                    hellas_channel::test_support::network(),
+                ),
+                home,
+                signer: Arc::new(PROVIDER.node_key()),
+                transport: iroh::SecretKey::from_bytes(&[5; 32]),
+                settlement: crate::test_support::signer(1),
+                owner: Some(Arc::new(ROOT.passkey())),
+                node: host.world.service.node().clone(),
+                content: host.content.clone(),
+            },
+            Document::default(),
+        )
+        .await
+        .unwrap();
+        let mut waiting = Box::pin(core.wait());
+        assert!(futures::poll!(&mut waiting).is_pending());
+        core.jobs.change(|| {
+            Some(Event::Revision {
+                revision: Revision(1),
+            })
+        });
+        assert!(futures::poll!(&mut waiting).is_pending());
+        let listener = Arc::new(BoundListener {
+            bound: Bound::Http {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                address: "127.0.0.1:0".parse().unwrap(),
+                socket: Mutex::new(None),
+            },
+            stop: tokio::sync::watch::channel(false).0,
+            started: true.into(),
+            failure: Default::default(),
+        });
+        let weak = Arc::downgrade(&listener);
+        let (finished, finish) = tokio::sync::oneshot::channel();
+        core.listeners.lock().unwrap().spawn(async move {
+            let _ = finished.send(());
+            ("late".into(), weak, Err("injected listener exit".into()))
+        });
+        core.listeners_changed.notify_one();
+        finish.await.unwrap();
+        assert!(
+            matches!(futures::poll!(&mut waiting), std::task::Poll::Ready(Err(error)) if error.to_string() == "injected listener exit")
+        );
+        drop(waiting);
+        core.shutdown().await.unwrap();
+        host.world.service.shutdown().await.unwrap();
+        host.content.close().await;
+    }
 }

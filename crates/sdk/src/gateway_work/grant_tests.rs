@@ -885,7 +885,7 @@ async fn queued_requests_wait_without_a_deadline_and_cancel_on_disconnect() {
         let (requester, stream) =
             Requester::<OutputEvent, WorkGatewayError>::new(crate::test_support::job());
         let run = fixture.gateway.backends["test"].run(
-            job,
+            WorkRequest::Job(job.input().clone()),
             requester,
             &fixture.gateway.signer,
             fixture.gateway.backends["test"].use_session(),
@@ -961,7 +961,7 @@ async fn disconnect_during_control_does_not_propose() {
         Requester::<OutputEvent, WorkGatewayError>::new(crate::test_support::job());
     {
         let run = fixture.gateway.backends["test"].run(
-            job,
+            WorkRequest::Job(job.input().clone()),
             requester,
             &fixture.gateway.signer,
             fixture.gateway.backends["test"].use_session(),
@@ -1490,7 +1490,11 @@ async fn watch_reports_health_for_every_resource_on_a_shared_grant() {
     .await;
     let (_, mut events) = fixture.gateway.jobs.watch(|_| ());
     for down in [true, false] {
-        fixture.gateway.backend("test").unwrap().health(down);
+        fixture
+            .gateway
+            .backend("test")
+            .unwrap()
+            .health(down.then(|| "session failed".into()));
         let mut ids = std::collections::BTreeSet::new();
         while let Ok(hellas_gateway::jobs::Event::Backend {
             id, down: observed, ..

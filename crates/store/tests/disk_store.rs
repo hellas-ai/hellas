@@ -697,3 +697,38 @@ async fn a_retired_ram_upper_scope_cannot_read_the_replacement_upper_for_the_sam
     );
     replacement.end().await.unwrap();
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn prepared_files_activate_without_another_hash_and_reject_changed_files() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("weights");
+    std::fs::write(&file, b"model weights").unwrap();
+    let store = open(root.path().join("content"), vec![], IndexMode::Resume, None).await;
+    store.finish_recovery().await.unwrap();
+    let prepared = store.inspect_files(vec![file.clone()]).await.unwrap();
+    assert_eq!(prepared[&file], ContentRef::for_bytes(b"model weights"));
+    assert!(
+        store
+            .pins(&Scope::Owner, "", Cursor::default())
+            .await
+            .unwrap()
+            .pins
+            .is_empty()
+    );
+    store
+        .rescan(vec![file.clone()], IndexMode::Require)
+        .await
+        .expect("preparation retains the verified hash for activation");
+    std::fs::write(&file, b"different model weights").unwrap();
+    assert!(
+        store
+            .rescan(vec![file.clone()], IndexMode::Require)
+            .await
+            .is_err()
+    );
+    let replaced = store.inspect_files(vec![file.clone()]).await.unwrap();
+    assert_ne!(replaced[&file], prepared[&file]);
+    store.rescan(vec![file], IndexMode::Require).await.unwrap();
+    store.close().await;
+}

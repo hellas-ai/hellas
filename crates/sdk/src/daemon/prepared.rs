@@ -9,28 +9,114 @@ use std::sync::OnceLock;
 pub(super) struct Prepared {
     pub revision: Revision,
     pub document: Document,
-    pub configuration: hellas_authority::model::grant::configuration::NodeConfiguration,
+    pub models: hellas_gateway::router::Models,
+    pub index: BTreeMap<String, runtime::Files>,
     pub entries: BTreeMap<String, runtime::PreparedBackend>,
     pub reuse: BTreeSet<String>,
     pub work: Arc<PreparedWork>,
-    pub counters: Arc<crate::counter_store::PreparedCounters>,
     pub routers: BTreeMap<String, Router>,
     pub listeners: BTreeMap<String, Arc<BoundListener>>,
 }
 
 impl Prepared {
-    pub async fn activate(self, core: &Core) -> Result<Arc<Snapshot>> {
-        self.counters.activate()?;
+    pub fn configuration(
+        &self,
+        core: &Core,
+    ) -> Result<hellas_authority::model::grant::configuration::NodeConfiguration> {
+        let old = core.snapshot.load_full();
+        for (id, entry) in &self.entries {
+            if let runtime::PreparedBackend::Ready(entry) = entry
+                && let crate::BackendState::Unavailable(error) = &entry.backend.state
+                && !(old.document.backends.get(id) == self.document.backends.get(id)
+                    && old
+                        .work
+                        .backend(id)
+                        .is_some_and(|backend| backend.error().is_some()))
+            {
+                return Err(format!("backend {id}: {error}").into());
+            }
+        }
+        let configuration = self.document.configuration(&self.work.info, &self.models)?;
+        let allowed: BTreeSet<_> = self
+            .document
+            .listeners
+            .values()
+            .filter_map(|listener| match listener {
+                Listener::Iroh { backends, .. } => Some(backends),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        let mut executable: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|(id, _)| allowed.contains(id))
+            .filter_map(|(_, entry)| match entry {
+                runtime::PreparedBackend::Ready(entry) => {
+                    Some((&entry.backend, entry.evaluator.as_deref()))
+                }
+                runtime::PreparedBackend::Paid { .. } => None,
+            })
+            .collect();
+        for info in &self.work.info {
+            if self.reuse.contains(&info.id) && allowed.contains(&info.id) {
+                executable.push((
+                    old.work.backend(&info.id).expect("reused backend"),
+                    info.evaluator.as_deref(),
+                ));
+            }
+        }
+        crate::gateway_work::provider::validate_resources(&executable, configuration.resources())
+            .map_err(Error::from)?;
+        Ok(configuration)
+    }
+
+    pub async fn activate(self, core: &Core) -> Arc<Snapshot> {
+        #[cfg(feature = "compute")]
+        let mut prepared = self;
+        #[cfg(not(feature = "compute"))]
+        let prepared = self;
+        #[cfg(feature = "compute")]
+        for (id, files) in prepared.index {
+            if let Err(error) = core.runtime.index(files).await {
+                let error = configuration_error(error, &prepared.document.redacted().1).to_string();
+                prepared.entries.insert(
+                    id.clone(),
+                    runtime::PreparedBackend::unavailable(&prepared.document.backends[&id], error),
+                );
+                prepared.reuse.remove(&id);
+            }
+        }
+        #[cfg(not(feature = "compute"))]
+        let _ = prepared.index;
         let mut entries = BTreeMap::new();
-        for (id, entry) in self.entries {
-            let entry = entry.activate(&core.runtime).await?;
+        for (id, entry) in prepared.entries {
+            let entry = match entry.activate(&core.runtime).await {
+                Ok(entry) => entry,
+                Err(error) => {
+                    let error =
+                        configuration_error(error, &prepared.document.redacted().1).to_string();
+                    let runtime::PreparedBackend::Ready(entry) =
+                        runtime::PreparedBackend::unavailable(
+                            &prepared.document.backends[&id],
+                            error,
+                        )
+                    else {
+                        unreachable!()
+                    };
+                    entry
+                }
+            };
             entries.insert(id, entry);
         }
-        for listener in self.listeners.values() {
+        for listener in prepared.listeners.values() {
             if !listener.started.load(std::sync::atomic::Ordering::Acquire)
                 && let Bound::Iroh(bound) = &listener.bound
+                && let Err(error) = bound.activate(core).await
             {
-                bound.activate(core).await?;
+                let error = configuration_error(error, &prepared.document.redacted().1).to_string();
+                let _ = listener.failure.set(error);
+                bound.endpoint.close().await;
             }
         }
         let old = core.snapshot.load_full();
@@ -39,20 +125,20 @@ impl Prepared {
             core.runtime.options.signer.clone(),
             core.jobs.clone(),
             Some(&old.work),
-            &self.reuse,
-            &self.work.info,
+            &prepared.reuse,
+            &prepared.work.info,
         );
         assert!(
-            self.work.active.set(work.clone()).is_ok(),
+            prepared.work.active.set(work.clone()).is_ok(),
             "candidate activates once"
         );
-        Ok(Arc::new(Snapshot {
-            revision: self.revision,
-            document: self.document,
+        Arc::new(Snapshot {
+            revision: prepared.revision,
+            document: prepared.document,
             work,
-            routers: self.routers,
-            listeners: self.listeners,
-        }))
+            routers: prepared.routers,
+            listeners: prepared.listeners,
+        })
     }
 }
 

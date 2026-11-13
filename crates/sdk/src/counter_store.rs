@@ -57,48 +57,6 @@ impl AssertionCounterStore for FilesystemAssertionCounterStore {
     }
 }
 
-/// Quote authentication checks durable high-water marks without changing them.
-/// A committed candidate publishes its advances before exposing its backends.
-pub(crate) struct PreparedCounters {
-    store: FilesystemAssertionCounterStore,
-    pending: std::sync::Mutex<Option<std::collections::BTreeMap<[u8; 33], u32>>>,
-}
-impl PreparedCounters {
-    pub fn new(home: &std::path::Path) -> Self {
-        Self {
-            store: FilesystemAssertionCounterStore::in_home(home),
-            pending: std::sync::Mutex::new(Some(Default::default())),
-        }
-    }
-    pub fn activate(&self) -> Result<(), AttestationError> {
-        let mut pending = self.pending.lock().map_err(|_| AttestationError::State)?;
-        if let Some(advances) = pending.as_ref() {
-            for (key, counter) in advances {
-                self.store.advance(key, *counter)?;
-            }
-        }
-        *pending = None;
-        Ok(())
-    }
-}
-impl AssertionCounterStore for PreparedCounters {
-    fn advance(&self, key: &[u8; 33], counter: u32) -> Result<(), AttestationError> {
-        let mut pending = self.pending.lock().map_err(|_| AttestationError::State)?;
-        let Some(advances) = pending.as_mut() else {
-            return self.store.advance(key, counter);
-        };
-        let previous = self
-            .store
-            .read(key)?
-            .max(advances.get(key).copied().unwrap_or(0));
-        if counter <= previous {
-            return Err(AttestationError::Counter);
-        }
-        advances.insert(*key, counter);
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,27 +75,6 @@ mod tests {
         let reopened = FilesystemAssertionCounterStore::new(directory.path().join("counters"));
         assert_eq!(reopened.advance(&key, 2), Err(AttestationError::Counter));
         reopened.advance(&key, 3).unwrap();
-    }
-    #[test]
-    fn prepared_counters_write_only_after_activation_and_keep_replay_checks() {
-        let root = tempfile::tempdir().unwrap();
-        let key = [9; 33];
-        let staged = PreparedCounters::new(root.path());
-        staged.advance(&key, 1).unwrap();
-        assert!(std::fs::read_dir(root.path()).unwrap().next().is_none());
-        drop(staged);
-        let staged = PreparedCounters::new(root.path());
-        staged.advance(&key, 1).unwrap();
-        assert_eq!(staged.advance(&key, 1), Err(AttestationError::Counter));
-        staged.activate().unwrap();
-        let durable = FilesystemAssertionCounterStore::in_home(root.path());
-        assert_eq!(durable.advance(&key, 1), Err(AttestationError::Counter));
-        staged.advance(&key, 2).unwrap();
-        assert_eq!(durable.advance(&key, 2), Err(AttestationError::Counter));
-        let competing = PreparedCounters::new(root.path());
-        competing.advance(&key, 3).unwrap();
-        durable.advance(&key, 3).unwrap();
-        assert_eq!(competing.activate(), Err(AttestationError::Counter));
     }
     #[test]
     fn corruption_fails_closed() {

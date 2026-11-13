@@ -57,9 +57,57 @@ impl Resource {
     }
 }
 impl Document {
-    pub(crate) async fn configuration(
+    pub(crate) fn model_evaluators(
+        &self,
+        info: &[hellas_gateway::BackendInfo],
+    ) -> BTreeMap<PathBuf, std::collections::BTreeSet<String>> {
+        let mut requested: BTreeMap<PathBuf, std::collections::BTreeSet<String>> = BTreeMap::new();
+        for route in &self.routes {
+            if let Presentation::Model { package, .. } = &route.presentation {
+                let evaluators = requested.entry(package.clone()).or_default();
+                for id in &route.backends {
+                    if let Some(evaluator) = info
+                        .iter()
+                        .find(|backend| backend.id == *id)
+                        .and_then(|backend| backend.evaluator.clone())
+                    {
+                        evaluators.insert(evaluator);
+                    }
+                }
+            }
+        }
+        for resource in &self.resources {
+            if let ResourceKind::Model { package } = &resource.kind {
+                let evaluators = requested.entry(package.clone()).or_default();
+                if let Some(evaluator) = info
+                    .iter()
+                    .find(|backend| backend.id == resource.backend)
+                    .and_then(|backend| backend.evaluator.clone())
+                {
+                    evaluators.insert(evaluator);
+                }
+            }
+        }
+        requested
+    }
+
+    #[cfg(any(test, feature = "integration-tests"))]
+    pub(crate) async fn configuration_for_test(
+        &self,
+        info: &[hellas_gateway::BackendInfo],
+    ) -> Result<NodeConfiguration, crate::daemon::Error> {
+        let mut models = hellas_gateway::router::Models::new();
+        for (path, evaluators) in self.model_evaluators(info) {
+            let packages = hellas_client::model::ModelPackage::open_many(&path, evaluators).await?;
+            models.insert(path, Ok(packages));
+        }
+        self.configuration(info, &models)
+    }
+
+    pub(crate) fn configuration(
         &self,
         backends: &[hellas_gateway::BackendInfo],
+        models: &hellas_gateway::router::Models,
     ) -> Result<NodeConfiguration, crate::daemon::Error> {
         let mut inputs = self.resources.clone();
         for (id, backend) in &self.backends {
@@ -159,11 +207,12 @@ impl Document {
                 .backends
                 .get(&input.backend)
                 .ok_or("resource backend is missing")?;
-            resources.push(
-                input
-                    .policy(backend, backends, index >= self.resources.len())
-                    .await?,
-            );
+            resources.push(input.policy(
+                backend,
+                backends,
+                models,
+                index >= self.resources.len(),
+            )?);
             accounts.entry(input.account).or_insert(ConfiguredBudget {
                 max_in_flight: u16::try_from(backend.max_in_flight.get())?.try_into()?,
                 limits: vec![],
@@ -180,10 +229,11 @@ impl Document {
     }
 }
 impl Resource {
-    async fn policy(
+    fn policy(
         &self,
         backend: &Backend,
         backends: &[hellas_gateway::BackendInfo],
+        models: &hellas_gateway::router::Models,
         model_route: bool,
     ) -> Result<GrantPolicy, crate::daemon::Error> {
         let (invocation_policy, https, responses) = match (&self.kind, &backend.kind) {
@@ -193,7 +243,13 @@ impl Resource {
                     .find(|b| b.id == self.backend)
                     .and_then(|b| b.evaluator.as_deref())
                     .ok_or("local backend has no evaluator")?;
-                let package = hellas_client::model::ModelPackage::open(package, evaluator).await?;
+                let package = models
+                    .get(package)
+                    .ok_or("model was not prepared")?
+                    .as_ref()
+                    .map_err(|error| error.clone())?
+                    .get(evaluator)
+                    .ok_or("model evaluator was not prepared")?;
                 let programs = if package.is_image() {
                     ComputePrograms::Any {}
                 } else {

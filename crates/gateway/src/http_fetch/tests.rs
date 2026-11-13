@@ -625,6 +625,7 @@ async fn failover_uses_each_backends_own_destination_and_credential() {
                     max_in_flight: 2,
                     in_flight: 0,
                     down: false,
+                    error: None,
                 })
                 .into()
         }

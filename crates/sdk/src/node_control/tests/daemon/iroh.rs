@@ -134,7 +134,7 @@ async fn both_listeners_keep_admitted_backends_when_fetch_configuration_changes(
             },
         });
         allowance.definition.policies = document
-            .configuration(&[])
+            .configuration_for_test(&[])
             .await
             .unwrap()
             .resources()
