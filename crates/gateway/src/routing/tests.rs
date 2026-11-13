@@ -616,3 +616,35 @@ fn stale_session_and_connection_pins_reselect_after_backend_replacement() {
         "stale soft pins must select again: {statuses:?}"
     );
 }
+
+#[test]
+fn wrong_route_refuses_but_keeps_a_continuation() {
+    let routing = Routing::new(
+        vec![row(&["a"], Some("one")), row(&["b"], Some("two"))],
+        Fake::new(),
+        Default::default(),
+    )
+    .unwrap();
+    let mut first = choose(&routing, Some("one"), None).unwrap();
+    first.next();
+    first.accept("a");
+    first
+        .response_binding("/v1/responses")
+        .unwrap()
+        .observe(&serde_json::json!({"object":"response", "id":"retained"}));
+    let follow = |model: &str| {
+        routing.select(
+            "/v1/responses",
+            "POST",
+            Hints {
+                model: Some(model.into()),
+                previous: Some("retained".into()),
+                ..Default::default()
+            },
+            None,
+            crate::test_support::job(),
+        )
+    };
+    assert_eq!(follow("two").err().unwrap().status, StatusCode::CONFLICT);
+    assert_eq!(order_of(follow("one").unwrap().1), ["a"]);
+}
