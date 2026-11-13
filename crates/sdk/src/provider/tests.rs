@@ -4,7 +4,7 @@ use hellas_private::StoreLocation;
 use iroh::{Endpoint, endpoint::presets};
 mod handshakes;
 pub(crate) mod host;
-mod node;
+pub(crate) mod node;
 use super::*;
 use bytes::Bytes;
 use futures::StreamExt as _;

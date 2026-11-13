@@ -26,7 +26,7 @@ pub struct Options {
     pub owner: Option<Arc<dyn hellas_authority::authenticator::Authenticator>>,
     pub chain: hellas_chain::chain_dir::ChainDir,
     pub node: hellas_authority::node::NodeCoordinator,
-    /// The host restores all Work roots before opening this recovery barrier.
+    /// Provider content; the core restores all retained chains before cleanup.
     pub content: DiskStore,
 }
 
@@ -34,6 +34,7 @@ pub(super) struct Runtime {
     pub options: Options,
     pub endpoint: tokio::sync::Mutex<Option<iroh::Endpoint>>,
     owner: tokio::sync::OnceCell<Arc<crate::client_owner::ClientOwner>>,
+    client_content: tokio::sync::OnceCell<DiskStore>,
     grant: tokio::sync::OnceCell<iroh::Endpoint>,
     paid: tokio::sync::OnceCell<iroh::Endpoint>,
     #[cfg(feature = "compute")]
@@ -58,6 +59,7 @@ impl Runtime {
             endpoint: tokio::sync::Mutex::new(options.endpoint.take()),
             options,
             owner: Default::default(),
+            client_content: Default::default(),
             grant: Default::default(),
             paid: Default::default(),
             #[cfg(feature = "compute")]
@@ -77,6 +79,9 @@ impl Runtime {
     }
 
     pub async fn shutdown(&self) {
+        if let Some(content) = self.client_content.get() {
+            content.close().await;
+        }
         for endpoint in [self.grant.get(), self.paid.get()].into_iter().flatten() {
             endpoint.close().await;
         }
@@ -215,8 +220,11 @@ impl Runtime {
                     .await?
                     .clone();
                 let apple_trust = self.trust(trust)?;
+                let content = self.client_content.get_or_try_init(|| {
+                    crate::chain_home::open_client_content(&self.options.chain)
+                }).await?.clone();
                 let options = crate::paid_client::PaidWorkOptions {
-                    content: self.options.content.clone(),
+                    content,
                     journal_kind: crate::paid_client::PaidJournalKind::Client,
                     config: crate::work_config::WorkConfig::from_chain_dir(
                         self.options.chain.clone(),

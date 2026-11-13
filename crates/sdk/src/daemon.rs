@@ -161,8 +161,12 @@ impl Core {
             #[cfg(test)]
             after_commit: Mutex::new(None),
         });
+        crate::chain_home::recover_provider_chains(
+            &core.runtime.options.home,
+            &core.runtime.options.settlement,
+            &core.runtime.options.content,
+        ).await?;
         let snapshot = core.prepare(document, entries).await?;
-        core.runtime.options.content.finish_recovery().await?;
         core.publish(snapshot);
         Ok(core)
     }

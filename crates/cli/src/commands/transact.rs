@@ -320,7 +320,7 @@ impl ClientArgs {
     ) -> super::CliResult<PaidWorkOptions> {
         self.paid_provider()?;
         let config = client::config(self, context).await?;
-        let content = client::content(context, config.network()).await?;
+        let content = hellas_sdk::chain_home::open_client_content(&context.chain).await?;
         self.options_with_config(context, price, assurance, config, content)
     }
 
