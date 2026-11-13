@@ -73,6 +73,7 @@ impl NodeCoordinator {
     ) -> Result<(), NodeStoreError> {
         let _changed = ChangeNotification(self.changed.clone());
         self.checked(caller, authorization, HOST_CONFIGURE, async |store, now| {
+            caller.session().step_up()?;
             let authority = store.state().authority();
             authority.authorize_caller(
                 caller,
@@ -198,6 +199,9 @@ impl NodeCoordinator {
             return Err(AuthorityError::Denied.into());
         }
         self.checked(caller, authorization, operation, async |store, now| {
+            if operation == HOST_CONFIGURE {
+                caller.session().step_up()?;
+            }
             let state = store.state();
             let authority = state.authority();
             authority.authorize_caller(

@@ -759,6 +759,10 @@ struct Inner {
     retired: std::sync::atomic::AtomicBool,
 }
 impl ExecutorGateway {
+    pub fn backend(&self, id: &str) -> Option<&Backend> {
+        self.backends.get(id).map(|backend| &backend.target)
+    }
+
     pub fn new(
         backends: std::collections::BTreeMap<String, BackendEntry>,
         signer: Arc<hellas_auth::ProducerSigningKey>,

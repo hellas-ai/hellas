@@ -324,6 +324,23 @@ async fn removing_a_backend_preserves_its_accepted_request_and_routes_the_next_o
                 expires: UnixMillis(u64::MAX),
                 label: None,
             };
+            let trust_store = f.directory.path().join("trust").join(id);
+            crate::trust_policy::TrustPolicyStore::new(&trust_store)
+                .approve(
+                    id,
+                    0,
+                    crate::trust_policy::TrustPolicy {
+                        provider_genesis: hellas_client::ProviderAddress::of(
+                            &bundle.offers[0].offer().provider,
+                        )
+                        .unwrap()
+                        .enrollment,
+                        assurance: hellas_rpc::Assurance::ProducerSigned,
+                        apple: None,
+                    },
+                    "independent test approval".into(),
+                )
+                .unwrap();
             document.backends.insert(
                 id.into(),
                 Backend {
@@ -335,7 +352,10 @@ async fn removing_a_backend_preserves_its_accepted_request_and_routes_the_next_o
                         )),
                         resource: None,
                         evaluator: None,
-                        trust: None,
+                        trust: Some(crate::daemon_config::Trust {
+                            store: trust_store,
+                            policy: id.into(),
+                        }),
                     },
                 },
             );

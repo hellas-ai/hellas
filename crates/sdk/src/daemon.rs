@@ -208,6 +208,11 @@ impl Core {
         Ok(self.runtime.client_resources(chain).await?.0)
     }
 
+    /// The same backends and job table used by listeners, for an embedded native UI.
+    pub fn execution(&self) -> Arc<ExecutorGateway> {
+        self.snapshot.load().work.clone()
+    }
+
     pub fn http_addresses(&self) -> BTreeMap<String, std::net::SocketAddr> {
         self.snapshot
             .load()

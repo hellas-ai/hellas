@@ -141,15 +141,20 @@ impl Runtime {
         trust
             .as_ref()
             .map(|trust| {
-                crate::trust_policy::TrustPolicyStore::new(&trust.store)
-                    .resolve(
-                        &trust.policy,
-                        hellas_rpc::Assurance::AppleAppAttest,
-                        Arc::new(crate::FilesystemAssertionCounterStore::in_home(
-                            &self.options.home,
-                        )),
-                    )
-                    .map_err(Into::into)
+                let store = crate::trust_policy::TrustPolicyStore::new(&trust.store);
+                let approved = store.load(&trust.policy)?;
+                let anchor = store.resolve(
+                    &trust.policy,
+                    approved.policy.assurance,
+                    Arc::new(crate::FilesystemAssertionCounterStore::in_home(
+                        &self.options.home,
+                    )),
+                )?;
+                let current = store.load(&trust.policy)?;
+                if current.revision != approved.revision || current.policy != approved.policy {
+                    return Err("trust approval changed during preparation".into());
+                }
+                Ok(anchor)
             })
             .transpose()
     }
@@ -257,11 +262,11 @@ impl Runtime {
                     config: crate::work_config::WorkConfig::from_chain_dir(chain)?,
                     provider,
                     provider_addrs: vec![],
-                    assurance: if apple_trust.is_some() {
-                        hellas_rpc::Assurance::AppleAppAttest
-                    } else {
-                        hellas_rpc::Assurance::ProducerSigned
-                    },
+                    assurance: apple_trust
+                        .as_ref()
+                        .map_or(hellas_rpc::Assurance::ProducerSigned, |trust| {
+                            trust.required_assurance
+                        }),
                     apple_trust,
                     expected_price: *max_price,
                     acceptance_blocks: 300,
