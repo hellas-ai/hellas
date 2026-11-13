@@ -183,3 +183,28 @@ async fn recovered_acceptances_do_not_consume_the_request_quota() {
     assert!(jobs.recover(&request()).is_err());
     jobs.drain().await.unwrap();
 }
+
+#[test]
+fn recovered_job_finishes_once_and_leaves_watch() {
+    let jobs = Arc::new(Jobs::default());
+    let (_, mut events) = jobs.watch(|_| ());
+    let job = jobs.recover(&request()).unwrap();
+    job.running("gpu");
+    job.finish(Outcome::Completed);
+    job.finish(Outcome::Failed);
+    assert!(jobs.watch(|jobs| jobs).0.is_empty());
+    drop(job);
+    let mut states = vec![];
+    while let Ok(Event::Job { job }) = events.try_recv() {
+        states.push((job.state, job.outcome));
+    }
+    assert_eq!(
+        states,
+        [
+            (State::Admitted, None),
+            (State::Accepted, None),
+            (State::Running, None),
+            (State::Finished, Some(Outcome::Completed)),
+        ]
+    );
+}

@@ -55,6 +55,7 @@ struct BoundListener {
     failure: std::sync::OnceLock<String>,
 }
 enum Bound {
+    Unavailable,
     Http {
         bind: std::net::SocketAddr,
         address: std::net::SocketAddr,
@@ -261,7 +262,7 @@ impl Core {
             .iter()
             .filter_map(|(id, listener)| match &listener.bound {
                 Bound::Http { address, .. } => Some((id.clone(), *address)),
-                Bound::Iroh(_) => None,
+                Bound::Iroh(_) | Bound::Unavailable => None,
             })
             .collect()
     }
@@ -292,7 +293,7 @@ impl Core {
             .iter()
             .filter_map(|(id, listener)| match &listener.bound {
                 Bound::Iroh(bound) => Some((id.clone(), bound.endpoint.addr())),
-                Bound::Http { .. } => None,
+                Bound::Http { .. } | Bound::Unavailable => None,
             })
             .collect()
     }
@@ -312,7 +313,7 @@ impl Core {
             .values()
             .find_map(|listener| match &listener.bound {
                 Bound::Iroh(bound) => Some(bound.administration.clone()),
-                Bound::Http { .. } => None,
+                Bound::Http { .. } | Bound::Unavailable => None,
             })
     }
 
@@ -545,24 +546,36 @@ impl Core {
                 });
             let bound = match reusable {
                 Some(bound) => bound.clone(),
-                None => Arc::new(BoundListener {
-                    bound: match listener {
-                        Listener::Http { bind, .. } => {
-                            let socket = tokio::net::TcpListener::bind(bind).await?;
-                            Bound::Http {
-                                bind: *bind,
-                                address: socket.local_addr()?,
-                                socket: Mutex::new(Some(socket)),
+                None => {
+                    let result: Result<Bound> = async {
+                        Ok(match listener {
+                            Listener::Http { bind, .. } => {
+                                let socket = tokio::net::TcpListener::bind(bind).await?;
+                                Bound::Http {
+                                    bind: *bind,
+                                    address: socket.local_addr()?,
+                                    socket: Mutex::new(Some(socket)),
+                                }
                             }
-                        }
-                        Listener::Iroh { port, chain, .. } => Bound::Iroh(Arc::new(
-                            iroh_listener::Bound::prepare(self, *port, chain).await?,
-                        )),
-                    },
-                    stop: tokio::sync::watch::channel(false).0,
-                    started: Default::default(),
-                    failure: Default::default(),
-                }),
+                            Listener::Iroh { port, chain, .. } => Bound::Iroh(Arc::new(
+                                iroh_listener::Bound::prepare(self, *port, chain).await?,
+                            )),
+                        })
+                    }
+                    .await;
+                    let failure = std::sync::OnceLock::new();
+                    let bound = result.unwrap_or_else(|error| {
+                        let error = configuration_error(error, &document.redacted().1).to_string();
+                        let _ = failure.set(error);
+                        Bound::Unavailable
+                    });
+                    Arc::new(BoundListener {
+                        bound,
+                        stop: tokio::sync::watch::channel(false).0,
+                        started: Default::default(),
+                        failure,
+                    })
+                }
             };
             listeners.insert(id.clone(), bound);
             let Listener::Http { zdr, .. } = listener else {
@@ -641,6 +654,7 @@ impl Core {
             }
             let core = Arc::downgrade(self);
             let serve: futures::future::BoxFuture<'static, Result<()>> = match &listener.bound {
+                Bound::Unavailable => continue,
                 Bound::Http { socket, .. } => {
                     let socket = socket
                         .lock()
@@ -663,6 +677,7 @@ impl Core {
                         .boxed()
                 }
                 Bound::Iroh(bound) => {
+                    bound.start();
                     let bound = bound.clone();
                     let stop = listener.stop.subscribe();
                     async move { bound.serve(core, stop).await }.boxed()

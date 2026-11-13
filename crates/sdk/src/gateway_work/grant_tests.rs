@@ -669,9 +669,10 @@ async fn repaired_resources_are_usable_through_the_gateway() {
     for _ in 0..2 {
         fixture.result(None).await.unwrap();
     }
-    // Quarantine cancels this job's delivery; cancellation may reach the
-    // transport before its typed refusal. The next request must be Forbidden.
-    assert!(fixture.result(None).await.is_err());
+    assert_err!(fixture.result(None).await, WorkGatewayError::Denied(error)
+        if matches!(error.downcast_ref::<crate::grant_client::GrantClientError>(),
+            Some(crate::grant_client::GrantClientError::Refused { code: hellas_rpc::pb::work::GrantRefusalCode::Quarantined, .. })));
+    assert!(!fixture.gateway.backends()[0].down);
     let http = fixture.http().await;
     assert_eq!(http.status().await, reqwest::StatusCode::FORBIDDEN);
     let WorkControlReply::Resource {

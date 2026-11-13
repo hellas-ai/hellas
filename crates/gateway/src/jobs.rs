@@ -366,16 +366,26 @@ impl Job {
         Ok(())
     }
     pub fn finish(&self, outcome: Outcome) {
+        {
+            let mut state = self.jobs.state.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(entry) = state.jobs.get_mut(&self.id) else {
+                return;
+            };
+            if entry.info.state == State::Finished {
+                return;
+            }
+            entry.info.state = State::Finished;
+            entry.info.outcome = Some(outcome);
+            let _ = self.jobs.events.send(Event::Job {
+                job: entry.info.clone(),
+            });
+        }
         let reservation = self
             .reservation
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
         if let Some(reservation) = reservation {
-            self.update(|info| {
-                info.state = State::Finished;
-                info.outcome = Some(outcome);
-            });
             reservation.finish(outcome);
         }
     }

@@ -75,9 +75,13 @@ impl Executor {
                     let terms = ExecutionTerms::Paid { price: job.price() };
                     let mut completed = match self.attempt {
                         None => {
-                            let mut session =
-                                before_proposal(deadline, &stop, None, open(PaidOpen::Job(job)))
-                                    .await??;
+                            let mut session = before_proposal(
+                                deadline,
+                                &stop,
+                                None,
+                                open(PaidOpen::Job(job, None)),
+                            )
+                            .await??;
                             let run = ExecutionSession::Paid(&mut session)
                                 .run(&request, terms, signer, controls, None)
                                 .await;

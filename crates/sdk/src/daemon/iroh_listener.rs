@@ -2,12 +2,14 @@ use super::{Core, Result};
 use crate::{
     ProviderOpen,
     gateway_work::provider::IrohBackend,
-    paid_provider::{MountedSetup, MountedWork, WorkRunner, WorkRunnerConfig, WorkWatcher},
+    paid_provider::{
+        ChainWorkRunner, MountedSetup, MountedWork, WorkRunner, WorkRunnerConfig, WorkWatcher,
+    },
     work_router::WorkRouter,
 };
 use hellas_authority::grant_service::{GrantService, WorkAdministration};
 use hellas_wire::peers::{PeerDirectory, PeerId};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 
 pub(super) struct Bound {
@@ -19,18 +21,20 @@ pub(super) struct Bound {
     grants: GrantService,
     pub administration: WorkAdministration,
     paid: Arc<Paid>,
+    runner: Mutex<Option<ChainWorkRunner>>,
     chain: crate::work_config::WorkConfig,
 }
 
 pub(super) struct Paid {
     work: MountedWork,
     setup: MountedSetup,
-    watcher: tokio::sync::Mutex<Option<WorkWatcher>>,
+    watcher: Mutex<Option<WorkWatcher>>,
 }
 impl Paid {
     pub async fn shutdown(&self) -> Result<()> {
         self.work.stop_pending();
-        if let Some(mut watcher) = self.watcher.lock().await.take() {
+        let watcher = self.watcher.lock().unwrap().take();
+        if let Some(mut watcher) = watcher {
             watcher.shutdown().await?;
         }
         Ok(())
@@ -126,6 +130,7 @@ impl Bound {
                 grants,
                 administration,
                 paid,
+                runner: Mutex::new(None),
             })
         }
         .await;
@@ -137,16 +142,14 @@ impl Bound {
 
     pub async fn activate(&self, core: &Core) -> Result<()> {
         self.chain.chain.persist()?;
-        let mut watcher = self.paid.watcher.lock().await;
+        let started = self.paid.watcher.lock().unwrap().is_some();
         let addresses = self
             .endpoint
             .addr()
             .ip_addrs()
             .map(ToString::to_string)
             .collect();
-        if let Some(watcher) = watcher.as_ref() {
-            watcher.configure(self.chain.clone(), addresses);
-        } else {
+        if !started {
             let runner = WorkRunner::discover(
                 WorkRunnerConfig {
                     chain: self.chain.chain.clone(),
@@ -156,12 +159,12 @@ impl Bound {
                 self.paid.setup.clone(),
             )
             .await?;
-            *watcher = Some(WorkWatcher::spawn(runner.on_chain(
+            *self.runner.lock().unwrap() = Some(runner.on_chain(
                 self.chain.clone(),
                 core.node().clone(),
                 self.open.enrollment().clone(),
                 addresses,
-            )));
+            ));
             core.runtime
                 .paid
                 .lock()
@@ -169,6 +172,23 @@ impl Bound {
                 .insert(self.chain.chain.as_path().into(), self.paid.clone());
         }
         Ok(())
+    }
+
+    /// The published snapshot must be visible before journal recovery can admit work.
+    pub fn start(&self) {
+        let mut watcher = self.paid.watcher.lock().unwrap();
+        if let Some(runner) = self.runner.lock().unwrap().take() {
+            *watcher = Some(WorkWatcher::spawn(runner));
+        } else if let Some(watcher) = watcher.as_ref() {
+            watcher.configure(
+                self.chain.clone(),
+                self.endpoint
+                    .addr()
+                    .ip_addrs()
+                    .map(ToString::to_string)
+                    .collect(),
+            );
+        }
     }
 
     pub async fn serve(
@@ -259,5 +279,77 @@ impl Bound {
         self.endpoint.close().await;
         grants?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::daemon::{Bound as ListenerBound, Options};
+    use crate::daemon_config::{Document, Listener};
+    use hellas_auth::authority::Revision;
+    use hellas_channel::test_support::actors::{PROVIDER, ROOT};
+    use std::collections::BTreeMap;
+
+    #[tokio::test]
+    async fn recovered_paid_watcher_waits_for_snapshot_publication() {
+        let host = crate::test_support::Host::builder().build().await;
+        let directory = tempfile::tempdir().unwrap();
+        let home = hellas_private::StoreLocation::for_test(directory.path());
+        crate::provider::tests::node::write_setup_journal(directory.path()).await;
+        crate::provider::tests::node::write_accepted_channel(directory.path()).await;
+        let content = hellas_channel::test_support::channel::content_store(directory.path()).await;
+        let options = Options {
+            discovery: false,
+            endpoint: None,
+            remote_control: Default::default(),
+            prover: None,
+            chain: crate::test_support::chain_dir(
+                directory.path(),
+                hellas_kernel::NetworkId::new("hellas-devnet-1").unwrap(),
+            ),
+            home,
+            signer: Arc::new(PROVIDER.node_key()),
+            transport: iroh::SecretKey::from_bytes(&[5; 32]),
+            settlement: hellas_channel::test_support::channel::provider(),
+            owner: Some(Arc::new(ROOT.passkey())),
+            node: host.world.service.node().clone(),
+            content: content.clone(),
+        };
+        let core = Core::new(options, Revision(0)).await.unwrap();
+        let mut document = Document::default();
+        document.listeners.insert(
+            "work".into(),
+            Listener::Iroh {
+                port: 0,
+                chain: None,
+                backends: vec![],
+            },
+        );
+        let prepared = core
+            .prepare(document, BTreeMap::new(), Revision(0))
+            .await
+            .unwrap();
+        let snapshot = prepared.activate(&core).await;
+        let ListenerBound::Iroh(bound) = &snapshot.listeners["work"].bound else {
+            panic!("iroh listener")
+        };
+        assert!(
+            snapshot.listeners["work"].failure.get().is_none(),
+            "{:?}",
+            snapshot.listeners["work"].failure.get()
+        );
+        assert!(core.watch().0.document.listeners.is_empty());
+        assert!(
+            bound.paid.watcher.lock().unwrap().is_none(),
+            "recovery must not run against the unpublished snapshot"
+        );
+        core.publish(snapshot.clone());
+        assert!(bound.paid.watcher.lock().unwrap().is_some());
+        assert!(core.watch().0.document.listeners.contains_key("work"));
+        core.shutdown().await.unwrap();
+        host.world.service.shutdown().await.unwrap();
+        host.content.close().await;
+        content.close().await;
     }
 }

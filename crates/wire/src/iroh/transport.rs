@@ -887,6 +887,40 @@ mod timeout_tests {
     }
 
     #[tokio::test]
+    async fn public_terminal_refusal_survives_delivery_revocation() {
+        use crate::write_authority::tests::Gate;
+        let (client, server, client_connection, server_connection) = connected_pair().await;
+        let transport = IrohTransport::new(server_connection);
+        let (_client_send, mut client_recv) =
+            raw_stream(&client_connection, &framed(open_frame(9))).await;
+        let inbound = transport.accept().await.unwrap().unwrap();
+        let (mut send, _recv) = inbound.stream.split();
+        let gate = Gate::default();
+        send.set_write_authority(gate.authority()).unwrap();
+        send.send_body(Bytes::from_static(b"accepted"))
+            .await
+            .unwrap();
+        gate.revoke();
+        let (sent, received) = tokio::join!(
+            send.refuse(Bytes::from_static(b"refused")),
+            client_recv.read_to_end(1024),
+        );
+        sent.unwrap();
+        let expected = [
+            framed(Frame::Body(Bytes::from_static(b"accepted"))),
+            framed(Frame::Body(Bytes::from_static(b"refused"))),
+            framed(Frame::End(crate::EndFrame {
+                status: crate::WireCode::Ok,
+                trailer: crate::Trailer::ok(),
+            })),
+        ]
+        .concat();
+        assert_eq!(received.unwrap(), expected);
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
     async fn blocked_response_frame_is_reset_on_deadline() {
         let (client, server, client_connection, server_connection) = connected_pair().await;
         let write_timeout = Duration::from_secs(10);

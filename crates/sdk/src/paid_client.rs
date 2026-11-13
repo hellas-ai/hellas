@@ -384,6 +384,7 @@ async fn check_payment_window(client: &ClientService, work_id: hellas_auth::Dige
 pub(crate) struct OpenIntent<'a> {
     pub(crate) job: Option<Box<crate::job::Job>>,
     pub(crate) allow_funding: bool,
+    pub(crate) quote: Option<PaidQuote>,
     pub(crate) before_open: Option<crate::client_owner::FundingBinding<'a>>,
 }
 
@@ -446,6 +447,7 @@ impl PaidWorkSession {
             OpenIntent {
                 job,
                 allow_funding,
+                quote: None,
                 before_open: None,
             },
             None,
@@ -506,12 +508,22 @@ impl PaidWorkSession {
                 return Err(PaidClientError::NoRetainedChannel);
             }
             None => {
-                let quote = within(
-                    connection_timeout,
-                    "paid provider connection",
-                    request_paid_quote(&args, &endpoint, &settlement_key, owner.principal()),
-                )
-                .await?;
+                let quote = match intent.quote.take() {
+                    Some(quote) => quote,
+                    None => {
+                        within(
+                            connection_timeout,
+                            "paid provider connection",
+                            request_paid_quote(
+                                &args,
+                                &endpoint,
+                                &settlement_key,
+                                owner.principal(),
+                            ),
+                        )
+                        .await?
+                    }
+                };
                 funding.check_quote(quote.funding_value)?;
                 if let Some(job) = intent.job.as_deref() {
                     job.check_policy(&quote.policy)?;

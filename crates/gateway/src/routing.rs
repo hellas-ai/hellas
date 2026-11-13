@@ -314,15 +314,22 @@ impl Routing {
                 .backend
                 .clone()
                 .ok_or_else(|| Unavailable::conflict("ambiguous server-side continuation"))?;
-            if self.instances.get(&backend.0) != Some(&backend.1)
-                || !route.backends.contains(&backend.0)
-            {
+            if self.instances.get(&backend.0) != Some(&backend.1) {
                 state.bindings.remove(&key);
                 if required {
                     return Err(Unavailable::conflict(
                         "continuation backend was replaced or removed; resend full context",
                     ));
                 }
+                continue;
+            }
+            if !route.backends.contains(&backend.0) {
+                if required {
+                    return Err(Unavailable::conflict(
+                        "continuation backend is not on this route",
+                    ));
+                }
+                state.bindings.remove(&key);
                 continue;
             }
             if pinned.as_ref().is_some_and(|p| *p != backend) {

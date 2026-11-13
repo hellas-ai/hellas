@@ -554,7 +554,13 @@ impl<const N: usize, C: Clock + Clone, P: MessagePipe> MuxDriver<N, C, P> {
                     tracing::warn!("pipe send: {e}");
                     return false;
                 }
-                if matches!(kind, crate::FrameKind::End | crate::FrameKind::Reset) {
+                // Authority belongs to this carrier write. The next Body or End
+                // reinstalls its own authority through the send command; idle
+                // streams must remain able to send a public terminal refusal.
+                if matches!(
+                    kind,
+                    crate::FrameKind::Body | crate::FrameKind::End | crate::FrameKind::Reset
+                ) {
                     self.authorities.remove(&key);
                 }
             }

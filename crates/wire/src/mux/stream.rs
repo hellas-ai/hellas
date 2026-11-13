@@ -119,6 +119,14 @@ impl crate::transport::SendHalf for MuxSendHalf {
             .map_err(Into::into)
     }
 
+    async fn refuse(&mut self, payload: Bytes) -> std::io::Result<()> {
+        self.authority = None;
+        self.send_body(payload)
+            .await
+            .map_err(std::io::Error::other)?;
+        self.close_send(None).await.map_err(std::io::Error::other)
+    }
+
     async fn close_send(&mut self, trailer: Option<Trailer>) -> Result<(), Self::Error> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
