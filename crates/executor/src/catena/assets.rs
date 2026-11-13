@@ -119,8 +119,8 @@ impl Assets {
     }
 }
 
-// Model size does not change the host staging allocation. Device memory stays
-// private until the bytes copied into it pass the content and length checks.
+// The host transfer buffer is bounded; Xet keeps metadata per chunk. Device
+// memory stays private until the content and length checks pass.
 const ASSET_STAGING_BYTES: usize = 8 << 20;
 
 fn stream_asset(
@@ -151,7 +151,15 @@ fn stream_asset(
 }
 
 pub fn upload(bytes: &[u8], dialect: GpuDialect) -> Result<MemOwn> {
-    Ok(MemOwn::from_bytes(bytes, dialect)?)
+    let mut memory = MemOwn::allocate(bytes.len() + bytes.len() % 2, dialect)?;
+    memory.write_bytes(0, bytes)?;
+    if !bytes.len().is_multiple_of(2) {
+        memory.write_bytes(bytes.len() as u64, &[0])?;
+    }
+    // Keep the zeroed physical word pad while exposing the exact input length.
+    let input = unsafe { MemOwn::from_raw_parts(memory.as_ptr(), bytes.len() as u64, dialect)? };
+    std::mem::forget(memory);
+    Ok(input)
 }
 
 #[cfg(test)]
@@ -273,6 +281,90 @@ mod tests {
         std::fs::write(&path, b"modified").unwrap();
         assert!(stream_asset(handle, object, |_, _| Ok(())).is_err());
         node.close().await;
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn upload_initializes_word_padding_without_changing_logical_length() {
+        const CHILD: &str = "HELLAS_UPLOAD_PADDING_TEST_LIBRARY";
+        if let Some(path) = std::env::var_os(CHILD) {
+            let library = unsafe { libloading::Library::new(path) }.unwrap();
+            let allocated =
+                unsafe { library.get::<unsafe extern "C" fn() -> usize>(b"allocation_size\0") }
+                    .unwrap();
+            for bytes in [&[][..], &[0x11, 0x22, 0x33], &[0x11, 0x22], &[0x11]] {
+                let memory = upload(bytes, GpuDialect::Hip).unwrap();
+                assert_eq!(memory.byte_len(), bytes.len() as u64);
+                if bytes.is_empty() {
+                    assert!(memory.as_ptr().is_null());
+                    continue;
+                }
+                let physical = unsafe { allocated() };
+                assert_eq!(physical, bytes.len().next_multiple_of(2));
+                // The child loads the host-memory HIP fixture, never a GPU runtime.
+                let actual =
+                    unsafe { std::slice::from_raw_parts(memory.as_ptr().cast::<u8>(), physical) };
+                assert_eq!(&actual[..bytes.len()], bytes);
+                assert!(actual[bytes.len()..].iter().all(|byte| *byte == 0));
+            }
+            return;
+        }
+        use std::{
+            io::Write,
+            process::{Command, Stdio},
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let library = directory.path().join("libamdhip64.so");
+        let mut compiler = Command::new("cc")
+            .args(["-shared", "-fPIC", "-x", "c", "-", "-o"])
+            .arg(&library)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        compiler
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(
+                br#"
+#include <stdlib.h>
+#include <string.h>
+static size_t allocated;
+size_t allocation_size(void) { return allocated; }
+int hipMalloc(void **pointer, size_t bytes) {
+    *pointer = malloc(bytes);
+    if (!*pointer) return 1;
+    allocated = bytes;
+    memset(*pointer, 0xa5, bytes);
+    return 0;
+}
+int hipMemcpy(void *destination, const void *source, size_t bytes, int kind) {
+    (void)kind;
+    memcpy(destination, source, bytes);
+    return 0;
+}
+int hipFree(void *pointer) { free(pointer); return 0; }
+"#,
+            )
+            .unwrap();
+        assert!(compiler.wait().unwrap().success());
+        assert!(
+            Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg(
+                    concat!(
+                        module_path!(),
+                        "::upload_initializes_word_padding_without_changing_logical_length"
+                    )
+                    .trim_start_matches("hellas_executor::")
+                )
+                .arg("--nocapture")
+                .env(CHILD, &library)
+                .env("LD_LIBRARY_PATH", directory.path())
+                .status()
+                .unwrap()
+                .success()
+        );
     }
 
     #[test]

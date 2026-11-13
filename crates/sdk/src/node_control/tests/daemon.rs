@@ -806,10 +806,7 @@ async fn resources_require_a_backend_allowed_by_the_iroh_listener() {
     document.resources.push(crate::daemon_config::Resource::new(
         "model".into(),
         "api".into(),
-        crate::daemon_config::ResourceKind::Https {
-            https,
-            credential: Some("api".into()),
-        },
+        crate::daemon_config::ResourceKind::Https { https },
     ));
     document.listeners.insert(
         "work".into(),
@@ -1106,66 +1103,63 @@ async fn occupied_saved_listener_keeps_control_available_for_repair() {
 }
 
 #[tokio::test]
-async fn changing_private_resource_binding_replaces_backend_and_preserves_old_snapshot() {
-    hellas_authority::test_support::within(async {
-        let f = fixture().await;
-        let mut document = Document::default();
-        document
-            .add_upstream("api", "https://example.com", Some("first-key".into()))
-            .unwrap();
-        let crate::daemon_config::BackendKind::Fetch {
-            upstream: crate::daemon_config::Upstream::Http { credentials, .. },
-            ..
-        } = &mut document.backends.get_mut("api").unwrap().kind
-        else {
-            unreachable!()
-        };
-        let mut second = credentials["api"].clone();
-        second.secret = Some("second-key".into());
-        credentials.insert("second".into(), second);
-        let resource = crate::daemon_config::Resource::new(
-            "account".into(),
-            "api".into(),
-            crate::daemon_config::ResourceKind::Https {
-                https: hellas_authority::test_support::chat_resource("https://example.com", 8),
-                credential: Some("api".into()),
-            },
-        );
-        let resource_id = resource.resource;
-        document.resources.push(resource);
-        let core = Core::open(options(&f), document.clone()).await.unwrap();
-        let old = core.snapshot.load_full();
-        let original = core.watch().0.backends[0].instance;
-        let (_client, _server, _connection, rpc, _served) = connect(&f, core.clone()).await;
-        rpc.configure(request(&document, 0)).await.unwrap();
-        assert_eq!(core.watch().0.backends[0].instance, original);
-        let crate::daemon_config::ResourceKind::Https { credential, .. } =
-            &mut document.resources[0].kind
-        else {
-            unreachable!()
-        };
-        *credential = Some("second".into());
-        rpc.configure(request(&document, 1)).await.unwrap();
-        assert_ne!(core.watch().0.backends[0].instance, original);
-        assert!(!std::ptr::eq(
-            old.work.backend("api").unwrap(),
-            core.snapshot.load().work.backend("api").unwrap()
-        ));
-        assert_eq!(
-            old.document.http_credentials("api").unwrap()[&resource_id],
-            Some("api".into())
-        );
-        assert_eq!(
-            core.snapshot
-                .load()
-                .document
-                .http_credentials("api")
-                .unwrap()[&resource_id],
-            Some("second".into())
-        );
-        core.shutdown().await.unwrap();
-        f.node.close().await;
-        f.content.close().await;
-    })
-    .await;
+async fn scope_overlap_is_rejected_before_configuration_commit() {
+    let f = fixture().await;
+    let core = Core::open(options(&f), Document::default()).await.unwrap();
+    let (_client, _server, _connection, rpc, _served) = connect(&f, core.clone()).await;
+    let mut document = Document::default();
+    document
+        .add_upstream("api", "https://example.com", Some("first-key".into()))
+        .unwrap();
+    let crate::daemon_config::BackendKind::Fetch {
+        upstream: crate::daemon_config::Upstream::Http { credentials, .. },
+        ..
+    } = &mut document.backends.get_mut("api").unwrap().kind
+    else {
+        unreachable!()
+    };
+    credentials.push(credentials[0].clone());
+    assert!(rpc.configure(request(&document, 0)).await.is_err());
+    assert_eq!(core.watch().0.revision, Revision(0));
+    core.shutdown().await.unwrap();
+    f.node.close().await;
+    f.content.close().await;
+}
+
+#[tokio::test]
+async fn configuration_publication_keeps_admission_closed_until_snapshot_swap() {
+    let f = fixture().await;
+    let core = Core::open(options(&f), Document::default()).await.unwrap();
+    let (_client, _server, _connection, rpc, _served) = connect(&f, core.clone()).await;
+    let committed = Arc::new(Semaphore::new(0));
+    let resume = Arc::new(Semaphore::new(0));
+    *core.after_commit.lock().unwrap() = Some((committed.clone(), resume.clone()));
+    let mut document = Document::default();
+    document
+        .add_upstream("api", "https://example.com", Some("key".into()))
+        .unwrap();
+    let configured = rpc.configure(request(&document, 0));
+    tokio::pin!(configured);
+    tokio::select! {
+        permit = committed.acquire() => permit.unwrap().forget(),
+        result = &mut configured => panic!("configuration ended before barrier: {result:?}"),
+    }
+    assert_eq!(
+        f.node.configuration().await.unwrap().unwrap().revision,
+        Revision(1)
+    );
+    assert_eq!(core.watch().0.revision, Revision(0));
+    let admission = f.node.configuration_admission();
+    tokio::pin!(admission);
+    assert!(
+        futures::poll!(&mut admission).is_pending(),
+        "admission observed committed authority before runtime publication"
+    );
+    resume.add_permits(1);
+    assert_eq!(configured.await.unwrap().revision, 1);
+    let _admission = admission.await;
+    assert_eq!(core.watch().0.revision, Revision(1));
+    core.shutdown().await.unwrap();
+    f.node.close().await;
+    f.content.close().await;
 }

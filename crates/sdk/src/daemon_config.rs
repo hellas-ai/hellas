@@ -113,10 +113,7 @@ pub enum Upstream {
         #[serde(default)]
         allow_private_addresses: bool,
         #[serde(default)]
-        credentials: BTreeMap<String, Credential>,
-        /// Provider-owned selection for owner Fetch execution.
-        #[serde(default)]
-        credential: Option<String>,
+        credentials: Vec<Credential>,
     },
     OpenaiResponses {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -147,13 +144,13 @@ impl Document {
         let mut document = self.clone();
         let mut secrets =
             hellas_authority::model::grant::configuration::ConfigurationSecrets::default();
-        document.secrets(|backend, alias, secret| {
+        document.secrets(|backend, slot, secret| {
             if let Some(value) = secret.take() {
                 secrets
                     .0
                     .entry(backend.into())
                     .or_default()
-                    .insert(alias.into(), value);
+                    .insert(slot.into(), value);
             }
         });
         (document, secrets)
@@ -174,12 +171,12 @@ impl Document {
         &mut self,
         stored: &hellas_authority::model::grant::configuration::ConfigurationSecrets,
     ) {
-        self.secrets(|backend, alias, secret| {
+        self.secrets(|backend, slot, secret| {
             if secret.is_none() {
                 *secret = stored
                     .0
                     .get(backend)
-                    .and_then(|values| values.get(alias))
+                    .and_then(|values| values.get(slot))
                     .cloned();
             }
         });
@@ -193,8 +190,8 @@ impl Document {
                     upstream: Upstream::Http { credentials, .. },
                     ..
                 } => {
-                    for (alias, credential) in credentials {
-                        visit(id, alias, &mut credential.secret);
+                    for (index, credential) in credentials.iter_mut().enumerate() {
+                        visit(id, &index.to_string(), &mut credential.secret);
                     }
                 }
                 BackendKind::Fetch {
@@ -231,6 +228,32 @@ impl Document {
             .any(|backend| backend.max_in_flight.get() > tokio::sync::Semaphore::MAX_PERMITS)
         {
             return Err("backend capacity exceeds the runtime limit");
+        }
+        for backend in self.backends.values() {
+            if let BackendKind::Fetch {
+                upstream: Upstream::Http { credentials, .. },
+                ..
+            } = &backend.kind
+            {
+                for (index, credential) in credentials.iter().enumerate() {
+                    if credentials[..index].iter().any(|other| {
+                        credential
+                            .allowed_origins
+                            .iter()
+                            .any(|value| other.allowed_origins.contains(value))
+                            && credential
+                                .allowed_paths
+                                .iter()
+                                .any(|value| other.allowed_paths.contains(value))
+                            && credential
+                                .allowed_methods
+                                .iter()
+                                .any(|value| other.allowed_methods.contains(value))
+                    }) {
+                        return Err("overlapping HTTP credential scopes");
+                    }
+                }
+            }
         }
         for listener in self.listeners.values() {
             if let Listener::Iroh { backends, .. } = listener {

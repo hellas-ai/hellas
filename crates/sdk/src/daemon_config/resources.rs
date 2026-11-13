@@ -30,18 +30,22 @@ pub struct Resource {
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ResourceKind {
-    Model {
-        package: PathBuf,
-    },
-    Https {
-        https: HttpsResource,
-        /// Private provider binding; never included in a signed offer.
-        #[serde(default)]
-        credential: Option<String>,
-    },
-    Responses {
-        responses: ResponsesResource,
-    },
+    Model { package: PathBuf },
+    Https { https: HttpsResource },
+    Responses { responses: ResponsesResource },
+}
+fn account_backed(https: &HttpsResource, credentials: &[Credential]) -> bool {
+    credentials.iter().any(|credential| {
+        credential.allowed_origins.contains(&https.origin)
+            && credential
+                .allowed_paths
+                .iter()
+                .any(|path| https.paths.contains(path))
+            && credential
+                .allowed_methods
+                .iter()
+                .any(|method| https.methods.contains(method))
+    })
 }
 fn job_millis() -> std::num::NonZeroU64 {
     std::num::NonZeroU64::new(300_000).unwrap()
@@ -114,8 +118,11 @@ impl Document {
         self.configuration(info, &models)
     }
 
-    /// The same provider resource definitions drive public policy and private bindings.
-    fn configured_resources(&self) -> Result<Vec<Resource>, crate::daemon::Error> {
+    pub(crate) fn configuration(
+        &self,
+        backends: &[hellas_gateway::BackendInfo],
+        models: &hellas_gateway::router::Models,
+    ) -> Result<NodeConfiguration, crate::daemon::Error> {
         let mut inputs = self.resources.clone();
         for (id, backend) in &self.backends {
             if inputs.iter().any(|r| r.backend == *id)
@@ -144,7 +151,7 @@ impl Document {
                     }
                 }
                 BackendKind::Fetch {
-                    upstream: Upstream::Http { credential, .. },
+                    upstream: Upstream::Http { credentials, .. },
                     ..
                 } => {
                     let mut resource: Option<HttpsResource> = None;
@@ -163,7 +170,7 @@ impl Document {
                             origin: url.origin().ascii_serialization(),
                             paths: vec![],
                             methods: vec!["POST".into()],
-                            account_backed: credential.is_some(),
+                            account_backed: false,
                             tls: target.route.tls.clone(),
                             accounting: AccountingProfile::None,
                             max_output_tokens: 0,
@@ -191,15 +198,10 @@ impl Document {
                             });
                         }
                     }
-                    if let Some(https) = resource {
-                        let mut resource = Resource::new(
-                            id.clone(),
-                            id.clone(),
-                            ResourceKind::Https {
-                                https,
-                                credential: credential.clone(),
-                            },
-                        );
+                    if let Some(mut https) = resource {
+                        https.account_backed = account_backed(&https, credentials);
+                        let mut resource =
+                            Resource::new(id.clone(), id.clone(), ResourceKind::Https { https });
                         resource.rates = Some(vec![]);
                         resource.max_job_millis = std::num::NonZeroU64::new(86_400_000).unwrap();
                         inputs.push(resource);
@@ -210,34 +212,6 @@ impl Document {
                 | BackendKind::Paid { .. } => {}
             }
         }
-        Ok(inputs)
-    }
-
-    pub(crate) fn http_credentials(
-        &self,
-        backend: &str,
-    ) -> Result<BTreeMap<ResourceId, Option<String>>, crate::daemon::Error> {
-        Ok(self
-            .configured_resources()?
-            .into_iter()
-            .filter_map(|resource| {
-                if resource.backend != backend {
-                    return None;
-                }
-                match resource.kind {
-                    ResourceKind::Https { credential, .. } => Some((resource.resource, credential)),
-                    _ => None,
-                }
-            })
-            .collect())
-    }
-
-    pub(crate) fn configuration(
-        &self,
-        backends: &[hellas_gateway::BackendInfo],
-        models: &hellas_gateway::router::Models,
-    ) -> Result<NodeConfiguration, crate::daemon::Error> {
-        let inputs = self.configured_resources()?;
         let mut resources = Vec::with_capacity(inputs.len());
         let mut accounts: BTreeMap<_, _> = self.budgets.iter().cloned().collect();
         if accounts.len() != self.budgets.len() {
@@ -317,19 +291,14 @@ impl Resource {
             }
             (kind, BackendKind::Fetch { upstream, .. }) => {
                 let (https, responses) = match (kind, upstream) {
-                    (
-                        ResourceKind::Https { https, credential },
-                        Upstream::Http { credentials, .. },
-                    ) => {
-                        if credential
-                            .as_ref()
-                            .is_some_and(|key| !credentials.contains_key(key))
-                        {
-                            return Err("unknown HTTPS credential alias".into());
+                    (ResourceKind::Https { https }, Upstream::Http { credentials, .. }) => {
+                        if https.account_backed != account_backed(https, credentials) {
+                            return Err(
+                                "HTTPS account_backed disagrees with backend credential scopes"
+                                    .into(),
+                            );
                         }
-                        let mut https = https.clone();
-                        https.account_backed = credential.is_some();
-                        (Some(https), None)
+                        (Some(https.clone()), None)
                     }
                     (ResourceKind::Responses { responses }, Upstream::OpenaiResponses { .. }) => {
                         (None, Some(responses.clone()))

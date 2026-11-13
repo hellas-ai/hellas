@@ -381,6 +381,7 @@ impl Core {
         // Dropping the caller detaches this commit-and-publication task.
         tokio::spawn(async move {
             let _serial = serial;
+            let publication = core.node().configuration_publication().await;
             let caller = core.node().session_caller(&session, binding).await?;
             core.node()
                 .configure(caller, authorization, stored, &configuration)
@@ -424,6 +425,7 @@ impl Core {
                 }))
                 .collect();
             let previous = core.publish(candidate.clone());
+            drop(publication);
             if let Err(error) = previous.work.retire(&candidate.work).await {
                 tracing::warn!(%error, "retired backend retains recovery obligations");
             }
@@ -462,9 +464,7 @@ impl Core {
             if entries.contains_key(id) {
                 continue;
             }
-            let resources = document.http_credentials(id)?;
-            let unchanged = old.document.backends.get(id) == Some(backend)
-                && old.document.http_credentials(id)? == resources;
+            let unchanged = old.document.backends.get(id) == Some(backend);
             let approved = match old.work.backend(id) {
                 Some(active) if unchanged => self
                     .runtime
@@ -478,7 +478,7 @@ impl Core {
                 entries.insert(
                     id.clone(),
                     self.runtime
-                        .open_backend(backend, counters.clone(), resources)
+                        .open_backend(backend, counters.clone())
                         .await
                         .unwrap_or_else(|error| {
                             runtime::PreparedBackend::unavailable(

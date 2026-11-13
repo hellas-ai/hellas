@@ -150,9 +150,9 @@ fn keys_are_inputs_and_only_omitted_keys_in_existing_entries_are_retained() {
     let mut document: Document = serde_json::from_value(serde_json::json!({
         "listeners": {}, "backends": {
             "http": { "kind": "fetch", "service": "https", "method": "request", "max_in_flight": 2,
-                "upstream": { "kind": "http", "allowed_hosts": ["example.org"], "credentials": {
-                    "main": { "allowed_origins": ["https://example.org"], "allowed_paths": ["/api"], "allowed_methods": ["POST"], "header_name": "authorization", "secret": "Bearer first-key" }
-                }}
+                "upstream": { "kind": "http", "allowed_hosts": ["example.org"], "credentials": [
+                    { "allowed_origins": ["https://example.org"], "allowed_paths": ["/api"], "allowed_methods": ["POST"], "header_name": "authorization", "secret": "Bearer first-key" }
+                ]}
             },
             "responses": { "kind": "fetch", "service": "openai", "method": "responses", "max_in_flight": 1,
                 "upstream": { "kind": "openai_responses", "secret": "second-key" }
@@ -299,7 +299,6 @@ async fn model_and_operator_inputs_keep_their_terms_in_one_configuration() {
         "models".into(),
         ResourceKind::Https {
             https: model.https.clone().unwrap(),
-            credential: Some("api".into()),
         },
     );
     explicit.max_job_millis = std::num::NonZeroU64::new(123_000).unwrap();
@@ -345,7 +344,7 @@ fn changed_upstream_does_not_inherit_a_stored_key() {
         unreachable!()
     };
     assert_eq!(allowed_hosts, &["collector.evil.example".to_string()]);
-    assert_eq!(credentials["api"].secret, None);
+    assert_eq!(credentials[0].secret, None);
 }
 
 #[tokio::test]
@@ -376,52 +375,93 @@ async fn granted_upstream_routes_preserve_the_direct_local_paths() {
     );
 }
 
-#[tokio::test]
-async fn resource_account_consent_is_derived_from_private_binding() {
+#[test]
+fn model_api_templates_require_versioned_paths_before_adding_routes() {
     let mut document = Document::default();
     document
         .add_upstream("api", "https://example.com", Some("key".into()))
         .unwrap();
-    for (name, credential, declared) in [
-        ("account", Some("api".into()), false),
-        ("anonymous", None, true),
-    ] {
-        let mut https = hellas_authority::test_support::chat_resource("https://example.com", 8);
-        https.account_backed = declared;
-        document.resources.push(Resource::new(
-            name.into(),
-            "api".into(),
-            ResourceKind::Https { https, credential },
-        ));
-    }
-    let configuration = document.configuration_for_test(&[]).await.unwrap();
+    let BackendKind::Fetch {
+        upstream: Upstream::Http { credentials, .. },
+        ..
+    } = &mut document.backends.get_mut("api").unwrap().kind
+    else {
+        unreachable!()
+    };
+    credentials.first_mut().unwrap().allowed_paths = vec!["/v1/responses".into(), "/health".into()];
+    assert!(document.add_upstream_model("model", "api").is_err());
+    assert!(document.routes.is_empty());
+}
+
+#[tokio::test]
+async fn scope_account_consent_mismatch_is_rejected() {
+    let mut document = Document::default();
+    document
+        .add_upstream("api", "https://example.com", Some("key".into()))
+        .unwrap();
+    document.resources.push(Resource::new(
+        "account".into(),
+        "api".into(),
+        ResourceKind::Https {
+            https: hellas_authority::test_support::chat_resource("https://example.com", 8),
+        },
+    ));
+    assert!(document.configuration_for_test(&[]).await.is_err());
+    let ResourceKind::Https { https } = &mut document.resources[0].kind else {
+        unreachable!()
+    };
+    https.account_backed = true;
+    https.paths.push("/health".into());
+    document.configuration_for_test(&[]).await.unwrap();
+    let ResourceKind::Https { https } = &mut document.resources[0].kind else {
+        unreachable!()
+    };
+    https.paths = vec!["/health".into()];
+    assert!(document.configuration_for_test(&[]).await.is_err());
+    let ResourceKind::Https { https } = &mut document.resources[0].kind else {
+        unreachable!()
+    };
+    https.account_backed = false;
+    document.configuration_for_test(&[]).await.unwrap();
+}
+
+#[test]
+fn reordered_credential_scopes_cannot_inherit_positional_secrets() {
+    let mut original = Document::default();
+    original
+        .add_upstream("api", "https://example.com", Some("first-key".into()))
+        .unwrap();
+    let BackendKind::Fetch {
+        upstream: Upstream::Http { credentials, .. },
+        ..
+    } = &mut original.backends.get_mut("api").unwrap().kind
+    else {
+        unreachable!()
+    };
+    let mut second = credentials[0].clone();
+    second.allowed_paths = vec!["/other".into()];
+    second.secret = Some("second-key".into());
+    credentials.push(second);
+    let mut reordered = original.redacted().0;
+    let BackendKind::Fetch {
+        upstream: Upstream::Http { credentials, .. },
+        ..
+    } = &mut reordered.backends.get_mut("api").unwrap().kind
+    else {
+        unreachable!()
+    };
+    credentials.swap(0, 1);
+    reordered.retain_secrets(&original);
+    let BackendKind::Fetch {
+        upstream: Upstream::Http { credentials, .. },
+        ..
+    } = &reordered.backends["api"].kind
+    else {
+        unreachable!()
+    };
     assert!(
-        configuration
-            .resource("account")
-            .unwrap()
-            .https
-            .as_ref()
-            .unwrap()
-            .account_backed
-    );
-    assert!(
-        !configuration
-            .resource("anonymous")
-            .unwrap()
-            .https
-            .as_ref()
-            .unwrap()
-            .account_backed
-    );
-    let bindings = document.http_credentials("api").unwrap();
-    assert_eq!(
-        bindings[&document.resources[0].resource],
-        Some("api".into())
-    );
-    assert_eq!(bindings[&document.resources[1].resource], None);
-    assert!(
-        !serde_json::to_string(configuration.resources())
-            .unwrap()
-            .contains("credential")
+        credentials
+            .iter()
+            .all(|credential| credential.secret.is_none())
     );
 }

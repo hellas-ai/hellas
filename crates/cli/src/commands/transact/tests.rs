@@ -207,35 +207,6 @@ fn fetch_args(extra: &[&str]) -> FetchArgs {
 }
 
 #[test]
-fn fetch_does_not_accept_provider_credential_selection() {
-    let request = fetch_args(&[]).request().unwrap();
-    assert!(request.headers.is_empty());
-    assert!(
-        serde_json::to_value(request)
-            .unwrap()
-            .get("credential")
-            .is_none()
-    );
-    let id = provider();
-    let error = crate::Cli::try_parse_from([
-        "hellas",
-        "fetch",
-        "https://example.test",
-        "--provider",
-        &id,
-        "--pay",
-        "20",
-        "--contract",
-        "http",
-        "--credential",
-        "api",
-    ])
-    .err()
-    .unwrap();
-    assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
-}
-
-#[test]
 fn provider_is_named_only_by_its_enrollment_and_node() {
     let id = provider();
     let p: Provider = id.parse().unwrap();

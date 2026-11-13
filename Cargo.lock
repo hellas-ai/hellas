@@ -760,7 +760,7 @@ dependencies = [
 [[package]]
 name = "catena-lang"
 version = "0.1.0"
-source = "git+https://github.com/hellas-ai/catena-lang.git?rev=f47ade17aa5fe45f0d4b2f8294107dfb7a29f28f#f47ade17aa5fe45f0d4b2f8294107dfb7a29f28f"
+source = "git+https://github.com/hellas-ai/catena-lang.git?rev=325d75d20f6f82511ab330b2c678075f204379d8#325d75d20f6f82511ab330b2c678075f204379d8"
 dependencies = [
  "anyhow",
  "bincode",
@@ -782,7 +782,7 @@ dependencies = [
 [[package]]
 name = "catena-models"
 version = "0.1.0"
-source = "git+https://github.com/hellas-ai/catena-models.git?rev=a98857c504e5af551b59851dba84113a21b323bf#a98857c504e5af551b59851dba84113a21b323bf"
+source = "git+https://github.com/hellas-ai/catena-models.git?rev=1160137a4b99c068a2fcd247cae50c5a8755405d#1160137a4b99c068a2fcd247cae50c5a8755405d"
 dependencies = [
  "anyhow",
  "axum",

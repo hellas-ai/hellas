@@ -174,22 +174,16 @@ impl OfferHost {
                         upstream: Upstream::Http {
                             allowed_hosts: vec!["localhost".into()],
                             allow_private_addresses: true,
-                            credential: None,
-                            credentials: [(
-                                "glm-account".into(),
-                                Credential {
-                                    trust_roots:
-                                        hellas_rpc::http_fetch::HttpTrustRoots::Certificates {
-                                            der_base64: vec![https.root_der.clone()],
-                                        },
-                                    allowed_origins: vec![https.origin.clone()],
-                                    allowed_paths: vec!["/v1/chat/completions".into()],
-                                    allowed_methods: vec!["POST".into()],
-                                    header_name: "authorization".into(),
-                                    secret: Some("Bearer fixture-key".into()),
+                            credentials: vec![Credential {
+                                trust_roots: hellas_rpc::http_fetch::HttpTrustRoots::Certificates {
+                                    der_base64: vec![https.root_der.clone()],
                                 },
-                            )]
-                            .into(),
+                                allowed_origins: vec![https.origin.clone()],
+                                allowed_paths: vec!["/v1/chat/completions".into()],
+                                allowed_methods: vec!["POST".into()],
+                                header_name: "authorization".into(),
+                                secret: Some("Bearer fixture-key".into()),
+                            }],
                         },
                     },
                 },
@@ -210,7 +204,6 @@ impl OfferHost {
                     .unwrap(),
                 kind: hellas_sdk::daemon_config::ResourceKind::Https {
                     https: resource.https.clone().unwrap(),
-                    credential: Some("glm-account".into()),
                 },
             }],
             machine: Some(ConfiguredBudget {
@@ -519,9 +512,11 @@ async fn generic_fetch_through_a_grant_uses_the_provider_sealed_credential_witho
     let host = OfferHost::start().await;
     let access = host.access().await;
     let bundle = std::fs::read(&access).unwrap();
-    for private in [b"glm-account".as_slice(), b"fixture-key".as_slice()] {
-        assert!(!bundle.windows(private.len()).any(|bytes| bytes == private));
-    }
+    assert!(
+        !bundle
+            .windows(b"fixture-key".len())
+            .any(|bytes| bytes == b"fixture-key")
+    );
     let root = host.root().join("upstream.der");
     std::fs::write(&root, STANDARD.decode(&host.https.root_der).unwrap()).unwrap();
     let body = host.root().join("request.json");

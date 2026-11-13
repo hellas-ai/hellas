@@ -12,7 +12,6 @@ struct Key {
     origin: String,
     addresses: Vec<SocketAddr>,
     tls: HttpTls,
-    credential: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -26,7 +25,6 @@ impl Clients {
         request: &HttpFetchRequest,
         url: &Url,
         mut addresses: Vec<SocketAddr>,
-        credential: Option<&str>,
     ) -> Result<Client, FetchProviderError> {
         // DNS answer order may rotate without changing the permitted set.
         addresses.sort_unstable();
@@ -35,7 +33,6 @@ impl Clients {
             origin: url.origin().ascii_serialization(),
             addresses,
             tls: request.tls.clone(),
-            credential: credential.map(str::to_owned),
         };
         if let Some(client) = Self::cached(&mut self.0.lock().unwrap(), &key) {
             return Ok(client);

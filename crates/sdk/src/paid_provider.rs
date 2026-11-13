@@ -335,7 +335,7 @@ impl WorkHandler for MountedWorkService {
             .driver
             .as_ref()
             .map(|driver| driver.admission(self.service.clone()));
-        let response = self.service.accept_when_ready(&request, execution).await;
+        let response = self.service.accept(&request, execution).await;
         Ok(response)
     }
 
@@ -1562,9 +1562,181 @@ mod tests {
         assert_eq!(response, duplicate);
     }
 
+    async fn paid_test_connection() -> (
+        iroh::Endpoint,
+        iroh::Endpoint,
+        iroh::endpoint::Connection,
+        iroh::endpoint::Connection,
+    ) {
+        use hellas_rpc::services::work::Work;
+        use hellas_wire::ServiceMarker as _;
+        use iroh::{Endpoint, EndpointAddr, TransportAddr, endpoint::presets};
+        let server = Endpoint::builder(presets::Minimal)
+            .alpns(vec![Work::ALPN.as_bytes().to_vec()])
+            .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let caller = Endpoint::builder(presets::Minimal)
+            .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let target = EndpointAddr::from_parts(
+            server.id(),
+            server.bound_sockets().into_iter().map(TransportAddr::Ip),
+        );
+        let (outgoing, incoming) =
+            tokio::join!(caller.connect(target, Work::ALPN.as_bytes()), async {
+                server
+                    .accept()
+                    .await
+                    .unwrap()
+                    .accept()
+                    .unwrap()
+                    .await
+                    .unwrap()
+            },);
+        let outgoing = outgoing.unwrap();
+        (caller, server, outgoing, incoming)
+    }
+
+    #[tokio::test]
+    async fn bidirectional_upload_preserves_connection_denial() {
+        use hellas_wire::{StreamTransport as _, iroh::IrohTransport};
+        let (caller, server, outgoing, incoming) = paid_test_connection().await;
+        let transport = IrohTransport::new(outgoing.clone());
+        let server_transport = IrohTransport::new(incoming.clone());
+        let mut upload = hellas_rpc::call::bidi_streaming::<
+            IrohTransport,
+            hellas_rpc::services::content::Upload,
+        >(&transport, Default::default())
+        .await
+        .unwrap();
+        let _inbound = server_transport.accept().await.unwrap().unwrap();
+        let mut writing = Box::pin(async {
+            for _ in 0..8 {
+                upload
+                    .send(hellas_rpc::pb::content::UploadRequest {
+                        part: Some(hellas_rpc::pb::content::upload_request::Part::Chunk(
+                            vec![7; 512 * 1024],
+                        )),
+                    })
+                    .await?;
+            }
+            Ok::<_, WireStatus>(())
+        });
+        assert!(futures::poll!(&mut writing).is_pending());
+        incoming.close(
+            u32::from(WireCode::PermissionDenied.as_u8()).into(),
+            b"revoked",
+        );
+        outgoing.closed().await;
+        assert_eq!(writing.await.unwrap_err().code, WireCode::PermissionDenied);
+        caller.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn disconnect_drops_waiting_paid_admission() {
+        use hellas_channel::work::ClientChannel as _;
+        use hellas_rpc::services::work::AcceptWork;
+        use hellas_wire::{MethodMarker as _, SendHalf as _, Stream as _, StreamTransport as _};
+        use prost::Message as _;
+
+        for disconnect_connection in [true, false] {
+            let fixture = PaidFixture::new();
+            let service = fixture.provider().await;
+            let mut client = fixture.client().await;
+            let request = client
+                .propose(
+                    &fixture.proposal(),
+                    &hellas_channel::test_support::channel::program_content().await,
+                    None,
+                )
+                .await
+                .unwrap();
+            service.observe_ready(fixture.ready.clone()).await.unwrap();
+            service.suspend().await.unwrap();
+            let mounted = MountedWorkService {
+                service: service.clone(),
+                driver: None,
+            };
+            let (caller, server, outgoing, incoming) = paid_test_connection().await;
+            let transport = hellas_wire::iroh::IrohTransport::new(outgoing.clone());
+            let (mut send, mut recv) = transport
+                .open(AcceptWork::METHOD_ID, Default::default())
+                .await
+                .unwrap()
+                .split();
+            send.send_body(request.encode_to_vec().into())
+                .await
+                .unwrap();
+            send.close_send(None).await.unwrap();
+            let server_transport = hellas_wire::iroh::IrohTransport::new(incoming.clone());
+            let inbound = server_transport.accept().await.unwrap().unwrap();
+            let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            struct DropNotice(Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for DropNotice {
+                fn drop(&mut self) {
+                    self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            let (entered, waiting) = tokio::sync::oneshot::channel();
+            let notice = DropNotice(dropped.clone());
+            let mut dispatch = Box::pin(hellas_rpc::call::dispatch_unary_with_context::<
+                hellas_wire::iroh::IrohTransport,
+                AcceptWork,
+                _,
+                _,
+                _,
+            >(inbound, |request, context| async move {
+                let _notice = notice;
+                let mut admission = Box::pin(wt(mounted.accept_work(request, context)));
+                assert!(futures::poll!(&mut admission).is_pending());
+                entered.send(()).unwrap();
+                admission.await
+            }));
+            tokio::select! {
+                result = &mut dispatch => panic!("admission did not wait: {result:?}"),
+                () = async { waiting.await.unwrap() } => {}
+            }
+            if disconnect_connection {
+                outgoing.close(0u32.into(), b"caller disconnected");
+                incoming.closed().await;
+                assert!(
+                    matches!(
+                        futures::poll!(&mut dispatch),
+                        std::task::Poll::Ready(Err(_))
+                    ),
+                    "the closed response stream must cancel waiting admission"
+                );
+            } else {
+                hellas_wire::RecvHalf::reset(&mut recv, WireCode::Cancelled);
+                assert!(dispatch.await.is_err());
+                assert!(
+                    outgoing.close_reason().is_none(),
+                    "only this RPC was cancelled"
+                );
+            }
+            assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(
+                service
+                    .with_state(|state| state.jobs().count())
+                    .await
+                    .unwrap(),
+                0
+            );
+            caller.close().await;
+            server.close().await;
+        }
+    }
+
     #[tokio::test]
     async fn waiting_proposals_end_on_denial_shutdown_or_expiry_without_acceptance() {
-        for end in ["denied", "stopped", "quiesced", "expired"] {
+        for end in ["denied", "stopped", "quiesced", "closed", "expired"] {
             let fixture = PaidFixture::new();
             let service = fixture.provider().await;
             let mut client = fixture.client().await;
@@ -1589,6 +1761,7 @@ mod tests {
                 "denied" => service.observe_unavailable(2).await.unwrap(),
                 "stopped" => service.stop().await.unwrap(),
                 "quiesced" => service.quiesce().await.unwrap(),
+                "closed" => service.close().await.unwrap(),
                 "expired" => {
                     let deadline = client
                         .with_state(|state| {

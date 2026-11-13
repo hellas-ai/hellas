@@ -61,7 +61,7 @@ those callers the same filesystem and device access as the provider process.
 ```sh
 hellas faucet
 hellas transcribe --model whisper-tiny --audio speech.wav --pay 20 --provider ENROLLMENT_ID@NODE_ID \
-  --backend hellas/catena-f47ade17aa5f-hip
+  --backend hellas/catena-325d75d20f6f-hip
 hellas transact --settle --provider ENROLLMENT_ID@NODE_ID
 ```
 

@@ -72,7 +72,6 @@ async fn both_listeners_keep_admitted_backends_when_fetch_configuration_changes(
                 max_job_millis: 300_000.try_into().unwrap(),
                 kind: crate::daemon_config::ResourceKind::Https {
                     https: template.clone(),
-                    credential: None,
                 },
             }],
             ..Default::default()
@@ -87,7 +86,6 @@ async fn both_listeners_keep_admitted_backends_when_fetch_configuration_changes(
                     upstream: Upstream::Http {
                         allowed_hosts: vec!["localhost".into()],
                         allow_private_addresses: true,
-                        credential: None,
                         credentials: Default::default(),
                     },
                 },

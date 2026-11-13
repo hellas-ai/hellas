@@ -545,7 +545,7 @@ async fn https_policy_conversion_rejects_a_non_http_schema() {
 }
 
 #[tokio::test]
-async fn https_policy_conversion_keeps_models_on_their_signed_paths() {
+async fn https_policy_conversion_keeps_models_and_refuses_colliding_local_paths() {
     let fixture = Fixture::builder().build().await;
     let mut policy = fixture.host.allowance.policies[0].clone();
     let template = policy.https.as_mut().unwrap();
@@ -572,6 +572,22 @@ async fn https_policy_conversion_keeps_models_on_their_signed_paths() {
             .unwrap()
             .models
             .is_none()
+    );
+    let template = policy.https.as_mut().unwrap();
+    template.paths = vec![
+        "/a/v1/chat/completions".into(),
+        "/b/v1/chat/completions".into(),
+    ];
+    template.model_policy = None;
+    let result = hellas_gateway::router::router(
+        grant_routes(&policy, "test").unwrap(),
+        fixture.gateway.clone(),
+        fixture.gateway.jobs.clone(),
+        Default::default(),
+    )
+    .await;
+    assert!(
+        matches!(result, Err(hellas_gateway::GatewayError::Routing(error)) if error.0 == "duplicate route key")
     );
     fixture.shutdown().await;
 }

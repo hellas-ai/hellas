@@ -742,13 +742,15 @@ mod tests {
             .unwrap();
         let authorization = PaidJobAuthorizationV2::decode(&request.authorization).unwrap();
         fixture::seed_content(
-            provider.fixture_store(),
+            &mut provider.close.store,
             authorization,
             input.canonical_bytes().unwrap().into(),
         )
         .await;
-        let reply = provider.accept(&request, None).await;
+        let service = WorkService::new(provider);
+        let reply = service.accept(&request, None).await;
         let work = client.accepted(&reply).await.unwrap();
+        let mut provider = service.endpoint().await.unwrap();
         provider.begin_run(work, &ready).await.unwrap();
         let transcript = output::InvocationOutput {
             outcome: output::Outcome::Succeeded,
@@ -774,6 +776,7 @@ mod tests {
         let provider_node = provider.close.store.content_store();
         let client_node = client.store.content_store();
         drop(provider);
+        drop(service);
         drop(client);
         provider_node.close().await;
         client_node.close().await;
@@ -854,7 +857,7 @@ mod tests {
         let mut policy = fixture::work_policy();
         policy.admissions.extend(fixture::fetch_policy().admissions);
         let ready = fixture::ready_of(&fixture::descriptor_with(policy.clone()), fixture::CURSOR);
-        let mut provider = ProviderEndpoint::new(
+        let provider = ProviderEndpoint::new(
             ready.clone(),
             fixture::store_at(
                 provider_root.path(),
@@ -877,6 +880,7 @@ mod tests {
         let mut ephemeral = fixture::fetch_bundle(2);
         ephemeral.application_policy = retained.application_policy.clone();
         let content = fixture::program_content().await;
+        let service = WorkService::new(provider);
         let mut ids = Vec::new();
         for input in [&retained, &ephemeral] {
             let proposal = client
@@ -891,14 +895,15 @@ mod tests {
                 .unwrap();
             let authorization = PaidJobAuthorizationV2::decode(&proposal.authorization).unwrap();
             fixture::seed_content(
-                provider.fixture_store(),
+                &mut service.endpoint().await.unwrap().close.store,
                 authorization,
                 input.canonical_bytes().unwrap().into(),
             )
             .await;
-            let reply = provider.accept(&proposal, None).await;
+            let reply = service.accept(&proposal, None).await;
             ids.push(client.accepted(&reply).await.unwrap());
         }
+        let mut provider = service.endpoint().await.unwrap();
         provider.begin_run(ids[0], &ready).await.unwrap();
         provider
             .record_result(
@@ -947,7 +952,7 @@ mod tests {
             .sign(&ephemeral.request, &fixture::provider_producer(), 1024)
             .unwrap();
         provider.record_result(ids[1], &output).await.unwrap();
-        let service = WorkService::new(provider);
+        drop(provider);
         let (transport, server) = crate::test_support::transport::transport_pair();
         let serving = fixture::serve_work(server, service);
         fetch_result_stream(transport, &mut client, &ready, ids[1], |_| Ok(()))
@@ -975,7 +980,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let client_root = tempfile::tempdir().unwrap();
         let ready = fixture::ready();
-        let mut provider = ProviderEndpoint::new(
+        let provider = ProviderEndpoint::new(
             ready.clone(),
             fixture::store_at(root.path(), &ready, Role::Provider, fixture::CURSOR).await,
             fixture::provider(),
@@ -988,6 +993,7 @@ mod tests {
         )
         .unwrap();
         let content = fixture::program_content().await;
+        let service = WorkService::new(provider);
         let mut jobs = Vec::new();
         for nonce in 1..=2 {
             let input = fixture::bundle(nonce);
@@ -1001,13 +1007,15 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let response = fixture::accept_uploaded(&mut provider, &proposal).await;
+            let response = fixture::accept_uploaded_service(&service, &proposal).await;
             let work = client.accepted(&response).await.unwrap();
+            let mut provider = service.endpoint().await.unwrap();
             provider.begin_run(work, &ready).await.unwrap();
             let events = fixture::transcript_for(&input.request, &[9, 10]);
             provider.record_result(work, &events).await.unwrap();
             jobs.push(work);
         }
+        let mut provider = service.endpoint().await.unwrap();
         provider
             .close
             .store
@@ -1062,7 +1070,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let client_root = tempfile::tempdir().unwrap();
         let ready = fixture::ready();
-        let mut provider = ProviderEndpoint::new(
+        let provider = ProviderEndpoint::new(
             ready.clone(),
             fixture::store_at(root.path(), &ready, Role::Provider, fixture::CURSOR).await,
             fixture::provider(),
@@ -1075,6 +1083,7 @@ mod tests {
         )
         .unwrap();
         let content = fixture::program_content().await;
+        let service = WorkService::new(provider);
         let mut jobs = Vec::new();
         for nonce in 1..=2 {
             let proposal = client
@@ -1087,9 +1096,10 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let response = fixture::accept_uploaded(&mut provider, &proposal).await;
+            let response = fixture::accept_uploaded_service(&service, &proposal).await;
             jobs.push(client.accepted(&response).await.unwrap());
         }
+        let mut provider = service.endpoint().await.unwrap();
         provider.begin_run(jobs[0], &ready).await.unwrap();
         provider
             .close
@@ -1106,7 +1116,7 @@ mod tests {
                 .is_empty()
         );
         let request = client.request_delivery(jobs[0], &[7; 32]).unwrap();
-        let service = WorkService::new(provider);
+        drop(provider);
         let mut reserved = service
             .reserve_stream_durably(&request, &[7; 32])
             .await
@@ -1156,7 +1166,7 @@ mod tests {
                 PendingSlot::Absent,
             ))
             .unwrap();
-        let mut provider = ProviderEndpoint::new(
+        let provider = ProviderEndpoint::new(
             ready.clone(),
             fixture::store_at(
                 provider_root.path(),
@@ -1184,11 +1194,11 @@ mod tests {
             )
             .await
             .unwrap();
-        let response = fixture::accept_uploaded(&mut provider, &proposal).await;
-        let work = client.accepted(&response).await.unwrap();
-        provider.begin_run(work, &ready).await.unwrap();
-        let request = client.request_delivery(work, &[7; 32]).unwrap();
         let service = WorkService::new(provider);
+        let response = fixture::accept_uploaded_service(&service, &proposal).await;
+        let work = client.accepted(&response).await.unwrap();
+        service.begin_run(work, &ready).await.unwrap();
+        let request = client.request_delivery(work, &[7; 32]).unwrap();
         let (entered, release) = service
             .endpoint()
             .await

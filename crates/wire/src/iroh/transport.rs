@@ -887,6 +887,35 @@ mod timeout_tests {
     }
 
     #[tokio::test]
+    async fn connection_denial_remains_typed_after_a_blocked_request_write() {
+        use crate::{RecvHalf as _, WireCode};
+        let (client, server, client_connection, server_connection) = connected_pair().await;
+        let client_transport = IrohTransport::new(client_connection.clone());
+        let server_transport = IrohTransport::new(server_connection.clone());
+        let stream = client_transport.open(9, Metadata::new()).await.unwrap();
+        let _inbound = server_transport.accept().await.unwrap().unwrap();
+        let (mut send, mut recv) = stream.split();
+        let mut write = Box::pin(send.send_body(Bytes::from(vec![7; 2 * 1024 * 1024])));
+        assert!(
+            poll!(&mut write).is_pending(),
+            "peer is not reading the request"
+        );
+        server_connection.close(
+            u32::from(WireCode::PermissionDenied.as_u8()).into(),
+            b"revoked",
+        );
+        client_connection.closed().await;
+        let error = write.await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        // Unary and server-streaming clients inspect this terminal response
+        // after a failed write; the original denial must survive that race.
+        assert!(recv.next().await.is_none());
+        assert_eq!(recv.trailer().unwrap().status, WireCode::PermissionDenied);
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
     async fn public_terminal_refusal_survives_delivery_revocation() {
         use crate::write_authority::tests::Gate;
         let (client, server, client_connection, server_connection) = connected_pair().await;

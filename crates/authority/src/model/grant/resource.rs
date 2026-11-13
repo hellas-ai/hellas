@@ -22,8 +22,7 @@ pub struct HttpsResource {
     pub origin: String,
     pub paths: Vec<String>,
     pub methods: Vec<String>,
-    /// Public consent metadata; the credential alias stays in provider configuration.
-    #[serde(default)]
+    /// Consent metadata: at least one allowed request uses a provider credential.
     pub account_backed: bool,
     pub tls: HttpTls,
     pub accounting: AccountingProfile,

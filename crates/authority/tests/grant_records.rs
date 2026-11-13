@@ -433,7 +433,7 @@ fn contacts_explicitly_refuse_unsupported_roots_and_keys() {
 }
 
 #[test]
-fn account_backed_consent_does_not_expose_a_provider_alias() {
+fn account_backed_resources_require_consent() {
     let mut offer = https_offer();
     offer.grant.allow_account_backed = false;
     assert_eq!(offer.grant.validate(), Err(GrantError::AccountBacked));
@@ -443,7 +443,4 @@ fn account_backed_consent_does_not_expose_a_provider_alias() {
         .unwrap()
         .account_backed = false;
     offer.grant.validate().unwrap();
-    let public = serde_json::to_value(&offer.grant.policies[0].https).unwrap();
-    assert!(public.get("credential").is_none());
-    assert_eq!(public["account_backed"], false);
 }

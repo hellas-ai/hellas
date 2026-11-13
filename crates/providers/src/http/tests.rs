@@ -213,8 +213,7 @@ fn provider() -> HttpFetchProvider {
             allowed_hosts: vec!["localhost".into()],
             allow_private_addresses: true,
         },
-        BTreeMap::new(),
-        HttpCredentialBindings::default(),
+        vec![],
     )
     .unwrap()
 }
@@ -261,8 +260,7 @@ async fn wrong_pin_wrong_roots_and_wrong_hostname_send_no_http_request() {
             allowed_hosts: vec!["localhost".into(), "127.0.0.1".into()],
             allow_private_addresses: true,
         },
-        BTreeMap::new(),
-        HttpCredentialBindings::default(),
+        vec![],
     )
     .unwrap();
     let response = configured.run(prepared(&valid)).await.unwrap();
@@ -322,7 +320,7 @@ async fn a_response_cut_at_the_signed_cap_is_a_caller_limit() {
 }
 
 #[tokio::test]
-async fn client_pools_separate_dns_answers_aliases_and_tls_settings_and_evict() {
+async fn client_pools_separate_dns_answers_and_tls_settings_and_evict() {
     let (mut request, calls, connections, task) = server(200, b"ok".to_vec(), None).await;
     let valid_tls = request.tls.clone();
     let url = request.parsed_url().unwrap();
@@ -330,7 +328,7 @@ async fn client_pools_separate_dns_answers_aliases_and_tls_settings_and_evict() 
     let other = SocketAddr::from(([127, 0, 0, 2], url.port().unwrap()));
     let clients = clients::Clients::default();
     for addresses in [vec![address, other], vec![other, address, address]] {
-        let client = clients.get(&request, &url, addresses, None).unwrap();
+        let client = clients.get(&request, &url, addresses).unwrap();
         assert_eq!(
             client
                 .get(url.clone())
@@ -348,56 +346,30 @@ async fn client_pools_separate_dns_answers_aliases_and_tls_settings_and_evict() 
         1,
         "DNS order must not discard a usable pool"
     );
-    let denied = clients.get(&request, &url, vec![other], None).unwrap();
+    let denied = clients.get(&request, &url, vec![other]).unwrap();
     assert!(
         denied.get(url.clone()).send().await.is_err(),
         "a new DNS answer must not reuse the old address"
     );
     assert_eq!(calls.load(Ordering::SeqCst), 2);
-    // Exercise the cache boundary directly: production credential authorization
-    // runs before this method and checks the operator roots, tested separately.
-    let alias = Some("second-account");
-    let client = clients
-        .get(&request, &url, vec![address, other], alias)
-        .unwrap();
-    assert_eq!(
-        client
-            .get(url.clone())
-            .send()
-            .await
-            .unwrap()
-            .bytes()
-            .await
-            .unwrap(),
-        "ok"
-    );
-    drop(client);
-    assert_eq!(connections.load(Ordering::SeqCst), 2);
     request.tls.spki_sha256 = vec!["00".repeat(32)];
-    let client = clients
-        .get(&request, &url, vec![address, other], alias)
-        .unwrap();
+    let client = clients.get(&request, &url, vec![address, other]).unwrap();
     assert!(client.get(url.clone()).send().await.is_err());
     assert_eq!(
         calls.load(Ordering::SeqCst),
-        3,
+        2,
         "wrong pins must not reuse a verified socket"
     );
     drop(client);
     request.tls.spki_sha256.clear();
     // More distinct policies than the cache admits must evict its old pools.
     for index in 0..40 {
-        let alias = format!("account-{index}");
-        clients
-            .get(&request, &url, vec![address], Some(&alias))
-            .unwrap();
+        request.tls.spki_sha256 = vec![format!("{index:064x}")];
+        clients.get(&request, &url, vec![address]).unwrap();
     }
     let before = connections.load(Ordering::SeqCst);
-    let alias = None;
     request.tls = valid_tls;
-    let client = clients
-        .get(&request, &url, vec![address, other], alias)
-        .unwrap();
+    let client = clients.get(&request, &url, vec![address, other]).unwrap();
     assert_eq!(
         client.get(url).send().await.unwrap().bytes().await.unwrap(),
         "ok"
@@ -471,12 +443,7 @@ async fn signed_heads_keep_representation_length_only_for_head_and_not_modified(
 #[tokio::test]
 async fn signed_response_size_and_default_private_address_denial_are_enforced() {
     let (mut request, calls, _, task) = server(200, vec![42; 100], None).await;
-    let public = HttpFetchProvider::new(
-        HttpEgressPolicy::default(),
-        BTreeMap::new(),
-        HttpCredentialBindings::default(),
-    )
-    .unwrap();
+    let public = HttpFetchProvider::new(HttpEgressPolicy::default(), vec![]).unwrap();
     assert!(public.run(prepared(&request)).await.is_err());
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     request.max_response_bytes = 16;
@@ -486,7 +453,7 @@ async fn signed_response_size_and_default_private_address_denial_are_enforced() 
 }
 
 #[test]
-fn credentials_cannot_be_redirected_or_used_with_caller_trust_anchors() {
+fn credentials_only_cover_declared_requests_and_reject_changed_roots() {
     let credential = HttpCredential {
         trust_roots: HttpTrustRoots::WebPki,
         allowed_origins: vec!["https://api.example.com".into()],
@@ -495,15 +462,7 @@ fn credentials_cannot_be_redirected_or_used_with_caller_trust_anchors() {
         header_name: "authorization".into(),
         header_value: "Bearer PRIVATE".into(),
     };
-    let provider = HttpFetchProvider::new(
-        HttpEgressPolicy::default(),
-        BTreeMap::from([("account-1".into(), credential)]),
-        HttpCredentialBindings {
-            owner: Some("account-1".into()),
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let provider = HttpFetchProvider::new(HttpEgressPolicy::default(), vec![credential]).unwrap();
     let mut request = HttpFetchRequest {
         url: "https://api.example.com/path".into(),
         method: "POST".into(),
@@ -517,54 +476,37 @@ fn credentials_cannot_be_redirected_or_used_with_caller_trust_anchors() {
     };
     assert!(
         provider
-            .credential(
-                &request,
-                &request.parsed_url().unwrap(),
-                provider.credential_alias(None).unwrap()
-            )
+            .credential(&request, &request.parsed_url().unwrap(),)
             .unwrap()
             .is_some()
     );
     request.method = "DELETE".into();
     assert!(
         provider
-            .credential(
-                &request,
-                &request.parsed_url().unwrap(),
-                provider.credential_alias(None).unwrap()
-            )
-            .is_err()
+            .credential(&request, &request.parsed_url().unwrap(),)
+            .unwrap()
+            .is_none()
     );
     request.method = "POST".into();
     request.url = "https://api.example.com/other".into();
     assert!(
         provider
-            .credential(
-                &request,
-                &request.parsed_url().unwrap(),
-                provider.credential_alias(None).unwrap()
-            )
-            .is_err()
+            .credential(&request, &request.parsed_url().unwrap(),)
+            .unwrap()
+            .is_none()
     );
     request.url = "https://attacker.example/".into();
     assert!(
         provider
-            .credential(
-                &request,
-                &request.parsed_url().unwrap(),
-                provider.credential_alias(None).unwrap()
-            )
-            .is_err()
+            .credential(&request, &request.parsed_url().unwrap(),)
+            .unwrap()
+            .is_none()
     );
     request.url = "https://api.example.com/path".into();
     request.tls.roots = HttpTrustRoots::Certificates { der_base64: vec![] };
     assert!(
         provider
-            .credential(
-                &request,
-                &request.parsed_url().unwrap(),
-                provider.credential_alias(None).unwrap()
-            )
+            .credential(&request, &request.parsed_url().unwrap(),)
             .is_err()
     );
     assert!(!format!("{provider:?}").contains("PRIVATE"));
@@ -594,7 +536,7 @@ fn special_addresses_never_qualify_as_public_egress() {
 }
 
 /// Offline demonstration: the TLS upstream sees the provider's credential;
-/// neither the alias nor the secret is part of the signed buyer request.
+/// the secret is absent from the signed buyer request.
 #[tokio::test]
 async fn provider_injects_secret_without_disclosing_it_to_the_buyer() {
     use hellas_auth::ProducerSigningKey;
@@ -617,21 +559,14 @@ async fn provider_injects_secret_without_disclosing_it_to_the_buyer() {
             allowed_hosts: vec!["localhost".into()],
             allow_private_addresses: true,
         },
-        BTreeMap::from([(
-            "provider-account".into(),
-            HttpCredential {
-                trust_roots: request.tls.roots.clone(),
-                allowed_origins: vec![url.origin().ascii_serialization()],
-                allowed_paths: vec!["/resource".into()],
-                allowed_methods: vec!["GET".into()],
-                header_name: "authorization".into(),
-                header_value: HttpSecret::Value(SECRET.into()),
-            },
-        )]),
-        HttpCredentialBindings {
-            owner: Some("provider-account".into()),
-            ..Default::default()
-        },
+        vec![HttpCredential {
+            trust_roots: request.tls.roots.clone(),
+            allowed_origins: vec![url.origin().ascii_serialization()],
+            allowed_paths: vec!["/resource".into()],
+            allowed_methods: vec!["GET".into()],
+            header_name: "authorization".into(),
+            header_value: HttpSecret::Value(SECRET.into()),
+        }],
     )
     .unwrap();
     let mut substituted = request.clone();
@@ -705,11 +640,6 @@ async fn provider_injects_secret_without_disclosing_it_to_the_buyer() {
     let upstream = String::from_utf8(captured.recv().await.unwrap()).unwrap();
     assert!(upstream.contains(&format!("authorization: {SECRET}\r\n")));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert!(
-        !String::from_utf8(serde_json::to_vec(&request).unwrap())
-            .unwrap()
-            .contains("provider-account")
-    );
     assert!(input_events.iter().all(|event| {
         !event
             .payload()
@@ -723,13 +653,10 @@ async fn provider_injects_secret_without_disclosing_it_to_the_buyer() {
             .any(|w| w == SECRET.as_bytes())
     }));
     // Reusing the TLS pool cannot bypass credential scope or override checks.
-    for (path, headers) in [
-        ("/elsewhere", vec![]),
-        (
-            "/resource",
-            vec![("authorization".into(), "buyer override".into())],
-        ),
-    ] {
+    for (path, headers) in [(
+        "/resource",
+        vec![("authorization".into(), "buyer override".into())],
+    )] {
         let mut forbidden = request.clone();
         forbidden.url = format!("{}{path}", url.origin().ascii_serialization());
         forbidden.headers = headers;
@@ -739,83 +666,68 @@ async fn provider_injects_secret_without_disclosing_it_to_the_buyer() {
     server.abort();
 }
 
-#[test]
-fn trusted_resource_bindings_select_exact_accounts_without_owner_fallback() {
-    use hellas_auth::authority::ResourceId;
-    let first = ResourceId(Digest::hash(b"first resource"));
-    let second = ResourceId(Digest::hash(b"second resource"));
-    let anonymous = ResourceId(Digest::hash(b"anonymous resource"));
-    let unknown = ResourceId(Digest::hash(b"unknown resource"));
-    let credential = HttpCredential {
-        trust_roots: HttpTrustRoots::WebPki,
-        allowed_origins: vec!["https://api.example.com".into()],
-        allowed_paths: vec!["/path".into()],
+async fn scope_selection_request(path: &str, expected: Option<&str>) {
+    let (capture, mut captured) = tokio::sync::mpsc::unbounded_channel();
+    let (mut request, _, _, server) =
+        server_fixture(200, b"ok".to_vec(), None, None, Some(capture)).await;
+    let url = request.parsed_url().unwrap();
+    let credential = |path: &str, secret: &str| HttpCredential {
+        allowed_origins: vec![url.origin().ascii_serialization()],
+        allowed_paths: vec![path.into()],
         allowed_methods: vec!["GET".into()],
+        trust_roots: request.tls.roots.clone(),
+        header_name: "authorization".into(),
+        header_value: secret.into(),
+    };
+    let provider = HttpFetchProvider::new(
+        HttpEgressPolicy {
+            allowed_hosts: vec!["localhost".into()],
+            allow_private_addresses: true,
+        },
+        vec![
+            credential("/resource", "Bearer FIRST"),
+            credential("/other", "Bearer SECOND"),
+        ],
+    )
+    .unwrap();
+    request.url = format!("{}{path}", url.origin().ascii_serialization());
+    assert_eq!(
+        collect(provider.run(prepared(&request)).await.unwrap()).await,
+        b"ok"
+    );
+    let headers = String::from_utf8(captured.recv().await.unwrap()).unwrap();
+    match expected {
+        Some(secret) => assert!(headers.contains(&format!("authorization: {secret}\r\n"))),
+        None => assert!(!headers.contains("authorization:")),
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn scope_selection_uses_the_credential_covering_the_request() {
+    scope_selection_request("/other", Some("Bearer SECOND")).await;
+}
+
+#[tokio::test]
+async fn scope_selection_leaves_uncovered_requests_anonymous() {
+    scope_selection_request("/public", None).await;
+}
+
+#[test]
+fn scope_overlap_is_rejected_even_with_different_headers_or_roots() {
+    let credential = HttpCredential {
+        allowed_origins: vec!["https://example.com".into()],
+        allowed_paths: vec!["/resource".into()],
+        allowed_methods: vec!["GET".into()],
+        trust_roots: HttpTrustRoots::WebPki,
         header_name: "authorization".into(),
         header_value: "Bearer FIRST".into(),
     };
     let mut other = credential.clone();
-    other.header_value = "Bearer SECOND".into();
-    let credentials = BTreeMap::from([("first".into(), credential), ("second".into(), other)]);
-    let provider = HttpFetchProvider::new(
-        HttpEgressPolicy::default(),
-        credentials.clone(),
-        HttpCredentialBindings {
-            owner: Some("second".into()),
-            resources: BTreeMap::from([
-                (first, Some("first".into())),
-                (second, Some("second".into())),
-                (anonymous, None),
-            ]),
-        },
-    )
-    .unwrap();
-    assert_eq!(provider.credential_alias(None).unwrap(), Some("second"));
-    assert_eq!(
-        provider.credential_alias(Some(first)).unwrap(),
-        Some("first")
-    );
-    assert_eq!(
-        provider.credential_alias(Some(second)).unwrap(),
-        Some("second")
-    );
-    assert_eq!(provider.credential_alias(Some(anonymous)).unwrap(), None);
-    assert!(provider.credential_alias(Some(unknown)).is_err());
-    let unselected = HttpFetchProvider::new(
-        HttpEgressPolicy::default(),
-        credentials.clone(),
-        HttpCredentialBindings::default(),
-    )
-    .unwrap();
-    assert_eq!(
-        unselected.credential_alias(None).unwrap(),
-        None,
-        "available accounts must not imply owner selection"
-    );
-    assert!(unselected.credential_alias(Some(first)).is_err());
-    for bindings in [
-        HttpCredentialBindings {
-            owner: Some("missing".into()),
-            ..Default::default()
-        },
-        HttpCredentialBindings {
-            resources: BTreeMap::from([(first, Some("missing".into()))]),
-            ..Default::default()
-        },
-    ] {
-        assert!(
-            HttpFetchProvider::new(HttpEgressPolicy::default(), credentials.clone(), bindings)
-                .is_err()
-        );
-    }
-    for alias in ["", "contains space", "slash/alias"] {
-        assert!(
-            HttpFetchProvider::new(
-                HttpEgressPolicy::default(),
-                BTreeMap::from([(alias.into(), credentials["first"].clone())]),
-                HttpCredentialBindings::default()
-            )
-            .is_err()
-        );
-    }
+    other.header_name = "x-api-key".into();
+    let certificate = generate_simple_self_signed(vec!["example.com".into()]).unwrap();
+    other.trust_roots = HttpTrustRoots::Certificates {
+        der_base64: vec![STANDARD.encode(certificate.cert.der())],
+    };
+    assert!(HttpFetchProvider::new(HttpEgressPolicy::default(), vec![credential, other]).is_err());
 }

@@ -346,15 +346,6 @@ mod tests {
             assert!(HttpFetchResponse::from_output(&request(), &output(events)).is_err());
         }
     }
-    #[test]
-    fn callers_cannot_select_a_provider_credential() {
-        let mut encoded = serde_json::to_value(request()).unwrap();
-        assert!(encoded.get("credential").is_none());
-        for alias in [serde_json::Value::Null, "provider-account".into()] {
-            encoded["credential"] = alias;
-            assert!(HttpFetchRequest::decode(&serde_json::to_vec(&encoded).unwrap()).is_err());
-        }
-    }
 
     #[test]
     fn requests_reject_ambiguous_or_unbounded_transport_inputs() {

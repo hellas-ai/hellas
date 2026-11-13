@@ -39,12 +39,6 @@ async fn http_uses_the_paid_backend_and_waits_for_its_payment_completion() {
             let http = hellas_rpc::http_fetch::HttpFetchRequest::decode(&request.body).unwrap();
             assert_eq!(http.url, "https://example.com/v1/responses?x=%2F&x=y");
             assert_eq!(http.body().unwrap(), b"opaque request");
-            assert!(
-                serde_json::from_slice::<serde_json::Value>(&request.body)
-                    .unwrap()
-                    .get("credential")
-                    .is_none()
-            );
             if self.busy {
                 return Err(crate::WorkGatewayBusy.into());
             }
@@ -337,6 +331,79 @@ async fn proxy(paid: Arc<Proxied>) -> (crate::test_support::server::Server, temp
     .await
     .unwrap();
     (handle, archive)
+}
+
+#[tokio::test]
+async fn configured_models_passthrough_takes_precedence_over_authenticated_discovery() {
+    for method in ["GET", "POST", "HEAD"] {
+        let mut route = http("/v1/models", None);
+        let crate::Presentation::Http { targets } = &mut route.presentation else {
+            unreachable!()
+        };
+        targets.get_mut("test").unwrap().route.method = method.into();
+        let fixture = crate::access::tests::Fixture::new().await;
+        let archive = tempfile::tempdir().unwrap();
+        let server = crate::test_support::server::serve(
+            fixture.access.node(),
+            fixture.access.bearer(),
+            crate::ArchiveOptions {
+                directory: archive.path().into(),
+                zdr: true,
+            },
+            Arc::new(Proxied {
+                status: 202,
+                body: (method != "HEAD").then_some("provider models"),
+                transcript: vec![],
+            }),
+            Arc::new(crate::jobs::Jobs::default()),
+            vec![route],
+        )
+        .await
+        .unwrap();
+        let client = reqwest::Client::new();
+        let url = format!("http://{}/v1/models", server.address());
+        assert_eq!(
+            client
+                .request(method.parse().unwrap(), &url)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let response = client
+            .get(&url)
+            .bearer_auth(server.bearer())
+            .send()
+            .await
+            .unwrap();
+        if method == "GET" {
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            assert_eq!(response.text().await.unwrap(), "provider models");
+        } else {
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.json::<serde_json::Value>().await.unwrap(),
+                serde_json::json!({"object":"list","data":[]})
+            );
+            let response = client
+                .request(method.parse().unwrap(), &url)
+                .bearer_auth(server.bearer())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            assert_eq!(
+                response.text().await.unwrap(),
+                if method == "HEAD" {
+                    ""
+                } else {
+                    "provider models"
+                }
+            );
+        }
+        server.shutdown().await.unwrap();
+    }
 }
 
 /// Proxied HTTPS responses name the accepted job and its provider in their

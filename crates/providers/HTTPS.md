@@ -36,15 +36,14 @@ at least one must match when supplied. Pins add constraints to chain validation.
 Provider credentials require the exact trust roots configured by the operator;
 a caller cannot substitute different roots.
 
-The operator configures account aliases separately:
+The operator configures credential scopes separately:
 
 ```json
 {
   "allowed_hosts": [],
   "allow_private_addresses": false,
-  "credential": "account-1",
-  "credentials": {
-    "account-1": {
+  "credentials": [
+    {
       "allowed_origins": ["https://api.example.com"],
       "allowed_paths": ["/v1/messages"],
       "allowed_methods": ["POST"],
@@ -52,25 +51,27 @@ The operator configures account aliases separately:
       "secret_env": "ACCOUNT_ONE_API_KEY",
       "prefix": "Bearer "
     },
-    "account-2": {
+    {
       "allowed_origins": ["https://api.example.com"],
-      "allowed_paths": ["/v1/messages"],
+      "allowed_paths": ["/v1/embeddings"],
       "allowed_methods": ["POST"],
       "header_name": "x-api-key",
       "secret_env": "ACCOUNT_TWO_API_KEY",
       "prefix": ""
     }
-  }
+  ]
 }
 ```
 
-The private backend `credential` selects the account for owner Fetch. An omitted
-selection means anonymous access, even when accounts are configured. For granted
-Fetch, the provider selects the alias bound to the authorized resource in its
-private `ResourceKind::Https` configuration. An unknown resource is refused; it
-does not inherit the owner selection. Signed offers expose only an `account_backed`
-consent flag, never the provider alias. This supports independent accounts at the
-same origin. Secrets are read from the provider process's environment and held in
+The provider selects the credential whose declared origin, path and method cover
+this request. Owner, paid and granted Fetch use the same selection. A request
+outside every declared scope runs anonymously. Overlapping scopes in one backend
+are rejected at configuration; two accounts covering the same request need two
+backends. TLS roots and header names cannot disambiguate overlapping scopes.
+A public resource's `account_backed` consent flag must agree with whether any of
+its allowed requests intersects a credential scope; a mismatch is rejected.
+Automatically generated model resources set this flag from their backend scopes.
+Secrets are read from the provider process's environment and held in
 memory. Alternatively, replace `secret_env` with `secret_file` and `secret_field`
 to read a private JSON login file on each request. The loader rejects symlinks,
 non-regular files, files that are not owner-only, and files over 64 KiB; atomic
@@ -108,7 +109,7 @@ query strings: if an API selects models or pricing through query parameters,
 a caller can still steer cost within an allowed path.
 
 DNS answers are resolved and checked on every request. Connections are reused
-only for the same origin, DNS address set, TLS roots/pins and credential alias.
+only for the same origin, DNS address set and TLS roots/pins.
 Each provider retains at most 32 client pools, with at most four idle connections
 per origin and a 90 second idle expiry. Credentials are still resolved per request;
 the pools contain no default authorization headers. Private,
@@ -125,7 +126,7 @@ accounts. In the CLI's Fetch route file, use:
 {
   "service": "http",
   "method": "request",
-  "destination": {"type": "http", "config": {"credentials": {}}}
+  "destination": {"type": "http", "config": {"credentials": []}}
 }
 ```
 
@@ -146,13 +147,12 @@ and checks ordering and size after transcript signature verification.
 ## Provider-owned credential demonstration
 
 Generic HTTPS preserves provider-side API-key injection. The buyer signs the
-HTTP request without an alias. The provider resolves its private resource or
-owner binding and inserts the secret header immediately before sending HTTPS.
-Neither the alias nor the key is added to the buyer input transcript or normal
-response transcript. Credentialed requests require the operator's configured
+HTTP request. The provider matches its declared credential scopes and inserts
+the selected secret header immediately before sending HTTPS.
+The key is absent from the buyer input transcript and normal response transcript. Credentialed requests require the operator's configured
 trust roots, an exact permitted origin/path/method,
 and no caller override of the credential header. Redirects are not followed.
-Scope aliases to upstreams you trust: an upstream receives the header and could
+Scope credentials to upstreams you trust: an upstream receives the header and could
 include it in its response; a transparent proxy cannot promise to hide a secret
 that the upstream itself returns.
 
@@ -164,7 +164,7 @@ nix develop --command cargo test -p hellas-providers provider_injects_secret -- 
 
 It runs the production HTTP provider and adaptor against a local TLS server,
 checks that the server receives the key, verifies the signed input and output,
-and confirms neither transcript contains the key and the request contains no alias. It also checks that warmed
+and confirms neither transcript contains the key. It also checks that warmed
 connection pools cannot bypass credential scope or header-override checks. The
 fixture configures its CA as the operator credential's trust root; a buyer
 substitution of those roots is refused.

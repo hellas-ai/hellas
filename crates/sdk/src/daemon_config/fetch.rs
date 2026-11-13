@@ -51,7 +51,6 @@ impl super::Backend {
     pub async fn open_fetch(
         &self,
         signer: Arc<hellas_auth::ProducerSigningKey>,
-        resources: std::collections::BTreeMap<hellas_auth::authority::ResourceId, Option<String>>,
     ) -> Result<Backend, Box<dyn std::error::Error + Send + Sync>> {
         let BackendKind::Fetch {
             service,
@@ -61,7 +60,7 @@ impl super::Backend {
         else {
             return Err("not a Fetch backend".into());
         };
-        let entry = upstream.entry(resources)?;
+        let entry = upstream.entry()?;
         let policy = self.fetch_policy()?;
         let mut routes = FetchRouteRegistry::new();
         routes.register(FetchRoute::new(service, method), entry)?;
@@ -76,37 +75,30 @@ impl super::Backend {
 }
 
 impl Upstream {
-    fn entry(
-        &self,
-        resources: std::collections::BTreeMap<hellas_auth::authority::ResourceId, Option<String>>,
-    ) -> Result<FetchRouteEntry, Box<dyn std::error::Error + Send + Sync>> {
+    fn entry(&self) -> Result<FetchRouteEntry, Box<dyn std::error::Error + Send + Sync>> {
         let capabilities = Default::default();
         Ok(match self {
             Self::Http {
                 allowed_hosts,
                 allow_private_addresses,
                 credentials,
-                credential,
             } => {
                 let credentials = credentials
                     .iter()
-                    .map(|(id, credential)| {
-                        Ok((
-                            id.clone(),
-                            hellas_providers::HttpCredential {
-                                allowed_origins: credential.allowed_origins.clone(),
-                                allowed_paths: credential.allowed_paths.clone(),
-                                allowed_methods: credential.allowed_methods.clone(),
-                                trust_roots: credential.trust_roots.clone(),
-                                header_name: credential.header_name.clone(),
-                                header_value: hellas_providers::HttpSecret::Value(
-                                    credential
-                                        .secret
-                                        .clone()
-                                        .ok_or("missing upstream credential")?,
-                                ),
-                            },
-                        ))
+                    .map(|credential| {
+                        Ok(hellas_providers::HttpCredential {
+                            allowed_origins: credential.allowed_origins.clone(),
+                            allowed_paths: credential.allowed_paths.clone(),
+                            allowed_methods: credential.allowed_methods.clone(),
+                            trust_roots: credential.trust_roots.clone(),
+                            header_name: credential.header_name.clone(),
+                            header_value: hellas_providers::HttpSecret::Value(
+                                credential
+                                    .secret
+                                    .clone()
+                                    .ok_or("missing upstream credential")?,
+                            ),
+                        })
                     })
                     .collect::<Result<_, Box<dyn std::error::Error + Send + Sync>>>()?;
                 FetchRouteEntry::new(
@@ -116,10 +108,6 @@ impl Upstream {
                             allow_private_addresses: *allow_private_addresses,
                         },
                         credentials,
-                        hellas_providers::HttpCredentialBindings {
-                            owner: credential.clone(),
-                            resources,
-                        },
                     )?),
                     Arc::new(hellas_providers::HttpFetchAdaptorFactory::new()?),
                     capabilities,

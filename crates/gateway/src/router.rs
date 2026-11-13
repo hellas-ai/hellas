@@ -81,6 +81,12 @@ pub async fn with_models(
             "id": id, "object": "model", "created": 0, "owned_by": "hellas"
         })).collect::<Vec<_>>()
     });
+    let models_methods: BTreeSet<_> = routing
+        .routes
+        .iter()
+        .flat_map(Route::keys)
+        .filter_map(|(path, method, _)| (path == "/v1/models").then_some(method))
+        .collect();
     let mut presentations = Vec::new();
     let mut errors = BTreeMap::new();
     for route in &routing.routes {
@@ -157,18 +163,25 @@ pub async fn with_models(
         };
         presentations.push(router);
     }
+    let handler = move |request| {
+        dispatch(
+            routing.clone(),
+            presentations.clone(),
+            jobs.clone(),
+            request,
+        )
+    };
+    let mut router = Router::new().fallback(handler.clone());
+    // Explicit GET passthrough wins; discovery must also leave other methods routable.
+    if !models_methods.contains("GET") {
+        let mut discovery = get(move || async move { Json(discovery) }).fallback(handler.clone());
+        if models_methods.contains("HEAD") {
+            discovery = discovery.head(handler);
+        }
+        router = router.route("/v1/models", discovery);
+    }
     Ok((
-        Router::new()
-            .route("/v1/models", get(move || async move { Json(discovery) }))
-            .fallback(move |request| {
-                dispatch(
-                    routing.clone(),
-                    presentations.clone(),
-                    jobs.clone(),
-                    request,
-                )
-            })
-            .layer(axum::extract::DefaultBodyLimit::disable()),
+        router.layer(axum::extract::DefaultBodyLimit::disable()),
         errors,
     ))
 }
