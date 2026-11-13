@@ -200,19 +200,14 @@ impl ModelContext {
         let (policy, evaluator) = matches.pop().unwrap();
         let access =
             base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bundle.encode()?);
-        let id = format!("{destination}-{}", &policy.resource.to_string()[..12]);
-        document
-            .backends
-            .entry(id.clone())
-            .or_insert_with(|| Backend {
-                max_in_flight: std::num::NonZeroUsize::new(8).unwrap(),
-                kind: BackendKind::Grant {
-                    access: Some(access),
-                    resource: Some(policy.resource),
-                    evaluator,
-                    trust,
-                },
-            });
+        let id = grant_backend(
+            document,
+            destination,
+            policy.resource,
+            access,
+            evaluator,
+            trust,
+        );
         if let Some(package) = package {
             document
                 .add_route(package_route(package, &id)?)
@@ -246,6 +241,40 @@ impl ModelContext {
         }
         Ok(())
     }
+}
+
+fn grant_backend(
+    document: &mut Document,
+    destination: &str,
+    resource: hellas_auth::authority::ResourceId,
+    access: String,
+    evaluator: Option<String>,
+    trust: Option<hellas_sdk::daemon_config::Trust>,
+) -> String {
+    let id = hellas_auth::hash_tuple(
+        "hellas.gateway.grant-backend.v1",
+        &[destination.as_bytes(), resource.to_string().as_bytes()],
+    )
+    .to_string();
+    let max_in_flight = document
+        .backends
+        .get(&id)
+        .map_or(std::num::NonZeroUsize::new(8).unwrap(), |backend| {
+            backend.max_in_flight
+        });
+    document.backends.insert(
+        id.clone(),
+        Backend {
+            max_in_flight,
+            kind: BackendKind::Grant {
+                access: Some(access),
+                resource: Some(resource),
+                evaluator,
+                trust,
+            },
+        },
+    );
+    id
 }
 
 fn package_route(package: PathBuf, backend: &str) -> Result<Route> {
@@ -723,6 +752,44 @@ pub fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = st
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn generated_grant_ids_fit_and_repair_refreshes_access() {
+        let resource = hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"model"));
+        let mut document = Document::default();
+        let contact = "a".repeat(64);
+        let id = grant_backend(
+            &mut document,
+            &contact,
+            resource,
+            "first".into(),
+            None,
+            None,
+        );
+        validate_name(&id).unwrap();
+        document.backends.get_mut(&id).unwrap().max_in_flight =
+            std::num::NonZeroUsize::new(3).unwrap();
+        assert_eq!(
+            grant_backend(
+                &mut document,
+                &contact,
+                resource,
+                "repaired".into(),
+                None,
+                None
+            ),
+            id
+        );
+        assert_eq!(document.backends[&id].max_in_flight.get(), 3);
+        assert!(
+            matches!(&document.backends[&id].kind, BackendKind::Grant { access: Some(access), .. } if access == "repaired")
+        );
+        let other = format!("{}b", &contact[..63]);
+        assert_ne!(
+            grant_backend(&mut document, &other, resource, "other".into(), None, None),
+            id
+        );
+    }
 
     #[test]
     fn stateless_and_stateful_command_surfaces_have_no_config_file() {

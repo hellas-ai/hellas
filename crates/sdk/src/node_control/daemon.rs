@@ -29,9 +29,10 @@ impl ControlSession {
             .map_err(|error| {
                 match error.downcast::<NodeStoreError>() {
                     Ok(error) => node_error(*error),
-                    // Prepared inputs can contain keys. They are never reflected in a control error.
-                    Err(_) => {
-                        WireStatus::new(WireCode::FailedPrecondition, "configuration rejected")
+                    Err(error) => {
+                        // Core removes write-only credentials from preparation errors.
+                        tracing::warn!(%error, "Configure failed");
+                        WireStatus::new(WireCode::FailedPrecondition, error.to_string())
                     }
                 }
             })?;

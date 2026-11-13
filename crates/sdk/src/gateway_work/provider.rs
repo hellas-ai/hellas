@@ -69,18 +69,22 @@ impl IrohBackend {
         &self,
         key: &BackendKey,
         caller: PublicKey,
+        recovered: bool,
     ) -> Result<(Arc<Job>, Arc<Backend>), BackendFault> {
         let core = self.core.upgrade().ok_or(AdmissionError::Closed)?;
-        let job = core
-            .jobs
-            .admit(&Request {
-                origin: Origin::Iroh {
-                    peer: hex::encode(caller.bytes()),
-                },
-                method: "work.execute".into(),
-                path: self.listener.clone(),
-            })
-            .map_err(BackendFault::caused_by)?;
+        let request = Request {
+            origin: Origin::Iroh {
+                peer: hex::encode(caller.bytes()),
+            },
+            method: "work.execute".into(),
+            path: self.listener.clone(),
+        };
+        let job = if recovered {
+            core.jobs.recover(&request)
+        } else {
+            core.jobs.admit(&request)
+        }
+        .map_err(BackendFault::caused_by)?;
         let snapshot = core.snapshot.load_full();
         let Some(crate::daemon_config::Listener::Iroh { backends, .. }) =
             snapshot.document.listeners.get(&self.listener)
@@ -93,7 +97,7 @@ impl IrohBackend {
 }
 impl WorkBackend for IrohBackend {
     fn try_admit(&self, key: &BackendKey, caller: PublicKey) -> Result<WorkPermit, BackendFault> {
-        let (job, inner) = self.admit(key, caller)?;
+        let (job, inner) = self.admit(key, caller, false)?;
         let slot = inner
             .slots
             .clone()
@@ -121,7 +125,7 @@ impl WorkBackend for IrohBackend {
         } else {
             let key = BackendKey::of(input.invocation())?;
             let caller = input.admission().caller().ok_or(AdmissionError::Closed)?;
-            let (job, inner) = self.admit(&key, caller)?;
+            let (job, inner) = self.admit(&key, caller, true)?;
             // A payment already accepted is owed execution; it waits for its bounded worker.
             let slot = inner
                 .slots

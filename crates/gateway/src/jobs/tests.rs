@@ -162,3 +162,24 @@ async fn task_panic_is_reported_after_other_work_finishes() {
     release.send(()).unwrap();
     assert!(matches!(draining.await, Err(WorkShutdownError::Task(error)) if error.is_panic()));
 }
+
+#[tokio::test]
+async fn recovered_acceptances_do_not_consume_the_request_quota() {
+    let limit = Arc::new(RequestLimit::default());
+    limit.configure(std::num::NonZeroU64::new(1));
+    let jobs = Arc::new(Jobs::new(limit));
+    let first = jobs.admit(&request()).unwrap();
+    first.accepted();
+    first.finish(Outcome::Completed);
+    assert!(jobs.admit(&request()).is_err());
+    let recovered: Vec<_> = (0..3).map(|_| jobs.recover(&request()).unwrap()).collect();
+    assert_eq!(jobs.watch(|jobs| jobs).0.len(), 3);
+    for job in recovered {
+        job.accepted();
+        job.finish(Outcome::Completed);
+    }
+    assert!(jobs.admit(&request()).is_err());
+    jobs.close();
+    assert!(jobs.recover(&request()).is_err());
+    jobs.drain().await.unwrap();
+}

@@ -141,8 +141,22 @@ impl Jobs {
         }
     }
 
+    /// Register work whose acceptance was recovered from a journal.
+    pub fn recover(self: &Arc<Self>, request: &Request) -> Result<Arc<Job>, Refusal> {
+        let job = self.register(request, None)?;
+        job.accepted();
+        Ok(job)
+    }
+
     pub fn admit(self: &Arc<Self>, request: &Request) -> Result<Arc<Job>, Refusal> {
-        let mut reservation = Some(self.limit.admit()?);
+        self.register(request, Some(self.limit.admit()?))
+    }
+
+    fn register(
+        self: &Arc<Self>,
+        request: &Request,
+        mut reservation: Option<limits::Hold>,
+    ) -> Result<Arc<Job>, Refusal> {
         let admitted = (|| {
             let mut state = self.state.lock().map_err(|_| WorkGatewayBusy)?;
             if state.closed {

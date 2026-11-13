@@ -752,3 +752,81 @@ async fn unrelated_configure_keeps_the_local_backend_instance() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn configure_rejection_includes_the_validation_reason() {
+    let f = fixture().await;
+    let core = Core::open(options(&f), Document::default()).await.unwrap();
+    let (_client, _server, connection, rpc, served) = connect(&f, core.clone()).await;
+    let mut document = Document::default();
+    document.listeners.insert(
+        "work".into(),
+        Listener::Iroh {
+            chain: None,
+            port: 0,
+            backends: vec!["missing".into()],
+        },
+    );
+    let error = rpc.configure(request(&document, 0)).await.unwrap_err();
+    assert_eq!(error.code(), WireCode::FailedPrecondition);
+    assert!(
+        error.to_string().contains("unknown iroh backend"),
+        "{error}"
+    );
+    assert_eq!(core.watch().0.revision, Revision(0));
+    assert!(!core.jobs.is_closed());
+    core.shutdown().await.unwrap();
+    connection.close(0u32.into(), b"test complete");
+    let _ = served.await.unwrap();
+}
+
+#[tokio::test]
+async fn resources_require_a_backend_allowed_by_the_iroh_listener() {
+    let f = fixture().await;
+    let core = Core::open(options(&f), Document::default()).await.unwrap();
+    let (_client, _server, connection, rpc, served) = connect(&f, core.clone()).await;
+    let mut document = Document::default();
+    document
+        .add_upstream("api", "https://api.example", Some("key".into()))
+        .unwrap();
+    document.add_upstream_model("model", "api").unwrap();
+    let https = hellas_authority::model::grant::resource::HttpsResource {
+        origin: "https://api.example".into(),
+        paths: vec!["/v1/responses".into()],
+        methods: vec!["POST".into()],
+        credential: Some("api".into()),
+        tls: hellas_rpc::http_fetch::HttpTls {
+            roots: hellas_rpc::http_fetch::HttpTrustRoots::WebPki,
+            spki_sha256: vec![],
+        },
+        accounting: hellas_authority::model::grant::resource::AccountingProfile::None,
+        max_output_tokens: 0,
+        max_response_bytes: 1 << 20,
+        model_policy: None,
+    };
+    document.resources.push(crate::daemon_config::Resource::new(
+        "model".into(),
+        "api".into(),
+        crate::daemon_config::ResourceKind::Https { https },
+    ));
+    document.listeners.insert(
+        "work".into(),
+        Listener::Iroh {
+            chain: None,
+            port: 0,
+            backends: vec![],
+        },
+    );
+    let error = rpc
+        .configure(request(&document, 0))
+        .await
+        .err()
+        .expect("unserved resource must be rejected");
+    assert!(
+        error.to_string().contains("resource has no backend"),
+        "{error}"
+    );
+    core.shutdown().await.unwrap();
+    connection.close(0u32.into(), b"test complete");
+    let _ = served.await.unwrap();
+}

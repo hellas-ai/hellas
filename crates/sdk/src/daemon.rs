@@ -344,7 +344,11 @@ impl Core {
         }
         document.retain_secrets(&current.document);
         let revision = expected.next().ok_or("configuration revision overflow")?;
-        let candidate = self.prepare(document, BTreeMap::new(), revision).await?;
+        let secrets = document.redacted().1;
+        let candidate = self
+            .prepare(document, BTreeMap::new(), revision)
+            .await
+            .map_err(|error| configuration_error(error, &secrets))?;
         let (redacted, secrets) = candidate.document.redacted();
         let stored = ConfigurationDocument {
             revision: expected,
@@ -437,9 +441,19 @@ impl Core {
         info.extend(entries.iter().map(|(id, backend)| backend.info(id)));
         let work = prepared::PreparedWork::new(info);
         let configuration = document.configuration(&work.info).await?;
-        let mut executable: Vec<_> = entries
+        let allowed: BTreeSet<_> = document
+            .listeners
             .values()
-            .filter_map(|entry| match entry {
+            .filter_map(|listener| match listener {
+                Listener::Iroh { backends, .. } => Some(backends),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        let mut executable: Vec<_> = entries
+            .iter()
+            .filter(|(id, _)| allowed.contains(id))
+            .filter_map(|(_, entry)| match entry {
                 runtime::PreparedBackend::Ready { entry, .. } => {
                     Some((&entry.backend, entry.evaluator.as_deref()))
                 }
@@ -447,7 +461,7 @@ impl Core {
             })
             .collect();
         for info in &work.info {
-            if reuse.contains(&info.id) {
+            if reuse.contains(&info.id) && allowed.contains(&info.id) {
                 executable.push((
                     old.work.backend(&info.id).expect("reused backend"),
                     info.evaluator.as_deref(),
@@ -655,3 +669,22 @@ impl Core {
     }
 }
 use axum::response::IntoResponse;
+
+fn configuration_error(
+    error: Error,
+    secrets: &hellas_authority::model::grant::configuration::ConfigurationSecrets,
+) -> Error {
+    let mut message = error.to_string();
+    for secret in secrets.0.values().flat_map(|values| values.values()) {
+        if !secret.is_empty() {
+            message = message.replace(secret, "[redacted]");
+            if let Some(token) = secret
+                .strip_prefix("Bearer ")
+                .filter(|token| !token.is_empty())
+            {
+                message = message.replace(token, "[redacted]");
+            }
+        }
+    }
+    message.into()
+}
