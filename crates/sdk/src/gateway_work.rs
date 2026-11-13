@@ -469,7 +469,40 @@ pub struct GrantBackend {
     pub options: crate::grant_client::GrantSessionOptions,
     pub transport: crate::grant_client::GrantTransport,
     pub policy: GrantPolicy,
-    pub(crate) session: Arc<tokio::sync::Mutex<Option<crate::grant_client::GrantSession>>>,
+    pub(crate) channel: Arc<GrantChannel>,
+}
+
+#[derive(Default)]
+pub(crate) struct GrantChannel {
+    session: tokio::sync::Mutex<Option<crate::grant_client::GrantSession>>,
+    active: std::sync::atomic::AtomicUsize,
+    retired: std::sync::atomic::AtomicBool,
+    down: Arc<std::sync::atomic::AtomicBool>,
+}
+type GrantChannels = std::collections::BTreeMap<hellas_auth::Digest, std::sync::Weak<GrantChannel>>;
+struct GrantUse(Arc<GrantChannel>);
+impl Drop for GrantUse {
+    fn drop(&mut self) {
+        self.0
+            .active
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+impl GrantBackend {
+    fn channel_id(&self) -> Option<hellas_authority::model::grant::ChannelId> {
+        Some(
+            self.options
+                .target
+                .offer()
+                .channel(hellas_authority::model::grant::ChannelClient {
+                    principal: self.options.principal,
+                    node: hellas_auth::authority::NodeKey::from_public_key(
+                        self.options.signer.public_key(),
+                    )
+                    .ok()?,
+                }),
+        )
+    }
 }
 
 impl Backend {
@@ -510,7 +543,7 @@ impl Backend {
             options,
             transport,
             policy,
-            session: Default::default(),
+            channel: Default::default(),
         })))
     }
     pub fn local(
@@ -748,6 +781,7 @@ pub struct ExecutorGateway {
     backends: std::collections::BTreeMap<String, Arc<Backend>>,
     signer: Arc<hellas_auth::ProducerSigningKey>,
     pub jobs: Arc<hellas_gateway::jobs::Jobs>,
+    grants: Arc<std::sync::Mutex<GrantChannels>>,
 }
 impl ExecutorGateway {
     pub fn backend(&self, id: &str) -> Option<&Backend> {
@@ -774,6 +808,10 @@ impl ExecutorGateway {
         previous: Option<&Self>,
         reuse: &std::collections::BTreeSet<String>,
     ) -> Arc<Self> {
+        let grants: Arc<std::sync::Mutex<GrantChannels>> =
+            previous.map_or_else(Default::default, |old| old.grants.clone());
+        let mut channels = grants.lock().unwrap();
+        channels.retain(|_, channel| channel.strong_count() > 0);
         let mut resolved: std::collections::BTreeMap<_, _> = previous
             .into_iter()
             .flat_map(|previous| previous.backends.iter())
@@ -789,12 +827,29 @@ impl ExecutorGateway {
             backend.capacity = entry.max_in_flight.get();
             backend.slots = Arc::new(Semaphore::new(backend.capacity));
             backend.down = Default::default();
+            if let BackendState::Grant(grant) = &mut backend.state {
+                if let Some(id) = grant.channel_id() {
+                    let retained = channels.entry(id.0).or_default();
+                    if let Some(channel) = retained.upgrade() {
+                        grant.channel = channel;
+                    } else {
+                        *retained = Arc::downgrade(&grant.channel);
+                    }
+                }
+                grant
+                    .channel
+                    .retired
+                    .store(false, std::sync::atomic::Ordering::Release);
+                backend.down = grant.channel.down.clone();
+            }
             (id, Arc::new(backend))
         }));
+        drop(channels);
         Arc::new(Self {
             backends: resolved,
             signer,
             jobs,
+            grants,
         })
     }
 
@@ -809,6 +864,16 @@ impl ExecutorGateway {
                 continue;
             }
             backend.slots.close();
+            if let BackendState::Grant(grant) = &backend.state {
+                let retained = next.backends.values().any(|next| {
+                    matches!(&next.state,
+                    BackendState::Grant(other) if Arc::ptr_eq(&grant.channel, &other.channel))
+                });
+                grant
+                    .channel
+                    .retired
+                    .store(!retained, std::sync::atomic::Ordering::Release);
+            }
             if backend.slots.available_permits() == backend.capacity
                 && let Err(error) = backend.close_sessions().await
             {
@@ -854,7 +919,19 @@ impl Backend {
     async fn close_sessions(&self) -> Result<(), WorkShutdownError> {
         match &self.state {
             BackendState::Grant(target) => {
-                if let Some(mut session) = target.session.lock().await.take() {
+                use std::sync::atomic::Ordering;
+                if !(target.channel.retired.load(Ordering::Acquire)
+                    || target.channel.down.load(Ordering::Acquire))
+                    || target.channel.active.load(Ordering::Acquire) != 0
+                {
+                    return Ok(());
+                }
+                let mut session = target.channel.session.lock().await;
+                if (target.channel.retired.load(Ordering::Acquire)
+                    || target.channel.down.load(Ordering::Acquire))
+                    && target.channel.active.load(Ordering::Acquire) == 0
+                    && let Some(mut session) = session.take()
+                {
                     session
                         .shutdown()
                         .await
@@ -894,6 +971,15 @@ impl Backend {
         signer: &hellas_auth::ProducerSigningKey,
     ) -> Result<(), WorkGatewayError> {
         use crate::execution::AttemptError;
+        let grant_use = if let BackendState::Grant(grant) = &self.state {
+            grant
+                .channel
+                .active
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            Some(GrantUse(grant.channel.clone()))
+        } else {
+            None
+        };
         let stop = requester.stop();
         let request = WorkRequest::Job(job.input().clone());
         let run = match &self.state {
@@ -935,10 +1021,12 @@ impl Backend {
             }
             Err(AttemptError::Stopped(error)) => Err(gateway_error(error.into())),
         };
+        drop(grant_use);
         // Keep a healthy channel open. A failed channel closes after its last
         // accepted job; the next demand opens it and performs recovery once.
-        if (self.down.load(std::sync::atomic::Ordering::Acquire) || self.slots.is_closed())
-            && self.slots.available_permits() + 1 == self.capacity
+        if matches!(self.state, BackendState::Grant(_))
+            || ((self.down.load(std::sync::atomic::Ordering::Acquire) || self.slots.is_closed())
+                && self.slots.available_permits() + 1 == self.capacity)
         {
             self.close_sessions().await.map_err(output_error)?;
         }
@@ -1104,7 +1192,26 @@ impl Backend {
             policy,
             ..
         } = target;
-        let mut guard = before_proposal(None, stop, None, target.session.lock()).await?;
+        let mut guard = before_proposal(None, stop, None, target.channel.session.lock()).await?;
+        if guard
+            .as_ref()
+            .is_some_and(|session| session.trust() != options.target.trust())
+        {
+            if target
+                .channel
+                .active
+                .load(std::sync::atomic::Ordering::Acquire)
+                > 1
+            {
+                return Err(pre(ExecutionError::RecoveryRequired));
+            }
+            if let Some(mut session) = guard.take() {
+                session
+                    .shutdown()
+                    .await
+                    .map_err(|error| pre(error.into()))?;
+            }
+        }
         if self.down.load(std::sync::atomic::Ordering::Acquire) && guard.is_some() {
             return Err(pre(ExecutionError::RecoveryRequired));
         }
@@ -1164,6 +1271,7 @@ impl Backend {
             .await
             .map_err(|error| committed(error.into()))?;
         let result = target
+            .channel
             .session
             .lock()
             .await
@@ -1260,6 +1368,12 @@ impl WorkExecutionBackend for ExecutorGateway {
     fn drain(&self) -> BoxFuture<'_, Result<(), WorkShutdownError>> {
         for backend in self.backends.values() {
             backend.slots.close();
+            if let BackendState::Grant(grant) = &backend.state {
+                grant
+                    .channel
+                    .retired
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
         }
         self.jobs.close();
         Box::pin(async move {

@@ -62,6 +62,7 @@ async fn ambiguous_acceptance_recovers_original_work_without_replacement() {
     drop(session);
     fixture
         .backend()
+        .channel
         .session
         .lock()
         .await

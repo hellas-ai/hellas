@@ -630,6 +630,9 @@ pub struct GrantSession {
     pending_body: std::collections::BTreeMap<Digest, (PreparedInvocation, (LocalStore, Scope))>,
 }
 impl GrantSession {
+    pub(crate) fn trust(&self) -> &ProviderTrustAnchor {
+        self.options.target.trust()
+    }
     pub(crate) fn execution_target(&self) -> Result<crate::execution::ExecutionTarget> {
         Ok(crate::execution::ExecutionTarget {
             network: self.target.network,

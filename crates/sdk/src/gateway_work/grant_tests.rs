@@ -41,6 +41,7 @@ enum UsageReport {
     Missing,
 }
 struct FixtureBuilder {
+    two_resources: bool,
     usage: UsageReport,
     budget: u64,
     completion: Completion,
@@ -100,6 +101,13 @@ impl FixtureBuilder {
         let resource = &mut allowance.definition.policies[0];
         resource.name = "chat".into();
         use_https(resource, template.clone());
+        if self.two_resources {
+            let mut second = resource.clone();
+            second.resource =
+                hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"second"));
+            second.name = "second".into();
+            allowance.definition.policies.push(second);
+        }
         let mut events = Reply::http(
             200,
             "text/event-stream",
@@ -150,19 +158,32 @@ impl FixtureBuilder {
         );
         let options = host.options(addresses);
         let gateway = ExecutorGateway::new(
-            [(
-                "test".into(),
-                BackendEntry {
-                    backend: crate::Backend::grant(
-                        options.target.offer().grant.policies[0].clone(),
-                        options,
-                        transport,
-                    ),
-                    evaluator: Some(hellas_channel::test_support::channel::evaluator()),
-                    max_in_flight: std::num::NonZeroUsize::new(self.max_in_flight).unwrap(),
-                },
-            )]
-            .into(),
+            options
+                .target
+                .offer()
+                .grant
+                .policies
+                .iter()
+                .enumerate()
+                .map(|(index, policy)| {
+                    (
+                        if index == 0 {
+                            "test".into()
+                        } else {
+                            "second".into()
+                        },
+                        BackendEntry {
+                            backend: crate::Backend::grant(
+                                policy.clone(),
+                                options.clone(),
+                                transport.clone(),
+                            ),
+                            evaluator: Some(hellas_channel::test_support::channel::evaluator()),
+                            max_in_flight: std::num::NonZeroUsize::new(self.max_in_flight).unwrap(),
+                        },
+                    )
+                })
+                .collect(),
             Arc::new(ProducerSigningKey::from_secret_bytes([8; 32]).unwrap()),
         );
         Fixture {
@@ -186,7 +207,7 @@ impl Fixture {
     /// Inspect the channel's one retained journal under its proposal mutex.
     async fn session(&self) -> tokio::sync::MappedMutexGuard<'_, GrantSession> {
         let backend = self.backend();
-        let mut guard = backend.session.lock().await;
+        let mut guard = backend.channel.session.lock().await;
         if guard.is_none() {
             *guard = Some(
                 GrantSession::open(backend.options.clone(), backend.transport.clone())
@@ -198,6 +219,7 @@ impl Fixture {
     }
     fn builder() -> FixtureBuilder {
         FixtureBuilder {
+            two_resources: false,
             usage: UsageReport::Reported,
             budget: 10,
             completion: Completion::Immediate,
@@ -472,7 +494,7 @@ async fn refreshed_https_bounds_are_checked_before_proposal() {
             3 => https.paths = vec!["/changed".into()],
             _ => https.max_response_bytes = 128,
         }
-        let guard = fixture.backend().session.lock().await;
+        let guard = fixture.backend().channel.session.lock().await;
         let mut stream = fixture
             .gateway
             .fetch(
@@ -565,7 +587,7 @@ async fn reused_policy_name_cannot_retarget_an_in_flight_request() {
     let mut replacement = old.clone();
     replacement.resource =
         hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"replacement"));
-    let guard = fixture.backend().session.lock().await;
+    let guard = fixture.backend().channel.session.lock().await;
     let mut stream = fixture
         .gateway
         .fetch(
@@ -856,7 +878,7 @@ async fn silent_work_still_ends_at_the_signed_deadline() {
 async fn queued_requests_wait_without_a_deadline_and_cancel_on_disconnect() {
     let fixture = Fixture::builder().build().await;
     for disconnect in [false, true] {
-        let held = fixture.backend().session.lock().await;
+        let held = fixture.backend().channel.session.lock().await;
         let job = fixture.gateway.backends["test"]
             .job(&WorkRequest::Fetch(fixture.request(None)))
             .unwrap();
@@ -1318,4 +1340,73 @@ async fn grant_concurrency(cancel: bool) {
     fixture.gateway.drain().await.unwrap();
     assert_eq!(fixture.host.backend.slots.available_permits(), 2);
     fixture.remote.shutdown().await;
+}
+
+#[tokio::test]
+async fn resources_from_one_grant_share_a_sequential_nonce_history() {
+    resources_from_one_grant(false).await;
+}
+#[tokio::test]
+async fn resources_from_one_grant_can_execute_concurrently() {
+    resources_from_one_grant(true).await;
+}
+async fn resources_from_one_grant(concurrent: bool) {
+    let fixture = FixtureBuilder {
+        two_resources: true,
+        completion: if concurrent {
+            Completion::Permits(Arc::new(Semaphore::new(0)))
+        } else {
+            Completion::Immediate
+        },
+        ..Fixture::builder().with_budget(100).max_in_flight(2)
+    }
+    .build()
+    .await;
+    let send = |id| {
+        fixture
+            .gateway
+            .fetch(
+                id,
+                crate::test_support::request_job(&fixture.gateway.jobs),
+                fixture.request(None),
+            )
+            .unwrap()
+    };
+    let finish = |mut stream: hellas_gateway::WorkFetchStream| async move {
+        let mut terminal = false;
+        while let Some(event) = within(stream.next()).await {
+            terminal |=
+                matches!(event.unwrap(), WorkEvent::Output(event) if event.terminal().is_some());
+        }
+        assert!(terminal);
+    };
+    if concurrent {
+        let mut first = send("test");
+        let mut second = send("second");
+        assert!(matches!(
+            within(first.next()).await.unwrap().unwrap(),
+            WorkEvent::Accepted(_)
+        ));
+        assert!(matches!(
+            within(second.next()).await.unwrap().unwrap(),
+            WorkEvent::Accepted(_)
+        ));
+        let next = ExecutorGateway::prepare(
+            Default::default(),
+            fixture.gateway.signer.clone(),
+            fixture.gateway.jobs.clone(),
+            Some(&fixture.gateway),
+            &["second".into()].into(),
+        );
+        fixture.gateway.retire(&next).await.unwrap();
+        fixture.host.backend.finish.release();
+        fixture.host.backend.finish.release();
+        futures::join!(finish(first), finish(second));
+    } else {
+        finish(send("test")).await;
+        finish(send("second")).await;
+    }
+    assert_eq!(fixture.session().await.store().next_nonce().unwrap(), 3);
+    assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 2);
+    fixture.shutdown().await;
 }
