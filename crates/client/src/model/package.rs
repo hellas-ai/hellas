@@ -5,13 +5,13 @@ use super::{
     qwen3::Qwen3,
     whisper::Whisper,
 };
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use hellas_rpc::protocol::invocation::{
     Artifact,
     compute::{Environment, Plan},
     output::InvocationOutput,
 };
-use hellas_store::content::{LocalStore, Scope};
+use hellas_store::content::{DiskStore, LocalStore, Scope};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -41,16 +41,8 @@ pub enum ModelKind {
 }
 
 impl ModelKind {
-    pub fn of(path: &Path) -> Self {
-        if path.join("model_index.json").is_file() {
-            Self::Image
-        } else if path.join(descriptor::GGUF).is_file() {
-            Self::Text
-        } else if path.is_dir() {
-            Self::Transcription
-        } else {
-            Self::Text
-        }
+    pub fn of(path: &Path) -> Result<Self> {
+        Ok(descriptor::classify(path)?.kind())
     }
 }
 
@@ -87,18 +79,17 @@ pub enum ModelResponse {
 
 impl ModelPackage {
     /// Native GGUF metadata, whether held in a full file or a descriptor directory.
-    pub fn gguf_path(path: &Path) -> PathBuf {
-        descriptor::gguf_path(path)
+    pub fn gguf_path(path: &Path) -> Result<PathBuf> {
+        descriptor::classify(path)?.gguf_path(path)
     }
 
-    /// The full weight file to inspect. Descriptors carry only a reference;
-    /// Flux names its separately held assets in assets.json.
-    pub fn weights_path(path: &Path) -> Option<PathBuf> {
-        descriptor::weights_path(path)
-    }
-
-    pub fn is_descriptor(path: &Path) -> bool {
-        descriptor::is_descriptor(path)
+    /// A local executing backend must have the full model package.
+    pub fn require_local_weights(path: &Path) -> Result<()> {
+        ensure!(
+            !descriptor::classify(path)?.is_descriptor(),
+            "local execution requires the full model weights, not a descriptor"
+        );
+        Ok(())
     }
 
     /// Create a new metadata-only package directory from a full Qwen or Whisper package.
@@ -110,58 +101,76 @@ impl ModelPackage {
     /// A Qwen GGUF, converted Whisper or Flux package, or Qwen/Whisper descriptor,
     /// rendering programs with the renderer registered under `evaluator`.
     pub async fn open(path: &Path, evaluator: &str) -> Result<Self> {
-        Self::open_with_weights(path, evaluator, None).await
+        let dialect = super::renderer(evaluator)?;
+        let source = Self::resolve(path, None).await?;
+        Self::open_resolved(&source, evaluator, dialect).await
     }
 
-    /// Open each distinct renderer once, sharing the one weight-file digest.
+    /// Open each distinct renderer once, sharing one resolved weight identity.
+    /// A supplied content store reuses its inspected identity across calls.
     pub async fn open_many(
         path: &Path,
         evaluators: impl IntoIterator<Item = String>,
+        store: Option<&DiskStore>,
     ) -> Result<std::collections::BTreeMap<String, Arc<Self>>> {
         let evaluators: std::collections::BTreeSet<_> = evaluators.into_iter().collect();
-        for evaluator in &evaluators {
-            super::renderer(evaluator)?;
+        let evaluators = evaluators
+            .into_iter()
+            .map(|evaluator| {
+                let dialect = super::renderer(&evaluator)?;
+                Ok((evaluator, dialect))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if evaluators.is_empty() {
+            return Ok(Default::default());
         }
-        let path_owned = path.to_owned();
-        let weights = tokio::task::spawn_blocking(move || -> Result<_> {
-            if let Some(weights) = descriptor::weights(&path_owned)? {
-                return Ok(Some(weights));
-            }
-            descriptor::weights_path(&path_owned)
-                .map(|path| descriptor::file_content(&path))
-                .transpose()
-        })
-        .await??;
+        let source = Self::resolve(path, store).await?;
         let mut packages = std::collections::BTreeMap::new();
-        for evaluator in evaluators {
-            let package = Self::open_with_weights(path, &evaluator, weights).await?;
+        for (evaluator, dialect) in evaluators {
+            let package = Self::open_resolved(&source, &evaluator, dialect).await?;
             packages.insert(evaluator, Arc::new(package));
         }
         Ok(packages)
     }
 
-    /// Render using an identity already inspected by the caller's content store.
-    /// This does not publish or verify a provider's weights. A descriptor's
-    /// embedded reference must agree with any supplied identity.
-    pub async fn open_with_weights(
-        path: &Path,
+    async fn resolve(path: &Path, store: Option<&DiskStore>) -> Result<descriptor::Resolved> {
+        let layout = descriptor::classify(path)?;
+        let inspected = match (store, layout.weights_path(path)) {
+            (Some(store), Some(path)) => Some(
+                *store
+                    .inspect_files(vec![path.clone()])
+                    .await?
+                    .get(&path)
+                    .context("model weights were not inspected")?,
+            ),
+            _ => None,
+        };
+        let path = path.to_owned();
+        tokio::task::spawn_blocking(move || layout.resolve(&path, inspected)).await?
+    }
+
+    async fn open_resolved(
+        source: &descriptor::Resolved,
         evaluator: &str,
-        weights: Option<hellas_rpc::ContentRef>,
+        dialect: super::GpuDialect,
     ) -> Result<Self> {
-        let dialect = super::renderer(evaluator)?;
         Ok(Self {
             evaluator: evaluator.into(),
-            family: match ModelKind::of(path) {
-                ModelKind::Image => Family::Flux(Arc::new({
-                    let path = path.to_owned();
+            family: match source {
+                descriptor::Resolved::Flux(path) => Family::Flux(Arc::new({
+                    let path = path.clone();
                     tokio::task::spawn_blocking(move || Flux::open(&path, dialect)).await??
                 })),
-                ModelKind::Transcription => {
-                    Family::Whisper(Arc::new(Whisper::open(path, dialect, weights).await?))
+                descriptor::Resolved::Whisper { path, weights } => {
+                    Family::Whisper(Arc::new(Whisper::open(path, dialect, *weights).await?))
                 }
-                ModelKind::Text => {
-                    Family::Qwen3(Arc::new(Qwen3::open(path, dialect, weights).await?))
-                }
+                descriptor::Resolved::Gguf {
+                    path,
+                    header,
+                    weights,
+                } => Family::Qwen3(Arc::new(
+                    Qwen3::open(path, dialect, *weights, header.clone()).await?,
+                )),
             },
         })
     }

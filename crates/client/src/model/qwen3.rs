@@ -16,7 +16,7 @@ use catena_models::{
 use hellas_channel::content::{DEFAULT_MAX_STAGING_BYTES, upload_object};
 use hellas_rpc::protocol::invocation::{Artifact, compute::*};
 use hellas_store::content::{LocalStore, MemoryStore, Reservations, Scope};
-use std::{collections::BTreeMap, fs::File, path::Path};
+use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 const PROMPT: &str = "prompt";
 const WEIGHTS: &str = "weights";
@@ -31,13 +31,8 @@ pub(super) struct Qwen3 {
 
 pub(super) fn metadata(
     path: &Path,
-    weights_bytes: Option<u64>,
+    header: &gguf::Header,
 ) -> Result<(ModelConfig, Vec<(u64, u64)>)> {
-    let mut file = File::open(path)?;
-    let header = match weights_bytes {
-        Some(bytes) => gguf::read_descriptor(&mut file, bytes)?,
-        None => gguf::read_header(&mut file)?,
-    };
     let config = read_gguf_model_config(path)?;
     let tensors: BTreeMap<_, _> = header
         .tensors
@@ -68,27 +63,13 @@ impl Qwen3 {
     pub async fn open(
         path: &Path,
         dialect: super::GpuDialect,
-        weights: Option<hellas_rpc::ContentRef>,
+        object: hellas_rpc::ContentRef,
+        header: Arc<gguf::Header>,
     ) -> Result<Self> {
         let path = path.to_owned();
         let (config, views, object, source, states) =
             tokio::task::spawn_blocking(move || -> Result<_> {
-                let descriptor = super::descriptor::weights(&path)?;
-                let object = match (descriptor, weights) {
-                    (Some(object), Some(inspected)) => {
-                        ensure!(
-                            object == inspected,
-                            "descriptor and supplied weights disagree"
-                        );
-                        object
-                    }
-                    (Some(object), None) | (None, Some(object)) => object,
-                    (None, None) => super::descriptor::file_content(&path)?,
-                };
-                let (config, views) = metadata(
-                    &super::descriptor::gguf_path(&path),
-                    descriptor.map(|object| object.bytes()),
-                )?;
+                let (config, views) = metadata(&path, &header)?;
                 // Qwen3.5 prefills with matrix cores; Qwen3 has only SIMT kernels.
                 let wmma = matches!(
                     config.architecture,

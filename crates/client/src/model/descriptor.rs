@@ -1,19 +1,17 @@
 //! A model's native metadata and the identity of its separately held weights.
 use super::{ModelKind, gguf, qwen3, whisper};
-use anyhow::{Result, ensure};
-use hellas_rpc::{ContentId, ContentRef};
-use hellas_store::{content::Reservations, fastresume::Records};
+use anyhow::{Result, bail, ensure};
+use hellas_rpc::ContentRef;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::File,
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::{LazyLock, Mutex},
+    sync::Arc,
 };
 
 const MANIFEST: &str = "descriptor.json";
-pub(super) const GGUF: &str = "header.gguf";
-const MAX_METADATA: usize = 64 << 20;
+const GGUF: &str = "header.gguf";
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -21,70 +19,188 @@ struct Descriptor {
     weights: ContentRef,
 }
 
-pub(super) fn is_descriptor(path: &Path) -> bool {
-    path.join(MANIFEST).is_file()
+#[derive(Clone, Copy)]
+pub(super) enum Layout {
+    Gguf,
+    GgufDescriptor,
+    Whisper,
+    WhisperDescriptor,
+    Flux,
 }
 
-pub(super) fn weights(path: &Path) -> Result<Option<ContentRef>> {
-    if !is_descriptor(path) {
-        return Ok(None);
+pub(super) enum Resolved {
+    Gguf {
+        path: PathBuf,
+        header: Arc<gguf::Header>,
+        weights: ContentRef,
+    },
+    Whisper {
+        path: PathBuf,
+        weights: ContentRef,
+    },
+    Flux(PathBuf),
+}
+
+/// Classify the native layout before interpreting any weight identity.
+pub(super) fn classify(path: &Path) -> Result<Layout> {
+    let metadata = std::fs::metadata(path)?;
+    if metadata.is_file() {
+        return Ok(Layout::Gguf);
     }
+    ensure!(
+        metadata.is_dir(),
+        "model package is not a regular file or directory"
+    );
+    let manifest = path.join(MANIFEST).try_exists()?;
+    let gguf = path.join(GGUF).try_exists()?;
+    let weights = path.join(whisper::WEIGHTS_FILE).try_exists()?;
+    let whisper = whisper::METADATA.iter().try_fold(false, |found, name| {
+        Ok::<_, std::io::Error>(path.join(name).try_exists()? || found)
+    })?;
+    let flux = path.join("model_index.json").try_exists()?;
+    ensure!(
+        !(flux && (manifest || gguf || whisper || weights)
+            || gguf && (whisper || weights)
+            || manifest && weights),
+        "mixed model layout: descriptor, GGUF, Whisper and Flux files cannot overlap"
+    );
+    if flux {
+        return Ok(Layout::Flux);
+    }
+    if gguf {
+        ensure!(manifest, "header.gguf requires descriptor.json");
+        return Ok(Layout::GgufDescriptor);
+    }
+    if manifest {
+        ensure!(whisper, "descriptor.json requires GGUF or Whisper metadata");
+        return Ok(Layout::WhisperDescriptor);
+    }
+    ensure!(
+        whisper && weights,
+        "Whisper package requires metadata and weights.bf16"
+    );
+    Ok(Layout::Whisper)
+}
+
+impl Layout {
+    pub(super) fn kind(self) -> ModelKind {
+        match self {
+            Self::Gguf | Self::GgufDescriptor => ModelKind::Text,
+            Self::Whisper | Self::WhisperDescriptor => ModelKind::Transcription,
+            Self::Flux => ModelKind::Image,
+        }
+    }
+    pub(super) fn is_descriptor(self) -> bool {
+        matches!(self, Self::GgufDescriptor | Self::WhisperDescriptor)
+    }
+    pub(super) fn gguf_path(self, path: &Path) -> Result<PathBuf> {
+        match self {
+            Self::Gguf => Ok(path.to_owned()),
+            Self::GgufDescriptor => Ok(path.join(GGUF)),
+            _ => bail!("model package is not GGUF"),
+        }
+    }
+    pub(super) fn weights_path(self, path: &Path) -> Option<PathBuf> {
+        match self {
+            Self::Gguf => Some(path.to_owned()),
+            Self::Whisper => Some(path.join(whisper::WEIGHTS_FILE)),
+            Self::GgufDescriptor | Self::WhisperDescriptor | Self::Flux => None,
+        }
+    }
+    pub(super) fn resolve(self, path: &Path, inspected: Option<ContentRef>) -> Result<Resolved> {
+        let weights =
+            |file: &Path| inspected.map_or_else(|| hellas_store::content::file_content(file), Ok);
+        match self {
+            Self::Gguf => Ok(Resolved::Gguf {
+                path: path.to_owned(),
+                header: Arc::new(gguf::read_header(&mut hellas_private::open_regular_file(
+                    path,
+                )?)?),
+                weights: weights(path)?,
+            }),
+            Self::GgufDescriptor => {
+                let weights = read_weights(path)?;
+                let path = path.join(GGUF);
+                let header = gguf::read_descriptor(
+                    &mut hellas_private::open_regular_file(&path)?,
+                    weights.bytes(),
+                )?;
+                Ok(Resolved::Gguf {
+                    path,
+                    header: Arc::new(header),
+                    weights,
+                })
+            }
+            Self::Whisper => Ok(Resolved::Whisper {
+                path: path.to_owned(),
+                weights: weights(&path.join(whisper::WEIGHTS_FILE))?,
+            }),
+            Self::WhisperDescriptor => Ok(Resolved::Whisper {
+                path: path.to_owned(),
+                weights: read_weights(path)?,
+            }),
+            Self::Flux => Ok(Resolved::Flux(path.to_owned())),
+        }
+    }
+}
+
+fn read_weights(path: &Path) -> Result<ContentRef> {
     let bytes = hellas_private::read_bounded_regular_file(&path.join(MANIFEST), 4096)?;
     let descriptor: Descriptor = serde_json::from_slice(&bytes)?;
     ensure!(
         descriptor.weights.bytes() > 0,
         "descriptor weights are empty"
     );
-    Ok(Some(descriptor.weights))
-}
-
-pub(super) fn gguf_path(path: &Path) -> PathBuf {
-    if path.is_dir() {
-        path.join(GGUF)
-    } else {
-        path.to_owned()
-    }
-}
-
-pub(super) fn weights_path(path: &Path) -> Option<PathBuf> {
-    if is_descriptor(path) {
-        return None;
-    }
-    match ModelKind::of(path) {
-        ModelKind::Text => Some(path.to_owned()),
-        ModelKind::Transcription => Some(path.join(whisper::WEIGHTS_FILE)),
-        ModelKind::Image => None,
-    }
-}
-
-/// Direct clients share file identities across opens and evaluators. Daemon
-/// callers supply the reference already inspected by their content store.
-/// Serialize inspection so concurrent first opens cannot hash the same file twice.
-pub(super) fn file_content(path: &Path) -> Result<ContentRef> {
-    static RECORDS: LazyLock<Mutex<Records>> = LazyLock::new(Mutex::default);
-    let indexed = RECORDS.lock().unwrap().index_file(
-        path,
-        &Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
-        false,
-    )?;
-    Ok(ContentRef::new(
-        ContentId::from_bytes(indexed.id.into_bytes()),
-        indexed.len,
-    ))
+    Ok(descriptor.weights)
 }
 
 /// Write a new descriptor directory, without copying any tensor data.
 pub(super) fn describe(path: &Path, output: &Path) -> Result<ContentRef> {
     ensure!(!output.try_exists()?, "destination already exists");
-    ensure!(!is_descriptor(path), "source is already a descriptor");
-    let kind = ModelKind::of(path);
-    ensure!(
-        kind != ModelKind::Image,
-        "Flux already describes its assets in assets.json"
-    );
-    let weights_path = weights_path(path).expect("Qwen and Whisper have weights");
-    let identity = hellas_store::fastresume::FileIdentity::of(&std::fs::metadata(&weights_path)?);
-    let object = file_content(&weights_path)?;
+    match classify(path)? {
+        Layout::Gguf => write_descriptor(path, output, |staging, object| {
+            let mut input = hellas_private::open_regular_file(path)?;
+            let header = gguf::read_header(&mut input)?;
+            use std::io::{Seek, SeekFrom};
+            input.seek(SeekFrom::Start(0))?;
+            let header_path = staging.join(GGUF);
+            let mut out = File::create(&header_path)?;
+            ensure!(
+                std::io::copy(&mut input.take(header.data_offset), &mut out)? == header.data_offset,
+                "GGUF header changed while describing model"
+            );
+            let header = gguf::read_descriptor(&mut File::open(&header_path)?, object.bytes())?;
+            qwen3::metadata(&header_path, &header)?;
+            Ok(())
+        }),
+        Layout::Whisper => write_descriptor(
+            &path.join(whisper::WEIGHTS_FILE),
+            output,
+            |staging, object| {
+                for name in whisper::METADATA {
+                    let bytes = hellas_private::read_bounded_regular_file(
+                        &path.join(name),
+                        whisper::MAX_METADATA_BYTES,
+                    )?;
+                    std::fs::write(staging.join(name), bytes)?;
+                }
+                whisper::validate_metadata(staging, object)
+            },
+        ),
+        Layout::GgufDescriptor | Layout::WhisperDescriptor => {
+            bail!("source is already a descriptor")
+        }
+        Layout::Flux => bail!("Flux already describes its assets in assets.json"),
+    }
+}
+
+fn write_descriptor(
+    weights: &Path,
+    output: &Path,
+    metadata: impl FnOnce(&Path, ContentRef) -> Result<()>,
+) -> Result<ContentRef> {
+    let identity = hellas_store::fastresume::FileIdentity::of(&std::fs::metadata(weights)?);
+    let object = hellas_store::content::file_content(weights)?;
     let parent = output
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -92,42 +208,14 @@ pub(super) fn describe(path: &Path, output: &Path) -> Result<ContentRef> {
     let staging = tempfile::Builder::new()
         .prefix(".descriptor-")
         .tempdir_in(parent)?;
-    match kind {
-        ModelKind::Text => {
-            let mut input = hellas_private::open_regular_file(path)?;
-            let header = gguf::read_header(&mut input)?;
-            ensure!(
-                header.data_offset <= MAX_METADATA as u64,
-                "GGUF header is too large"
-            );
-            use std::io::{Seek, SeekFrom};
-            input.seek(SeekFrom::Start(0))?;
-            let mut out = File::create(staging.path().join(GGUF))?;
-            ensure!(
-                std::io::copy(&mut input.take(header.data_offset), &mut out)? == header.data_offset,
-                "GGUF header changed while describing model"
-            );
-            out.sync_all()?;
-            qwen3::metadata(&staging.path().join(GGUF), Some(object.bytes()))?;
-        }
-        ModelKind::Transcription => {
-            for name in whisper::METADATA {
-                let bytes =
-                    hellas_private::read_bounded_regular_file(&path.join(name), MAX_METADATA)?;
-                std::fs::write(staging.path().join(name), bytes)?;
-            }
-            whisper::validate_metadata(staging.path(), object)?;
-        }
-        ModelKind::Image => unreachable!("Flux has its own asset descriptors"),
-    }
+    metadata(staging.path(), object)?;
     ensure!(
-        identity == hellas_store::fastresume::FileIdentity::of(&std::fs::metadata(&weights_path)?),
+        identity == hellas_store::fastresume::FileIdentity::of(&std::fs::metadata(weights)?),
         "weights changed while describing model"
     );
     let mut manifest = File::create(staging.path().join(MANIFEST))?;
     serde_json::to_writer_pretty(&mut manifest, &Descriptor { weights: object })?;
     manifest.write_all(b"\n")?;
-    manifest.sync_all()?;
     std::fs::rename(staging.path(), output)?;
     Ok(object)
 }
