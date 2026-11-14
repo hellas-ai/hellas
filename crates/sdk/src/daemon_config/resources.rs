@@ -34,6 +34,19 @@ pub enum ResourceKind {
     Https { https: HttpsResource },
     Responses { responses: ResponsesResource },
 }
+fn account_backed(https: &HttpsResource, credentials: &[Credential]) -> bool {
+    credentials.iter().any(|credential| {
+        credential.allowed_origins.contains(&https.origin)
+            && credential
+                .allowed_paths
+                .iter()
+                .any(|path| https.paths.contains(path))
+            && credential
+                .allowed_methods
+                .iter()
+                .any(|method| https.methods.contains(method))
+    })
+}
 fn job_millis() -> std::num::NonZeroU64 {
     std::num::NonZeroU64::new(300_000).unwrap()
 }
@@ -98,7 +111,8 @@ impl Document {
     ) -> Result<NodeConfiguration, crate::daemon::Error> {
         let mut models = hellas_gateway::router::Models::new();
         for (path, evaluators) in self.model_evaluators(info) {
-            let packages = hellas_client::model::ModelPackage::open_many(&path, evaluators).await?;
+            let packages =
+                hellas_client::model::ModelPackage::open_many(&path, evaluators, None).await?;
             models.insert(path, Ok(packages));
         }
         self.configuration(info, &models)
@@ -137,7 +151,7 @@ impl Document {
                     }
                 }
                 BackendKind::Fetch {
-                    upstream: Upstream::Http { .. },
+                    upstream: Upstream::Http { credentials, .. },
                     ..
                 } => {
                     let mut resource: Option<HttpsResource> = None;
@@ -156,7 +170,7 @@ impl Document {
                             origin: url.origin().ascii_serialization(),
                             paths: vec![],
                             methods: vec!["POST".into()],
-                            credential: target.route.credential.clone(),
+                            account_backed: false,
                             tls: target.route.tls.clone(),
                             accounting: AccountingProfile::None,
                             max_output_tokens: 0,
@@ -184,7 +198,8 @@ impl Document {
                             });
                         }
                     }
-                    if let Some(https) = resource {
+                    if let Some(mut https) = resource {
+                        https.account_backed = account_backed(&https, credentials);
                         let mut resource =
                             Resource::new(id.clone(), id.clone(), ResourceKind::Https { https });
                         resource.rates = Some(vec![]);
@@ -277,12 +292,11 @@ impl Resource {
             (kind, BackendKind::Fetch { upstream, .. }) => {
                 let (https, responses) = match (kind, upstream) {
                     (ResourceKind::Https { https }, Upstream::Http { credentials, .. }) => {
-                        if https
-                            .credential
-                            .as_ref()
-                            .is_some_and(|key| !credentials.contains_key(key))
-                        {
-                            return Err("unknown HTTPS credential alias".into());
+                        if https.account_backed != account_backed(https, credentials) {
+                            return Err(
+                                "HTTPS account_backed disagrees with backend credential scopes"
+                                    .into(),
+                            );
                         }
                         (Some(https.clone()), None)
                     }

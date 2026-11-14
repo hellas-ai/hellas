@@ -1,6 +1,6 @@
 use catena_lang::{
     codegen::GpuDialect,
-    runtime::{MemOwn, MemRef},
+    runtime::{MemOwn, MemRef, RuntimeModule},
 };
 use hellas_rpc::{ContentId, ContentRef};
 use hellas_store::content::VerifiedReader;
@@ -84,7 +84,7 @@ impl Assets {
         }
         let padded = object
             .bytes()
-            .checked_add(object.bytes() % 2)
+            .checked_next_multiple_of(8)
             .ok_or("asset length overflow")?;
         if padded > self.capacity {
             return Err("asset exceeds resident capacity".into());
@@ -104,9 +104,38 @@ impl Assets {
             let (old, _) = state.entries.remove(&victim).unwrap();
             state.used -= old.memory.byte_len();
         }
-        let words = asset_words(reader, object)?;
+        let memory = allocate_asset(usize::try_from(padded)?, self.dialect)?;
+        let (mut runtime, pid) = super::pool::spawn(cancel.clone(), self.dialect)?;
+        let watchdog = super::process::Watchdog::with_cancel(
+            pid,
+            deadline.map(|end| end.saturating_duration_since(Instant::now())),
+            cancel.clone(),
+        );
+        let result = (|| {
+            let artifact = runtime.load(asset_program(self.dialect)?)?;
+            stream_asset(reader, object, |offset, words| {
+                let chunk = MemOwn::from_u64_slice(words, self.dialect)?;
+                // Both allocations stay parent-owned. Returning an owner through
+                // SafeRuntime would copy the entire destination on every chunk.
+                artifact.exec_values(
+                    "hellas.asset.write",
+                    vec![
+                        chunk.as_ref().into(),
+                        (offset / 8).into(),
+                        memory.as_ref().into(),
+                        (words.len() as u64).into(),
+                    ],
+                )?;
+                Ok(())
+            })
+        })();
+        drop(runtime);
+        if watchdog.finish() || cancel.is_cancelled() {
+            return Err("asset upload timed out or cancelled".into());
+        }
+        result?;
         let resident = Arc::new(Resident {
-            memory: MemOwn::from_u16_slice(&words, self.dialect)?,
+            memory,
             bytes: object.bytes(),
         });
         state.used += padded;
@@ -115,20 +144,70 @@ impl Assets {
     }
 }
 
-fn asset_words(reader: VerifiedReader, object: ContentRef) -> Result<Vec<u16>> {
-    let len = usize::try_from(object.bytes())?;
-    let count = len.checked_add(1).ok_or("asset length overflow")? / 2;
-    let mut words = Vec::new();
-    words.try_reserve_exact(count)?;
-    words.resize(count, 0u16);
-    // Initialized u16 storage accepts arbitrary bytes; the final padding byte remains zero.
-    let bytes = unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), len) };
-    let mut reader = reader;
-    reader.read_exact(bytes)?;
-    if reader.read(&mut [0])? != 0 || ContentRef::for_bytes(bytes) != object {
+fn allocate_asset(bytes: usize, dialect: GpuDialect) -> Result<MemOwn> {
+    if bytes == 0 {
+        return Ok(MemOwn::from_u64_slice(&[], dialect)?);
+    }
+    if bytes > isize::MAX as usize {
+        return Err("asset length exceeds host address space".into());
+    }
+    // Plain Catena exposes only allocation-with-copy in Rust. A read-only
+    // anonymous mapping supplies shared zero pages without touching a full host
+    // buffer. Keep its fallible allocation API; generated allocation aborts on
+    // GPU OOM. Drop the mapping immediately after the synchronous copy.
+    let zeroes = memmap2::MmapMut::map_anon(bytes)?.make_read_only()?;
+    // Anonymous mappings are page-aligned, initialized, and immutable. Asset
+    // lengths have already been rounded to whole u64 words.
+    let words = unsafe { std::slice::from_raw_parts(zeroes.as_ptr().cast::<u64>(), bytes / 8) };
+    Ok(MemOwn::from_u64_slice(words, dialect)?)
+}
+
+fn asset_program(dialect: GpuDialect) -> Result<RuntimeModule> {
+    let sources = catena_lang::stdlib::core_sources()
+        .chain([include_str!("assets.hex")])
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    super::compile::compile_sources(&sources, dialect)
+}
+
+// Only these initialized words are hashed and copied. The final device owner
+// stays private until the exact length and content hash pass; later changes to
+// the source file cannot change it. Xet retains metadata per chunk.
+const ASSET_STAGING_BYTES: usize = 8 << 20;
+
+#[cfg(test)]
+fn word_bytes(words: &[u64]) -> &[u8] {
+    // Every bit pattern is valid, and this borrows the initialized word storage.
+    unsafe { std::slice::from_raw_parts(words.as_ptr().cast(), std::mem::size_of_val(words)) }
+}
+
+fn stream_asset(
+    mut reader: impl Read,
+    object: ContentRef,
+    mut write: impl FnMut(u64, &[u64]) -> Result<()>,
+) -> Result<()> {
+    let mut staging =
+        vec![0u64; object.bytes().min(ASSET_STAGING_BYTES as u64).div_ceil(8) as usize];
+    let mut hasher = hellas_xet::XetFileHasher::new();
+    let mut offset = 0;
+    while offset < object.bytes() {
+        let count = (object.bytes() - offset).min(ASSET_STAGING_BYTES as u64) as usize;
+        let words = &mut staging[..count.div_ceil(8)];
+        // Clear the final physical word so bytes outside the logical object are zero.
+        *words.last_mut().unwrap() = 0;
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), count) };
+        reader.read_exact(bytes)?;
+        hasher.update(bytes);
+        write(offset, words)?;
+        offset += count as u64;
+    }
+    if reader.read(&mut [0])? != 0
+        || ContentId::from_bytes(hasher.finalize().into_bytes()) != object.id()
+    {
         return Err("verified asset changed while reading".into());
     }
-    Ok(words)
+    Ok(())
 }
 
 pub fn upload(bytes: &[u8], dialect: GpuDialect) -> Result<MemOwn> {
@@ -166,15 +245,73 @@ mod tests {
     fn ram_assets_preserve_exact_bytes_and_private_padding() {
         let bytes = [0x11, 0x22, 0x33];
         let object = ContentRef::for_bytes(&bytes);
-        let words = asset_words(reader(&bytes), object).unwrap();
-        assert_eq!(words.len(), 2);
-        assert_eq!(words[0].to_ne_bytes(), [0x11, 0x22]);
-        assert_eq!(words[1].to_ne_bytes(), [0x33, 0]);
-        assert!(asset_words(reader(&bytes), ContentRef::new(object.id(), 4)).is_err());
-        assert!(asset_words(reader(&[0x44, 0x22, 0x33]), object).is_err());
+        let mut uploaded = Vec::new();
+        stream_asset(reader(&bytes), object, |offset, words| {
+            let chunk = word_bytes(words);
+            assert_eq!(offset as usize, uploaded.len());
+            uploaded.extend_from_slice(chunk);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(uploaded, [0x11, 0x22, 0x33, 0, 0, 0, 0, 0]);
+        assert!(
+            stream_asset(reader(&bytes), ContentRef::new(object.id(), 4), |_, _| Ok(
+                ()
+            ))
+            .is_err()
+        );
+        assert!(
+            stream_asset(
+                reader(&bytes),
+                ContentRef::for_bytes(&bytes[..2]),
+                |_, _| Ok(())
+            )
+            .is_err()
+        );
+        assert!(stream_asset(reader(&[0x44, 0x22, 0x33]), object, |_, _| Ok(())).is_err());
     }
+    #[test]
+    fn large_assets_stream_with_bounded_reads_and_uploads() {
+        struct BoundedReader<'a>(&'a [u8]);
+        impl Read for BoundedReader<'_> {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                assert!(bytes.len() <= ASSET_STAGING_BYTES);
+                self.0.read(bytes)
+            }
+        }
+        let bytes = (0..ASSET_STAGING_BYTES * 2 + 17)
+            .map(|i| i as u8)
+            .collect::<Vec<_>>();
+        let mut uploaded = 0;
+        stream_asset(
+            BoundedReader(&bytes),
+            ContentRef::for_bytes(&bytes),
+            |offset, words| {
+                let chunk = word_bytes(words);
+                assert_eq!(offset, uploaded);
+                assert!(chunk.len() <= ASSET_STAGING_BYTES);
+                let count = chunk.len().min(bytes.len() - offset as usize);
+                assert_eq!(
+                    &chunk[..count],
+                    &bytes[offset as usize..offset as usize + count]
+                );
+                assert!(chunk[count..].iter().all(|byte| *byte == 0));
+                uploaded += chunk.len() as u64;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(uploaded, (bytes.len() as u64).next_multiple_of(8));
+        assert!(
+            stream_asset(reader(b"x"), ContentRef::for_bytes(b"x"), |_, _| Err(
+                "upload failed".into()
+            ))
+            .is_err()
+        );
+    }
+
     #[tokio::test]
-    async fn file_mutation_after_verified_open_is_rejected_before_gpu_upload() {
+    async fn file_mutation_after_verified_open_is_rejected_before_residency() {
         use hellas_store::content::{
             ContentStore, DiskStore, IndexMode, LocalStore, Reservations, Scope,
         };
@@ -214,8 +351,152 @@ mod tests {
             .unwrap()
             .unwrap();
         std::fs::write(&path, b"modified").unwrap();
-        assert!(asset_words(handle, object).is_err());
+        assert!(stream_asset(handle, object, |_, _| Ok(())).is_err());
         node.close().await;
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn upload_initializes_word_padding_without_changing_logical_length() {
+        const CHILD: &str = "HELLAS_UPLOAD_PADDING_TEST_LIBRARY";
+        if let Some(path) = std::env::var_os(CHILD) {
+            let library = unsafe { libloading::Library::new(path) }.unwrap();
+            let allocated =
+                unsafe { library.get::<unsafe extern "C" fn() -> usize>(b"allocation_size\0") }
+                    .unwrap();
+            for bytes in [&[][..], &[0x11, 0x22, 0x33], &[0x11, 0x22], &[0x11]] {
+                let memory = upload(bytes, GpuDialect::Hip).unwrap();
+                assert_eq!(memory.byte_len(), bytes.len() as u64);
+                if bytes.is_empty() {
+                    assert!(memory.as_ptr().is_null());
+                    continue;
+                }
+                let physical = unsafe { allocated() };
+                assert_eq!(physical, bytes.len().next_multiple_of(2));
+                // The child loads the host-memory HIP fixture, never a GPU runtime.
+                let actual =
+                    unsafe { std::slice::from_raw_parts(memory.as_ptr().cast::<u8>(), physical) };
+                assert_eq!(&actual[..bytes.len()], bytes);
+                assert!(actual[bytes.len()..].iter().all(|byte| *byte == 0));
+            }
+            for bytes in [0, 8, 24] {
+                let memory = allocate_asset(bytes, GpuDialect::Hip).unwrap();
+                assert_eq!(memory.byte_len(), bytes as u64);
+                assert_eq!(memory.try_to_u64_vec().unwrap(), vec![0; bytes / 8]);
+            }
+            let fail =
+                unsafe { library.get::<unsafe extern "C" fn()>(b"fail_allocations\0") }.unwrap();
+            unsafe { fail() };
+            assert!(allocate_asset(8, GpuDialect::Hip).is_err());
+            return;
+        }
+        use std::{
+            io::Write,
+            process::{Command, Stdio},
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let library = directory.path().join("libamdhip64.so");
+        let mut compiler = Command::new("cc")
+            .args(["-shared", "-fPIC", "-x", "c", "-", "-o"])
+            .arg(&library)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        compiler
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(
+                br#"
+#include <stdlib.h>
+#include <string.h>
+static size_t allocated;
+static int fail;
+void fail_allocations(void) { fail = 1; }
+size_t allocation_size(void) { return allocated; }
+int hipMalloc(void **pointer, size_t bytes) {
+    if (fail) return 2;
+    *pointer = malloc(bytes);
+    if (!*pointer) return 1;
+    allocated = bytes;
+    memset(*pointer, 0xa5, bytes);
+    return 0;
+}
+int hipMemcpy(void *destination, const void *source, size_t bytes, int kind) {
+    (void)kind;
+    memcpy(destination, source, bytes);
+    return 0;
+}
+int hipFree(void *pointer) { free(pointer); return 0; }
+"#,
+            )
+            .unwrap();
+        assert!(compiler.wait().unwrap().success());
+        assert!(
+            Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg(
+                    concat!(
+                        module_path!(),
+                        "::upload_initializes_word_padding_without_changing_logical_length"
+                    )
+                    .trim_start_matches("hellas_executor::")
+                )
+                .arg("--nocapture")
+                .env(CHILD, &library)
+                .env("LD_LIBRARY_PATH", directory.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    #[test]
+    fn upload_program_compiles_for_both_dialects() {
+        for dialect in [GpuDialect::Hip, GpuDialect::Cuda] {
+            let module = asset_program(dialect).unwrap();
+            let entry = module
+                .functions
+                .iter()
+                .find(|f| f.source_name == "hellas.asset.write")
+                .unwrap();
+            use catena_lang::runtime::ValueKind::{MemRef, U64};
+            assert_eq!(entry.inputs, [MemRef, U64, MemRef, U64]);
+            assert_eq!(entry.outputs, [U64]);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a HIP device"]
+    fn hip_uploads_preserve_bytes_and_enforce_ranges() {
+        let dialect = GpuDialect::Hip;
+        // Cross multiple transfers, preserve every byte pattern, and exercise padding.
+        let bytes = (0..ASSET_STAGING_BYTES * 2 + 17)
+            .map(|i| i as u8)
+            .collect::<Vec<_>>();
+        let assets = Assets::new((bytes.len() as u64).next_multiple_of(8), dialect);
+        let resident = assets
+            .pin(reader(&bytes), ContentRef::for_bytes(&bytes))
+            .unwrap();
+        let words = resident.memory().try_to_u64_vec().unwrap();
+        let actual = word_bytes(&words);
+        assert_eq!(&actual[..bytes.len()], bytes);
+        assert!(actual[bytes.len()..].iter().all(|b| *b == 0));
+        assert!(resident.view(bytes.len() as u64, 1).is_err());
+        assert!(resident.view(u64::MAX, 2).is_err());
+        assert_eq!(upload(&bytes[..3], dialect).unwrap().byte_len(), 3);
+        // A failed hash must never publish a partially initialized resident.
+        let corrupt = Assets::new(8, dialect);
+        assert!(
+            corrupt
+                .pin(reader(b"bad"), ContentRef::for_bytes(b"yes"))
+                .is_err()
+        );
+        assert!(corrupt.state.try_lock().unwrap().entries.is_empty());
+        let empty = Assets::new(0, dialect)
+            .pin(reader(b""), ContentRef::for_bytes(b""))
+            .unwrap();
+        assert_eq!(empty.memory().byte_len(), 0);
     }
 
     #[test]

@@ -6,6 +6,7 @@ use hellas_store::content::{DiskStore, config::Reconciler};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "compute")]
 /// A file or directory served to jobs, and every object it holds.
 type Content = (PathBuf, Vec<hellas_rpc::ContentRef>);
 
@@ -14,28 +15,31 @@ pub(crate) struct ContentConfiguration {
 }
 
 impl ContentConfiguration {
-    /// Every regular file under each of `content` (a file or a directory) is
-    /// served to jobs that name it, as one `config/content-NNNN` Jobs pin.
-    /// They are hashed once, here.
-    pub(crate) fn load(path: Option<PathBuf>, content: Vec<PathBuf>) -> Result<Self> {
+    pub(crate) fn load(path: Option<PathBuf>) -> Result<Self> {
         let path = path.map(std::path::absolute).transpose()?;
-        let content: Vec<Content> = content
-            .into_iter()
-            .map(|root| {
-                let root = std::path::absolute(&root)?;
-                let objects = files(&root)?
-                    .iter()
-                    .map(|file| {
-                        hellas_store::content::file_content(file)
-                            .with_context(|| format!("failed to hash {}", file.display()))
-                    })
-                    .collect::<Result<_>>()?;
-                Ok((root, objects))
-            })
-            .collect::<Result<_>>()?;
         Ok(Self {
-            config: read(path.as_deref(), &content)?,
+            config: read(path.as_deref())?,
         })
+    }
+
+    /// Index --content through the execution store, then pin those same references.
+    #[cfg(feature = "compute")]
+    pub(crate) async fn add_content(
+        &mut self,
+        store: &DiskStore,
+        paths: Vec<PathBuf>,
+    ) -> Result<()> {
+        let mut content = Vec::new();
+        for root in paths {
+            let root = std::path::absolute(root)?;
+            let objects = store
+                .inspect_files(vec![root.clone()])
+                .await?
+                .into_values()
+                .collect();
+            content.push((root, objects));
+        }
+        add_content(&mut self.config, &content)
     }
 
     #[cfg(feature = "compute")]
@@ -59,35 +63,7 @@ impl ContentConfiguration {
     }
 }
 
-/// The regular files at `root`: itself, or every one under it, in path order.
-fn files(root: &Path) -> Result<Vec<PathBuf>> {
-    let metadata = std::fs::symlink_metadata(root)
-        .with_context(|| format!("failed to read {}", root.display()))?;
-    if metadata.is_file() {
-        return Ok(vec![root.to_owned()]);
-    }
-    anyhow::ensure!(
-        metadata.is_dir(),
-        "{} is not a regular file or directory",
-        root.display()
-    );
-    let mut found = Vec::new();
-    let mut entries: Vec<_> = std::fs::read_dir(root)?
-        .map(|entry| entry.map(|entry| entry.path()))
-        .collect::<std::io::Result<_>>()?;
-    entries.sort();
-    for entry in entries {
-        let kind = std::fs::symlink_metadata(&entry)?.file_type();
-        if kind.is_file() {
-            found.push(entry);
-        } else if kind.is_dir() {
-            found.extend(files(&entry)?);
-        }
-    }
-    Ok(found)
-}
-
-fn read(path: Option<&Path>, content: &[Content]) -> Result<Config> {
+fn read(path: Option<&Path>) -> Result<Config> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct File {
@@ -112,6 +88,12 @@ fn read(path: Option<&Path>, content: &[Content]) -> Result<Config> {
             *lower = parent.join(&*lower);
         }
     }
+    config.validate()?;
+    Ok(config)
+}
+
+#[cfg(feature = "compute")]
+fn add_content(config: &mut Config, content: &[Content]) -> Result<()> {
     use hellas_store::content::config::{Declaration, Object};
     anyhow::ensure!(
         content.is_empty()
@@ -140,5 +122,5 @@ fn read(path: Option<&Path>, content: &[Content]) -> Result<Config> {
         }
     }
     config.validate()?;
-    Ok(config)
+    Ok(())
 }

@@ -94,6 +94,59 @@ fn order_of(mut selection: Selection) -> Vec<String> {
     std::iter::from_fn(|| selection.next()).collect()
 }
 
+#[tokio::test]
+async fn discovery_lists_models_from_native_and_fetch_routes_once() {
+    use axum::{body::Body, http::Request};
+    use hellas_client::model::{GpuDialect, ModelPackage, evaluator};
+    use tower::ServiceExt;
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../client/src/model/whisper/mini");
+    let native = Route {
+        backends: vec!["a".into()],
+        presentation: Presentation::Model {
+            model: "speech".into(),
+            package: path.clone(),
+            modality: hellas_client::model::ModelKind::Transcription,
+            max_tokens: 1,
+        },
+    };
+    let packages = ModelPackage::open_many(&path, [evaluator(GpuDialect::Hip)], None)
+        .await
+        .unwrap();
+    let models = [(path, Ok(packages))].into();
+    let (router, errors) = crate::router::with_models(
+        vec![
+            native,
+            row(&["b"], Some("speech")),
+            row(&["c"], Some("chat")),
+        ],
+        Fake::new(),
+        Default::default(),
+        Default::default(),
+        &models,
+    )
+    .await
+    .unwrap();
+    assert!(errors.is_empty());
+    let response = router
+        .oneshot(Request::get("/v1/models").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["object"], "list");
+    let ids: Vec<_> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|model| model["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["chat", "speech"]);
+}
+
 #[test]
 fn routes_match_exact_keys_and_order_by_load_then_rotating_ties() {
     let work = Fake::new();
@@ -355,12 +408,15 @@ async fn compute_is_rendered_for_each_selected_evaluator() {
     }
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../client/src/model/package/mini-qwen3.gguf");
+    let root = tempfile::tempdir().unwrap();
+    let descriptor = root.path().join("descriptor");
+    ModelPackage::describe(&path, &descriptor).await.unwrap();
     let route = Route {
         backends: vec!["hip".into(), "cuda".into()],
         presentation: Presentation::Model {
             modality: hellas_client::model::ModelKind::Text,
             model: "tiny".into(),
-            package: path.clone(),
+            package: descriptor,
             max_tokens: 1,
         },
     };

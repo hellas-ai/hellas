@@ -123,7 +123,7 @@ fn spawner() -> &'static mpsc::Sender<SpawnRequest> {
     static SPAWNER: OnceLock<mpsc::Sender<SpawnRequest>> = OnceLock::new();
     SPAWNER.get_or_init(start_spawner)
 }
-fn spawn(
+pub(super) fn spawn(
     cancel: Cancellation,
     dialect: GpuDialect,
 ) -> std::result::Result<(SafeRuntime, i32), SpawnError> {

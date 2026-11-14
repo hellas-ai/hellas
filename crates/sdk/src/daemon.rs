@@ -381,6 +381,7 @@ impl Core {
         // Dropping the caller detaches this commit-and-publication task.
         tokio::spawn(async move {
             let _serial = serial;
+            let publication = core.node().configuration_publication().await;
             let caller = core.node().session_caller(&session, binding).await?;
             core.node()
                 .configure(caller, authorization, stored, &configuration)
@@ -424,6 +425,7 @@ impl Core {
                 }))
                 .collect();
             let previous = core.publish(candidate.clone());
+            drop(publication);
             if let Err(error) = previous.work.retire(&candidate.work).await {
                 tracing::warn!(%error, "retired backend retains recovery obligations");
             }

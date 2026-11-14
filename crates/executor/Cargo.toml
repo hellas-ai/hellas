@@ -13,7 +13,9 @@ otel = ["hellas-rpc/otel", "dep:opentelemetry", "dep:tracing-opentelemetry"]
 compute = [
     "dep:bincode",
     "dep:catena-lang",
+    "dep:hellas-xet",
     "dep:libloading",
+    "dep:memmap2",
     "dep:metacat",
     "dep:sha2",
     "dep:tempfile",
@@ -35,7 +37,9 @@ hellas-private.workspace = true
 hellas-rpc = { workspace = true, features = ["execute", "fetch", "work"] }
 hellas-store.workspace = true
 hellas-wire = { workspace = true }
+hellas-xet = { workspace = true, optional = true, features = ["chunking"] }
 libloading = { version = "0.9", optional = true }
+memmap2 = { version = "0.9", optional = true }
 metacat = { version = "0.3", optional = true }
 opentelemetry = { workspace = true, optional = true }
 rand = { workspace = true }

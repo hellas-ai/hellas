@@ -266,7 +266,7 @@ impl crate::transport::SendHalf for IrohSendHalf {
                         "peer stopped the final frame",
                     ));
                 }
-                Ok(Err(error)) => return Err(std::io::Error::other(error)),
+                Ok(Err(error)) => return Err(write_error(error.into())),
                 Err(_) => {
                     let _ = send.reset(STREAM_ERROR_CODE.into());
                     return Err(std::io::Error::new(
@@ -414,6 +414,12 @@ impl FuturesStream for IrohRecvHalf {
                         "iroh stream ended without End frame",
                     ))));
                 }
+                Err(iroh::endpoint::ReadError::ConnectionLost(
+                    iroh::endpoint::ConnectionError::ApplicationClosed(close),
+                )) if close.error_code == u32::from(WireCode::PermissionDenied.as_u8()).into() => {
+                    this.abort(WireCode::PermissionDenied, "connection authorization ended");
+                    return Poll::Ready(None);
+                }
                 Err(error) => {
                     this.abort(WireCode::Internal, "iroh receive error");
                     return Poll::Ready(Some(Err(std::io::Error::other(format!(
@@ -496,6 +502,18 @@ fn encode_outbound_frame(frame: &Frame) -> std::io::Result<BytesMut> {
     Ok(encoded)
 }
 
+fn write_error(error: iroh::endpoint::WriteError) -> std::io::Error {
+    let kind = match &error {
+        iroh::endpoint::WriteError::ConnectionLost(
+            iroh::endpoint::ConnectionError::ApplicationClosed(close),
+        ) if close.error_code == u32::from(WireCode::PermissionDenied.as_u8()).into() => {
+            std::io::ErrorKind::PermissionDenied
+        }
+        _ => std::io::ErrorKind::Other,
+    };
+    std::io::Error::new(kind, error)
+}
+
 async fn write_frame_with_timeout(
     send: &mut SendStream,
     length: &[u8],
@@ -517,10 +535,8 @@ async fn write_frame_with_timeout(
             authority.write_all(send, length).await?;
             authority.write_all(send, frame).await
         } else {
-            send.write_all(length)
-                .await
-                .map_err(std::io::Error::other)?;
-            send.write_all(frame).await.map_err(std::io::Error::other)
+            send.write_all(length).await.map_err(write_error)?;
+            send.write_all(frame).await.map_err(write_error)
         }
     };
     match n0_future::time::timeout(timeout, write).await {

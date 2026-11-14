@@ -12,8 +12,8 @@ hellas gateway \
   --model gpt-5@openrouter
 ```
 
-A local path accepts the existing `ModelPackage` formats: Qwen GGUF and
-converted Whisper or Flux directories. The package determines the modality
+A local path accepts Qwen GGUF, converted Whisper or Flux directories, and
+Qwen or Whisper descriptor directories. The package determines the modality
 and API paths. Remote Compute uses `PATH@CONTACT`: the gateway needs that
 local package to render the invocation for the contact's evaluator. A Fetch
 grant uses `NAME@CONTACT`, checked against the models in its signed offer.
@@ -22,6 +22,45 @@ Attest provider, independently approve its pins under the same contact name:
 `hellas trust --store "$HELLAS_HOME/trust" approve CONTACT --policy POLICY.json
 --expected-revision 0 --reason REASON` (use `~/.hellas/trust` for the default
 home). The bundle cannot approve or replace those pins.
+
+## Model packages and descriptors
+
+Remote Compute needs the model's rendering metadata and the weights' content
+reference. Produce a descriptor once from a full package:
+
+```sh
+hellas model describe ./qwen3.gguf -o ./qwen3
+hellas model describe ./whisper-tiny -o ./whisper-remote
+hellas gateway --model ./qwen3@alice --model ./whisper-remote@alice
+```
+
+The output is a new directory with `descriptor.json`, a JSON object with one
+`weights` field containing the original asset's `ContentRef` (`id` and `bytes`).
+A Qwen descriptor also contains `header.gguf`: exactly the GGUF header,
+metadata, tensor table and alignment padding, ending before tensor data. A
+Whisper descriptor contains `config.json`, `generation_config.json` and
+`tokenizer.json`; its config determines the converted tensor layout. There are
+no weights in either descriptor. Flux already names its assets in `assets.json`
+and needs no descriptor conversion.
+
+`ModelPackage::open`, `hellas program`, `text` and `transcribe` accept these
+directories just as they accept full packages. Descriptors preserve the native
+tokenizer metadata and produce the same program, environment and call-plan
+bytes for the same request and evaluator. The path's file stem is the gateway's model name: `qwen3.remote` is served as
+`qwen3`.
+
+Describing a package hashes its weights once. A gateway opening a full package
+shares that hash across offer matching, evaluators and content indexing. Opening
+a descriptor reads only its metadata. Keep model packages immutable while loaded.
+
+A descriptor is for rendering remote jobs. A local executing backend requires
+the full package; the provider's content store verifies actual weight bytes
+against the job's content reference. A descriptor cannot supply or substitute
+for those bytes. Hand-edited descriptors are trusted renderer input: an incorrect
+weights reference or metadata can produce a job that the provider refuses or
+executes with meaningless results.
+
+## Upstreams and HTTP access
 
 `NAME@UPSTREAM` selects a named OpenAI-compatible HTTPS endpoint. Its key file
 is read once and the key remains write-only in the configuration. Startup

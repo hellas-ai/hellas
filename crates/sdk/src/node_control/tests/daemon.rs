@@ -376,7 +376,6 @@ async fn removing_a_backend_preserves_its_accepted_request_and_routes_the_next_o
                                     path: template.paths[0].clone(),
                                     method: "POST".into(),
                                     url: format!("{}{}", template.origin, template.paths[0]),
-                                    credential: None,
                                     tls: template.tls.clone(),
                                     headers: vec![],
                                     max_response_bytes: template.max_response_bytes,
@@ -794,7 +793,7 @@ async fn resources_require_a_backend_allowed_by_the_iroh_listener() {
         origin: "https://api.example".into(),
         paths: vec!["/v1/responses".into()],
         methods: vec!["POST".into()],
-        credential: Some("api".into()),
+        account_backed: true,
         tls: hellas_rpc::http_fetch::HttpTls {
             roots: hellas_rpc::http_fetch::HttpTrustRoots::WebPki,
             spki_sha256: vec![],
@@ -860,6 +859,34 @@ fn model_document(path: std::path::PathBuf) -> Document {
         "backends": {"local": {"kind": "local", "evaluator": hellas_executor::catena::evaluator(hellas_executor::GpuDialect::Hip), "max_in_flight": 2}},
         "routes": [{"backends": ["local"], "kind": "model", "model": "tiny", "package": path, "modality": "text", "max_tokens": 1}]
     })).unwrap()
+}
+
+#[cfg(feature = "compute")]
+#[tokio::test]
+async fn a_descriptor_cannot_activate_a_local_model_backend() {
+    let f = fixture().await;
+    let descriptor = f.directory.path().join("descriptor");
+    hellas_client::model::ModelPackage::describe(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../client/src/model/package/mini-qwen3.gguf"),
+        &descriptor,
+    )
+    .await
+    .unwrap();
+    let core = Core::open(options(&f), model_document(descriptor))
+        .await
+        .unwrap();
+    let view = core.watch().0;
+    assert!(view.backends[0].down);
+    assert!(
+        view.backends[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("full model weights")
+    );
+    assert!(!core.jobs.is_closed());
+    core.shutdown().await.unwrap();
 }
 
 #[cfg(feature = "compute")]
@@ -1073,4 +1100,66 @@ async fn occupied_saved_listener_keeps_control_available_for_repair() {
     core.shutdown().await.unwrap();
     connection.close(0u32.into(), b"test complete");
     let _ = served.await.unwrap();
+}
+
+#[tokio::test]
+async fn scope_overlap_is_rejected_before_configuration_commit() {
+    let f = fixture().await;
+    let core = Core::open(options(&f), Document::default()).await.unwrap();
+    let (_client, _server, _connection, rpc, _served) = connect(&f, core.clone()).await;
+    let mut document = Document::default();
+    document
+        .add_upstream("api", "https://example.com", Some("first-key".into()))
+        .unwrap();
+    let crate::daemon_config::BackendKind::Fetch {
+        upstream: crate::daemon_config::Upstream::Http { credentials, .. },
+        ..
+    } = &mut document.backends.get_mut("api").unwrap().kind
+    else {
+        unreachable!()
+    };
+    credentials.push(credentials[0].clone());
+    assert!(rpc.configure(request(&document, 0)).await.is_err());
+    assert_eq!(core.watch().0.revision, Revision(0));
+    core.shutdown().await.unwrap();
+    f.node.close().await;
+    f.content.close().await;
+}
+
+#[tokio::test]
+async fn configuration_publication_keeps_admission_closed_until_snapshot_swap() {
+    let f = fixture().await;
+    let core = Core::open(options(&f), Document::default()).await.unwrap();
+    let (_client, _server, _connection, rpc, _served) = connect(&f, core.clone()).await;
+    let committed = Arc::new(Semaphore::new(0));
+    let resume = Arc::new(Semaphore::new(0));
+    *core.after_commit.lock().unwrap() = Some((committed.clone(), resume.clone()));
+    let mut document = Document::default();
+    document
+        .add_upstream("api", "https://example.com", Some("key".into()))
+        .unwrap();
+    let configured = rpc.configure(request(&document, 0));
+    tokio::pin!(configured);
+    tokio::select! {
+        permit = committed.acquire() => permit.unwrap().forget(),
+        result = &mut configured => panic!("configuration ended before barrier: {result:?}"),
+    }
+    assert_eq!(
+        f.node.configuration().await.unwrap().unwrap().revision,
+        Revision(1)
+    );
+    assert_eq!(core.watch().0.revision, Revision(0));
+    let admission = f.node.configuration_admission();
+    tokio::pin!(admission);
+    assert!(
+        futures::poll!(&mut admission).is_pending(),
+        "admission observed committed authority before runtime publication"
+    );
+    resume.add_permits(1);
+    assert_eq!(configured.await.unwrap().revision, 1);
+    let _admission = admission.await;
+    assert_eq!(core.watch().0.revision, Revision(1));
+    core.shutdown().await.unwrap();
+    f.node.close().await;
+    f.content.close().await;
 }

@@ -12,6 +12,7 @@ pub mod faucet;
 mod bootstrap;
 pub mod daemon;
 pub mod identity;
+pub mod model;
 pub mod monitor;
 pub mod rpc;
 pub mod store;

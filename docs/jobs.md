@@ -49,6 +49,11 @@ renders one chat turn with the GGUF's tokenizer and embedded Jinja chat template
 runs it as a Compute job
 and prints the decoded reply.
 
+For remote jobs, `text`, `transcribe` and `program` also accept a
+[model descriptor](http-gateway.md#model-packages-and-descriptors), produced by
+`hellas model describe PATH -o DIR`. It retains rendering metadata and the
+weights' content reference; the executing provider holds the real weights.
+
 `hellas transact --job DIR` executes a caller-owned job folder for any
 application. `hellas run` (one call of a Catena program) and `hellas fetch`
 (one HTTPS request) build such a folder and go through the same SDK
@@ -302,9 +307,15 @@ recovered request whose policy does not admit the job's contract is refused
 before funding or payment. `request.json` is an
 `HttpFetchRequest` or the selected service's JSON input. For HTTPS, the helper
 supports `-X METHOD`, repeated `-H 'Name: value'`, `--data @FILE`, and
-`--max-response-bytes N`. Without an explicit cap, it uses the provider's
-deliverable response limit. `--tls-root FILE` supplies a DER trust anchor;
+`--max-response-bytes N`. The provider uses the credential whose configured
+origin, path and method cover the request, or sends it without a credential when
+none applies. The request carries no credential selector or provider secret.
+Without an explicit cap, it uses the provider's deliverable response limit.
+`--tls-root FILE` supplies a DER trust anchor;
 `--spki-sha256 HEX` supplies a leaf SPKI pin when the provider requires one.
+
+A configured gateway `GET /v1/models` passthrough takes precedence over generated
+model discovery. Other configured methods on that path keep their normal routing.
 
 Apple-attested providers require the independent `--trust-store` and
 `--trust-policy` approval. Fetch additionally selects
