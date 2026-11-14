@@ -1,0 +1,206 @@
+# Bounded asset uploads using the public, portable Catena memory operations.
+# Each launch copies integer words into an exclusive unpublished destination.
+# Borrowed IPC views never transfer ownership or allocate a second full buffer.
+# The caller checks ranges; each kernel thread owns exactly one destination word.
+(theory type nat {
+(arr asset.left : 0 -> 1)
+(arr asset.right : 0 -> 1)
+(arr asset.count : 0 -> 1)
+(arr asset.memory : 0 -> 1)
+(arr asset.index : 0 -> 1)
+(arr asset.end : 0 -> 1)
+(arr asset.predicate : 0 -> 1)
+(arr asset.blocks : 0 -> 1)
+(arr asset.threads : 0 -> 1)
+(arr asset.one : 0 -> 1)
+(arr asset.grid : 0 -> 1)
+(arr asset.block : 0 -> 1)
+(arr asset.thread : 0 -> 1)
+})
+(theory program type {
+(arr meta.asset.left : 1 -> asset.left)
+(arr meta.asset.right : 1 -> asset.right)
+(arr meta.asset.count : 1 -> asset.count)
+(arr meta.asset.index : 1 -> asset.index)
+(arr meta.asset.end : 1 -> asset.end)
+(arr meta.asset.predicate : 1 -> asset.predicate)
+(arr meta.asset.blocks : 1 -> asset.blocks)
+(arr meta.asset.threads : 1 -> asset.threads)
+(arr meta.asset.one : 1 -> asset.one)
+(arr meta.asset.grid : 1 -> asset.grid)
+(arr meta.asset.thread : 1 -> asset.thread)
+(arr meta.asset.instantiate.9 : {((cap.ref mem) val) ({asset.count u64} :)} -> {({((cap.ref mem) val) ({asset.count u64} :)} *) asset.count asset.memory})
+(arr meta.asset.instantiate.10 : {1} -> {1 ({asset.index asset.count} prop.Less)})
+(arr meta.asset.instantiate.11 : {({asset.index u64} :) (({asset.index asset.count} prop.Less) |-)} -> {({({asset.index u64} :) (({asset.index asset.count} prop.Less) |-)} *) asset.count asset.index})
+(arr meta.asset.u64-write.3 : {1} -> {1 ({({asset.blocks asset.one} stdlib.gpu.geometry.sort.D2) ({asset.threads asset.one} stdlib.gpu.geometry.sort.D2) asset.grid asset.block asset.count u64 asset.thread asset.memory ({asset.count asset.index} stdlib.gpu.memory.sort.At)} stdlib.gpu.memory.prop.GlobalOwn)})
+(arr meta.asset.u64-write.4 : {({asset.memory ({asset.count u64} stdlib.gpu.memory.type.Global)} :) ({({asset.count asset.index} stdlib.gpu.memory.sort.At) ({asset.count} stdlib.gpu.memory.type.Ix)} :) (u64 val) (({({asset.blocks asset.one} stdlib.gpu.geometry.sort.D2) ({asset.threads asset.one} stdlib.gpu.geometry.sort.D2) asset.grid asset.block asset.count u64 asset.thread asset.memory ({asset.count asset.index} stdlib.gpu.memory.sort.At)} stdlib.gpu.memory.prop.GlobalOwn) |-)} -> {({({asset.memory ({asset.count u64} stdlib.gpu.memory.type.Global)} :) ({({({asset.count asset.index} stdlib.gpu.memory.sort.At) ({asset.count} stdlib.gpu.memory.type.Ix)} :) ({(u64 val) (({({asset.blocks asset.one} stdlib.gpu.geometry.sort.D2) ({asset.threads asset.one} stdlib.gpu.geometry.sort.D2) asset.grid asset.block asset.count u64 asset.thread asset.memory ({asset.count asset.index} stdlib.gpu.memory.sort.At)} stdlib.gpu.memory.prop.GlobalOwn) |-)} *)} *)} *) u64 ({asset.blocks asset.one} stdlib.gpu.geometry.sort.D2) ({asset.threads asset.one} stdlib.gpu.geometry.sort.D2) asset.grid asset.block asset.thread asset.count asset.memory ({asset.count asset.index} stdlib.gpu.memory.sort.At)})
+})
+
+(def program stdlib.hellas.assets.u64.add : {(u64 val) (u64 val)} -> (u64 val) =
+ ([a b.]
+  ([.] stdlib.numeric.numeric.u64 [x0.])
+  ([.] unit.intro meta.asset.left [x1.])
+  ([.a x1] smolcat.value.named_at [x2.])
+  ([.] unit.intro meta.asset.right [x3.])
+  ([.b x3] smolcat.value.named_at [x4.])
+  ([.x2 x4 x0] stdlib.numeric.+ :.forget [x5.])
+  [. x5]
+ ))
+
+(def program stdlib.hellas.assets.u64.div : {(u64 val) (u64 val)} -> (u64 val) =
+ ([a b.]
+  ([.] stdlib.numeric.numeric.u64 [x0.])
+  ([.] unit.intro meta.asset.left [x1.])
+  ([.a x1] smolcat.value.named_at [x2.])
+  ([.] unit.intro meta.asset.right [x3.])
+  ([.b x3] smolcat.value.named_at [x4.])
+  ([.x2 x4 x0] stdlib.numeric./ :.forget [x5.])
+  [. x5]
+ ))
+
+(def program stdlib.hellas.assets.u64.less : {(u64 val) (u64 val)} -> (bool val) =
+ ([a b.]
+  ([.] stdlib.numeric.numeric.u64 [x0.])
+  ([.a b x0] stdlib.numeric.less [x1.])
+  [. x1]
+ ))
+
+(def program stdlib.hellas.assets.ref-count-u64 : {((cap.ref mem) val)} -> (u64 val) =
+ ([memory.]
+  ([.memory] stdlib.gpu.memory.mem_cast_ref_u64 [x0.])
+  ([.x0] *.elim [x1 x2.])
+  ([.x2] *.elim [x3 x4.])
+  ([.x4] unsafe.discard unit.elim)
+  ([.x1] :.forget [x5.])
+  [. x5]
+ ))
+
+(def program stdlib.hellas.assets.ref-read-u64 : {((cap.ref mem) val) (u64 val)} -> (u64 val) =
+ ([memory index.]
+  ([.memory] stdlib.hellas.assets.ref-count-u64 [x0.])
+  ([.] unit.intro meta.asset.count [x1.])
+  ([.x0 x1] smolcat.value.named_at [x2.])
+  ([.memory x2] (meta.asset.instantiate.9 {{_} (name.stdlib.gpu.memory.global_ref_u64 lift)} evaluate {_}) [x3.])
+  ([.x3] *.elim [x4 x5.])
+  ([.x5] unsafe.discard unit.elim)
+  ([.] unit.intro meta.asset.index [x6.])
+  ([.index x6] smolcat.value.named_at [x7.])
+  ([.] unit.intro [x8.])
+  ([.x8] (meta.asset.instantiate.10 {{_} (name.unsafe.assume lift)} evaluate {_}) [x9.])
+  ([.x7 x9] (meta.asset.instantiate.11 {{_} (name.stdlib.gpu.memory.ix lift)} evaluate {_}) [x10.])
+  ([.x4] :.forget [x11.])
+  ([.x10] :.forget [x12.])
+  ([.x11 x12] stdlib.gpu.memory.global_read_unsafe [x13.])
+  [. x13]
+ ))
+
+(def program stdlib.hellas.assets.grid : {(u64 val)} -> ({asset.grid ({({asset.blocks asset.one} stdlib.gpu.geometry.sort.D2) ({asset.threads asset.one} stdlib.gpu.geometry.sort.D2)} stdlib.gpu.geometry.type.Grid)} :) =
+ ([blocks.]
+  ([.] unit.intro meta.asset.blocks [x0.])
+  ([.blocks x0] smolcat.value.named_at [x1.])
+  ([.] const.u64.0x0000000000000001 [x2.])
+  ([.] unit.intro meta.asset.one [x3.])
+  ([.x2 x3] smolcat.value.named_at [x4.])
+  ([.] const.u64.0x0000000000000100 [x5.])
+  ([.] unit.intro meta.asset.threads [x6.])
+  ([.x5 x6] smolcat.value.named_at [x7.])
+  ([.] const.u64.0x0000000000000001 [x8.])
+  ([.] unit.intro meta.asset.one [x9.])
+  ([.x8 x9] smolcat.value.named_at [x10.])
+  ([.x1 x4 x7 x10] stdlib.gpu.geometry.make_grid [x11 x12.])
+  ([.x12] unsafe.discard unit.elim)
+  ([.x11] :.forget [x13.])
+  ([.] unit.intro meta.asset.grid [x14.])
+  ([.x13 x14] smolcat.value.named_at [x15.])
+  [. x15]
+ ))
+
+(def program stdlib.hellas.assets.thread-index : {({({asset.block ({({asset.blocks asset.one} stdlib.gpu.geometry.sort.D2) ({asset.threads asset.one} stdlib.gpu.geometry.sort.D2) asset.grid} stdlib.gpu.geometry.type.Block)} :) (({({asset.blocks asset.one} stdlib.gpu.geometry.sort.D2) ({asset.threads asset.one} stdlib.gpu.geometry.sort.D2) asset.grid asset.block} stdlib.gpu.geometry.type.Thread) val)} *)} -> (u64 val) =
+ ([pair.]
+  ([.pair] *.elim [x0 x1.])
+  ([.] unit.intro meta.asset.thread [x2.])
+  ([.x1 x2] smolcat.value.named_at [x3.])
+  ([.x3] stdlib.gpu.geometry.in_grid_index stdlib.gpu.geometry.x :.forget [x4.])
+  [. x4]
+ ))
+
+(def program stdlib.hellas.assets.write-u64 : {((cap.ref mem) val) (u64 val) (u64 val)} -> 1 =
+ ([memory index value.]
+  ([.memory] stdlib.hellas.assets.ref-count-u64 [x0.])
+  ([.] unit.intro meta.asset.count [x1.])
+  ([.x0 x1] smolcat.value.named_at [x2.])
+  ([.memory x2] (meta.asset.instantiate.9 {{_} (name.stdlib.gpu.memory.global_ref_u64 lift)} evaluate {_}) [x3.])
+  ([.x3] *.elim [x4 x5.])
+  ([.x5] unsafe.discard unit.elim)
+  ([.] unit.intro meta.asset.index [x8.])
+  ([.index x8] smolcat.value.named_at [x9.])
+  ([.] unit.intro [x10.])
+  ([.x10] (meta.asset.instantiate.10 {{_} (name.unsafe.assume lift)} evaluate {_}) [x11.])
+  ([.x9 x11] (meta.asset.instantiate.11 {{_} (name.stdlib.gpu.memory.ix lift)} evaluate {_}) [x12.])
+  ([.] unit.intro [x13.])
+  ([.x13] (meta.asset.u64-write.3 {{_} (name.unsafe.assume lift)} evaluate {_}) [x14.])
+  ([.x4 x12 value x14] (meta.asset.u64-write.4 {{_} (name.stdlib.gpu.memory.global_write lift)} evaluate {_}) [x15.])
+  [. x15]
+ ))
+
+(def program stdlib.hellas.assets.copy.element : {((cap.ref mem) val) (u64 val) ((cap.ref mem) val) (u64 val)} -> 1 =
+ ([x offset out element.]
+ ({[.x] [.element]} stdlib.hellas.assets.ref-read-u64 [point-result.])
+ ({[.element] [.offset]} stdlib.hellas.assets.u64.add [destination.])
+ ({[.out] [.destination] [.point-result]} stdlib.hellas.assets.write-u64)
+ (unit.elim) (unit.intro)
+ ))
+
+(def program stdlib.hellas.assets.copy.yes : {((cap.ref mem) val) (u64 val) ((cap.ref mem) val) ({(u64 val) ({((asset.predicate prop.IsTrue) |-) 1} *)} *)} -> 1 =
+ ([x offset out pair.]
+ ([.pair] *.elim [element proofs.])
+ ([.proofs] *.elim [proof unit.])
+ ([.proof] unsafe.discard unit.elim)
+ ([.unit] unit.elim)
+ ({[.x] [.offset] [.out] [.element]} stdlib.hellas.assets.copy.element)
+ ))
+
+(def program stdlib.hellas.assets.copy.no : {((cap.ref mem) val) (u64 val) ((cap.ref mem) val) ({(u64 val) ({(({(asset.predicate prop.IsTrue)} stdlib.prelude.prop.Not) |-) 1} *)} *)} -> 1 =
+ ([x offset out pair.]
+ ([.pair] *.elim [element proofs.])
+ ([.proofs] *.elim [proof unit.])
+ ([.proof] unsafe.discard unit.elim)
+ [.unit]
+ ))
+
+(def program stdlib.hellas.assets.copy.launch : {((cap.ref mem) val) (u64 val) ((cap.ref mem) val) (u64 val) ({({asset.block ({({asset.blocks asset.one} stdlib.gpu.geometry.sort.D2) ({asset.threads asset.one} stdlib.gpu.geometry.sort.D2) asset.grid} stdlib.gpu.geometry.type.Block)} :) (({({asset.blocks asset.one} stdlib.gpu.geometry.sort.D2) ({asset.threads asset.one} stdlib.gpu.geometry.sort.D2) asset.grid asset.block} stdlib.gpu.geometry.type.Thread) val)} *)} -> 1 =
+ ([x offset out work thread.]
+ ([.thread] stdlib.hellas.assets.thread-index [element.])
+ ({[.element] [.work]} stdlib.hellas.assets.u64.less [in-bounds.])
+ ({[.in-bounds] (unit.intro meta.asset.predicate)} smolcat.value.named_at :.forget [condition.])
+ ({[.x] [.offset] [.out]} partial.stdlib.hellas.assets.copy.yes.3 [yes.])
+ ({[.x] [.offset] [.out]} partial.stdlib.hellas.assets.copy.no.3 [no.])
+ ({[.condition] [.element] [.yes] [.no] unit.intro} core.if)
+ ))
+
+(def program stdlib.hellas.assets.copy.host : {((cap.ref mem) val) (u64 val) ((cap.ref mem) val) (u64 val) ({asset.grid ({({asset.blocks asset.one} stdlib.gpu.geometry.sort.D2) ({asset.threads asset.one} stdlib.gpu.geometry.sort.D2)} stdlib.gpu.geometry.type.Grid)} :) ({({asset.index u64} :) ({(u64 val) ({(({asset.index asset.end} prop.Less) |-) (prop.Truth |-)} *)} *)} *)} -> ({(u64 val) (prop.Truth |-)} *) =
+ ([x offset out work grid pair.]
+ ([.pair] *.elim [step rest.])
+ ([.rest] *.elim [value proofs.])
+ ([.proofs] *.elim [less truth.])
+ ([.less] unsafe.discard unit.elim)
+ ({[.x] [.offset] [.out] [.work]} partial.stdlib.hellas.assets.copy.launch.4 [kernel.])
+ ({[.grid] [.kernel]} unsafe.launch)
+ (unit.elim)
+ ({[.value] [.truth]} *.intro)
+ ))
+
+(def program stdlib.hellas.assets.copy.run : {((cap.ref mem) val) (u64 val) ((cap.ref mem) val) (u64 val)} -> (u64 val) =
+ ([x offset out work.]
+ ({[.work] (const.u64.0x00000000000000FF)} stdlib.hellas.assets.u64.add [padded.])
+ ({[.padded] (const.u64.0x0000000000000100)} stdlib.hellas.assets.u64.div [blocks.])
+ ([.blocks] stdlib.hellas.assets.grid [grid.])
+ ({[.x] [.offset] [.out] [.work] [.grid]} partial.stdlib.hellas.assets.copy.host.5 [host.])
+ ({(const.u64.0x0000000000000001) (unit.intro meta.asset.end)} smolcat.value.named_at [end.])
+ ({[.end] (const.u64.0x0000000000000000) [.host] core.truth} core.fold.bounded_u64 [result proof.])
+ ([.proof] unsafe.discard unit.elim)
+ [.result]
+ ))
+
+(def program hellas.asset.write : {((cap.ref mem) val) (u64 val) ((cap.ref mem) val) (u64 val)} -> (u64 val) =
+ stdlib.hellas.assets.copy.run)

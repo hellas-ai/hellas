@@ -760,7 +760,7 @@ dependencies = [
 [[package]]
 name = "catena-lang"
 version = "0.1.0"
-source = "git+https://github.com/hellas-ai/catena-lang.git?rev=325d75d20f6f82511ab330b2c678075f204379d8#325d75d20f6f82511ab330b2c678075f204379d8"
+source = "git+https://github.com/hellas-ai/catena-lang.git?branch=master#dfad87438018925b9b5e591f3cc8b59806e88719"
 dependencies = [
  "anyhow",
  "bincode",
@@ -782,13 +782,12 @@ dependencies = [
 [[package]]
 name = "catena-models"
 version = "0.1.0"
-source = "git+https://github.com/hellas-ai/catena-models.git?rev=1160137a4b99c068a2fcd247cae50c5a8755405d#1160137a4b99c068a2fcd247cae50c5a8755405d"
+source = "git+https://github.com/hellas-ai/catena-models.git?rev=4bb7fddf71c6e795fa0894b6c316fbeeed32f9c4#4bb7fddf71c6e795fa0894b6c316fbeeed32f9c4"
 dependencies = [
  "anyhow",
  "axum",
  "catena-lang",
  "clap",
- "half",
  "hf-hub",
  "hound",
  "http-body",
@@ -3347,6 +3346,7 @@ dependencies = [
  "hellas-xet",
  "libc",
  "libloading",
+ "memmap2",
  "metacat",
  "opentelemetry",
  "opentelemetry_sdk",

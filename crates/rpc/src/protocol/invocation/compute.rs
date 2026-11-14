@@ -5,9 +5,9 @@ use crate::ContentRef;
 
 /// The locked Catena compiler. A GPU runtime that compiles its programs
 /// registers an evaluator id that extends it with the runtime's name.
-pub const EVALUATOR: &str = "hellas/catena-325d75d20f6f";
+pub const EVALUATOR: &str = "hellas/catena-dfad87438018";
 /// A program by compute id: `<evaluator>/<manifest>`, such as
-/// `hellas/catena-325d75d20f6f-hip/<64-hex manifest>`.
+/// `hellas/catena-dfad87438018-hip/<64-hex manifest>`.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "String")]
 pub struct ProgramId {

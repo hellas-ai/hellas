@@ -32,15 +32,13 @@ use hellas_kernel::{
 };
 use hellas_rpc::{
     ContentId, ContentRef, EventCommitment, RequestCommitment, Retention,
-    protocol::invocation::{Admission, ComputePrograms, InvocationPolicy, PreparedInvocation},
+    protocol::invocation::{InvocationPolicy, PreparedInvocation},
 };
 
 // ── Fixtures ──────────────────────────────────────────────────────────
 
 const NETWORK: &str = "hellas-devnet-1";
 const OTHER_NETWORK: &str = "hellas-devnet-32";
-// Golden preimages keep their original evaluator bytes across runtime upgrades.
-const VECTOR_EVALUATOR: &str = "hellas/catena-dfad87438018-hip";
 /// The channel's certificate capacity, from the kernel's own settlement
 /// arithmetic over an edge that locks a million and reserves nothing.
 fn capacity() -> WorkPaymentSettlement {
@@ -143,25 +141,12 @@ fn channel_policy() -> PaidChannelPolicyV1 {
 
 fn bundle() -> PreparedInvocation {
     let mut input = fixture::bundle(0x77);
-    let manifest = fixture::environment().manifest(VECTOR_EVALUATOR).unwrap();
-    input.request.execution_environment = manifest.content_id();
     input.request.runner_public_key =
         hellas_auth::PublicKey::Secp256k1(provider().party_key().to_bytes());
-    PreparedInvocation::new(
-        input.request,
-        &manifest,
-        input.input,
-        work_policy().canonical_bytes().unwrap(),
-    )
-    .unwrap()
+    input
 }
 fn work_policy() -> InvocationPolicy {
-    let mut policy = fixture::work_policy();
-    policy.admissions = vec![Admission::Compute {
-        evaluator: VECTOR_EVALUATOR.into(),
-        programs: ComputePrograms::Any {},
-    }];
-    policy
+    fixture::work_policy()
 }
 fn work_policy_digest(channel: &PaidChannel, policy: &InvocationPolicy) -> Digest {
     job::policy_digest(channel.network(), channel.id(), policy).unwrap()

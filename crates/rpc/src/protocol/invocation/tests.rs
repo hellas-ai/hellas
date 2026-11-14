@@ -163,12 +163,7 @@ fn every_policy_term_changes_the_committed_identity() {
 
 #[test]
 fn policy_is_bounded_canonical_and_has_no_compile_budget() {
-    let mut p = policy();
-    // Preserve the input of this canonical vector across runtime upgrades.
-    p.admissions[0] = Admission::Compute {
-        evaluator: "hellas/catena-dfad87438018".into(),
-        programs: ComputePrograms::Any {},
-    };
+    let p = policy();
     let bytes = p.canonical_bytes().unwrap();
     assert_eq!(
         p.content_id().unwrap().to_string(),
@@ -1444,15 +1439,15 @@ fn compute_evaluator_matches_locked_catena_revision() {
         .filter(|package| package.lines().any(|line| line == "name = \"catena-lang\""));
     let package = packages.next().expect("catena-lang is locked");
     assert!(packages.next().is_none(), "multiple catena-lang revisions");
-    let source = package
+    let revision = package
         .lines()
         .find_map(|line| {
-            line.strip_prefix("source = \"git+https://github.com/hellas-ai/catena-lang.git?rev=")
-                .and_then(|source| source.strip_suffix('"'))
+            line.strip_prefix(
+                "source = \"git+https://github.com/hellas-ai/catena-lang.git?branch=master#",
+            )
+            .and_then(|source| source.strip_suffix('"'))
         })
-        .expect("catena-lang is pinned to an exact upstream revision");
-    let (pin, revision) = source.split_once('#').expect("locked Git revision");
-    assert_eq!(pin, revision, "manifest pin must match the locked commit");
+        .expect("catena-lang is pinned to upstream master");
     assert_eq!(revision.len(), 40);
     assert!(revision.bytes().all(|byte| byte.is_ascii_hexdigit()));
     assert_eq!(

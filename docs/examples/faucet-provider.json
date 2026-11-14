@@ -10,7 +10,7 @@
         "admissions": [
           {
             "kind": "compute",
-            "evaluator": "hellas/catena-325d75d20f6f-hip",
+            "evaluator": "hellas/catena-dfad87438018-hip",
             "programs": {
               "mode": "any"
             }

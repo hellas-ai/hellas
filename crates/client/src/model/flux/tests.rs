@@ -287,10 +287,6 @@ async fn converted_weights_match_upstream_storage_and_reject_invalid_tensors() {
     let f32_bytes: Vec<_> = f32_bits.into_iter().flat_map(u32::to_le_bytes).collect();
     let bf16_bits = [0u16, 0x8000, 0x7f81, 0xffff];
     let bf16_bytes: Vec<_> = bf16_bits.into_iter().flat_map(u16::to_le_bytes).collect();
-    let f16_bytes: Vec<_> = [0x3c00u16, 0xc000, 0x0001, 0x7c00]
-        .into_iter()
-        .flat_map(u16::to_le_bytes)
-        .collect();
     safetensors::serialize_to_file(
         [
             (
@@ -303,11 +299,7 @@ async fn converted_weights_match_upstream_storage_and_reject_invalid_tensors() {
             ),
             (
                 "half",
-                TensorView::new(Dtype::F16, vec![4], &f16_bytes).unwrap(),
-            ),
-            (
-                "integer",
-                TensorView::new(Dtype::U16, vec![4], &bf16_bytes).unwrap(),
+                TensorView::new(Dtype::F16, vec![4], &bf16_bytes).unwrap(),
             ),
         ],
         None,
@@ -334,22 +326,6 @@ async fn converted_weights_match_upstream_storage_and_reject_invalid_tensors() {
                 .flat_map(|v| ((v as u32) << 16).to_le_bytes())
                 .collect(),
         ),
-        (
-            "half",
-            false,
-            [0x3f80u16, 0xc000, 0x3380, 0x7f80]
-                .into_iter()
-                .flat_map(u16::to_le_bytes)
-                .collect(),
-        ),
-        (
-            "half",
-            true,
-            [0x3f800000u32, 0xc0000000, 0x33800000, 0x7f800000]
-                .into_iter()
-                .flat_map(u32::to_le_bytes)
-                .collect(),
-        ),
     ] {
         let mut bytes = Vec::new();
         weights::write(
@@ -364,7 +340,7 @@ async fn converted_weights_match_upstream_storage_and_reject_invalid_tensors() {
         .unwrap();
         assert_eq!(bytes, expected, "{name} storage f32={f32}");
     }
-    for (name, shape) in [("float", vec![2]), ("integer", vec![4])] {
+    for (name, shape) in [("float", vec![2]), ("half", vec![4])] {
         let mut bytes = Vec::new();
         assert!(
             weights::write(

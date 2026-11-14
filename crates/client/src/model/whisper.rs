@@ -271,7 +271,7 @@ impl Whisper {
             })
             .transpose()?
             .unwrap_or(0);
-        let features = audio::log_mel(samples, self.config.num_mel_bins)?;
+        let features = audio::log_mel(samples)?;
         let mut inputs = vec![floats("features", &features)];
         for (name, values) in ["language-mask", "text-mask", "begin-mask"]
             .into_iter()

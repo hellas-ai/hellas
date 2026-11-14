@@ -115,7 +115,7 @@ Or use a friend's access bundle and their GPU evaluator:
 
 ```sh
 hellas transcribe --model whisper-tiny --audio speech.wav --access friend.access \
-  --backend hellas/catena-325d75d20f6f-hip
+  --backend hellas/catena-dfad87438018-hip
 ```
 
 A paid job uses devnet coins and checks the quoted price before signing:
@@ -123,7 +123,7 @@ A paid job uses devnet coins and checks the quoted price before signing:
 ```sh
 hellas faucet
 hellas transcribe --model whisper-tiny --audio speech.wav --pay 20 \
-  --provider "$DEVNET_PROVIDER" --backend hellas/catena-325d75d20f6f-hip
+  --provider "$DEVNET_PROVIDER" --backend hellas/catena-dfad87438018-hip
 ```
 
 `--local` is available in GPU builds. NVIDIA providers use the CUDA evaluator.

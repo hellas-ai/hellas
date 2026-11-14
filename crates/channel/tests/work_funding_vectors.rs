@@ -8,7 +8,7 @@ use hellas_channel::model::work::{
     paid_work_v2_id,
 };
 use hellas_kernel::NetworkId;
-use hellas_rpc::protocol::invocation::{Admission, InvocationPolicy, Limits};
+use hellas_rpc::protocol::invocation::{Admission, InvocationPolicy, Limits, compute};
 use hellas_rpc::{ContentId, RequestCommitment, Retention};
 fn network() -> NetworkId {
     NetworkId::new("funding-v2").unwrap()
@@ -39,8 +39,7 @@ const GRANT: &str = "010a0101010101010101010101010101010101010101010101010101010
 fn invocation() -> InvocationPolicy {
     InvocationPolicy {
         admissions: vec![Admission::Compute {
-            // Keep the input bytes of the independent encoding vectors fixed.
-            evaluator: "hellas/catena-dfad87438018".into(),
+            evaluator: compute::EVALUATOR.into(),
             programs: hellas_rpc::protocol::invocation::ComputePrograms::Any {},
         }],
         limits: Limits {

@@ -395,7 +395,7 @@ The receiving device runs jobs with it directly:
 
 ```sh
 hellas transcribe --model whisper-tiny --audio speech.wav --access me.access \
-  --backend hellas/catena-325d75d20f6f-hip
+  --backend hellas/catena-dfad87438018-hip
 ```
 
 Every job command (`transcribe`, `text`, `image`, `run`, `fetch` and
