@@ -305,7 +305,6 @@ mod tests {
                 roots: hellas_rpc::http_fetch::HttpTrustRoots::WebPki,
                 spki_sha256: vec![],
             },
-            credential: None,
             max_response_bytes: 1,
         };
         let events = hellas_rpc::fetch::build_input_events_with_retention(

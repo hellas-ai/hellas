@@ -46,6 +46,7 @@ impl SessionKey<'_> {
 #[derive(Clone)]
 pub struct NodeCoordinator {
     pub(crate) store: Arc<EndpointLock<NodeStore>>,
+    configuration_gate: Arc<tokio::sync::RwLock<()>>,
     pub(crate) clock: Arc<dyn Fn() -> UnixMillis + Send + Sync>,
     pub(crate) changed: Arc<tokio::sync::Notify>,
 }
@@ -63,9 +64,21 @@ impl NodeCoordinator {
     pub fn new(store: NodeStore, clock: Arc<dyn Fn() -> UnixMillis + Send + Sync>) -> Self {
         Self {
             store: Arc::new(EndpointLock::new(store)),
+            configuration_gate: Arc::new(tokio::sync::RwLock::new(())),
             clock,
             changed: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// Keep a resource policy and its selected runtime in the same published configuration.
+    pub async fn configuration_admission(&self) -> impl Send + use<> {
+        self.configuration_gate.clone().read_owned().await
+    }
+
+    /// Hold across configuration commit, activation and publication; prepare first.
+    /// Acquire before the authority writer, as admission does.
+    pub async fn configuration_publication(&self) -> impl Send + use<> {
+        self.configuration_gate.clone().write_owned().await
     }
 
     /// Close a standalone writer after its services have drained.

@@ -104,3 +104,22 @@ async fn quarantine_ends_delivery_even_when_a_resource_keeps_old_terms() {
     );
     assert!(binding.cancellation().is_cancelled());
 }
+
+#[tokio::test]
+async fn configuration_publication_blocks_grant_admission_before_authority_lookup() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, secret) = setup_with_credential(dir.path()).await;
+    let backend = Backend::default();
+    let (service, work, _) = service(dir.path(), store, backend.clone(), &secret).await;
+    let node = service.node();
+    let publishing = node.configuration_publication().await;
+    let request = AcceptWorkRequest::default();
+    let mut acceptance = Box::pin(service.accept(&work.access, &request));
+    assert!(futures::poll!(&mut acceptance).is_pending());
+    drop(acceptance);
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+    drop(publishing);
+    let response = service.accept(&work.access, &request).await;
+    assert_eq!(refusal(response), GrantRefusalCode::Malformed);
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+}

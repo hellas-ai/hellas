@@ -3,7 +3,9 @@ use crate::{
     GatewayResult, Presentation, Route, WorkExecutionBackend, affinity::Hints, path_error,
     route::RouteExecution, routing::Routing,
 };
-use axum::{Router, body::Body, extract::Request, http::StatusCode, response::Response};
+use axum::{
+    Json, Router, body::Body, extract::Request, http::StatusCode, response::Response, routing::get,
+};
 use hellas_client::model::ModelPackage;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -45,7 +47,7 @@ pub async fn router(
     for (path, evaluators) in evaluators {
         models.insert(
             path.clone(),
-            Ok(ModelPackage::open_many(&path, evaluators)
+            Ok(ModelPackage::open_many(&path, evaluators, None)
                 .await
                 .map_err(|error| crate::GatewayError::Presentation(error.into()))?),
         );
@@ -67,6 +69,24 @@ pub async fn with_models(
     models: &Models,
 ) -> GatewayResult<(Router, BTreeMap<String, String>)> {
     let routing = Routing::new(routes, work.clone(), memory)?;
+    let model_ids: BTreeSet<_> = routing
+        .routes
+        .iter()
+        .flat_map(Route::keys)
+        .filter_map(|(_, _, model)| model)
+        .collect();
+    let discovery = serde_json::json!({
+        "object": "list",
+        "data": model_ids.into_iter().map(|id| serde_json::json!({
+            "id": id, "object": "model", "created": 0, "owned_by": "hellas"
+        })).collect::<Vec<_>>()
+    });
+    let models_methods: BTreeSet<_> = routing
+        .routes
+        .iter()
+        .flat_map(Route::keys)
+        .filter_map(|(path, method, _)| (path == "/v1/models").then_some(method))
+        .collect();
     let mut presentations = Vec::new();
     let mut errors = BTreeMap::new();
     for route in &routing.routes {
@@ -143,17 +163,25 @@ pub async fn with_models(
         };
         presentations.push(router);
     }
+    let handler = move |request| {
+        dispatch(
+            routing.clone(),
+            presentations.clone(),
+            jobs.clone(),
+            request,
+        )
+    };
+    let mut router = Router::new().fallback(handler.clone());
+    // Explicit GET passthrough wins; discovery must also leave other methods routable.
+    if !models_methods.contains("GET") {
+        let mut discovery = get(move || async move { Json(discovery) }).fallback(handler.clone());
+        if models_methods.contains("HEAD") {
+            discovery = discovery.head(handler);
+        }
+        router = router.route("/v1/models", discovery);
+    }
     Ok((
-        Router::new()
-            .fallback(move |request| {
-                dispatch(
-                    routing.clone(),
-                    presentations.clone(),
-                    jobs.clone(),
-                    request,
-                )
-            })
-            .layer(axum::extract::DefaultBodyLimit::disable()),
+        router.layer(axum::extract::DefaultBodyLimit::disable()),
         errors,
     ))
 }

@@ -420,6 +420,10 @@ async fn controlled_gateway_projects_the_shared_tls_response() {
 
 #[tokio::test]
 async fn credential_revocation_closes_the_real_upstream_tls_body() {
+    futures::future::join_all((0..16).map(|_| revoke_held_upstream())).await;
+}
+
+async fn revoke_held_upstream() {
     let held = HeldUpstream::default();
     let fixture = ShareFixtureBuilder::default()
         .with_held_upstream(held.clone())
@@ -439,7 +443,9 @@ async fn credential_revocation_closes_the_real_upstream_tls_body() {
         .unwrap()
         .unwrap();
     // Revocation reaches the client as a typed refusal after the upstream closes.
-    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::FORBIDDEN, "{body}");
     fixture.shutdown().await;
 }
 

@@ -237,6 +237,76 @@ async fn wait_for_pending_cleanup(node: &DiskStore) {
 }
 
 #[tokio::test]
+async fn stale_input_staging_preserves_reservations_and_finalized_denial_still_cleans_them() {
+    use futures::StreamExt;
+    for end in ["complete", "cancel", "denied", "stopped", "expired"] {
+        let (_root, service, node, frames) = pending_upload_fixture().await;
+        service.observe_ready(fixture::ready()).await.unwrap();
+        let connection = hellas_channel::work::admission::Cancellation::new();
+        let mut upload = service
+            .upload_stream(
+                Box::pin(futures::stream::iter(frames.into_iter().map(Ok))),
+                hellas_wire::TransportContext {
+                    open_exporter: Some([7; 32]),
+                    ..Default::default()
+                },
+                connection.clone(),
+            )
+            .await
+            .unwrap();
+        upload.next().await.unwrap().unwrap();
+        let reserved = node.stats().unwrap().outstanding;
+        assert!(reserved > 0);
+        service.suspend().await.unwrap();
+        // Input and its ACKs may finish while stale; nothing has been accepted.
+        upload.next().await.unwrap().unwrap();
+        assert_eq!(node.stats().unwrap().outstanding, reserved);
+        assert_eq!(
+            service
+                .with_state(|state| state.jobs().count())
+                .await
+                .unwrap(),
+            0
+        );
+        match end {
+            "complete" => (),
+            "cancel" => connection.cancel(),
+            "denied" => service
+                .observe_unavailable(fixture::CURSOR + 1)
+                .await
+                .unwrap(),
+            "stopped" => service.stop().await.unwrap(),
+            "expired" => {
+                fixture::observe_service(
+                    &service,
+                    fixture::authorization().acceptance_deadline + 1,
+                    hellas_kernel::PendingSlot::Absent,
+                )
+                .await
+            }
+            _ => unreachable!(),
+        }
+        if end == "complete" {
+            while let Some(progress) = upload.next().await {
+                progress.unwrap();
+            }
+            connection.cancel();
+        } else {
+            assert!(
+                tokio::time::timeout(hellas_channel::test_support::HANG_GUARD, upload.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_err(),
+                "{end} must end the input upload"
+            );
+        }
+        drop(upload);
+        wait_for_pending_cleanup(&node).await;
+    }
+}
+
+#[tokio::test]
 async fn dropping_an_incomplete_stream_releases_its_scope_and_reservation() {
     use futures::StreamExt;
     let (_root, service, node, frames) = pending_upload_fixture().await;

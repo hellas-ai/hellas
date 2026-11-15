@@ -121,7 +121,6 @@ async fn both_listeners_keep_admitted_backends_when_fetch_configuration_changes(
                                     path: template.paths[0].clone(),
                                     method: "POST".into(),
                                     url: format!("{}{}", template.origin, template.paths[0]),
-                                    credential: None,
                                     tls: template.tls.clone(),
                                     headers: vec![],
                                     max_response_bytes: template.max_response_bytes,

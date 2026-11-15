@@ -46,7 +46,6 @@ struct ContentWrite {
     changes: Arc<tokio::sync::Notify>,
     changed: futures::future::BoxFuture<'static, ()>,
     cancelled: futures::future::BoxFuture<'static, ()>,
-    timer: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
     waiting: Option<
         futures::future::BoxFuture<
             'static,
@@ -78,7 +77,6 @@ impl ContentWrite {
             changes: host.changed.clone(),
             changed: Box::pin(host.changed.clone().notified_owned()),
             cancelled: Box::pin(async move { cancellation.cancelled().await }),
-            timer: None,
             waiting: None,
         }
     }
@@ -125,25 +123,10 @@ impl hellas_wire::WriteAuthorization for ContentWrite {
                 .close
                 .store
                 .has_content_scope(self.work, self.reservation)
-            || held.check_content_authority(&self.authorization).is_err()
+            || held.check_upload_authority(&self.authorization).is_err()
         {
             self.denied = true;
             return Poll::Ready(Err(denied()));
-        }
-        if let Some(remaining) = held.observation.as_ref().and_then(Observation::remaining) {
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "inventory class C: observation expiry"
-            )]
-            let timer = self
-                .timer
-                .get_or_insert_with(|| Box::pin(tokio::time::sleep(remaining)));
-            timer
-                .as_mut()
-                .reset(tokio::time::Instant::now() + remaining);
-            let _ = timer.as_mut().poll(cx);
-        } else {
-            self.timer = None;
         }
         write(cx)
     }
@@ -356,6 +339,17 @@ where
 
 impl ProviderEndpoint {
     fn check_content_authority(&self, authorization: &PaidJobAuthorizationV2) -> Result<(), Error> {
+        self.check_upload_authority(authorization)?;
+        if let Some(observation) = &self.observation {
+            observation.check().map_err(|_| Error::Denied)?;
+        }
+        Ok(())
+    }
+
+    // Staging signed input grants no execution or result access. Its only wire
+    // responses are upload acknowledgements, so certified freshness is required
+    // at acceptance/execution, not for this bounded, connection-owned reservation.
+    fn check_upload_authority(&self, authorization: &PaidJobAuthorizationV2) -> Result<(), Error> {
         self.close
             .store
             .check_authority()
@@ -364,8 +358,10 @@ impl ProviderEndpoint {
         if self.state().terminal_by_id(work).is_some() || self.state().close_settled().is_some() {
             return Err(Error::Denied);
         }
-        if let Some(observation) = &self.observation {
-            observation.check().map_err(|_| Error::Denied)?;
+        if self.observation.as_ref().is_some_and(|observation| {
+            matches!(observation.check(), Err(EndpointError::NotAdmitting))
+        }) {
+            return Err(Error::Denied);
         }
         if let Some(job) = self
             .state()
@@ -379,10 +375,13 @@ impl ProviderEndpoint {
                 return Err(Error::Denied);
             }
         } else {
-            if self.state().close_prepared().is_some() || self.state().close_opened().is_some() {
+            if !self.accepting
+                || self.state().close_prepared().is_some()
+                || self.state().close_opened().is_some()
+            {
                 return Err(Error::Denied);
             }
-            let ready = self.admitting().map_err(|_| Error::Denied)?;
+            let ready = self.ready.as_ref().ok_or(Error::Denied)?;
             crate::job::check_authorization(
                 ready.channel(),
                 authorization,
@@ -453,7 +452,11 @@ impl WorkService {
                 Ok(move || {
                     if connection.as_ref().is_some_and(admission::Cancellation::is_cancelled) { return Err(Error::Denied); }
                     if held.state().channel().id() != channel || work_id(held.state().channel(), &authorization) != work || !held.close.store.has_content_scope(work, reservation) { return Err(Error::Denied); }
-                    held.check_content_authority(&authorization)
+                    if connection.is_some() {
+                        held.check_upload_authority(&authorization)
+                    } else {
+                        held.check_content_authority(&authorization)
+                    }
                 })
             }
         }, move || {
@@ -469,8 +472,11 @@ impl WorkService {
                 let remaining = {
                     let Ok(endpoint) = service.endpoint().await else { return; };
                     let work = work_id(endpoint.state().channel(), &authorization);
-                    if !endpoint.close.store.has_content_scope(work, reservation) || endpoint.check_content_authority(&authorization).is_err() { return; }
-                    endpoint.observation.as_ref().and_then(Observation::remaining)
+                    if !endpoint.close.store.has_content_scope(work, reservation) || endpoint.check_upload_authority(&authorization).is_err() { return; }
+                    if connection.is_some() { None } else {
+                        if endpoint.check_content_authority(&authorization).is_err() { return; }
+                        endpoint.observation.as_ref().and_then(Observation::remaining)
+                    }
                 };
                 #[expect(clippy::disallowed_methods, reason = "inventory class C: observation expiry")]
                 let expiry = async { match remaining { Some(remaining) => tokio::time::sleep(remaining).await, None => std::future::pending().await } };
@@ -547,7 +553,7 @@ impl WorkService {
                     .authenticate_proposal(&request)
                     .map_err(|error| status(error.reason))?;
                 endpoint
-                    .check_content_authority(&authorization)
+                    .check_upload_authority(&authorization)
                     .map_err(status)?;
                 let signature =
                     signature(&opening.binding_signature).ok_or_else(|| status(Error::Denied))?;
@@ -567,8 +573,9 @@ impl WorkService {
                     return Err(status(Error::Denied));
                 }
                 let policy = endpoint
-                    .admitting()
-                    .map_err(status)?
+                    .ready
+                    .as_ref()
+                    .ok_or_else(|| status(Error::Denied))?
                     .invocation_policy()
                     .clone();
                 let facts = policy.classify_manifest(&manifest).map_err(status)?;
@@ -696,7 +703,7 @@ impl WorkService {
                 if !widened && reply.complete {
                     let (closure, local, bound) = {
                         let endpoint = host.endpoint().await.map_err(status)?;
-                        endpoint.check_content_authority(&authorization).map_err(status)?;
+                        endpoint.check_upload_authority(&authorization).map_err(status)?;
                         let root_bytes = match root { Some(root) => endpoint.close.store.read_content(id, root).await.map_err(status)?, None => bytes::Bytes::new() };
                         let closure = crate::job::content_closure(&policy, &manifest, &root_bytes, authorization.input_content).map_err(status)?;
                         let (local, _) = endpoint.close.store.invocation_content(id).map_err(status)?;
@@ -705,7 +712,7 @@ impl WorkService {
                     };
                     local.acquire_missing(&bound,closure.clone()).await.map_err(status)?;
                     let mut endpoint = host.endpoint().await.map_err(status)?;
-                    endpoint.check_content_authority(&authorization).map_err(status)?;
+                    endpoint.check_upload_authority(&authorization).map_err(status)?;
                     if !endpoint.close.store.has_content_scope(id,reservation) {Err(status(Error::Denied))?;}
                     let (_, scope) = endpoint.close.store.widen_content(id, closure, policy.limits.max_upload_bytes).await.map_err(status)?;
                     if authorization.retention == hellas_rpc::Retention::Retain { endpoint.close.store.reserve_retained(id, facts.max_spool_bytes).await.map_err(status)?; }

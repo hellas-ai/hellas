@@ -24,7 +24,7 @@ use hellas_rpc::call::{WithTrailer, with_trailer as wt};
 use hellas_rpc::pb::work::{
     AcceptWorkRequest, AcceptWorkResponse, AdmitCertificateRequest, AdmitCertificateResponse,
     ExchangeSetupRequest, ExchangeSetupResponse, FundingKind, GetStandingRequest,
-    GetStandingResponse, StreamResultRequest, WorkRefusalCode, WorkRefused, WorkRoute,
+    GetStandingResponse, StreamResultRequest, WorkRoute,
 };
 use hellas_rpc::services::work::WorkHandler;
 use hellas_rpc::services::work_setup::WorkSetupHandler;
@@ -232,9 +232,9 @@ impl AcceptedWorkDriver {
         }
     }
 
-    fn admission(&self, service: WorkService, ready: ReadyChannel) -> AcceptExecution {
+    fn admission(&self, service: WorkService) -> AcceptExecution {
         let driver = self.clone();
-        Box::new(move |input, caller| {
+        Box::new(move |input, caller, ready| {
             let permit = (driver.reserve)(&BackendKey::of(input)?, caller)?;
             Ok(Box::new(move |work| {
                 driver.spawn(service, ready, work, Some(permit))
@@ -331,24 +331,10 @@ impl WorkHandler for MountedWorkService {
         request: AcceptWorkRequest,
         _context: TransportContext,
     ) -> Result<impl Into<WithTrailer<AcceptWorkResponse>> + Send, WireStatus> {
-        if let Some(response) = self.service.precheck_acceptance(&request).await {
-            return Ok(response);
-        }
-        let ready = match self.service.readiness().await {
-            Ok(ready) => ready,
-            Err(error) => {
-                debug!(%error, "channel observer is not ready for acceptance");
-                return Ok(AcceptWorkResponse::refused(WorkRefused {
-                    grant: None,
-                    code: WorkRefusalCode::NotReady as i32,
-                    reason: error.to_string(),
-                }));
-            }
-        };
         let execution = self
             .driver
             .as_ref()
-            .map(|driver| driver.admission(self.service.clone(), ready));
+            .map(|driver| driver.admission(self.service.clone()));
         let response = self.service.accept(&request, execution).await;
         Ok(response)
     }
@@ -1489,6 +1475,328 @@ mod tests {
     use super::*;
     use crate::test_support::{PaidFixture, accept_uploaded};
     use hellas_channel::work_store::JobPhase;
+    use hellas_wire::WireCode;
+
+    #[tokio::test]
+    async fn stale_observation_keeps_the_original_proposal_waiting_for_finalized_progress() {
+        use hellas_channel::model::work::{PaidJobAuthorizationV2, PrivateRecord as _, work_id};
+        use hellas_channel::work::ClientChannel as _;
+        let fixture = PaidFixture::new();
+        let service = fixture.provider().await;
+        let mut client = fixture.client().await;
+        let request = client
+            .propose(
+                &fixture.proposal(),
+                &hellas_channel::test_support::channel::program_content().await,
+                None,
+            )
+            .await
+            .unwrap();
+        let authorization = PaidJobAuthorizationV2::decode(&request.authorization).unwrap();
+        let id = work_id(fixture.ready.channel(), &authorization);
+        service.observe_ready(fixture.ready.clone()).await.unwrap();
+        service.suspend().await.unwrap();
+        let (wire, _upload) =
+            crate::test_support::upload_paid_input(&fixture, &service, &client, &request).await;
+        let mounted = MountedWorkService {
+            service: service.clone(),
+            driver: None,
+        };
+        let mut acceptance = Box::pin(wt(
+            mounted.accept_work(wire.clone(), TransportContext::default())
+        ));
+        assert!(
+            futures::poll!(&mut acceptance).is_pending(),
+            "stale observation must not abandon the signed proposal"
+        );
+        assert!(matches!(
+            service.observe_ready(fixture.ready.clone()).await,
+            Err(hellas_channel::work::EndpointError::ObservationStale)
+        ));
+        assert!(futures::poll!(&mut acceptance).is_pending());
+        assert_eq!(
+            client
+                .with_state(|state| state.job_by_id(id).unwrap().phase())
+                .await
+                .unwrap(),
+            JobPhase::HalfSigned
+        );
+        let observed = fixture.observed(2, hellas_kernel::PendingSlot::Absent);
+        service
+            .advance_close(&observed, &hellas_channel::test_support::channel::NullSink)
+            .await
+            .unwrap();
+        service
+            .observe_ready(fixture.descriptor.check_ready(&observed).unwrap())
+            .await
+            .unwrap();
+        let response = acceptance.await.unwrap().response;
+        assert_eq!(
+            client
+                .client()
+                .await
+                .unwrap()
+                .accepted(&response)
+                .await
+                .unwrap(),
+            id
+        );
+        assert_eq!(
+            service
+                .with_state(|state| state.jobs().count())
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            client
+                .with_state(|state| state.proposal_nonce_high_water())
+                .await
+                .unwrap(),
+            authorization.proposal_nonce
+        );
+        service.suspend().await.unwrap();
+        let duplicate = wt(mounted.accept_work(wire, TransportContext::default()))
+            .await
+            .unwrap()
+            .response;
+        assert_eq!(response, duplicate);
+    }
+
+    async fn paid_test_connection() -> (
+        iroh::Endpoint,
+        iroh::Endpoint,
+        iroh::endpoint::Connection,
+        iroh::endpoint::Connection,
+    ) {
+        use hellas_rpc::services::work::Work;
+        use hellas_wire::ServiceMarker as _;
+        use iroh::{Endpoint, EndpointAddr, TransportAddr, endpoint::presets};
+        let server = Endpoint::builder(presets::Minimal)
+            .alpns(vec![Work::ALPN.as_bytes().to_vec()])
+            .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let caller = Endpoint::builder(presets::Minimal)
+            .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let target = EndpointAddr::from_parts(
+            server.id(),
+            server.bound_sockets().into_iter().map(TransportAddr::Ip),
+        );
+        let (outgoing, incoming) =
+            tokio::join!(caller.connect(target, Work::ALPN.as_bytes()), async {
+                server
+                    .accept()
+                    .await
+                    .unwrap()
+                    .accept()
+                    .unwrap()
+                    .await
+                    .unwrap()
+            },);
+        let outgoing = outgoing.unwrap();
+        (caller, server, outgoing, incoming)
+    }
+
+    #[tokio::test]
+    async fn bidirectional_upload_preserves_connection_denial() {
+        use hellas_wire::{StreamTransport as _, iroh::IrohTransport};
+        let (caller, server, outgoing, incoming) = paid_test_connection().await;
+        let transport = IrohTransport::new(outgoing.clone());
+        let server_transport = IrohTransport::new(incoming.clone());
+        let mut upload = hellas_rpc::call::bidi_streaming::<
+            IrohTransport,
+            hellas_rpc::services::content::Upload,
+        >(&transport, Default::default())
+        .await
+        .unwrap();
+        let _inbound = server_transport.accept().await.unwrap().unwrap();
+        let mut writing = Box::pin(async {
+            for _ in 0..8 {
+                upload
+                    .send(hellas_rpc::pb::content::UploadRequest {
+                        part: Some(hellas_rpc::pb::content::upload_request::Part::Chunk(
+                            vec![7; 512 * 1024],
+                        )),
+                    })
+                    .await?;
+            }
+            Ok::<_, WireStatus>(())
+        });
+        assert!(futures::poll!(&mut writing).is_pending());
+        incoming.close(
+            u32::from(WireCode::PermissionDenied.as_u8()).into(),
+            b"revoked",
+        );
+        outgoing.closed().await;
+        assert_eq!(writing.await.unwrap_err().code, WireCode::PermissionDenied);
+        caller.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn disconnect_drops_waiting_paid_admission() {
+        use hellas_rpc::services::work::AcceptWork;
+        use hellas_wire::{MethodMarker as _, SendHalf as _, Stream as _, StreamTransport as _};
+        use prost::Message as _;
+
+        for disconnect_connection in [true, false] {
+            let fixture = PaidFixture::new();
+            let service = fixture.provider().await;
+            let mut client = fixture.client().await;
+            let request = client
+                .propose(
+                    &fixture.proposal(),
+                    &hellas_channel::test_support::channel::program_content().await,
+                    None,
+                )
+                .await
+                .unwrap();
+            service.observe_ready(fixture.ready.clone()).await.unwrap();
+            service.suspend().await.unwrap();
+            let mounted = MountedWorkService {
+                service: service.clone(),
+                driver: None,
+            };
+            let (caller, server, outgoing, incoming) = paid_test_connection().await;
+            let transport = hellas_wire::iroh::IrohTransport::new(outgoing.clone());
+            let (mut send, mut recv) = transport
+                .open(AcceptWork::METHOD_ID, Default::default())
+                .await
+                .unwrap()
+                .split();
+            send.send_body(request.encode_to_vec().into())
+                .await
+                .unwrap();
+            send.close_send(None).await.unwrap();
+            let server_transport = hellas_wire::iroh::IrohTransport::new(incoming.clone());
+            let inbound = server_transport.accept().await.unwrap().unwrap();
+            let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            struct DropNotice(Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for DropNotice {
+                fn drop(&mut self) {
+                    self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            let (entered, waiting) = tokio::sync::oneshot::channel();
+            let notice = DropNotice(dropped.clone());
+            let mut dispatch = Box::pin(hellas_rpc::call::dispatch_unary_with_context::<
+                hellas_wire::iroh::IrohTransport,
+                AcceptWork,
+                _,
+                _,
+                _,
+            >(inbound, |request, context| async move {
+                let _notice = notice;
+                let mut admission = Box::pin(wt(mounted.accept_work(request, context)));
+                assert!(futures::poll!(&mut admission).is_pending());
+                entered.send(()).unwrap();
+                admission.await
+            }));
+            tokio::select! {
+                result = &mut dispatch => panic!("admission did not wait: {result:?}"),
+                () = async { waiting.await.unwrap() } => {}
+            }
+            if disconnect_connection {
+                outgoing.close(0u32.into(), b"caller disconnected");
+                incoming.closed().await;
+                assert!(
+                    matches!(
+                        futures::poll!(&mut dispatch),
+                        std::task::Poll::Ready(Err(_))
+                    ),
+                    "the closed response stream must cancel waiting admission"
+                );
+            } else {
+                hellas_wire::RecvHalf::reset(&mut recv, WireCode::Cancelled);
+                assert!(dispatch.await.is_err());
+                assert!(
+                    outgoing.close_reason().is_none(),
+                    "only this RPC was cancelled"
+                );
+            }
+            assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(
+                service
+                    .with_state(|state| state.jobs().count())
+                    .await
+                    .unwrap(),
+                0
+            );
+            caller.close().await;
+            server.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn waiting_proposals_end_on_denial_shutdown_or_expiry_without_acceptance() {
+        for end in ["denied", "stopped", "quiesced", "closed", "expired"] {
+            let fixture = PaidFixture::new();
+            let service = fixture.provider().await;
+            let mut client = fixture.client().await;
+            let request = client
+                .propose(
+                    &fixture.proposal(),
+                    &hellas_channel::test_support::channel::program_content().await,
+                    None,
+                )
+                .await
+                .unwrap();
+            service.observe_ready(fixture.ready.clone()).await.unwrap();
+            service.suspend().await.unwrap();
+            let mounted = MountedWorkService {
+                service: service.clone(),
+                driver: None,
+            };
+            let mut waiting =
+                Box::pin(wt(mounted.accept_work(request, TransportContext::default())));
+            assert!(futures::poll!(&mut waiting).is_pending());
+            match end {
+                "denied" => service.observe_unavailable(2).await.unwrap(),
+                "stopped" => service.stop().await.unwrap(),
+                "quiesced" => service.quiesce().await.unwrap(),
+                "closed" => service.close().await.unwrap(),
+                "expired" => {
+                    let deadline = client
+                        .with_state(|state| {
+                            state
+                                .jobs()
+                                .next()
+                                .unwrap()
+                                .authorization()
+                                .acceptance_deadline
+                        })
+                        .await
+                        .unwrap();
+                    let observed =
+                        fixture.observed(deadline + 1, hellas_kernel::PendingSlot::Absent);
+                    service
+                        .advance_close(&observed, &hellas_channel::test_support::channel::NullSink)
+                        .await
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let response = waiting.await.unwrap().response;
+            assert!(matches!(
+                response.outcome,
+                Some(hellas_rpc::pb::work::accept_work_response::Outcome::Refused(_))
+            ));
+            assert_eq!(
+                service
+                    .with_state(|state| state.jobs().count())
+                    .await
+                    .unwrap(),
+                0
+            );
+        }
+    }
 
     /// Every durable acceptance is dispatched after a restart, not only
     /// a lone one. The running gate is the duplicate-execution barrier;

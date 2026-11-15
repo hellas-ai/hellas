@@ -60,6 +60,31 @@ pub struct Header {
 /// Tensor data is not read; every returned range is checked against file length.
 pub fn read_header<R: Read + Seek>(input: &mut R) -> Result<Header, Error> {
     let file_bytes = input.seek(SeekFrom::End(0))?;
+    read_header_for_bytes(input, file_bytes, file_bytes)
+}
+
+/// A descriptor keeps exactly the header, but its ranges name a separate asset.
+#[cfg(feature = "models")]
+pub(super) fn read_descriptor<R: Read + Seek>(
+    input: &mut R,
+    weights_bytes: u64,
+) -> Result<Header, Error> {
+    let file_bytes = input.seek(SeekFrom::End(0))?;
+    bounded(file_bytes, MAX_HEADER_BYTES, "header bytes")?;
+    let header = read_header_for_bytes(input, file_bytes, weights_bytes)?;
+    if file_bytes != header.data_offset {
+        return Err(Error::Invalid(
+            "descriptor must contain only the GGUF header",
+        ));
+    }
+    Ok(header)
+}
+
+fn read_header_for_bytes<R: Read + Seek>(
+    input: &mut R,
+    file_bytes: u64,
+    weights_bytes: u64,
+) -> Result<Header, Error> {
     input.seek(SeekFrom::Start(0))?;
     let mut reader = HeaderReader {
         input,
@@ -166,7 +191,7 @@ pub fn read_header<R: Read + Seek>(input: &mut R) -> Result<Header, Error> {
             .offset
             .checked_add(tensor.bytes)
             .ok_or(Error::Invalid("tensor range overflow"))?;
-        if end > file_bytes {
+        if end > weights_bytes {
             return Err(Error::Invalid("tensor range exceeds file"));
         }
         ranges.push((tensor.offset, end));

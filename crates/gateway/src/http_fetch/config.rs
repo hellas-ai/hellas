@@ -10,7 +10,6 @@ pub struct HttpRoute {
     pub path: String,
     pub method: String,
     pub url: String,
-    pub credential: Option<String>,
     #[serde(default = "public_tls")]
     pub tls: HttpTls,
     #[serde(default)]
@@ -55,7 +54,7 @@ impl HttpRoute {
             .iter()
             .all(|(name, _)| !credential_header(name)))
         {
-            return Err(crate::GatewayConfigError::CredentialAlias.into());
+            return Err(crate::GatewayConfigError::CredentialHeader.into());
         }
         route.request(Bytes::new(), &HeaderMap::new())?.validate()?;
         Ok(())
@@ -100,7 +99,6 @@ impl HttpRoute {
             headers,
             body_base64: STANDARD.encode(body),
             tls: self.tls.clone(),
-            credential: self.credential.clone(),
             max_response_bytes: self.max_response_bytes,
         })
     }

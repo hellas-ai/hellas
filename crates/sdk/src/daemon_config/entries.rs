@@ -41,49 +41,44 @@ impl Document {
         else {
             return Err("backend is not an HTTP upstream".into());
         };
-        let api = credentials
-            .get("api")
-            .ok_or("upstream has no model API credential")?;
+        let [api] = credentials.as_slice() else {
+            return Err("model API needs one credential scope".into());
+        };
+        if api.allowed_paths.iter().any(|path| !path.contains("/v1/")) {
+            return Err("model API needs a /v1/ path".into());
+        }
         let [origin] = api.allowed_origins.as_slice() else {
             return Err("model API needs one origin".into());
         };
         let routes = api
             .allowed_paths
             .iter()
-            .map(|upstream_path| {
-                let suffix = upstream_path
-                    .rsplit_once("/v1/")
-                    .ok_or("model API needs a /v1/ path")?
-                    .1;
-                Ok(Route {
-                    backends: vec![id.into()],
-                    presentation: Presentation::Http {
-                        targets: [(
-                            id.into(),
-                            HttpTarget {
-                                service: service.clone(),
-                                method: method.clone(),
-                                route: HttpRoute {
-                                    path: format!("/v1/{suffix}"),
-                                    method: "POST".into(),
-                                    url: format!("{origin}{upstream_path}"),
-                                    credential: Some("api".into()),
-                                    tls: HttpTls {
-                                        roots: api.trust_roots.clone(),
-                                        spki_sha256: vec![],
-                                    },
-                                    headers: vec![],
-                                    max_response_bytes:
-                                        hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES,
-                                    models: Some(vec![model.into()]),
+            .map(|upstream_path| Route {
+                backends: vec![id.into()],
+                presentation: Presentation::Http {
+                    targets: [(
+                        id.into(),
+                        HttpTarget {
+                            service: service.clone(),
+                            method: method.clone(),
+                            route: HttpRoute {
+                                path: crate::gateway_work::http_route_path(upstream_path).into(),
+                                method: "POST".into(),
+                                url: format!("{origin}{upstream_path}"),
+                                tls: HttpTls {
+                                    roots: api.trust_roots.clone(),
+                                    spki_sha256: vec![],
                                 },
+                                headers: vec![],
+                                max_response_bytes: hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES,
+                                models: Some(vec![model.into()]),
                             },
-                        )]
-                        .into(),
-                    },
-                })
+                        },
+                    )]
+                    .into(),
+                },
             })
-            .collect::<Result<Vec<_>, crate::daemon::Error>>()?;
+            .collect::<Vec<_>>();
         for route in routes {
             self.add_route(route)?;
         }
@@ -157,20 +152,16 @@ impl Upstream {
         Ok(Self::Http {
             allowed_hosts: vec![parsed.host_str().ok_or("upstream has no host")?.into()],
             allow_private_addresses: false,
-            credentials: [(
-                "api".into(),
-                Credential {
-                    trust_roots: hellas_rpc::http_fetch::HttpTrustRoots::WebPki,
-                    allowed_origins: vec![parsed.origin().ascii_serialization()],
-                    allowed_paths: ["responses", "chat/completions", "completions"]
-                        .map(|path| format!("{base}/v1/{path}"))
-                        .into(),
-                    allowed_methods: vec!["POST".into()],
-                    header_name: "authorization".into(),
-                    secret: secret.as_ref().map(|key| format!("Bearer {key}")),
-                },
-            )]
-            .into(),
+            credentials: vec![Credential {
+                trust_roots: hellas_rpc::http_fetch::HttpTrustRoots::WebPki,
+                allowed_origins: vec![parsed.origin().ascii_serialization()],
+                allowed_paths: ["responses", "chat/completions", "completions"]
+                    .map(|path| format!("{base}/v1/{path}"))
+                    .into(),
+                allowed_methods: vec!["POST".into()],
+                header_name: "authorization".into(),
+                secret: secret.as_ref().map(|key| format!("Bearer {key}")),
+            }],
         })
     }
 }

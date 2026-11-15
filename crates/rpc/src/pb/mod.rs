@@ -157,14 +157,14 @@ mod id_pins {
         use super::services::work::{
             AcceptWork, AdmitCertificate, GetStanding, Open, StreamResult, Work,
         };
-        // Removing Work.UploadContent deliberately rotates the Work descriptor.
-        // Content.Upload now carries scoped uploads; surviving method schemas stay stable.
-        assert_eq!(<Work as ServiceMarker>::SERVICE_ID, 0x69dc2ebd);
+        // Removing GrantRefusalCode::Credential rotates Work and every method
+        // whose response contains WorkRefused. Open has no refusal and stays stable.
+        assert_eq!(<Work as ServiceMarker>::SERVICE_ID, 0xcc363e2b);
         assert_eq!(<Open as MethodMarker>::METHOD_ID, 0x93cb0b39);
-        assert_eq!(<AcceptWork as MethodMarker>::METHOD_ID, 0x5188734e);
-        assert_eq!(<GetStanding as MethodMarker>::METHOD_ID, 0x64b53882);
-        assert_eq!(<StreamResult as MethodMarker>::METHOD_ID, 0x6f992f60);
-        assert_eq!(<AdmitCertificate as MethodMarker>::METHOD_ID, 0x07db8b8e);
+        assert_eq!(<AcceptWork as MethodMarker>::METHOD_ID, 0x2148fd40);
+        assert_eq!(<GetStanding as MethodMarker>::METHOD_ID, 0x6f6bc033);
+        assert_eq!(<StreamResult as MethodMarker>::METHOD_ID, 0xe127ef67);
+        assert_eq!(<AdmitCertificate as MethodMarker>::METHOD_ID, 0x7d9a26a8);
     }
 
     /// The handshake carrier is its own service, so its ids are its own.
@@ -178,10 +178,11 @@ mod id_pins {
     #[test]
     fn work_setup_ids_are_stable() {
         use super::services::work_setup::{ExchangeSetup, Open, RequestOffer, WorkSetup};
-        // RequestOffer deliberately rotates the setup service descriptor.
-        assert_eq!(<WorkSetup as ServiceMarker>::SERVICE_ID, 0x0fb60b29);
+        // ExchangeSetup carries WorkRefused, so removing the credential refusal
+        // rotates its method and service IDs. Open and RequestOffer stay stable.
+        assert_eq!(<WorkSetup as ServiceMarker>::SERVICE_ID, 0x402f81f7);
         assert_eq!(<Open as MethodMarker>::METHOD_ID, 0xcbe4ebd5);
-        assert_eq!(<ExchangeSetup as MethodMarker>::METHOD_ID, 0x14d05693);
+        assert_eq!(<ExchangeSetup as MethodMarker>::METHOD_ID, 0x22ad0cc7);
         assert_eq!(<RequestOffer as MethodMarker>::METHOD_ID, 0x97c491fd);
     }
 

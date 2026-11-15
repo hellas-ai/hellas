@@ -160,10 +160,10 @@ async fn send_request<S: SendHalf, R: RecvHalf, Q: Message>(
     let written = async {
         send.send_body(buf.freeze())
             .await
-            .map_err(|e| WireStatus::internal(format!("send: {e}")))?;
+            .map_err(|error| write_to_status("send", error))?;
         send.close_send(None)
             .await
-            .map_err(|e| WireStatus::internal(format!("close_send: {e}")))
+            .map_err(|error| write_to_status("close_send", error))
     }
     .await;
     if let Err(error) = written {
@@ -287,6 +287,18 @@ where
     result
 }
 
+fn write_to_status<E: std::error::Error + 'static>(operation: &str, error: E) -> WireStatus {
+    let code = if (&error as &dyn std::error::Error)
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+    {
+        WireCode::PermissionDenied
+    } else {
+        WireCode::Internal
+    };
+    WireStatus::new(code, format!("{operation}: {error}"))
+}
+
 fn transport_to_status<E: std::error::Error>(err: E) -> WireStatus {
     WireStatus::new(WireCode::Unavailable, err.to_string())
 }
@@ -388,7 +400,7 @@ where
             this.send
                 .send_body(payload)
                 .await
-                .map_err(|e| WireStatus::internal(format!("send: {e}")))
+                .map_err(|error| write_to_status("send", error))
         })
     }
 
@@ -401,7 +413,7 @@ where
             this.send
                 .close_send(trailer)
                 .await
-                .map_err(|e| WireStatus::internal(format!("close_send: {e}")))
+                .map_err(|error| write_to_status("close_send", error))
         })
     }
 
@@ -988,7 +1000,8 @@ where
             }
             let request = M::Request::decode(&req_bytes[..])
                 .map_err(|error| TransportError::Protocol(format!("prost decode: {error}")))?;
-            let handled = handler(request, inbound.context).await;
+            let handled =
+                await_response(&mut send, handler(request, inbound.context), &operation).await?;
             if let Some(ms) = worked.ms() {
                 tracing::event!(
                     name: "response_worker_ms",
@@ -1056,6 +1069,20 @@ async fn write_trailer<S: SendHalf>(
     Ok(())
 }
 
+async fn await_response<S: SendHalf, F: std::future::Future>(
+    send: &mut S,
+    handler: F,
+    call: &CallSpan,
+) -> Result<F::Output, TransportError> {
+    match futures_util::future::select(Box::pin(handler), Box::pin(send.stopped())).await {
+        futures_util::future::Either::Left((response, _)) => Ok(response),
+        futures_util::future::Either::Right(_) => {
+            call.finish(WireCode::Cancelled);
+            Err(TransportError::Io("response consumer disconnected".into()))
+        }
+    }
+}
+
 async fn write_unary_response<S: SendHalf, R: Message>(
     send: &mut S,
     result: Result<WithTrailer<R>, WireStatus>,
@@ -1098,18 +1125,7 @@ async fn write_streaming_response<S: SendHalf, R: Message>(
             .map_err(|error| TransportError::Io(format!("response authority: {error}")))?;
     }
     loop {
-        let next = match futures_util::future::select(
-            Box::pin(responses.next()),
-            Box::pin(send.stopped()),
-        )
-        .await
-        {
-            futures_util::future::Either::Left((next, _)) => next,
-            futures_util::future::Either::Right(_) => {
-                call.finish(WireCode::Cancelled);
-                return Err(TransportError::Io("response consumer disconnected".into()));
-            }
-        };
+        let next = await_response(send, responses.next(), call).await?;
         let Some(response) = next else {
             break;
         };
@@ -1181,12 +1197,8 @@ where
             let request = M::Request::decode(&req_bytes[..])
                 .map_err(|e| TransportError::Protocol(format!("prost decode: {e}")))?;
 
-            write_unary_response(
-                &mut send,
-                handler(request, context).await.map(Into::into),
-                &operation,
-            )
-            .await
+            let handled = await_response(&mut send, handler(request, context), &operation).await?;
+            write_unary_response(&mut send, handled.map(Into::into), &operation).await
         },
         span,
     )
@@ -1561,6 +1573,31 @@ mod streaming_call_tests {
         fn reset(&mut self, code: WireCode) {
             *self.state.reset.lock().unwrap() = Some(code);
         }
+    }
+
+    #[tokio::test]
+    async fn streaming_upload_preserves_write_denials() {
+        struct Denied;
+        impl SendHalf for Denied {
+            type Error = std::io::Error;
+            async fn send_body(&mut self, _: Bytes) -> Result<(), Self::Error> {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            }
+            async fn close_send(&mut self, _: Option<Trailer>) -> Result<(), Self::Error> {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            }
+            fn reset(&mut self, _: WireCode) {}
+        }
+        let mut sink =
+            StreamingSink::<U32Msg>::new(Denied, CallSpan::new(tracing::Span::none()), None);
+        assert_eq!(
+            sink.send(U32Msg { x: 1 }).await.unwrap_err().code,
+            WireCode::PermissionDenied
+        );
+        assert_eq!(
+            sink.close().await.unwrap_err().code,
+            WireCode::PermissionDenied
+        );
     }
 
     #[tokio::test]

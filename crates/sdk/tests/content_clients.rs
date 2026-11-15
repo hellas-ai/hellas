@@ -42,10 +42,12 @@ fn content() -> (LocalStore, Scope) {
 #[tokio::test]
 async fn native_grant_session_transfers_accepts_and_delivers_without_payload_files() {
     let f = Fixture::new(false).await;
-    let mut session =
-        GrantSession::open(f.options(vec![]), GrantTransport::Local(f.service.clone()))
-            .await
-            .unwrap();
+    let mut session = GrantSession::open(
+        f.options(vec![]),
+        GrantTransport::Local(f.service.clone().into()),
+    )
+    .await
+    .unwrap();
     let result = session
         .run("responses", f.input(), &content(), None, None, None)
         .await
@@ -191,10 +193,12 @@ async fn remote_pending_upload_is_released_when_the_authenticated_work_connectio
 #[tokio::test]
 async fn missing_local_compute_root_never_journals_a_grant_proposal() {
     let f = Fixture::new(true).await;
-    let mut session =
-        GrantSession::open(f.options(vec![]), GrantTransport::Local(f.service.clone()))
-            .await
-            .unwrap();
+    let mut session = GrantSession::open(
+        f.options(vec![]),
+        GrantTransport::Local(f.service.clone().into()),
+    )
+    .await
+    .unwrap();
     let mut input = hellas_channel::test_support::channel::bundle(1);
     input.request.retain = false;
     input.request.runner_public_key = principal(2).1.public_key();
