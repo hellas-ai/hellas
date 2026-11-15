@@ -97,7 +97,6 @@ impl From<&NodeStoreError> for WorkRefused {
                 TemplateError::Origin => C::Origin,
                 TemplateError::PathMethod => C::PathMethod,
                 TemplateError::Tls => C::Tls,
-                TemplateError::Credential => C::Credential,
                 TemplateError::Headers => C::Headers,
                 TemplateError::GenerationCap => C::GenerationCap,
                 TemplateError::StreamUsage => C::StreamUsage,

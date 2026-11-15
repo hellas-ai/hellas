@@ -15,7 +15,7 @@ enum Case {
     Origin,
     Path,
     TlsRoots,
-    Credential,
+    Headers,
     Paused,
 }
 struct RefusalWorld {
@@ -82,14 +82,13 @@ impl Case {
             Self::OutOfScope => {
                 request.authorization.work_policy_digest = Digest::hash(b"ungranted policy")
             }
-            Self::Origin | Self::Path | Self::TlsRoots | Self::Credential | Self::Model => {
+            Self::Origin | Self::Path | Self::TlsRoots | Self::Headers | Self::Model => {
                 let mut http = HttpFetchRequest {
                     url: "https://glm.test/v1/chat/completions".into(),
                     method: "POST".into(),
                     headers: vec![],
                     body_base64: "eyJtYXhfdG9rZW5zIjo4fQ==".into(),
                     tls: resource.tls,
-                    credential: None,
                     max_response_bytes: 4096,
                 };
                 match self {
@@ -100,7 +99,9 @@ impl Case {
                             der_base64: vec!["AQ==".into()],
                         }
                     }
-                    Self::Credential => http.credential = Some("other-account".into()),
+                    Self::Headers => http
+                        .headers
+                        .push(("authorization".into(), "caller-key".into())),
                     Self::Model => {
                         use base64::Engine as _;
                         http.body_base64 = base64::engine::general_purpose::STANDARD
@@ -178,7 +179,7 @@ async fn grant_refusals_preserve_the_typed_reason() {
         (Case::Origin, C::Origin),
         (Case::Path, C::PathMethod),
         (Case::TlsRoots, C::Tls),
-        (Case::Credential, C::Credential),
+        (Case::Headers, C::Headers),
         (Case::Paused, C::Paused),
     ] {
         let directory = tempfile::tempdir().unwrap();

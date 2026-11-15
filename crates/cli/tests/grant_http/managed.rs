@@ -3,6 +3,35 @@ use super::*;
 use hellas_sdk::node_control::bootstrap::Invitation;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn same_home_owner_pairs_and_administers_the_daemon() {
+    let root = tempfile::tempdir().unwrap();
+    let owner = Cli::new(root.path(), "owner", ROOT_PASSKEY);
+    let mut process = owner.spawn(&["serve", "--port", "0"], "same-home.log");
+    let encoded = process.wait_for("hellas-invite:").await;
+    let invite = format!("hellas-invite:{encoded}");
+    let invitation = Invitation::decode(&invite).unwrap();
+    owner.run(&["pair", &invite, "--name", "mine"]).await;
+    process.wait_for("Daemon ready;").await;
+    let provider = process.wait_for("Provider: ").await;
+    let address: hellas_sdk::client::ProviderAddress = provider.parse().unwrap();
+    assert_eq!(address.node, invitation.node);
+    assert_eq!(
+        address.enrollment.to_string(),
+        owner.run(&["identity", "show-enrollment-id"]).await.trim()
+    );
+    for args in [&["admin", "status"][..], &["routes"][..]] {
+        let output = owner.output(args).await;
+        assert!(
+            output.status.success(),
+            "{args:?}: {}\ndaemon: {}",
+            String::from_utf8_lossy(&output.stderr),
+            std::fs::read_to_string(&process.log).unwrap()
+        );
+    }
+    process.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn paired_owner_configures_routes_and_restart_preserves_them() {
     let occupied = std::net::TcpListener::bind("127.0.0.1:8080").unwrap();
     let root = tempfile::tempdir().unwrap();

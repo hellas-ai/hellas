@@ -27,39 +27,48 @@ pub struct ImageArgs {
     output: PathBuf,
 }
 
-pub async fn image(args: ImageArgs, context: Context) -> super::super::CliResult<()> {
-    let request = ImageRequest {
-        prompt: &args.prompt,
-        seed: args.seed,
-        width: args.width,
-        height: args.height,
-        steps: args.steps,
-    };
-    request.validate()?;
-    let evaluator = args.target.renderer()?;
-    let package = ModelPackage::open(&args.model, &evaluator).await?;
-    let rendered = package.render_job(&ModelRequest::Image(request)).await?;
-    let mut target = args.target;
-    target.models = vec![args.model.clone()];
-    run_quoted(
-        &args.client,
-        target,
-        &context,
-        args.pay,
-        None,
-        async |price| compute_job(price, evaluator, rendered).await,
-        |directory| Some(directory.join("result")),
-        |_, completed, _| {
-            let ModelResponse::Image(image) = package.decode(&completed.output)? else {
-                bail!("expected image");
+pub async fn image(mut args: ImageArgs, context: Context) -> super::super::CliResult<()> {
+    context
+        .model_command(async {
+            args.target.models = vec![args.model.clone()];
+            let request = ImageRequest {
+                prompt: &args.prompt,
+                seed: args.seed,
+                width: args.width,
+                height: args.height,
+                steps: args.steps,
             };
-            std::fs::write(&args.output, image.png(args.width, args.height)?)?;
-            println!("{}", args.output.display());
-            std::io::stdout().lock().flush()?;
-            Ok(())
-        },
-    )
-    .await
+            request.validate()?;
+            let evaluator = args.target.renderer()?;
+            let content = args.target.content(&context).await?;
+            let package =
+                ModelPackage::open_many(&args.model, [evaluator.clone()], content.as_ref())
+                    .await?
+                    .remove(&evaluator)
+                    .context("model evaluator is not prepared")?;
+            let rendered = package.render_job(&ModelRequest::Image(request)).await?;
+            let target = args.target;
+            run_quoted(
+                &args.client,
+                target,
+                &context,
+                args.pay,
+                None,
+                async |price| compute_job(price, evaluator, rendered).await,
+                |directory| Some(directory.join("result")),
+                |_, completed, _| {
+                    let ModelResponse::Image(image) = package.decode(&completed.output)? else {
+                        bail!("expected image");
+                    };
+                    std::fs::write(&args.output, image.png(args.width, args.height)?)?;
+                    println!("{}", args.output.display());
+                    std::io::stdout().lock().flush()?;
+                    Ok(())
+                },
+            )
+            .await
+        })
+        .await
 }
 
 #[cfg(test)]

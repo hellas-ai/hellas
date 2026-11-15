@@ -16,7 +16,7 @@ fn resource() -> HttpsResource {
         origin: "https://glm.lan:8443".into(),
         paths: vec!["/v1/chat/completions".into()],
         methods: vec!["POST".into()],
-        credential: Some("glm".into()),
+        account_backed: true,
         tls: http_fetch::HttpTls {
             roots: http_fetch::HttpTrustRoots::Certificates {
                 der_base64: vec![STANDARD.encode(b"fixture DER")],
@@ -37,7 +37,6 @@ fn request(body: serde_json::Value) -> http_fetch::HttpFetchRequest {
         headers: vec![],
         body_base64: STANDARD.encode(serde_json::to_vec(&body).unwrap()),
         tls: r.tls,
-        credential: r.credential,
         max_response_bytes: r.max_response_bytes,
     }
 }
@@ -55,14 +54,16 @@ fn signed_template_is_exact_and_only_client_repairs_generation() {
         (0, TemplateError::Origin),
         (1, TemplateError::PathMethod),
         (2, TemplateError::Tls),
-        (3, TemplateError::Credential),
+        (3, TemplateError::Headers),
     ] {
         let mut altered = req.clone();
         match field {
             0 => altered.url = "https://elsewhere.lan/v1/chat/completions".into(),
             1 => altered.method = "GET".into(),
             2 => altered.tls.roots = http_fetch::HttpTrustRoots::WebPki,
-            _ => altered.credential = None,
+            _ => altered
+                .headers
+                .push(("authorization".into(), "caller-key".into())),
         };
         assert_eq!(r.matches(&altered), Err(expected));
     }
@@ -429,4 +430,17 @@ fn contacts_explicitly_refuse_unsupported_roots_and_keys() {
             Err(GrantError::UnsupportedKey)
         ));
     }
+}
+
+#[test]
+fn account_backed_resources_require_consent() {
+    let mut offer = https_offer();
+    offer.grant.allow_account_backed = false;
+    assert_eq!(offer.grant.validate(), Err(GrantError::AccountBacked));
+    offer.grant.policies[0]
+        .https
+        .as_mut()
+        .unwrap()
+        .account_backed = false;
+    offer.grant.validate().unwrap();
 }

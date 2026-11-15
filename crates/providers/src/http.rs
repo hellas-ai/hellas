@@ -17,7 +17,6 @@ use reqwest::{
     header::{HeaderName, HeaderValue},
 };
 use std::{
-    collections::BTreeMap,
     net::{IpAddr, SocketAddr},
     sync::Arc,
     time::Duration,
@@ -69,7 +68,7 @@ impl std::fmt::Debug for HttpCredential {
 pub struct HttpFetchProvider {
     environment: ContentId,
     policy: HttpEgressPolicy,
-    credentials: Arc<BTreeMap<String, HttpCredential>>,
+    credentials: Arc<Vec<HttpCredential>>,
     clients: Arc<clients::Clients>,
 }
 
@@ -80,7 +79,7 @@ fn fault(message: &'static str) -> FetchProviderError {
 impl HttpFetchProvider {
     pub fn new(
         policy: HttpEgressPolicy,
-        credentials: BTreeMap<String, HttpCredential>,
+        credentials: Vec<HttpCredential>,
     ) -> Result<Self, FetchProviderError> {
         if policy.allow_private_addresses && policy.allowed_hosts.is_empty() {
             return Err(fault("private egress requires an explicit host allowlist"));
@@ -95,20 +94,35 @@ impl HttpFetchProvider {
                 return Err(fault("egress hosts must be canonical names without ports"));
             }
         }
-        for (alias, credential) in &credentials {
+        for (index, credential) in credentials.iter().enumerate() {
+            if credentials[..index].iter().any(|other| {
+                credential
+                    .allowed_origins
+                    .iter()
+                    .any(|value| other.allowed_origins.contains(value))
+                    && credential
+                        .allowed_paths
+                        .iter()
+                        .any(|value| other.allowed_paths.contains(value))
+                    && credential
+                        .allowed_methods
+                        .iter()
+                        .any(|value| other.allowed_methods.contains(value))
+            }) {
+                return Err(fault("overlapping HTTP credential scopes"));
+            }
             hellas_rpc::http_fetch::HttpTls {
                 roots: credential.trust_roots.clone(),
                 spki_sha256: vec![],
             }
             .validate()
             .map_err(|_| fault("invalid credential trust roots"))?;
-            if alias.is_empty()
-                || credential.allowed_origins.is_empty()
+            if credential.allowed_origins.is_empty()
                 || credential.allowed_paths.is_empty()
                 || credential.allowed_methods.is_empty()
             {
                 return Err(fault(
-                    "credential requires an alias, exact origins, paths and methods",
+                    "credential requires exact origins, paths and methods",
                 ));
             }
             check_headers(&[(credential.header_name.clone(), String::new())], true)
@@ -160,26 +174,18 @@ impl HttpFetchProvider {
         request: &HttpFetchRequest,
         url: &Url,
     ) -> Result<Option<&HttpCredential>, FetchProviderError> {
-        let Some(alias) = &request.credential else {
+        let Some(credential) = self.credentials.iter().find(|credential| {
+            credential
+                .allowed_origins
+                .contains(&url.origin().ascii_serialization())
+                && credential
+                    .allowed_paths
+                    .iter()
+                    .any(|path| path == url.path())
+                && credential.allowed_methods.contains(&request.method)
+        }) else {
             return Ok(None);
         };
-        let credential = self
-            .credentials
-            .get(alias)
-            .ok_or_else(|| fault("unknown credential alias"))?;
-        if !credential
-            .allowed_origins
-            .contains(&url.origin().ascii_serialization())
-            || !credential
-                .allowed_paths
-                .iter()
-                .any(|path| path == url.path())
-            || !credential.allowed_methods.contains(&request.method)
-        {
-            return Err(fault(
-                "credential is not authorized for this URL and method",
-            ));
-        }
         // A caller-controlled CA could impersonate the allowed origin and
         // steal its credential. Only the operator selects this trust boundary;
         // additional caller pins can narrow it, never replace its roots.

@@ -430,33 +430,6 @@ pub fn input_uploads(
     (wire, frames)
 }
 
-pub async fn accept_uploaded(
-    endpoint: &mut crate::work::ProviderEndpoint,
-    request: &hellas_rpc::pb::work::AcceptWorkRequest,
-) -> hellas_rpc::pb::work::AcceptWorkResponse {
-    let (wire, _) = fixture_uploads(endpoint.state().channel(), request);
-    let reference = hellas_rpc::protocol::content::decode_reference(&wire.prepared_input);
-    let bytes =
-        if hellas_rpc::protocol::content::decode_reference(&request.prepared_input).is_none() {
-            Some(request.prepared_input.clone())
-        } else {
-            reference.and_then(|reference| {
-                (0..=u8::MAX)
-                    .map(bundle_bytes)
-                    .find(|bytes| hellas_rpc::ContentRef::for_bytes(bytes) == reference)
-            })
-        };
-    if let Some(bytes) = bytes
-        && let Ok(authorization) =
-            <PaidJobAuthorizationV2 as crate::model::work::PrivateRecord>::decode(
-                &wire.authorization,
-            )
-    {
-        seed_content(endpoint.fixture_store(), authorization, bytes.into()).await;
-    }
-    endpoint.accept(&wire, None).await
-}
-
 pub async fn accept_uploaded_service(
     service: &crate::work::WorkService,
     request: &hellas_rpc::pb::work::AcceptWorkRequest,
@@ -1151,7 +1124,6 @@ pub fn fetch_bundle(nonce: u8) -> PreparedInvocation {
             roots: hellas_rpc::http_fetch::HttpTrustRoots::WebPki,
             spki_sha256: vec![],
         },
-        credential: None,
         max_response_bytes: 128,
     })
     .unwrap();

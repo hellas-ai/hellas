@@ -17,8 +17,8 @@ pub use error::PaidClientError;
 pub use funding::{RecoveredFundingChannel, recover_funding_channels, recover_funding_intent};
 pub use offer::{PaidQuote, request_paid_quote};
 pub use settlement::{
-    FinalizedChannelSettlement, RetainedSettlementChannel, finalized_channel_settlement,
-    retained_settlement_channels, settle_channel,
+    FinalizedChannelSettlement, RetainedSettlementChannel, channel_is_settled,
+    finalized_channel_settlement, retained_settlement_channels, settle_channel,
 };
 type Result<T, E = PaidClientError> = std::result::Result<T, E>;
 use crate::client_owner::ClientOwner;

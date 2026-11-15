@@ -190,7 +190,7 @@ pub fn chat_resource(origin: &str, max_output_tokens: u64) -> resource::HttpsRes
         origin: origin.into(),
         paths: vec!["/v1/chat/completions".into()],
         methods: vec!["POST".into()],
-        credential: None,
+        account_backed: false,
         tls: hellas_rpc::http_fetch::HttpTls {
             roots: hellas_rpc::http_fetch::HttpTrustRoots::WebPki,
             spki_sha256: vec![],
@@ -315,7 +315,6 @@ pub fn proposal_for(
             headers: vec![],
             body_base64: "eyJtYXhfdG9rZW5zIjo4fQ==".into(),
             tls: resource.tls.clone(),
-            credential: resource.credential.clone(),
             max_response_bytes: resource.max_response_bytes,
         })
         .unwrap()

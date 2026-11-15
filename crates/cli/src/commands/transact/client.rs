@@ -1,7 +1,5 @@
 use super::{ClientArgs, Context};
-use hellas_sdk::paid_client::{
-    finalized_channel_settlement, retained_settlement_channels, settle_channel,
-};
+use hellas_sdk::paid_client::{channel_is_settled, retained_settlement_channels, settle_channel};
 use hellas_sdk::work_config::WorkConfig;
 type CliResult<T> = super::super::CliResult<T>;
 
@@ -42,14 +40,13 @@ pub(super) async fn settle(args: &ClientArgs, context: &Context) -> CliResult<()
             config.clone(),
             content.clone(),
         )?;
-        if finalized_channel_settlement(
+        if channel_is_settled(
             &options,
             channel.bond,
             owner,
             context.settlement.party_key(),
         )
         .await?
-        .is_some()
         {
             continue;
         }

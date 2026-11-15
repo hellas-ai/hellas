@@ -142,10 +142,12 @@ impl TextState {
         if default_max_tokens == 0 {
             return Err(crate::GatewayConfigError::MaxTokens.into());
         }
-        let presentation = tokio::task::spawn_blocking(move || TextPresentation::from_gguf(&path))
-            .await
-            .map_err(crate::GatewayError::Task)?
-            .map_err(|error| crate::GatewayError::Presentation(error.into()))?;
+        let presentation = tokio::task::spawn_blocking(move || {
+            TextPresentation::from_gguf(&hellas_client::model::ModelPackage::gguf_path(&path)?)
+        })
+        .await
+        .map_err(crate::GatewayError::Task)?
+        .map_err(|error| crate::GatewayError::Presentation(error.into()))?;
         Ok(Self {
             inference_metrics: super::backend::telemetry::InferenceMetrics::new(),
             default_max_tokens,

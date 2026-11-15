@@ -146,8 +146,7 @@ pub async fn run(
             "daemon addressing requires --profile"
         );
         let reconcile = args.content_config.is_some();
-        let loaded =
-            crate::content_configuration::ContentConfiguration::load(args.content_config, vec![])?;
+        let loaded = crate::content_configuration::ContentConfiguration::load(args.content_config)?;
         let config = loaded.config().clone();
         if let StoreCommand::Index { paths, recheck } = args.command {
             return index(&config, home, paths, recheck).await;

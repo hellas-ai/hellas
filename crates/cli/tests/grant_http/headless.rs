@@ -50,6 +50,25 @@ async fn headless_gateway_hands_its_bearer_to_an_authenticated_client() {
     let client = reqwest::Client::new();
     assert_eq!(
         client
+            .get(format!("{address}/v1/models"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    let discovery = client
+        .get(format!("{address}/v1/models"))
+        .bearer_auth(token.trim())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(discovery.status(), reqwest::StatusCode::OK);
+    let models: Value = discovery.json().await.unwrap();
+    assert_eq!(models["data"].as_array().unwrap().len(), 1);
+    assert_eq!(models["data"][0]["id"], "model");
+    assert_eq!(
+        client
             .post(format!("{address}/v1/chat/completions"))
             .send()
             .await

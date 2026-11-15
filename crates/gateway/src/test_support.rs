@@ -55,6 +55,7 @@ pub async fn execution(
             work.backends()
                 .into_iter()
                 .filter_map(|backend| backend.evaluator),
+            None,
         )
         .await
         .unwrap(),

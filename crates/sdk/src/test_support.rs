@@ -442,6 +442,28 @@ pub async fn accept_uploaded(
     client: &hellas_channel::work::ClientService,
     request: &hellas_rpc::pb::work::AcceptWorkRequest,
 ) -> hellas_rpc::pb::work::AcceptWorkResponse {
+    let (wire, upload) = upload_paid_input(fixture, service, client, request).await;
+    let response = service.accept(&wire, None).await;
+    drop(upload);
+    tokio::time::timeout(hellas_channel::test_support::HANG_GUARD, async {
+        while service.content_upload_count().await.unwrap() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    response
+}
+
+pub async fn upload_paid_input(
+    fixture: &PaidFixture,
+    service: &hellas_channel::work::WorkService,
+    client: &hellas_channel::work::ClientService,
+    request: &hellas_rpc::pb::work::AcceptWorkRequest,
+) -> (
+    hellas_rpc::pb::work::AcceptWorkRequest,
+    hellas_channel::work::admission::CancelOnFailure,
+) {
     use hellas_channel::model::work::{
         PaidJobAuthorizationV2, PrivateRecord as _, signing_hash, work_id,
     };
@@ -481,16 +503,7 @@ pub async fn accept_uploaded(
     })
     .await
     .expect("fresh positive acceptance completes its content upload");
-    let response = service.accept(&wire, None).await;
-    connection.cancel();
-    tokio::time::timeout(hellas_channel::test_support::HANG_GUARD, async {
-        while service.content_upload_count().await.unwrap() != 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    response
+    (wire, _stop)
 }
 
 /// Drive one real generic stream, respecting complete-on-Open for cached objects.

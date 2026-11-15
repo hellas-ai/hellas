@@ -8,8 +8,8 @@ use hellas_presentation::{ChatMessage, TextPresentation};
 pub struct TextArgs {
     #[command(flatten)]
     client: ClientArgs,
-    /// Qwen GGUF; the provider holds the same weights.
-    #[arg(long, value_name = "FILE")]
+    /// Qwen GGUF or descriptor; the provider holds the matching weights.
+    #[arg(long, value_name = "PATH")]
     model: PathBuf,
     #[arg(long)]
     prompt: String,
@@ -26,42 +26,51 @@ pub struct TextArgs {
     output: Option<PathBuf>,
 }
 
-pub async fn text(args: TextArgs, context: Context) -> super::super::CliResult<()> {
-    let evaluator = args.target.renderer()?;
-    let (package, presentation, rendered) = prepare(&args, &evaluator).await?;
-    let mut target = args.target;
-    target.models = vec![args.model.clone()];
-    run_quoted(
-        &args.client,
-        target,
-        &context,
-        args.pay,
-        None,
-        async |price| compute_job(price, evaluator, rendered).await,
-        |_| args.output.clone(),
-        |_, completed, _| {
-            let ModelResponse::Tokens(tokens) = package.decode(&completed.output)? else {
-                bail!("expected generated tokens");
-            };
-            println!("{}", presentation.decode(&tokens)?);
-            std::io::stdout().lock().flush()?;
-            Ok(())
-        },
-    )
-    .await
+pub async fn text(mut args: TextArgs, context: Context) -> super::super::CliResult<()> {
+    context
+        .model_command(async {
+            args.target.models = vec![args.model.clone()];
+            let evaluator = args.target.renderer()?;
+            let content = args.target.content(&context).await?;
+            let (package, presentation, rendered) =
+                prepare(&args, &evaluator, content.as_ref()).await?;
+            let target = args.target;
+            run_quoted(
+                &args.client,
+                target,
+                &context,
+                args.pay,
+                None,
+                async |price| compute_job(price, evaluator, rendered).await,
+                |_| args.output.clone(),
+                |_, completed, _| {
+                    let ModelResponse::Tokens(tokens) = package.decode(&completed.output)? else {
+                        bail!("expected generated tokens");
+                    };
+                    println!("{}", presentation.decode(&tokens)?);
+                    std::io::stdout().lock().flush()?;
+                    Ok(())
+                },
+            )
+            .await
+        })
+        .await
 }
 
 async fn prepare(
     args: &TextArgs,
     evaluator: &str,
+    content: Option<&hellas_store::content::DiskStore>,
 ) -> anyhow::Result<(
-    ModelPackage,
+    Arc<ModelPackage>,
     TextPresentation,
     hellas_client::model::ComputeJob,
 )> {
     let model = args.model.clone();
-    let presentation =
-        tokio::task::spawn_blocking(move || TextPresentation::from_gguf(&model)).await??;
+    let presentation = tokio::task::spawn_blocking(move || {
+        TextPresentation::from_gguf(&ModelPackage::gguf_path(&model)?)
+    })
+    .await??;
     let messages: Vec<_> = args
         .system
         .iter()
@@ -78,7 +87,10 @@ async fn prepare(
         .into_iter()
         .map(u64::from)
         .collect();
-    let package = ModelPackage::open(&args.model, evaluator).await?;
+    let package = ModelPackage::open_many(&args.model, [evaluator.to_owned()], content)
+        .await?
+        .remove(evaluator)
+        .context("model evaluator is not prepared")?;
     let rendered = package
         .render_job(&ModelRequest::Text {
             prompt_ids: &prompt,
@@ -122,7 +134,7 @@ mod tests {
             };
             args
         };
-        let render = async |args: TextArgs| prepare(&args, &args.target.renderer()?).await;
+        let render = async |args: TextArgs| prepare(&args, &args.target.renderer()?, None).await;
         let (_, presentation, job) = render(parse(&[])).await.unwrap();
         let (_, _, with_system) = render(parse(&["--system", "be brief"])).await.unwrap();
         assert_ne!(job.inputs, with_system.inputs);

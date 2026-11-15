@@ -1,6 +1,6 @@
 use super::{Result, Runtime};
 use crate::daemon_config::{BackendKind, Document, ResourceKind};
-use hellas_client::model::{ModelKind, ModelPackage};
+use hellas_client::model::ModelPackage;
 use hellas_gateway::{BackendInfo, Presentation, router::Models};
 use hellas_rpc::ContentRef;
 use std::{
@@ -42,27 +42,16 @@ impl Runtime {
                     cached.packages.clear();
                     cached.files = files;
                 }
-                let weights = match ModelKind::of(&path) {
-                    ModelKind::Text => Some(path.clone()),
-                    ModelKind::Transcription => {
-                        Some(path.join(hellas_client::model::whisper::WEIGHTS_FILE))
-                    }
-                    ModelKind::Image => None,
-                }
-                .map(|path| {
-                    cached
-                        .files
-                        .get(&path)
-                        .copied()
-                        .ok_or("model weights were not inspected")
-                })
-                .transpose()?;
-                for evaluator in &evaluators {
-                    if !cached.packages.contains_key(evaluator) {
-                        let package =
-                            ModelPackage::open_with_weights(&path, evaluator, weights).await?;
-                        cached.packages.insert(evaluator.clone(), Arc::new(package));
-                    }
+                let missing = evaluators
+                    .iter()
+                    .filter(|evaluator| !cached.packages.contains_key(*evaluator))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !missing.is_empty() {
+                    cached.packages.extend(
+                        ModelPackage::open_many(&path, missing, Some(&self.options.content))
+                            .await?,
+                    );
                 }
                 Ok(cached
                     .packages
@@ -80,7 +69,7 @@ impl Runtime {
             let BackendKind::Local { content, .. } = &backend.kind else {
                 continue;
             };
-            let mut paths: BTreeSet<_> = content.iter().cloned().collect();
+            let mut paths = BTreeSet::new();
             paths.extend(
                 document
                     .routes
@@ -101,6 +90,14 @@ impl Runtime {
                         _ => None,
                     }),
             );
+            if let Err(error) = paths
+                .iter()
+                .try_for_each(|path| ModelPackage::require_local_weights(path))
+            {
+                index.insert(id.clone(), Err(error.to_string()));
+                continue;
+            }
+            paths.extend(content.iter().cloned());
             index.insert(
                 id.clone(),
                 self.options

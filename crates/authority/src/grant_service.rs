@@ -401,6 +401,7 @@ impl GrantService {
         }
     }
     async fn accept(&self, access: &Access, request: &AcceptWorkRequest) -> AcceptWorkResponse {
+        let admission = self.node.configuration_admission().await;
         // Durable acceptance, RAM transfer and execution ownership complete
         // together even when the caller drops its response future.
         let service = self.clone();
@@ -411,6 +412,7 @@ impl GrantService {
             .try_with(Clone::clone)
             .ok();
         tokio::spawn(async move {
+            let _admission = admission;
             let run = async {
                 let result = service.accept_inner(&access, &request).await;
                 AcceptWorkResponse {

@@ -173,13 +173,18 @@ enum Commands {
         output: PathBuf,
     },
     /// Print the program manifest a model's jobs run, which `serve
-    /// --program` admits: a Qwen GGUF or a converted Whisper package.
+    /// --program` admits: a Qwen GGUF, converted Whisper package, or descriptor.
     Program {
         #[arg(value_name = "PATH")]
         model: PathBuf,
         /// The registered renderer (evaluator id) the program is compiled for.
         #[arg(long, value_name = "EVALUATOR")]
         backend: String,
+    },
+    /// Prepare model metadata for rendering jobs on another machine.
+    Model {
+        #[command(subcommand)]
+        command: commands::model::ModelCommand,
     },
     /// Transcribe one WAV with a client-rendered Whisper job.
     Transcribe(commands::transact::TranscribeArgs),
@@ -380,6 +385,15 @@ async fn async_main() {
                 .await
                 .and_then(|package| package.program())
                 .map(|program| println!("{program}"));
+            tracer_provider.shutdown();
+            if let Err(error) = result {
+                eprintln!("error: {error:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        Commands::Model { command } => {
+            let result = commands::model::run(command).await;
             tracer_provider.shutdown();
             if let Err(error) = result {
                 eprintln!("error: {error:#}");
@@ -623,6 +637,7 @@ async fn async_main() {
             .await
         }
         Commands::ConvertWhisper { .. }
+        | Commands::Model { .. }
         | Commands::ConvertFlux { .. }
         | Commands::Program { .. } => {
             unreachable!("model commands handled before identity load")

@@ -242,7 +242,6 @@ fn prepared_for(
         method: "GET".into(),
         headers: vec![],
         body_base64: String::new(),
-        credential: None,
         tls: crate::http_fetch::HttpTls {
             roots: crate::http_fetch::HttpTrustRoots::WebPki,
             spki_sha256: if pinned {

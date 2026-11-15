@@ -7,7 +7,7 @@ use hellas_rpc::{
     services::work::{Open, Work, WorkServer},
 };
 use hellas_wire::{
-    Dispatcher, Inbound, MethodMarker, ServiceMarker, Stream, StreamTransport, TransportError,
+    Dispatcher, Inbound, MethodMarker, ServiceMarker, StreamTransport, TransportError,
     iroh::IrohTransport,
 };
 use iroh::endpoint::Connection;
@@ -187,7 +187,7 @@ impl Dispatcher<IrohTransport> for WorkConnection {
     type Error = TransportError;
     async fn dispatch(
         &self,
-        mut inbound: Inbound<<IrohTransport as StreamTransport>::Stream>,
+        inbound: Inbound<<IrohTransport as StreamTransport>::Stream>,
     ) -> Result<(), Self::Error> {
         let authenticated = inbound.context.open_exporter == Some(self.exporter)
             && match &self.server.0.funding {
@@ -195,10 +195,13 @@ impl Dispatcher<IrohTransport> for WorkConnection {
                 Funding::Payment(_) => true,
             };
         if !authenticated {
-            inbound.stream.reset(WireCode::PermissionDenied);
-            self._lease
-                .connection
-                .close(0u32.into(), b"Work session invalid");
+            // Connection revocation also ends already-running streams. Preserve
+            // its authorization refusal for every receiver, rather than racing
+            // a generic reset against their individual terminal responses.
+            self._lease.connection.close(
+                u32::from(WireCode::PermissionDenied.as_u8()).into(),
+                b"Work session invalid",
+            );
             return Err(TransportError::Protocol(
                 "Work session is no longer authenticated".into(),
             ));
