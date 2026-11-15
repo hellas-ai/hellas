@@ -100,6 +100,8 @@ implicitly. Declarative startup's retained local control profile lives at
 `--control-socket HOME/provider/control.sock` for later operator edits. The next
 declarative restart restores the declared document. Preserve the whole home
 across restarts; losing the authority journal after initialization fails closed.
+The initial local credential uses the standard one-year owner scope; automatic
+credential renewal is not implemented.
 
 Home Manager can run the stateful service on Darwin:
 

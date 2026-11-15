@@ -726,12 +726,12 @@ pub async fn serve(
     options.remote_control = hellas_sdk::node_control::RemoteControlAdmission::credential_gated();
     let start = if let Some(state) = desired {
         let (caller, authorization) = approval.context("missing startup approval")?;
-        Start::Reconcile {
+        Start::Reconcile(Box::new(Reconciliation {
             document: state.document,
             caller,
             authorization,
-            paid_policy: state.paid_policy.map(Box::new),
-        }
+            paid_policy: state.paid_policy,
+        }))
     } else if node.configuration().await?.is_some() {
         Start::Restore(port)
     } else {
@@ -781,12 +781,13 @@ pub async fn serve(
 enum Start {
     Transient(Document),
     Restore(Option<u16>),
-    Reconcile {
-        document: Document,
-        caller: hellas_auth::authority::AuthenticatedCaller,
-        authorization: hellas_auth::authority::GrantId,
-        paid_policy: Option<Box<hellas_channel::model::paid_policy::PaidPolicy>>,
-    },
+    Reconcile(Box<Reconciliation>),
+}
+struct Reconciliation {
+    document: Document,
+    caller: hellas_auth::authority::AuthenticatedCaller,
+    authorization: hellas_auth::authority::GrantId,
+    paid_policy: Option<hellas_channel::model::paid_policy::PaidPolicy>,
 }
 
 async fn run_daemon(
@@ -801,18 +802,19 @@ async fn run_daemon(
         let core = match start {
             Start::Transient(document) => hellas_sdk::daemon::Core::open(options, document).await,
             Start::Restore(port) => hellas_sdk::daemon::Core::restore(options, port).await,
-            Start::Reconcile {
-                document,
-                caller,
-                authorization,
-                paid_policy,
-            } => {
+            Start::Reconcile(start) => {
+                let Reconciliation {
+                    document,
+                    caller,
+                    authorization,
+                    paid_policy,
+                } = *start;
                 hellas_sdk::daemon::Core::reconcile(
                     options,
                     document,
                     caller,
                     authorization,
-                    paid_policy.map(|policy| *policy),
+                    paid_policy,
                 )
                 .await
             }
