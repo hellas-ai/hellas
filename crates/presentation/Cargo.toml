@@ -13,8 +13,8 @@ catena-models.workspace = true
 hellas-adaptors.workspace = true
 hellas-rpc = { workspace = true, features = ["execute"] }
 jsonschema = { version = "0.49", default-features = false }
-minijinja = { version = "2", features = ["json", "loop_controls"] }
-minijinja-contrib = { version = "2", features = ["pycompat"] }
+minijinja = { version = "3", features = ["json", "loop_controls"] }
+minijinja-contrib = { version = "3", features = ["pycompat"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
