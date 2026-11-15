@@ -104,6 +104,26 @@ async fn paid_policy_requires_owner_passkey_and_current_revision_and_survives_ch
     assert_eq!(first.policy, paid());
     assert_eq!(first.revision, Revision(1));
     assert!(matches!(
+        node.reconcile_paid_policy(&daily, GrantId([0; 16]), Some(paid()))
+            .await,
+        Err(NodeStoreError::Authority(
+            hellas_auth::authority::AuthorityError::StepUp
+        ))
+    ));
+    node.reconcile_paid_policy(&admin.caller, GrantId([0; 16]), Some(paid()))
+        .await
+        .unwrap();
+    assert_eq!(node.paid_policy().await.unwrap(), Some(first.clone()));
+    let mut invalid = paid();
+    invalid.jobs_per_channel = 0;
+    assert!(
+        node.reconcile_paid_policy(&admin.caller, GrantId([0; 16]), Some(invalid))
+            .await
+            .is_err()
+    );
+    assert_eq!(node.paid_policy().await.unwrap(), Some(first.clone()));
+
+    assert!(matches!(
         admin.command(command(0)).await,
         Err(NodeStoreError::Authority(
             hellas_auth::authority::AuthorityError::Revision
@@ -114,6 +134,24 @@ async fn paid_policy_requires_owner_passkey_and_current_revision_and_survives_ch
     let current = node.paid_policy().await.unwrap().unwrap();
     assert_eq!(current.revision, Revision(2));
     assert_ne!(current.policy_salt, first.policy_salt);
+    node.reconcile_paid_policy(&admin.caller, GrantId([0; 16]), None)
+        .await
+        .unwrap();
+    let disabled = node.paid_policy().await.unwrap().unwrap();
+    assert!(!disabled.enabled);
+    assert_eq!(disabled.revision, Revision(3));
+    assert_eq!(disabled.policy_salt, current.policy_salt);
+    node.reconcile_paid_policy(&admin.caller, GrantId([0; 16]), None)
+        .await
+        .unwrap();
+    assert_eq!(node.paid_policy().await.unwrap(), Some(disabled));
+    node.reconcile_paid_policy(&admin.caller, GrantId([0; 16]), Some(paid()))
+        .await
+        .unwrap();
+    let current = node.paid_policy().await.unwrap().unwrap();
+    assert!(current.enabled);
+    assert_eq!(current.revision, Revision(4));
+
     let held = node.writer().await.unwrap();
     let restored =
         crate::work_store::grant::State::restore(held.state().snapshot().unwrap()).unwrap();

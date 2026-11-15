@@ -112,8 +112,11 @@ enum Commands {
     },
     /// Administer node authority and settings.
     Admin(commands::admin::AdminArgs),
-    /// Run the stateful daemon, configured live through backend and route verbs.
+    /// Run the stateful daemon, with live edits or declarative desired state.
     Serve {
+        /// Reconcile a TOML daemon configuration and optional owner-approved paid terms.
+        #[arg(long = "config", conflicts_with = "port")]
+        config_file: Option<std::path::PathBuf>,
         #[arg(long)]
         port: Option<u16>,
         #[cfg(feature = "otel")]
@@ -123,7 +126,7 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1")]
         metrics_addr: std::net::IpAddr,
     },
-    /// Serve models and upstreams from flags, without saving routing configuration.
+    /// Serve a TOML configuration without saving routing configuration.
     Gateway {
         #[command(flatten)]
         args: commands::daemon::GatewayArgs,
@@ -489,7 +492,9 @@ async fn async_main() {
             commands::store::run(args, &home, Some(&local_identity), passkey).await
         }
 
-        Commands::Serve { port, .. } => {
+        Commands::Serve {
+            port, config_file, ..
+        } => {
             async {
                 commands::daemon::serve(
                     &home,
@@ -497,6 +502,7 @@ async fn async_main() {
                     owner.as_ref(),
                     &selected_chain,
                     port,
+                    config_file,
                     #[cfg(feature = "otel")]
                     metrics,
                 )

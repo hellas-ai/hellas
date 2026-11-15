@@ -20,31 +20,86 @@ Catena runs inside an isolated worker. Local daemon backends select CUDA when
 an NVIDIA device is present and HIP otherwise. The NixOS module supplies the
 matching toolchain and device access.
 
-A declarative HTTP deployment runs the stateless gateway with flags:
+A declarative HTTP deployment runs the stateless gateway from TOML settings:
 
 ```nix
 services.hellas.gateway = {
   enable = true;
-  models = [ "/srv/models/qwen3.gguf" "gpt-5@openrouter" ];
-  upstreams.openrouter = {
-    url = "https://openrouter.ai/api";
-    keyFile = "/run/secrets/openrouter.key";
+  settings = {
+    models = [ "/srv/models/qwen3.gguf" "gpt-5@openrouter" ];
+    upstreams.openrouter = {
+      url = "https://openrouter.ai/api";
+      key_file = "/run/secrets/openrouter.key";
+    };
+    listeners.api = { kind = "http"; bind = "127.0.0.1:8080"; zdr = true; };
   };
 };
 ```
 
-The module renders `--model`, `--upstream` and `--bind` arguments. It never
-writes a routing file or invokes stateful backend/route verbs. Model packages
-and API key files remain runtime paths outside the Nix store. Provision private
-files for the service user; do not interpolate Nix paths or call
-`builtins.readFile` on secrets. The gateway keeps its HTTP bearer in memory;
+The module generates the shared TOML configuration and runs `gateway --config`.
+Model packages and API key files remain runtime paths outside the Nix store.
+Provision private files for the service user; do not interpolate Nix paths or
+call `builtins.readFile` on secrets. The gateway keeps its HTTP bearer in memory;
 use `gateway.extraArgs = [ "--wrap" "COMMAND" ];` to pass it to a child.
 
-For a persistent node, enable `services.hellas.enable`. Pair the node's invite,
-then manage its journaled document with `hellas backend`, `hellas route` and
-`hellas routes`. These edits are operator actions, not NixOS reload commands.
-The home, chain selection, passkey, metrics and environment remain module
-options; routing belongs to the daemon document.
+For a declarative persistent provider:
+
+```nix
+services.hellas = {
+  enable = true;
+  passkey = "/run/secrets/hellas-owner.passkey";
+  settings = {
+    models = [ "/srv/models/qwen3.gguf" "/srv/models/whisper-tiny" ];
+    listeners.work = {
+      kind = "iroh";
+      port = 31145;
+      backends = [ "local" ];
+    };
+    execution = {
+      queue_capacity = 1;
+      session_programs = 1;
+      session_asset_bytes = 1516744736;
+    };
+  };
+};
+```
+
+`settings` becomes TOML passed to `serve --config`. The first start approves
+ownership with the provisioned software passkey without a pairing prompt.
+Subsequent starts reconcile the complete routing document, retaining identity,
+credentials, payment journals, budgets and outstanding duties. Identical
+configuration does not advance its revision. Removed routes and listeners are
+removed. Execution bounds apply on restart; live control edits cannot change
+them. Several model routes share the same serialized local GPU executor.
+
+Put paid offer terms in `settings.paid_policy`, using the policy fields from
+[the paid-work guide](paid-gateway.md). The owner authenticates each startup;
+unchanged paid terms retain their revision and salt. Removing `paid_policy`
+disables new automatic offers while preserving funded channels and recovery.
+Configuration and paid terms have separate journal commits; interrupted startup
+converges on retry. Startup never requests faucet coins or delegates stake.
+Fund the owner and delegate stake to the node's settlement key explicitly as
+described in that guide.
+
+Both services also accept `configFile = "/run/hellas.toml"` for an externally
+provisioned TOML file. It is mutually exclusive with `settings`. Configure firewall access explicitly
+with `networking.firewall.allowedTCPPorts` / `allowedUDPPorts` to match the
+listener addresses and ports in TOML. The module rejects
+embedded `secret`/`access` values and store paths in settings. Use runtime key
+files (`upstreams.NAME.key_file`), or a private runtime configFile when raw
+credential-bearing backend definitions are necessary. Such a file must be
+readable only by its intended service user. With a runtime configFile, provision
+its model mounts and any additional service sandbox paths separately.
+
+Without settings/configFile, `services.hellas.enable` retains the interactive
+mode: pair its invite, then use `hellas backend`, `hellas route` and
+`hellas routes`. An existing paired authority without the local startup
+credential is refused by `serve --config`; it is never replaced or recovered
+implicitly. Declarative startup's retained local control profile lives at
+`HOME/provider/startup-profile/profile.json`; pass it with `--profile` and use
+`--control-socket HOME/provider/control.sock` for later operator edits. The next
+declarative restart restores the declared document. Preserve the whole home
+across restarts; losing the authority journal after initialization fails closed.
 
 Home Manager can run the stateful service on Darwin:
 

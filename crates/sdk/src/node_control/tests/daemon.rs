@@ -1163,3 +1163,44 @@ async fn configuration_publication_keeps_admission_closed_until_snapshot_swap() 
     f.node.close().await;
     f.content.close().await;
 }
+
+#[tokio::test]
+async fn execution_bounds_change_only_at_owner_approved_startup() {
+    hellas_authority::test_support::within(async {
+        let f = fixture().await;
+        let core = Core::open(options(&f), Document::default()).await.unwrap();
+        let (_client, _server, connection, rpc, served) = connect(&f, core.clone()).await;
+        let mut document = Document::default();
+        document.execution.queue_capacity = std::num::NonZeroUsize::new(1);
+        document.execution.session_programs = std::num::NonZeroUsize::new(1);
+        document.execution.session_asset_bytes = std::num::NonZeroU64::new(1516744736);
+        let error = rpc.configure(request(&document, 0)).await.unwrap_err();
+        assert!(error.to_string().contains("restart"), "{error}");
+        assert!(f.node.configuration().await.unwrap().is_none());
+        connection.close(0u32.into(), b"done");
+        let _ = served.await;
+        core.shutdown().await.unwrap();
+        let caller = f
+            .node
+            .authenticate_session(&f.secret, SessionKey::Passkey(&ROOT.passkey()))
+            .await
+            .unwrap();
+        let core = Core::reconcile(options(&f), document.clone(), caller, ROOT_GRANT, None)
+            .await
+            .unwrap();
+        assert_eq!(core.watch().0.revision, Revision(1));
+        assert_eq!(core.watch().0.document.execution, document.execution);
+        core.shutdown().await.unwrap();
+        let caller = f
+            .node
+            .authenticate_session(&f.secret, SessionKey::Passkey(&ROOT.passkey()))
+            .await
+            .unwrap();
+        let core = Core::reconcile(options(&f), document, caller, ROOT_GRANT, None)
+            .await
+            .unwrap();
+        assert_eq!(core.watch().0.revision, Revision(1));
+        core.shutdown().await.unwrap();
+    })
+    .await;
+}

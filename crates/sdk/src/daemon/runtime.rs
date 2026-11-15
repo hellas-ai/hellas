@@ -279,8 +279,11 @@ impl Runtime {
     pub async fn open_backend(
         &self,
         configured: &crate::daemon_config::Backend,
+        execution: &crate::daemon_config::Execution,
         counters: Arc<crate::counter_store::FilesystemAssertionCounterStore>,
     ) -> Result<PreparedBackend> {
+        #[cfg(not(feature = "compute"))]
+        let _ = execution;
         let (backend, evaluator) = match &configured.kind {
             BackendKind::Fetch { .. } => (
                 configured.open_fetch(self.options.signer.clone()).await?,
@@ -404,20 +407,26 @@ impl Runtime {
                         .unwrap_or_else(hellas_executor::catena::default_gpu);
                     let evaluator = hellas_executor::catena::evaluator(dialect);
                     let mut executors = self.executors.lock().await;
-                    let backend = match executors.entry(evaluator.clone()) {
-                        std::collections::btree_map::Entry::Occupied(entry) => entry.get().clone(),
-                        std::collections::btree_map::Entry::Vacant(entry) => entry
-                            .insert(
-                                crate::execution::local::spawn(
-                                    self.options.signer.clone(),
-                                    hellas_executor::GpuConfig {
-                                        backend: dialect,
-                                        ..Default::default()
-                                    },
-                                )
-                                .await?,
-                            )
-                            .clone(),
+                    let backend = if let Some(backend) = executors.get(&evaluator) {
+                        backend.clone()
+                    } else {
+                        let mut config = hellas_executor::ExecutorSpawnConfig::new(
+                            self.options.signer.clone(),
+                            Default::default(),
+                        );
+                        config.gpu_config.backend = dialect;
+                        if let Some(value) = execution.queue_capacity {
+                            config.queue_capacity = value.get();
+                        }
+                        if let Some(value) = execution.session_programs {
+                            config.gpu_config.session_programs = value.get();
+                        }
+                        if let Some(value) = execution.session_asset_bytes {
+                            config.gpu_config.session_asset_bytes = value.get();
+                        }
+                        let backend = hellas_executor::Executor::spawn_configured(config).await?;
+                        executors.insert(evaluator.clone(), backend.clone());
+                        backend
                     };
                     drop(executors);
                     (

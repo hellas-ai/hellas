@@ -1,10 +1,10 @@
 //! One live configuration, with preparation before the journal's commit point.
-use crate::daemon_config::{Document, Listener};
+use crate::daemon_config::{BackendKind, Document, Listener};
 use crate::{BackendEntry, ExecutorGateway};
 use arc_swap::ArcSwap;
 use axum::{Router, extract::Request, response::Response};
 use futures::FutureExt;
-use hellas_auth::authority::{AuthenticatedSession, GrantId, Revision};
+use hellas_auth::authority::{AuthenticatedCaller, AuthenticatedSession, GrantId, Revision};
 use hellas_authority::{model::grant::configuration::ConfigurationDocument, node::NodeCoordinator};
 use hellas_gateway::{
     WorkExecutionBackend,
@@ -189,7 +189,44 @@ impl Core {
 
     /// Apply an explicit process startup port as a journaled edit before listening.
     pub async fn restore(options: Options, port: Option<u16>) -> Result<Arc<Self>> {
-        let (mut document, revision) = match options.node.configuration().await? {
+        Self::restore_document(options, port, None, None).await
+    }
+
+    /// Reconcile owner-approved startup configuration before exposing listeners.
+    pub async fn reconcile(
+        options: Options,
+        document: Document,
+        caller: AuthenticatedCaller,
+        authorization: GrantId,
+        paid_policy: Option<hellas_channel::model::paid_policy::PaidPolicy>,
+    ) -> Result<Arc<Self>> {
+        options
+            .node
+            .authorize_configure(&caller, authorization)
+            .await?;
+        if caller.subject() != options.node.owner().await? {
+            return Err("startup configuration requires the authority owner".into());
+        }
+        Self::restore_document(
+            options,
+            None,
+            Some(document),
+            Some((caller, authorization, paid_policy)),
+        )
+        .await
+    }
+
+    async fn restore_document(
+        options: Options,
+        port: Option<u16>,
+        desired: Option<Document>,
+        approval: Option<(
+            AuthenticatedCaller,
+            GrantId,
+            Option<hellas_channel::model::paid_policy::PaidPolicy>,
+        )>,
+    ) -> Result<Arc<Self>> {
+        let (saved, revision) = match options.node.configuration().await? {
             Some(stored) => {
                 let mut document: Document = serde_json::from_str(&stored.document)?;
                 document.restore_secrets(&stored.secrets);
@@ -197,7 +234,9 @@ impl Core {
             }
             None => (Document::default(), Revision(0)),
         };
-        let mut changed = false;
+        let explicit = desired.is_some();
+        let mut document = desired.unwrap_or_else(|| saved.clone());
+        document.retain_secrets(&saved);
         if let Some(port) = port {
             let listener = document
                 .listeners
@@ -205,7 +244,6 @@ impl Core {
                 .find(|listener| matches!(listener, Listener::Iroh { .. }));
             match listener {
                 Some(Listener::Iroh { port: saved, .. }) => {
-                    changed = *saved != port;
                     *saved = port;
                 }
                 _ => {
@@ -217,10 +255,10 @@ impl Core {
                             backends: vec![],
                         },
                     );
-                    changed = true;
                 }
             }
         }
+        let changed = document != saved;
         let core = Self::new(options, revision).await?;
         let next = if changed {
             revision.next().ok_or("configuration revision overflow")?
@@ -228,9 +266,18 @@ impl Core {
             revision
         };
         let candidate = core.prepare(document, BTreeMap::new(), next).await?;
+        let configuration = if explicit {
+            candidate.configuration(&core)?
+        } else {
+            core.node().resource_configuration().await?
+        };
+        if let Some((caller, authorization, policy)) = approval {
+            core.node()
+                .reconcile_paid_policy(&caller, authorization, policy)
+                .await?;
+        }
         if changed {
             let (redacted, secrets) = candidate.document.redacted();
-            let configuration = core.node().resource_configuration().await?;
             core.node()
                 .configure_startup(
                     ConfigurationDocument {
@@ -361,6 +408,9 @@ impl Core {
         if current.revision != expected {
             return Err("configuration revision changed".into());
         }
+        if document.execution != current.document.execution {
+            return Err("execution bounds require a daemon restart".into());
+        }
         document.retain_secrets(&current.document);
         let revision = expected.next().ok_or("configuration revision overflow")?;
         let secrets = document.redacted().1;
@@ -464,7 +514,9 @@ impl Core {
             if entries.contains_key(id) {
                 continue;
             }
-            let unchanged = old.document.backends.get(id) == Some(backend);
+            let unchanged = old.document.backends.get(id) == Some(backend)
+                && (!matches!(backend.kind, BackendKind::Local { .. })
+                    || old.document.execution == document.execution);
             let approved = match old.work.backend(id) {
                 Some(active) if unchanged => self
                     .runtime
@@ -478,7 +530,7 @@ impl Core {
                 entries.insert(
                     id.clone(),
                     self.runtime
-                        .open_backend(backend, counters.clone())
+                        .open_backend(backend, &document.execution, counters.clone())
                         .await
                         .unwrap_or_else(|error| {
                             runtime::PreparedBackend::unavailable(
@@ -501,6 +553,7 @@ impl Core {
                 document.backends[&backend.id].kind,
                 crate::daemon_config::BackendKind::Local { .. }
             ) && old.document.backends.get(&backend.id) == document.backends.get(&backend.id)
+                && old.document.execution == document.execution
                 && let Some(previous) = old_info.iter().find(|old| old.id == backend.id)
             {
                 backend.instance = previous.instance;

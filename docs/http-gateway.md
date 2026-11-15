@@ -65,7 +65,8 @@ executes with meaningless results.
 `NAME@UPSTREAM` selects a named OpenAI-compatible HTTPS endpoint. Its key file
 is read once and the key remains write-only in the configuration. Startup
 prints a table of model, modality, API path, backend, state and jobs in flight.
-There are no routing files or per-modality flags.
+The same model selection is available in a TOML service configuration; there
+are no per-modality flags.
 
 The default HTTP address is `127.0.0.1:8080`; `--bind ADDRESS:PORT` changes it.
 Every request requires a scoped `gateway.invoke` bearer. The foreground
@@ -92,6 +93,63 @@ The parent directory must exist. The file is replaced atomically with mode
 startup fails. The NixOS gateway unit writes `/run/hellas-gateway/bearer` inside
 its private runtime directory; an administrator can read it for an authorized
 client. The bearer changes on restart.
+
+## Shared TOML configuration
+
+For repeatable startup, both forms accept `--config PATH`:
+
+```toml
+models = ["/srv/models/qwen3.gguf", "/srv/models/whisper-tiny", "gpt-5@api"]
+
+[upstreams.api]
+url = "https://api.example.com/v1"
+key_file = "/run/secrets/api.key"
+
+[listeners.api]
+kind = "http"
+bind = "127.0.0.1:8080"
+zdr = true
+```
+
+```sh
+hellas gateway --config gateway.toml --wrap claude
+```
+
+`gateway --config` requires exactly one HTTP listener named `api`. It rejects
+paid provider terms and cannot be mixed with `--model`, `--upstream` or `--bind`.
+The existing flags remain useful for foreground use and compile into the same
+daemon document. The gateway retains its ephemeral HTTP authority and bearer
+behavior; it does not journal routing configuration.
+
+The TOML schema is the SDK's daemon document (`listeners`, `backends`, `routes`,
+`resources`, `machine`, `budgets`, `limits`, `execution`), plus `models`,
+`upstreams` and optional `paid_policy`. Models and upstreams are resolved into
+that document with the same logic as route/backend edits. Paths name prepared
+local packages or descriptors; conversion and acquisition remain separate
+commands. Multiple local model routes share a serialized executor for each
+evaluator, rather than running GPU jobs concurrently.
+
+`execution.queue_capacity`, `execution.session_programs` and
+`execution.session_asset_bytes` are positive bounds for the local executor;
+absent values use native defaults. Changing them requires a daemon restart.
+For a provider add an iroh listener, for example:
+
+```toml
+[listeners.work]
+kind = "iroh"
+port = 31145
+backends = ["local"]
+```
+
+`hellas --passkey /run/secrets/owner.passkey serve --config provider.toml`
+approves a fresh local authority without a pairing prompt, then reconciles the
+complete document before listening. The software passkey, saved approval and
+initial credential remain runtime data. Identical restarts retain revisions;
+changes and removals are journaled while identity, payment state, usage and
+outstanding duties survive. `--config` conflicts with `serve --port`; declare
+the listener port in TOML. Existing paired authorities without a local startup
+credential are refused rather than replaced. See [Nix deployments](nix.md) for
+paid terms, runtime paths and retained control-profile details.
 
 ## Persistent service
 

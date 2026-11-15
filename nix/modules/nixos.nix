@@ -24,18 +24,74 @@ let
     || normalizedPath == normalizedRoot
     || lib.hasPrefix "${normalizedRoot}/" normalizedPath;
   outsideManagedRoots = roots: path: !(lib.any (root: pathWithin root path) roots);
+  toml = pkgs.formats.toml { };
+  providerConfig =
+    if cfg.configFile != null then
+      cfg.configFile
+    else if cfg.settings == { } then
+      null
+    else
+      toString (toml.generate "hellas-provider.toml" cfg.settings);
+  gatewayConfig =
+    if gateway.configFile != null then
+      gateway.configFile
+    else
+      toString (toml.generate "hellas-gateway.toml" gateway.settings);
+  settingsSafe =
+    value:
+    if builtins.isAttrs value then
+      !(lib.any (
+        name:
+        builtins.elem name [
+          "secret"
+          "access"
+        ]
+      ) (lib.attrNames value))
+      && lib.all settingsSafe (lib.attrValues value)
+    else if builtins.isList value then
+      lib.all settingsSafe value
+    else if builtins.isString value then
+      outsideStoreString value
+    else
+      true;
+  modelPaths =
+    settings:
+    lib.filter (lib.hasPrefix "/") (
+      map (model: builtins.head (lib.splitString "@" model)) (settings.models or [ ])
+    )
+    ++ lib.concatMap (
+      backend: lib.optionals ((backend.kind or "") == "local") (backend.content or [ ])
+    ) (lib.attrValues (settings.backends or { }))
+    ++ lib.concatMap (route: lib.optional ((route.kind or "") == "model") route.package) (
+      settings.routes or [ ]
+    )
+    ++ lib.concatMap (
+      resource: lib.optional ((resource.kind.kind or "") == "model") resource.kind.package
+    ) (settings.resources or [ ]);
+  settingPaths =
+    settings:
+    modelPaths settings
+    ++ lib.mapAttrsToList (_: upstream: upstream.key_file) (settings.upstreams or { })
+    ++ lib.concatMap (backend: lib.optional (backend ? trust) backend.trust.store) (
+      lib.attrValues (settings.backends or { })
+    );
   providerWritablePaths = lib.optional (outsideManagedRoots [ hellasLib.defaultStateDir ] cfg.home) (
     normalizeRuntimePath cfg.home
   );
-  gatewayContentPaths = lib.filter (lib.hasPrefix "/") (
-    map (model: builtins.head (lib.splitString "@" model)) gateway.models
-  );
+  gatewayContentPaths = modelPaths gateway.settings;
   gatewayWritablePaths = lib.optional (!(pathWithin "/var/lib/hellas-gateway" gateway.home)) (
     normalizeRuntimePath gateway.home
   );
   providerGpuConfigured = hellas.catenaPlatform pkgs && cfg.enable;
   gatewayGpuConfigured =
-    hellas.catenaPlatform pkgs && lib.any (model: !(lib.hasInfix "@" model)) gateway.models;
+    hellas.catenaPlatform pkgs
+    && (
+      gateway.configFile != null
+      || lib.any (model: !(lib.hasInfix "@" model)) (gateway.settings.models or [ ])
+      || lib.any (backend: (backend.kind or "") == "local") (
+        lib.attrValues (gateway.settings.backends or { })
+      )
+    );
   inherit (hellasLib) cudaToolkit;
   rocmToolkit = hellasLib.mkRocmToolkit cfg.rocmPackages;
   nvidiaDriverEnabled = builtins.elem "nvidia" config.services.xserver.videoDrivers;
@@ -77,13 +133,16 @@ let
   providerRuntimePaths = [
     cfg.home
   ]
+  ++ lib.optional (cfg.configFile != null) cfg.configFile
+  ++ lib.optionals cfg.enable (settingPaths cfg.settings)
   ++ lib.optional (cfg.chainConfig != null) cfg.chainConfig
   ++ lib.optional (cfg.passkey != null) cfg.passkey
   ++ lib.optional (cfg.environmentFile != null) cfg.environmentFile;
   gatewayRuntimePaths = lib.optionals gateway.enable (
     [ gateway.home ]
+    ++ lib.optional (gateway.configFile != null) gateway.configFile
+    ++ settingPaths gateway.settings
     ++ gatewayContentPaths
-    ++ lib.mapAttrsToList (_: upstream: upstream.keyFile) gateway.upstreams
     ++ lib.optional (gateway.environmentFile != null) gateway.environmentFile
     ++ lib.optional (gateway.chainConfig != null) gateway.chainConfig
     ++ lib.optional (gateway.passkey != null) gateway.passkey
@@ -123,6 +182,11 @@ in
     }
     // hellas.serveOptions { inherit lib pkgs; }
     // {
+      settings = mkOption {
+        type = toml.type;
+        default = { };
+        description = "TOML daemon configuration. Keep model bytes and credential files at runtime paths outside the Nix store; never embed secrets.";
+      };
       gateway = hellas.gatewayOptions { inherit lib; } // {
         package = mkOption {
           type = types.package;
@@ -143,11 +207,6 @@ in
           rocm-core, rocm-device-libs and rocm-runtime.
         '';
       };
-      openFirewall = mkOption {
-        type = types.bool;
-        default = false;
-        description = "Open the Hellas UDP listen port in the firewall.";
-      };
       environmentFile = mkOption {
         type = types.nullOr (types.strMatching "/.*");
         default = null;
@@ -166,9 +225,9 @@ in
         example = 137438953472;
         description = ''
           Optional systemd MemoryMax byte ceiling for the complete provider
-          unit. When set, it must exceed the native executor asset bound
-          default (128 GiB) so the runtime, compiler,
-          child workers, and non-asset allocations have headroom. The service
+          unit. Set settings.execution.session_asset_bytes below this ceiling
+          to leave headroom for the runtime, compiler, child workers and
+          non-asset allocations. The native default asset bound is 128 GiB. The service
           never uses swap and an OOM kills the whole unit before
           Restart=on-failure restarts it.
         '';
@@ -177,6 +236,24 @@ in
 
   config = mkIf (cfg.enable || gateway.enable) {
     assertions = [
+      {
+        assertion = !cfg.enable || cfg.configFile == null || cfg.settings == { };
+        message = "services.hellas.settings and configFile are mutually exclusive.";
+      }
+      {
+        assertion = !cfg.enable || providerConfig == null || cfg.passkey != null;
+        message = "services.hellas declarative configuration requires the owner passkey.";
+      }
+      {
+        assertion = !gateway.enable || gateway.configFile == null || gateway.settings == { };
+        message = "services.hellas.gateway.settings and configFile are mutually exclusive.";
+      }
+      {
+        assertion =
+          (!cfg.enable || settingsSafe cfg.settings) && (!gateway.enable || settingsSafe gateway.settings);
+        message = "services.hellas settings must use runtime paths outside the Nix store and cannot embed secret/access values; use a private runtime configFile for credentials.";
+      }
+
       {
         assertion = cfg.otel.enable || (cfg.metricsPort == null && gateway.metricsPort == null);
         message = "services.hellas metrics ports require otel.enable and packages built with the otel feature.";
@@ -218,16 +295,18 @@ in
         message = "services.hellas.gateway.extraArgs may not override module-managed runtime, content, identity, trust, or configuration flags; use the corresponding option instead.";
       }
       {
-        assertion = !gateway.enable || gateway.models != [ ];
-        message = "services.hellas.gateway.models must name at least one model.";
+        assertion = !gateway.enable || gateway.settings != { } || gateway.configFile != null;
+        message = "services.hellas.gateway requires settings or configFile.";
       }
       {
-        assertion = lib.all (model: lib.hasPrefix "/" model || lib.hasInfix "@" model) gateway.models;
-        message = "services.hellas.gateway.models local packages must use absolute runtime paths.";
-      }
-      {
-        assertion = !gateway.openFirewall || gateway.port != 0;
-        message = "services.hellas.gateway.openFirewall requires a fixed port.";
+        assertion =
+          lib.all (model: lib.hasPrefix "/" model || lib.hasInfix "@" model) (
+            (cfg.settings.models or [ ]) ++ (gateway.settings.models or [ ])
+          )
+          && lib.all (path: lib.hasPrefix "/" path) (
+            settingPaths cfg.settings ++ settingPaths gateway.settings
+          );
+        message = "services.hellas model and credential paths must be absolute runtime paths.";
       }
     ];
 
@@ -265,7 +344,9 @@ in
           [ "${cfg.package}/bin/hellas" ]
           ++ hellas.mkServeArgs {
             inherit lib;
-            serve = cfg;
+            serve = cfg // {
+              configFile = providerConfig;
+            };
             inherit (cfg) otel;
           }
         );
@@ -339,7 +420,10 @@ in
         ExecStart = lib.escapeShellArgs (
           [ "${gateway.package}/bin/hellas" ]
           ++ hellas.mkGatewayArgs {
-            inherit lib gateway;
+            inherit lib;
+            gateway = gateway // {
+              configFile = gatewayConfig;
+            };
             bearerFile = "/run/hellas-gateway/bearer";
             inherit (cfg) otel;
           }
@@ -374,11 +458,5 @@ in
       );
     };
 
-    networking.firewall = {
-      allowedUDPPorts = lib.optionals (cfg.enable && cfg.openFirewall && cfg.port != null) [ cfg.port ];
-      allowedTCPPorts = lib.optionals (gateway.enable && gateway.openFirewall && gateway.port != 0) [
-        gateway.port
-      ];
-    };
   };
 }

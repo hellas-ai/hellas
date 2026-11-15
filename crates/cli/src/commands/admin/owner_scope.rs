@@ -1,7 +1,7 @@
 //! Default permissions for the owner explicitly pairing a fresh node.
 use hellas_auth::{Digest, authority::*};
 
-pub(super) fn administrator(
+pub(crate) fn administrator(
     public: hellas_authority::authenticator::PublicKey,
 ) -> anyhow::Result<GrantSpec> {
     let authority = AuthorityId(Digest::from_bytes(rand::random()));

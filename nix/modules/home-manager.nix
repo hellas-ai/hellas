@@ -25,6 +25,7 @@ let
   serveRuntimePaths = [
     cfg.serve.home
   ]
+  ++ lib.optional (cfg.serve.configFile != null) cfg.serve.configFile
   ++ lib.optional (cfg.serve.chainConfig != null) cfg.serve.chainConfig
   ++ lib.optional (cfg.serve.passkey != null) cfg.serve.passkey
   ++ lib.optional (cfg.serve.environmentFile != null) cfg.serve.environmentFile;

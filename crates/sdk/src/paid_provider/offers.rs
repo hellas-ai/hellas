@@ -294,6 +294,9 @@ impl OfferAllocator {
         let Some(current) = current else {
             return Ok(refused(OfferRefusalCode::NoPolicy, 0));
         };
+        if !current.enabled && registry.is_empty() {
+            return Ok(refused(OfferRefusalCode::NoPolicy, 0));
+        }
         current.policy.check().map_err(unavailable)?;
         if current.policy.offers.bond_lifetime_blocks
             > hellas_chain::domain::MAX_EDGE_LIFETIME_BLOCKS
@@ -367,6 +370,11 @@ impl OfferAllocator {
                 }
                 held.push(state);
             }
+        }
+        // Retained offers above remain resumable under their signed terms.
+        // Disabling the policy only stops new quotes and stake allocations.
+        if !current.enabled {
+            return Ok(refused(OfferRefusalCode::NoPolicy, 0));
         }
         if coins.is_empty() {
             return quote(&policy, current.policy.offers.omission_bond);

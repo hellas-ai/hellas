@@ -10,16 +10,21 @@ use std::{
     sync::Arc,
 };
 
+mod config;
+
 #[derive(clap::Args)]
 pub struct GatewayArgs {
+    /// TOML routing and listener configuration.
+    #[arg(long, conflicts_with_all = ["models", "upstreams", "bind"])]
+    pub config: Option<PathBuf>,
     /// Qwen GGUF, Whisper/Flux package or descriptor; PATH@CONTACT or NAME@UPSTREAM.
-    #[arg(long = "model", required = true)]
+    #[arg(long = "model", required_unless_present = "config")]
     pub models: Vec<String>,
     /// NAME=HTTPS_API_URL,key-file=PATH (an OpenAI-compatible service).
     #[arg(long = "upstream")]
     pub upstreams: Vec<String>,
-    #[arg(long, default_value = "127.0.0.1:8080")]
-    pub bind: std::net::SocketAddr,
+    #[arg(long)]
+    pub bind: Option<std::net::SocketAddr>,
     #[arg(long)]
     pub wrap: Option<String>,
     /// Write the gateway bearer atomically to this private file (mode 0600).
@@ -556,6 +561,22 @@ pub async fn gateway(
     chain: &hellas_chain::genesis::ChainProfile,
     #[cfg(feature = "otel")] metrics: Option<(std::net::SocketAddr, crate::metrics::MetricsBundle)>,
 ) -> Result<()> {
+    let configured = match args.config {
+        Some(path) => config::State::load(&path)?,
+        None => config::State::gateway(args.models, args.upstreams, args.bind)?,
+    };
+    ensure!(
+        configured.paid_policy.is_none(),
+        "gateway configuration cannot set paid provider policy"
+    );
+    ensure!(
+        configured.document.listeners.len() == 1
+            && matches!(
+                configured.document.listeners.get("api"),
+                Some(Listener::Http { .. })
+            ),
+        "gateway configuration requires exactly one HTTP listener named api"
+    );
     let mut tty = if args.wrap.is_none() && args.bearer_file.is_none() {
         let terminal = if cfg!(windows) { "CONOUT$" } else { "/dev/tty" };
         Some(
@@ -583,46 +604,9 @@ pub async fn gateway(
             .await?;
     let options = options(home.clone(), identity, owner, chain, node.clone(), None).await?;
     context.content = Some(options.content.clone());
-    let prepared: Result<_> = async {
-        let mut document = Document::default();
-        document.listeners.insert(
-            "api".into(),
-            Listener::Http {
-                bind: args.bind,
-                zdr: true,
-            },
-        );
-        for upstream in args.upstreams {
-            let (definition, key_file) = upstream
-                .rsplit_once(",key-file=")
-                .context("upstream is NAME=HTTPS_API_URL,key-file=PATH")?;
-            let (name, url) = definition
-                .split_once('=')
-                .context("upstream is NAME=HTTPS_API_URL,key-file=PATH")?;
-            apply(
-                &mut document,
-                Edit::Backend(BackendCommand::Add {
-                    name: name.into(),
-                    url: url.into(),
-                    key_file: key_file.into(),
-                }),
-                &context,
-            )
-            .await?;
-        }
-        for model in args.models {
-            apply(
-                &mut document,
-                Edit::Route(RouteCommand::Add { model }),
-                &context,
-            )
-            .await?;
-        }
-        Ok(document)
-    }
-    .await;
+    let prepared = configured.resolve(&context).await;
     let document = match prepared {
-        Ok(document) => document,
+        Ok(state) => state.document,
         Err(error) => {
             options.content.close().await;
             node.close().await;
@@ -631,8 +615,7 @@ pub async fn gateway(
     };
     run_daemon(
         options,
-        Some(document),
-        None,
+        Start::Transient(document),
         #[cfg(feature = "otel")]
         metrics,
         async |core| {
@@ -680,13 +663,41 @@ pub async fn serve(
     owner: Option<&hellas_kernel::SoftPasskey>,
     chain: &hellas_chain::genesis::ChainProfile,
     port: Option<u16>,
+    config_file: Option<PathBuf>,
     #[cfg(feature = "otel")] metrics: Option<(std::net::SocketAddr, crate::metrics::MetricsBundle)>,
 ) -> Result<()> {
+    let desired = if let Some(path) = config_file {
+        let state = config::State::load(&path)?;
+        let context = ModelContext::new(
+            home,
+            identity,
+            owner.map(|owner| owner as &dyn Authenticator),
+        )?;
+        Some(state.resolve(&context).await?)
+    } else {
+        None
+    };
+    let startup = if desired.is_some() {
+        Some(
+            super::bootstrap::prepare_local(
+                home,
+                identity,
+                owner.context("--config requires --passkey")?,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     let shutdown = shutdown_signal()?;
     tokio::pin!(shutdown);
-    let endpoint = tokio::select! {
-        result = super::bootstrap::prepare(home, &identity.transport_key, &identity.enrollment, port) => result?,
-        signal = &mut shutdown => return Ok(signal?),
+    let endpoint = if desired.is_some() {
+        None
+    } else {
+        tokio::select! {
+            result = super::bootstrap::prepare(home, &identity.transport_key, &identity.enrollment, port) => result?,
+            signal = &mut shutdown => return Ok(signal?),
+        }
     };
     let store = hellas_authority::work_store::grant::NodeStore::open(
         &home.child("provider").child("authority"),
@@ -699,10 +710,30 @@ pub async fn serve(
         store,
         Arc::new(|| hellas_auth::authority::UnixMillis::now().unwrap_or_default()),
     );
+    let approval = if let Some(startup) = startup {
+        let owner = owner.context("--config requires --passkey")?;
+        let caller = node
+            .authenticate_session(
+                &startup.credential(),
+                hellas_authority::node::SessionKey::Passkey(owner),
+            )
+            .await?;
+        Some((caller, startup.authorization))
+    } else {
+        None
+    };
     let mut options = options(home.clone(), identity, owner, chain, node.clone(), endpoint).await?;
     options.remote_control = hellas_sdk::node_control::RemoteControlAdmission::credential_gated();
-    let document = if node.configuration().await?.is_some() {
-        None
+    let start = if let Some(state) = desired {
+        let (caller, authorization) = approval.context("missing startup approval")?;
+        Start::Reconcile {
+            document: state.document,
+            caller,
+            authorization,
+            paid_policy: state.paid_policy.map(Box::new),
+        }
+    } else if node.configuration().await?.is_some() {
+        Start::Restore(port)
     } else {
         let mut document = Document::default();
         document.listeners.insert(
@@ -713,12 +744,11 @@ pub async fn serve(
                 backends: vec![],
             },
         );
-        Some(document)
+        Start::Transient(document)
     };
     run_daemon(
         options,
-        document,
-        port,
+        start,
         #[cfg(feature = "otel")]
         metrics,
         async |core| {
@@ -748,19 +778,44 @@ pub async fn serve(
     .await
 }
 
+enum Start {
+    Transient(Document),
+    Restore(Option<u16>),
+    Reconcile {
+        document: Document,
+        caller: hellas_auth::authority::AuthenticatedCaller,
+        authorization: hellas_auth::authority::GrantId,
+        paid_policy: Option<Box<hellas_channel::model::paid_policy::PaidPolicy>>,
+    },
+}
+
 async fn run_daemon(
     options: hellas_sdk::daemon::Options,
-    document: Option<Document>,
-    port: Option<u16>,
+    start: Start,
     #[cfg(feature = "otel")] metrics: Option<(std::net::SocketAddr, crate::metrics::MetricsBundle)>,
     run: impl AsyncFnOnce(Arc<hellas_sdk::daemon::Core>) -> Result<()>,
 ) -> Result<()> {
     let content = options.content.clone();
     let node = options.node.clone();
     let serving = async {
-        let core = match document {
-            Some(document) => hellas_sdk::daemon::Core::open(options, document).await,
-            None => hellas_sdk::daemon::Core::restore(options, port).await,
+        let core = match start {
+            Start::Transient(document) => hellas_sdk::daemon::Core::open(options, document).await,
+            Start::Restore(port) => hellas_sdk::daemon::Core::restore(options, port).await,
+            Start::Reconcile {
+                document,
+                caller,
+                authorization,
+                paid_policy,
+            } => {
+                hellas_sdk::daemon::Core::reconcile(
+                    options,
+                    document,
+                    caller,
+                    authorization,
+                    paid_policy.map(|policy| *policy),
+                )
+                .await
+            }
         }
         .map_err(anyhow::Error::from_boxed)?;
         let result = async {
@@ -1062,7 +1117,7 @@ mod tests {
     }
 
     #[test]
-    fn stateless_and_stateful_command_surfaces_have_no_config_file() {
+    fn command_forms_share_config_and_reject_ambiguous_routing_flags() {
         let parsed = crate::Cli::try_parse_from([
             "hellas",
             "gateway",
@@ -1082,10 +1137,37 @@ mod tests {
             unreachable!()
         };
         assert_eq!(args.models.len(), 4);
+        for command in ["serve", "gateway"] {
+            assert!(crate::Cli::try_parse_from(["hellas", command, "--config", "file"]).is_ok());
+        }
+
         for args in [
-            vec!["hellas", "gateway", "--config", "file"],
+            vec![
+                "hellas",
+                "gateway",
+                "--config",
+                "file",
+                "--model",
+                "model.gguf",
+            ],
+            vec![
+                "hellas",
+                "gateway",
+                "--config",
+                "file",
+                "--upstream",
+                "api=https://api.example/v1,key-file=key",
+            ],
+            vec![
+                "hellas",
+                "gateway",
+                "--config",
+                "file",
+                "--bind",
+                "127.0.0.1:8080",
+            ],
+            vec!["hellas", "serve", "--config", "file", "--port", "0"],
             vec!["hellas", "serve", "--model", "model.gguf"],
-            vec!["hellas", "serve", "--fetch-config", "file"],
             vec!["hellas", "serve", "apply", "file"],
         ] {
             assert!(crate::Cli::try_parse_from(args).is_err());

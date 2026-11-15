@@ -26,20 +26,28 @@ let
       ];
     };
   evalProvider = settings: eval ({ enable = true; } // settings);
+  gatewaySettings = {
+    models = [
+      "/srv/models/qwen.gguf"
+      "flux@friend"
+      "gpt-5@upstream"
+    ];
+    upstreams.upstream = {
+      url = "https://api.example.com/v1";
+      key_file = "/run/secrets/upstream.key";
+    };
+    listeners.api = {
+      kind = "http";
+      bind = "127.0.0.1:8080";
+      zdr = true;
+    };
+  };
   evalGateway =
     settings:
     eval {
       gateway = {
         enable = true;
-        models = [
-          "/srv/models/qwen.gguf"
-          "flux@friend"
-          "gpt-5@upstream"
-        ];
-        upstreams.upstream = {
-          url = "https://api.example.com/v1";
-          keyFile = "/run/secrets/upstream.key";
-        };
+        settings = gatewaySettings;
       }
       // settings;
     };
@@ -50,14 +58,21 @@ let
     ) (throw "missing module assertion: ${text}") evaluation.config.assertions).assertion;
   defaultProviderService = (evalProvider { }).config.systemd.services.hellas;
   gateway = (evalGateway { }).config.systemd.services.hellas-gateway;
-  remote = (evalGateway { models = [ "gpt-5@upstream" ]; }).config.systemd.services.hellas-gateway;
+  remote =
+    (evalGateway {
+      settings = gatewaySettings // {
+        models = [ "gpt-5@upstream" ];
+      };
+    }).config.systemd.services.hellas-gateway;
   custom = (evalGateway { home = "/srv/gateway-state"; }).config.systemd.services.hellas-gateway;
   metrics =
     (eval {
       otel.enable = true;
       gateway = {
         enable = true;
-        models = [ "gpt-5@upstream" ];
+        settings = gatewaySettings // {
+          models = [ "gpt-5@upstream" ];
+        };
         metricsPort = 9401;
       };
     }).config.systemd.services.hellas-gateway;
@@ -192,22 +207,70 @@ let
       matched = builtins.match ".* --config (.*)" service.serviceConfig.ExecStart;
     in
     if matched == null then throw "validator ExecStart has no config" else builtins.head matched;
+  declarative = evalProvider {
+    passkey = "/run/secrets/owner";
+    settings = {
+      models = [
+        "/srv/models/qwen.gguf"
+        "/srv/models/flux@alice"
+      ];
+      listeners.work = {
+        kind = "iroh";
+        port = 31145;
+        backends = [ "local" ];
+      };
+      execution = {
+        queue_capacity = 1;
+        session_programs = 1;
+        session_asset_bytes = 1516744736;
+      };
+    };
+  };
+  declarativeService = declarative.config.systemd.services.hellas;
   paidWorkValidatorServices = paidWorkValidators.config.systemd.services;
   validatorConfig2 = validatorConfigPath paidWorkValidatorServices."hellas-validator-devnet-node2";
 in
 {
   provider-content-eval =
+    assert lib.hasInfix "serve --config /nix/store/" declarativeService.serviceConfig.ExecStart;
+    assert !(lib.hasInfix "--port" declarativeService.serviceConfig.ExecStart);
+    assert lib.elem "/srv/models/flux" declarativeService.unitConfig.RequiresMountsFor;
+    assert !(lib.elem "/srv/models/flux@alice" declarativeService.unitConfig.RequiresMountsFor);
+    assert
+      !(assertion "owner passkey" (evalProvider {
+        settings.listeners.work = {
+          kind = "iroh";
+          port = 0;
+          backends = [ ];
+        };
+      }));
+    assert
+      !(assertion "cannot embed" (evalProvider {
+        settings.backends.api = {
+          kind = "fetch";
+          upstream.secret = "bad";
+        };
+      }));
+    assert
+      !(assertion "cannot embed" (evalProvider {
+        settings.models = [ "${builtins.storeDir}/model" ];
+      }));
+    assert
+      !(assertion "mutually exclusive" (evalProvider {
+        settings.models = [ "/srv/model" ];
+        configFile = "/run/config";
+      }));
+    assert lib.hasInfix "--config /run/hellas.toml"
+      (evalProvider {
+        configFile = "/run/hellas.toml";
+        passkey = "/run/owner";
+      }).config.systemd.services.hellas.serviceConfig.ExecStart;
     assert lib.hasInfix "serve --port" defaultProviderService.serviceConfig.ExecStart;
     assert !(lib.hasInfix "--model" defaultProviderService.serviceConfig.ExecStart);
-    assert lib.hasInfix "gateway --bind 127.0.0.1:8080" gateway.serviceConfig.ExecStart;
-    assert lib.hasInfix "--model /srv/models/qwen.gguf --model flux@friend --model gpt-5@upstream"
-      gateway.serviceConfig.ExecStart;
-    assert lib.hasInfix (lib.escapeShellArgs [
-      "--upstream"
-      "upstream=https://api.example.com/v1,key-file=/run/secrets/upstream.key"
-    ]) gateway.serviceConfig.ExecStart;
+    assert lib.hasInfix "gateway --config /nix/store/" gateway.serviceConfig.ExecStart;
+    assert !(lib.hasInfix "--model" gateway.serviceConfig.ExecStart);
+    assert !(lib.hasInfix "--upstream" gateway.serviceConfig.ExecStart);
     assert lib.hasInfix "--bearer-file /run/hellas-gateway/bearer" gateway.serviceConfig.ExecStart;
-    assert !(lib.hasInfix "--config" gateway.serviceConfig.ExecStart);
     assert !(lib.hasInfix "--local" gateway.serviceConfig.ExecStart);
     assert lib.hasInfix "--metrics-port 9401 --metrics-addr 127.0.0.1" metrics.serviceConfig.ExecStart;
     assert gateway.serviceConfig.ReadOnlyPaths == [ "/srv/models/qwen.gguf" ];
@@ -219,27 +282,24 @@ in
     assert gateway.serviceConfig ? LimitMEMLOCK;
     assert !(remote.serviceConfig ? LimitMEMLOCK);
     assert
-      !(assertion "must name at least one" (evalGateway {
-        models = [ ];
+      !(assertion "requires settings" (evalGateway {
+        settings = { };
       }));
     assert
       !(assertion "absolute runtime paths" (evalGateway {
-        models = [ "relative.gguf" ];
+        settings = gatewaySettings // {
+          models = [ "relative.gguf" ];
+        };
       }));
     assert
-      !(assertion "fixed port" (evalGateway {
-        port = 0;
-        openFirewall = true;
+      !(assertion "cannot embed" (evalGateway {
+        settings.models = [ "${builtins.storeDir}/model.gguf" ];
       }));
     assert
-      !(assertion "runtime data outside" (evalGateway {
-        models = [ "${builtins.storeDir}/model.gguf" ];
-      }));
-    assert
-      !(assertion "runtime data outside" (evalGateway {
-        upstreams.upstream = {
+      !(assertion "cannot embed" (evalGateway {
+        settings.upstreams.upstream = {
           url = "https://example.com";
-          keyFile = "${builtins.storeDir}/key";
+          key_file = "${builtins.storeDir}/key";
         };
       }));
     assert

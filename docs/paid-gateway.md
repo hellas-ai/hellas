@@ -56,6 +56,16 @@ pin that enrollment; native programs run with the provider user's permissions.
 Only admit programs you trust. A policy admitting arbitrary programs grants
 those callers the same filesystem and device access as the provider process.
 
+For unattended service startup, `serve --config provider.toml` also accepts the
+policy itself under `[paid_policy]`, without the command wrapper or
+`expected_revision`. The provisioned owner passkey authenticates the change;
+startup compares against journaled terms under the writer lock. Identical terms
+retain their salt and revision. Removing the section disables new automatic
+offers, increments the policy revision once, and preserves all existing channel
+journals and signed terms. Restarting with the section still absent is a no-op.
+This never funds or delegates coins. See [the shared TOML schema](http-gateway.md#shared-toml-configuration)
+and [NixOS settings](nix.md).
+
 ## Buy
 
 ```sh

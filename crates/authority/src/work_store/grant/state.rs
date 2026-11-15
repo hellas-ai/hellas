@@ -391,6 +391,24 @@ impl State {
                         .permission(self.authority.authority(), None)?,
                 )?;
                 match &record.mutation {
+                    super::WorkMutation::DisablePaidPolicy { expected } => {
+                        record.caller.session().step_up()?;
+                        let owner = self
+                            .authority
+                            .grant(self.authority.root_grant())
+                            .ok_or(NodeStoreError::Malformed)?
+                            .spec()
+                            .subject;
+                        if record.caller.actor() != owner {
+                            return Err(hellas_auth::authority::AuthorityError::Denied.into());
+                        }
+                        let current = self.paid_policy.as_mut().ok_or(NodeStoreError::Malformed)?;
+                        if current.revision != *expected {
+                            return Err(hellas_auth::authority::AuthorityError::Revision.into());
+                        }
+                        current.revision = expected.next().ok_or(NodeStoreError::Malformed)?;
+                        current.enabled = false;
+                    }
                     super::WorkMutation::PaidPolicy {
                         expected,
                         policy_salt,
@@ -417,6 +435,7 @@ impl State {
                         policy.check()?;
                         self.paid_policy =
                             Some(hellas_channel::model::paid_policy::StoredPaidPolicy {
+                                enabled: true,
                                 revision: expected.next().ok_or(NodeStoreError::Malformed)?,
                                 policy_salt: *policy_salt,
                                 policy: policy.as_ref().clone(),

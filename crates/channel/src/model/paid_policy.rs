@@ -39,6 +39,7 @@ pub struct OfferPolicy {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoredPaidPolicy {
+    pub enabled: bool,
     pub revision: Revision,
     pub policy_salt: [u8; 32],
     pub policy: PaidPolicy,

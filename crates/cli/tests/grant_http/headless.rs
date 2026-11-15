@@ -12,16 +12,23 @@ async fn headless_gateway_hands_its_bearer_to_an_authenticated_client() {
     std::fs::write(&bearer, "old").unwrap();
     std::fs::set_permissions(&bearer, std::fs::Permissions::from_mode(0o644)).unwrap();
     let upstream = format!("api=https://example.com/v1,key-file={}", key.display());
+    let config = root.path().join("gateway.toml");
+    std::fs::write(
+        &config,
+        toml::to_string(&json!({
+            "models": ["model@api"],
+            "upstreams": {"api": {"url": "https://example.com/v1", "key_file": key}},
+            "listeners": {"api": {"kind": "http", "bind": "127.0.0.1:0", "zdr": true}}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     let log = root.path().join("headless.log");
     let output = std::fs::File::create(&log).unwrap();
     let mut command = cli.command(&[
         "gateway",
-        "--bind",
-        "127.0.0.1:0",
-        "--upstream",
-        &upstream,
-        "--model",
-        "model@api",
+        "--config",
+        string(&config),
         "--bearer-file",
         string(&bearer),
     ]);

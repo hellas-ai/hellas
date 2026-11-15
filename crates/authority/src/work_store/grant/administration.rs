@@ -13,6 +13,9 @@ pub const WORK_RESOURCE_REPAIR: &str = "work.resource.repair";
 pub const WORK_PAID_POLICY_CONFIGURE: &str = "work.paid.configure";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum WorkMutation {
+    DisablePaidPolicy {
+        expected: Revision,
+    },
     PaidPolicy {
         expected: Revision,
         policy_salt: [u8; 32],
@@ -32,7 +35,7 @@ pub(crate) enum WorkMutation {
 impl WorkMutation {
     pub(crate) fn operation(&self) -> &'static str {
         match self {
-            Self::PaidPolicy { .. } => WORK_PAID_POLICY_CONFIGURE,
+            Self::PaidPolicy { .. } | Self::DisablePaidPolicy { .. } => WORK_PAID_POLICY_CONFIGURE,
             Self::Budget(_) => WORK_BUDGET_CONFIGURE,
             Self::Define(_) => WORK_ALLOWANCE_CONFIGURE,
             Self::Generation { .. } => WORK_GENERATION_RESET,

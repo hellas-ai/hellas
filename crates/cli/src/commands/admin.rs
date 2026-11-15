@@ -2,7 +2,7 @@
 use anyhow::Context as _;
 use std::path::{Path, PathBuf};
 mod node;
-mod owner_scope;
+pub(super) mod owner_scope;
 pub(super) use node::{connect_local, connect_remote};
 pub use node::{daemon, gateway_authority, inspect_offline, pair, run, share};
 pub(crate) const CONTROL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);

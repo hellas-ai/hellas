@@ -98,6 +98,27 @@ pub fn pin_remote(
     )
 }
 
+/// Pin a locally provisioned server certificate on an existing application profile.
+/// The caller owns this profile and must obtain the certificate independently.
+pub fn pin_local(path: &Path, certificate: &Path) -> io::Result<()> {
+    let mut profile: ProfileFile = serde_json::from_slice(&read_private(path)?)
+        .map_err(|_| invalid("invalid control profile"))?;
+    if !certificate.is_absolute() || profile.remote_node.is_some() {
+        return Err(invalid(
+            "local trust requires an absolute certificate path and no remote pin",
+        ));
+    }
+    profile.local = Some(LocalTrust {
+        certificate: certificate.into(),
+        server_name: "localhost".into(),
+    });
+    hellas_private::write_atomically(
+        path,
+        ".pinning",
+        &serde_json::to_vec(&profile).map_err(io::Error::other)?,
+    )
+}
+
 impl LocalTrust {
     fn load(self, parent: &Path) -> io::Result<(Arc<ClientConfig>, ServerName<'static>)> {
         let certificate =

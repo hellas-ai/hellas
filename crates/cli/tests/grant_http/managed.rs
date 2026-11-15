@@ -204,3 +204,108 @@ async fn saved_configuration(
     store.close().await;
     saved
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn declarative_serve_bootstraps_and_converges_without_pairing() {
+    let root = tempfile::tempdir().unwrap();
+    let owner = Cli::new(root.path(), "declarative", ROOT_PASSKEY);
+    let config = root.path().join("provider.toml");
+    let initial = "[listeners.work]\nkind = 'iroh'\nport = 0\nbackends = []\n";
+    let recipe: Value = serde_json::from_str(include_str!(
+        "../../../../docs/examples/faucet-provider.json"
+    ))
+    .unwrap();
+    let paid = toml::to_string(&json!({"paid_policy": recipe["SetPaidPolicy"]["policy"]})).unwrap();
+    let configured = format!("{initial}\n{paid}");
+    std::fs::write(&config, &configured).unwrap();
+    let args = ["serve", "--config", string(&config)];
+    let mut first = owner.spawn(&args, "declarative-first.log");
+    first.wait_for("Daemon ready;").await;
+    owner
+        .run(&[
+            "routes",
+            "--profile",
+            string(&owner.home.join("provider/startup-profile/profile.json")),
+            "--control-socket",
+            string(&owner.home.join("provider/control.sock")),
+        ])
+        .await;
+
+    let identity = owner.run(&["identity", "show-enrollment-id"]).await;
+    first.stop().await;
+    let before = saved_configuration(&owner).await;
+    let paid_before = saved_paid_policy(&owner).await;
+    assert!(paid_before.enabled);
+    let startup = std::fs::read(owner.home.join("provider/startup.json")).unwrap();
+    let mut second = owner.spawn(&args, "declarative-restart.log");
+    second.wait_for("Daemon ready;").await;
+    second.stop().await;
+    let same = saved_configuration(&owner).await;
+    assert_eq!(same.revision, before.revision);
+    assert_eq!(same.document, before.document);
+    assert_eq!(saved_paid_policy(&owner).await, paid_before);
+    assert_eq!(
+        startup,
+        std::fs::read(owner.home.join("provider/startup.json")).unwrap()
+    );
+    assert_eq!(
+        identity,
+        owner.run(&["identity", "show-enrollment-id"]).await
+    );
+    // The entire document is desired: adding then removing a listener converges.
+    std::fs::write(
+        &config,
+        format!("{configured}\n[listeners.api]\nkind = 'http'\nbind = '127.0.0.1:0'\n"),
+    )
+    .unwrap();
+    let mut changed = owner.spawn(&args, "declarative-change.log");
+    changed.wait_for("Daemon ready;").await;
+    changed.stop().await;
+    assert_eq!(
+        saved_configuration(&owner).await.revision,
+        before.revision.next().unwrap()
+    );
+    std::fs::write(&config, initial).unwrap();
+    let mut removed = owner.spawn(&args, "declarative-remove.log");
+    removed.wait_for("Daemon ready;").await;
+    removed.stop().await;
+    let final_state = saved_configuration(&owner).await;
+    assert_eq!(final_state.document, before.document);
+    let disabled = saved_paid_policy(&owner).await;
+    assert!(!disabled.enabled);
+    assert_eq!(disabled.revision, paid_before.revision.next().unwrap());
+    assert_eq!(disabled.policy_salt, paid_before.policy_salt);
+
+    // Invalid input neither revises the journal nor replaces the owner.
+    std::fs::write(&config, "[listeners.work]\nkind = 'iroh'\nport = 'bad'\n").unwrap();
+    assert!(!owner.output(&args).await.status.success());
+    assert_eq!(
+        saved_configuration(&owner).await.revision,
+        final_state.revision
+    );
+    std::fs::write(&config, initial).unwrap();
+    std::fs::write(&owner.passkey, hex::encode(AGENT_PASSKEY)).unwrap();
+    assert!(!owner.output(&args).await.status.success());
+    assert_eq!(
+        saved_configuration(&owner).await.revision,
+        final_state.revision
+    );
+}
+
+async fn saved_paid_policy(cli: &Cli) -> hellas_channel::model::paid_policy::StoredPaidPolicy {
+    let root = hellas_private::StoreLocation::from_home(
+        &cli.home.join("provider/authority"),
+        hellas_private::Durability::Crash,
+    );
+    let mut store = hellas_authority::work_store::grant::NodeStore::open(
+        &root,
+        hellas_authority::model::grant::grant_network(),
+        None,
+        hellas_auth::authority::UnixMillis::now().unwrap(),
+    )
+    .await
+    .unwrap();
+    let policy = store.state().paid_policy().unwrap().clone();
+    store.close().await;
+    policy
+}
