@@ -21,13 +21,6 @@ let
         chmod 0555 "$out/bin/hellas"
       '';
 
-  originalEntrypoint = [
-    (if cuda then "${entrypoint}" else "${runtime}/bin/hellas")
-    "serve"
-    "--port"
-    "31145"
-  ];
-
   gpu = backend != "network";
   cuda = backend == "cuda";
   toolkit = if cuda then pkgs.hellasLib.cudaToolkit else pkgs.hellasLib.rocmToolkit;
@@ -66,7 +59,12 @@ let
     ]
     ++ pkgs.lib.optional cuda compiler;
     config = {
-      Entrypoint = originalEntrypoint;
+      Entrypoint = [ (if cuda then "${entrypoint}" else "${runtime}/bin/hellas") ];
+      Cmd = [
+        "serve"
+        "--port"
+        "31145"
+      ];
       Labels = {
         "org.opencontainers.image.source" = "https://github.com/hellas-ai/hellas";
         "org.opencontainers.image.revision" = revision;

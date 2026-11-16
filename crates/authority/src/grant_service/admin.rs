@@ -43,7 +43,8 @@ impl WorkAdministration {
         command: WorkControlCommand,
     ) -> Result<WorkControlReply, NodeStoreError> {
         let operation = match &command {
-            WorkControlCommand::SetPaidPolicy { .. } => {
+            WorkControlCommand::SetPaidPolicy { .. }
+            | WorkControlCommand::DisablePaidPolicy { .. } => {
                 crate::work_store::grant::WORK_PAID_POLICY_CONFIGURE
             }
             WorkControlCommand::List
@@ -78,21 +79,28 @@ impl WorkAdministration {
                         expected_revision,
                         policy,
                     } => {
-                        let mut policy_salt = [0; 32];
-                        getrandom::fill(&mut policy_salt)
-                            .map_err(|_| hellas_auth::authority::AuthorityError::Entropy)?;
-                        (
-                            WorkMutation::PaidPolicy {
-                                expected: expected_revision,
-                                policy_salt,
-                                policy,
-                            },
-                            ChangeReply::Ready(WorkControlReply::PaidPolicyChanged {
-                                revision: expected_revision
-                                    .next()
-                                    .ok_or(GrantError::StateCapacity)?,
-                            }),
-                        )
+                        let revision = store
+                            .configure_paid_policy(
+                                caller,
+                                authorization,
+                                Some(expected_revision),
+                                Some(*policy),
+                                now,
+                            )
+                            .await?;
+                        return Ok(WorkControlReply::PaidPolicyChanged { revision });
+                    }
+                    WorkControlCommand::DisablePaidPolicy { expected_revision } => {
+                        let revision = store
+                            .configure_paid_policy(
+                                caller,
+                                authorization,
+                                Some(expected_revision),
+                                None,
+                                now,
+                            )
+                            .await?;
+                        return Ok(WorkControlReply::PaidPolicyChanged { revision });
                     }
                     WorkControlCommand::Catalogue => {
                         return Ok(WorkControlReply::Catalogue(

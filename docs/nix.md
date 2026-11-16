@@ -20,33 +20,141 @@ Catena runs inside an isolated worker. Local daemon backends select CUDA when
 an NVIDIA device is present and HIP otherwise. The NixOS module supplies the
 matching toolchain and device access.
 
-A declarative HTTP deployment runs the stateless gateway with flags:
+A declarative HTTP deployment runs the stateless gateway from TOML settings:
 
 ```nix
 services.hellas.gateway = {
   enable = true;
-  models = [ "/srv/models/qwen3.gguf" "gpt-5@openrouter" ];
-  upstreams.openrouter = {
-    url = "https://openrouter.ai/api";
-    keyFile = "/run/secrets/openrouter.key";
+  credentials.api = "/run/secrets/openrouter.key";
+  settings = {
+    models = [ "/srv/models/qwen3.gguf" "gpt-5@openrouter" ];
+    upstreams.openrouter = {
+      url = "https://openrouter.ai/api";
+      key_file = "credential:api";
+    };
+    listeners.api = { kind = "http"; bind = "127.0.0.1:8080"; zdr = true; };
   };
 };
 ```
 
-The module renders `--model`, `--upstream` and `--bind` arguments. It never
-writes a routing file or invokes stateful backend/route verbs. Model packages
-and API key files remain runtime paths outside the Nix store. Provision private
-files for the service user; do not interpolate Nix paths or call
-`builtins.readFile` on secrets. The gateway keeps its HTTP bearer in memory;
-use `gateway.extraArgs = [ "--wrap" "COMMAND" ];` to pass it to a child.
+The module generates TOML for `gateway --config`. Private `configFile`, owner
+passkey and named `credentials` files use systemd `LoadCredential`.
+`credential:NAME` reads a named key from `CREDENTIALS_DIRECTORY`; absolute key
+paths require independently provisioned access for the service user. Copying a
+private TOML file does not grant access to other paths it references.
 
-For a persistent node, enable `services.hellas.enable`. Pair the node's invite,
-then manage its journaled document with `hellas backend`, `hellas route` and
-`hellas routes`. These edits are operator actions, not NixOS reload commands.
-The home, chain selection, passkey, metrics and environment remain module
-options; routing belongs to the daemon document.
+Keep model packages and secrets outside the Nix store: never interpolate Nix
+paths or use `builtins.readFile` on secrets. The gateway retains its bearer in
+memory; `gateway.extraArgs = [ "--wrap" "COMMAND" ];` passes it to a child.
 
-Home Manager can run the stateful service on Darwin:
+For a declarative persistent provider:
+
+```nix
+services.hellas = {
+  enable = true;
+  passkey = "/run/secrets/hellas-owner.passkey";
+  settings = {
+    models = [ "/srv/models/qwen3.gguf" "/srv/models/whisper-tiny" ];
+    listeners.work = {
+      kind = "iroh";
+      port = 31145;
+      backends = [ "local" ];
+    };
+    execution = {
+      queue_capacity = 1;
+      session_programs = 1;
+      session_asset_bytes = 1516744736;
+    };
+  };
+};
+```
+
+`settings` becomes TOML passed to `serve --config`. The first start approves
+ownership with the provisioned software passkey without a pairing prompt.
+Subsequent starts reconcile the complete routing document, retaining identity,
+credentials, payment journals, budgets and outstanding duties. Identical
+configuration does not advance its revision. Removed routes and listeners are
+removed. Execution bounds apply on restart; live control edits cannot change
+them. Several model routes share the same serialized local GPU executor.
+
+Put paid offer terms in `settings.paid_policy`, using the policy fields from
+[the paid-work guide](paid-gateway.md). The owner authenticates each startup;
+unchanged paid terms retain their revision and salt. Removing `paid_policy`
+disables new automatic offers while preserving funded channels and recovery.
+Configuration and paid terms have separate journal commits; interrupted startup
+converges on retry. Startup never requests faucet coins or delegates stake.
+Fund the owner and delegate stake to the node's settlement key explicitly as
+described in that guide.
+
+Both services accept `configFile = "/run/hellas.toml"` instead of `settings`.
+Declare firewall rules for the TOML listeners explicitly. Generated settings
+reject store paths and credential `secret`/`access` fields, not backend names.
+Use named upstream credentials or private runtime TOML for raw credentials;
+provision model mounts and sandbox paths separately for external TOML.
+
+Without settings/configFile, `services.hellas.enable` retains the interactive
+mode: pair its invite, then use `hellas backend`, `hellas route` and
+`hellas routes`. An existing paired authority without the local startup
+credential is refused by `serve --config`; it is never replaced or recovered
+implicitly. Declarative startup's retained local control profile lives at
+`HOME/provider/startup-profile/profile.json`; pass it with `--profile` and use
+`--control-socket HOME/provider/control.sock` for later operator edits. The next
+declarative restart restores the declared document. Preserve the whole home
+across restarts; losing the authority journal after initialization fails closed.
+The root owner scope and canonical credential use the standard one-year
+validity. Renew or explicitly rebind them with the service stopped:
+
+```sh
+# Read the current authority revision using admin inspect-offline (see admin.md).
+hellas --home /var/lib/hellas/.hellas --passkey /run/secrets/owner.passkey \
+  admin rebind-local --expected-revision "$REVISION"
+```
+
+This signs the existing authority recovery operation with a fresh normal owner
+scope under the same authority ID. It retains accounting, paid terms and channel
+duties, advances the generation, and revokes old credentials and administrative
+grants; explicitly regrant any required remote administration. It replaces the
+one canonical `provider/startup-profile/credential` file, so the retained local
+profile and the next declarative startup use the same credential. No startup
+implicitly renews or recovers authority. If the process dies or credential
+publication fails after recovery commits, inspect the current revision and run
+this explicit operation again at that revision; a stale revision is refused.
+Never remove journals or startup metadata to work around expiry.
+
+For the default NixOS DynamicUser deployment, run inspection/rebind as the
+service's owning identity, not as a bare root CLI. A manually started maintenance
+unit preserves that ownership and the existing credential bindings:
+
+```nix
+systemd.services.hellas-owner-maintenance = {
+  conflicts = [ "hellas.service" ];
+  after = [ "hellas.service" ];
+  serviceConfig = {
+    Type = "oneshot";
+    User = "hellas";
+    DynamicUser = true;
+    StateDirectory = "hellas";
+    StateDirectoryMode = "0700";
+    LoadCredential = config.systemd.services.hellas.serviceConfig.LoadCredential;
+    # Replace 123 with the stopped authority's inspected revision.
+    ExecStart = "${config.services.hellas.package}/bin/hellas --home /var/lib/hellas/.hellas --passkey %d/owner-passkey admin rebind-local --expected-revision 123";
+  };
+};
+```
+
+First use that unit's same account/state-directory settings with
+`admin inspect-offline --journal provider/authority /run/hellas-inspection.json`
+as the command, where the query file contains `{"Grants":{"after":null}}`.
+Read the reported authority revision, then select the rebind command above.
+Start the maintenance unit explicitly with `systemctl start
+hellas-owner-maintenance`; inspect its output and restart `hellas` explicitly
+after success. Adapt the home, account and writable-path bindings for a custom
+deployment. Do not change journal ownership to bypass private-file checks.
+
+Home Manager accepts externally provisioned `serve.configFile` and requires
+`serve.passkey` for declarative startup. Both must be readable by the login user;
+it has no generated `settings` or systemd credential delivery. It can also run
+the interactive service on Darwin:
 
 ```nix
 programs.hellas = {
@@ -91,6 +199,15 @@ job) runs the workspace tests once under `cargo llvm-cov`. It fails on a
 failing test and prints line coverage, which is informational and never fails
 the check. Its output holds `lcov.info`, `summary.json` and `summary.txt`.
 
+## Node home format
+
+This cutover uses `hellas.node.identity.v2`, journal v6 and checkpoint v6.
+Earlier home formats are rejected at the identity marker before journal replay,
+regardless of checkpoint rotation. There is no automatic migration or reset.
+Use a new, separately provisioned home for this greenfield format; retain older
+homes with their matching binary for any outstanding obligations. Do not delete
+journals or change markers to bypass rejection.
+
 ## Docker
 
 The default `docker` output is a network-only node image. It contains no local Catena or
@@ -118,10 +235,14 @@ docker run --rm --device /dev/kfd --device /dev/dri \
   ghcr.io/hellas-ai/hellas:hip
 ```
 
-Both images start `serve`. Pair the invite, then add model routes using paths
+Images have the Hellas executable (or CUDA environment wrapper) as Entrypoint,
+with `serve --port 31145` as the default Cmd. Override Cmd directly for a
+declarative provider, for example `IMAGE serve --config /run/provider.toml`;
+the CUDA wrapper forwards those arguments unchanged. By default pair the invite,
+then add model routes using paths
 inside the container. The host supplies the GPU driver; model packages stay
-on runtime volumes. For a stateless container, override the entrypoint with
-`hellas` and run `gateway --model /content/PACKAGE`.
+on runtime volumes. For a stateless container, override Cmd with `gateway --model /content/PACKAGE` and its bearer/wrapper
+options.
 
 A GPU asset owner uploads verified weights once and execution workers receive
 them as read-only views over GPU IPC. Worker replacement retains weights; asset
@@ -129,9 +250,8 @@ pressure recreates the owner.
 
 ## Recording and replaying jobs
 
-The gateway keeps no inference cache. `hellas_gateway::start` runs over any
-`WorkExecutionBackend`; the CLI passes `hellas_sdk::ExecutorGateway`, which runs
-each request as one job through the same `Executor` as the job commands. Text
+The daemon core connects gateway routes to `hellas_sdk::ExecutorGateway`, which
+runs each request as one job through the same `Executor` as job commands. Text
 and Fetch events are serializable, so an application can record and replay jobs
 by wrapping its work source.
 
@@ -162,7 +282,7 @@ Scrapes collect executor and gateway instruments from the same meter provider
 used for optional OTLP push; both can run together. OTLP environment opt-outs,
 including `OTEL_SDK_DISABLED`, leave the requested local listener active.
 Iroh endpoint metrics share the response for serve and for paid and granted
-gateways; a `--local` gateway has no endpoint.
+gateways; local-only model backends do not open a provider endpoint.
 
 NixOS exposes `services.hellas.metricsPort` and
 `services.hellas.gateway.metricsPort`, with `metricsAddress` beside each port

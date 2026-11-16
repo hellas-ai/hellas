@@ -71,7 +71,7 @@ impl Default for ResourceHealth {
 /// It names the frame format, so a journal written under different semantics
 /// is refused at the boundary instead of being reinterpreted. Bump it with
 /// any change to [`Frame`] or [`Change`] that is not readable as written.
-pub(super) const JOURNAL_NAMESPACE: &str = "hellas.node.journal.v5";
+pub(super) const JOURNAL_NAMESPACE: &str = "hellas.node.journal.v6";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct Frame {
@@ -133,6 +133,32 @@ pub(super) enum Change {
     },
 }
 impl State {
+    fn check_paid_policy_record(
+        &self,
+        record: &super::WorkRecord,
+        expected: Revision,
+    ) -> Result<(), NodeStoreError> {
+        record.caller.session().step_up()?;
+        let owner = self
+            .authority
+            .grant(self.authority.root_grant())
+            .ok_or(NodeStoreError::Malformed)?
+            .spec()
+            .subject;
+        if record.caller.actor() != owner {
+            return Err(hellas_auth::authority::AuthorityError::Denied.into());
+        }
+        if self
+            .paid_policy
+            .as_ref()
+            .map_or(Revision(0), |policy| policy.revision)
+            != expected
+        {
+            return Err(hellas_auth::authority::AuthorityError::Revision.into());
+        }
+        Ok(())
+    }
+
     pub fn configuration(
         &self,
     ) -> Option<&crate::model::grant::configuration::ConfigurationDocument> {
@@ -391,32 +417,22 @@ impl State {
                         .permission(self.authority.authority(), None)?,
                 )?;
                 match &record.mutation {
+                    super::WorkMutation::DisablePaidPolicy { expected } => {
+                        self.check_paid_policy_record(record, *expected)?;
+                        let current = self.paid_policy.as_mut().ok_or(NodeStoreError::Malformed)?;
+                        current.revision = expected.next().ok_or(NodeStoreError::Malformed)?;
+                        current.enabled = false;
+                    }
                     super::WorkMutation::PaidPolicy {
                         expected,
                         policy_salt,
                         policy,
                     } => {
-                        record.caller.session().step_up()?;
-                        let owner = self
-                            .authority
-                            .grant(self.authority.root_grant())
-                            .ok_or(NodeStoreError::Malformed)?
-                            .spec()
-                            .subject;
-                        if record.caller.actor() != owner {
-                            return Err(hellas_auth::authority::AuthorityError::Denied.into());
-                        }
-                        if self
-                            .paid_policy
-                            .as_ref()
-                            .map_or(Revision(0), |p| p.revision)
-                            != *expected
-                        {
-                            return Err(hellas_auth::authority::AuthorityError::Revision.into());
-                        }
+                        self.check_paid_policy_record(record, *expected)?;
                         policy.check()?;
                         self.paid_policy =
                             Some(hellas_channel::model::paid_policy::StoredPaidPolicy {
+                                enabled: true,
                                 revision: expected.next().ok_or(NodeStoreError::Malformed)?,
                                 policy_salt: *policy_salt,
                                 policy: policy.as_ref().clone(),
@@ -965,9 +981,9 @@ fn verify(
     .map_err(|_| GrantError::Signature.into())
 }
 
-/// Snapshots retain health decisions made under the frame accounting semantics.
-/// Refuse pre-v5 state even when rotation removed every old frame.
-const CHECKPOINT_NAMESPACE: &str = "hellas.node.checkpoint.v5";
+/// Snapshots retain accounting, health and enabled/disabled paid policy semantics.
+/// Refuse pre-v6 state even when rotation removed every old frame.
+const CHECKPOINT_NAMESPACE: &str = "hellas.node.checkpoint.v6";
 
 #[derive(Serialize, Deserialize)]
 pub(super) struct Snapshot {

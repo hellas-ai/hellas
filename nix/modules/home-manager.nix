@@ -25,6 +25,7 @@ let
   serveRuntimePaths = [
     cfg.serve.home
   ]
+  ++ lib.optional (cfg.serve.configFile != null) cfg.serve.configFile
   ++ lib.optional (cfg.serve.chainConfig != null) cfg.serve.chainConfig
   ++ lib.optional (cfg.serve.passkey != null) cfg.serve.passkey
   ++ lib.optional (cfg.serve.environmentFile != null) cfg.serve.environmentFile;
@@ -132,6 +133,11 @@ in
 
     (mkIf (cfg.enable || cfg.serve.enable) {
       assertions = [
+        {
+          assertion = cfg.serve.configFile == null || cfg.serve.passkey != null;
+          message = "programs.hellas.serve.configFile requires the owner passkey; Home Manager supports runtime files only.";
+        }
+
         {
           assertion = cfg.serve.metricsPort == null || cfg.otel.enable;
           message = "programs.hellas.serve metrics ports require otel.enable and a package built with the otel feature.";

@@ -180,10 +180,45 @@ pub fn save_credential(
     path: &Path,
     credential: &CredentialSecret,
 ) -> io::Result<()> {
+    publish_private(file, path, &credential_bytes(credential))
+}
+
+fn credential_bytes(credential: &CredentialSecret) -> Zeroizing<Vec<u8>> {
     let mut bytes = Zeroizing::new(Vec::with_capacity(48));
     bytes.extend_from_slice(&credential.id().0);
     bytes.extend_from_slice(credential.expose_secret());
-    publish_private(file, path, &bytes)
+    bytes
+}
+
+/// Replace the operator-selected canonical credential after an explicit rebind.
+pub fn replace_credential(path: &Path, credential: &CredentialSecret) -> io::Result<()> {
+    hellas_private::write_atomically(path, ".credential", &credential_bytes(credential))
+}
+
+/// Write profile metadata referring to the one canonical credential file.
+pub fn write_local(
+    path: &Path,
+    authority: AuthorityId,
+    authorization: GrantId,
+    credential: &Path,
+    certificate: &Path,
+) -> io::Result<()> {
+    let file = ProfileFile {
+        authority,
+        authorization,
+        credential: credential.into(),
+        local: Some(LocalTrust {
+            certificate: certificate.into(),
+            server_name: "localhost".into(),
+        }),
+        remote_node: None,
+        remote_addresses: vec![],
+    };
+    hellas_private::write_atomically(
+        path,
+        ".profile",
+        &serde_json::to_vec(&file).map_err(io::Error::other)?,
+    )
 }
 
 /// Durably publish secret-bearing bytes through a private temporary file

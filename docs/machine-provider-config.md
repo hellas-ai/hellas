@@ -24,8 +24,9 @@ authenticated console. If creation cannot be
 confirmed, reconcile by the requested name before retrying; a failed response
 can still correspond to an allocated, billable resource.
 
-The image's entrypoint is `serve --port 31145`. A node with no owner prints its invite and waits to be paired. Preserve the persistent home
-mount.
+The image's default command is `serve --port 31145`; its entrypoint is the
+Hellas executable or CUDA setup wrapper. A node with no owner prints its invite
+and waits to be paired. Preserve the persistent home mount.
 
 RunPod does not expose inbound UDP ([port documentation](https://docs.runpod.io/pods/configuration/expose-ports)).
 Do not request `31145/udp` or substitute a TCP mapping into a QUIC invitation.
@@ -59,12 +60,12 @@ and `sha-FULL_COMMIT_SHA-hip`.
 Updating a tag or template does not upgrade an already running Pod. Review the
 new release's state compatibility before replacing a persistent worker.
 
-Preserve the image's Docker entrypoint: it already selects `serve`, port 31145,
-including CUDA driver-library setup where needed. In RunPod's
-`dockerStartCmd`, pass only additional arguments, for example:
+Preserve the image's Docker entrypoint, including CUDA driver-library setup.
+RunPod's `dockerStartCmd` replaces the default command, so include the subcommand
+and all desired arguments:
 
 ```json
-["--home", "/var/lib/hellas/.hellas"]
+["serve", "--port", "31145", "--home", "/var/lib/hellas/.hellas"]
 ```
 
 Put converted packages on the persistent volume. Pair the invite, then use

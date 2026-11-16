@@ -116,6 +116,31 @@ impl NodeCoordinator {
             .await
     }
 
+    /// Reconcile owner-approved automatic offer terms before starting transports.
+    /// Equality is checked under the same writer lock as the commit: a restart
+    /// retains the policy revision and salt, including after a lost reply.
+    pub async fn reconcile_paid_policy(
+        &self,
+        caller: &AuthenticatedCaller,
+        authorization: GrantId,
+        policy: Option<hellas_channel::model::paid_policy::PaidPolicy>,
+    ) -> Result<(), NodeStoreError> {
+        use crate::work_store::grant::WORK_PAID_POLICY_CONFIGURE;
+        let _changed = ChangeNotification(self.changed.clone());
+        self.checked(
+            caller,
+            authorization,
+            WORK_PAID_POLICY_CONFIGURE,
+            async |store, now| {
+                store
+                    .configure_paid_policy(caller, authorization, None, policy, now)
+                    .await
+                    .map(|_| ())
+            },
+        )
+        .await
+    }
+
     /// Reject unauthorized candidates before any runtime preparation.
     pub async fn authorize_configure(
         &self,

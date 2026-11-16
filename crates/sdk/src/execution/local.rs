@@ -158,8 +158,18 @@ pub(crate) async fn run(
 pub async fn spawn(
     signer: std::sync::Arc<ProducerSigningKey>,
     gpu: hellas_executor::GpuConfig,
+    bounds: &crate::daemon_config::Execution,
 ) -> std::result::Result<hellas_executor::ExecutorHandle, hellas_executor::ExecutorError> {
     let mut config = hellas_executor::ExecutorSpawnConfig::new(signer, Default::default());
     config.gpu_config = gpu;
+    if let Some(value) = bounds.queue_capacity {
+        config.queue_capacity = value;
+    }
+    if let Some(value) = bounds.session_programs {
+        config.gpu_config.session_programs = value.get();
+    }
+    if let Some(value) = bounds.session_asset_bytes {
+        config.gpu_config.session_asset_bytes = value.get();
+    }
     hellas_executor::Executor::spawn_configured(config).await
 }

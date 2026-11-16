@@ -10,7 +10,9 @@ pub use resources::{Resource, ResourceKind};
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Document {
+    #[serde(default)]
     pub listeners: BTreeMap<String, Listener>,
+    #[serde(default)]
     pub backends: BTreeMap<String, Backend>,
     #[serde(default)]
     pub routes: Vec<hellas_gateway::Route>,
@@ -25,18 +27,32 @@ pub struct Document {
     )>,
     #[serde(default)]
     pub limits: Limits,
+    #[serde(default)]
+    pub execution: Execution,
+}
+/// Bounds for the shared local executor. Absent values retain native defaults.
+#[derive(Clone, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Execution {
+    pub queue_capacity: Option<usize>,
+    pub session_programs: Option<NonZeroUsize>,
+    pub session_asset_bytes: Option<std::num::NonZeroU64>,
 }
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Limits {
     pub requests_per_minute: Option<std::num::NonZeroU64>,
 }
+const fn default_http_zdr() -> bool {
+    true
+}
+
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Listener {
     Http {
         bind: SocketAddr,
-        #[serde(default)]
+        #[serde(default = "default_http_zdr")]
         zdr: bool,
     },
     Iroh {
@@ -45,6 +61,14 @@ pub enum Listener {
         chain: Option<hellas_chain::genesis::CustomChainFile>,
         backends: Vec<String>,
     },
+}
+impl Listener {
+    pub fn http(bind: SocketAddr) -> Self {
+        Self::Http {
+            bind,
+            zdr: default_http_zdr(),
+        }
+    }
 }
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Backend {
@@ -204,6 +228,11 @@ impl Document {
     }
 
     pub fn validate(&self) -> Result<(), &'static str> {
+        if self.execution.queue_capacity.is_some_and(|queued| {
+            hellas_executor::ExecutorSpawnConfig::capacity_total(1, queued).is_err()
+        }) {
+            return Err("execution queue capacity exceeds the runtime limit");
+        }
         // One provider enrollment owns one transport identity and set of paid journals.
         if self
             .listeners

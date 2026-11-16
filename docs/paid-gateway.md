@@ -28,7 +28,11 @@ The JSON is a complete `WorkControlCommand`: `SetPaidPolicy` contains
 `expected_revision` and `policy`. The first approval expects revision 0 and
 returns `{"PaidPolicyChanged":{"revision":1}}`. For later approvals, copy the
 file and set `expected_revision` to the last returned revision. Stale revisions
-and daily node-key sessions cannot change paid terms.
+and daily node-key sessions cannot change paid terms. Raw administration also accepts
+`{"DisablePaidPolicy":{"expected_revision":N}}`. Set and disable share startup's
+owner/passkey checks and idempotent comparison. The expected revision is checked
+before equality: a stale request fails; equal terms at the current revision
+retain their revision and salt.
 
 The policy's `invocation_policy` names the evaluator shown by `hellas routes`.
 Change the example's HIP evaluator if the provider uses another runtime. Its
@@ -55,6 +59,16 @@ The provider address combines its enrollment ID and transport node ID. Buyers
 pin that enrollment; native programs run with the provider user's permissions.
 Only admit programs you trust. A policy admitting arbitrary programs grants
 those callers the same filesystem and device access as the provider process.
+
+For unattended service startup, `serve --config provider.toml` also accepts the
+policy itself under `[paid_policy]`, without the command wrapper or
+`expected_revision`. The provisioned owner passkey authenticates the change;
+startup compares against journaled terms under the writer lock. Identical terms
+retain their salt and revision. Removing the section disables new automatic
+offers, increments the policy revision once, and preserves all existing channel
+journals and signed terms. Restarting with the section still absent is a no-op.
+This never funds or delegates coins. See [the shared TOML schema](http-gateway.md#shared-toml-configuration)
+and [NixOS settings](nix.md).
 
 ## Buy
 

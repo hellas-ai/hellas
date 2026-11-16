@@ -1,5 +1,41 @@
 { self }:
 rec {
+  configurationOptions = { lib, pkgs }: {
+    settings = lib.mkOption {
+      inherit (pkgs.formats.toml { }) type;
+      default = { };
+      description = "TOML daemon configuration. Keep model bytes and credential files at runtime paths; never embed secrets.";
+    };
+    configFile = lib.mkOption {
+      type = lib.types.nullOr (lib.types.strMatching "/.*");
+      default = null;
+      description = "Private runtime TOML file, mutually exclusive with settings; loaded using systemd credentials.";
+    };
+    credentials = lib.mkOption {
+      type = lib.types.attrsOf (lib.types.strMatching "/.*");
+      default = { };
+      description = "Named runtime secrets supplied by systemd LoadCredential. In TOML upstreams use key_file = credential:NAME.";
+    };
+  };
+  mkConfiguration =
+    {
+      pkgs,
+      name,
+      settings,
+      configFile,
+    }:
+    if configFile != null then
+      "%d/hellas-config"
+    else if settings == { } then
+      null
+    else
+      toString ((pkgs.formats.toml { }).generate name settings);
+  loadCredentials =
+    lib: cfg:
+    lib.optional (cfg.configFile != null) "hellas-config:${cfg.configFile}"
+    ++ lib.optional (cfg.passkey != null) "owner-passkey:${cfg.passkey}"
+    ++ lib.mapAttrsToList (name: path: "${name}:${path}") cfg.credentials;
+
   # A node runs local Catena Compute, so modules select the compute build.
   # It omits OTEL; modules opt in through the package override.
   normalCliPackage =
@@ -188,6 +224,7 @@ rec {
     "--durability"
     "--home"
     "--log-file"
+    "--config"
     "--port"
     "--chain"
     "--chain-config"
@@ -198,6 +235,7 @@ rec {
   protectedGatewayExtraArgs = [
     "--home"
     "--log-file"
+    "--config"
     "--chain"
     "--chain-config"
     "--passkey"
@@ -317,6 +355,11 @@ rec {
       runtimePath = types.strMatching "/.*";
     in
     {
+      configFile = mkOption {
+        type = types.nullOr (types.strMatching "/.*");
+        default = null;
+        description = "Runtime TOML configuration path. Home Manager is file-only; provision it outside the Nix store.";
+      };
       port = mkOption {
         type = types.nullOr types.port;
         default = hellasLib.executorPort;
@@ -369,12 +412,13 @@ rec {
     };
 
   gatewayOptions =
-    { lib }:
+    { lib, pkgs }:
     let
       inherit (lib) mkEnableOption mkOption types;
       runtimePath = types.strMatching "/.*";
     in
-    {
+    (configurationOptions { inherit lib pkgs; })
+    // {
       enable = mkEnableOption "Hellas HTTP gateway";
       chain = mkOption {
         type = types.nullOr (types.enum [ "devnet" ]);
@@ -385,16 +429,6 @@ rec {
         type = types.nullOr runtimePath;
         default = null;
         description = "Authenticated custom chain profile passed as --chain-config.";
-      };
-      host = mkOption {
-        type = types.str;
-        default = "127.0.0.1";
-        description = "Host interface for the HTTP gateway to bind.";
-      };
-      port = mkOption {
-        type = types.port;
-        default = 8080;
-        description = "HTTP gateway port; zero chooses a free port.";
       };
       metricsAddress = mkOption {
         type = types.str;
@@ -422,44 +456,12 @@ rec {
         example = "/run/secrets/hellas-gateway.env";
         description = "Optional systemd EnvironmentFile path for gateway-only settings.";
       };
-      openFirewall = mkOption {
-        type = types.bool;
-        default = false;
-        description = "Open the HTTP gateway port in the firewall.";
-      };
       extraArgs = mkOption {
         type = types.listOf types.str;
         default = [ ];
         description = "Extra arguments to pass to `hellas gateway`. They may add unsupported harmless switches such as `--wrap`, but may not override module-managed runtime, content, identity, trust, or configuration flags (including `--flag=value`).";
       };
-      models = mkOption {
-        type = types.listOf types.str;
-        default = [ ];
-        example = [
-          "/srv/models/qwen3.gguf"
-          "flux@alice"
-          "gpt-5@openrouter"
-        ];
-        description = "Ordered --model entries: local package paths, PATH@CONTACT, or NAME@UPSTREAM.";
-      };
-      upstreams = mkOption {
-        type = types.attrsOf (
-          types.submodule {
-            options = {
-              url = mkOption {
-                type = types.str;
-                description = "OpenAI-compatible HTTPS API base URL.";
-              };
-              keyFile = mkOption {
-                type = runtimePath;
-                description = "API key file read at service startup, outside the Nix store.";
-              };
-            };
-          }
-        );
-        default = { };
-        description = "Named upstreams rendered as --upstream flags; keys remain runtime files.";
-      };
+
     };
 
   # OTEL_EXPORTER_OTLP_* env vars derived from a resolved `otel` cfg.
@@ -511,7 +513,8 @@ rec {
       serve.durability
       "serve"
     ]
-    ++ optArg "--port" serve.port
+    ++ optArg "--config" serve.configFile
+    ++ lib.optionals (serve.configFile == null) (optArg "--port" serve.port)
     ++ optArg "--chain" serve.chain
     ++ optArg "--chain-config" serve.chainConfig
     ++ optArg "--passkey" serve.passkey
@@ -537,25 +540,16 @@ rec {
           flag
           (toString value)
         ];
-      host = if lib.hasInfix ":" gateway.host then "[${gateway.host}]" else gateway.host;
     in
     [
       "--home"
       gateway.home
       "gateway"
-      "--bind"
-      "${host}:${toString gateway.port}"
     ]
-    ++ lib.concatMap (model: [
-      "--model"
-      model
-    ]) gateway.models
-    ++ lib.concatLists (
-      lib.mapAttrsToList (name: upstream: [
-        "--upstream"
-        "${name}=${upstream.url},key-file=${upstream.keyFile}"
-      ]) gateway.upstreams
-    )
+    ++ [
+      "--config"
+      gateway.configFile
+    ]
     ++ optArg "--chain" gateway.chain
     ++ optArg "--chain-config" gateway.chainConfig
     ++ optArg "--passkey" gateway.passkey

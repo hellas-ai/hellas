@@ -10,16 +10,21 @@ use std::{
     sync::Arc,
 };
 
+mod config;
+
 #[derive(clap::Args)]
 pub struct GatewayArgs {
+    /// TOML routing and listener configuration.
+    #[arg(long, conflicts_with_all = ["models", "upstreams", "bind"])]
+    pub config: Option<PathBuf>,
     /// Qwen GGUF, Whisper/Flux package or descriptor; PATH@CONTACT or NAME@UPSTREAM.
-    #[arg(long = "model", required = true)]
+    #[arg(long = "model", required_unless_present = "config")]
     pub models: Vec<String>,
     /// NAME=HTTPS_API_URL,key-file=PATH (an OpenAI-compatible service).
     #[arg(long = "upstream")]
     pub upstreams: Vec<String>,
-    #[arg(long, default_value = "127.0.0.1:8080")]
-    pub bind: std::net::SocketAddr,
+    #[arg(long)]
+    pub bind: Option<std::net::SocketAddr>,
     #[arg(long)]
     pub wrap: Option<String>,
     /// Write the gateway bearer atomically to this private file (mode 0600).
@@ -336,7 +341,17 @@ pub fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 fn key(path: &Path) -> Result<String> {
-    let path = if let Some(suffix) = path.to_str().and_then(|p| p.strip_prefix("~/")) {
+    let path = if let Some(name) = path
+        .to_str()
+        .and_then(|path| path.strip_prefix("credential:"))
+    {
+        validate_name(name)?;
+        PathBuf::from(
+            std::env::var_os("CREDENTIALS_DIRECTORY")
+                .context("credential: references require CREDENTIALS_DIRECTORY")?,
+        )
+        .join(name)
+    } else if let Some(suffix) = path.to_str().and_then(|p| p.strip_prefix("~/")) {
         PathBuf::from(std::env::var_os("HOME").context("HOME is unset")?).join(suffix)
     } else {
         path.to_owned()
@@ -350,6 +365,13 @@ fn key(path: &Path) -> Result<String> {
     Ok(value.into())
 }
 
+fn expand_upstream(document: &mut Document, name: &str, url: &str, key_file: &Path) -> Result<()> {
+    validate_name(name)?;
+    document
+        .add_upstream(name, url, Some(key(key_file)?))
+        .map_err(anyhow::Error::from_boxed)
+}
+
 pub async fn apply(document: &mut Document, edit: Edit, context: &ModelContext) -> Result<()> {
     match edit {
         Edit::Backend(BackendCommand::Add {
@@ -357,10 +379,7 @@ pub async fn apply(document: &mut Document, edit: Edit, context: &ModelContext) 
             url,
             key_file,
         }) => {
-            validate_name(&name)?;
-            document
-                .add_upstream(&name, &url, Some(key(&key_file)?))
-                .map_err(anyhow::Error::from_boxed)?;
+            expand_upstream(document, &name, &url, &key_file)?;
         }
         Edit::Backend(BackendCommand::Rm { name }) => document
             .remove_backend(&name)
@@ -369,7 +388,7 @@ pub async fn apply(document: &mut Document, edit: Edit, context: &ModelContext) 
         Edit::Route(RouteCommand::Listen { bind }) => {
             document
                 .listeners
-                .insert("api".into(), Listener::Http { bind, zdr: true });
+                .insert("api".into(), Listener::http(bind));
         }
         Edit::Route(RouteCommand::Rm { model }) => {
             let (name, destination) = model
@@ -404,6 +423,8 @@ pub async fn apply(document: &mut Document, edit: Edit, context: &ModelContext) 
             document.routes.retain(|route| !route.backends.is_empty());
         }
     }
+    // Interactive operator edits expose executable backends on the work listener.
+    // Declarative compilation never calls this command-layer attachment step.
     for listener in document.listeners.values_mut() {
         if let Listener::Iroh { backends, .. } = listener {
             *backends = document
@@ -556,6 +577,29 @@ pub async fn gateway(
     chain: &hellas_chain::genesis::ChainProfile,
     #[cfg(feature = "otel")] metrics: Option<(std::net::SocketAddr, crate::metrics::MetricsBundle)>,
 ) -> Result<()> {
+    let configured = match args.config {
+        Some(path) => config::Config::load(&path)?,
+        None => config::Config::gateway(args.models, args.upstreams, args.bind)?,
+    };
+    ensure!(
+        configured.paid_policy.is_none(),
+        "gateway configuration cannot set paid provider policy"
+    );
+    ensure!(
+        configured.document.listeners.len() == 1,
+        "gateway requires exactly one HTTP listener"
+    );
+    let (listener, kind) = configured
+        .document
+        .listeners
+        .iter()
+        .next()
+        .context("missing HTTP listener")?;
+    ensure!(
+        matches!(kind, Listener::Http { .. }),
+        "gateway requires an HTTP listener"
+    );
+    let listener = listener.clone();
     let mut tty = if args.wrap.is_none() && args.bearer_file.is_none() {
         let terminal = if cfg!(windows) { "CONOUT$" } else { "/dev/tty" };
         Some(
@@ -583,46 +627,9 @@ pub async fn gateway(
             .await?;
     let options = options(home.clone(), identity, owner, chain, node.clone(), None).await?;
     context.content = Some(options.content.clone());
-    let prepared: Result<_> = async {
-        let mut document = Document::default();
-        document.listeners.insert(
-            "api".into(),
-            Listener::Http {
-                bind: args.bind,
-                zdr: true,
-            },
-        );
-        for upstream in args.upstreams {
-            let (definition, key_file) = upstream
-                .rsplit_once(",key-file=")
-                .context("upstream is NAME=HTTPS_API_URL,key-file=PATH")?;
-            let (name, url) = definition
-                .split_once('=')
-                .context("upstream is NAME=HTTPS_API_URL,key-file=PATH")?;
-            apply(
-                &mut document,
-                Edit::Backend(BackendCommand::Add {
-                    name: name.into(),
-                    url: url.into(),
-                    key_file: key_file.into(),
-                }),
-                &context,
-            )
-            .await?;
-        }
-        for model in args.models {
-            apply(
-                &mut document,
-                Edit::Route(RouteCommand::Add { model }),
-                &context,
-            )
-            .await?;
-        }
-        Ok(document)
-    }
-    .await;
+    let prepared = configured.resolve(&context).await;
     let document = match prepared {
-        Ok(document) => document,
+        Ok((document, _)) => document,
         Err(error) => {
             options.content.close().await;
             node.close().await;
@@ -631,13 +638,15 @@ pub async fn gateway(
     };
     run_daemon(
         options,
-        Some(document),
-        None,
+        Start::Transient(document),
         #[cfg(feature = "otel")]
         metrics,
         async |core| {
             print(&core.watch().0);
-            let address = core.http_addresses()["api"];
+            let address = *core
+                .http_addresses()
+                .get(&listener)
+                .context("gateway HTTP listener is unavailable")?;
             if let Some(path) = args.bearer_file {
                 hellas_private::write_atomically(&path, ".bearer", access.bearer().as_bytes())?;
             }
@@ -680,29 +689,65 @@ pub async fn serve(
     owner: Option<&hellas_kernel::SoftPasskey>,
     chain: &hellas_chain::genesis::ChainProfile,
     port: Option<u16>,
+    config_file: Option<PathBuf>,
     #[cfg(feature = "otel")] metrics: Option<(std::net::SocketAddr, crate::metrics::MetricsBundle)>,
 ) -> Result<()> {
+    let declarative = config_file.is_some();
+    let desired = if let Some(path) = config_file {
+        let state = config::Config::load(&path)?;
+        let context = ModelContext::new(
+            home,
+            identity,
+            owner.map(|owner| owner as &dyn Authenticator),
+        )?;
+        Some(state.resolve(&context).await?)
+    } else {
+        None
+    };
+    let ownership = hellas_authority::work_store::grant::StartupLock::acquire(
+        &home.child("provider/authority"),
+    )?;
     let shutdown = shutdown_signal()?;
     tokio::pin!(shutdown);
-    let endpoint = tokio::select! {
-        result = super::bootstrap::prepare(home, &identity.transport_key, &identity.enrollment, port) => result?,
-        signal = &mut shutdown => return Ok(signal?),
+    let (endpoint, store, declarative_start) = if let Some(state) = desired {
+        let (store, credential) = super::bootstrap::prepare_local(
+            home,
+            identity,
+            owner.context("--config requires --passkey")?,
+            &ownership,
+        )
+        .await?;
+        let authorization = store.state().authority().root_grant();
+        (None, store, Some((state, credential, authorization)))
+    } else {
+        let (endpoint, store) = tokio::select! {
+            result = super::bootstrap::prepare(home, &identity.transport_key, &identity.enrollment, port, &ownership) => result?,
+            signal = &mut shutdown => return Ok(signal?),
+        };
+        (endpoint, store, None)
     };
-    let store = hellas_authority::work_store::grant::NodeStore::open(
-        &home.child("provider").child("authority"),
-        hellas_authority::model::grant::grant_network(),
-        Some(identity.enrollment.clone()),
-        hellas_auth::authority::UnixMillis::now()?,
-    )
-    .await?;
     let node = hellas_authority::node::NodeCoordinator::new(
         store,
         Arc::new(|| hellas_auth::authority::UnixMillis::now().unwrap_or_default()),
     );
-    let mut options = options(home.clone(), identity, owner, chain, node.clone(), endpoint).await?;
-    options.remote_control = hellas_sdk::node_control::RemoteControlAdmission::credential_gated();
-    let document = if node.configuration().await?.is_some() {
-        None
+    let start = if let Some((state, credential, authorization)) = declarative_start {
+        let caller = node
+            .authenticate_session(
+                &credential,
+                hellas_authority::node::SessionKey::Passkey(
+                    owner.context("--config requires --passkey")?,
+                ),
+            )
+            .await?;
+        let (document, paid_policy) = state;
+        Start::Reconcile(Box::new(Reconciliation {
+            document,
+            caller,
+            authorization,
+            paid_policy,
+        }))
+    } else if node.configuration().await?.is_some() {
+        Start::Restore(port)
     } else {
         let mut document = Document::default();
         document.listeners.insert(
@@ -713,12 +758,13 @@ pub async fn serve(
                 backends: vec![],
             },
         );
-        Some(document)
+        Start::Transient(document)
     };
+    let mut options = options(home.clone(), identity, owner, chain, node.clone(), endpoint).await?;
+    options.remote_control = hellas_sdk::node_control::RemoteControlAdmission::credential_gated();
     run_daemon(
         options,
-        document,
-        port,
+        start,
         #[cfg(feature = "otel")]
         metrics,
         async |core| {
@@ -734,7 +780,11 @@ pub async fn serve(
                 "Provider: {}",
                 hellas_sdk::client::ProviderAddress::of(&identity.enrollment)?
             );
-            eprintln!("Daemon ready; configure it with hellas backend and hellas route.");
+            if declarative {
+                eprintln!("Daemon ready; declared configuration reconciled.");
+            } else {
+                eprintln!("Daemon ready; configure it with hellas backend and hellas route.");
+            }
             let signal: Result<()> = tokio::select! {
                 result = &mut shutdown => result.map_err(Into::into),
                 result = core.wait() => result.map_err(anyhow::Error::from_boxed),
@@ -748,19 +798,46 @@ pub async fn serve(
     .await
 }
 
+enum Start {
+    Transient(Document),
+    Restore(Option<u16>),
+    Reconcile(Box<Reconciliation>),
+}
+struct Reconciliation {
+    document: Document,
+    caller: hellas_auth::authority::AuthenticatedCaller,
+    authorization: hellas_auth::authority::GrantId,
+    paid_policy: Option<hellas_channel::model::paid_policy::PaidPolicy>,
+}
+
 async fn run_daemon(
     options: hellas_sdk::daemon::Options,
-    document: Option<Document>,
-    port: Option<u16>,
+    start: Start,
     #[cfg(feature = "otel")] metrics: Option<(std::net::SocketAddr, crate::metrics::MetricsBundle)>,
     run: impl AsyncFnOnce(Arc<hellas_sdk::daemon::Core>) -> Result<()>,
 ) -> Result<()> {
     let content = options.content.clone();
     let node = options.node.clone();
     let serving = async {
-        let core = match document {
-            Some(document) => hellas_sdk::daemon::Core::open(options, document).await,
-            None => hellas_sdk::daemon::Core::restore(options, port).await,
+        let core = match start {
+            Start::Transient(document) => hellas_sdk::daemon::Core::open(options, document).await,
+            Start::Restore(port) => hellas_sdk::daemon::Core::restore(options, port).await,
+            Start::Reconcile(start) => {
+                let Reconciliation {
+                    document,
+                    caller,
+                    authorization,
+                    paid_policy,
+                } = *start;
+                hellas_sdk::daemon::Core::reconcile(
+                    options,
+                    document,
+                    caller,
+                    authorization,
+                    paid_policy,
+                )
+                .await
+            }
         }
         .map_err(anyhow::Error::from_boxed)?;
         let result = async {
@@ -802,23 +879,49 @@ mod tests {
     use super::*;
     use clap::Parser;
 
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn gateway_matching_and_store_preparation_hash_full_weights_once() {
-        const CHILD: &str = "HELLAS_TEST_GATEWAY_HASH_ONCE";
-        if std::env::var_os(CHILD).is_none() {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "commands::daemon::tests::gateway_matching_and_store_preparation_hash_full_weights_once", "--nocapture"])
-                .env(CHILD, "1")
-                .output().unwrap();
-            assert!(
-                output.status.success(),
-                "{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            return;
+    pub(super) fn model_context(home: &Path) -> ModelContext {
+        ModelContext {
+            home: home.into(),
+            principal: None,
+            content: None,
+            holder: NodeKey::from_public_key(
+                hellas_auth::ProducerSigningKey::from_secret_bytes([1; 32])
+                    .unwrap()
+                    .public_key(),
+            )
+            .unwrap(),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    const WEIGHTS_BYTES: u64 = 32 << 20;
+
+    #[cfg(target_os = "linux")]
+    fn isolated(test: &str) -> bool {
+        const CHILD: &str = "HELLAS_TEST_WEIGHT_READ_CASE";
+        if std::env::var(CHILD).ok().as_deref() == Some(test) {
+            return true;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("commands::daemon::tests::{test}"),
+                "--nocapture",
+            ])
+            .env(CHILD, test)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
+    }
+
+    #[cfg(target_os = "linux")]
+    fn full_weights() -> (tempfile::TempDir, PathBuf) {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("full.gguf");
         std::fs::copy(
@@ -827,13 +930,41 @@ mod tests {
             &path,
         )
         .unwrap();
-        let size = 32 << 20;
         std::fs::OpenOptions::new()
             .write(true)
             .open(&path)
             .unwrap()
-            .set_len(size)
+            .set_len(WEIGHTS_BYTES)
             .unwrap();
+        (root, path)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_bytes() -> u64 {
+        std::fs::read_to_string("/proc/self/io")
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("rchar: ").map(|n| n.parse().unwrap()))
+            .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_weights_once(before: u64) {
+        let bytes = read_bytes() - before;
+        assert!(
+            (WEIGHTS_BYTES..WEIGHTS_BYTES + (1 << 20)).contains(&bytes),
+            "expected one full read of {WEIGHTS_BYTES} weights bytes, observed {bytes}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn gateway_matching_and_store_preparation_hash_full_weights_once() {
+        if !isolated("gateway_matching_and_store_preparation_hash_full_weights_once") {
+            return;
+        }
+        let (root, path) = full_weights();
+        let size = WEIGHTS_BYTES;
         let store = hellas_store::content::DiskStore::open(
             hellas_private::StoreLocation::for_test(&root.path().join("content")),
             vec![],
@@ -846,24 +977,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let context = ModelContext {
-            home: root.path().into(),
-            principal: None,
-            holder: NodeKey::from_public_key(
-                hellas_auth::ProducerSigningKey::from_secret_bytes([1; 32])
-                    .unwrap()
-                    .public_key(),
-            )
-            .unwrap(),
-            content: Some(store.clone()),
-        };
-        let read_bytes = || -> u64 {
-            std::fs::read_to_string("/proc/self/io")
-                .unwrap()
-                .lines()
-                .find_map(|line| line.strip_prefix("rchar: ").map(|n| n.parse().unwrap()))
-                .unwrap()
-        };
+        let mut context = model_context(root.path());
+        context.content = Some(store.clone());
         let before = read_bytes();
         let hip = hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip);
         let cuda = hellas_client::model::evaluator(hellas_client::model::GpuDialect::Cuda);
@@ -878,52 +993,18 @@ mod tests {
             .rescan(vec![path], hellas_store::content::IndexMode::Resume)
             .await
             .unwrap();
-        let bytes = read_bytes() - before;
-        assert!(bytes >= size, "cold weights were not read: {bytes}");
-        assert!(
-            bytes < size + (1 << 20),
-            "weights were read more than once: {bytes} bytes for {size} weights bytes"
-        );
+        assert_weights_once(before);
         store.close().await;
     }
 
     #[cfg(all(target_os = "linux", feature = "compute"))]
     #[tokio::test]
     async fn local_rendering_and_indexing_hash_full_weights_once() {
-        const CHILD: &str = "HELLAS_TEST_LOCAL_HASH_ONCE";
-        if std::env::var_os(CHILD).is_none() {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "commands::daemon::tests::local_rendering_and_indexing_hash_full_weights_once",
-                    "--nocapture",
-                ])
-                .env(CHILD, "1")
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+        if !isolated("local_rendering_and_indexing_hash_full_weights_once") {
             return;
         }
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("full.gguf");
-        std::fs::copy(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../client/src/model/package/mini-qwen3.gguf"),
-            &path,
-        )
-        .unwrap();
-        let size = 32 << 20;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_len(size)
-            .unwrap();
+        let (root, path) = full_weights();
+        let size = WEIGHTS_BYTES;
         let native = crate::compute::LocalArgs {
             content_config: None,
             content: vec![],
@@ -932,13 +1013,6 @@ mod tests {
                 gpu_session_programs: 1,
                 gpu_session_asset_bytes: size,
             },
-        };
-        let read_bytes = || -> u64 {
-            std::fs::read_to_string("/proc/self/io")
-                .unwrap()
-                .lines()
-                .find_map(|line| line.strip_prefix("rchar: ").map(|n| n.parse().unwrap()))
-                .unwrap()
         };
         let before = read_bytes();
         let store = crate::compute::content(
@@ -954,11 +1028,7 @@ mod tests {
                 .await
                 .unwrap();
         packages[&evaluator].program().unwrap();
-        let bytes = read_bytes() - before;
-        assert!(
-            bytes >= size && bytes < size + (1 << 20),
-            "weights were read more than once: {bytes} bytes for {size} weights bytes"
-        );
+        assert_weights_once(before);
         store.close().await;
     }
 
@@ -1003,17 +1073,7 @@ mod tests {
     #[tokio::test]
     async fn remove_grant_route_by_contact_uses_its_generated_id() {
         let directory = tempfile::tempdir().unwrap();
-        let context = ModelContext {
-            home: directory.path().into(),
-            content: None,
-            principal: None,
-            holder: NodeKey::from_public_key(
-                hellas_auth::ProducerSigningKey::from_secret_bytes([1; 32])
-                    .unwrap()
-                    .public_key(),
-            )
-            .unwrap(),
-        };
+        let context = model_context(directory.path());
         let contact = "a".repeat(64);
         let mut document = Document::default();
         let id = grant_backend(
@@ -1062,7 +1122,7 @@ mod tests {
     }
 
     #[test]
-    fn stateless_and_stateful_command_surfaces_have_no_config_file() {
+    fn command_forms_share_config_and_reject_ambiguous_routing_flags() {
         let parsed = crate::Cli::try_parse_from([
             "hellas",
             "gateway",
@@ -1082,11 +1142,36 @@ mod tests {
             unreachable!()
         };
         assert_eq!(args.models.len(), 4);
+        for command in ["serve", "gateway"] {
+            assert!(crate::Cli::try_parse_from(["hellas", command, "--config", "file"]).is_ok());
+        }
+
         for args in [
-            vec!["hellas", "gateway", "--config", "file"],
-            vec!["hellas", "serve", "--model", "model.gguf"],
-            vec!["hellas", "serve", "--fetch-config", "file"],
-            vec!["hellas", "serve", "apply", "file"],
+            vec![
+                "hellas",
+                "gateway",
+                "--config",
+                "file",
+                "--model",
+                "model.gguf",
+            ],
+            vec![
+                "hellas",
+                "gateway",
+                "--config",
+                "file",
+                "--upstream",
+                "api=https://api.example/v1,key-file=key",
+            ],
+            vec![
+                "hellas",
+                "gateway",
+                "--config",
+                "file",
+                "--bind",
+                "127.0.0.1:8080",
+            ],
+            vec!["hellas", "serve", "--config", "file", "--port", "0"],
         ] {
             assert!(crate::Cli::try_parse_from(args).is_err());
         }
@@ -1111,17 +1196,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let key_file = directory.path().join("key");
         std::fs::write(&key_file, "test-secret\n").unwrap();
-        let context = ModelContext {
-            home: directory.path().into(),
-            content: None,
-            principal: None,
-            holder: NodeKey::from_public_key(
-                hellas_auth::ProducerSigningKey::from_secret_bytes([1; 32])
-                    .unwrap()
-                    .public_key(),
-            )
-            .unwrap(),
-        };
+        let context = model_context(directory.path());
         let mut document = Document::default();
         document.listeners.insert(
             "work".into(),

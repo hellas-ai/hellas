@@ -26,20 +26,28 @@ let
       ];
     };
   evalProvider = settings: eval ({ enable = true; } // settings);
+  gatewaySettings = {
+    models = [
+      "/srv/models/qwen.gguf"
+      "flux@friend"
+      "gpt-5@upstream"
+    ];
+    upstreams.upstream = {
+      url = "https://api.example.com/v1";
+      key_file = "/run/secrets/upstream.key";
+    };
+    listeners.api = {
+      kind = "http";
+      bind = "127.0.0.1:8080";
+      zdr = true;
+    };
+  };
   evalGateway =
     settings:
     eval {
       gateway = {
         enable = true;
-        models = [
-          "/srv/models/qwen.gguf"
-          "flux@friend"
-          "gpt-5@upstream"
-        ];
-        upstreams.upstream = {
-          url = "https://api.example.com/v1";
-          keyFile = "/run/secrets/upstream.key";
-        };
+        settings = gatewaySettings;
       }
       // settings;
     };
@@ -50,14 +58,21 @@ let
     ) (throw "missing module assertion: ${text}") evaluation.config.assertions).assertion;
   defaultProviderService = (evalProvider { }).config.systemd.services.hellas;
   gateway = (evalGateway { }).config.systemd.services.hellas-gateway;
-  remote = (evalGateway { models = [ "gpt-5@upstream" ]; }).config.systemd.services.hellas-gateway;
+  remote =
+    (evalGateway {
+      settings = gatewaySettings // {
+        models = [ "gpt-5@upstream" ];
+      };
+    }).config.systemd.services.hellas-gateway;
   custom = (evalGateway { home = "/srv/gateway-state"; }).config.systemd.services.hellas-gateway;
   metrics =
     (eval {
       otel.enable = true;
       gateway = {
         enable = true;
-        models = [ "gpt-5@upstream" ];
+        settings = gatewaySettings // {
+          models = [ "gpt-5@upstream" ];
+        };
         metricsPort = 9401;
       };
     }).config.systemd.services.hellas-gateway;
@@ -192,22 +207,138 @@ let
       matched = builtins.match ".* --config (.*)" service.serviceConfig.ExecStart;
     in
     if matched == null then throw "validator ExecStart has no config" else builtins.head matched;
+  nestedGateway = import (pkgs.path + "/nixos/lib/eval-config.nix") {
+    system = pkgs.stdenv.hostPlatform.system;
+    modules = [
+      self.nixosModules.default
+      {
+        nixpkgs.pkgs = plainPkgs;
+        system.stateVersion = "26.05";
+        services.hellas.gateway = {
+          enable = true;
+          inherit package;
+          settings.listeners.frontend = {
+            kind = "http";
+          };
+        };
+      }
+      { services.hellas.gateway.settings.listeners.frontend.bind = "127.0.0.1:8080"; }
+    ];
+  };
+  credentialProvider = evalProvider {
+    configFile = "/run/secrets/provider.toml";
+    passkey = "/run/secrets/owner";
+    credentials.api = "/run/secrets/api";
+  };
+  dockerConfig =
+    backend:
+    (import ../docker.nix {
+      pkgs = pkgs // {
+        dockerTools.streamLayeredImage = args: args;
+      };
+      inherit backend;
+      rustToolchain = self.lib.rustToolchain pkgs;
+      cli = package;
+    }).image.config;
+  declarative = evalProvider {
+    passkey = "/run/secrets/owner";
+    settings = {
+      models = [
+        "/srv/models/qwen.gguf"
+        "/srv/models/flux@revision@alice"
+      ];
+      listeners.work = {
+        kind = "iroh";
+        port = 31145;
+        backends = [ "local" ];
+      };
+      execution = {
+        queue_capacity = 1;
+        session_programs = 1;
+        session_asset_bytes = 1516744736;
+      };
+    };
+  };
+  declarativeService = declarative.config.systemd.services.hellas;
   paidWorkValidatorServices = paidWorkValidators.config.systemd.services;
   validatorConfig2 = validatorConfigPath paidWorkValidatorServices."hellas-validator-devnet-node2";
 in
 {
   provider-content-eval =
+    assert
+      nestedGateway.config.services.hellas.gateway.settings.listeners.frontend == {
+        kind = "http";
+        bind = "127.0.0.1:8080";
+      };
+    assert
+      credentialProvider.config.systemd.services.hellas.serviceConfig.LoadCredential == [
+        "hellas-config:/run/secrets/provider.toml"
+        "owner-passkey:/run/secrets/owner"
+        "api:/run/secrets/api"
+      ];
+    assert lib.hasInfix "--passkey %d/owner-passkey"
+      credentialProvider.config.systemd.services.hellas.serviceConfig.ExecStart;
+    assert assertion "cannot embed" (evalProvider {
+      settings.backends.secret = {
+        kind = "local";
+        max_in_flight = 1;
+      };
+    });
+    assert lib.all
+      (
+        backend:
+        let
+          config = dockerConfig backend;
+        in
+        builtins.length config.Entrypoint == 1
+        &&
+          config.Cmd == [
+            "serve"
+            "--port"
+            "31145"
+          ]
+      )
+      [
+        "network"
+        "cuda"
+      ];
+    assert lib.hasInfix "serve --config /nix/store/" declarativeService.serviceConfig.ExecStart;
+    assert !(lib.hasInfix "--port" declarativeService.serviceConfig.ExecStart);
+    assert lib.elem "/srv/models/flux@revision" declarativeService.unitConfig.RequiresMountsFor;
+    assert
+      !(lib.elem "/srv/models/flux@revision@alice" declarativeService.unitConfig.RequiresMountsFor);
+    assert
+      !(assertion "owner passkey" (evalProvider {
+        settings.listeners.work = {
+          kind = "iroh";
+          port = 0;
+          backends = [ ];
+        };
+      }));
+    assert
+      !(assertion "cannot embed" (evalProvider {
+        settings.backends.api = {
+          kind = "fetch";
+          upstream.secret = "bad";
+        };
+      }));
+    assert
+      !(assertion "cannot embed" (evalProvider {
+        settings.models = [ "${builtins.storeDir}/model" ];
+      }));
+    assert
+      !(assertion "mutually exclusive" (evalProvider {
+        settings.models = [ "/srv/model" ];
+        configFile = "/run/config";
+      }));
+    assert lib.hasInfix "--config %d/hellas-config"
+      credentialProvider.config.systemd.services.hellas.serviceConfig.ExecStart;
     assert lib.hasInfix "serve --port" defaultProviderService.serviceConfig.ExecStart;
     assert !(lib.hasInfix "--model" defaultProviderService.serviceConfig.ExecStart);
-    assert lib.hasInfix "gateway --bind 127.0.0.1:8080" gateway.serviceConfig.ExecStart;
-    assert lib.hasInfix "--model /srv/models/qwen.gguf --model flux@friend --model gpt-5@upstream"
-      gateway.serviceConfig.ExecStart;
-    assert lib.hasInfix (lib.escapeShellArgs [
-      "--upstream"
-      "upstream=https://api.example.com/v1,key-file=/run/secrets/upstream.key"
-    ]) gateway.serviceConfig.ExecStart;
+    assert lib.hasInfix "gateway --config /nix/store/" gateway.serviceConfig.ExecStart;
+    assert !(lib.hasInfix "--model" gateway.serviceConfig.ExecStart);
+    assert !(lib.hasInfix "--upstream" gateway.serviceConfig.ExecStart);
     assert lib.hasInfix "--bearer-file /run/hellas-gateway/bearer" gateway.serviceConfig.ExecStart;
-    assert !(lib.hasInfix "--config" gateway.serviceConfig.ExecStart);
     assert !(lib.hasInfix "--local" gateway.serviceConfig.ExecStart);
     assert lib.hasInfix "--metrics-port 9401 --metrics-addr 127.0.0.1" metrics.serviceConfig.ExecStart;
     assert gateway.serviceConfig.ReadOnlyPaths == [ "/srv/models/qwen.gguf" ];
@@ -219,27 +350,24 @@ in
     assert gateway.serviceConfig ? LimitMEMLOCK;
     assert !(remote.serviceConfig ? LimitMEMLOCK);
     assert
-      !(assertion "must name at least one" (evalGateway {
-        models = [ ];
+      !(assertion "requires settings" (evalGateway {
+        settings = { };
       }));
     assert
       !(assertion "absolute runtime paths" (evalGateway {
-        models = [ "relative.gguf" ];
+        settings = gatewaySettings // {
+          models = [ "relative.gguf" ];
+        };
       }));
     assert
-      !(assertion "fixed port" (evalGateway {
-        port = 0;
-        openFirewall = true;
+      !(assertion "cannot embed" (evalGateway {
+        settings.models = [ "${builtins.storeDir}/model.gguf" ];
       }));
     assert
-      !(assertion "runtime data outside" (evalGateway {
-        models = [ "${builtins.storeDir}/model.gguf" ];
-      }));
-    assert
-      !(assertion "runtime data outside" (evalGateway {
-        upstreams.upstream = {
+      !(assertion "cannot embed" (evalGateway {
+        settings.upstreams.upstream = {
           url = "https://example.com";
-          keyFile = "${builtins.storeDir}/key";
+          key_file = "${builtins.storeDir}/key";
         };
       }));
     assert
@@ -287,57 +415,26 @@ in
       ! ${pkgs.gnugrep}/bin/grep -F 'runtime-secret-not-in-wrapper' ${runtimeEnvironmentWrapper}
       ! ${pkgs.gnugrep}/bin/grep -F '/Users/hellas/.config/hellas/provider.env' ${runtimeEnvironmentWrapper}
 
-      printf '%s\n' 'INSECURE=value' > "$PWD/insecure-mode.env"
-      chmod 0644 "$PWD/insecure-mode.env"
-      if ${runtimeEnvironmentWrapper} "$PWD/insecure-mode.env" ${pkgs.coreutils}/bin/true 2>/dev/null; then
-        exit 1
-      fi
-
-      printf '%s\n' 'SYMLINK=value' > "$PWD/symlink-target.env"
-      ln -s "$PWD/symlink-target.env" "$PWD/symlink.env"
-      if ${runtimeEnvironmentWrapper} "$PWD/symlink.env" ${pkgs.coreutils}/bin/true 2>/dev/null; then
-        exit 1
-      fi
-
-      ${pkgs.coreutils}/bin/mkfifo "$PWD/fifo.env"
-      chmod 0600 "$PWD/fifo.env"
-      fifo_status=0
-      ${pkgs.coreutils}/bin/timeout 2 \
-        ${runtimeEnvironmentWrapper} "$PWD/fifo.env" ${pkgs.coreutils}/bin/true \
-        2>/dev/null || fifo_status=$?
-      test "$fifo_status" -ne 0
-      test "$fifo_status" -ne 124
-
-      ln -s ${builtins.dirOf runtimeEnvironmentStoreFile} "$PWD/store-parent"
-      if ${runtimeEnvironmentWrapper} \
-        "$PWD/store-parent/${builtins.baseNameOf runtimeEnvironmentStoreFile}" \
-        ${pkgs.coreutils}/bin/true 2>/dev/null; then
-        exit 1
-      fi
-
-      printf '%s\n' 'MALFORMED' > "$PWD/malformed.env"
-      if ${runtimeEnvironmentWrapper} "$PWD/malformed.env" ${pkgs.coreutils}/bin/true 2>/dev/null; then
-        exit 1
-      fi
-
-      printf '%s\n' 'DUPLICATE=one' 'DUPLICATE=two' > "$PWD/duplicate.env"
-      if ${runtimeEnvironmentWrapper} "$PWD/duplicate.env" ${pkgs.coreutils}/bin/true 2>/dev/null; then
-        exit 1
-      fi
-
-      printf 'CR=value\r\n' > "$PWD/carriage-return.env"
-      if ${runtimeEnvironmentWrapper} "$PWD/carriage-return.env" ${pkgs.coreutils}/bin/true 2>/dev/null; then
-        exit 1
-      fi
-
-      printf 'NUL=value\000suffix\n' > "$PWD/nul.env"
-      if ${runtimeEnvironmentWrapper} "$PWD/nul.env" ${pkgs.coreutils}/bin/true 2>/dev/null; then
-        exit 1
-      fi
-
-      if ${runtimeEnvironmentWrapper} "$PWD/missing.env" ${pkgs.coreutils}/bin/true 2>/dev/null; then
-        exit 1
-      fi
+      printf '%s\n' 'INSECURE=value' > insecure.env
+      chmod 0644 insecure.env
+      ln -s "$environment_file" symlink.env
+      ${pkgs.coreutils}/bin/mkfifo fifo.env
+      ln -s ${builtins.dirOf runtimeEnvironmentStoreFile} store-parent
+      printf '%s\n' 'MALFORMED' > malformed.env
+      printf '%s\n' 'DUPLICATE=one' 'DUPLICATE=two' > duplicate.env
+      printf 'CR=value\r\n' > carriage-return.env
+      printf 'NUL=value\000suffix\n' > nul.env
+      for file in insecure.env symlink.env fifo.env malformed.env duplicate.env \
+        carriage-return.env nul.env missing.env \
+        store-parent/${builtins.baseNameOf runtimeEnvironmentStoreFile}; do
+        status=0
+        ${pkgs.coreutils}/bin/timeout 2 ${runtimeEnvironmentWrapper} "$PWD/$file" \
+          ${pkgs.coreutils}/bin/true 2>/dev/null || status=$?
+        if [ "$status" -eq 0 ] || [ "$status" -eq 124 ]; then
+          echo "expected prompt rejection of $file, got $status" >&2
+          exit 1
+        fi
+      done
 
       touch "$out"
     '';
