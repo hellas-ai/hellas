@@ -1,5 +1,5 @@
 //! One live configuration, with preparation before the journal's commit point.
-use crate::daemon_config::{BackendKind, Document, Listener};
+use crate::daemon_config::{Document, Listener};
 use crate::{BackendEntry, ExecutorGateway};
 use arc_swap::ArcSwap;
 use axum::{Router, extract::Request, response::Response};
@@ -514,9 +514,7 @@ impl Core {
             if entries.contains_key(id) {
                 continue;
             }
-            let unchanged = old.document.backends.get(id) == Some(backend)
-                && (!matches!(backend.kind, BackendKind::Local { .. })
-                    || old.document.execution == document.execution);
+            let unchanged = old.document.backends.get(id) == Some(backend);
             let approved = match old.work.backend(id) {
                 Some(active) if unchanged => self
                     .runtime
@@ -553,7 +551,6 @@ impl Core {
                 document.backends[&backend.id].kind,
                 crate::daemon_config::BackendKind::Local { .. }
             ) && old.document.backends.get(&backend.id) == document.backends.get(&backend.id)
-                && old.document.execution == document.execution
                 && let Some(previous) = old_info.iter().find(|old| old.id == backend.id)
             {
                 backend.instance = previous.instance;

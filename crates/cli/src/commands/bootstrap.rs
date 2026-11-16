@@ -33,6 +33,22 @@ pub async fn prepare(
         Err(NodeStoreError::Uninitialized) => {}
         Err(error) => return Err(error.into()),
     }
+    if home.join("provider/startup.json").try_exists()? {
+        match Startup::load(home)? {
+            Startup::Initialized { .. } => anyhow::bail!(
+                "authority journal is missing; refusing to reset initialized runtime state"
+            ),
+            Startup::Pending { .. } => {
+                anyhow::bail!("local owner initialization is pending; resume serve --config")
+            }
+        }
+    }
+    ensure!(
+        !home
+            .join("provider/startup-profile/profile.json")
+            .try_exists()?,
+        "local startup metadata is missing; refusing implicit reinitialization"
+    );
     prepare_tls(home)?;
     let endpoint = bootstrap::bind_transport(
         transport_key.clone(),
@@ -81,7 +97,7 @@ fn prepare_tls(home: &StoreLocation) -> Result<()> {
 #[serde(tag = "phase", rename_all = "snake_case", deny_unknown_fields)]
 enum Startup {
     Pending {
-        approval: PreparedBootstrap,
+        approval: Box<PreparedBootstrap>,
         authorization: GrantId,
         credential: PathBuf,
     },
@@ -134,7 +150,7 @@ async fn pending(
     // An orphan here is unissued: there is neither authority nor pending approval.
     profile::replace_credential(&root.join(&credential), &secret)?;
     let startup = Startup::Pending {
-        approval,
+        approval: Box::new(approval),
         authorization,
         credential,
     };
@@ -176,6 +192,10 @@ pub(super) async fn prepare_local(
             existing.is_none(),
             "authority exists without a local startup credential; refusing to replace it"
         );
+        ensure!(
+            !root.join("startup-profile/profile.json").try_exists()?,
+            "local startup metadata is missing; refusing implicit reinitialization"
+        );
         pending(home, identity, owner).await?
     };
     let (store, authority, authorization, credential) = match (startup, existing) {
@@ -214,7 +234,7 @@ pub(super) async fn prepare_local(
                     &journal,
                     hellas_authority::model::grant::grant_network(),
                     authorization,
-                    approval,
+                    *approval,
                     Some(identity.enrollment.clone()),
                     now,
                 )
@@ -363,6 +383,21 @@ mod tests {
             .err()
             .unwrap();
         assert!(error.to_string().contains("refusing to reset"));
+        let error = prepare(
+            &home,
+            &identity.transport_key,
+            &identity.enrollment,
+            Some(0),
+            &lock,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("refusing to reset"));
+        assert_eq!(
+            certificate,
+            std::fs::read(home.join("provider/control.cert.der")).unwrap()
+        );
     }
 
     #[tokio::test]

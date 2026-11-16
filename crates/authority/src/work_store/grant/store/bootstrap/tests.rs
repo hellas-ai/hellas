@@ -1075,3 +1075,30 @@ async fn concurrent_bootstrap_commits_only_one_complete_store() {
         .unwrap();
     assert_eq!(reopened.state().authority().revision(), Revision(1));
 }
+
+#[tokio::test]
+async fn previous_home_format_is_rejected_before_journal_replay_or_rotation() {
+    for rotated in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let (mut store, _) = bootstrap(root.path()).await;
+        if rotated {
+            store.rotate().await.unwrap();
+        }
+        store.close().await;
+        let location = StoreLocation::for_test(root.path());
+        let marker_path = root.path().join(MARKER);
+        let mut marker: Marker = decode(&std::fs::read(&marker_path).unwrap()).unwrap();
+        marker.namespace = "hellas.node.identity.v1".into();
+        let previous = encode(&marker).unwrap();
+        hellas_private::write_atomically(&marker_path, ".previous-format", &previous).unwrap();
+        let error = NodeStore::open(&location, network(), None, UnixMillis(2))
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            error.to_string().contains("incompatible node home format"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(marker_path).unwrap(), previous);
+    }
+}

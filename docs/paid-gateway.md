@@ -28,7 +28,11 @@ The JSON is a complete `WorkControlCommand`: `SetPaidPolicy` contains
 `expected_revision` and `policy`. The first approval expects revision 0 and
 returns `{"PaidPolicyChanged":{"revision":1}}`. For later approvals, copy the
 file and set `expected_revision` to the last returned revision. Stale revisions
-and daily node-key sessions cannot change paid terms.
+and daily node-key sessions cannot change paid terms. Raw administration also accepts
+`{"DisablePaidPolicy":{"expected_revision":N}}`. Set and disable share startup's
+owner/passkey checks and idempotent comparison. The expected revision is checked
+before equality: a stale request fails; equal terms at the current revision
+retain their revision and salt.
 
 The policy's `invocation_policy` names the evaluator shown by `hellas routes`.
 Change the example's HIP evaluator if the provider uses another runtime. Its

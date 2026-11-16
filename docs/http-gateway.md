@@ -130,8 +130,9 @@ commands. Multiple local model routes share a serialized executor for each
 evaluator, rather than running GPU jobs concurrently.
 
 `execution.queue_capacity`, `execution.session_programs` and
-`execution.session_asset_bytes` are positive bounds for the local executor;
-absent values use native defaults. Changing them requires a daemon restart.
+`execution.session_asset_bytes` bound the local executor. Queue capacity may be
+zero (no waiting jobs); cache counts/bytes must be positive. Absent values use
+native defaults. Changing them requires a daemon restart.
 For a provider add an iroh listener, for example:
 
 ```toml

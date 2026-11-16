@@ -34,7 +34,7 @@ pub struct Document {
 #[derive(Clone, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Execution {
-    pub queue_capacity: Option<NonZeroUsize>,
+    pub queue_capacity: Option<usize>,
     pub session_programs: Option<NonZeroUsize>,
     pub session_asset_bytes: Option<std::num::NonZeroU64>,
 }
@@ -61,6 +61,14 @@ pub enum Listener {
         chain: Option<hellas_chain::genesis::CustomChainFile>,
         backends: Vec<String>,
     },
+}
+impl Listener {
+    pub fn http(bind: SocketAddr) -> Self {
+        Self::Http {
+            bind,
+            zdr: default_http_zdr(),
+        }
+    }
 }
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Backend {
@@ -220,11 +228,9 @@ impl Document {
     }
 
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self
-            .execution
-            .queue_capacity
-            .is_some_and(|n| n.get() > tokio::sync::Semaphore::MAX_PERMITS)
-        {
+        if self.execution.queue_capacity.is_some_and(|queued| {
+            hellas_executor::ExecutorSpawnConfig::capacity_total(1, queued).is_err()
+        }) {
             return Err("execution queue capacity exceeds the runtime limit");
         }
         // One provider enrollment owns one transport identity and set of paid journals.

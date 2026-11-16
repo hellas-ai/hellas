@@ -125,57 +125,17 @@ impl NodeCoordinator {
         authorization: GrantId,
         policy: Option<hellas_channel::model::paid_policy::PaidPolicy>,
     ) -> Result<(), NodeStoreError> {
-        use crate::work_store::grant::{WORK_PAID_POLICY_CONFIGURE, WorkMutation};
+        use crate::work_store::grant::WORK_PAID_POLICY_CONFIGURE;
         let _changed = ChangeNotification(self.changed.clone());
         self.checked(
             caller,
             authorization,
             WORK_PAID_POLICY_CONFIGURE,
             async |store, now| {
-                let authority = store.state().authority();
-                authority.authorize_caller(
-                    caller,
-                    authorization,
-                    &Operation::named(WORK_PAID_POLICY_CONFIGURE)?
-                        .permission(authority.authority(), None)?,
-                    now,
-                )?;
-                caller.session().step_up()?;
-                let owner = authority
-                    .grant(authority.root_grant())
-                    .ok_or(NodeStoreError::Malformed)?
-                    .spec()
-                    .subject;
-                if caller.subject() != owner {
-                    return Err(AuthorityError::Denied.into());
-                }
-                if let Some(policy) = &policy {
-                    policy.check()?;
-                }
-                let current = store.state().paid_policy();
-                if match (&policy, current) {
-                    (Some(policy), Some(current)) => current.enabled && &current.policy == policy,
-                    (None, current) => current.is_none_or(|current| !current.enabled),
-                    _ => false,
-                } {
-                    return Ok(());
-                }
-                let expected = current.map_or(Revision(0), |current| current.revision);
-                let mutation = match policy {
-                    Some(policy) => {
-                        let mut policy_salt = [0; 32];
-                        getrandom::fill(&mut policy_salt).map_err(|_| AuthorityError::Entropy)?;
-                        WorkMutation::PaidPolicy {
-                            expected,
-                            policy_salt,
-                            policy: Box::new(policy),
-                        }
-                    }
-                    None => WorkMutation::DisablePaidPolicy { expected },
-                };
                 store
-                    .commit_work(caller, authorization, mutation, now)
+                    .configure_paid_policy(caller, authorization, None, policy, now)
                     .await
+                    .map(|_| ())
             },
         )
         .await

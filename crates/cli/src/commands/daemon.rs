@@ -388,7 +388,7 @@ pub async fn apply(document: &mut Document, edit: Edit, context: &ModelContext) 
         Edit::Route(RouteCommand::Listen { bind }) => {
             document
                 .listeners
-                .insert("api".into(), Listener::Http { bind, zdr: true });
+                .insert("api".into(), Listener::http(bind));
         }
         Edit::Route(RouteCommand::Rm { model }) => {
             let (name, destination) = model
@@ -423,6 +423,8 @@ pub async fn apply(document: &mut Document, edit: Edit, context: &ModelContext) 
             document.routes.retain(|route| !route.backends.is_empty());
         }
     }
+    // Interactive operator edits expose executable backends on the work listener.
+    // Declarative compilation never calls this command-layer attachment step.
     for listener in document.listeners.values_mut() {
         if let Listener::Iroh { backends, .. } = listener {
             *backends = document

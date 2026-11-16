@@ -90,6 +90,7 @@ pub(crate) async fn local(
                 session_programs: native.gpu.gpu_session_programs,
                 session_asset_bytes: native.gpu.gpu_session_asset_bytes,
             },
+            &Default::default(),
         )
         .await?;
         Ok::<_, anyhow::Error>(hellas_sdk::execution::local::LocalExecution {

@@ -23,6 +23,9 @@ pub struct AllowanceTerms {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum WorkControlCommand {
+    DisablePaidPolicy {
+        expected_revision: Revision,
+    },
     SetPaidPolicy {
         expected_revision: Revision,
         policy: Box<hellas_channel::model::paid_policy::PaidPolicy>,

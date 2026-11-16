@@ -37,10 +37,7 @@ impl State {
         let mut document = Document::default();
         document.listeners.insert(
             "api".into(),
-            Listener::Http {
-                bind: bind.unwrap_or_else(|| "127.0.0.1:8080".parse().unwrap()),
-                zdr: true,
-            },
+            Listener::http(bind.unwrap_or_else(|| "127.0.0.1:8080".parse().unwrap())),
         );
         let mut named = std::collections::BTreeMap::new();
         for upstream in upstreams {
@@ -238,7 +235,7 @@ key_file = "/run/secrets/upstream"
             bounds.document.execution.session_asset_bytes.unwrap().get(),
             1516744736
         );
-        assert!(State::parse("[execution]\nqueue_capacity = 0").is_err());
+        assert!(State::parse("[execution]\nqueue_capacity = 0").is_ok());
         assert!(State::parse("[listeners.api]\nkind = 'http'\nbind = 'invalid'").is_err());
         assert!(State::parse("[paid_policy]\njobs_per_channel = 0").is_err());
     }

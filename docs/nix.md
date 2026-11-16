@@ -181,6 +181,36 @@ job) runs the workspace tests once under `cargo llvm-cov`. It fails on a
 failing test and prints line coverage, which is informational and never fails
 the check. Its output holds `lcov.info`, `summary.json` and `summary.txt`.
 
+For the default NixOS DynamicUser deployment, run inspection/rebind as the
+service's owning identity, not as a bare root CLI. A manually started maintenance
+unit preserves that ownership and the existing credential bindings:
+
+```nix
+systemd.services.hellas-owner-maintenance = {
+  conflicts = [ "hellas.service" ];
+  after = [ "hellas.service" ];
+  serviceConfig = {
+    Type = "oneshot";
+    User = "hellas";
+    DynamicUser = true;
+    StateDirectory = "hellas";
+    StateDirectoryMode = "0700";
+    LoadCredential = config.systemd.services.hellas.serviceConfig.LoadCredential;
+    # Replace 123 with the stopped authority's inspected revision.
+    ExecStart = "${config.services.hellas.package}/bin/hellas --home /var/lib/hellas/.hellas --passkey %d/owner-passkey admin rebind-local --expected-revision 123";
+  };
+};
+```
+
+First use that unit's same account/state-directory settings with
+`admin inspect-offline --journal provider/authority /run/hellas-inspection.json`
+as the command, where the query file contains `{"Grants":{"after":null}}`.
+Read the reported authority revision, then select the rebind command above.
+Start the maintenance unit explicitly with `systemctl start
+hellas-owner-maintenance`; inspect its output and restart `hellas` explicitly
+after success. Adapt the home, account and writable-path bindings for a custom
+deployment. Do not change journal ownership to bypass private-file checks.
+
 ## Node home format
 
 This cutover uses `hellas.node.identity.v2`, journal v6 and checkpoint v6.

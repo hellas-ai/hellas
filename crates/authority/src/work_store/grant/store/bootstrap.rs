@@ -60,7 +60,7 @@ impl StartupLock {
 }
 
 /// Namespace of the bootstrap ownership marker.
-const IDENTITY_NAMESPACE: &str = "hellas.node.identity.v1";
+const IDENTITY_NAMESPACE: &str = "hellas.node.identity.v2";
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -464,7 +464,11 @@ fn read_marker(
         },
     )?;
     let marker: Marker = decode(&bytes)?;
-    if marker.namespace != IDENTITY_NAMESPACE || marker.network != network {
+    if marker.namespace != IDENTITY_NAMESPACE {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+            "incompatible node home format: this binary requires hellas.node.identity.v2 / journal.v6; no automatic migration or reset is supported").into());
+    }
+    if marker.network != network {
         return Err(NodeStoreError::Malformed);
     }
     Ok((identity_lock, marker))

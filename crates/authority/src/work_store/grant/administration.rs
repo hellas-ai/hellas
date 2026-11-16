@@ -62,6 +62,64 @@ pub(crate) struct BindRecord {
     pub provider: hellas_rpc::ProviderEnrollmentBundle,
 }
 impl NodeStore {
+    pub(crate) async fn configure_paid_policy(
+        &mut self,
+        caller: &AuthenticatedCaller,
+        authorization: Authorization,
+        expected: Option<Revision>,
+        policy: Option<hellas_channel::model::paid_policy::PaidPolicy>,
+        now: UnixMillis,
+    ) -> Result<Revision, NodeStoreError> {
+        let authority = self.state().authority();
+        authority.authorize_caller(
+            caller,
+            authorization,
+            &crate::operations::Operation::named(WORK_PAID_POLICY_CONFIGURE)?
+                .permission(authority.authority(), None)?,
+            now,
+        )?;
+        caller.session().step_up()?;
+        let owner = authority
+            .grant(authority.root_grant())
+            .ok_or(NodeStoreError::Malformed)?
+            .spec()
+            .subject;
+        if caller.subject() != owner {
+            return Err(hellas_auth::authority::AuthorityError::Denied.into());
+        }
+        let current = self.state().paid_policy();
+        let revision = current.map_or(Revision(0), |current| current.revision);
+        if expected.is_some_and(|expected| expected != revision) {
+            return Err(hellas_auth::authority::AuthorityError::Revision.into());
+        }
+        if let Some(policy) = &policy {
+            policy.check()?;
+        }
+        if match (&policy, current) {
+            (Some(policy), Some(current)) => current.enabled && &current.policy == policy,
+            (None, current) => current.is_none_or(|current| !current.enabled),
+            _ => false,
+        } {
+            return Ok(revision);
+        }
+        let mutation = match policy {
+            Some(policy) => {
+                let mut policy_salt = [0; 32];
+                getrandom::fill(&mut policy_salt)
+                    .map_err(|_| hellas_auth::authority::AuthorityError::Entropy)?;
+                WorkMutation::PaidPolicy {
+                    expected: revision,
+                    policy_salt,
+                    policy: Box::new(policy),
+                }
+            }
+            None => WorkMutation::DisablePaidPolicy { expected: revision },
+        };
+        self.commit_work(caller, authorization, mutation, now)
+            .await?;
+        revision.next().ok_or(NodeStoreError::Malformed)
+    }
+
     /// Callers verify the root proof first. Rebinding the bound enrollment is a
     /// no-op so a lost reply can be retried; any other enrollment is refused.
     pub(crate) async fn bind_provider(

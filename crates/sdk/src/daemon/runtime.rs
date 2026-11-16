@@ -410,21 +410,15 @@ impl Runtime {
                     let backend = if let Some(backend) = executors.get(&evaluator) {
                         backend.clone()
                     } else {
-                        let mut config = hellas_executor::ExecutorSpawnConfig::new(
+                        let backend = crate::execution::local::spawn(
                             self.options.signer.clone(),
-                            Default::default(),
-                        );
-                        config.gpu_config.backend = dialect;
-                        if let Some(value) = execution.queue_capacity {
-                            config.queue_capacity = value.get();
-                        }
-                        if let Some(value) = execution.session_programs {
-                            config.gpu_config.session_programs = value.get();
-                        }
-                        if let Some(value) = execution.session_asset_bytes {
-                            config.gpu_config.session_asset_bytes = value.get();
-                        }
-                        let backend = hellas_executor::Executor::spawn_configured(config).await?;
+                            hellas_executor::GpuConfig {
+                                backend: dialect,
+                                ..Default::default()
+                            },
+                            execution,
+                        )
+                        .await?;
                         executors.insert(evaluator.clone(), backend.clone());
                         backend
                     };

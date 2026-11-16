@@ -56,6 +56,13 @@ pub struct ExecutorSpawnConfig {
     pub gpu_config: GpuConfig,
 }
 impl ExecutorSpawnConfig {
+    pub fn capacity_total(active: usize, queued: usize) -> Result<usize, ExecutorError> {
+        active
+            .checked_add(queued)
+            .filter(|total| *total <= Semaphore::MAX_PERMITS)
+            .ok_or_else(|| ExecutorError::ResourceExhausted("executor capacity overflow".into()))
+    }
+
     pub fn new(producer_key: Arc<ProducerSigningKey>, fetch_routes: FetchRouteRegistry) -> Self {
         Self {
             queue_capacity: hellas_rpc::DEFAULT_EXECUTION_QUEUE_CAPACITY,
@@ -105,12 +112,7 @@ impl Executor {
             ));
         }
         let capacity = |active: usize, queued: usize| -> Result<Arc<Semaphore>, ExecutorError> {
-            let total = active
-                .checked_add(queued)
-                .filter(|n| *n <= Semaphore::MAX_PERMITS)
-                .ok_or_else(|| {
-                    ExecutorError::ResourceExhausted("executor capacity overflow".into())
-                })?;
+            let total = ExecutorSpawnConfig::capacity_total(active, queued)?;
             Ok(Arc::new(Semaphore::new(total)))
         };
         #[cfg(feature = "compute")]

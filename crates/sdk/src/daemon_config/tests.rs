@@ -465,3 +465,16 @@ fn reordered_credential_scopes_cannot_inherit_positional_secrets() {
             .all(|credential| credential.secret.is_none())
     );
 }
+
+#[test]
+fn local_execution_queue_counts_active_work_and_allows_no_waiters() {
+    let mut document = Document::default();
+    document.execution.queue_capacity = Some(0);
+    assert!(document.validate().is_ok());
+    document.execution.queue_capacity = Some(tokio::sync::Semaphore::MAX_PERMITS - 1);
+    assert!(document.validate().is_ok());
+    document.execution.queue_capacity = Some(tokio::sync::Semaphore::MAX_PERMITS);
+    assert!(document.validate().is_err());
+    document.execution.queue_capacity = Some(usize::MAX);
+    assert!(document.validate().is_err());
+}

@@ -1171,7 +1171,7 @@ async fn execution_bounds_change_only_at_owner_approved_startup() {
         let core = Core::open(options(&f), Document::default()).await.unwrap();
         let (_client, _server, connection, rpc, served) = connect(&f, core.clone()).await;
         let mut document = Document::default();
-        document.execution.queue_capacity = std::num::NonZeroUsize::new(1);
+        document.execution.queue_capacity = Some(0);
         document.execution.session_programs = std::num::NonZeroUsize::new(1);
         document.execution.session_asset_bytes = std::num::NonZeroU64::new(1516744736);
         let error = rpc.configure(request(&document, 0)).await.unwrap_err();
