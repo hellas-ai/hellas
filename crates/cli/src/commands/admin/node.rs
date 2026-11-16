@@ -640,7 +640,7 @@ pub async fn gateway_authority(
 )> {
     let administrator = super::super::owner::administrator(passkey.public_key()?)?;
     let authority = administrator.authority;
-    let root = GrantId([0; 16]);
+    let root = super::super::owner::ROOT_GRANT;
     let holder = NodeKey::from_public_key(identity.node_key.public_key())?;
     let approval = super::super::owner::approve(
         passkey,
@@ -733,7 +733,7 @@ pub async fn pair(
         return Ok(());
     }
     let invitation = node_control::bootstrap::Invitation::decode(invite)?;
-    let root = GrantId([0; 16]);
+    let root = super::super::owner::ROOT_GRANT;
     let scope = super::super::owner::administrator(passkey.public_key()?)?;
     let holder = hellas_auth::authority::NodeKey::from_public_key(identity.node_key.public_key())?;
     let approval = super::super::owner::approve(

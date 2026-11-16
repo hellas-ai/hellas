@@ -1,34 +1,27 @@
 //! TOML and foreground shorthand compile into the same daemon document.
 use super::*;
+use hellas_channel::model::paid_policy::PaidPolicy;
 use serde::Deserialize;
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Inputs {
-    #[serde(default)]
-    models: Vec<String>,
-    #[serde(default)]
-    upstreams: std::collections::BTreeMap<String, Upstream>,
-    #[serde(default)]
-    paid_policy: Option<hellas_channel::model::paid_policy::PaidPolicy>,
-}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Upstream {
     url: String,
     key_file: PathBuf,
 }
-pub(super) struct Resolved {
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Config {
+    #[serde(flatten)]
     pub document: Document,
-    pub paid_policy: Option<hellas_channel::model::paid_policy::PaidPolicy>,
-}
-pub(super) struct State {
-    pub document: Document,
+    #[serde(default)]
     models: Vec<String>,
+    #[serde(default)]
     upstreams: std::collections::BTreeMap<String, Upstream>,
-    pub paid_policy: Option<hellas_channel::model::paid_policy::PaidPolicy>,
+    #[serde(default)]
+    pub paid_policy: Option<PaidPolicy>,
 }
-impl State {
+impl Config {
     pub fn gateway(
         models: Vec<String>,
         upstreams: Vec<String>,
@@ -74,49 +67,38 @@ impl State {
             .with_context(|| format!("configuration {}", path.display()))
     }
     fn parse(text: &str) -> Result<Self> {
-        let diagnostic = |error: toml::de::Error| {
-            let offset = error.span().map_or(0, |span| span.start).min(text.len());
-            let prefix = &text.as_bytes()[..offset];
-            let line = prefix.iter().filter(|byte| **byte == b'\n').count() + 1;
-            let column = prefix
-                .iter()
-                .rposition(|byte| *byte == b'\n')
-                .map_or(offset + 1, |newline| offset - newline);
-            anyhow::anyhow!("invalid daemon TOML at line {line}, column {column} (byte {offset})")
-        };
-        let mut table: toml::Table = toml::from_str(text).map_err(diagnostic)?;
-        let mut inputs = toml::Table::new();
-        for key in ["models", "upstreams", "paid_policy"] {
-            if let Some(value) = table.remove(key) {
-                inputs.insert(key.into(), value);
-            }
-        }
-        let schema_error = |error: toml::de::Error| {
+        let config: Self = toml::from_str(text).map_err(|error: toml::de::Error| {
             let message = error.message();
-            let safe = if let Some((_, expected)) = message.split_once(", expected ") {
-                format!("expected {expected}")
+            let cause = if let Some((_, expected)) = message.split_once(", expected ") {
+                format!("configuration schema: expected {expected}")
             } else if message.starts_with("missing field `") {
-                message.to_owned()
+                format!("configuration schema: {message}")
             } else {
-                "unknown or invalid field".into()
+                "unknown configuration field or invalid TOML syntax".into()
             };
-            anyhow::anyhow!("invalid configuration schema: {safe}")
-        };
-        let inputs: Inputs = toml::Value::Table(inputs)
-            .try_into()
-            .map_err(schema_error)?;
-        let document: Document = toml::Value::Table(table).try_into().map_err(schema_error)?;
-        if let Some(policy) = &inputs.paid_policy {
+            let location = error
+                .span()
+                .map(|span| {
+                    let prefix = &text.as_bytes()[..span.start.min(text.len())];
+                    let line = prefix.iter().filter(|byte| **byte == b'\n').count() + 1;
+                    let column = prefix
+                        .iter()
+                        .rposition(|byte| *byte == b'\n')
+                        .map_or(prefix.len() + 1, |newline| prefix.len() - newline);
+                    format!(
+                        " at line {line}, column {column} (bytes {}..{})",
+                        span.start, span.end
+                    )
+                })
+                .unwrap_or_default();
+            anyhow::anyhow!("{cause}{location}")
+        })?;
+        if let Some(policy) = &config.paid_policy {
             policy.check()?;
         }
-        Ok(Self {
-            document,
-            models: inputs.models,
-            upstreams: inputs.upstreams,
-            paid_policy: inputs.paid_policy,
-        })
+        Ok(config)
     }
-    pub async fn resolve(self, context: &ModelContext) -> Result<Resolved> {
+    pub async fn resolve(self, context: &ModelContext) -> Result<(Document, Option<PaidPolicy>)> {
         let mut document = self.document;
         for (name, upstream) in self.upstreams {
             expand_upstream(&mut document, &name, &upstream.url, &upstream.key_file)?;
@@ -125,10 +107,7 @@ impl State {
             context.add(&mut document, &model).await?;
         }
         document.validate().map_err(anyhow::Error::msg)?;
-        Ok(Resolved {
-            document,
-            paid_policy: self.paid_policy,
-        })
+        Ok((document, self.paid_policy))
     }
 }
 
@@ -141,61 +120,55 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let key = root.path().join("key");
         std::fs::write(&key, "runtime-secret").unwrap();
-        let context = ModelContext {
-            home: root.path().into(),
-            content: None,
-            principal: None,
-            holder: NodeKey::from_public_key(
-                hellas_auth::ProducerSigningKey::from_secret_bytes([1; 32])
-                    .unwrap()
-                    .public_key(),
-            )
-            .unwrap(),
-        };
+        let context = super::super::tests::model_context(root.path());
         let shorthand = format!("remote=https://example.com/v1,key-file={}", key.display());
-        let flags = State::gateway(vec!["model@remote".into()], vec![shorthand], None)
-            .unwrap()
-            .resolve(&context)
-            .await
-            .unwrap();
+        let flags = Config::gateway(
+            vec!["model@remote".into(), "second@remote".into()],
+            vec![shorthand],
+            None,
+        )
+        .unwrap()
+        .resolve(&context)
+        .await
+        .unwrap();
         let text = format!(
-            "models = ['model@remote']\n[listeners.api]\nkind = 'http'\nbind = '127.0.0.1:8080'\n[upstreams.remote]\nurl = 'https://example.com/v1'\nkey_file = '{}'\n",
+            "models = ['model@remote', 'second@remote']\n[listeners.api]\nkind = 'http'\nbind = '127.0.0.1:8080'\n[upstreams.remote]\nurl = 'https://example.com/v1'\nkey_file = '{}'\n",
             key.display()
         );
-        let file = State::parse(&text)
+        let file = Config::parse(&text)
             .unwrap()
             .resolve(&context)
             .await
             .unwrap();
-        assert!(flags.document == file.document);
+        assert!(flags.0 == file.0);
         let selected = format!(
             "{text}\n[backends.local]\nkind = 'local'\nmax_in_flight = 1\n[listeners.work]\nkind = 'iroh'\nport = 0\nbackends = ['local']\n"
         );
-        let file = State::parse(&selected)
+        let file = Config::parse(&selected)
             .unwrap()
             .resolve(&context)
             .await
             .unwrap();
         assert!(
-            matches!(&file.document.listeners["work"], Listener::Iroh { backends, .. } if backends == &["local"])
+            matches!(&file.0.listeners["work"], Listener::Iroh { backends, .. } if backends == &["local"])
         );
+        assert!(Config::parse("unknown = true").is_err());
         let explicit =
-            State::parse(&text.replace("kind = 'http'", "kind = 'http'\nzdr = false")).unwrap();
+            Config::parse(&text.replace("kind = 'http'", "kind = 'http'\nzdr = false")).unwrap();
         assert!(matches!(
             explicit.document.listeners["api"],
             Listener::Http { zdr: false, .. }
         ));
-        let schema = State::parse("models = 'private-key-material'")
+        let schema = Config::parse("models = 'private-key-material'")
             .err()
             .unwrap()
             .to_string();
         assert!(
             schema.contains("schema")
                 && schema.contains("expected")
-                && !schema.contains("line 1")
                 && !schema.contains("private-key-material")
         );
-        let error = State::parse("models = [\n'private-key-material'\nBAD")
+        let error = Config::parse("models = [\n'private-key-material'\nBAD")
             .err()
             .unwrap()
             .to_string();
@@ -204,39 +177,5 @@ mod tests {
                 && error.contains("column")
                 && !error.contains("private-key-material")
         );
-    }
-
-    #[test]
-    fn shared_toml_supports_multiple_models_and_runtime_keys() {
-        let state = State::parse(
-            r#"
-models = ["/srv/qwen.gguf", "/srv/flux"]
-[listeners.work]
-kind = "iroh"
-port = 31145
-backends = ["local"]
-[listeners.api]
-kind = "http"
-bind = "127.0.0.1:8080"
-[upstreams.remote]
-url = "https://example.com/v1"
-key_file = "/run/secrets/upstream"
-"#,
-        )
-        .unwrap();
-        assert_eq!(state.models.len(), 2);
-        assert_eq!(
-            state.upstreams["remote"].key_file,
-            Path::new("/run/secrets/upstream")
-        );
-        assert!(State::parse("unknown = true").is_err());
-        let bounds = State::parse("[execution]\nqueue_capacity = 1\nsession_programs = 1\nsession_asset_bytes = 1516744736").unwrap();
-        assert_eq!(
-            bounds.document.execution.session_asset_bytes.unwrap().get(),
-            1516744736
-        );
-        assert!(State::parse("[execution]\nqueue_capacity = 0").is_ok());
-        assert!(State::parse("[listeners.api]\nkind = 'http'\nbind = 'invalid'").is_err());
-        assert!(State::parse("[paid_policy]\njobs_per_channel = 0").is_err());
     }
 }

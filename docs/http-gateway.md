@@ -233,10 +233,9 @@ an eligible backend; account-specific quota endpoints are not aggregated.
 
 ## Payloads and cancellation
 
-The CLI's HTTP listeners use ZDR: request and response payloads are not
-archived. This governs application writes, not OS swap, upstream retention or
-a coding client's session logs. Embedders can configure an HTTP listener's
-archive policy; archives then live under `<home>/gateway-archive` and exclude
+HTTP listeners default to ZDR: request and response payloads are not archived.
+This governs application writes, not OS swap, upstream retention or client logs.
+Setting `zdr = false` enables archives under `<home>/gateway-archive`, excluding
 authentication headers. A request can further restrict persistence with
 `x-hellas-zdr: true`.
 

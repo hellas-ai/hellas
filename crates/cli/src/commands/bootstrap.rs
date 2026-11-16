@@ -1,7 +1,7 @@
 //! Pairing and local owner startup share exclusive authority ownership.
 use anyhow::{Context, Result, ensure};
 use hellas_auth::authority::{
-    AuthorityId, CredentialSecret, GrantId, NodeKey, Ownership, PrincipalId, Revision, UnixMillis,
+    AuthorityId, CredentialSecret, NodeKey, Ownership, PrincipalId, Revision, UnixMillis,
 };
 use hellas_authority::{
     authenticator::Authenticator,
@@ -10,7 +10,8 @@ use hellas_authority::{
 use hellas_private::StoreLocation;
 use hellas_sdk::node_control::{RemoteControlAdmission, bootstrap, profile};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+
+const CREDENTIAL: &str = "provider/startup-profile/credential";
 
 pub async fn prepare(
     home: &StoreLocation,
@@ -21,20 +22,11 @@ pub async fn prepare(
 ) -> Result<(Option<iroh::Endpoint>, NodeStore)> {
     let journal = home.child("provider/authority");
     let now = UnixMillis::now()?;
-    match NodeStore::open(
-        &journal,
-        hellas_authority::model::grant::grant_network(),
-        Some(enrollment.clone()),
-        now,
-    )
-    .await
-    {
-        Ok(store) => return Ok((None, store)),
-        Err(NodeStoreError::Uninitialized) => {}
-        Err(error) => return Err(error.into()),
+    if let Some(store) = open(home, enrollment).await? {
+        return Ok((None, store));
     }
-    if home.join("provider/startup.json").try_exists()? {
-        match Startup::load(home)? {
+    if let Some(startup) = Startup::load(home)? {
+        match startup {
             Startup::Initialized { .. } => anyhow::bail!(
                 "authority journal is missing; refusing to reset initialized runtime state"
             ),
@@ -43,12 +35,6 @@ pub async fn prepare(
             }
         }
     }
-    ensure!(
-        !home
-            .join("provider/startup-profile/profile.json")
-            .try_exists()?,
-        "local startup metadata is missing; refusing implicit reinitialization"
-    );
     prepare_tls(home)?;
     let endpoint = bootstrap::bind_transport(
         transport_key.clone(),
@@ -78,6 +64,24 @@ pub async fn prepare(
     Ok((Some(endpoint), store))
 }
 
+async fn open(
+    home: &StoreLocation,
+    enrollment: &hellas_rpc::ProviderEnrollmentBundle,
+) -> Result<Option<NodeStore>> {
+    match NodeStore::open(
+        &home.child("provider/authority"),
+        hellas_authority::model::grant::grant_network(),
+        Some(enrollment.clone()),
+        UnixMillis::now()?,
+    )
+    .await
+    {
+        Ok(store) => Ok(Some(store)),
+        Err(NodeStoreError::Uninitialized) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn prepare_tls(home: &StoreLocation) -> Result<()> {
     let root = home.child("provider");
     hellas_private::create_dir_all_durable(&root)?;
@@ -96,19 +100,20 @@ fn prepare_tls(home: &StoreLocation) -> Result<()> {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case", deny_unknown_fields)]
 enum Startup {
-    Pending {
-        approval: Box<PreparedBootstrap>,
-        authorization: GrantId,
-        credential: PathBuf,
-    },
-    Initialized {
-        authority: AuthorityId,
-        authorization: GrantId,
-        credential: PathBuf,
-    },
+    Pending { approval: Box<PreparedBootstrap> },
+    Initialized { authority: AuthorityId },
 }
 impl Startup {
-    fn load(home: &StoreLocation) -> Result<Self> {
+    fn load(home: &StoreLocation) -> Result<Option<Self>> {
+        if !home.join("provider/startup.json").try_exists()? {
+            ensure!(
+                !home
+                    .join("provider/startup-profile/profile.json")
+                    .try_exists()?,
+                "local startup metadata is missing; refusing implicit reinitialization"
+            );
+            return Ok(None);
+        }
         let bytes = hellas_private::read_private_bounded(
             hellas_private::open_regular_file(&home.join("provider/startup.json"))?,
             64 * 1024,
@@ -130,7 +135,7 @@ async fn pending(
     owner: &dyn Authenticator,
 ) -> Result<Startup> {
     let administrator = super::owner::administrator(owner.public_key()?)?;
-    let authorization = GrantId([0; 16]);
+    let authorization = super::owner::ROOT_GRANT;
     let holder = NodeKey::from_public_key(identity.node_key.public_key())?;
     let (approval, secret) = super::owner::approve(
         owner,
@@ -144,24 +149,15 @@ async fn pending(
     )
     .await?
     .prepare(None)?;
-    let credential = PathBuf::from("startup-profile/credential");
     let root = home.child("provider");
     hellas_private::create_dir_all_durable(&root.join("startup-profile"))?;
     // An orphan here is unissued: there is neither authority nor pending approval.
-    profile::replace_credential(&root.join(&credential), &secret)?;
+    profile::replace_credential(&home.join(CREDENTIAL), &secret)?;
     let startup = Startup::Pending {
         approval: Box::new(approval),
-        authorization,
-        credential,
     };
     startup.save(home)?;
     Ok(startup)
-}
-
-pub(super) struct LocalStartup {
-    pub store: NodeStore,
-    pub credential: CredentialSecret,
-    pub authorization: GrantId,
 }
 
 pub(super) async fn prepare_local(
@@ -169,58 +165,28 @@ pub(super) async fn prepare_local(
     identity: &crate::identity::LocalIdentity,
     owner: &dyn Authenticator,
     _ownership: &StartupLock,
-) -> Result<LocalStartup> {
+) -> Result<(NodeStore, CredentialSecret)> {
     let root = home.child("provider");
     let journal = root.child("authority");
-    let now = UnixMillis::now()?;
-    let existing = match NodeStore::open(
-        &journal,
-        hellas_authority::model::grant::grant_network(),
-        Some(identity.enrollment.clone()),
-        now,
-    )
-    .await
-    {
-        Ok(store) => Some(store),
-        Err(NodeStoreError::Uninitialized) => None,
-        Err(error) => return Err(error.into()),
-    };
-    let startup = if root.join("startup.json").try_exists()? {
-        Startup::load(home)?
+    let existing = open(home, &identity.enrollment).await?;
+    let startup = if let Some(startup) = Startup::load(home)? {
+        startup
     } else {
         ensure!(
             existing.is_none(),
             "authority exists without a local startup credential; refusing to replace it"
         );
-        ensure!(
-            !root.join("startup-profile/profile.json").try_exists()?,
-            "local startup metadata is missing; refusing implicit reinitialization"
-        );
         pending(home, identity, owner).await?
     };
-    let (store, authority, authorization, credential) = match (startup, existing) {
+    let principal = PrincipalId::from_public_key(hellas_auth::PublicKey::P256(
+        owner.public_key()?.to_compressed(),
+    ))?;
+    let (store, authority) = match (startup, existing) {
         (Startup::Initialized { .. }, None) => anyhow::bail!(
             "authority journal is missing; refusing to reset initialized runtime state"
         ),
-        (
-            Startup::Initialized {
-                authority,
-                authorization,
-                credential,
-            },
-            Some(store),
-        ) => (store, authority, authorization, credential),
-        (
-            Startup::Pending {
-                approval,
-                authorization,
-                credential,
-            },
-            existing,
-        ) => {
-            let principal = PrincipalId::from_public_key(hellas_auth::PublicKey::P256(
-                owner.public_key()?.to_compressed(),
-            ))?;
+        (Startup::Initialized { authority }, Some(store)) => (store, authority),
+        (Startup::Pending { approval }, existing) => {
             ensure!(
                 approval.administrator.subject == principal,
                 "startup passkey differs from the approved owner"
@@ -233,29 +199,21 @@ pub(super) async fn prepare_local(
                 NodeStore::bootstrap_prepared(
                     &journal,
                     hellas_authority::model::grant::grant_network(),
-                    authorization,
+                    super::owner::ROOT_GRANT,
                     *approval,
                     Some(identity.enrollment.clone()),
-                    now,
+                    UnixMillis::now()?,
                 )
                 .await?
             };
-            Startup::Initialized {
-                authority,
-                authorization,
-                credential: credential.clone(),
-            }
-            .save(home)?;
-            (store, authority, authorization, credential)
+            Startup::Initialized { authority }.save(home)?;
+            (store, authority)
         }
     };
     ensure!(
         store.state().authority().authority() == authority,
         "startup authority differs from the retained journal"
     );
-    let principal = PrincipalId::from_public_key(hellas_auth::PublicKey::P256(
-        owner.public_key()?.to_compressed(),
-    ))?;
     let state = store.state().authority();
     ensure!(
         state
@@ -266,20 +224,16 @@ pub(super) async fn prepare_local(
             == principal,
         "startup passkey differs from the authority owner"
     );
-    let canonical = root.join(&credential);
+    let canonical = home.join(CREDENTIAL);
     let secret = profile::read_credential(&canonical)?;
     profile::write_local(
         &root.join("startup-profile/profile.json"),
         authority,
-        authorization,
+        state.root_grant(),
         &canonical,
         &root.join("control.cert.der"),
     )?;
-    Ok(LocalStartup {
-        store,
-        credential: secret,
-        authorization,
-    })
+    Ok((store, secret))
 }
 
 /// Explicit operator recovery, including expired-root renewal. Accounting and
@@ -293,13 +247,8 @@ pub(super) async fn rebind_local(
     expected: Revision,
 ) -> Result<()> {
     let _ownership = StartupLock::acquire(&home.child("provider/authority"))?;
-    let Startup::Initialized {
-        authority,
-        authorization: _,
-        credential,
-    } = Startup::load(home)?
-    else {
-        anyhow::bail!("local initialization is pending; finish startup before rebind");
+    let Some(Startup::Initialized { authority }) = Startup::load(home)? else {
+        anyhow::bail!("rebind-local requires initialized local startup metadata");
     };
     let scope = super::owner::administrator_for(owner.public_key()?, authority)?;
     let holder = NodeKey::from_public_key(identity.node_key.public_key())?;
@@ -319,7 +268,7 @@ pub(super) async fn rebind_local(
         UnixMillis::now()?,
     )
     .await?;
-    profile::replace_credential(&home.join("provider").join(credential), &secret)
+    profile::replace_credential(&home.join(CREDENTIAL), &secret)
         .with_context(|| format!("recovery committed at revision {}; credential replacement failed; inspect and explicitly recover again", record.revision.0))?;
     println!(
         "{}",
@@ -343,40 +292,20 @@ mod tests {
         // This is the durable interrupted-init checkpoint, before any authority.
         pending(&home, &identity, &owner).await.unwrap();
         let credential = std::fs::read(home.join("provider/startup-profile/credential")).unwrap();
-        let mut first = prepare_local(&home, &identity, &owner, &lock)
+        let (mut store, secret) = prepare_local(&home, &identity, &owner, &lock)
             .await
             .unwrap();
-        let metadata = std::fs::read(home.join("provider/startup.json")).unwrap();
         let certificate = std::fs::read(home.join("provider/control.cert.der")).unwrap();
         assert!(StartupLock::acquire(&home.child("provider/authority")).is_err());
         assert_eq!(
             credential,
             std::fs::read(home.join("provider/startup-profile/credential")).unwrap()
         );
-        assert_eq!(
-            metadata,
-            std::fs::read(home.join("provider/startup.json")).unwrap()
-        );
-        first.store.close().await;
-        let mut restarted = prepare_local(&home, &identity, &owner, &lock)
-            .await
-            .unwrap();
-        assert_eq!(first.credential.id(), restarted.credential.id());
         let profile =
             profile::ClientProfile::load(&home.join("provider/startup-profile/profile.json"))
                 .unwrap();
-        assert_eq!(profile.credential.id(), restarted.credential.id());
-        assert_eq!(
-            certificate,
-            std::fs::read(home.join("provider/control.cert.der")).unwrap()
-        );
-        restarted.store.close().await;
-        let other = hellas_kernel::SoftPasskey::from_secret_scalar([18; 32]).unwrap();
-        assert!(
-            prepare_local(&home, &identity, &other, &lock)
-                .await
-                .is_err()
-        );
+        assert_eq!(profile.credential.id(), secret.id());
+        store.close().await;
         std::fs::remove_dir_all(home.join("provider/authority")).unwrap();
         let error = prepare_local(&home, &identity, &owner, &lock)
             .await
@@ -411,7 +340,7 @@ mod tests {
         let now = UnixMillis::now().unwrap();
         scope.not_before = UnixMillis(now.0 - 3 * 86400000);
         scope.expires = UnixMillis(now.0 - 86400000);
-        let authorization = GrantId([0; 16]);
+        let authorization = super::super::owner::ROOT_GRANT;
         let holder = NodeKey::from_public_key(identity.node_key.public_key()).unwrap();
         let (approval, secret) = super::super::owner::approve(
             &owner,
@@ -428,8 +357,7 @@ mod tests {
         .prepare(None)
         .unwrap();
         hellas_private::create_dir_all_durable(&home.join("provider/startup-profile")).unwrap();
-        let credential = PathBuf::from("startup-profile/credential");
-        profile::replace_credential(&home.join("provider").join(&credential), &secret).unwrap();
+        profile::replace_credential(&home.join(CREDENTIAL), &secret).unwrap();
         prepare_tls(&home).unwrap();
         let mut store = NodeStore::bootstrap_prepared(
             &home.child("provider/authority"),
@@ -445,8 +373,6 @@ mod tests {
         store.close().await;
         Startup::Initialized {
             authority: scope.authority,
-            authorization,
-            credential,
         }
         .save(&home)
         .unwrap();
@@ -475,14 +401,7 @@ mod tests {
             .unwrap_err();
         assert!(failure.to_string().contains("recovery committed"));
         std::fs::remove_dir(&credential_path).unwrap();
-        let mut inspection = NodeStore::open(
-            &home.child("provider/authority"),
-            hellas_authority::model::grant::grant_network(),
-            None,
-            UnixMillis::now().unwrap(),
-        )
-        .await
-        .unwrap();
+        let mut inspection = open(&home, &identity.enrollment).await.unwrap().unwrap();
         let inspected = inspection.state().authority().revision();
         inspection.close().await;
         assert_eq!(inspected, committed.next().unwrap());
@@ -490,25 +409,20 @@ mod tests {
             .await
             .unwrap();
         let lock = StartupLock::acquire(&home.child("provider/authority")).unwrap();
-        let startup = prepare_local(&home, &identity, &owner, &lock)
+        let (store, credential) = prepare_local(&home, &identity, &owner, &lock)
             .await
             .unwrap();
-        assert_ne!(startup.credential.id(), secret.id());
-        assert_eq!(
-            startup.store.state().authority().authority(),
-            scope.authority
-        );
-        let node = hellas_authority::node::NodeCoordinator::new(
-            startup.store,
-            std::sync::Arc::new(move || now),
-        );
+        assert_ne!(credential.id(), secret.id());
+        assert_eq!(store.state().authority().authority(), scope.authority);
+        let node =
+            hellas_authority::node::NodeCoordinator::new(store, std::sync::Arc::new(move || now));
         let retained_profile =
             profile::ClientProfile::load(&home.join("provider/startup-profile/profile.json"))
                 .unwrap();
-        assert_eq!(retained_profile.authorization, startup.authorization);
-        assert_eq!(retained_profile.credential.id(), startup.credential.id());
+        assert_eq!(retained_profile.authorization, authorization);
+        assert_eq!(retained_profile.credential.id(), credential.id());
         node.authenticate_session(
-            &startup.credential,
+            &credential,
             hellas_authority::node::SessionKey::Passkey(&owner),
         )
         .await

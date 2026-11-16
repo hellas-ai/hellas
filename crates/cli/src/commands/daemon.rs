@@ -578,8 +578,8 @@ pub async fn gateway(
     #[cfg(feature = "otel")] metrics: Option<(std::net::SocketAddr, crate::metrics::MetricsBundle)>,
 ) -> Result<()> {
     let configured = match args.config {
-        Some(path) => config::State::load(&path)?,
-        None => config::State::gateway(args.models, args.upstreams, args.bind)?,
+        Some(path) => config::Config::load(&path)?,
+        None => config::Config::gateway(args.models, args.upstreams, args.bind)?,
     };
     ensure!(
         configured.paid_policy.is_none(),
@@ -629,7 +629,7 @@ pub async fn gateway(
     context.content = Some(options.content.clone());
     let prepared = configured.resolve(&context).await;
     let document = match prepared {
-        Ok(state) => state.document,
+        Ok((document, _)) => document,
         Err(error) => {
             options.content.close().await;
             node.close().await;
@@ -694,7 +694,7 @@ pub async fn serve(
 ) -> Result<()> {
     let declarative = config_file.is_some();
     let desired = if let Some(path) = config_file {
-        let state = config::State::load(&path)?;
+        let state = config::Config::load(&path)?;
         let context = ModelContext::new(
             home,
             identity,
@@ -710,18 +710,15 @@ pub async fn serve(
     let shutdown = shutdown_signal()?;
     tokio::pin!(shutdown);
     let (endpoint, store, declarative_start) = if let Some(state) = desired {
-        let startup = super::bootstrap::prepare_local(
+        let (store, credential) = super::bootstrap::prepare_local(
             home,
             identity,
             owner.context("--config requires --passkey")?,
             &ownership,
         )
         .await?;
-        (
-            None,
-            startup.store,
-            Some((state, startup.credential, startup.authorization)),
-        )
+        let authorization = store.state().authority().root_grant();
+        (None, store, Some((state, credential, authorization)))
     } else {
         let (endpoint, store) = tokio::select! {
             result = super::bootstrap::prepare(home, &identity.transport_key, &identity.enrollment, port, &ownership) => result?,
@@ -742,11 +739,12 @@ pub async fn serve(
                 ),
             )
             .await?;
+        let (document, paid_policy) = state;
         Start::Reconcile(Box::new(Reconciliation {
-            document: state.document,
+            document,
             caller,
             authorization,
-            paid_policy: state.paid_policy,
+            paid_policy,
         }))
     } else if node.configuration().await?.is_some() {
         Start::Restore(port)
@@ -881,23 +879,49 @@ mod tests {
     use super::*;
     use clap::Parser;
 
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn gateway_matching_and_store_preparation_hash_full_weights_once() {
-        const CHILD: &str = "HELLAS_TEST_GATEWAY_HASH_ONCE";
-        if std::env::var_os(CHILD).is_none() {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "commands::daemon::tests::gateway_matching_and_store_preparation_hash_full_weights_once", "--nocapture"])
-                .env(CHILD, "1")
-                .output().unwrap();
-            assert!(
-                output.status.success(),
-                "{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            return;
+    pub(super) fn model_context(home: &Path) -> ModelContext {
+        ModelContext {
+            home: home.into(),
+            principal: None,
+            content: None,
+            holder: NodeKey::from_public_key(
+                hellas_auth::ProducerSigningKey::from_secret_bytes([1; 32])
+                    .unwrap()
+                    .public_key(),
+            )
+            .unwrap(),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    const WEIGHTS_BYTES: u64 = 32 << 20;
+
+    #[cfg(target_os = "linux")]
+    fn isolated(test: &str) -> bool {
+        const CHILD: &str = "HELLAS_TEST_WEIGHT_READ_CASE";
+        if std::env::var(CHILD).ok().as_deref() == Some(test) {
+            return true;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("commands::daemon::tests::{test}"),
+                "--nocapture",
+            ])
+            .env(CHILD, test)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
+    }
+
+    #[cfg(target_os = "linux")]
+    fn full_weights() -> (tempfile::TempDir, PathBuf) {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("full.gguf");
         std::fs::copy(
@@ -906,13 +930,41 @@ mod tests {
             &path,
         )
         .unwrap();
-        let size = 32 << 20;
         std::fs::OpenOptions::new()
             .write(true)
             .open(&path)
             .unwrap()
-            .set_len(size)
+            .set_len(WEIGHTS_BYTES)
             .unwrap();
+        (root, path)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_bytes() -> u64 {
+        std::fs::read_to_string("/proc/self/io")
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("rchar: ").map(|n| n.parse().unwrap()))
+            .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_weights_once(before: u64) {
+        let bytes = read_bytes() - before;
+        assert!(
+            (WEIGHTS_BYTES..WEIGHTS_BYTES + (1 << 20)).contains(&bytes),
+            "expected one full read of {WEIGHTS_BYTES} weights bytes, observed {bytes}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn gateway_matching_and_store_preparation_hash_full_weights_once() {
+        if !isolated("gateway_matching_and_store_preparation_hash_full_weights_once") {
+            return;
+        }
+        let (root, path) = full_weights();
+        let size = WEIGHTS_BYTES;
         let store = hellas_store::content::DiskStore::open(
             hellas_private::StoreLocation::for_test(&root.path().join("content")),
             vec![],
@@ -925,24 +977,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let context = ModelContext {
-            home: root.path().into(),
-            principal: None,
-            holder: NodeKey::from_public_key(
-                hellas_auth::ProducerSigningKey::from_secret_bytes([1; 32])
-                    .unwrap()
-                    .public_key(),
-            )
-            .unwrap(),
-            content: Some(store.clone()),
-        };
-        let read_bytes = || -> u64 {
-            std::fs::read_to_string("/proc/self/io")
-                .unwrap()
-                .lines()
-                .find_map(|line| line.strip_prefix("rchar: ").map(|n| n.parse().unwrap()))
-                .unwrap()
-        };
+        let mut context = model_context(root.path());
+        context.content = Some(store.clone());
         let before = read_bytes();
         let hip = hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip);
         let cuda = hellas_client::model::evaluator(hellas_client::model::GpuDialect::Cuda);
@@ -957,52 +993,18 @@ mod tests {
             .rescan(vec![path], hellas_store::content::IndexMode::Resume)
             .await
             .unwrap();
-        let bytes = read_bytes() - before;
-        assert!(bytes >= size, "cold weights were not read: {bytes}");
-        assert!(
-            bytes < size + (1 << 20),
-            "weights were read more than once: {bytes} bytes for {size} weights bytes"
-        );
+        assert_weights_once(before);
         store.close().await;
     }
 
     #[cfg(all(target_os = "linux", feature = "compute"))]
     #[tokio::test]
     async fn local_rendering_and_indexing_hash_full_weights_once() {
-        const CHILD: &str = "HELLAS_TEST_LOCAL_HASH_ONCE";
-        if std::env::var_os(CHILD).is_none() {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "commands::daemon::tests::local_rendering_and_indexing_hash_full_weights_once",
-                    "--nocapture",
-                ])
-                .env(CHILD, "1")
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+        if !isolated("local_rendering_and_indexing_hash_full_weights_once") {
             return;
         }
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("full.gguf");
-        std::fs::copy(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../client/src/model/package/mini-qwen3.gguf"),
-            &path,
-        )
-        .unwrap();
-        let size = 32 << 20;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_len(size)
-            .unwrap();
+        let (root, path) = full_weights();
+        let size = WEIGHTS_BYTES;
         let native = crate::compute::LocalArgs {
             content_config: None,
             content: vec![],
@@ -1011,13 +1013,6 @@ mod tests {
                 gpu_session_programs: 1,
                 gpu_session_asset_bytes: size,
             },
-        };
-        let read_bytes = || -> u64 {
-            std::fs::read_to_string("/proc/self/io")
-                .unwrap()
-                .lines()
-                .find_map(|line| line.strip_prefix("rchar: ").map(|n| n.parse().unwrap()))
-                .unwrap()
         };
         let before = read_bytes();
         let store = crate::compute::content(
@@ -1033,11 +1028,7 @@ mod tests {
                 .await
                 .unwrap();
         packages[&evaluator].program().unwrap();
-        let bytes = read_bytes() - before;
-        assert!(
-            bytes >= size && bytes < size + (1 << 20),
-            "weights were read more than once: {bytes} bytes for {size} weights bytes"
-        );
+        assert_weights_once(before);
         store.close().await;
     }
 
@@ -1082,17 +1073,7 @@ mod tests {
     #[tokio::test]
     async fn remove_grant_route_by_contact_uses_its_generated_id() {
         let directory = tempfile::tempdir().unwrap();
-        let context = ModelContext {
-            home: directory.path().into(),
-            content: None,
-            principal: None,
-            holder: NodeKey::from_public_key(
-                hellas_auth::ProducerSigningKey::from_secret_bytes([1; 32])
-                    .unwrap()
-                    .public_key(),
-            )
-            .unwrap(),
-        };
+        let context = model_context(directory.path());
         let contact = "a".repeat(64);
         let mut document = Document::default();
         let id = grant_backend(
@@ -1191,8 +1172,6 @@ mod tests {
                 "127.0.0.1:8080",
             ],
             vec!["hellas", "serve", "--config", "file", "--port", "0"],
-            vec!["hellas", "serve", "--model", "model.gguf"],
-            vec!["hellas", "serve", "apply", "file"],
         ] {
             assert!(crate::Cli::try_parse_from(args).is_err());
         }
@@ -1217,17 +1196,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let key_file = directory.path().join("key");
         std::fs::write(&key_file, "test-secret\n").unwrap();
-        let context = ModelContext {
-            home: directory.path().into(),
-            content: None,
-            principal: None,
-            holder: NodeKey::from_public_key(
-                hellas_auth::ProducerSigningKey::from_secret_bytes([1; 32])
-                    .unwrap()
-                    .public_key(),
-            )
-            .unwrap(),
-        };
+        let context = model_context(directory.path());
         let mut document = Document::default();
         document.listeners.insert(
             "work".into(),

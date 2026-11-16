@@ -2,6 +2,8 @@
 use hellas_auth::{Digest, authority::*};
 use hellas_authority::{authenticator::Authenticator, work_store::grant::OwnerApproval};
 
+pub(crate) const ROOT_GRANT: GrantId = GrantId([0; 16]);
+
 pub(crate) fn administrator(
     public: hellas_authority::authenticator::PublicKey,
 ) -> anyhow::Result<GrantSpec> {
