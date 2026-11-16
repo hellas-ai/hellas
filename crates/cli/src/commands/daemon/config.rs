@@ -74,18 +74,28 @@ impl State {
     pub fn load(path: &Path) -> Result<Self> {
         let bytes = hellas_private::read_bounded_regular_file(path, 512 * 1024)?;
         Self::parse(std::str::from_utf8(&bytes)?)
+            .with_context(|| format!("configuration {}", path.display()))
     }
     fn parse(text: &str) -> Result<Self> {
-        let mut table: toml::Table =
-            toml::from_str(text).map_err(|_| anyhow::anyhow!("invalid daemon TOML syntax"))?;
+        let diagnostic = |error: toml::de::Error| {
+            let offset = error.span().map_or(0, |span| span.start).min(text.len());
+            let prefix = &text.as_bytes()[..offset];
+            let line = prefix.iter().filter(|byte| **byte == b'\n').count() + 1;
+            let column = prefix
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map_or(offset + 1, |newline| offset - newline);
+            anyhow::anyhow!("invalid daemon TOML at line {line}, column {column} (byte {offset})")
+        };
+        let mut table: toml::Table = toml::from_str(text).map_err(diagnostic)?;
         let mut inputs = toml::Table::new();
         for key in ["models", "upstreams", "paid_policy"] {
             if let Some(value) = table.remove(key) {
                 inputs.insert(key.into(), value);
             }
         }
-        let inputs: Inputs = toml::Value::Table(inputs).try_into()?;
-        let document: Document = toml::Value::Table(table).try_into()?;
+        let inputs: Inputs = toml::Value::Table(inputs).try_into().map_err(diagnostic)?;
+        let document: Document = toml::Value::Table(table).try_into().map_err(diagnostic)?;
         if let Some(policy) = &inputs.paid_policy {
             policy.check()?;
         }
@@ -99,28 +109,10 @@ impl State {
     pub async fn resolve(self, context: &ModelContext) -> Result<Resolved> {
         let mut document = self.document;
         for (name, upstream) in self.upstreams {
-            ensure!(
-                !document.backends.contains_key(&name),
-                "duplicate backend {name}"
-            );
-            apply(
-                &mut document,
-                Edit::Backend(BackendCommand::Add {
-                    name,
-                    url: upstream.url,
-                    key_file: upstream.key_file,
-                }),
-                context,
-            )
-            .await?;
+            expand_upstream(&mut document, &name, &upstream.url, &upstream.key_file)?;
         }
         for model in self.models {
-            apply(
-                &mut document,
-                Edit::Route(RouteCommand::Add { model }),
-                context,
-            )
-            .await?;
+            context.add(&mut document, &model).await?;
         }
         document.validate().map_err(anyhow::Error::msg)?;
         Ok(Resolved {
@@ -133,6 +125,66 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn compilation_preserves_selection_and_matches_foreground_defaults() {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        std::fs::write(&key, "runtime-secret").unwrap();
+        let context = ModelContext {
+            home: root.path().into(),
+            content: None,
+            principal: None,
+            holder: NodeKey::from_public_key(
+                hellas_auth::ProducerSigningKey::from_secret_bytes([1; 32])
+                    .unwrap()
+                    .public_key(),
+            )
+            .unwrap(),
+        };
+        let shorthand = format!("remote=https://example.com/v1,key-file={}", key.display());
+        let flags = State::gateway(vec!["model@remote".into()], vec![shorthand], None)
+            .unwrap()
+            .resolve(&context)
+            .await
+            .unwrap();
+        let text = format!(
+            "models = ['model@remote']\n[listeners.api]\nkind = 'http'\nbind = '127.0.0.1:8080'\n[upstreams.remote]\nurl = 'https://example.com/v1'\nkey_file = '{}'\n",
+            key.display()
+        );
+        let file = State::parse(&text)
+            .unwrap()
+            .resolve(&context)
+            .await
+            .unwrap();
+        assert!(flags.document == file.document);
+        let selected = format!(
+            "{text}\n[backends.local]\nkind = 'local'\nmax_in_flight = 1\n[listeners.work]\nkind = 'iroh'\nport = 0\nbackends = ['local']\n"
+        );
+        let file = State::parse(&selected)
+            .unwrap()
+            .resolve(&context)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&file.document.listeners["work"], Listener::Iroh { backends, .. } if backends == &["local"])
+        );
+        let explicit =
+            State::parse(&text.replace("kind = 'http'", "kind = 'http'\nzdr = false")).unwrap();
+        assert!(matches!(
+            explicit.document.listeners["api"],
+            Listener::Http { zdr: false, .. }
+        ));
+        let error = State::parse("models = [\n'private-key-material'\nBAD")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains("line")
+                && error.contains("column")
+                && !error.contains("private-key-material")
+        );
+    }
 
     #[test]
     fn shared_toml_supports_multiple_models_and_runtime_keys() {

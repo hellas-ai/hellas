@@ -355,6 +355,13 @@ fn key(path: &Path) -> Result<String> {
     Ok(value.into())
 }
 
+fn expand_upstream(document: &mut Document, name: &str, url: &str, key_file: &Path) -> Result<()> {
+    validate_name(name)?;
+    document
+        .add_upstream(name, url, Some(key(key_file)?))
+        .map_err(anyhow::Error::from_boxed)
+}
+
 pub async fn apply(document: &mut Document, edit: Edit, context: &ModelContext) -> Result<()> {
     match edit {
         Edit::Backend(BackendCommand::Add {
@@ -362,10 +369,7 @@ pub async fn apply(document: &mut Document, edit: Edit, context: &ModelContext) 
             url,
             key_file,
         }) => {
-            validate_name(&name)?;
-            document
-                .add_upstream(&name, &url, Some(key(&key_file)?))
-                .map_err(anyhow::Error::from_boxed)?;
+            expand_upstream(document, &name, &url, &key_file)?;
         }
         Edit::Backend(BackendCommand::Rm { name }) => document
             .remove_backend(&name)
@@ -570,13 +574,20 @@ pub async fn gateway(
         "gateway configuration cannot set paid provider policy"
     );
     ensure!(
-        configured.document.listeners.len() == 1
-            && matches!(
-                configured.document.listeners.get("api"),
-                Some(Listener::Http { .. })
-            ),
-        "gateway configuration requires exactly one HTTP listener named api"
+        configured.document.listeners.len() == 1,
+        "gateway requires exactly one HTTP listener"
     );
+    let (listener, kind) = configured
+        .document
+        .listeners
+        .iter()
+        .next()
+        .context("missing HTTP listener")?;
+    ensure!(
+        matches!(kind, Listener::Http { .. }),
+        "gateway requires an HTTP listener"
+    );
+    let listener = listener.clone();
     let mut tty = if args.wrap.is_none() && args.bearer_file.is_none() {
         let terminal = if cfg!(windows) { "CONOUT$" } else { "/dev/tty" };
         Some(
@@ -620,7 +631,10 @@ pub async fn gateway(
         metrics,
         async |core| {
             print(&core.watch().0);
-            let address = core.http_addresses()["api"];
+            let address = *core
+                .http_addresses()
+                .get(&listener)
+                .context("gateway HTTP listener is unavailable")?;
             if let Some(path) = args.bearer_file {
                 hellas_private::write_atomically(&path, ".bearer", access.bearer().as_bytes())?;
             }
@@ -666,6 +680,7 @@ pub async fn serve(
     config_file: Option<PathBuf>,
     #[cfg(feature = "otel")] metrics: Option<(std::net::SocketAddr, crate::metrics::MetricsBundle)>,
 ) -> Result<()> {
+    let declarative = config_file.is_some();
     let desired = if let Some(path) = config_file {
         let state = config::State::load(&path)?;
         let context = ModelContext::new(
@@ -764,7 +779,11 @@ pub async fn serve(
                 "Provider: {}",
                 hellas_sdk::client::ProviderAddress::of(&identity.enrollment)?
             );
-            eprintln!("Daemon ready; configure it with hellas backend and hellas route.");
+            if declarative {
+                eprintln!("Daemon ready; declared configuration reconciled.");
+            } else {
+                eprintln!("Daemon ready; configure it with hellas backend and hellas route.");
+            }
             let signal: Result<()> = tokio::select! {
                 result = &mut shutdown => result.map_err(Into::into),
                 result = core.wait() => result.map_err(anyhow::Error::from_boxed),

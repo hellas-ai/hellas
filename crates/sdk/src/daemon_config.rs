@@ -43,12 +43,16 @@ pub struct Execution {
 pub struct Limits {
     pub requests_per_minute: Option<std::num::NonZeroU64>,
 }
+const fn default_http_zdr() -> bool {
+    true
+}
+
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Listener {
     Http {
         bind: SocketAddr,
-        #[serde(default)]
+        #[serde(default = "default_http_zdr")]
         zdr: bool,
     },
     Iroh {

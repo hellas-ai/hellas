@@ -108,14 +108,14 @@ key_file = "/run/secrets/api.key"
 [listeners.api]
 kind = "http"
 bind = "127.0.0.1:8080"
-zdr = true
+zdr = true # default; set false explicitly to retain request/response data
 ```
 
 ```sh
 hellas gateway --config gateway.toml --wrap claude
 ```
 
-`gateway --config` requires exactly one HTTP listener named `api`. It rejects
+`gateway --config` requires exactly one HTTP listener (its name is arbitrary). It rejects
 paid provider terms and cannot be mixed with `--model`, `--upstream` or `--bind`.
 The existing flags remain useful for foreground use and compile into the same
 daemon document. The gateway retains its ephemeral HTTP authority and bearer

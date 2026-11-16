@@ -18,7 +18,7 @@ async fn headless_gateway_hands_its_bearer_to_an_authenticated_client() {
         toml::to_string(&json!({
             "models": ["model@api"],
             "upstreams": {"api": {"url": "https://example.com/v1", "key_file": key}},
-            "listeners": {"api": {"kind": "http", "bind": "127.0.0.1:0", "zdr": true}}
+            "listeners": {"frontend": {"kind": "http", "bind": "127.0.0.1:0", "zdr": true}}
         }))
         .unwrap(),
     )

@@ -126,7 +126,7 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1")]
         metrics_addr: std::net::IpAddr,
     },
-    /// Serve a TOML configuration without saving routing configuration.
+    /// Serve models from foreground flags or TOML, without saving routing configuration.
     Gateway {
         #[command(flatten)]
         args: commands::daemon::GatewayArgs,
