@@ -2,7 +2,7 @@
 rec {
   configurationOptions = { lib, pkgs }: {
     settings = lib.mkOption {
-      type = (pkgs.formats.toml { }).type;
+      inherit (pkgs.formats.toml { }) type;
       default = { };
       description = "TOML daemon configuration. Keep model bytes and credential files at runtime paths; never embed secrets.";
     };

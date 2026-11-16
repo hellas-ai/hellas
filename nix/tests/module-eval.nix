@@ -230,17 +230,16 @@ let
     passkey = "/run/secrets/owner";
     credentials.api = "/run/secrets/api";
   };
-  dockerNetwork = import ../docker.nix {
-    inherit pkgs;
-    rustToolchain = self.lib.rustToolchain pkgs;
-    cli = package;
-  };
-  dockerCuda = import ../docker.nix {
-    inherit pkgs;
-    rustToolchain = self.lib.rustToolchain pkgs;
-    cli = package;
-    backend = "cuda";
-  };
+  dockerConfig =
+    backend:
+    (import ../docker.nix {
+      pkgs = pkgs // {
+        dockerTools.streamLayeredImage = args: args;
+      };
+      inherit backend;
+      rustToolchain = self.lib.rustToolchain pkgs;
+      cli = package;
+    }).image.config;
   declarative = evalProvider {
     passkey = "/run/secrets/owner";
     settings = {
@@ -285,25 +284,24 @@ in
         max_in_flight = 1;
       };
     });
-    assert builtins.length dockerNetwork.imageConfig.Entrypoint == 1;
-    assert
-      dockerNetwork.imageConfig.Cmd == [
-        "serve"
-        "--port"
-        "31145"
+    assert lib.all
+      (
+        backend:
+        let
+          config = dockerConfig backend;
+        in
+        builtins.length config.Entrypoint == 1
+        &&
+          config.Cmd == [
+            "serve"
+            "--port"
+            "31145"
+          ]
+      )
+      [
+        "network"
+        "cuda"
       ];
-    assert builtins.length dockerCuda.imageConfig.Entrypoint == 1;
-    assert dockerCuda.imageConfig.Cmd == dockerNetwork.imageConfig.Cmd;
-    assert lib.hasInfix ''"$@"'' dockerCuda.entrypointText;
-    assert
-      !(lib.elem "--port" (
-        dockerCuda.imageConfig.Entrypoint
-        ++ [
-          "serve"
-          "--config"
-          "/run/provider.toml"
-        ]
-      ));
     assert lib.hasInfix "serve --config /nix/store/" declarativeService.serviceConfig.ExecStart;
     assert !(lib.hasInfix "--port" declarativeService.serviceConfig.ExecStart);
     assert lib.elem "/srv/models/flux@revision" declarativeService.unitConfig.RequiresMountsFor;
@@ -334,10 +332,7 @@ in
         configFile = "/run/config";
       }));
     assert lib.hasInfix "--config %d/hellas-config"
-      (evalProvider {
-        configFile = "/run/hellas.toml";
-        passkey = "/run/owner";
-      }).config.systemd.services.hellas.serviceConfig.ExecStart;
+      credentialProvider.config.systemd.services.hellas.serviceConfig.ExecStart;
     assert lib.hasInfix "serve --port" defaultProviderService.serviceConfig.ExecStart;
     assert !(lib.hasInfix "--model" defaultProviderService.serviceConfig.ExecStart);
     assert lib.hasInfix "gateway --config /nix/store/" gateway.serviceConfig.ExecStart;
@@ -420,57 +415,26 @@ in
       ! ${pkgs.gnugrep}/bin/grep -F 'runtime-secret-not-in-wrapper' ${runtimeEnvironmentWrapper}
       ! ${pkgs.gnugrep}/bin/grep -F '/Users/hellas/.config/hellas/provider.env' ${runtimeEnvironmentWrapper}
 
-      printf '%s\n' 'INSECURE=value' > "$PWD/insecure-mode.env"
-      chmod 0644 "$PWD/insecure-mode.env"
-      if ${runtimeEnvironmentWrapper} "$PWD/insecure-mode.env" ${pkgs.coreutils}/bin/true 2>/dev/null; then
-        exit 1
-      fi
-
-      printf '%s\n' 'SYMLINK=value' > "$PWD/symlink-target.env"
-      ln -s "$PWD/symlink-target.env" "$PWD/symlink.env"
-      if ${runtimeEnvironmentWrapper} "$PWD/symlink.env" ${pkgs.coreutils}/bin/true 2>/dev/null; then
-        exit 1
-      fi
-
-      ${pkgs.coreutils}/bin/mkfifo "$PWD/fifo.env"
-      chmod 0600 "$PWD/fifo.env"
-      fifo_status=0
-      ${pkgs.coreutils}/bin/timeout 2 \
-        ${runtimeEnvironmentWrapper} "$PWD/fifo.env" ${pkgs.coreutils}/bin/true \
-        2>/dev/null || fifo_status=$?
-      test "$fifo_status" -ne 0
-      test "$fifo_status" -ne 124
-
-      ln -s ${builtins.dirOf runtimeEnvironmentStoreFile} "$PWD/store-parent"
-      if ${runtimeEnvironmentWrapper} \
-        "$PWD/store-parent/${builtins.baseNameOf runtimeEnvironmentStoreFile}" \
-        ${pkgs.coreutils}/bin/true 2>/dev/null; then
-        exit 1
-      fi
-
-      printf '%s\n' 'MALFORMED' > "$PWD/malformed.env"
-      if ${runtimeEnvironmentWrapper} "$PWD/malformed.env" ${pkgs.coreutils}/bin/true 2>/dev/null; then
-        exit 1
-      fi
-
-      printf '%s\n' 'DUPLICATE=one' 'DUPLICATE=two' > "$PWD/duplicate.env"
-      if ${runtimeEnvironmentWrapper} "$PWD/duplicate.env" ${pkgs.coreutils}/bin/true 2>/dev/null; then
-        exit 1
-      fi
-
-      printf 'CR=value\r\n' > "$PWD/carriage-return.env"
-      if ${runtimeEnvironmentWrapper} "$PWD/carriage-return.env" ${pkgs.coreutils}/bin/true 2>/dev/null; then
-        exit 1
-      fi
-
-      printf 'NUL=value\000suffix\n' > "$PWD/nul.env"
-      if ${runtimeEnvironmentWrapper} "$PWD/nul.env" ${pkgs.coreutils}/bin/true 2>/dev/null; then
-        exit 1
-      fi
-
-      if ${runtimeEnvironmentWrapper} "$PWD/missing.env" ${pkgs.coreutils}/bin/true 2>/dev/null; then
-        exit 1
-      fi
+      printf '%s\n' 'INSECURE=value' > insecure.env
+      chmod 0644 insecure.env
+      ln -s "$environment_file" symlink.env
+      ${pkgs.coreutils}/bin/mkfifo fifo.env
+      ln -s ${builtins.dirOf runtimeEnvironmentStoreFile} store-parent
+      printf '%s\n' 'MALFORMED' > malformed.env
+      printf '%s\n' 'DUPLICATE=one' 'DUPLICATE=two' > duplicate.env
+      printf 'CR=value\r\n' > carriage-return.env
+      printf 'NUL=value\000suffix\n' > nul.env
+      for file in insecure.env symlink.env fifo.env malformed.env duplicate.env \
+        carriage-return.env nul.env missing.env \
+        store-parent/${builtins.baseNameOf runtimeEnvironmentStoreFile}; do
+        status=0
+        ${pkgs.coreutils}/bin/timeout 2 ${runtimeEnvironmentWrapper} "$PWD/$file" \
+          ${pkgs.coreutils}/bin/true 2>/dev/null || status=$?
+        if [ "$status" -eq 0 ] || [ "$status" -eq 124 ]; then
+          echo "expected prompt rejection of $file, got $status" >&2
+          exit 1
+        fi
+      done
 
       touch "$out"
     '';

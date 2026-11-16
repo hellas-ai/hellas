@@ -21,13 +21,11 @@ let
         chmod 0555 "$out/bin/hellas"
       '';
 
-  executableEntrypoint = [ (if cuda then "${entrypoint}" else "${runtime}/bin/hellas") ];
-
   gpu = backend != "network";
   cuda = backend == "cuda";
   toolkit = if cuda then pkgs.hellasLib.cudaToolkit else pkgs.hellasLib.rocmToolkit;
   compiler = pkgs.cudaPackages.backendStdenv.cc;
-  entrypointText = (
+  entrypoint = pkgs.writeShellScript "hellas-${backend}-entrypoint" (
     pkgs.lib.optionalString cuda ''
       # CDI can inject the driver at a host-specific path, including /nix/store.
       # Read the container cache explicitly: Nix glibc does not search it.
@@ -40,62 +38,6 @@ let
       exec ${runtime}/bin/hellas "$@"
     ''
   );
-  imageConfig = {
-    Entrypoint = executableEntrypoint;
-    Cmd = [
-      "serve"
-      "--port"
-      "31145"
-    ];
-    Labels = {
-      "org.opencontainers.image.source" = "https://github.com/hellas-ai/hellas";
-      "org.opencontainers.image.revision" = revision;
-    };
-    WorkingDir = "/var/lib/hellas";
-    Volumes."/var/lib/hellas" = { };
-    ExposedPorts."31145/udp" = { };
-    Env = [
-      "HOME=/var/lib/hellas"
-      "HELLAS_HOME=/var/lib/hellas/.hellas"
-      "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
-      "NIX_SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
-    ]
-    ++ pkgs.lib.optionals gpu [
-      "PATH=${
-        pkgs.lib.makeBinPath (
-          [
-            toolkit
-            pkgs.coreutils
-            pkgs.binutils
-            pkgs.bash
-          ]
-          ++ pkgs.lib.optional cuda compiler
-        )
-      }"
-      # The ROCm toolkit's lib/ carries its own glibc, which would replace the
-      # binary's loader-matched libc and abort at startup; HIP is found via
-      # ROCM_PATH/HIP_PATH instead.
-      "LD_LIBRARY_PATH=${pkgs.lib.optionalString cuda "${toolkit}/lib:"}/usr/local/nvidia/lib64:/usr/local/nvidia/lib:/run/opengl-driver/lib"
-    ]
-    ++ (
-      if cuda then
-        [
-          "CUDA_PATH=${toolkit}"
-          "NVCC_CCBIN=${compiler}/bin/c++"
-          "NVIDIA_VISIBLE_DEVICES=all"
-          "NVIDIA_DRIVER_CAPABILITIES=compute,utility"
-        ]
-      else
-        pkgs.lib.optionals gpu [
-          "ROCM_PATH=${toolkit}"
-          "HIP_PATH=${toolkit}"
-          "HIP_CLANG_PATH=${toolkit}/bin"
-          "DEVICE_LIB_PATH=${toolkit}/amdgcn/bitcode"
-          "HIP_FLAGS=--rocm-path=${toolkit} --rocm-device-lib-path=${toolkit}/amdgcn/bitcode"
-        ]
-    );
-  };
-  entrypoint = pkgs.writeShellScript "hellas-${backend}-entrypoint" entrypointText;
   image = pkgs.dockerTools.streamLayeredImage {
     name = imageRepository;
     tag = backend;
@@ -116,10 +58,64 @@ let
       pkgs.bash
     ]
     ++ pkgs.lib.optional cuda compiler;
-    config = imageConfig;
+    config = {
+      Entrypoint = [ (if cuda then "${entrypoint}" else "${runtime}/bin/hellas") ];
+      Cmd = [
+        "serve"
+        "--port"
+        "31145"
+      ];
+      Labels = {
+        "org.opencontainers.image.source" = "https://github.com/hellas-ai/hellas";
+        "org.opencontainers.image.revision" = revision;
+      };
+      WorkingDir = "/var/lib/hellas";
+      Volumes."/var/lib/hellas" = { };
+      ExposedPorts."31145/udp" = { };
+      Env = [
+        "HOME=/var/lib/hellas"
+        "HELLAS_HOME=/var/lib/hellas/.hellas"
+        "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+        "NIX_SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+      ]
+      ++ pkgs.lib.optionals gpu [
+        "PATH=${
+          pkgs.lib.makeBinPath (
+            [
+              toolkit
+              pkgs.coreutils
+              pkgs.binutils
+              pkgs.bash
+            ]
+            ++ pkgs.lib.optional cuda compiler
+          )
+        }"
+        # The ROCm toolkit's lib/ carries its own glibc, which would replace the
+        # binary's loader-matched libc and abort at startup; HIP is found via
+        # ROCM_PATH/HIP_PATH instead.
+        "LD_LIBRARY_PATH=${pkgs.lib.optionalString cuda "${toolkit}/lib:"}/usr/local/nvidia/lib64:/usr/local/nvidia/lib:/run/opengl-driver/lib"
+      ]
+      ++ (
+        if cuda then
+          [
+            "CUDA_PATH=${toolkit}"
+            "NVCC_CCBIN=${compiler}/bin/c++"
+            "NVIDIA_VISIBLE_DEVICES=all"
+            "NVIDIA_DRIVER_CAPABILITIES=compute,utility"
+          ]
+        else
+          pkgs.lib.optionals gpu [
+            "ROCM_PATH=${toolkit}"
+            "HIP_PATH=${toolkit}"
+            "HIP_CLANG_PATH=${toolkit}/bin"
+            "DEVICE_LIB_PATH=${toolkit}/amdgcn/bitcode"
+            "HIP_FLAGS=--rocm-path=${toolkit} --rocm-device-lib-path=${toolkit}/amdgcn/bitcode"
+          ]
+      );
+    };
   };
 
 in
 {
-  inherit image imageConfig entrypointText;
+  inherit image;
 }

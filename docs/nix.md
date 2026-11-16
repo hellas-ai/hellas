@@ -25,38 +25,27 @@ A declarative HTTP deployment runs the stateless gateway from TOML settings:
 ```nix
 services.hellas.gateway = {
   enable = true;
+  credentials.api = "/run/secrets/openrouter.key";
   settings = {
     models = [ "/srv/models/qwen3.gguf" "gpt-5@openrouter" ];
     upstreams.openrouter = {
       url = "https://openrouter.ai/api";
-      key_file = "/run/secrets/openrouter.key";
+      key_file = "credential:api";
     };
     listeners.api = { kind = "http"; bind = "127.0.0.1:8080"; zdr = true; };
   };
 };
 ```
 
-The module generates the shared TOML configuration and runs `gateway --config`.
-Model packages and API key files remain runtime paths outside the Nix store.
-Provision private files for the service user; do not interpolate Nix paths or
-call `builtins.readFile` on secrets. The gateway keeps its HTTP bearer in memory;
-use `gateway.extraArgs = [ "--wrap" "COMMAND" ];` to pass it to a child.
+The module generates TOML for `gateway --config`. Private `configFile`, owner
+passkey and named `credentials` files use systemd `LoadCredential`.
+`credential:NAME` reads a named key from `CREDENTIALS_DIRECTORY`; absolute key
+paths require independently provisioned access for the service user. Copying a
+private TOML file does not grant access to other paths it references.
 
-Private runtime TOML and owner passkeys use systemd `LoadCredential`; ExecStart
-receives `%d/hellas-config` and `%d/owner-passkey`, expanded by systemd to private
-files readable by the DynamicUser. A TOML file referencing other secret paths
-does not grant access to those files. Supply named upstream secrets explicitly:
-
-```nix
-services.hellas.gateway.credentials.api = "/run/secrets/openrouter.key";
-services.hellas.gateway.settings.upstreams.openrouter.key_file = "credential:api";
-```
-
-`credential:NAME` resolves only against systemd's `CREDENTIALS_DIRECTORY` at
-runtime. Absolute key paths remain supported when you independently provision
-read access for the service user. Home Manager is file-only (`serve.configFile`)
-and requires its owner passkey; provision both files readable by that login user.
-It does not copy files via systemd or offer a `settings` option.
+Keep model packages and secrets outside the Nix store: never interpolate Nix
+paths or use `builtins.readFile` on secrets. The gateway retains its bearer in
+memory; `gateway.extraArgs = [ "--wrap" "COMMAND" ];` passes it to a child.
 
 For a declarative persistent provider:
 
@@ -97,15 +86,11 @@ converges on retry. Startup never requests faucet coins or delegates stake.
 Fund the owner and delegate stake to the node's settlement key explicitly as
 described in that guide.
 
-Both services also accept `configFile = "/run/hellas.toml"` for an externally
-provisioned TOML file. It is mutually exclusive with `settings`. Configure firewall access explicitly
-with `networking.firewall.allowedTCPPorts` / `allowedUDPPorts` to match the
-listener addresses and ports in TOML. The module rejects
-embedded credential `secret`/`access` fields (backend names are unrestricted) and store paths in settings. Use runtime key
-files (`upstreams.NAME.key_file`), or a private runtime configFile when raw
-credential-bearing backend definitions are necessary. Such a file must be
-readable only by its intended service user. With a runtime configFile, provision
-its model mounts and any additional service sandbox paths separately.
+Both services accept `configFile = "/run/hellas.toml"` instead of `settings`.
+Declare firewall rules for the TOML listeners explicitly. Generated settings
+reject store paths and credential `secret`/`access` fields, not backend names.
+Use named upstream credentials or private runtime TOML for raw credentials;
+provision model mounts and sandbox paths separately for external TOML.
 
 Without settings/configFile, `services.hellas.enable` retains the interactive
 mode: pair its invite, then use `hellas backend`, `hellas route` and
@@ -136,7 +121,40 @@ publication fails after recovery commits, inspect the current revision and run
 this explicit operation again at that revision; a stale revision is refused.
 Never remove journals or startup metadata to work around expiry.
 
-Home Manager can run the stateful service on Darwin:
+For the default NixOS DynamicUser deployment, run inspection/rebind as the
+service's owning identity, not as a bare root CLI. A manually started maintenance
+unit preserves that ownership and the existing credential bindings:
+
+```nix
+systemd.services.hellas-owner-maintenance = {
+  conflicts = [ "hellas.service" ];
+  after = [ "hellas.service" ];
+  serviceConfig = {
+    Type = "oneshot";
+    User = "hellas";
+    DynamicUser = true;
+    StateDirectory = "hellas";
+    StateDirectoryMode = "0700";
+    LoadCredential = config.systemd.services.hellas.serviceConfig.LoadCredential;
+    # Replace 123 with the stopped authority's inspected revision.
+    ExecStart = "${config.services.hellas.package}/bin/hellas --home /var/lib/hellas/.hellas --passkey %d/owner-passkey admin rebind-local --expected-revision 123";
+  };
+};
+```
+
+First use that unit's same account/state-directory settings with
+`admin inspect-offline --journal provider/authority /run/hellas-inspection.json`
+as the command, where the query file contains `{"Grants":{"after":null}}`.
+Read the reported authority revision, then select the rebind command above.
+Start the maintenance unit explicitly with `systemctl start
+hellas-owner-maintenance`; inspect its output and restart `hellas` explicitly
+after success. Adapt the home, account and writable-path bindings for a custom
+deployment. Do not change journal ownership to bypass private-file checks.
+
+Home Manager accepts externally provisioned `serve.configFile` and requires
+`serve.passkey` for declarative startup. Both must be readable by the login user;
+it has no generated `settings` or systemd credential delivery. It can also run
+the interactive service on Darwin:
 
 ```nix
 programs.hellas = {
@@ -180,36 +198,6 @@ The `unit` check (`nix build .#checks.x86_64-linux.unit`, the PR "Unit tests"
 job) runs the workspace tests once under `cargo llvm-cov`. It fails on a
 failing test and prints line coverage, which is informational and never fails
 the check. Its output holds `lcov.info`, `summary.json` and `summary.txt`.
-
-For the default NixOS DynamicUser deployment, run inspection/rebind as the
-service's owning identity, not as a bare root CLI. A manually started maintenance
-unit preserves that ownership and the existing credential bindings:
-
-```nix
-systemd.services.hellas-owner-maintenance = {
-  conflicts = [ "hellas.service" ];
-  after = [ "hellas.service" ];
-  serviceConfig = {
-    Type = "oneshot";
-    User = "hellas";
-    DynamicUser = true;
-    StateDirectory = "hellas";
-    StateDirectoryMode = "0700";
-    LoadCredential = config.systemd.services.hellas.serviceConfig.LoadCredential;
-    # Replace 123 with the stopped authority's inspected revision.
-    ExecStart = "${config.services.hellas.package}/bin/hellas --home /var/lib/hellas/.hellas --passkey %d/owner-passkey admin rebind-local --expected-revision 123";
-  };
-};
-```
-
-First use that unit's same account/state-directory settings with
-`admin inspect-offline --journal provider/authority /run/hellas-inspection.json`
-as the command, where the query file contains `{"Grants":{"after":null}}`.
-Read the reported authority revision, then select the rebind command above.
-Start the maintenance unit explicitly with `systemctl start
-hellas-owner-maintenance`; inspect its output and restart `hellas` explicitly
-after success. Adapt the home, account and writable-path bindings for a custom
-deployment. Do not change journal ownership to bypass private-file checks.
 
 ## Node home format
 

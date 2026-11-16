@@ -135,24 +135,19 @@ let
   outsideStorePath = hellas.runtimePathIsOutsideStore lib;
   outsideStoreString = hellas.runtimeStringIsOutsideStore lib;
   userEnvironmentStrings = lib.filter builtins.isString (lib.attrValues cfg.environment);
-  providerRuntimePaths = [
-    cfg.home
-  ]
-  ++ lib.attrValues cfg.credentials
-  ++ lib.optional (cfg.configFile != null) cfg.configFile
-  ++ lib.optionals cfg.enable (settingPaths cfg.settings)
-  ++ lib.optional (cfg.chainConfig != null) cfg.chainConfig
-  ++ lib.optional (cfg.passkey != null) cfg.passkey
-  ++ lib.optional (cfg.environmentFile != null) cfg.environmentFile;
-  gatewayRuntimePaths = lib.optionals gateway.enable (
-    [ gateway.home ]
-    ++ lib.attrValues gateway.credentials
-    ++ lib.optional (gateway.configFile != null) gateway.configFile
-    ++ settingPaths gateway.settings
-    ++ lib.optional (gateway.environmentFile != null) gateway.environmentFile
-    ++ lib.optional (gateway.chainConfig != null) gateway.chainConfig
-    ++ lib.optional (gateway.passkey != null) gateway.passkey
-  );
+  runtimePaths =
+    service:
+    [ service.home ]
+    ++ lib.attrValues service.credentials
+    ++ lib.filter (path: path != null) [
+      service.configFile
+      service.chainConfig
+      service.passkey
+      service.environmentFile
+    ]
+    ++ lib.optionals service.enable (settingPaths service.settings);
+  providerRuntimePaths = runtimePaths cfg;
+  gatewayRuntimePaths = lib.optionals gateway.enable (runtimePaths gateway);
   gpuDeviceAccess = {
     # DynamicUser does not inherit an interactive user's device groups.
     # The cgroup rule covers every DRM render node without baking a
