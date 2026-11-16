@@ -377,6 +377,39 @@ mod tests {
         .save(&home)
         .unwrap();
         drop(lock);
+        // Connection options must not silently redirect an offline mutation to
+        // this home. Exercise Clap's global options against a recoverable store.
+        use clap::Parser;
+        let credential = std::fs::read(home.join(CREDENTIAL)).unwrap();
+        let revision = expected.0.to_string();
+        for target in [
+            vec!["--profile", "other-node/profile.json"],
+            vec!["--control-socket", "other-node/control.sock"],
+            vec!["--node", "other-node"],
+            vec!["--node", "other-node", "--address", "127.0.0.1:31145"],
+        ] {
+            let cli =
+                crate::Cli::try_parse_from(["hellas", "admin"].into_iter().chain(target).chain([
+                    "rebind-local",
+                    "--expected-revision",
+                    &revision,
+                ]))
+                .unwrap();
+            let crate::Commands::Admin(args) = cli.command else {
+                unreachable!()
+            };
+            let error = super::super::admin::run(args, &identity, Some(&owner), &home)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("offline mutations reject"),
+                "{error:#}"
+            );
+        }
+        let mut unchanged = open(&home, &identity.enrollment).await.unwrap().unwrap();
+        assert_eq!(unchanged.state().authority().revision(), expected);
+        unchanged.close().await;
+        assert_eq!(std::fs::read(home.join(CREDENTIAL)).unwrap(), credential);
         rebind_local(&home, &identity, &owner, expected)
             .await
             .unwrap();

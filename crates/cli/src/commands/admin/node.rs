@@ -62,27 +62,30 @@ pub async fn run(
     passkey: Option<&dyn Authenticator>,
     home: &StoreLocation,
 ) -> Result<()> {
-    if let AdminCommand::RebindLocal { expected_revision } = &args.command {
-        let passkey = passkey.context("local rebind requires --passkey")?;
-        return super::super::bootstrap::rebind_local(
-            home,
-            identity,
-            passkey,
-            Revision(*expected_revision),
-        )
-        .await;
-    }
     match &args.command {
-        AdminCommand::Bootstrap { .. } | AdminCommand::Recover { .. } => {
+        AdminCommand::Bootstrap { .. }
+        | AdminCommand::Recover { .. }
+        | AdminCommand::RebindLocal { .. } => {
             ensure!(
                 args.profile.is_none()
                     && args.control_socket.is_none()
                     && args.node_enrollment.is_none()
                     && args.addresses.is_empty(),
-                "offline initialization does not connect to a daemon"
+                "offline mutations reject --profile, --control-socket, --node and --address"
             );
-            let passkey = passkey.context("offline initialization requires --passkey")?;
-            return offline(args.command, identity, passkey, home).await;
+            let passkey = passkey.context("offline mutations require --passkey")?;
+            return match args.command {
+                AdminCommand::RebindLocal { expected_revision } => {
+                    super::super::bootstrap::rebind_local(
+                        home,
+                        identity,
+                        passkey,
+                        Revision(expected_revision),
+                    )
+                    .await
+                }
+                command => offline(command, identity, passkey, home).await,
+            };
         }
         _ => {}
     }
