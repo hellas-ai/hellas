@@ -1,5 +1,41 @@
 { self }:
 rec {
+  configurationOptions = { lib, pkgs }: {
+    settings = lib.mkOption {
+      type = (pkgs.formats.toml { }).type;
+      default = { };
+      description = "TOML daemon configuration. Keep model bytes and credential files at runtime paths; never embed secrets.";
+    };
+    configFile = lib.mkOption {
+      type = lib.types.nullOr (lib.types.strMatching "/.*");
+      default = null;
+      description = "Private runtime TOML file, mutually exclusive with settings; loaded using systemd credentials.";
+    };
+    credentials = lib.mkOption {
+      type = lib.types.attrsOf (lib.types.strMatching "/.*");
+      default = { };
+      description = "Named runtime secrets supplied by systemd LoadCredential. In TOML upstreams use key_file = credential:NAME.";
+    };
+  };
+  mkConfiguration =
+    {
+      pkgs,
+      name,
+      settings,
+      configFile,
+    }:
+    if configFile != null then
+      "%d/hellas-config"
+    else if settings == { } then
+      null
+    else
+      toString ((pkgs.formats.toml { }).generate name settings);
+  loadCredentials =
+    lib: cfg:
+    lib.optional (cfg.configFile != null) "hellas-config:${cfg.configFile}"
+    ++ lib.optional (cfg.passkey != null) "owner-passkey:${cfg.passkey}"
+    ++ lib.mapAttrsToList (name: path: "${name}:${path}") cfg.credentials;
+
   # A node runs local Catena Compute, so modules select the compute build.
   # It omits OTEL; modules opt in through the package override.
   normalCliPackage =
@@ -322,7 +358,7 @@ rec {
       configFile = mkOption {
         type = types.nullOr (types.strMatching "/.*");
         default = null;
-        description = "Runtime TOML configuration path, mutually exclusive with settings. Provision outside the Nix store.";
+        description = "Runtime TOML configuration path. Home Manager is file-only; provision it outside the Nix store.";
       };
       port = mkOption {
         type = types.nullOr types.port;
@@ -376,24 +412,14 @@ rec {
     };
 
   gatewayOptions =
-    { lib }:
+    { lib, pkgs }:
     let
       inherit (lib) mkEnableOption mkOption types;
       runtimePath = types.strMatching "/.*";
     in
-    {
+    (configurationOptions { inherit lib pkgs; })
+    // {
       enable = mkEnableOption "Hellas HTTP gateway";
-      settings = mkOption {
-        type = types.attrs;
-        default = { };
-        description = "TOML daemon configuration. Model and credential file paths must refer to runtime data; never embed secrets.";
-      };
-      configFile = mkOption {
-        type = types.nullOr (types.strMatching "/.*");
-        default = null;
-        description = "Runtime TOML configuration path, mutually exclusive with settings. Provision outside the Nix store.";
-      };
-
       chain = mkOption {
         type = types.nullOr (types.enum [ "devnet" ]);
         default = null;

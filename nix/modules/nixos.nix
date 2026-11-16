@@ -24,41 +24,44 @@ let
     || normalizedPath == normalizedRoot
     || lib.hasPrefix "${normalizedRoot}/" normalizedPath;
   outsideManagedRoots = roots: path: !(lib.any (root: pathWithin root path) roots);
-  toml = pkgs.formats.toml { };
-  providerConfig =
-    if cfg.configFile != null then
-      cfg.configFile
-    else if cfg.settings == { } then
-      null
-    else
-      toString (toml.generate "hellas-provider.toml" cfg.settings);
-  gatewayConfig =
-    if gateway.configFile != null then
-      gateway.configFile
-    else
-      toString (toml.generate "hellas-gateway.toml" gateway.settings);
-  settingsSafe =
+  providerConfig = hellas.mkConfiguration {
+    inherit pkgs;
+    name = "hellas-provider.toml";
+    inherit (cfg) settings configFile;
+  };
+  gatewayConfig = hellas.mkConfiguration {
+    inherit pkgs;
+    name = "hellas-gateway.toml";
+    inherit (gateway) settings configFile;
+  };
+  settingStrings =
     value:
-    if builtins.isAttrs value then
-      !(lib.any (
-        name:
-        builtins.elem name [
-          "secret"
-          "access"
-        ]
-      ) (lib.attrNames value))
-      && lib.all settingsSafe (lib.attrValues value)
+    if builtins.isString value then
+      [ value ]
+    else if builtins.isAttrs value then
+      lib.concatMap settingStrings (lib.attrValues value)
     else if builtins.isList value then
-      lib.all settingsSafe value
-    else if builtins.isString value then
-      outsideStoreString value
+      lib.concatMap settingStrings value
     else
-      true;
+      [ ];
+  settingsSafe =
+    settings:
+    lib.all outsideStoreString (settingStrings settings)
+    && lib.all (
+      backend:
+      !(backend ? access)
+      && !(backend.upstream or { } ? secret)
+      && lib.all (credential: !(credential ? secret)) (backend.upstream.credentials or [ ])
+    ) (lib.attrValues (settings.backends or { }));
+  selectorPackage =
+    model:
+    let
+      parts = lib.splitString "@" model;
+    in
+    if builtins.length parts > 1 then lib.concatStringsSep "@" (lib.init parts) else model;
   modelPaths =
     settings:
-    lib.filter (lib.hasPrefix "/") (
-      map (model: builtins.head (lib.splitString "@" model)) (settings.models or [ ])
-    )
+    lib.filter (lib.hasPrefix "/") (map selectorPackage (settings.models or [ ]))
     ++ lib.concatMap (
       backend: lib.optionals ((backend.kind or "") == "local") (backend.content or [ ])
     ) (lib.attrValues (settings.backends or { }))
@@ -71,7 +74,9 @@ let
   settingPaths =
     settings:
     modelPaths settings
-    ++ lib.mapAttrsToList (_: upstream: upstream.key_file) (settings.upstreams or { })
+    ++ lib.filter (path: !(lib.hasPrefix "credential:" path)) (
+      lib.mapAttrsToList (_: upstream: upstream.key_file) (settings.upstreams or { })
+    )
     ++ lib.concatMap (backend: lib.optional (backend ? trust) backend.trust.store) (
       lib.attrValues (settings.backends or { })
     );
@@ -133,6 +138,7 @@ let
   providerRuntimePaths = [
     cfg.home
   ]
+  ++ lib.attrValues cfg.credentials
   ++ lib.optional (cfg.configFile != null) cfg.configFile
   ++ lib.optionals cfg.enable (settingPaths cfg.settings)
   ++ lib.optional (cfg.chainConfig != null) cfg.chainConfig
@@ -140,9 +146,9 @@ let
   ++ lib.optional (cfg.environmentFile != null) cfg.environmentFile;
   gatewayRuntimePaths = lib.optionals gateway.enable (
     [ gateway.home ]
+    ++ lib.attrValues gateway.credentials
     ++ lib.optional (gateway.configFile != null) gateway.configFile
     ++ settingPaths gateway.settings
-    ++ gatewayContentPaths
     ++ lib.optional (gateway.environmentFile != null) gateway.environmentFile
     ++ lib.optional (gateway.chainConfig != null) gateway.chainConfig
     ++ lib.optional (gateway.passkey != null) gateway.passkey
@@ -181,13 +187,9 @@ in
       '';
     }
     // hellas.serveOptions { inherit lib pkgs; }
+    // hellas.configurationOptions { inherit lib pkgs; }
     // {
-      settings = mkOption {
-        type = toml.type;
-        default = { };
-        description = "TOML daemon configuration. Keep model bytes and credential files at runtime paths outside the Nix store; never embed secrets.";
-      };
-      gateway = hellas.gatewayOptions { inherit lib; } // {
+      gateway = hellas.gatewayOptions { inherit lib pkgs; } // {
         package = mkOption {
           type = types.package;
           default = cfg.package;
@@ -236,6 +238,18 @@ in
 
   config = mkIf (cfg.enable || gateway.enable) {
     assertions = [
+      {
+        assertion = lib.all (
+          name:
+          builtins.match "[A-Za-z0-9][A-Za-z0-9._-]*" name != null
+          && !(builtins.elem name [
+            "hellas-config"
+            "owner-passkey"
+          ])
+        ) ((lib.attrNames cfg.credentials) ++ (lib.attrNames gateway.credentials));
+        message = "services.hellas credential names must be simple names other than reserved hellas-config/owner-passkey.";
+      }
+
       {
         assertion = !cfg.enable || cfg.configFile == null || cfg.settings == { };
         message = "services.hellas.settings and configFile are mutually exclusive.";
@@ -346,10 +360,12 @@ in
             inherit lib;
             serve = cfg // {
               configFile = providerConfig;
+              passkey = if cfg.passkey == null then null else "%d/owner-passkey";
             };
             inherit (cfg) otel;
           }
         );
+        LoadCredential = hellas.loadCredentials lib cfg;
         Restart = "on-failure";
         DynamicUser = true;
         RuntimeDirectory = "hellas";
@@ -423,11 +439,13 @@ in
             inherit lib;
             gateway = gateway // {
               configFile = gatewayConfig;
+              passkey = if gateway.passkey == null then null else "%d/owner-passkey";
             };
             bearerFile = "/run/hellas-gateway/bearer";
             inherit (cfg) otel;
           }
         );
+        LoadCredential = hellas.loadCredentials lib gateway;
         Restart = "on-failure";
         DynamicUser = true;
         RuntimeDirectory = "hellas-gateway";

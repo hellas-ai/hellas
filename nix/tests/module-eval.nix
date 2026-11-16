@@ -207,12 +207,46 @@ let
       matched = builtins.match ".* --config (.*)" service.serviceConfig.ExecStart;
     in
     if matched == null then throw "validator ExecStart has no config" else builtins.head matched;
+  nestedGateway = import (pkgs.path + "/nixos/lib/eval-config.nix") {
+    system = pkgs.stdenv.hostPlatform.system;
+    modules = [
+      self.nixosModules.default
+      {
+        nixpkgs.pkgs = plainPkgs;
+        system.stateVersion = "26.05";
+        services.hellas.gateway = {
+          enable = true;
+          inherit package;
+          settings.listeners.frontend = {
+            kind = "http";
+          };
+        };
+      }
+      { services.hellas.gateway.settings.listeners.frontend.bind = "127.0.0.1:8080"; }
+    ];
+  };
+  credentialProvider = evalProvider {
+    configFile = "/run/secrets/provider.toml";
+    passkey = "/run/secrets/owner";
+    credentials.api = "/run/secrets/api";
+  };
+  dockerNetwork = import ../docker.nix {
+    inherit pkgs;
+    rustToolchain = self.lib.rustToolchain pkgs;
+    cli = package;
+  };
+  dockerCuda = import ../docker.nix {
+    inherit pkgs;
+    rustToolchain = self.lib.rustToolchain pkgs;
+    cli = package;
+    backend = "cuda";
+  };
   declarative = evalProvider {
     passkey = "/run/secrets/owner";
     settings = {
       models = [
         "/srv/models/qwen.gguf"
-        "/srv/models/flux@alice"
+        "/srv/models/flux@revision@alice"
       ];
       listeners.work = {
         kind = "iroh";
@@ -232,10 +266,49 @@ let
 in
 {
   provider-content-eval =
+    assert
+      nestedGateway.config.services.hellas.gateway.settings.listeners.frontend == {
+        kind = "http";
+        bind = "127.0.0.1:8080";
+      };
+    assert
+      credentialProvider.config.systemd.services.hellas.serviceConfig.LoadCredential == [
+        "hellas-config:/run/secrets/provider.toml"
+        "owner-passkey:/run/secrets/owner"
+        "api:/run/secrets/api"
+      ];
+    assert lib.hasInfix "--passkey %d/owner-passkey"
+      credentialProvider.config.systemd.services.hellas.serviceConfig.ExecStart;
+    assert assertion "cannot embed" (evalProvider {
+      settings.backends.secret = {
+        kind = "local";
+        max_in_flight = 1;
+      };
+    });
+    assert builtins.length dockerNetwork.imageConfig.Entrypoint == 1;
+    assert
+      dockerNetwork.imageConfig.Cmd == [
+        "serve"
+        "--port"
+        "31145"
+      ];
+    assert builtins.length dockerCuda.imageConfig.Entrypoint == 1;
+    assert dockerCuda.imageConfig.Cmd == dockerNetwork.imageConfig.Cmd;
+    assert lib.hasInfix ''"$@"'' dockerCuda.entrypointText;
+    assert
+      !(lib.elem "--port" (
+        dockerCuda.imageConfig.Entrypoint
+        ++ [
+          "serve"
+          "--config"
+          "/run/provider.toml"
+        ]
+      ));
     assert lib.hasInfix "serve --config /nix/store/" declarativeService.serviceConfig.ExecStart;
     assert !(lib.hasInfix "--port" declarativeService.serviceConfig.ExecStart);
-    assert lib.elem "/srv/models/flux" declarativeService.unitConfig.RequiresMountsFor;
-    assert !(lib.elem "/srv/models/flux@alice" declarativeService.unitConfig.RequiresMountsFor);
+    assert lib.elem "/srv/models/flux@revision" declarativeService.unitConfig.RequiresMountsFor;
+    assert
+      !(lib.elem "/srv/models/flux@revision@alice" declarativeService.unitConfig.RequiresMountsFor);
     assert
       !(assertion "owner passkey" (evalProvider {
         settings.listeners.work = {
@@ -260,7 +333,7 @@ in
         settings.models = [ "/srv/model" ];
         configFile = "/run/config";
       }));
-    assert lib.hasInfix "--config /run/hellas.toml"
+    assert lib.hasInfix "--config %d/hellas-config"
       (evalProvider {
         configFile = "/run/hellas.toml";
         passkey = "/run/owner";

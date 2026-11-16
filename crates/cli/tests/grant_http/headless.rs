@@ -17,7 +17,7 @@ async fn headless_gateway_hands_its_bearer_to_an_authenticated_client() {
         &config,
         toml::to_string(&json!({
             "models": ["model@api"],
-            "upstreams": {"api": {"url": "https://example.com/v1", "key_file": key}},
+            "upstreams": {"api": {"url": "https://example.com/v1", "key_file": "credential:upstream.key"}},
             "listeners": {"frontend": {"kind": "http", "bind": "127.0.0.1:0", "zdr": true}}
         }))
         .unwrap(),
@@ -32,6 +32,7 @@ async fn headless_gateway_hands_its_bearer_to_an_authenticated_client() {
         "--bearer-file",
         string(&bearer),
     ]);
+    command.env("CREDENTIALS_DIRECTORY", root.path());
     // A new session has no controlling terminal, regardless of the test runner.
     unsafe {
         command.pre_exec(|| {

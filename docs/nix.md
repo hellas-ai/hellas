@@ -42,6 +42,22 @@ Provision private files for the service user; do not interpolate Nix paths or
 call `builtins.readFile` on secrets. The gateway keeps its HTTP bearer in memory;
 use `gateway.extraArgs = [ "--wrap" "COMMAND" ];` to pass it to a child.
 
+Private runtime TOML and owner passkeys use systemd `LoadCredential`; ExecStart
+receives `%d/hellas-config` and `%d/owner-passkey`, expanded by systemd to private
+files readable by the DynamicUser. A TOML file referencing other secret paths
+does not grant access to those files. Supply named upstream secrets explicitly:
+
+```nix
+services.hellas.gateway.credentials.api = "/run/secrets/openrouter.key";
+services.hellas.gateway.settings.upstreams.openrouter.key_file = "credential:api";
+```
+
+`credential:NAME` resolves only against systemd's `CREDENTIALS_DIRECTORY` at
+runtime. Absolute key paths remain supported when you independently provision
+read access for the service user. Home Manager is file-only (`serve.configFile`)
+and requires its owner passkey; provision both files readable by that login user.
+It does not copy files via systemd or offer a `settings` option.
+
 For a declarative persistent provider:
 
 ```nix
@@ -85,7 +101,7 @@ Both services also accept `configFile = "/run/hellas.toml"` for an externally
 provisioned TOML file. It is mutually exclusive with `settings`. Configure firewall access explicitly
 with `networking.firewall.allowedTCPPorts` / `allowedUDPPorts` to match the
 listener addresses and ports in TOML. The module rejects
-embedded `secret`/`access` values and store paths in settings. Use runtime key
+embedded credential `secret`/`access` fields (backend names are unrestricted) and store paths in settings. Use runtime key
 files (`upstreams.NAME.key_file`), or a private runtime configFile when raw
 credential-bearing backend definitions are necessary. Such a file must be
 readable only by its intended service user. With a runtime configFile, provision
@@ -165,6 +181,15 @@ job) runs the workspace tests once under `cargo llvm-cov`. It fails on a
 failing test and prints line coverage, which is informational and never fails
 the check. Its output holds `lcov.info`, `summary.json` and `summary.txt`.
 
+## Node home format
+
+This cutover uses `hellas.node.identity.v2`, journal v6 and checkpoint v6.
+Earlier home formats are rejected at the identity marker before journal replay,
+regardless of checkpoint rotation. There is no automatic migration or reset.
+Use a new, separately provisioned home for this greenfield format; retain older
+homes with their matching binary for any outstanding obligations. Do not delete
+journals or change markers to bypass rejection.
+
 ## Docker
 
 The default `docker` output is a network-only node image. It contains no local Catena or
@@ -192,10 +217,14 @@ docker run --rm --device /dev/kfd --device /dev/dri \
   ghcr.io/hellas-ai/hellas:hip
 ```
 
-Both images start `serve`. Pair the invite, then add model routes using paths
+Images have the Hellas executable (or CUDA environment wrapper) as Entrypoint,
+with `serve --port 31145` as the default Cmd. Override Cmd directly for a
+declarative provider, for example `IMAGE serve --config /run/provider.toml`;
+the CUDA wrapper forwards those arguments unchanged. By default pair the invite,
+then add model routes using paths
 inside the container. The host supplies the GPU driver; model packages stay
-on runtime volumes. For a stateless container, override the entrypoint with
-`hellas` and run `gateway --model /content/PACKAGE`.
+on runtime volumes. For a stateless container, override Cmd with `gateway --model /content/PACKAGE` and its bearer/wrapper
+options.
 
 A GPU asset owner uploads verified weights once and execution workers receive
 them as read-only views over GPU IPC. Worker replacement retains weights; asset
@@ -203,9 +232,8 @@ pressure recreates the owner.
 
 ## Recording and replaying jobs
 
-The gateway keeps no inference cache. `hellas_gateway::start` runs over any
-`WorkExecutionBackend`; the CLI passes `hellas_sdk::ExecutorGateway`, which runs
-each request as one job through the same `Executor` as the job commands. Text
+The daemon core connects gateway routes to `hellas_sdk::ExecutorGateway`, which
+runs each request as one job through the same `Executor` as job commands. Text
 and Fetch events are serializable, so an application can record and replay jobs
 by wrapping its work source.
 
@@ -236,7 +264,7 @@ Scrapes collect executor and gateway instruments from the same meter provider
 used for optional OTLP push; both can run together. OTLP environment opt-outs,
 including `OTEL_SDK_DISABLED`, leave the requested local listener active.
 Iroh endpoint metrics share the response for serve and for paid and granted
-gateways; a `--local` gateway has no endpoint.
+gateways; local-only model backends do not open a provider endpoint.
 
 NixOS exposes `services.hellas.metricsPort` and
 `services.hellas.gateway.metricsPort`, with `metricsAddress` beside each port
