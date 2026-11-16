@@ -341,7 +341,17 @@ pub fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 fn key(path: &Path) -> Result<String> {
-    let path = if let Some(suffix) = path.to_str().and_then(|p| p.strip_prefix("~/")) {
+    let path = if let Some(name) = path
+        .to_str()
+        .and_then(|path| path.strip_prefix("credential:"))
+    {
+        validate_name(name)?;
+        PathBuf::from(
+            std::env::var_os("CREDENTIALS_DIRECTORY")
+                .context("credential: references require CREDENTIALS_DIRECTORY")?,
+        )
+        .join(name)
+    } else if let Some(suffix) = path.to_str().and_then(|p| p.strip_prefix("~/")) {
         PathBuf::from(std::env::var_os("HOME").context("HOME is unset")?).join(suffix)
     } else {
         path.to_owned()
@@ -692,55 +702,44 @@ pub async fn serve(
     } else {
         None
     };
-    let startup = if desired.is_some() {
-        Some(
-            super::bootstrap::prepare_local(
-                home,
-                identity,
-                owner.context("--config requires --passkey")?,
-            )
-            .await?,
-        )
-    } else {
-        None
-    };
+    let ownership = hellas_authority::work_store::grant::StartupLock::acquire(
+        &home.child("provider/authority"),
+    )?;
     let shutdown = shutdown_signal()?;
     tokio::pin!(shutdown);
-    let endpoint = if desired.is_some() {
-        None
+    let (endpoint, store, declarative_start) = if let Some(state) = desired {
+        let startup = super::bootstrap::prepare_local(
+            home,
+            identity,
+            owner.context("--config requires --passkey")?,
+            &ownership,
+        )
+        .await?;
+        (
+            None,
+            startup.store,
+            Some((state, startup.credential, startup.authorization)),
+        )
     } else {
-        tokio::select! {
-            result = super::bootstrap::prepare(home, &identity.transport_key, &identity.enrollment, port) => result?,
+        let (endpoint, store) = tokio::select! {
+            result = super::bootstrap::prepare(home, &identity.transport_key, &identity.enrollment, port, &ownership) => result?,
             signal = &mut shutdown => return Ok(signal?),
-        }
+        };
+        (endpoint, store, None)
     };
-    let store = hellas_authority::work_store::grant::NodeStore::open(
-        &home.child("provider").child("authority"),
-        hellas_authority::model::grant::grant_network(),
-        Some(identity.enrollment.clone()),
-        hellas_auth::authority::UnixMillis::now()?,
-    )
-    .await?;
     let node = hellas_authority::node::NodeCoordinator::new(
         store,
         Arc::new(|| hellas_auth::authority::UnixMillis::now().unwrap_or_default()),
     );
-    let approval = if let Some(startup) = startup {
-        let owner = owner.context("--config requires --passkey")?;
+    let start = if let Some((state, credential, authorization)) = declarative_start {
         let caller = node
             .authenticate_session(
-                &startup.credential(),
-                hellas_authority::node::SessionKey::Passkey(owner),
+                &credential,
+                hellas_authority::node::SessionKey::Passkey(
+                    owner.context("--config requires --passkey")?,
+                ),
             )
             .await?;
-        Some((caller, startup.authorization))
-    } else {
-        None
-    };
-    let mut options = options(home.clone(), identity, owner, chain, node.clone(), endpoint).await?;
-    options.remote_control = hellas_sdk::node_control::RemoteControlAdmission::credential_gated();
-    let start = if let Some(state) = desired {
-        let (caller, authorization) = approval.context("missing startup approval")?;
         Start::Reconcile(Box::new(Reconciliation {
             document: state.document,
             caller,
@@ -761,6 +760,8 @@ pub async fn serve(
         );
         Start::Transient(document)
     };
+    let mut options = options(home.clone(), identity, owner, chain, node.clone(), endpoint).await?;
+    options.remote_control = hellas_sdk::node_control::RemoteControlAdmission::credential_gated();
     run_daemon(
         options,
         start,

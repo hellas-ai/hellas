@@ -94,8 +94,21 @@ impl State {
                 inputs.insert(key.into(), value);
             }
         }
-        let inputs: Inputs = toml::Value::Table(inputs).try_into().map_err(diagnostic)?;
-        let document: Document = toml::Value::Table(table).try_into().map_err(diagnostic)?;
+        let schema_error = |error: toml::de::Error| {
+            let message = error.message();
+            let safe = if let Some((_, expected)) = message.split_once(", expected ") {
+                format!("expected {expected}")
+            } else if message.starts_with("missing field `") {
+                message.to_owned()
+            } else {
+                "unknown or invalid field".into()
+            };
+            anyhow::anyhow!("invalid configuration schema: {safe}")
+        };
+        let inputs: Inputs = toml::Value::Table(inputs)
+            .try_into()
+            .map_err(schema_error)?;
+        let document: Document = toml::Value::Table(table).try_into().map_err(schema_error)?;
         if let Some(policy) = &inputs.paid_policy {
             policy.check()?;
         }
@@ -175,6 +188,16 @@ mod tests {
             explicit.document.listeners["api"],
             Listener::Http { zdr: false, .. }
         ));
+        let schema = State::parse("models = 'private-key-material'")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            schema.contains("schema")
+                && schema.contains("expected")
+                && !schema.contains("line 1")
+                && !schema.contains("private-key-material")
+        );
         let error = State::parse("models = [\n'private-key-material'\nBAD")
             .err()
             .unwrap()

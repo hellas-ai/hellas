@@ -100,8 +100,25 @@ implicitly. Declarative startup's retained local control profile lives at
 `--control-socket HOME/provider/control.sock` for later operator edits. The next
 declarative restart restores the declared document. Preserve the whole home
 across restarts; losing the authority journal after initialization fails closed.
-The initial local credential uses the standard one-year owner scope; automatic
-credential renewal is not implemented.
+The root owner scope and canonical credential use the standard one-year
+validity. Renew or explicitly rebind them with the service stopped:
+
+```sh
+# Read the current authority revision using admin inspect-offline (see admin.md).
+hellas --home /var/lib/hellas/.hellas --passkey /run/secrets/owner.passkey \
+  admin rebind-local --expected-revision "$REVISION"
+```
+
+This signs the existing authority recovery operation with a fresh normal owner
+scope under the same authority ID. It retains accounting, paid terms and channel
+duties, advances the generation, and revokes old credentials and administrative
+grants; explicitly regrant any required remote administration. It replaces the
+one canonical `provider/startup-profile/credential` file, so the retained local
+profile and the next declarative startup use the same credential. No startup
+implicitly renews or recovers authority. If the process dies or credential
+publication fails after recovery commits, inspect the current revision and run
+this explicit operation again at that revision; a stale revision is refused.
+Never remove journals or startup metadata to work around expiry.
 
 Home Manager can run the stateful service on Darwin:
 

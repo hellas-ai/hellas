@@ -14,6 +14,7 @@ pub mod daemon;
 pub mod identity;
 pub mod model;
 pub mod monitor;
+mod owner;
 pub mod rpc;
 pub mod store;
 pub mod transact;

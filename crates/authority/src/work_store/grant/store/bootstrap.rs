@@ -22,6 +22,43 @@ impl Drop for IdentityLock {
     }
 }
 
+/// Stable ownership of startup metadata beside the atomically published authority.
+/// Hold this before writing TLS, pending owner approval or application credentials,
+/// and retain it while the process owns the node. Uses the authority's file-lock
+/// discipline; the inode is never replaced during initialization or rotation.
+pub struct StartupLock {
+    _lock: IdentityLock,
+}
+
+impl StartupLock {
+    pub fn acquire(directory: &StoreLocation) -> Result<Self, NodeStoreError> {
+        let parent = directory.parent().ok_or(NodeStoreError::Malformed)?;
+        hellas_private::create_dir_all_durable(parent)?;
+        let mut name = std::ffi::OsString::from(".");
+        name.push(directory.file_name().ok_or(NodeStoreError::Malformed)?);
+        name.push(".startup.lock");
+        let path = parent.join(name);
+        if !path.try_exists()? {
+            let temporary = hellas_private::private_tempfile(parent, ".startup-lock-", ".writing")?;
+            match temporary.persist_noclobber(&path) {
+                Ok(file) => {
+                    file.sync_all()?;
+                    hellas_private::sync_directory(parent)?;
+                }
+                Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.error.into()),
+            }
+        }
+        let file = hellas_private::open_regular_file_rw(&path)?;
+        if !hellas_private::is_private(&file)? {
+            return Err(NodeStoreError::Malformed);
+        }
+        Ok(Self {
+            _lock: lock(file, &path)?,
+        })
+    }
+}
+
 /// Namespace of the bootstrap ownership marker.
 const IDENTITY_NAMESPACE: &str = "hellas.node.identity.v1";
 

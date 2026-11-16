@@ -98,27 +98,6 @@ pub fn pin_remote(
     )
 }
 
-/// Pin a locally provisioned server certificate on an existing application profile.
-/// The caller owns this profile and must obtain the certificate independently.
-pub fn pin_local(path: &Path, certificate: &Path) -> io::Result<()> {
-    let mut profile: ProfileFile = serde_json::from_slice(&read_private(path)?)
-        .map_err(|_| invalid("invalid control profile"))?;
-    if !certificate.is_absolute() || profile.remote_node.is_some() {
-        return Err(invalid(
-            "local trust requires an absolute certificate path and no remote pin",
-        ));
-    }
-    profile.local = Some(LocalTrust {
-        certificate: certificate.into(),
-        server_name: "localhost".into(),
-    });
-    hellas_private::write_atomically(
-        path,
-        ".pinning",
-        &serde_json::to_vec(&profile).map_err(io::Error::other)?,
-    )
-}
-
 impl LocalTrust {
     fn load(self, parent: &Path) -> io::Result<(Arc<ClientConfig>, ServerName<'static>)> {
         let certificate =
@@ -201,10 +180,45 @@ pub fn save_credential(
     path: &Path,
     credential: &CredentialSecret,
 ) -> io::Result<()> {
+    publish_private(file, path, &credential_bytes(credential))
+}
+
+fn credential_bytes(credential: &CredentialSecret) -> Zeroizing<Vec<u8>> {
     let mut bytes = Zeroizing::new(Vec::with_capacity(48));
     bytes.extend_from_slice(&credential.id().0);
     bytes.extend_from_slice(credential.expose_secret());
-    publish_private(file, path, &bytes)
+    bytes
+}
+
+/// Replace the operator-selected canonical credential after an explicit rebind.
+pub fn replace_credential(path: &Path, credential: &CredentialSecret) -> io::Result<()> {
+    hellas_private::write_atomically(path, ".credential", &credential_bytes(credential))
+}
+
+/// Write profile metadata referring to the one canonical credential file.
+pub fn write_local(
+    path: &Path,
+    authority: AuthorityId,
+    authorization: GrantId,
+    credential: &Path,
+    certificate: &Path,
+) -> io::Result<()> {
+    let file = ProfileFile {
+        authority,
+        authorization,
+        credential: credential.into(),
+        local: Some(LocalTrust {
+            certificate: certificate.into(),
+            server_name: "localhost".into(),
+        }),
+        remote_node: None,
+        remote_addresses: vec![],
+    };
+    hellas_private::write_atomically(
+        path,
+        ".profile",
+        &serde_json::to_vec(&file).map_err(io::Error::other)?,
+    )
 }
 
 /// Durably publish secret-bearing bytes through a private temporary file

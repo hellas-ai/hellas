@@ -1,10 +1,17 @@
 //! Default permissions for the owner explicitly pairing a fresh node.
 use hellas_auth::{Digest, authority::*};
+use hellas_authority::{authenticator::Authenticator, work_store::grant::OwnerApproval};
 
 pub(crate) fn administrator(
     public: hellas_authority::authenticator::PublicKey,
 ) -> anyhow::Result<GrantSpec> {
-    let authority = AuthorityId(Digest::from_bytes(rand::random()));
+    administrator_for(public, AuthorityId(Digest::from_bytes(rand::random())))
+}
+
+pub(crate) fn administrator_for(
+    public: hellas_authority::authenticator::PublicKey,
+    authority: AuthorityId,
+) -> anyhow::Result<GrantSpec> {
     let subject =
         PrincipalId::from_public_key(hellas_auth::PublicKey::P256(public.to_compressed()))?;
     let permissions: std::collections::BTreeSet<_> = [
@@ -52,5 +59,21 @@ pub(crate) fn administrator(
         not_before: now,
         expires: UnixMillis(now.0.checked_add(year).ok_or(AuthorityError::Invalid)?),
         delegation_depth: 0,
+    })
+}
+
+pub(crate) async fn approve(
+    passkey: &dyn Authenticator,
+    ownership: Ownership,
+    administrator: &GrantSpec,
+    scope: &GrantSpec,
+    holder: NodeKey,
+) -> anyhow::Result<OwnerApproval> {
+    let digest = ownership_digest(ownership, administrator, scope, holder);
+    Ok(OwnerApproval {
+        administrator: administrator.clone(),
+        credential: scope.clone(),
+        holder,
+        assertion: passkey.assert(digest).await?,
     })
 }

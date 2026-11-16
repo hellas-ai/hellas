@@ -3,7 +3,7 @@ use crate::{commands::contributions::offer_fingerprints, identity::LocalIdentity
 use anyhow::{Context, Result, ensure};
 use hellas_auth::authority::{
     AdministrationCommand, AdministrationRecord, Credential, CredentialCommand, CredentialHolder,
-    CredentialId, GrantCommand, GrantId, GrantSpec, NodeKey, Ownership, Revision, ownership_digest,
+    CredentialId, GrantCommand, GrantId, GrantSpec, NodeKey, Ownership, Revision,
 };
 use hellas_authority::model::grant::admin::{
     MAX_ADMIN_BYTES, WorkControlCommand, WorkControlReply,
@@ -62,6 +62,16 @@ pub async fn run(
     passkey: Option<&dyn Authenticator>,
     home: &StoreLocation,
 ) -> Result<()> {
+    if let AdminCommand::RebindLocal { expected_revision } = &args.command {
+        let passkey = passkey.context("local rebind requires --passkey")?;
+        return super::super::bootstrap::rebind_local(
+            home,
+            identity,
+            passkey,
+            Revision(*expected_revision),
+        )
+        .await;
+    }
     match &args.command {
         AdminCommand::Bootstrap { .. } | AdminCommand::Recover { .. } => {
             ensure!(
@@ -531,6 +541,8 @@ async fn offline(
         holder,
         credential_out,
     } = state;
+    let _ownership =
+        hellas_authority::work_store::grant::StartupLock::acquire(&home.child(&journal))?;
     let administrator: GrantSpec = read(&administrator)?;
     let scope: GrantSpec = read(&credential_scope)?;
     let CredentialHolder::Node(holder) = read(&holder)? else {
@@ -541,7 +553,9 @@ async fn offline(
     let output = credential_output(&credential_out)?;
     let now = hellas_auth::authority::UnixMillis::now().unwrap_or_default();
     let network = hellas_authority::model::grant::grant_network();
-    let approve = |ownership| owner_approval(passkey, ownership, &administrator, &scope, holder);
+    let approve = |ownership| {
+        super::super::owner::approve(passkey, ownership, &administrator, &scope, holder)
+    };
     let (secret, revision) = match (root, revision) {
         (Some(root), None) => {
             let (store, secret) = NodeStore::bootstrap(
@@ -615,22 +629,6 @@ fn credential_output(path: &Path) -> Result<tempfile::NamedTempFile> {
     )?)
 }
 
-async fn owner_approval(
-    passkey: &dyn Authenticator,
-    ownership: Ownership,
-    administrator: &GrantSpec,
-    scope: &GrantSpec,
-    holder: hellas_auth::authority::NodeKey,
-) -> Result<OwnerApproval> {
-    let digest = ownership_digest(ownership, administrator, scope, holder);
-    Ok(OwnerApproval {
-        administrator: administrator.clone(),
-        credential: scope.clone(),
-        holder,
-        assertion: passkey.assert(digest).await?,
-    })
-}
-
 /// A foreground gateway has an ephemeral HTTP authority and keeps its bearer in memory.
 pub async fn gateway_authority(
     journal: &StoreLocation,
@@ -640,11 +638,11 @@ pub async fn gateway_authority(
     hellas_authority::node::NodeCoordinator,
     hellas_gateway::GatewayAccess,
 )> {
-    let administrator = super::owner_scope::administrator(passkey.public_key()?)?;
+    let administrator = super::super::owner::administrator(passkey.public_key()?)?;
     let authority = administrator.authority;
     let root = GrantId([0; 16]);
     let holder = NodeKey::from_public_key(identity.node_key.public_key())?;
-    let approval = owner_approval(
+    let approval = super::super::owner::approve(
         passkey,
         Ownership::Bootstrap { root, target: None },
         &administrator,
@@ -735,19 +733,10 @@ pub async fn pair(
         return Ok(());
     }
     let invitation = node_control::bootstrap::Invitation::decode(invite)?;
-    ensure!(
-        !name.is_empty()
-            && name.len() <= 64
-            && name.as_bytes()[0].is_ascii_alphanumeric()
-            && name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte)),
-        "a node name is 1..64 ASCII letters, digits, dots, underscores or hyphens, starting with a letter or digit"
-    );
     let root = GrantId([0; 16]);
-    let scope = super::owner_scope::administrator(passkey.public_key()?)?;
+    let scope = super::super::owner::administrator(passkey.public_key()?)?;
     let holder = hellas_auth::authority::NodeKey::from_public_key(identity.node_key.public_key())?;
-    let approval = owner_approval(
+    let approval = super::super::owner::approve(
         passkey,
         Ownership::Bootstrap {
             root,
@@ -795,7 +784,5 @@ fn print_status(status: hellas_rpc::pb::host::HostStatus) -> Result<()> {
 }
 
 use hellas_authority::{
-    authenticator::Authenticator,
-    node::SessionKey,
-    work_store::grant::{NodeStore, OwnerApproval},
+    authenticator::Authenticator, node::SessionKey, work_store::grant::NodeStore,
 };

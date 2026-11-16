@@ -88,7 +88,7 @@ pub async fn accept(
     directory: &StoreLocation,
     network: hellas_kernel::NetworkId,
     provider: Option<ProviderEnrollmentBundle>,
-) -> Result<(), WireStatus> {
+) -> Result<NodeStore, WireStatus> {
     let now = UnixMillis::now().map_err(|_| unavailable())?;
     let remaining = invitation.expires.0.checked_sub(now.0).ok_or_else(denied)?;
     if remaining == 0
@@ -166,7 +166,7 @@ pub async fn accept(
         // Admission ends the client's handshake deadline. Accepted writes must
         // still finish if the client disconnects before either reply arrives.
         let _ = tokio::time::timeout(HANDSHAKE_TIMEOUT, send.write_all(&[VERSION])).await;
-        let mut store = NodeStore::bootstrap_prepared(
+        let store = NodeStore::bootstrap_prepared(
             directory,
             network,
             request.root,
@@ -178,13 +178,12 @@ pub async fn accept(
         .map_err(node_error)?;
         // The store is now the crash-safe completion marker. No other request
         // can commit; cancel remaining unauthenticated connections before handoff.
-        store.close().await;
         pending.shutdown().await;
         let _ = send.write_all(&[VERSION]).await;
         let _ = send.finish();
         let _ = tokio::time::timeout(HANDSHAKE_TIMEOUT, send.stopped()).await;
         tracing::info!("owner bootstrap committed");
-        return Ok(());
+        return Ok(store);
     }
     tracing::warn!("owner bootstrap pairing attempts exhausted");
     Err(denied())
