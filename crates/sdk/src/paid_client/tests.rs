@@ -651,6 +651,7 @@ async fn gateway_keeps_the_quote_used_for_rendering_until_session_open() {
     let (bundle, producer) = enrollment(server.id());
     let address = hellas_client::ProviderAddress::of(&bundle).unwrap();
     let quotes = Arc::new(AtomicUsize::new(0));
+    let (completed, mut completions) = tokio::sync::mpsc::unbounded_channel();
     let serving = tokio::spawn({
         let server = server.clone();
         let quotes = quotes.clone();
@@ -695,6 +696,7 @@ async fn gateway_keeps_the_quote_used_for_rendering_until_session_open() {
                 )
                 .await
                 .unwrap();
+                completed.send(()).unwrap();
             }
         }
     });
@@ -756,6 +758,9 @@ async fn gateway_keeps_the_quote_used_for_rendering_until_session_open() {
         1,
         "rendering and admission use the same quote"
     );
+    // Receiving the quote can precede QUIC acknowledging the server's End.
+    // Wait for successful dispatch before closing its endpoint.
+    completions.recv().await.unwrap();
     gateway.drain().await.unwrap();
     server.close().await;
     serving.await.unwrap();
