@@ -355,6 +355,8 @@ pub enum QueryError {
     ChannelClosed,
     #[error("state unavailable: {0}")]
     StateUnavailable(String),
+    #[error("no bounded finality proof is available locally for height {height}")]
+    FinalityProofUnavailable { height: u64 },
     #[error("certified state is not yet applied")]
     NotYetApplied,
     #[error("chain read remained unavailable for {timeout:?}: {reason}")]
@@ -383,6 +385,9 @@ impl From<QueryError> for WireStatus {
             }
             QueryError::StateUnavailable(message) => {
                 WireStatus::new(WireCode::FailedPrecondition, message)
+            }
+            error @ QueryError::FinalityProofUnavailable { .. } => {
+                WireStatus::new(WireCode::Unavailable, error.to_string())
             }
             QueryError::NotYetApplied => {
                 WireStatus::new(WireCode::OutOfRange, "certified state is not yet applied")

@@ -246,6 +246,7 @@ fn main() {
         }
     }
 
+    platform_hardening::install_fatal_panic_hook();
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

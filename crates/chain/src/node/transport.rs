@@ -217,6 +217,14 @@ impl FullNode {
     pub fn finalized(&self) -> watch::Receiver<NodeState> {
         self.0.core.readiness.state.subscribe()
     }
+    /// A process hosting this node must stop serving when execution stops.
+    pub async fn wait_stopped(&self) -> Error {
+        let _ = self
+            .finalized()
+            .wait_for(|state| matches!(state, NodeState::Halted { .. }))
+            .await;
+        self.0.core.readiness.stopped_error()
+    }
     pub async fn wait_ready(&self) -> Result<ChainView, QueryError> {
         self.finalized()
             .wait_for(|state| !matches!(state, NodeState::CatchingUp { .. }))
