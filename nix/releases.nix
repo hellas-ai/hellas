@@ -144,7 +144,12 @@ let
     let
       validation = nativePkg.mkHellasPackage {
         pname = "hellas-${component}-validation";
-        cargoBuildType = "debug";
+        # Validation installs only a pass marker. Match Crane's test profiles
+        # so the full release suite also fits on the PR runner's disk.
+        CARGO_PROFILE_DEV_DEBUG = "0";
+        CARGO_PROFILE_TEST_DEBUG = "0";
+        CARGO_INCREMENTAL = "0";
+        separateDebugInfo = false;
         buildPhase = ''
           runHook preBuild
           ${lib.concatMapStringsSep "\n" (name: lib.getExe ci.checks.${name}) spec.checks}
