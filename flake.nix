@@ -69,8 +69,8 @@
       # cache.hellas.ai; the checks themselves run on GitHub. A PR that changes
       # dependencies or the toolchain builds its own until it merges.
       hydraJobs.x86_64-linux = { inherit (perSystem.x86_64-linux.checks) cargo-deps; };
-      # Shared with infra's component jobsets. PR CI builds CLI validation
-      # directly from this output so it exercises the release build environment.
+      # Infra consumes these component jobs directly. Their checks are the
+      # same derivations PR CI builds, with no separate validation environment.
       releaseJobs =
         builtins.mapAttrs
           (

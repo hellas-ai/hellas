@@ -3,14 +3,12 @@
   pkgs,
   lib,
   system,
-  nativePkg,
   nativePackages,
   crossPackages,
   linuxOutputs,
   hydraLints,
-  hydraUnit,
+  buildChecks,
   hellasRpcWasm,
-  ci,
 }:
 let
   x86 = system == "x86_64-linux";
@@ -142,45 +140,30 @@ let
   makeRelease =
     component: spec:
     let
-      validation = nativePkg.mkHellasPackage {
-        pname = "hellas-${component}-validation";
-        # Validation installs only a pass marker. Match Crane's test profiles
-        # so the full release suite also fits on the PR runner's disk.
-        CARGO_PROFILE_DEV_DEBUG = "0";
-        CARGO_PROFILE_TEST_DEBUG = "0";
-        CARGO_INCREMENTAL = "0";
-        separateDebugInfo = false;
-        buildPhase = ''
-          runHook preBuild
-          ${lib.concatMapStringsSep "\n" (name: lib.getExe ci.checks.${name}) spec.checks}
-          runHook postBuild
-        '';
-        doCheck = false;
-        installPhase = ''
-          mkdir -p "$out"
-          touch "$out/passed"
-        '';
-      };
+      checks =
+        hydraLints
+        // lib.genAttrs (
+          [
+            "unit"
+            "feature-targets"
+          ]
+          ++ spec.checks
+        ) (name: buildChecks.${name});
       tests = lib.genAttrs spec.vms (name: linuxOutputs.nixosTests.${name});
       required = pkgs.releaseTools.aggregate {
         name = "hellas-${component}-${system}-tested";
-        constituents = [
-          validation
-          hydraUnit
-        ]
-        ++ lib.attrValues hydraLints
-        ++ lib.attrValues spec.artifacts
-        ++ lib.attrValues tests;
+        constituents = lib.attrValues checks ++ lib.attrValues spec.artifacts ++ lib.attrValues tests;
       };
       manifest = pkgs.writeText "hellas-${component}-release.json" (
         builtins.toJSON {
           inherit component revision system;
+          inherit (nativePackages.cli) version;
           artifacts = lib.mapAttrs (_: toString) spec.artifacts;
         }
       );
     in
     {
-      inherit validation tests required;
+      inherit checks tests required;
       inherit (spec) artifacts;
       release = pkgs.runCommand "hellas-${component}-${system}-release" { } ''
         test -e ${required}

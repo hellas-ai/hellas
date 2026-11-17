@@ -404,10 +404,20 @@ let
     ] (name: mkHydraSourceCheck ci.checks.${name})
     // {
       "no-catgrad-lock" = noCatgradLock;
+      publish = import ./tests/publish.nix { inherit pkgs; };
       inherit (nativePkg.craneChecks) clippy;
     };
 
-  hydraUnit = nativePkg.craneChecks.unit;
+  # Each executable Cargo check declares its command and toolchain once in
+  # ci.nix. Use the existing specialized Crane checks for coverage/clippy/etc.
+  buildChecks =
+    lib.mapAttrs (name: check: nativePkg.mkCargoCheck name check.cargoCheck) (
+      lib.filterAttrs (_: check: check ? cargoCheck) ci.checks
+    )
+    // nativePkg.craneChecks
+    // lib.mapAttrs (_: mkHydraSourceCheck) kernel.checks
+    // kernel.buildChecks
+    // hydraLints;
 
 in
 {
@@ -470,9 +480,7 @@ in
     inherit (ci) builds;
   };
 
-  checks = hydraLints // {
-    unit = hydraUnit;
-    inherit (nativePkg.craneChecks) regressions feature-targets;
+  checks = buildChecks // {
     # Published so later builds substitute compiled dependencies.
     cargo-deps = nativePkg.cargoDeps;
   };
@@ -509,14 +517,12 @@ in
       pkgs
       lib
       system
-      nativePkg
       nativePackages
       crossPackages
       linuxOutputs
       hydraLints
-      hydraUnit
+      buildChecks
       hellasRpcWasm
-      ci
       ;
   };
 }

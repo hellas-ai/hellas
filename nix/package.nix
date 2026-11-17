@@ -256,6 +256,30 @@ let
     }
   );
 
+  # Feature tests and target checks share ci.nix's commands and the same Crane
+  # environment/artifacts as unit and clippy. WASM selects its toolchain here.
+  mkCargoCheck =
+    name:
+    {
+      command,
+      toolchain,
+      nativeBuildInputs,
+    }:
+    (craneLib.overrideToolchain toolchain).mkCargoDerivation (
+      craneArgs
+      // {
+        pname = "hellas-check-${name}";
+        cargoArtifacts = cargoDeps;
+        doInstallCargoArtifacts = false;
+        inherit nativeBuildInputs;
+        buildPhaseCargoCommand = command;
+        installPhaseCommand = "mkdir -p $out";
+      }
+      // lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
+        RUST_TEST_THREADS = "1";
+      }
+    );
+
   craneChecks = {
     clippy = craneLib.cargoClippy (
       craneArgs
@@ -315,7 +339,7 @@ let
           }
         );
     # Type-checks each library as a dependent builds it, then every target of
-    # every release selection: what Hydra's validation compiles.
+    # every release selection, independently of feature unification in tests.
     feature-targets = craneLib.mkCargoDerivation (
       craneArgs
       // {
@@ -340,7 +364,7 @@ let
     );
   };
 
-  # Stamp the revision only on shipped artifacts. Checks and validation builds
+  # Stamp the revision only on shipped artifacts. Checks
   # leave it out, so a commit that changes no inputs reuses their results.
   revEnv.GIT_REV = builtins.substring 0 12 rev;
 in
@@ -357,6 +381,7 @@ in
     cargoDeps
     cargoLlvmCov
     craneChecks
+    mkCargoCheck
     clippyArgs
     cargoSelections
     ;

@@ -26,7 +26,7 @@ jobs:
       - name: Lints
         run: >-
           nix build --accept-flake-config --print-build-logs --no-link
-          .#checks.x86_64-linux.{actions,buf,clippy,deadnix,feature-targets,fmt,nixfmt,no-catgrad-lock,sort,statix,taplo}
+          .#checks.x86_64-linux.{actions,buf,clippy,deadnix,feature-targets,fmt,nixfmt,no-catgrad-lock,publish,sort,statix,taplo}
       # Hydra only reports evaluation errors after merge, on a tab nobody
       # watches; evaluate every job here so a broken one fails the PR.
       - name: Nix job evaluation
@@ -37,16 +37,17 @@ jobs:
             echo "Jobs that fail to evaluate: $failed" >&2
             exit 1
           fi
-      # Not derivations: deny needs the advisory database, the others inspect
-      # the dependency graph or one narrow feature set or target.
+      - name: Dependency graph checks
+        run: >-
+          nix build --accept-flake-config --print-build-logs --no-link
+          .#checks.x86_64-linux.{cargo-sources,channel-dependencies,provider-dependencies,xet-no-alloc}
+      # The advisory database changes independently of the source revision.
       - name: Dependency lints
         env:
           CARGO_INCREMENTAL: "0"
           CARGO_PROFILE_DEV_DEBUG: "0"
         run: |
-          for check in cargo-sources deny channel-dependencies provider-dependencies xet-no-alloc wasm-chain wasm-rpc wasm-xet; do
-            nix run --accept-flake-config ".#check-$check"
-          done
+          nix run --accept-flake-config .#check-deny
 
   # One instrumented run of the workspace tests: it fails on a failing test
   # and prints line coverage without enforcing it.
@@ -54,14 +55,27 @@ jobs:
   unit-tests:
     name: Unit tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
+      - name: Make room for release checks and the native package
+        run: |
+          [[ "$RUNNER_ENVIRONMENT" == github-hosted && "$RUNNER_OS" == Linux ]]
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache /usr/share/swift
+          available=$(df -B1 --output=avail / | tail -1)
+          (( available >= 40 * 1024 * 1024 * 1024 )) || { echo "Need 40 GiB free for Nix builds" >&2; exit 1; }
       - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
       - name: Unit tests + coverage
         run: nix build --accept-flake-config --print-build-logs --no-link .#checks.x86_64-linux.unit
-      # Keep release validation under this existing required status check.
-      # Build the exact derivation consumed by infra's hellas-release.nix;
-      # Crane checks alone do not exercise nixpkgs' release setup hooks.
-      - name: CLI release validation
-        run: nix build --accept-flake-config --print-build-logs --no-link .#releaseJobs.cli.x86_64-linux.validation
+      # Every component uses these same named check derivations on Hydra.
+      # Nix deduplicates checks shared by multiple components and the steps above.
+      - name: Component release checks
+        run: |
+          nix build --accept-flake-config --print-build-logs --no-link --max-jobs 1 --impure --expr '
+            let flake = builtins.getFlake (toString ./.);
+            in builtins.concatLists (map
+              (component: builtins.attrValues component.x86_64-linux.checks)
+              (builtins.attrValues flake.releaseJobs))'
+      # Exercise buildRustPackage setup hooks in a real shipped package too.
+      - name: Native CLI package
+        run: nix build --accept-flake-config --print-build-logs --no-link .#packages.x86_64-linux.cli
