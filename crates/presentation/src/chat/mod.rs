@@ -267,9 +267,13 @@ mod tests {
         let rendered = crate::tests::template(false)
             .render(&messages, &input::chat_tools(&request()).unwrap())
             .unwrap();
-        assert!(rendered.contains(
-            "<tool_call>\n{\"name\": \"bash\", \"arguments\": {\"command\":\"df -h\"}}\n</tool_call>"
-        ));
+        // MiniJinja 3's tojson follows Jinja's spaced JSON separators.
+        assert!(
+            rendered.contains(
+                "<tool_call>\n{\"name\": \"bash\", \"arguments\": {\"command\": \"df -h\"}}\n</tool_call>"
+            ),
+            "{rendered}"
+        );
         assert!(rendered.contains("<tool_response>\n/home: 74% used\n</tool_response>"));
     }
 
