@@ -151,7 +151,7 @@ let
   # Shared with the `check-clippy` app in ci.nix.
   clippyArgs = "--workspace --all-targets --features ${integrationFeatures} -- -D warnings -W clippy::large_futures -W clippy::large_stack_frames";
 
-  # Every package and feature selection a release validation compiles, as
+  # Every package and feature selection a release check compiles, as
   # Cargo arguments. The ci.nix checks run their tests and lints under these;
   # `cargoDeps` compiles each one's dependencies, and `feature-targets`
   # type-checks every target of each, so a pull request compiles what Hydra

@@ -32,7 +32,7 @@ jobs:
       - name: Nix job evaluation
         run: |
           failed=$(nix eval --accept-flake-config --impure --json --expr \
-            "import ./nix/ci/eval-jobs.nix { flake = builtins.getFlake (toString ./.); }")
+            'import ./nix/ci/eval-jobs.nix { flake = builtins.getFlake ("git+file://" + toString ./.); }')
           if [ "$failed" != "[]" ]; then
             echo "Jobs that fail to evaluate: $failed" >&2
             exit 1
@@ -72,7 +72,7 @@ jobs:
       - name: Component release checks
         run: |
           nix build --accept-flake-config --print-build-logs --no-link --max-jobs 1 --impure --expr '
-            let flake = builtins.getFlake (toString ./.);
+            let flake = builtins.getFlake ("git+file://" + toString ./.);
             in builtins.concatLists (map
               (component: builtins.attrValues component.x86_64-linux.checks)
               (builtins.attrValues flake.releaseJobs))'
