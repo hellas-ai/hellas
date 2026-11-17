@@ -121,6 +121,36 @@ pub struct ChainIndexer {
 }
 
 impl ChainIndexer {
+    /// Store a proof already verified against the node's provisioned authority.
+    /// Retain the certificate too: a downloaded ancestor is not necessarily
+    /// within one public proof's bounds of the subscribed head.
+    #[cfg(feature = "full-node")]
+    pub(crate) async fn accept_verified_proof(
+        &self,
+        block: HellasBlock,
+        proof: crate::finality_proof::FinalityProof,
+    ) -> Result<(), QueryError> {
+        use commonware_consensus::{Reporter as _, simplex::types::Activity};
+        for candidate in std::iter::once(block).chain(proof.descendants) {
+            if !self
+                .marshal
+                .verified(candidate.context().round, candidate)
+                .await
+            {
+                return Err(QueryError::ChannelClosed);
+            }
+        }
+        if !self
+            .marshal
+            .clone()
+            .report(Activity::Finalization(proof.certificate))
+            .accepted()
+        {
+            return Err(QueryError::ChannelClosed);
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "full-node")]
     pub(crate) fn retain_from(&self, public_floor: u64, recovery_floor: u64) {
         self.retained_from
@@ -223,13 +253,16 @@ impl ChainIndexer {
                 let encoded = crate::finality_proof::FinalityProof::encode(
                     &finalization.encode(),
                     &descendants,
-                )?;
+                )
+                .map_err(|_| QueryError::FinalityProofUnavailable {
+                    height: height.get(),
+                })?;
                 return Ok(Some(finalized_block(block, encoded)));
             }
             if descendants.len() >= crate::finality_proof::MAX_FINALITY_DESCENDANTS {
-                return Err(QueryError::StateUnavailable(
-                    "finality ancestry exceeds proof block limit".into(),
-                ));
+                return Err(QueryError::FinalityProofUnavailable {
+                    height: height.get(),
+                });
             }
             let next_height = candidate.height().get().checked_add(1).ok_or_else(|| {
                 QueryError::StateUnavailable("finality ancestry height overflow".into())
@@ -247,9 +280,9 @@ impl ChainIndexer {
             }
             proof_bytes = proof_bytes.saturating_add(child.encode().len());
             if proof_bytes > crate::finality_proof::MAX_FINALITY_PROOF_BYTES {
-                return Err(QueryError::StateUnavailable(
-                    "finality ancestry exceeds proof byte limit".into(),
-                ));
+                return Err(QueryError::FinalityProofUnavailable {
+                    height: height.get(),
+                });
             }
             descendants.push(child.clone());
             candidate = child;
