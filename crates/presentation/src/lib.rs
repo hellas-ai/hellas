@@ -58,7 +58,8 @@ impl ChatTemplate {
         self.environment
             .get_template("chat")?
             .render(minijinja::context! {
-                messages => messages, tools => tools, enable_thinking => false,
+                messages => minijinja::value::Serde(messages),
+                tools => minijinja::value::Serde(tools), enable_thinking => false,
                 add_generation_prompt => true, add_vision_id => false,
                 bos_token => "<|endoftext|>", eos_token => "<|im_end|>",
             })
