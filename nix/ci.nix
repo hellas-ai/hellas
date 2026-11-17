@@ -39,29 +39,48 @@ let
   '';
 
   mkCargoConfigured =
-    config: offline: name: cmd: inputs:
-    mk name ''
-      cargo_home=$(mktemp -d)
-      trap 'rm -rf "$cargo_home"' EXIT
-      cp ${config} "$cargo_home/config.toml"
-      export CARGO_HOME="$cargo_home"
-      # Native build scripts copy source permissions into OUT_DIR. Keep registry
-      # builds and different read-only vendor snapshots in separate caches.
-      export CARGO_TARGET_DIR="''${CARGO_TARGET_DIR:-target/check/${builtins.baseNameOf cargoDeps}}"
-      export CARGO_NET_OFFLINE=${lib.boolToString offline}
-      export SQLX_OFFLINE=true
-      ${lib.optionalString pkgs.stdenv.hostPlatform.isDarwin ''
-        export RUST_TEST_THREADS=1
-      ''}
-      ${cmd}
-    '' ([ pkgs.coreutils ] ++ inputs);
+    config: offline: name: cmd: environment:
+    (mk name
+      ''
+        cargo_home=$(mktemp -d)
+        trap 'rm -rf "$cargo_home"' EXIT
+        cp ${config} "$cargo_home/config.toml"
+        export CARGO_HOME="$cargo_home"
+        # Native build scripts copy source permissions into OUT_DIR. Keep registry
+        # builds and different read-only vendor snapshots in separate caches.
+        export CARGO_TARGET_DIR="''${CARGO_TARGET_DIR:-target/check/${builtins.baseNameOf cargoDeps}}"
+        export CARGO_NET_OFFLINE=${lib.boolToString offline}
+        export SQLX_OFFLINE=true
+        ${lib.optionalString pkgs.stdenv.hostPlatform.isDarwin ''
+          export RUST_TEST_THREADS=1
+        ''}
+        ${cmd}
+      ''
+      (
+        [
+          environment.toolchain
+          pkgs.coreutils
+        ]
+        ++ environment.inputs
+      )
+    ).overrideAttrs
+      {
+        # The app and the sandboxed Crane check consume this one command. Crane
+        # supplies its own Cargo home and compiled artifacts, not the app wrapper.
+        passthru = lib.optionalAttrs offline {
+          cargoCheck = {
+            command = cmd;
+            inherit (environment) toolchain;
+            nativeBuildInputs = environment.inputs;
+          };
+        };
+      };
 
   mkCargo = mkCargoConfigured cargoConfig true;
 
-  cargoEnv =
-    toolchain:
-    [
-      toolchain
+  cargoEnv = toolchain: {
+    inherit toolchain;
+    inputs = [
       # Unix FIFO-adversary regressions create their fixtures with `mkfifo`.
       # Keep that test dependency explicit: writeShellApplication otherwise
       # gives Cargo a deliberately minimal PATH.
@@ -78,6 +97,7 @@ let
     # cc-wrapper.
     ++ lib.optional pkgs.stdenv.hostPlatform.isDarwin pkgs.llvmPackages.llvm
     ++ workspaceNativeBuildInputs;
+  };
 
   # CI-gating checks. These surface as `apps.<sys>.check-<name>` for local and
   # external matrix runners.
@@ -104,7 +124,7 @@ let
     # This catches source replacement regressions without runner credentials.
     cargo-sources =
       mkCargo "check-cargo-sources" "cargo metadata --locked --format-version 1 > /dev/null"
-        [ rustToolchain ];
+        (cargoEnv rustToolchain);
     fmt = mk "check-fmt" "cargo fmt --all -- --check" [ rustToolchain ];
     clippy = mkCargo "check-clippy" "cargo clippy ${clippyArgs}" (cargoEnv rustToolchain);
     # The default CLI includes client, gateway and daemon. Check the optional
@@ -176,7 +196,7 @@ let
           exit 1
         fi
       done
-    '' (cargoEnv rustToolchain ++ [ pkgs.gnugrep ]);
+    '' ((cargoEnv rustToolchain) // { inputs = (cargoEnv rustToolchain).inputs ++ [ pkgs.gnugrep ]; });
     # The keyhole: providers run generic compute and know no models. Provider
     # crates must not reach client model code, and the provider half of the
     # CLI and SDK must not name it. Client model code stays client-side.
@@ -207,7 +227,7 @@ let
         echo "provider code names client model code" >&2
         exit 1
       fi
-    '' (cargoEnv rustToolchain ++ [ pkgs.gnugrep ]);
+    '' ((cargoEnv rustToolchain) // { inputs = (cargoEnv rustToolchain).inputs ++ [ pkgs.gnugrep ]; });
     # RPC owns the generated Work/WorkSetup interfaces and their wire-id pins;
     # Channel and authority own the canonical records and durable orchestration.
     # Test each complete package so service/method identity pins stay covered.
@@ -294,10 +314,12 @@ let
     buf = mk "check-buf" bufLintCommand [ pkgs.buf ];
     deny = mkCargoConfigured cargoAuditConfig false "check-deny" denyCommand (
       (cargoEnv rustToolchain)
-      ++ [
-        pkgs.cargo-deny
-        pkgs.git
-      ]
+      // {
+        inputs = (cargoEnv rustToolchain).inputs ++ [
+          pkgs.cargo-deny
+          pkgs.git
+        ];
+      }
     );
     deadnix = mk "check-deadnix" ''
       shopt -s globstar

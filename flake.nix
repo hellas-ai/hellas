@@ -69,7 +69,8 @@
       # cache.hellas.ai; the checks themselves run on GitHub. A PR that changes
       # dependencies or the toolchain builds its own until it merges.
       hydraJobs.x86_64-linux = { inherit (perSystem.x86_64-linux.checks) cargo-deps; };
-      # Selected explicitly by the component's Hydra jobset, never by PR CI.
+      # Infra consumes these component jobs directly. Their checks are the
+      # same derivations PR CI builds, with no separate validation environment.
       releaseJobs =
         builtins.mapAttrs
           (
@@ -91,10 +92,9 @@
       windowsJobs.x86_64-linux = perSystem.x86_64-linux.windowsJobs;
       formatter = forAllSystems (system: perSystem.${system}.formatter);
 
-      overlays.default = final: _prev: {
-        hellas = self.packages.${final.system};
-        hellasLib = import ./nix/lib { pkgs = final; };
-      };
+      overlays.default = nixpkgs.lib.composeExtensions (import ./nix/overlay.nix) (
+        final: _prev: { hellas = self.packages.${final.system}; }
+      );
 
       nixosModules = {
         hellas = import ./nix/modules/nixos.nix { inherit self; };

@@ -10,6 +10,7 @@ pkgs.writeShellApplication {
     pkgs.gh
     pkgs.gnugrep
     pkgs.jq
+    pkgs.nix
     pkgs.skopeo
   ];
   text = ''
@@ -73,11 +74,19 @@ pkgs.writeShellApplication {
     fi
     echo "revision $revision (CLI eval $cli_eval, GPU eval $gpu_eval)"
 
-    builds=$(jq -s 'add' <(api "/eval/$cli_eval/builds") <(api "/eval/$gpu_eval/builds"))
+    cli_builds=$(api "/eval/$cli_eval/builds")
+    builds=$(jq -s 'add' <(echo "$cli_builds") <(api "/eval/$gpu_eval/builds"))
     output() {
       jq -er --arg job "$1" '[.[] | select(.job == $job and .buildstatus == 0)][0].buildoutputs.out.path // error("missing successful artifact job: \($job)")' <<< "$builds"
     }
-    version=$(jq -er '[.[] | select(.job == "x86_64-linux.validation")][0].nixname | ltrimstr("hellas-cli-validation-")' <<< "$builds")
+    # Both components have a job named x86_64-linux.release. Read CLI metadata
+    # from its own evaluation, then verify the signed store output and identity.
+    manifest=$(jq -er '[.[] | select(.job == "x86_64-linux.release" and .finished == 1 and .buildstatus == 0)][0].buildoutputs.out.path // error("missing CLI release manifest")' <<< "$cli_builds")
+    nix copy --from "$cache" --option trusted-public-keys "$cache_key" "$manifest"
+    version=$(jq -er --arg revision "$revision" '
+      select(.component == "cli" and .system == "x86_64-linux" and .revision == $revision)
+      | .version | select(type == "string" and test("^[0-9]+[.][0-9]+[.][0-9]+([-+][0-9A-Za-z.-]+)?$"))
+    ' "$manifest/release.json")
     image_jobs=(network:x86_64-linux.artifacts.network-image hip:x86_64-linux.artifacts.hip-image cuda:x86_64-linux.artifacts.cuda-image)
     archive_jobs=(x86_64-linux.artifacts.portable-x86_64 x86_64-linux.artifacts.portable-aarch64 aarch64-darwin.artifacts.portable-aarch64 x86_64-linux.artifacts.wasm)
     # Resolve the complete release before changing any published tags.

@@ -1619,6 +1619,9 @@ fn indexed_owner_proof_spans_the_database_publication_boundary() {
             .unwrap();
         assert_eq!(after.page(), during.page());
         assert_eq!(after.block().bundle().payload, proof.payload);
+        // Publication retains the node's database runtime through its source.
+        // Release that fixture handle before shutting down the runtime owner.
+        drop(publication);
         h.node.shutdown().await.unwrap();
     });
 }
