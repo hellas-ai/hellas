@@ -10,9 +10,7 @@
 let
   overlays = [
     (import rust-overlay)
-    (final: _prev: {
-      hellasLib = import ./lib { pkgs = final; };
-    })
+    (import ./overlay.nix)
   ];
   pkgs = import nixpkgs (
     {

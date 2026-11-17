@@ -419,7 +419,7 @@ let
     // kernel.buildChecks
     // hydraLints
     // lib.optionalAttrs isX86_64Linux {
-      telemetry-collector = import ./tests/collector.nix { inherit pkgs; };
+      telemetry-collector = pkgs.opentelemetry-collector-contrib;
     };
 
 in

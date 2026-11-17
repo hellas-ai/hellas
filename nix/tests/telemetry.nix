@@ -21,7 +21,7 @@ pkgs.testers.runNixOSTest (
       systemd.globalEnvironment = environment;
       services.opentelemetry-collector = {
         enable = true;
-        package = import ./collector.nix { inherit pkgs; };
+        package = pkgs.opentelemetry-collector-contrib;
         validateConfigFile = true;
         settings = {
           receivers.otlp.protocols.http.endpoint = "127.0.0.1:4318";
