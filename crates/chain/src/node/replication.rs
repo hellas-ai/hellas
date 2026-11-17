@@ -348,7 +348,12 @@ fn retry_delay(attempt: u32) -> Duration {
         .min(MAX_RETRY_DELAY_MS);
     Duration::from_millis(cap / 2 + rand::random::<u64>() % (cap / 2 + 1))
 }
-impl opaque::Fetcher for Network {
+#[derive(Clone)]
+pub(super) struct ArchiveFetcher {
+    pub network: Network,
+    pub archive: ChainIndexer,
+}
+impl opaque::Fetcher for ArchiveFetcher {
     type Key = handler::Key<Digest>;
     type Value = Bytes;
     async fn fetch(&self, key: Self::Key) -> Option<Bytes> {
@@ -357,14 +362,19 @@ impl opaque::Fetcher for Network {
             handler::Key::Finalized { height } => FinalizedBlockQuery::Height(height.get()),
             handler::Key::Notarized { .. } => return None,
         };
-        let block = self.fetch(query).await?;
+        let block = self.network.fetch(query).await?;
         let decoded = HellasBlock::decode(block.block.as_slice()).ok()?;
+        let proof =
+            crate::finality_proof::FinalityProof::decode(&block.snapshot.finalization).ok()?;
         match key {
-            handler::Key::Block(_) => Some(decoded.encode()),
+            handler::Key::Block(_) => {
+                self.archive
+                    .accept_verified_proof(decoded.clone(), proof)
+                    .await
+                    .ok()?;
+                Some(decoded.encode())
+            }
             handler::Key::Finalized { .. } => {
-                let proof =
-                    crate::finality_proof::FinalityProof::decode(&block.snapshot.finalization)
-                        .ok()?;
                 if !proof.descendants.is_empty() {
                     return None;
                 }

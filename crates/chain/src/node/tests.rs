@@ -255,7 +255,10 @@ fn recovery_finds_the_first_committed_block_before_its_archive_acknowledgment() 
         let (receiver, handler) = handler::init(runtime.child("handler"), NZUsize!(256));
         let resolver = commonware_resolver::opaque::init::<_, _, _, PublicKey>(
             runtime.child("resolver"),
-            network,
+            replication::ArchiveFetcher {
+                network,
+                archive: archive.clone(),
+            },
             handler,
             NZUsize!(256),
             Duration::from_millis(500),
@@ -816,6 +819,142 @@ fn indexed_node_publishes_from_its_execution_database_and_reopens_pruned_state()
     });
 }
 
+#[cfg(feature = "indexer-api")]
+#[test]
+fn indexed_catch_up_preserves_certificates_beyond_one_proof_window() {
+    run_qmdb(|runtime| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let mut fixture = Fixture::new(runtime, &directory.path().join("source")).await;
+        let source = FullNode::start(fixture.config.clone()).await.unwrap();
+        let mut history = Vec::new();
+        for _ in 0..crate::finality_proof::MAX_FINALITY_DESCENDANTS + 2 {
+            let block = fixture.next().await;
+            apply(&source, block.clone()).await.unwrap();
+            history.push(block);
+        }
+        let last = history.last().unwrap();
+        for cached in [false, true] {
+            let mut config = fixture.config.clone();
+            config.chain = crate::chain_dir::ChainDir::open(
+                &hellas_private::StoreLocation::from_home(
+                    &directory
+                        .path()
+                        .join(if cached { "old-archive" } else { "fresh" }),
+                    Crash,
+                ),
+                &config.chain,
+            )
+            .unwrap();
+            if cached {
+                let node = FullNode::start_indexed(config.clone(), "read".into())
+                    .await
+                    .unwrap();
+                // The old resolver persisted these blocks but discarded their
+                // certificates. Reopen that actual on-disk cache before replay.
+                for incoming in &history {
+                    let block = HellasBlock::decode(incoming.block.as_slice()).unwrap();
+                    assert!(
+                        node.0
+                            .core
+                            .indexer
+                            .marshal
+                            .verified(block.context().round, block)
+                            .await
+                    );
+                }
+                node.shutdown().await.unwrap();
+            }
+            let node = FullNode::start_indexed(config.clone(), "read".into())
+                .await
+                .unwrap();
+            node.0.network.seed(source.endpoint_addr());
+            node.0.network.discover(source.endpoint_addr()).await;
+            let view = node.wait_ready().await.unwrap();
+            assert_eq!(
+                view.client()
+                    .get_latest_block()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .payload,
+                last.snapshot.payload
+            );
+            let publication = node.publication().unwrap();
+            assert_eq!(publication.recovery_height().unwrap(), last.snapshot.height);
+            for incoming in &history {
+                let stored = publication
+                    .archive
+                    .get_finalized_block(FinalizedBlockQuery::Height(incoming.snapshot.height))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                fixture
+                    .committee
+                    .verifier
+                    .verify_snapshot(&stored.snapshot, &stored.block)
+                    .unwrap();
+                assert!(
+                    crate::finality_proof::FinalityProof::decode(&stored.snapshot.finalization)
+                        .unwrap()
+                        .descendants
+                        .len()
+                        <= crate::finality_proof::MAX_FINALITY_DESCENDANTS
+                );
+            }
+            drop(publication);
+            drop(view);
+            node.shutdown().await.unwrap();
+            let reopened = FullNode::start_indexed(config, "read".into())
+                .await
+                .unwrap();
+            assert_eq!(
+                reopened.publication().unwrap().recovery_height().unwrap(),
+                last.snapshot.height
+            );
+            assert_eq!(
+                reopened
+                    .owner_proof(fixture.allocations[0].0, 0, 32, None)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .block()
+                    .view()
+                    .payload(),
+                last.snapshot.payload
+            );
+            reopened.shutdown().await.unwrap();
+        }
+        source.shutdown().await.unwrap();
+    });
+}
+
+#[cfg(feature = "indexer-api")]
+#[test]
+fn index_failure_reaches_the_host_as_a_typed_error() {
+    run_qmdb(|runtime| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = Fixture::new(runtime, directory.path()).await;
+        let node = FullNode::start_indexed(fixture.config, "read".into())
+            .await
+            .unwrap();
+        node.0.core.readiness.fail(Error::Execution {
+            height: 1,
+            operation: "index intent",
+            reason: "storage fixture".into(),
+        });
+        assert!(matches!(
+            node.wait_stopped().await,
+            Error::Execution {
+                height: 1,
+                operation: "index intent",
+                ..
+            }
+        ));
+        assert!(node.view().is_err());
+        node.shutdown().await.unwrap();
+    });
+}
+
 #[cfg(feature = "validator")]
 #[test]
 fn validator_archive_seeds_execution_over_iroh() {
@@ -1140,7 +1279,10 @@ fn full_node_and_validator_execution_roles_share_the_same_directory() {
                 let (receiver, handler) = handler::init(context.child("handler"), NZUsize!(256));
                 let resolver = commonware_resolver::opaque::init::<_, _, _, PublicKey>(
                     context.child("resolver"),
-                    network,
+                    replication::ArchiveFetcher {
+                        network,
+                        archive: indexer.clone(),
+                    },
                     handler,
                     NZUsize!(256),
                     Duration::from_millis(500),

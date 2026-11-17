@@ -87,16 +87,32 @@ pub(crate) struct Publication {
     pub(crate) index: Option<crate::edge_index::Publication>,
 }
 impl Publication {
+    #[cfg(feature = "indexer-api")]
+    pub(crate) async fn fail(
+        &self,
+        block: &HellasBlock,
+        operation: &'static str,
+        error: impl std::fmt::Display,
+    ) -> ! {
+        self.readiness.fail(crate::node::Error::Execution {
+            height: block.height().get(),
+            operation,
+            reason: error.to_string(),
+        });
+        // Commonware's Application::apply is infallible. Notify the supervisor
+        // and let it cancel this task; never return a batch it could commit.
+        std::future::pending().await
+    }
+
     pub(crate) async fn finalized<E>(&self, block: &HellasBlock, database: &UtxoDatabase<E>)
     where
         E: commonware_storage::Context + Spawner + Send + Sync + 'static,
     {
         #[cfg(feature = "indexer-api")]
-        if let Some(index) = &self.index {
-            index
-                .finalized(block, database)
-                .await
-                .expect("certified index publication failed");
+        if let Some(index) = &self.index
+            && let Err(error) = index.finalized(block, database).await
+        {
+            self.fail(block, "index publication", error).await;
         }
         if let Some(retain) = self.retention {
             // Two blocks are needed by Stateful's one-ack recovery window.

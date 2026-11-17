@@ -545,7 +545,9 @@ where
     ) -> <Self::Databases as DatabaseSet<E>>::Merkleized {
         Box::pin(async move {
             #[cfg(feature = "indexer-api")]
-            if let Some(index) = self.publication.as_ref().and_then(|p| p.index.as_ref()) {
+            if let Some(publication) = &self.publication
+                && let Some(index) = &publication.index
+            {
                 let (batches, changes) = crate::execution::execute_all_observed(
                     kernel_context(
                         self.network,
@@ -563,10 +565,9 @@ where
                 let executed = crate::execution::finalized::check(block, batches)
                     .await
                     .expect("certified block must reproduce its roots");
-                index
-                    .prepare(block, changes)
-                    .await
-                    .expect("certified index intent must persist");
+                if let Err(error) = index.prepare(block, changes).await {
+                    publication.fail(block, "index intent", error).await;
+                }
                 return executed;
             }
             crate::execution::finalized::execute(

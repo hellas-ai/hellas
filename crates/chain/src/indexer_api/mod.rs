@@ -47,7 +47,10 @@ pub fn run(options: OriginOptions) -> OriginResult<()> {
         let state = OriginState::new(node.clone())?;
         let app = router(state.clone());
         let listener = ::tokio::net::TcpListener::bind(options.listen).await?;
-        let result = axum::serve(listener, app).await.map_err(Into::into);
+        let result = ::tokio::select! {
+            result = axum::serve(listener, app) => result.map_err(Into::into),
+            error = node.wait_stopped() => Err(error.into()),
+        };
         node.shutdown().await?;
         result
     })

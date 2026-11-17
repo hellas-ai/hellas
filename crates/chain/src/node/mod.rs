@@ -64,7 +64,7 @@ impl Indexing {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum Error {
     #[error("invalid node configuration: {0}")]
     Config(String),
@@ -72,6 +72,14 @@ pub enum Error {
     InvalidBlock(String),
     #[error("chain storage failed: {0}")]
     Storage(String),
+    #[error("chain execution failed at height {height} during {operation}: {reason}")]
+    Execution {
+        height: u64,
+        operation: &'static str,
+        reason: String,
+    },
+    #[error("chain node stopped: {0}")]
+    Stopped(&'static str),
     #[error(transparent)]
     Query(#[from] QueryError),
 }
@@ -189,6 +197,7 @@ impl NodeState {
 pub(crate) struct Readiness {
     pub(crate) state: watch::Sender<NodeState>,
     cancel: CancellationToken,
+    failure: std::sync::Mutex<Option<Error>>,
 }
 impl Default for Readiness {
     fn default() -> Self {
@@ -204,6 +213,7 @@ impl Readiness {
             })
             .0,
             cancel,
+            failure: Default::default(),
         }
     }
     fn status(&self) -> NodeState {
@@ -248,6 +258,22 @@ impl Readiness {
             true
         });
         self.cancel.cancel();
+    }
+
+    #[cfg(feature = "indexer-api")]
+    pub(crate) fn fail(&self, error: Error) {
+        self.failure.lock().unwrap().get_or_insert(error);
+        self.halt("chain execution failed");
+    }
+
+    fn stopped_error(&self) -> Error {
+        self.failure.lock().unwrap().clone().unwrap_or_else(|| {
+            let reason = match self.status() {
+                NodeState::Halted { reason, .. } => reason,
+                _ => "chain supervision closed",
+            };
+            Error::Stopped(reason)
+        })
     }
 }
 
@@ -525,6 +551,7 @@ impl Core {
                     index,
                     verifier: verifier.clone(),
                     archive: indexer.clone(),
+                    source: network.clone(),
                 })
             }
         };
@@ -548,7 +575,10 @@ impl Core {
         let (receiver, handler) = handler::init(context.child("marshal_handler"), NZUsize!(256));
         let resolver = opaque::init::<_, _, _, PublicKey>(
             context.child("resolver"),
-            network.clone(),
+            replication::ArchiveFetcher {
+                network: network.clone(),
+                archive: indexer.clone(),
+            },
             handler,
             NZUsize!(256),
             std::time::Duration::from_millis(500),
@@ -606,7 +636,7 @@ impl Core {
         }
         let database = tokio::select! {
             database = mailbox.subscribe_databases() => database,
-            _ = stopped.cancelled() => { tasks.stop(&context).await; return Err(Error::Query(QueryError::ChannelClosed)); }
+            _ = stopped.cancelled() => { tasks.stop(&context).await; return Err(readiness.stopped_error()); }
         };
         let restore = || {
             crate::execution::pipeline::restore(
@@ -642,7 +672,7 @@ impl Core {
             };
             let result = tokio::select! {
                 result = tokio::time::timeout(RECOVERY_TIMEOUT, recovery) => result.map_err(storage).and_then(|result| result.map_err(Error::from)),
-                _ = stopped.cancelled() => Err(Error::Query(QueryError::ChannelClosed)),
+                _ = stopped.cancelled() => Err(readiness.stopped_error()),
             };
             if let Err(error) = result {
                 tasks.stop(&context).await;
