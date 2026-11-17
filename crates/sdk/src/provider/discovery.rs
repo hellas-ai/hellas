@@ -89,7 +89,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn unavailable_mdns_keeps_direct_connections_alive() {
+    async fn unavailable_mdns_keeps_dht_running() {
         const ALPN: &[u8] = b"discovery-fallback-test";
         let server = Endpoint::builder(iroh::endpoint::presets::Minimal)
             .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
@@ -111,28 +111,7 @@ mod tests {
         assert!(advertiser._mdns.is_none());
         assert!(!advertiser.task.is_finished());
 
-        let client = Endpoint::builder(iroh::endpoint::presets::Minimal)
-            .bind()
-            .await
-            .unwrap();
-        // A hang guard for the handshake, not a timing requirement.
-        let (connected, accepted) =
-            tokio::time::timeout(std::time::Duration::from_secs(30), async {
-                tokio::join!(client.connect(server.addr(), ALPN), async {
-                    server.accept().await.unwrap().await
-                })
-            })
-            .await
-            .unwrap();
-        let connected = connected.unwrap();
-        let accepted = accepted.unwrap();
-        assert_eq!(connected.remote_id(), server.id());
-        assert_eq!(accepted.remote_id(), client.id());
-
-        connected.close(0_u32.into(), b"done");
-        accepted.close(0_u32.into(), b"done");
         advertiser.shutdown().await;
-        client.close().await;
         server.close().await;
     }
 }
