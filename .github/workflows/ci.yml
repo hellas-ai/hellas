@@ -40,7 +40,7 @@ jobs:
       - name: Dependency graph checks
         run: >-
           nix build --accept-flake-config --print-build-logs --no-link
-          .#checks.x86_64-linux.{cargo-sources,channel-dependencies,provider-dependencies,xet-no-alloc}
+          .#checks.x86_64-linux.{cargo-sources,channel-dependencies,provider-dependencies,wasm-chain,wasm-rpc,wasm-xet,xet-no-alloc}
       # The advisory database changes independently of the source revision.
       - name: Dependency lints
         env:
