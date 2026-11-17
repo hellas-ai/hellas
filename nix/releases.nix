@@ -112,6 +112,7 @@ let
     };
     consensus = {
       checks = [
+        "telemetry-collector"
         "chain-features"
         "chain-block-view"
         "chain-indexer-lint"

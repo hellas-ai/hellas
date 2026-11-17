@@ -417,7 +417,10 @@ let
     // nativePkg.craneChecks
     // lib.mapAttrs (_: mkHydraSourceCheck) kernel.checks
     // kernel.buildChecks
-    // hydraLints;
+    // hydraLints
+    // lib.optionalAttrs isX86_64Linux {
+      telemetry-collector = import ./tests/collector.nix { inherit pkgs; };
+    };
 
 in
 {
