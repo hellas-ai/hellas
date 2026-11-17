@@ -20,6 +20,7 @@ fn catena_child() {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[path = "paid_e2e/automatic.rs"]
 mod automatic;
 #[path = "paid_e2e/budget.rs"]
