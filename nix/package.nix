@@ -95,6 +95,10 @@ let
     };
     inherit stdenv;
     auditable = false;
+    # Use Cargo's bundled native libraries, as Crane and the check apps do.
+    # nixpkgs otherwise forces pkg-config in cargoSetupHook, including for
+    # zstd. The portable musl/Darwin and wasm builds need the bundled sources.
+    dontCargoUseSystemLibs = true;
     # sqlx's query macros check against the committed `.sqlx` metadata, so a
     # build never needs a live database.
     SQLX_OFFLINE = "true";

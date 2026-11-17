@@ -54,9 +54,14 @@ jobs:
   unit-tests:
     name: Unit tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
       - name: Unit tests + coverage
         run: nix build --accept-flake-config --print-build-logs --no-link .#checks.x86_64-linux.unit
+      # Keep release validation under this existing required status check.
+      # Build the exact derivation consumed by infra's hellas-release.nix;
+      # Crane checks alone do not exercise nixpkgs' release setup hooks.
+      - name: CLI release validation
+        run: nix build --accept-flake-config --print-build-logs --no-link .#releaseJobs.cli.x86_64-linux.validation
