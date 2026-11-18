@@ -7,7 +7,7 @@ mod tests;
 pub use error::WorkConfigError;
 type Result<T> = std::result::Result<T, WorkConfigError>;
 use hellas_chain::chain_dir::ChainDir;
-use hellas_chain::genesis::{ChainProfile, CustomChainFile};
+use hellas_chain::genesis::{ChainFile, ChainProfile};
 
 /// One process chain and where its journals live. How often channels are
 /// read and how old a read may be are the channel crate's, derived from
@@ -46,7 +46,7 @@ impl WorkConfig {
     }
 }
 
-/// One optional custom file; no remote identity discovery.
+/// Load the operator-supplied chain file without remote identity discovery.
 pub fn load_chain_profile(path: &Path) -> Result<ChainProfile> {
     let bytes = hellas_private::read_bounded_regular_file(
         path,
@@ -56,12 +56,12 @@ pub fn load_chain_profile(path: &Path) -> Result<ChainProfile> {
         path: path.to_path_buf(),
         source,
     })?;
-    let file: CustomChainFile =
+    let file: ChainFile =
         serde_json::from_slice(&bytes).map_err(|source| WorkConfigError::Parse {
             path: path.to_path_buf(),
             source,
         })?;
-    Ok(ChainProfile::custom(file)?)
+    Ok(ChainProfile::from_file(file)?)
 }
 
 /// Packs typed funding coins without imposing a provider/client funding policy.

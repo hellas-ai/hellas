@@ -391,14 +391,13 @@ fn empty_channel_settlement_recovers_exact_return_and_rejects_wrong_identity() {
             let b_genesis_json = serde_json::to_string(&b_genesis).unwrap();
             let mut b_trust = a_chain.trust().clone();
             b_trust.genesis_sha256 = hex::encode(Sha256::hash(b_genesis_json.as_bytes()));
-            let b_profile = hellas_chain::genesis::ChainProfile::custom(
-                hellas_chain::genesis::CustomChainFile {
+            let b_profile =
+                hellas_chain::genesis::ChainProfile::from_file(hellas_chain::genesis::ChainFile {
                     genesis_json: b_genesis_json,
                     trust: b_trust,
                     validators: a_chain.validators().to_vec(),
-                },
-            )
-            .unwrap();
+                })
+                .unwrap();
             case.options.config.chain =
                 hellas_chain::chain_dir::ChainDir::open(a_chain.home(), &b_profile).unwrap();
             assert_ne!(case.options.journal_root(), a_journals);
@@ -701,14 +700,13 @@ fn empty_channel_settlement_recovers_exact_return_and_rejects_wrong_identity() {
             let mut trust = wrong_network.config.chain.trust().clone();
             trust.network_id = "wrong-network".into();
             trust.genesis_sha256 = hex::encode(Sha256::hash(wrong_genesis_json.as_bytes()));
-            let wrong_profile = hellas_chain::genesis::ChainProfile::custom(
-                hellas_chain::genesis::CustomChainFile {
+            let wrong_profile =
+                hellas_chain::genesis::ChainProfile::from_file(hellas_chain::genesis::ChainFile {
                     trust,
                     validators: wrong_network.config.chain.validators().to_vec(),
                     genesis_json: wrong_genesis_json,
-                },
-            )
-            .unwrap();
+                })
+                .unwrap();
             wrong_network.config.chain = hellas_chain::chain_dir::ChainDir::open(
                 &StoreLocation::from_home(case.root.path(), Crash),
                 &wrong_profile,

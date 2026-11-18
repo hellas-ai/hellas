@@ -15,7 +15,7 @@ fn options(root: &Path) -> ProvisionOptions {
     let provider = hellas_channel::test_support::enrollment(&key, &key, [7; 32], [3; 32]);
     let location = StoreLocation::for_test(root);
     ProvisionOptions {
-        network: NetworkId::new("hellas-devnet-1").unwrap(),
+        network: NetworkId::new("test-network").unwrap(),
         journal_root: location,
         settlement_key: signer(0x22),
         provider,
@@ -34,7 +34,7 @@ fn options(root: &Path) -> ProvisionOptions {
             List::empty(CoinId::from_bytes([0; 32])),
         ),
         policy: ProviderChannelPolicy {
-            network: NetworkId::new("hellas-devnet-1").unwrap(),
+            network: NetworkId::new("test-network").unwrap(),
             policy_salt: [9; 32],
             channel_policy: PaidChannelPolicyV1 {
                 compute_credit_limit: 40,

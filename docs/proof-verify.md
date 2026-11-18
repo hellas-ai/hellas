@@ -4,7 +4,7 @@
 The included native origin follows the chain archive and listens only on loopback.
 
 Provision a `hellas_genesis::TrustDocument` independently of the RPC peer. It has
-`schema_version: 1`, `network_id: "hellas-devnet-4"`, the SHA-256 of the exact
+`schema_version: 1`, a `network_id`, the SHA-256 of the exact
 genesis JSON bytes, and a nonempty contiguous epoch schedule. Each epoch supplies
 an ID, a height range, and the 96-character compressed BLS MinPk threshold
 identity. Schedules start at height zero, have no gaps or overlaps, and use
@@ -54,9 +54,8 @@ only after deterministic replay matches the certified state and owner roots.
 
 ## Run the native origin
 
-For a disposable custom network, give generated genesis a fresh `--network-id`
-and export the public epoch-zero trust from the validator configuration. A
-registered network ID must keep its shipped genesis:
+Give generated genesis an explicit `--network-id` and export the public
+epoch-zero trust from the validator configuration:
 
 ```sh
 hellas chain validator export-trust --config network/validator-0.toml --genesis network/genesis.json > network/trust.json
@@ -91,8 +90,9 @@ validator and finalization metadata as unverified.
 
 `ProofVerifier::with_genesis(trust, genesis_bytes)` pins the full document;
 `ProofVerifier::with_digest(trust, canonical_digest)` accepts a derived
-light-client pin. Without `--chain-config`, CLI commands
-select the compiled Devnet profile.
+light-client pin. Chain commands require `--chain-config FILE`; there is no
+built-in network. The operator distributes the genesis, trust and faucet files.
+A re-genesis changes those inputs without rebuilding Hellas.
 
 `hellas --chain-config chain.json chain indexer serve --rpc wss://relay.example/ws
 --home /var/lib/hellas/explorer --listen 127.0.0.1:8788` starts the local

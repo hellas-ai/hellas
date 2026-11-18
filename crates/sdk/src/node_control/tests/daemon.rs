@@ -501,10 +501,7 @@ async fn an_unbound_daemon_can_install_its_iroh_listener_after_owner_binding() {
         let profile_path = opts
             .home
             .join("chains")
-            .join(
-                hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet)
-                    .state_key(),
-            )
+            .join(hellas_genesis::test_support::profile().state_key())
             .join("profile.json");
         let enrollment = hellas_channel::test_support::enrollment(
             &hellas_auth::ProducerSigningKey::from_secret_bytes([55; 32]).unwrap(),
@@ -518,12 +515,7 @@ async fn an_unbound_daemon_can_install_its_iroh_listener_after_owner_binding() {
         document.listeners.insert(
             "work".into(),
             Listener::Iroh {
-                chain: Some(
-                    hellas_chain::genesis::ChainProfile::known(
-                        hellas_chain::genesis::Chain::Devnet,
-                    )
-                    .to_file(),
-                ),
+                chain: Some(hellas_genesis::test_support::profile().to_file()),
                 port: 0,
                 backends: vec![],
             },

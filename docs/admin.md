@@ -9,7 +9,7 @@ use by every command that acts for a principal. `--passkey FILE` (32 raw bytes
 or 64 hex digits) points at a key held outside the home instead, as services do
 with secrets under `/run`.
 
-Start the daemon with `hellas serve`, pair its invite, then configure packages
+Start the daemon with `hellas --chain-config chain.json serve`, pair its invite, then configure packages
 with `hellas route add PATH`. Fetch upstreams use `hellas backend add NAME URL
 --key-file FILE` and `hellas route add MODEL@NAME`. The verbs build one complete
 document and send one atomic `Configure`; `hellas routes` reads `Watch`.
@@ -203,7 +203,7 @@ Its request and authentication clients share the same proxy/CA/redirect policy;
 refresh errors discard upstream descriptions before logging or persistence. These
 path protections do not establish signed-platform privacy or vendor retention policy.
 
-`hellas fetch` runs only under the HTTPS contract its caller names with
+`hellas --chain-config chain.json fetch` runs only under the HTTPS contract its caller names with
 `--contract`: `http`, the contract built into the release, or an exact
 descriptor file. It never takes the contract from the provider's quote; a quote
 that does not admit the named contract is refused before funding. The signed
@@ -394,7 +394,7 @@ ID before distributing it or retrying issuance.
 The receiving device runs jobs with it directly:
 
 ```sh
-hellas transcribe --model whisper-tiny --audio speech.wav --access me.access \
+hellas --chain-config chain.json transcribe --model whisper-tiny --audio speech.wav --access me.access \
   --backend hellas/catena-dfad87438018-hip
 ```
 
@@ -431,7 +431,7 @@ On that device, use the new file. To re-run a saved job with the new credential
 rather than replay its retained result, name a new attempt:
 
 ```sh
-hellas transact --job ./saved-job --access me-renewed.access \
+hellas --chain-config chain.json transact --job ./saved-job --access me-renewed.access \
   --attempt ./renewed-attempt.json --output ./renewed-result
 ```
 
@@ -493,7 +493,7 @@ PKCS#8 `control.key.der` under `<home>/provider`. The control socket and TLS fil
 use that directory; the grant authority journal is `<home>/provider/authority`.
 The daemon validates TLS identity before
 opening the provider and binding listeners. Startup does not generate trust files.
-After explicit initialization, start `hellas serve`. Routing and resource
+After explicit initialization, start `hellas --chain-config chain.json serve`. Routing and resource
 configuration live in the authority journal. `Configure` validates the whole
 candidate, including resource revisions, then commits the document, machine
 budget, accounts and resources in one frame. A rejected update leaves all of

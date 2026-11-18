@@ -48,7 +48,7 @@ where
     crate::execution::test_support::run_qmdb(test)
 }
 
-/// The shipped devnet document's committee size.
+/// The fixture's committee size.
 pub const VALIDATORS: usize = 6;
 
 /// The runtime handed to [`Devnet::start`]; [`run`] provides one.
@@ -75,23 +75,13 @@ pub struct GenesisOwner {
 }
 
 impl GenesisOwner {
-    /// A published devnet faucet owner, with its full genesis allocation.
-    /// Panics if `index` is not in 0..100.
-    pub fn faucet(index: u8) -> Self {
-        let accounts: Vec<crate::genesis::FaucetAccount> =
-            serde_json::from_str(crate::genesis::HELLAS_DEVNET_4_FAUCET_JSON)
-                .expect("the shipped faucet list parses");
-        let account = accounts
-            .into_iter()
-            .find(|account| account.index == index)
-            .expect("faucet index is in 0..100");
+    pub fn passkey(seed: u8) -> Self {
+        let mut secret_scalar = [seed; 32];
+        secret_scalar[0] = 1;
         Self {
             kind: OwnerKind::Passkey,
-            secret_scalar: hex::decode(account.secret_scalar)
-                .unwrap()
-                .try_into()
-                .unwrap(),
-            balance: 931_145,
+            secret_scalar,
+            balance: 10_000,
         }
     }
 
@@ -585,15 +575,15 @@ impl Devnet {
     /// A full-node configuration that submits through `validator` and
     /// syncs from it. The caller owns the node it starts.
     pub fn profile(&self, validator: usize) -> crate::genesis::ChainProfile {
-        use crate::genesis::{Chain, ChainProfile, CustomChainFile};
+        use crate::genesis::{ChainFile, ChainProfile};
         use commonware_cryptography::{Hasher as _, Sha256};
         let validator = &self.validators[validator];
         let genesis_json = serde_json::to_string(&self.document).unwrap();
-        let mut trust = ChainProfile::known(Chain::Devnet).trust().clone();
+        let mut trust = hellas_genesis::test_support::profile().trust().clone();
         trust.network_id = self.document.network_id.clone();
         trust.genesis_sha256 = hex::encode(Sha256::hash(genesis_json.as_bytes()));
         trust.epochs[0].threshold_identity = hex::encode(&self.consensus_info.threshold_identity);
-        ChainProfile::custom(CustomChainFile {
+        ChainProfile::from_file(ChainFile {
             trust,
             validators: vec![validator.light_client_url.clone()],
             genesis_json,

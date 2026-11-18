@@ -26,7 +26,6 @@ let
     cfg.serve.home
   ]
   ++ lib.optional (cfg.serve.configFile != null) cfg.serve.configFile
-  ++ lib.optional (cfg.serve.chainConfig != null) cfg.serve.chainConfig
   ++ lib.optional (cfg.serve.passkey != null) cfg.serve.passkey
   ++ lib.optional (cfg.serve.environmentFile != null) cfg.serve.environmentFile;
 
@@ -147,8 +146,8 @@ in
           message = "programs.hellas.serve.extraArgs may not override module-managed runtime, content, identity, trust, or configuration flags; use the corresponding option instead.";
         }
         {
-          assertion = cfg.serve.chain == null || cfg.serve.chainConfig == null;
-          message = "programs.hellas.serve.chain and chainConfig are mutually exclusive.";
+          assertion = !cfg.serve.enable || cfg.serve.chainConfig != null;
+          message = "programs.hellas.serve.chainConfig is required.";
         }
         {
           assertion = lib.all outsideStoreString userEnvironmentStrings;

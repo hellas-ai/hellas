@@ -14,7 +14,7 @@ use tokio::sync::watch;
 
 pub(super) struct Bound {
     pub port: u16,
-    pub profile: Option<hellas_chain::genesis::CustomChainFile>,
+    pub profile: Option<hellas_chain::genesis::ChainFile>,
     pub endpoint: iroh::Endpoint,
     alpns: Vec<Vec<u8>>,
     open: Arc<ProviderOpen>,
@@ -44,7 +44,7 @@ impl Bound {
     pub async fn prepare(
         core: &Arc<Core>,
         port: u16,
-        profile: &Option<hellas_chain::genesis::CustomChainFile>,
+        profile: &Option<hellas_chain::genesis::ChainFile>,
     ) -> Result<Self> {
         let options = &core.runtime.options;
         let chain = crate::work_config::WorkConfig::from_chain_dir(core.runtime.chain(profile)?)?;
@@ -306,7 +306,7 @@ mod tests {
             prover: None,
             chain: crate::test_support::chain_dir(
                 directory.path(),
-                hellas_kernel::NetworkId::new("hellas-devnet-1").unwrap(),
+                hellas_kernel::NetworkId::new("test-network").unwrap(),
             ),
             home,
             signer: Arc::new(PROVIDER.node_key()),

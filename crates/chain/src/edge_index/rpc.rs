@@ -110,7 +110,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let index = EdgeIndex::open(
             &hellas_private::StoreLocation::for_test(&dir.path().join("index.redb")),
-            "hellas-devnet-1".into(),
+            "test-network".into(),
             "ab".repeat(32),
             "cd".repeat(32),
         )

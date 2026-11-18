@@ -1,5 +1,5 @@
 //! Native storage paths for one validated chain profile.
-use crate::genesis::{ChainProfile, ChainProfileError, CustomChainFile};
+use crate::genesis::{ChainFile, ChainProfile, ChainProfileError};
 use hellas_private::StoreLocation;
 use std::{io, path::Path};
 
@@ -67,9 +67,8 @@ impl ChainDir {
                         error
                     }
                 })?;
-                let file: CustomChainFile =
-                    serde_json::from_slice(&bytes).map_err(invalid_profile)?;
-                let profile = ChainProfile::custom(file).map_err(invalid_profile)?;
+                let file: ChainFile = serde_json::from_slice(&bytes).map_err(invalid_profile)?;
+                let profile = ChainProfile::from_file(file).map_err(invalid_profile)?;
                 if root.file_name() != Some(std::ffi::OsStr::new(&profile.state_key())) {
                     return Err(invalid_profile(format!(
                         "chain profile does not match directory {}",
@@ -167,7 +166,7 @@ fn directories(root: &StoreLocation) -> io::Result<Vec<StoreLocation>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::genesis::{Chain, CustomChainFile, Genesis};
+    use crate::genesis::{ChainFile, Genesis};
     use hellas_private::Durability::Crash;
     use sha2::{Digest as _, Sha256};
 
@@ -177,7 +176,7 @@ mod tests {
         let home = StoreLocation::from_home(&directory.path().join("home"), Crash);
         assert!(ChainDir::discover(&home).unwrap().is_empty());
         assert!(!home.exists(), "discovery must not create a home");
-        let profile = ChainProfile::known(Chain::Devnet)
+        let profile = hellas_genesis::test_support::profile()
             .with_validators(vec!["wss://example.com/chain".into()])
             .unwrap();
         let chain = ChainDir::open(&home, &profile).unwrap();
@@ -202,7 +201,7 @@ mod tests {
         swapped.genesis_json = serde_json::to_string(&genesis).unwrap();
         swapped.trust.network_id = genesis.network_id;
         swapped.trust.genesis_sha256 = hex::encode(Sha256::digest(&swapped.genesis_json));
-        let swapped = ChainProfile::custom(swapped).unwrap();
+        let swapped = ChainProfile::from_file(swapped).unwrap();
         assert_ne!(swapped.state_key(), profile.state_key());
         std::fs::write(&file, serde_json::to_vec(&swapped.to_file()).unwrap()).unwrap();
         assert!(
@@ -217,7 +216,7 @@ mod tests {
     fn store_locations_keep_the_selected_durability() {
         use hellas_private::Durability;
         let home = tempfile::tempdir().unwrap();
-        let profile = ChainProfile::known(Chain::Devnet);
+        let profile = hellas_genesis::test_support::profile();
         for durability in [Durability::Crash, Durability::Power] {
             let home = StoreLocation::from_home(home.path(), durability);
             let chain = ChainDir::open(&home, &profile).unwrap();
@@ -238,15 +237,15 @@ mod tests {
     fn same_genesis_with_another_initial_authority_cannot_read_state() {
         let directory = tempfile::tempdir().unwrap();
         let home = StoreLocation::from_home(directory.path(), Crash);
-        let known = ChainProfile::known(Chain::Devnet);
-        let mut genesis: Genesis = known.genesis().clone();
+        let fixture = hellas_genesis::test_support::profile();
+        let mut genesis: Genesis = fixture.genesis().clone();
         genesis.network_id = "custom-1".into();
         let genesis_json = serde_json::to_string(&genesis).unwrap();
-        let mut trust = known.trust().clone();
+        let mut trust = fixture.trust().clone();
         trust.network_id = genesis.network_id.clone();
         trust.genesis_sha256 = hex::encode(Sha256::digest(&genesis_json));
         let make = |trust| {
-            ChainProfile::custom(CustomChainFile {
+            ChainProfile::from_file(ChainFile {
                 trust,
                 validators: vec!["ws://127.0.0.1:9080".into()],
                 genesis_json: genesis_json.clone(),

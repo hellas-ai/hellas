@@ -33,8 +33,10 @@ On a GPU machine, one command serves both packages. Qwen uses GGUF; Whisper
 and Flux use the directories produced by their converters. Hellas detects the
 kind and prints each model, API path and backend at startup.
 
+The examples use an operator-supplied `chain.json`; see [chain configuration](docs/proof-verify.md#run-the-native-origin).
+
 ```sh
-hellas gateway --model ./qwen3.gguf --model ./whisper-tiny --wrap claude
+hellas --chain-config chain.json gateway --model ./qwen3.gguf --model ./whisper-tiny --wrap claude
 ```
 
 `--wrap` gives the child its OpenAI and Anthropic URLs and a private bearer,
@@ -49,7 +51,7 @@ with `gateway` or `serve`; [NixOS settings](docs/nix.md) generate the same file.
 An upstream works without a GPU. The key file is read at startup:
 
 ```sh
-hellas gateway \
+hellas --chain-config chain.json gateway \
   --upstream openrouter=https://openrouter.ai/api,key-file="$HOME/or.key" \
   --model gpt-5@openrouter --wrap claude
 ```
@@ -64,7 +66,7 @@ backend. See the [HTTP gateway guide](docs/http-gateway.md).
 Start the persistent daemon on the GPU machine:
 
 ```sh
-hellas serve
+hellas --chain-config chain.json serve
 ```
 
 A new node prints one `hellas-invite:` line and waits for its owner. In another
@@ -97,7 +99,7 @@ own copy of the same package or a [metadata-only descriptor](docs/http-gateway.m
 
 ```sh
 hellas pair friend.access --name alice
-hellas gateway --model ./qwen3.gguf@alice --wrap claude
+hellas --chain-config chain.json gateway --model ./qwen3.gguf@alice --wrap claude
 ```
 
 Each native job runs in its own process group. This contains crashes and
@@ -110,21 +112,21 @@ programs you trust. See [node administration](docs/admin.md).
 The same packages work with the job commands. On your GPU:
 
 ```sh
-hellas transcribe --model whisper-tiny --audio speech.wav --local
+hellas --chain-config chain.json transcribe --model whisper-tiny --audio speech.wav --local
 ```
 
 Or use a friend's access bundle and their GPU evaluator:
 
 ```sh
-hellas transcribe --model whisper-tiny --audio speech.wav --access friend.access \
+hellas --chain-config chain.json transcribe --model whisper-tiny --audio speech.wav --access friend.access \
   --backend hellas/catena-dfad87438018-hip
 ```
 
 A paid job uses devnet coins and checks the quoted price before signing:
 
 ```sh
-hellas faucet
-hellas transcribe --model whisper-tiny --audio speech.wav --pay 20 \
+hellas --chain-config chain.json faucet --accounts faucet.json
+hellas --chain-config chain.json transcribe --model whisper-tiny --audio speech.wav --pay 20 \
   --provider "$DEVNET_PROVIDER" --backend hellas/catena-dfad87438018-hip
 ```
 

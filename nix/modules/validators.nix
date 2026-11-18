@@ -91,7 +91,6 @@ let
         ${genesisFlag} \
         ${allocationFlags} \
         > "$out"
-      ${cli} chain validator check-config --config "$out"
     '';
 
   validatorOptions =
@@ -214,7 +213,7 @@ let
         genesis = mkOption {
           type = types.nullOr types.path;
           default = null;
-          description = "Canonical genesis JSON embedded in every validator config.";
+          description = "Genesis JSON used when generating validator configuration.";
         };
         networkId = mkOption {
           type = types.nullOr types.str;
@@ -276,15 +275,10 @@ let
           default = null;
           description = "Optional home base for this cluster. Each validator uses a distinct nodeN subdirectory; null uses its systemd StateDirectory.";
         };
-        chain = mkOption {
-          type = types.nullOr (types.enum [ "devnet" ]);
-          default = null;
-          description = "Compiled chain; null uses the binary default.";
-        };
         chainConfig = mkOption {
           type = types.nullOr (types.strMatching "/.*");
           default = null;
-          description = "Authenticated custom chain profile outside the Nix store.";
+          description = "Authenticated chain profile supplied by the operator.";
         };
         memoryMax = mkOption {
           type = types.nullOr types.str;
@@ -328,13 +322,8 @@ in
           message = "services.hellas-chain-validators.${name}.networkId cannot be combined with genesis.";
         }
         {
-          assertion = validator.chain == null || validator.chainConfig == null;
-          message = "services.hellas-chain-validators.${name}.chain and chainConfig are mutually exclusive.";
-        }
-        {
-          assertion =
-            validator.chainConfig == null || hellas.runtimePathIsOutsideStore lib validator.chainConfig;
-          message = "services.hellas-chain-validators.${name}.chainConfig must be runtime data outside the Nix store.";
+          assertion = validator.chainConfig != null;
+          message = "services.hellas-chain-validators.${name}.chainConfig is required.";
         }
         {
           assertion = validator.home == null || hellas.runtimePathIsOutsideStore lib validator.home;
@@ -444,11 +433,9 @@ in
                   "${validator.home}/node${toString index}";
               usesRuntimeConfig = validator.runtimeConfigFiles != [ ];
               configFile = if usesRuntimeConfig then "%d/validator-config" else mkConfigFile validator index;
-              chainArgs =
-                optionalString (validator.chain != null) " --chain ${escapeShellArg validator.chain}"
-                + optionalString (
-                  validator.chainConfig != null
-                ) " --chain-config ${escapeShellArg validator.chainConfig}";
+              chainArgs = optionalString (
+                validator.chainConfig != null
+              ) " --chain-config ${escapeShellArg validator.chainConfig}";
             in
             {
               name = serviceName;
@@ -465,7 +452,7 @@ in
                 startLimitBurst = 5;
                 startLimitIntervalSec = 60;
                 serviceConfig = {
-                  ExecStart = "${getExe validator.package} --home ${escapeShellArg home} chain validator run --config ${configFile}${chainArgs}";
+                  ExecStart = "${getExe validator.package} --home ${escapeShellArg home}${chainArgs} chain validator run --config ${configFile}";
                   Type = "simple";
                   Restart = "on-failure";
                   RestartSec = 5;

@@ -29,46 +29,6 @@ struct Fixture {
     allocations: Vec<(SettlementKey, u64)>,
 }
 
-#[test]
-fn compiled_devnet_profile_starts_on_clean_home_with_pinned_hls3_genesis() {
-    use commonware_runtime::Supervisor as _;
-    run_qmdb(|runtime| async move {
-        let profile = hellas_genesis::ChainProfile::known(hellas_genesis::Chain::Devnet);
-        let genesis = profile.genesis();
-        let leader = genesis
-            .validators
-            .iter()
-            .map(|validator| {
-                PublicKey::decode(hex::decode(&validator.public_key).unwrap().as_slice()).unwrap()
-            })
-            .min()
-            .unwrap();
-        let application = crate::Application::new(
-            runtime.child("known_genesis"),
-            crate::domain::network_id(genesis).unwrap(),
-            crate::genesis_digest(genesis),
-            leader,
-            genesis_allocations(genesis).unwrap(),
-            "known_genesis",
-            crate::ApplicationConfig::default(),
-        )
-        .await;
-        assert_eq!(
-            application.genesis_block().digest().0,
-            profile.known_genesis_payload_pin().unwrap()
-        );
-        let home = tempfile::tempdir().unwrap();
-        let chain = crate::chain_dir::ChainDir::open(
-            &hellas_private::StoreLocation::from_home(home.path(), Crash),
-            &profile,
-        )
-        .unwrap();
-        let mut config = Config::for_profile(chain, vec![], None).unwrap();
-        config.validators.clear();
-        let node = FullNode::start(config).await.unwrap();
-        node.shutdown().await.unwrap();
-    });
-}
 impl Fixture {
     async fn new(runtime: runtime::Context, directory: &std::path::Path) -> Self {
         Self::new_in(runtime, directory, domain::TEST_NETWORK, 5000).await
@@ -119,13 +79,11 @@ impl Fixture {
         );
         use commonware_cryptography::{Hasher as _, Sha256};
         let genesis_json = serde_json::to_string(&genesis).unwrap();
-        let mut trust = hellas_genesis::ChainProfile::known(hellas_genesis::Chain::Devnet)
-            .trust()
-            .clone();
+        let mut trust = hellas_genesis::test_support::profile().trust().clone();
         trust.network_id = genesis.network_id.clone();
         trust.genesis_sha256 = hex::encode(Sha256::hash(genesis_json.as_bytes()));
         trust.epochs[0].threshold_identity = hex::encode(committee.assembler.identity().encode());
-        let profile = hellas_genesis::ChainProfile::custom(hellas_genesis::CustomChainFile {
+        let profile = hellas_genesis::ChainProfile::from_file(hellas_genesis::ChainFile {
             trust,
             validators: vec!["ws://unused.invalid".into()],
             genesis_json,
@@ -1781,13 +1739,10 @@ fn full_node_derives_h0_from_the_selected_custom_genesis() {
 #[test]
 fn nonindexed_full_node_refuses_an_expiring_threshold_key() {
     use commonware_cryptography::{Hasher as _, Sha256};
-    let mut genesis: hellas_genesis::Genesis =
-        serde_json::from_str(hellas_genesis::HELLAS_DEVNET_4_JSON).unwrap();
+    let mut genesis: hellas_genesis::Genesis = hellas_genesis::test_support::genesis();
     genesis.network_id = "custom-node-rotating-1".into();
     let genesis_json = serde_json::to_string(&genesis).unwrap();
-    let mut trust = hellas_genesis::ChainProfile::known(hellas_genesis::Chain::Devnet)
-        .trust()
-        .clone();
+    let mut trust = hellas_genesis::test_support::profile().trust().clone();
     trust.network_id = genesis.network_id.clone();
     trust.genesis_sha256 = hex::encode(Sha256::hash(genesis_json.as_bytes()));
     trust.epochs[0].end_height = Some(2);
@@ -1796,7 +1751,7 @@ fn nonindexed_full_node_refuses_an_expiring_threshold_key() {
     next.start_height = 2;
     next.end_height = None;
     trust.epochs.push(next);
-    let profile = hellas_genesis::ChainProfile::custom(hellas_genesis::CustomChainFile {
+    let profile = hellas_genesis::ChainProfile::from_file(hellas_genesis::ChainFile {
         trust,
         validators: vec!["ws://127.0.0.1:9080".into()],
         genesis_json,

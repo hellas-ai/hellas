@@ -6,13 +6,13 @@ re-run the job, so this shows who answered, not that the answer is correct.
 
 ## Sell
 
-Start `hellas serve`, pair its invite, and configure the local packages or
+Start `hellas --chain-config chain.json serve`, pair its invite, and configure the local packages or
 Fetch backends it may execute. Routing uses `backend` and `route` verbs; paid
 terms are a separate owner-approved policy in the same authority.
 
 ```sh
-hellas faucet
-hellas serve
+hellas --chain-config chain.json faucet --accounts faucet.json
+hellas --chain-config chain.json serve
 # In another shell, pair the printed invite, then configure a package:
 hellas pair hellas-invite:… --name mine
 hellas route add /srv/models/whisper-tiny
@@ -73,10 +73,10 @@ and [NixOS settings](nix.md).
 ## Buy
 
 ```sh
-hellas faucet
-hellas transcribe --model whisper-tiny --audio speech.wav --pay 20 --provider ENROLLMENT_ID@NODE_ID \
+hellas --chain-config chain.json faucet --accounts faucet.json
+hellas --chain-config chain.json transcribe --model whisper-tiny --audio speech.wav --pay 20 --provider ENROLLMENT_ID@NODE_ID \
   --backend hellas/catena-dfad87438018-hip
-hellas transact --settle --provider ENROLLMENT_ID@NODE_ID
+hellas --chain-config chain.json transact --settle --provider ENROLLMENT_ID@NODE_ID
 ```
 
 The client renders the program for `--backend`, the renderer the provider's GPU
@@ -112,7 +112,7 @@ metadata. The client includes the program with every job; a provider may dedupli
 received sources by content ID, but never needs a preinstalled model program.
 Weights remain a separate ordinary content-addressed asset.
 
-The process selects one chain with `--chain devnet` or `--chain-config FILE`.
+The process requires one authenticated chain file with `--chain-config FILE`.
 The custom JSON file contains the exact `genesis_json` bytes as a JSON string,
 `trust`, and a nonempty `validators` URL list. The buyer and gateway start
 no chain node. They authenticate remote state against the selected genesis and
@@ -121,7 +121,7 @@ trust; relay URLs supply transport only.
 `wss://devnet.hellas.ai/ws/validator-{0..5}`. Local transport and settlement
 keys are created on first use and retained with the identity.
 
-The buyer's principal key funds channels; on the devnet, `hellas faucet` gives it
+The buyer's principal key funds channels; on the devnet, `hellas --chain-config chain.json faucet --accounts faucet.json` gives it
 coins. A new channel asks for one owner approval over its exact quoted amount: the
 provider's jobs per channel times its price, plus omission reserve and fees.
 At most four eligible owner coins fund one delegated output; change returns
@@ -139,7 +139,7 @@ The original signed offer, policy and authenticated peer are durable together;
 retries return the same offer and restart requires no route configuration.
 Unanswered offers expire at their bond timeout.
 
-`--provider` takes the address `hellas serve` prints: the content ID of the
+`--provider` takes the address `hellas --chain-config chain.json serve` prints: the content ID of the
 provider's enrollment bundle and the node ID it binds. Each live Open checks
 that the provider presents exactly that enrollment, that it names the live
 transport, and verifies the producer proof; a retained channel whose offer names
@@ -326,7 +326,7 @@ Tracking and recovery behavior is described in
 
 ## Retained settlement and journal upgrades
 
-`hellas transact --settle` and the SDK's `settle_channel` close an existing
+`hellas --chain-config chain.json transact --settle` and the SDK's `settle_channel` close an existing
 funded channel after the entire provider has stopped, including its background
 clock. The shared channel driver submits the close start as soon as it is
 signed, and the final adjudicated transaction once the read shows the contest

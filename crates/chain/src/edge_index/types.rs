@@ -85,7 +85,7 @@ mod tests {
         let response = ListEdgesResponse {
             envelope: Some(EdgeIndexMetadata {
                 schema_version: SCHEMA_VERSION,
-                network_id: "hellas-devnet-1".into(),
+                network_id: "test-network".into(),
                 genesis_sha256: "a1".repeat(32),
                 trust_sha256: "b2".repeat(32),
                 snapshot: Some(Snapshot {

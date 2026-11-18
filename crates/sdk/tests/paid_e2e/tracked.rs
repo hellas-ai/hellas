@@ -19,14 +19,13 @@ fn paid_public_boundaries_reject_another_chain_before_proposal() {
             let a_genesis_json = serde_json::to_string(&a_genesis).unwrap();
             let mut a_trust = b_chain.trust().clone();
             a_trust.genesis_sha256 = hex::encode(Sha256::hash(a_genesis_json.as_bytes()));
-            let a_profile = hellas_chain::genesis::ChainProfile::custom(
-                hellas_chain::genesis::CustomChainFile {
+            let a_profile =
+                hellas_chain::genesis::ChainProfile::from_file(hellas_chain::genesis::ChainFile {
                     genesis_json: a_genesis_json,
                     trust: a_trust,
                     validators: b_chain.validators().to_vec(),
-                },
-            )
-            .unwrap();
+                })
+                .unwrap();
             let a_chain =
                 hellas_chain::chain_dir::ChainDir::open(b_chain.home(), &a_profile).unwrap();
             assert_eq!(a_chain.network_id(), b_chain.network_id());

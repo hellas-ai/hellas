@@ -514,8 +514,9 @@ fn setup(args: SetupArgs) -> Result<(), ValidatorError> {
         }
         None => Genesis {
             schema_version: crate::genesis::GENESIS_SCHEMA_VERSION,
-            network_id: network_id
-                .unwrap_or_else(|| crate::genesis::Chain::default().network().id.to_string()),
+            network_id: network_id.ok_or_else(|| {
+                ValidatorError::InvalidSetup("--network-id is required without --genesis".into())
+            })?,
             validators: generated_validators,
             allocations: genesis_allocations
                 .iter()
@@ -579,7 +580,7 @@ mod genesis_allocation_tests {
         let directory = tempfile::tempdir().unwrap();
         let output_dir = directory.path().join("network");
         generate_network(GenerateNetworkArgs {
-            network_id: hellas_genesis::HELLAS_DEVNET_4_ID.into(),
+            network_id: "test-network".into(),
             validators: 1,
             labels: vec!["demo".into()],
             addresses: vec!["127.0.0.1".into()],
@@ -900,14 +901,9 @@ fn run(
         }
     };
     if scheme.identity().encode().as_ref() != expected_threshold_identity.as_slice() {
-        let reason = match profile.known_chain() {
-            Some(chain) => format!(
-                "this binary is out of date for {}; please update",
-                chain.name()
-            ),
-            None => "threshold identity differs from selected chain".into(),
-        };
-        return Err(ValidatorError::Scheme(reason));
+        return Err(ValidatorError::Scheme(
+            "threshold identity differs from configured chain".into(),
+        ));
     }
     let consensus_info = ConsensusInfo {
         validators: scheme

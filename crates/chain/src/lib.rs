@@ -30,10 +30,7 @@ pub mod indexer_api;
 pub mod owner_proof;
 #[cfg(feature = "proof-verify")]
 pub mod proof_verify;
-/// The shipped genesis documents and the type that reads them. It is its
-/// own `std` crate because a browser build and the relay in another
-/// repository read the same bytes a validator does; re-exported whole so
-/// `hellas_chain::genesis::*` is the path it always was.
+/// Portable genesis and trust documents supplied by the operator.
 #[cfg(feature = "domain")]
 pub use hellas_genesis as genesis;
 #[cfg(any(feature = "indexer", feature = "validator"))]
@@ -111,41 +108,6 @@ pub use server::{
 pub use work_blocks::WorkBlocks;
 #[cfg(any(feature = "client-core", feature = "server"))]
 pub use work_view::{FinalizedWorkView, WorkChannelQuery, WorkChannelSnapshot};
-
-/// `hellas_chain::genesis::*` is a published path: the CLI, the client
-/// and the relay in the explorer repository all reach the shipped
-/// documents through it. A re-export can be re-pointed without any of
-/// them failing to compile, so this walks the path chain publishes and
-/// re-checks the reviewed bytes at the far end of it.
-#[cfg(all(test, feature = "domain"))]
-mod genesis_reexport {
-    use sha2::{Digest as _, Sha256};
-
-    #[test]
-    fn the_documents_reached_through_chain_are_the_reviewed_bytes() {
-        let selector = "devnet";
-        let id = crate::genesis::HELLAS_DEVNET_4_ID;
-        let json = crate::genesis::HELLAS_DEVNET_4_JSON;
-        let expected = "be1d1f9240f3eccd18afc8675d967454842c6a694e9ee8b4e457b3a5fd7c9901";
-        let hex: String = Sha256::digest(json.as_bytes())
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        assert_eq!(hex, expected, "{selector}");
-
-        let network = crate::genesis::known_network(selector).expect("shipped network");
-        assert_eq!(network.id, id);
-        assert_eq!(network.json, json);
-
-        let genesis: crate::genesis::Genesis =
-            serde_json::from_str(json).expect("shipped document parses");
-        genesis.validate().expect("shipped document validates");
-        assert_eq!(genesis.network_id, id);
-
-        assert_eq!(crate::genesis::known_network_names(), vec!["devnet"]);
-        assert_eq!(crate::genesis::GENESIS_SCHEMA_VERSION, 1);
-    }
-}
 
 #[cfg(all(test, feature = "indexer"))]
 pub(crate) use indexer::fixtures::spawn_archive;

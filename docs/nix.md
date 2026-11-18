@@ -25,6 +25,7 @@ A declarative HTTP deployment runs the stateless gateway from TOML settings:
 ```nix
 services.hellas.gateway = {
   enable = true;
+  chainConfig = "/run/hellas/chain.json";
   credentials.api = "/run/secrets/openrouter.key";
   settings = {
     models = [ "/srv/models/qwen3.gguf" "gpt-5@openrouter" ];
@@ -52,6 +53,7 @@ For a declarative persistent provider:
 ```nix
 services.hellas = {
   enable = true;
+  chainConfig = "/run/hellas/chain.json";
   passkey = "/run/secrets/hellas-owner.passkey";
   settings = {
     models = [ "/srv/models/qwen3.gguf" "/srv/models/whisper-tiny" ];
@@ -160,7 +162,7 @@ the interactive service on Darwin:
 programs.hellas = {
   enable = true;
   serve = {
-    enable = true;
+    chainConfig = "/run/hellas/chain.json";    enable = true;
     passkey = "/Users/alice/.config/hellas/owner.passkey";
     environmentFile = "/Users/alice/.config/hellas/provider.env";
   };
@@ -236,12 +238,13 @@ docker run --rm --device /dev/kfd --device /dev/dri \
 ```
 
 Images have the Hellas executable (or CUDA environment wrapper) as Entrypoint,
-with `serve --port 31145` as the default Cmd. Override Cmd directly for a
-declarative provider, for example `IMAGE serve --config /run/provider.toml`;
+with `serve --port 31145` as the default Cmd. Mount the operator's chain file
+and pass it explicitly, for example
+`IMAGE --chain-config /run/chain.json serve --config /run/provider.toml`;
 the CUDA wrapper forwards those arguments unchanged. By default pair the invite,
 then add model routes using paths
 inside the container. The host supplies the GPU driver; model packages stay
-on runtime volumes. For a stateless container, override Cmd with `gateway --model /content/PACKAGE` and its bearer/wrapper
+on runtime volumes. For a stateless container, override Cmd with `--chain-config /run/chain.json gateway --model /content/PACKAGE` and its bearer/wrapper
 options.
 
 A GPU asset owner uploads verified weights once and execution workers receive
@@ -273,8 +276,8 @@ server, `--metrics-port`/`--metrics-addr`, and gateway/executor instruments.
 Dependencies may still collect their own telemetry independently. Use an `otel`
 build (`cli.override { otel = true; }` or the `docker-otel` image) for metrics.
 
-With that build, `hellas serve --metrics-port 9090` and
-`hellas gateway --metrics-port 9091` serve Prometheus text at
+With that build, `hellas --chain-config chain.json serve --metrics-port 9090` and
+`hellas --chain-config chain.json gateway --metrics-port 9091` serve Prometheus text at
 `http://127.0.0.1:<port>/metrics`. This unauthenticated listener defaults to
 loopback. `--metrics-addr IP` explicitly selects another interface, including
 `0.0.0.0` for container scraping. One-shot commands do not start a metrics server.

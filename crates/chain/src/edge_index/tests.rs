@@ -169,7 +169,7 @@ impl Harness {
         let head = HellasBlock::genesis(leader, root, target, crate::genesis_digest(&genesis));
         let allocations = crate::config::genesis_allocations(&genesis).unwrap();
         let directory = tempfile::tempdir().unwrap();
-        let profile = hellas_genesis::ChainProfile::custom(hellas_genesis::CustomChainFile {
+        let profile = hellas_genesis::ChainProfile::from_file(hellas_genesis::ChainFile {
             trust: trust.clone(),
             validators: vec!["ws://unused.invalid".into()],
             genesis_json: String::from_utf8(genesis_json.clone()).unwrap(),

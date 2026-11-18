@@ -1,11 +1,11 @@
 # HTTP gateway
 
-`hellas gateway` builds one daemon document from repeatable flags and runs in
+`hellas --chain-config chain.json gateway` builds one daemon document from repeatable flags and runs in
 the foreground. It saves no routing configuration. Local models, friends'
 grants and API upstreams can appear together:
 
 ```sh
-hellas gateway \
+hellas --chain-config chain.json gateway \
   --model ./qwen3.gguf --model ./whisper-tiny --model ./flux \
   --model ./qwen3.gguf@alice \
   --upstream openrouter=https://openrouter.ai/api,key-file="$HOME/or.key" \
@@ -31,7 +31,7 @@ reference. Produce a descriptor once from a full package:
 ```sh
 hellas model describe ./qwen3.gguf -o ./qwen3
 hellas model describe ./whisper-tiny -o ./whisper-remote
-hellas gateway --model ./qwen3@alice --model ./whisper-remote@alice
+hellas --chain-config chain.json gateway --model ./qwen3@alice --model ./whisper-remote@alice
 ```
 
 The output is a new directory with `descriptor.json`, a JSON object with one
@@ -73,14 +73,14 @@ Every request requires a scoped `gateway.invoke` bearer. The foreground
 command prints its bearer to the terminal, or passes it directly to a child:
 
 ```sh
-hellas gateway --model ./qwen3.gguf --wrap claude
+hellas --chain-config chain.json gateway --model ./qwen3.gguf --wrap claude
 ```
 
 `--wrap` supplies OpenAI and Anthropic URLs and tokens, and drains accepted
 work when the child exits. For headless clients, use `--bearer-file PATH`:
 
 ```sh
-hellas gateway --model ./qwen3.gguf --bearer-file "$HOME/gateway.bearer"
+hellas --chain-config chain.json gateway --model ./qwen3.gguf --bearer-file "$HOME/gateway.bearer"
 # In another shell:
 curl -H "Authorization: Bearer $(cat "$HOME/gateway.bearer")" \
   -H "Content-Type: application/json" \
@@ -112,7 +112,7 @@ zdr = true # default; set false explicitly to retain request/response data
 ```
 
 ```sh
-hellas gateway --config gateway.toml --wrap claude
+hellas --chain-config chain.json gateway --config gateway.toml --wrap claude
 ```
 
 `gateway --config` requires exactly one HTTP listener (its name is arbitrary). It rejects
@@ -142,7 +142,7 @@ port = 31145
 backends = ["local"]
 ```
 
-`hellas --passkey /run/secrets/owner.passkey serve --config provider.toml`
+`hellas --chain-config chain.json --passkey /run/secrets/owner.passkey serve --config provider.toml`
 approves a fresh local authority without a pairing prompt, then reconciles the
 complete document before listening. The software passkey, saved approval and
 initial credential remain runtime data. Identical restarts retain revisions;
@@ -154,7 +154,7 @@ paid terms, runtime paths and retained control-profile details.
 
 ## Persistent service
 
-`hellas serve` runs the same core, restoring its document from the authority
+`hellas --chain-config chain.json serve` runs the same core, restoring its document from the authority
 journal. An explicit `serve --port PORT` changes the saved iroh port through
 a journaled configuration edit before listening; later starts without the flag
 restore that port. A fresh node has no HTTP listener. Pair its printed invite first, then use the

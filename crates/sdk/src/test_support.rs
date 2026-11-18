@@ -5,21 +5,14 @@ use hellas_private::StoreLocation;
 pub(crate) use crate::provider::tests::host::{Host, RemoteHost, provider_enrollment};
 use crate::work_config::WorkConfig;
 use hellas_auth::ProducerSigningKey;
-use hellas_chain::genesis::{ChainProfile, CustomChainFile};
+use hellas_chain::genesis::{ChainFile, ChainProfile};
 
 pub(crate) fn chain_dir(
     home: &std::path::Path,
     network: NetworkId,
 ) -> hellas_chain::chain_dir::ChainDir {
-    let known = ChainProfile::known(hellas_chain::genesis::Chain::Devnet);
-    if network.as_str() == known.network_id() {
-        return hellas_chain::chain_dir::ChainDir::open(
-            &StoreLocation::from_home(home, Crash),
-            &known,
-        )
-        .unwrap();
-    }
-    let mut genesis = known.genesis().clone();
+    let fixture = hellas_genesis::test_support::profile();
+    let mut genesis = fixture.genesis().clone();
     genesis.network_id = network.as_str().into();
     chain_dir_with_genesis(home, &genesis)
 }
@@ -29,12 +22,12 @@ pub(crate) fn chain_dir_with_genesis(
     genesis: &hellas_chain::genesis::Genesis,
 ) -> hellas_chain::chain_dir::ChainDir {
     use commonware_cryptography::{Hasher as _, Sha256};
-    let known = ChainProfile::known(hellas_chain::genesis::Chain::Devnet);
+    let fixture = hellas_genesis::test_support::profile();
     let genesis_json = serde_json::to_string(genesis).unwrap();
-    let mut trust = known.trust().clone();
+    let mut trust = fixture.trust().clone();
     trust.network_id = genesis.network_id.clone();
     trust.genesis_sha256 = hex::encode(Sha256::hash(genesis_json.as_bytes()));
-    let profile = ChainProfile::custom(CustomChainFile {
+    let profile = ChainProfile::from_file(ChainFile {
         trust,
         validators: vec!["ws://unused.invalid".into()],
         genesis_json,
@@ -50,8 +43,8 @@ pub(crate) fn chain_dir_with_variant(
     network: NetworkId,
     variant: u64,
 ) -> hellas_chain::chain_dir::ChainDir {
-    let known = ChainProfile::known(hellas_chain::genesis::Chain::Devnet);
-    let mut genesis = known.genesis().clone();
+    let fixture = hellas_genesis::test_support::profile();
+    let mut genesis = fixture.genesis().clone();
     genesis.network_id = network.as_str().into();
     genesis.allocations[0].balance += variant;
     chain_dir_with_genesis(home, &genesis)

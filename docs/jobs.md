@@ -6,7 +6,7 @@ ENROLLMENT_ID@NODE_ID`), or on this machine (`--local`, GPU builds only). To
 run an existing job folder under a grant:
 
 ```sh
-hellas transact --job ./job --access friend.access --output ./result
+hellas --chain-config chain.json transact --job ./job --access friend.access --output ./result
 ```
 
 The access file is checked against this home's principal and device. The grant
@@ -34,8 +34,8 @@ from its `--model` file or directory; `run` and `transact --job` read assets
 through `--content PATH` or `--content-config`. `--timeout` bounds it like any other job.
 
 ```sh
-hellas transcribe --model ./whisper-tiny --audio speech.wav --local
-hellas text --model ./qwen3.gguf --prompt 'Why is the sky blue?' --local
+hellas --chain-config chain.json transcribe --model ./whisper-tiny --audio speech.wav --local
+hellas --chain-config chain.json text --model ./qwen3.gguf --prompt 'Why is the sky blue?' --local
 ```
 
 A Compute job names the evaluator its program is rendered for. Remote Compute
@@ -44,7 +44,7 @@ registers (such as `hellas/catena-dfad87438018-hip`), before they ask for a
 quote; the provider refuses a program for an evaluator it did not register.
 `--local` renders for this machine's GPU runtime.
 
-`hellas text --model FILE.gguf --prompt TEXT [--system TEXT] [--max-tokens N]`
+`hellas --chain-config chain.json text --model FILE.gguf --prompt TEXT [--system TEXT] [--max-tokens N]`
 renders one chat turn with the GGUF's tokenizer and embedded Jinja chat template,
 runs it as a Compute job
 and prints the decoded reply.
@@ -54,8 +54,8 @@ For remote jobs, `text`, `transcribe` and `program` also accept a
 `hellas model describe PATH -o DIR`. It retains rendering metadata and the
 weights' content reference; the executing provider holds the real weights.
 
-`hellas transact --job DIR` executes a caller-owned job folder for any
-application. `hellas run` (one call of a Catena program) and `hellas fetch`
+`hellas --chain-config chain.json transact --job DIR` executes a caller-owned job folder for any
+application. `hellas --chain-config chain.json run` (one call of a Catena program) and `hellas --chain-config chain.json fetch`
 (one HTTPS request) build such a folder and go through the same SDK
 transaction. Requesters run no node: they keep local signing keys and
 wallet/channel metadata, and chain reads use authenticated validator RPCs.
@@ -65,26 +65,26 @@ new operation ranges, rebuilding the view if pruning overtakes its cursor.
 Signing keys and funding/channel recovery journals remain durable.
 
 ```sh
-hellas faucet
-hellas run --provider ENROLLMENT_ID@NODE_ID --source counter.hex --entry advance \
+hellas --chain-config chain.json faucet --accounts faucet.json
+hellas --chain-config chain.json run --provider ENROLLMENT_ID@NODE_ID --source counter.hex --entry advance \
   --arg u64:2 --arg u64:3 --returns u64 --backend hellas/catena-dfad87438018-hip \
   --pay 20 --save-job ./add
-hellas transact --job ./add --provider ENROLLMENT_ID@NODE_ID@127.0.0.1:9000 -o ./result
-hellas fetch https://example.com/data --provider ENROLLMENT_ID@NODE_ID --pay 20 \
+hellas --chain-config chain.json transact --job ./add --provider ENROLLMENT_ID@NODE_ID@127.0.0.1:9000 -o ./result
+hellas --chain-config chain.json fetch https://example.com/data --provider ENROLLMENT_ID@NODE_ID --pay 20 \
   --contract http --spki-sha256 LEAF_SPKI_SHA256 --save-job ./request -o ./response
-hellas transact --settle --provider ENROLLMENT_ID@NODE_ID
+hellas --chain-config chain.json transact --settle --provider ENROLLMENT_ID@NODE_ID
 ```
 
-`--provider` takes the address `hellas serve` prints: the content ID of the
+`--provider` takes the address `hellas --chain-config chain.json serve` prints: the content ID of the
 provider's enrollment bundle and the node ID it binds, optionally followed by
 `@IP:PORT`. Quotes, funding, payment and every reconnect refuse a provider that
 presents any other enrollment, before anything is signed or funded.
 
 Paid jobs act for the home's principal key, `<home>/principal.key`, created on
 first use; `--passkey FILE` points at a key held outside the home. `hellas
-faucet [--amount N]` pays it devnet coins from a random public faucet account
-and waits until the payment is final. The default chain is the shipped devnet. Select a compiled chain with
-`--chain devnet`, or pass one authenticated JSON profile with `--chain-config FILE`.
+faucet --accounts faucet.json [--amount N]` pays it devnet coins from a random public faucet account
+and waits until the payment is final. Supply the operator's authenticated JSON profile with `--chain-config FILE` and
+public faucet accounts with `faucet --accounts FILE`.
 The profile contains the exact `genesis_json` bytes as a JSON string, `trust`,
 and a nonempty `validators` URL list. `--timeout 90s` bounds the whole operation;
 without it the command waits until the job is done. `--home DIR` selects the directory for identity and requester state.
@@ -253,7 +253,7 @@ uploads for the program, token IDs and noise. Set its execution budget for
 the selected hardware and step count.
 
 ```sh
-hellas image --provider ENROLLMENT_ID@NODE_ID --model klein \
+hellas --chain-config chain.json image --provider ENROLLMENT_ID@NODE_ID --model klein \
   --prompt 'a small red fox' --seed 42 --width 512 --height 512 --steps 4 \
   --backend hellas/catena-dfad87438018-hip --pay 20 -o fox.png
 ```

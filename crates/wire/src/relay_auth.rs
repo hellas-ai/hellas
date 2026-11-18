@@ -154,7 +154,7 @@ mod tests {
 
     fn fixture() -> RelayAdmission<'static> {
         RelayAdmission::new(
-            "hellas-devnet-1",
+            "test-network",
             "relay.example:8443",
             "/relay/validator",
             PeerIdentity([0x42; 32]),

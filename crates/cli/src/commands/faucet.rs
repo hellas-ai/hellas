@@ -15,14 +15,21 @@ pub const DEFAULT_AMOUNT: u64 = 1000;
 /// Sends `amount` from a random public faucet account of the selected chain
 /// to `principal`, waits until the payment is final, and prints the
 /// principal's balance.
-pub async fn faucet(amount: u64, principal: &SoftPasskey, profile: &ChainProfile) -> CliResult {
+pub async fn faucet(
+    amount: u64,
+    accounts: &std::path::Path,
+    principal: &SoftPasskey,
+    profile: &ChainProfile,
+) -> CliResult {
     ensure!(amount > 0, "amount must be positive");
-    let account = faucet_account(profile, rand::random_range(0..100))?;
+    let accounts: Vec<FaucetAccount> = serde_json::from_slice(&std::fs::read(accounts)?)?;
+    ensure!(!accounts.is_empty(), "faucet accounts file is empty");
+    let account = &accounts[rand::random_range(0..accounts.len())];
     eprintln!(
         "devnet faucet account {}: {}",
         account.index, account.address
     );
-    let balance = pay(amount, &faucet_passkey(&account)?, principal, profile)
+    let balance = pay(amount, &faucet_passkey(account)?, principal, profile)
         .await
         .with_context(|| format!("devnet faucet account {}", account.index))?;
     println!(
@@ -139,17 +146,6 @@ async fn owned_coins(
     Ok(coins)
 }
 
-fn faucet_account(chain: &ChainProfile, index: u8) -> anyhow::Result<FaucetAccount> {
-    let faucet_json = chain
-        .faucet_json()
-        .ok_or_else(|| anyhow!("selected chain has no faucet accounts"))?;
-    let accounts: Vec<FaucetAccount> = serde_json::from_str(faucet_json)?;
-    accounts
-        .into_iter()
-        .find(|account| account.index == index)
-        .ok_or_else(|| anyhow!("devnet faucet account must be from 0 through 99"))
-}
-
 fn faucet_passkey(account: &FaucetAccount) -> anyhow::Result<SoftPasskey> {
     let scalar: [u8; 32] = hex::decode(&account.secret_scalar)?
         .try_into()
@@ -162,33 +158,12 @@ fn faucet_passkey(account: &FaucetAccount) -> anyhow::Result<SoftPasskey> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hellas_chain::genesis::Chain;
-
-    #[test]
-    fn every_faucet_passkey_controls_its_genesis_allocation() {
-        let chain = ChainProfile::known(Chain::Devnet);
-        let genesis: hellas_chain::genesis::Genesis =
-            serde_json::from_str(hellas_chain::genesis::HELLAS_DEVNET_4_JSON).unwrap();
-        for index in 0..100 {
-            let account = faucet_account(&chain, index).unwrap();
-            let key = faucet_passkey(&account).unwrap();
-            let address = SettlementKey::from(key.party_key()).to_string();
-            let allocation = genesis
-                .allocations
-                .iter()
-                .find(|a| a.address == address)
-                .unwrap();
-            assert!(allocation.balance >= DEFAULT_AMOUNT);
-            assert_eq!(address, account.address);
-        }
-        assert!(faucet_account(&chain, 100).is_err());
-    }
 
     #[test]
     fn the_faucet_pays_the_principal_and_waits_until_the_payment_is_final() {
         use hellas_chain::test_support::devnet::{Devnet, DevnetConfig, GenesisOwner, run};
         run(|runtime| async move {
-            let faucet = GenesisOwner::faucet(7);
+            let faucet = GenesisOwner::passkey(7);
             let mut devnet = Devnet::start(
                 runtime,
                 DevnetConfig {
@@ -213,7 +188,7 @@ mod tests {
             // Everything the faucet holds is too much for one payment.
             let source = SoftPasskey::from_secret_scalar(faucet.secret_scalar).unwrap();
             let principal = SoftPasskey::from_secret_scalar([0x52; 32]).unwrap();
-            assert!(pay(931_145, &source, &principal, &profile).await.is_err());
+            assert!(pay(10_000, &source, &principal, &profile).await.is_err());
         });
     }
 }

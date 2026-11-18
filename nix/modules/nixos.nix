@@ -141,7 +141,6 @@ let
     ++ lib.attrValues service.credentials
     ++ lib.filter (path: path != null) [
       service.configFile
-      service.chainConfig
       service.passkey
       service.environmentFile
     ]
@@ -292,12 +291,12 @@ in
         message = "services.hellas.extraArgs may not override module-managed runtime, content, identity, trust, or configuration flags; use the corresponding option instead.";
       }
       {
-        assertion = cfg.chain == null || cfg.chainConfig == null;
-        message = "services.hellas.chain and chainConfig are mutually exclusive.";
+        assertion = !cfg.enable || cfg.chainConfig != null;
+        message = "services.hellas.chainConfig is required.";
       }
       {
-        assertion = gateway.chain == null || gateway.chainConfig == null;
-        message = "services.hellas.gateway.chain and chainConfig are mutually exclusive.";
+        assertion = !gateway.enable || gateway.chainConfig != null;
+        message = "services.hellas.gateway.chainConfig is required.";
       }
       {
         assertion = hellas.extraArgsAreSafe lib hellas.protectedGatewayExtraArgs gateway.extraArgs;
@@ -328,7 +327,7 @@ in
         # Pull in external model/content mounts even when they are declared
         # `nofail`; starting against an empty mountpoint would index the wrong
         # filesystem and make an otherwise satisfiable environment disappear.
-        RequiresMountsFor = providerRuntimePaths;
+        RequiresMountsFor = providerRuntimePaths ++ lib.optional (cfg.chainConfig != null) cfg.chainConfig;
       };
       path = lib.optionals providerGpuConfigured gpuPackages;
       environment = hellas.renderEnvironment (
@@ -407,7 +406,8 @@ in
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
       unitConfig = lib.optionalAttrs (gatewayRuntimePaths != [ ]) {
-        RequiresMountsFor = gatewayRuntimePaths;
+        RequiresMountsFor =
+          gatewayRuntimePaths ++ lib.optional (gateway.chainConfig != null) gateway.chainConfig;
       };
       path = lib.optionals gatewayGpuConfigured gpuPackages;
       environment = hellas.renderEnvironment (

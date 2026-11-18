@@ -17,7 +17,7 @@ fn config_with_genesis(address: String) -> (ValidatorConfig, Genesis) {
     let public_key = hex::encode(private_key.public_key().encode());
     let genesis = Genesis {
         schema_version: crate::genesis::GENESIS_SCHEMA_VERSION,
-        network_id: crate::genesis::HELLAS_DEVNET_4_ID.to_string(),
+        network_id: "test-network".to_string(),
         validators: vec![GenesisValidator {
             public_key,
             label: "validator-0".to_string(),
@@ -176,7 +176,7 @@ fn peer_topology_must_cover_exact_genesis_committee() {
 #[test]
 fn any_valid_genesis_network_id_is_accepted_and_carried() {
     let address = p256_key(7).to_string();
-    for id in ["hellas-devnet-1", "another-network", "someone-elses-net"] {
+    for id in ["test-network", "another-network", "someone-elses-net"] {
         let (config, mut genesis) = config_with_genesis(address.clone());
         genesis.network_id = id.to_string();
 
