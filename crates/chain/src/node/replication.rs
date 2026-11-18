@@ -3,7 +3,7 @@ use super::*;
 use crate::execution::store::UtxoDatabase;
 use bytes::Bytes;
 use commonware_codec::Decode;
-use commonware_consensus::{Heightable as _, marshal::resolver::handler};
+use commonware_consensus::marshal::resolver::handler;
 use commonware_resolver::opaque;
 use commonware_storage::{mmr, qmdb::sync::resolver as state};
 use commonware_utils::channel::oneshot;
@@ -11,9 +11,7 @@ use futures_util::{StreamExt, stream::FuturesUnordered};
 use hellas_rpc::{
     pb::{chain as pb, swarm},
     services::{
-        chain_sync::{
-            ChainSync, ChainSyncClientImpl, GetArchiveBlock, GetFinalizedBlock, GetOperations,
-        },
+        chain_sync::{ChainSync, ChainSyncClientImpl, GetFinalizedBlock, GetOperations},
         node::{Node, NodeClientImpl},
     },
 };
@@ -200,119 +198,57 @@ impl Network {
         .await
         .cloned()
     }
-    pub async fn fetch(&self, query: FinalizedBlockQuery) -> Option<FinalizedBlock> {
-        self.fetch_from_peers::<GetFinalizedBlock, _, _, _>(|client| async move {
-            let response = client
-                .get_finalized_block(crate::client::finalized_block_query_to_proto(query))
+    pub async fn fetch(&self, query: FinalizedBlockQuery) -> Result<Option<FinalizedBlock>, Error> {
+        for id in self.candidates() {
+            // Only the peer actually queried spends a token. Admission waits
+            // happen before the RPC deadline and do not reach resolver retries.
+            let mut permit = self
+                .manager()
+                .acquire_method_wait::<GetFinalizedBlock>(
+                    peer(id),
+                    RpcObservation::authenticated_transport("iroh"),
+                )
                 .await
-                .map_err(QueryError::from)?;
-            let Some(wire) = response.block else {
-                return Ok(None);
-            };
-            let block = crate::client::finalized_block_from_proto(wire).map_err(invalid)?;
-            self.trust.verify(&block)?;
-            if match query {
-                FinalizedBlockQuery::Height(h) => h != block.snapshot.height,
-                FinalizedBlockQuery::Payload(d) => d != block.snapshot.payload,
-                FinalizedBlockQuery::Latest => false,
-            } {
-                return Err(invalid("peer answered another block query"));
-            }
-            Ok(Some(block))
-        })
-        .await
-    }
-    /// This response is only hash-authenticated. Marshal binds the requested
-    /// digest to a certified chain before admitting the block as finalized.
-    async fn fetch_archive_block(
-        &self,
-        digest: Digest,
-    ) -> Option<(HellasBlock, Option<crate::finality_proof::FinalityProof>)> {
-        self.fetch_from_peers::<GetArchiveBlock, _, _, _>(|client| async move {
-            let response = client
-                .get_archive_block(pb::GetArchiveBlockRequest {
-                    payload: digest.to_vec(),
-                })
-                .await
-                .map_err(QueryError::from)?;
-            let Some(bytes) = response.block else {
-                return Ok(None);
-            };
-            let block = HellasBlock::decode(bytes.as_slice()).map_err(invalid)?;
-            if block.digest() != digest || block.encode().as_ref() != bytes {
-                return Err(invalid("archive response does not match requested digest"));
-            }
-            let epoch =
-                commonware_consensus::types::Epocher::containing(&self.trust, block.height())
-                    .ok_or_else(|| {
-                        invalid("archive block height is outside provisioned authority")
-                    })?
-                    .epoch();
-            if block.context().round.epoch() != epoch {
-                return Err(invalid(
-                    "archive block epoch differs from provisioned height schedule",
-                ));
-            }
-            let proof = if let Some(finalization) = response.finalization {
-                self.trust.verify(&FinalizedBlock {
-                    snapshot: crate::LatestBlock {
-                        height: block.height().get(),
-                        payload: digest,
-                        state_root: block.state_root(),
-                        finalization: finalization.clone(),
-                    },
-                    block: bytes,
-                })?;
-                Some(crate::finality_proof::FinalityProof::decode(&finalization).map_err(invalid)?)
-            } else {
-                None
-            };
-            Ok(Some((block, proof)))
-        })
-        .await
-    }
-    async fn fetch_from_peers<M, T, F, Fut>(&self, read: F) -> Option<T>
-    where
-        M: hellas_wire::MethodMarker,
-        F: Fn(Client) -> Fut,
-        Fut: std::future::Future<Output = Result<Option<T>, Error>>,
-    {
-        let read = &read;
-        let mut pending = futures_util::stream::iter(self.candidates())
-            .map(|id| async move {
-                let mut permit = self
-                    .manager()
-                    .acquire_method::<M>(peer(id), RpcObservation::authenticated_transport("iroh"))
-                    .ok()?;
-                let result =
-                    tokio::time::timeout(TIMEOUT, async { read(self.client(id).await?).await })
-                        .await
-                        .map_err(storage)
-                        .and_then(std::convert::identity);
-                match result {
-                    Ok(block) => {
-                        permit.finish_ok();
-                        block
-                    }
-                    Err(error @ Error::InvalidBlock(_)) => {
-                        permit.finish_err(error.to_string());
-                        self.block(id);
-                        None
-                    }
-                    Err(error) => {
-                        permit.finish_err(error.to_string());
-                        self.clients.lock().unwrap().remove(&id);
-                        None
+                .map_err(|error| storage(format!("ChainSync admission: {error}")))?;
+            let result = tokio::time::timeout(TIMEOUT, async {
+                let client = self.client(id).await?;
+                let response = client
+                    .get_finalized_block(crate::client::finalized_block_query_to_proto(query))
+                    .await
+                    .map_err(QueryError::from)?;
+                let Some(wire) = response.block else {
+                    return Ok(None);
+                };
+                let block = crate::client::finalized_block_from_proto(wire).map_err(invalid)?;
+                self.trust.verify(&block)?;
+                if match query {
+                    FinalizedBlockQuery::Height(h) => h != block.snapshot.height,
+                    FinalizedBlockQuery::Payload(d) => d != block.snapshot.payload,
+                    FinalizedBlockQuery::Latest => false,
+                } {
+                    return Err(invalid("peer answered another block query"));
+                }
+                Ok::<_, Error>(Some(block))
+            })
+            .await;
+            match result {
+                Ok(Ok(block)) => {
+                    permit.finish_ok();
+                    if block.is_some() {
+                        return Ok(block);
                     }
                 }
-            })
-            .buffer_unordered(8);
-        while let Some(block) = pending.next().await {
-            if block.is_some() {
-                return block;
+                Ok(Err(error @ Error::InvalidBlock(_))) => {
+                    permit.finish_err(error.to_string());
+                    self.block(id);
+                }
+                error => {
+                    permit.finish_err(format!("{error:?}"));
+                    self.clients.lock().unwrap().remove(&id);
+                }
             }
         }
-        None
+        Ok(None)
     }
     /// Background discovery. Registry capability observations select feeders.
     pub async fn discover_periodically(&self) {
@@ -417,26 +353,30 @@ impl opaque::Fetcher for ArchiveFetcher {
     type Key = handler::Key<Digest>;
     type Value = Bytes;
     async fn fetch(&self, key: Self::Key) -> Option<Bytes> {
-        match key {
-            handler::Key::Block(digest) => {
-                let (block, proof) = self.network.fetch_archive_block(digest).await?;
-                if let Some(proof) = proof {
-                    self.archive
-                        .accept_verified_proof(block.clone(), proof)
-                        .await
-                        .ok()?;
-                }
-                Some(block.encode())
+        let query = match key {
+            handler::Key::Block(digest) => FinalizedBlockQuery::Payload(digest),
+            handler::Key::Finalized { height } => FinalizedBlockQuery::Height(height.get()),
+            handler::Key::Notarized { .. } => return None,
+        };
+        let block = match self.network.fetch(query).await {
+            Ok(block) => block?,
+            Err(error) => {
+                tracing::error!(%error, "ChainSync local admission failed");
+                return None;
             }
-            handler::Key::Finalized { height } => {
-                let block = self
-                    .network
-                    .fetch(FinalizedBlockQuery::Height(height.get()))
-                    .await?;
-                let decoded = HellasBlock::decode(block.block.as_slice()).ok()?;
-                let proof =
-                    crate::finality_proof::FinalityProof::decode(&block.snapshot.finalization)
-                        .ok()?;
+        };
+        let decoded = HellasBlock::decode(block.block.as_slice()).ok()?;
+        let proof =
+            crate::finality_proof::FinalityProof::decode(&block.snapshot.finalization).ok()?;
+        match key {
+            handler::Key::Block(_) => {
+                self.archive
+                    .accept_verified_proof(decoded.clone(), proof)
+                    .await
+                    .ok()?;
+                Some(decoded.encode())
+            }
+            handler::Key::Finalized { .. } => {
                 if !proof.descendants.is_empty() {
                     return None;
                 }

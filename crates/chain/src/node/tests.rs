@@ -586,30 +586,20 @@ struct StateRequests {
     requested: tokio::sync::Notify,
     advanced: tokio::sync::watch::Sender<bool>,
 }
+struct ReplayGate {
+    height: u64,
+    reached: tokio::sync::Notify,
+    release: tokio::sync::watch::Sender<bool>,
+}
 #[derive(Clone)]
 struct CorruptSource(
     hellas_rpc::pb::chain::GetFinalizedBlockResponse,
     Option<(FullNode, bool)>,
     Option<Arc<StateRequests>>,
+    Option<Arc<ReplayGate>>,
 );
 #[allow(refining_impl_trait)]
 impl hellas_rpc::services::chain_sync::ChainSyncHandler for CorruptSource {
-    async fn get_archive_block(
-        &self,
-        request: hellas_rpc::pb::chain::GetArchiveBlockRequest,
-    ) -> Result<hellas_rpc::pb::chain::GetArchiveBlockResponse, hellas_wire::WireStatus> {
-        if let Some((node, _)) = &self.1 {
-            return hellas_rpc::services::chain_sync::ChainSyncHandler::get_archive_block(
-                node, request,
-            )
-            .await;
-        }
-        Ok(hellas_rpc::pb::chain::GetArchiveBlockResponse {
-            block: self.0.block.as_ref().map(|block| block.block.clone()),
-            finalization: None,
-        })
-    }
-
     async fn get_latest_block(
         &self,
         _: hellas_rpc::pb::chain::GetLatestBlockRequest,
@@ -621,10 +611,27 @@ impl hellas_rpc::services::chain_sync::ChainSyncHandler for CorruptSource {
         request: hellas_rpc::pb::chain::GetFinalizedBlockRequest,
     ) -> Result<hellas_rpc::pb::chain::GetFinalizedBlockResponse, hellas_wire::WireStatus> {
         if let Some((node, _)) = &self.1 {
-            return hellas_rpc::services::chain_sync::ChainSyncHandler::get_finalized_block(
+            let response = hellas_rpc::services::chain_sync::ChainSyncHandler::get_finalized_block(
                 node, request,
             )
-            .await;
+            .await?;
+            if let Some(gate) = &self.3
+                && let Some(snapshot) = response
+                    .block
+                    .as_ref()
+                    .and_then(|block| block.snapshot.as_ref())
+                && snapshot.height <= gate.height
+            {
+                if snapshot.height == gate.height {
+                    gate.reached.notify_one();
+                }
+                gate.release
+                    .subscribe()
+                    .wait_for(|released| *released)
+                    .await
+                    .unwrap();
+            }
+            return Ok(response);
         }
         Ok(self.0.clone())
     }
@@ -709,50 +716,141 @@ impl hellas_rpc::services::chain_sync::ChainSyncHandler for CorruptSource {
 }
 
 #[test]
-fn archive_block_requires_the_requested_hash_and_does_not_assert_finality() {
+fn certified_peer_fetch_spends_one_token_and_waits_for_local_refill() {
+    use hellas_rpc::services::chain_sync::GetFinalizedBlock;
+    use hellas_wire::ServiceMarker as _;
+    use hellas_wire::peers::{
+        AcquireDenied, PeerDirectory, PeerDirectoryConfig, PeerManagerError, PeerRegistryConfig,
+        RpcObservation, ServiceAlias,
+    };
     run_qmdb(|runtime| async move {
         let directory = tempfile::tempdir().unwrap();
         let mut fixture = Fixture::new(runtime, directory.path()).await;
         let block = fixture.next().await;
-        let (endpoint, serving) = serve_source(CorruptSource(
-            crate::server::finalized_block_response(Some(block.clone())),
-            None,
-            None,
-        ))
-        .await;
-        let node = FullNode::start(fixture.config.clone()).await.unwrap();
-        node.0.network.seed(endpoint.addr());
-        let fetcher = super::replication::ArchiveFetcher {
-            network: node.0.network.clone(),
-            archive: node.0.core.indexer.clone(),
-        };
-        use commonware_consensus::marshal::resolver::handler::Key;
-        use commonware_resolver::opaque::Fetcher as _;
+        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .bind()
+            .await
+            .unwrap();
+        let mut network = super::replication::Network::new(
+            endpoint,
+            Trust::Genesis(Arc::new(fixture.committee.verifier.clone())),
+        );
+        let mut sources = Vec::new();
+        for _ in 0..6 {
+            sources.push(
+                serve_source(CorruptSource(
+                    crate::server::finalized_block_response(Some(block.clone())),
+                    None,
+                    None,
+                    None,
+                ))
+                .await,
+            );
+        }
+        let observation = RpcObservation::authenticated_transport("iroh");
+        // Freeze refill to account exactly for requests sent, including cancelled losers.
+        network.directory = PeerDirectory::with_config(
+            super::replication::peer(network.endpoint.id()),
+            PeerDirectoryConfig {
+                registry: PeerRegistryConfig {
+                    bucket_capacity: 64.0,
+                    bucket_refill_per_sec: 0.0,
+                    ..Default::default()
+                },
+                service_aliases: vec![ServiceAlias::new(
+                    hellas_rpc::services::chain_sync::ChainSync::ALPN,
+                    hellas_rpc::services::chain_sync::ChainSync::NAME,
+                )],
+                ..Default::default()
+            },
+        );
+        for (endpoint, _) in &sources {
+            network.seed(endpoint.addr());
+        }
+        for _ in 0..64 {
+            assert_eq!(
+                network
+                    .fetch(FinalizedBlockQuery::Latest)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .snapshot
+                    .payload,
+                block.snapshot.payload
+            );
+        }
+        let mut remaining = 0;
+        for (endpoint, _) in &sources {
+            while let Ok(permit) = network.manager().acquire_method::<GetFinalizedBlock>(
+                super::replication::peer(endpoint.id()),
+                observation,
+            ) {
+                remaining += 1;
+                drop(permit);
+            }
+        }
+        assert_eq!(remaining, 6 * 64 - 64);
+        assert!(
+            network
+                .fetch(FinalizedBlockQuery::Latest)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("ChainSync admission")
+        );
+        // The real 64-token/32-per-second budget must queue locally rather than
+        // return None and make Marshal wait for its 500 ms resolver retry.
+        network.directory = PeerDirectory::with_config(
+            super::replication::peer(network.endpoint.id()),
+            PeerDirectoryConfig {
+                registry: PeerRegistryConfig {
+                    bucket_capacity: 64.0,
+                    bucket_refill_per_sec: 32.0,
+                    ..Default::default()
+                },
+                service_aliases: vec![ServiceAlias::new(
+                    hellas_rpc::services::chain_sync::ChainSync::ALPN,
+                    hellas_rpc::services::chain_sync::ChainSync::NAME,
+                )],
+                ..Default::default()
+            },
+        );
+        for (endpoint, _) in &sources {
+            network.seed(endpoint.addr());
+            loop {
+                match network.manager().acquire_method::<GetFinalizedBlock>(
+                    super::replication::peer(endpoint.id()),
+                    observation,
+                ) {
+                    Ok(permit) => drop(permit),
+                    Err(error) => {
+                        assert!(matches!(
+                            error,
+                            PeerManagerError::Admission(AcquireDenied::RateLimited {
+                                retry_after_ms: Some(_),
+                                ..
+                            })
+                        ));
+                        break;
+                    }
+                }
+            }
+        }
         assert_eq!(
-            fetcher
-                .fetch(Key::Block(block.snapshot.payload))
+            network
+                .fetch(FinalizedBlockQuery::Latest)
                 .await
                 .unwrap()
-                .as_ref(),
-            block.block
+                .unwrap()
+                .snapshot
+                .payload,
+            block.snapshot.payload
         );
-        // A hash match is usable as ancestry, but is not a certified live tip.
-        assert_eq!(node.status().executed_height(), 0);
-        assert!(
-            fetcher
-                .fetch(Key::Block(Digest::from([99; 32])))
-                .await
-                .is_none()
-        );
-        assert!(
-            node.0
-                .manager
-                .is_blocked(super::replication::peer(endpoint.id()))
-        );
-        drop(fetcher);
-        node.shutdown().await.unwrap();
-        endpoint.close().await;
-        serving.abort();
+        network.endpoint.close().await;
+        for (endpoint, serving) in sources {
+            endpoint.close().await;
+            serving.abort();
+        }
     });
 }
 
@@ -772,6 +870,7 @@ fn corrupt_peer_is_dropped_and_marked_failed_in_the_registry() {
             }
             let server = CorruptSource(
                 crate::server::finalized_block_response(Some(block)),
+                None,
                 None,
                 None,
             );
@@ -885,96 +984,81 @@ fn indexed_node_publishes_from_its_execution_database_and_reopens_pruned_state()
 
 #[cfg(feature = "indexer-api")]
 #[test]
-fn indexed_catch_up_with_pruned_certificates_crosses_many_proof_windows() {
+fn indexed_catch_up_preserves_evidence_across_a_network_walk_back_restart() {
     run_qmdb(|runtime| async move {
         let directory = tempfile::tempdir().unwrap();
         let mut fixture = Fixture::new(runtime, &directory.path().join("source")).await;
         let source = FullNode::start(fixture.config.clone()).await.unwrap();
-        let count = crate::finality_proof::MAX_FINALITY_DESCENDANTS * 16;
+        let count = 1024;
         let mut history = Vec::new();
         for _ in 0..count {
-            let incoming = fixture.next().await;
-            let block = HellasBlock::decode(incoming.block.as_slice()).unwrap();
-            assert!(
-                source
-                    .0
-                    .core
-                    .indexer
-                    .marshal
-                    .verified(block.context().round, block)
-                    .await
-            );
-            history.push(incoming);
+            let block = fixture.next().await;
+            apply(&source, block.clone()).await.unwrap();
+            history.push(block);
         }
-        // Model certificate pruning: keep every canonical block but retain only
-        // the tip's certificate. No peer can manufacture a bounded proof at h=1.
         let last = history.last().unwrap();
-        apply(&source, last.clone()).await.unwrap();
-        assert!(matches!(
-            source
-                .0
-                .core
-                .indexer
-                .get_finalized_block(FinalizedBlockQuery::Height(1))
-                .await,
-            Err(QueryError::FinalityProofUnavailable { height: 1 })
-        ));
-        assert!(
-            source
-                .0
-                .core
-                .indexer
-                .marshal
-                .get_finalization(Height::new(1))
-                .await
-                .is_none()
-        );
-        for (name, cached, reopen_during_replay) in [
-            ("cached", true, false),
-            ("fresh", false, false),
-            ("resume", true, true),
-        ] {
+        for restart in [false, true] {
             let mut config = fixture.config.clone();
             config.chain = crate::chain_dir::ChainDir::open(
-                &hellas_private::StoreLocation::from_home(&directory.path().join(name), Crash),
+                &hellas_private::StoreLocation::from_home(
+                    &directory
+                        .path()
+                        .join(if restart { "restart" } else { "fresh" }),
+                    Crash,
+                ),
                 &config.chain,
             )
             .unwrap();
+            let gate = Arc::new(ReplayGate {
+                height: count / 2,
+                reached: Default::default(),
+                release: tokio::sync::watch::channel(false).0,
+            });
+            let mut sources = Vec::new();
+            for _ in 0..6 {
+                sources.push(
+                    serve_source(CorruptSource(
+                        crate::server::finalized_block_response(Some(last.clone())),
+                        Some((source.clone(), false)),
+                        None,
+                        restart.then(|| gate.clone()),
+                    ))
+                    .await,
+                );
+            }
+            config.peers = sources
+                .iter()
+                .map(|(endpoint, _)| endpoint.addr())
+                .collect();
             let node = FullNode::start_indexed(config.clone(), "read".into())
                 .await
                 .unwrap();
-            if cached {
-                for incoming in &history {
-                    let block = HellasBlock::decode(incoming.block.as_slice()).unwrap();
-                    assert!(
-                        node.0
-                            .core
-                            .indexer
-                            .marshal
-                            .verified(block.context().round, block)
-                            .await
-                    );
-                }
-            }
-            node.0.network.seed(source.endpoint_addr());
-            node.0.network.discover(source.endpoint_addr()).await;
-            let node = if reopen_during_replay {
-                let mut progress = node.finalized();
-                progress
-                    .wait_for(|state| state.executed_height() >= count as u64 / 2)
-                    .await
-                    .unwrap();
-                assert!(node.status().executed_height() < last.snapshot.height);
+            let node = if restart {
+                gate.reached.notified().await;
+                let archive = &node.0.core.indexer;
+                assert!(
+                    archive
+                        .marshal
+                        .get_block(Height::new(count / 2 + 1))
+                        .await
+                        .is_some()
+                );
+                assert!(
+                    archive
+                        .marshal
+                        .get_block(Height::new(count / 2))
+                        .await
+                        .is_none()
+                );
+                assert_eq!(node.status().executed_height(), 0);
                 node.shutdown().await.unwrap();
-                config.peers = vec![source.endpoint_addr()];
+                gate.release.send_replace(true);
                 FullNode::start_indexed(config.clone(), "read".into())
                     .await
                     .unwrap()
             } else {
                 node
             };
-            // Fresh and cached cases finish in one process. The third case
-            // separately tests durable recovery from an uncertified height.
             let view = node.wait_ready().await.unwrap();
             assert_eq!(
                 view.client()
@@ -986,22 +1070,20 @@ fn indexed_catch_up_with_pruned_certificates_crosses_many_proof_windows() {
                 last.snapshot.payload
             );
             let publication = node.publication().unwrap();
-            assert_eq!(publication.recovery_height().unwrap(), last.snapshot.height);
-            let near =
-                last.snapshot.height - crate::finality_proof::MAX_FINALITY_DESCENDANTS as u64;
-            let proof = publication
-                .archive
-                .get_finalized_block(FinalizedBlockQuery::Height(near))
-                .await
-                .unwrap()
-                .unwrap();
-            publication
-                .verifier
-                .verify_finalized(
-                    proof,
-                    crate::proof_verify::ProofQuery::Block(FinalizedBlockQuery::Height(near)),
-                )
-                .unwrap();
+            assert_eq!(publication.recovery_height().unwrap(), count);
+            for incoming in &history {
+                let stored = publication
+                    .archive
+                    .get_finalized_block(FinalizedBlockQuery::Height(incoming.snapshot.height))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                fixture
+                    .committee
+                    .verifier
+                    .verify_snapshot(&stored.snapshot, &stored.block)
+                    .unwrap();
+            }
             drop(publication);
             drop(view);
             node.shutdown().await.unwrap();
@@ -1010,7 +1092,7 @@ fn indexed_catch_up_with_pruned_certificates_crosses_many_proof_windows() {
                 .unwrap();
             assert_eq!(
                 reopened.publication().unwrap().recovery_height().unwrap(),
-                last.snapshot.height
+                count
             );
             assert_eq!(
                 reopened
@@ -1024,11 +1106,15 @@ fn indexed_catch_up_with_pruned_certificates_crosses_many_proof_windows() {
                     .unwrap()
                     .unwrap()
                     .block()
-                    .bundle()
-                    .payload,
-                hex::encode(last.snapshot.payload)
+                    .view()
+                    .payload(),
+                last.snapshot.payload
             );
             reopened.shutdown().await.unwrap();
+            for (endpoint, serving) in sources {
+                endpoint.close().await;
+                serving.abort();
+            }
         }
         source.shutdown().await.unwrap();
     });
@@ -1229,6 +1315,7 @@ fn state_sync_blocks_bad_proofs_and_advances_its_floor_from_the_live_feed() {
                 crate::server::finalized_block_response(Some(block.clone())),
                 Some((seed.clone(), corrupt)),
                 Some(requested.clone()),
+                None,
             );
             let (endpoint, task) = serve_source(server).await;
             tasks.push(task);
@@ -1529,6 +1616,7 @@ fn cancelled_bootstrap_releases_its_writer_and_resumes_the_certified_floor() {
             crate::server::finalized_block_response(Some(block.clone())),
             None,
             Some(requested.clone()),
+            None,
         ))
         .await;
         let mut config = fixture.config.clone();
@@ -1591,6 +1679,7 @@ fn rejects_foreign_chain(target_network: hellas_kernel::NetworkId, target_balanc
             crate::server::finalized_block_response(Some(incoming.clone())),
             None,
             None,
+            None,
         ))
         .await;
         let label = "target";
@@ -1622,7 +1711,11 @@ fn rejects_foreign_chain(target_network: hellas_kernel::NetworkId, target_balanc
             let network = replication::Network::new(client.clone(), trust);
             network.seed(endpoint.addr());
             assert!(
-                network.fetch(FinalizedBlockQuery::Latest).await.is_none(),
+                network
+                    .fetch(FinalizedBlockQuery::Latest)
+                    .await
+                    .unwrap()
+                    .is_none(),
                 "{label}: ChainSync accepted foreign history"
             );
             client.close().await;

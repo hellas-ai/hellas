@@ -224,7 +224,12 @@ impl ProofVerifier {
         let view = FinalizedBlockView::decode(&finalized)?;
         let block = view.block();
         for candidate in std::iter::once(block).chain(proof.descendants.iter()) {
-            self.verify_block_epoch(candidate)?;
+            use commonware_consensus::Heightable as _;
+            if self.trust.epoch_at(candidate.height().get())?.epoch
+                != candidate.context().round.epoch().get()
+            {
+                return Err(VerificationError::Epoch);
+            }
         }
         proof
             .verify_terminal_context(proof.descendants.last().unwrap_or(block))
@@ -264,17 +269,6 @@ impl ProofVerifier {
             view,
             transaction_index,
         })
-    }
-
-    pub(crate) fn verify_block_epoch(
-        &self,
-        block: &crate::HellasBlock,
-    ) -> Result<(), VerificationError> {
-        use commonware_consensus::Heightable as _;
-        if self.trust.epoch_at(block.height().get())?.epoch != block.context().round.epoch().get() {
-            return Err(VerificationError::Epoch);
-        }
-        Ok(())
     }
 
     /// Verify an exact key set at one certified Current-QMDB root, plus the

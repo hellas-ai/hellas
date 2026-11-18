@@ -417,49 +417,6 @@ impl Harness {
 }
 
 #[test]
-fn canonical_index_history_preserves_public_proof_bounds() {
-    run_qmdb(|runtime| async move {
-        let mut h = Harness::new(runtime, Vec::new(), "sparse-proofs").await;
-        let store = super::store::IndexStore::open(
-            &h.directory.path().join("sparse.redb"),
-            h.index.store.identity.clone(),
-        )
-        .unwrap();
-        let count = crate::finality_proof::MAX_FINALITY_DESCENDANTS + 2;
-        for height in 1..=count {
-            let proof = h.append(Vec::new()).await;
-            let block = HellasBlock::decode(proof.canonical_block.as_slice()).unwrap();
-            store
-                .prepare_checkpoint(&block, (height == count).then_some(proof), Vec::new())
-                .unwrap();
-            store.publish_intent().unwrap();
-            if height < count {
-                assert!(store.read(None).is_err());
-            }
-        }
-        let read = store.read(None).unwrap();
-        assert!(matches!(
-            read.proof(1)
-                .unwrap_err()
-                .downcast_ref::<crate::QueryError>(),
-            Some(crate::QueryError::FinalityProofUnavailable { height: 1 })
-        ));
-        let proof = read.proof(2).unwrap();
-        assert_eq!(
-            crate::finality_proof::FinalityProof::decode(&proof.finalization)
-                .unwrap()
-                .descendants
-                .len(),
-            crate::finality_proof::MAX_FINALITY_DESCENDANTS
-        );
-        h.verifier
-            .verify(proof, ProofQuery::Block(FinalizedBlockQuery::Height(2)))
-            .unwrap();
-        assert_eq!(store.latest().unwrap().unwrap().digest(), h.head.digest());
-    });
-}
-
-#[test]
 fn native_edge_index_unsorted_committee_genesis_matches_validator() {
     run_qmdb(|runtime| async move {
         let mut harness = Harness::new(runtime, Vec::new(), "unsorted-genesis").await;
@@ -847,7 +804,7 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
             Some(proof.height)
         );
         assert_eq!(
-            hex::encode(h.index.store.latest().unwrap().unwrap().digest()),
+            h.index.store.latest().unwrap().unwrap().payload,
             proof.payload
         );
         let after = h
@@ -1605,7 +1562,7 @@ fn indexed_owner_proof_spans_the_database_publication_boundary() {
             .verify_address(during.bundle().clone(), owner, 0, OWNER_PAGE_LIMIT)
             .unwrap();
         assert_eq!(
-            hex::encode(publication.index.store.latest().unwrap().unwrap().digest()),
+            publication.index.store.latest().unwrap().unwrap().payload,
             previous.payload
         );
         assert!(
@@ -1748,7 +1705,7 @@ fn indexed_restart_replays_published_unacknowledged_checkpoint_before_backlog() 
             .await;
         assert_eq!(h.node.status().executed_height(), tip.height);
         assert_eq!(
-            hex::encode(h.index.store.latest().unwrap().unwrap().digest()),
+            h.index.store.latest().unwrap().unwrap().payload,
             tip.payload
         );
         assert_eq!(

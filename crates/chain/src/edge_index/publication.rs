@@ -6,7 +6,7 @@ use crate::{
     execution::store::{UtxoDatabase, UtxoDb},
     proof_verify::{ProofQuery, ProofVerifier, VerifiedAddress},
 };
-use commonware_codec::Encode as _;
+use commonware_codec::DecodeExt as _;
 use commonware_consensus::{Block as _, Heightable};
 use commonware_cryptography::Digestible;
 use commonware_glue::stateful::db::ManagedDb;
@@ -21,14 +21,18 @@ pub(crate) struct Publication {
     pub(crate) archive: ChainIndexer,
 }
 impl Publication {
-    /// This is a replay target, not authority. Recovery binds it to Marshal's
-    /// authenticated archive and all three executed database commitments.
+    /// Publication can be one block ahead of Marshal's durable acknowledgment.
+    /// Replay that certified checkpoint before reconciling the recovered stores.
     pub(crate) fn recovery_height(&self) -> Result<u64> {
-        Ok(self
-            .index
-            .store
-            .latest()?
-            .map_or(0, |block| block.height().get()))
+        let Some(proof) = self.index.store.latest()? else {
+            return Ok(0);
+        };
+        let height = proof.height;
+        self.verifier.verify(
+            proof,
+            ProofQuery::Block(FinalizedBlockQuery::Height(height)),
+        )?;
+        Ok(height)
     }
 
     /// Reconcile the published index only after Stateful has restored execution,
@@ -39,9 +43,6 @@ impl Publication {
         database: &UtxoDatabase<E>,
         checkpoint: &HellasBlock,
     ) -> Result<()> {
-        if checkpoint.height().get() > 0 {
-            self.verifier.verify_block_epoch(checkpoint)?;
-        }
         let reader = database.read().await;
         if reader.root() != checkpoint.state_root() {
             return Err("index recovery checkpoint differs from executed state".into());
@@ -54,12 +55,12 @@ impl Publication {
             return Err("index recovery checkpoint differs from executed database metadata".into());
         }
         if let Some(intent) = self.index.store.intent()? {
-            let block = intent.block()?;
-            self.verifier.verify_block_epoch(&block)?;
-            if let Some(proof) = intent.proof {
-                self.verify_checkpoint_proof(proof, &block)?;
-            }
-            if block.digest() == checkpoint.digest() {
+            let verified = self.verifier.verify(
+                intent.proof.clone(),
+                ProofQuery::Block(FinalizedBlockQuery::Height(intent.proof.height)),
+            )?;
+            let block = HellasBlock::decode(intent.proof.canonical_block.as_slice())?;
+            if verified.view().payload() == checkpoint.digest() {
                 self.index.store.publish_intent()?;
             } else if checkpoint.height().get().checked_add(1) == Some(block.height().get())
                 && block.parent() == checkpoint.digest()
@@ -72,11 +73,14 @@ impl Publication {
             }
         }
         match self.index.store.latest()? {
-            Some(block) => {
-                if let Some(proof) = self.index.store.proof_for_state_root(reader.root())? {
-                    self.verify_checkpoint_proof(proof, &block)?;
-                }
-                if block.digest() != checkpoint.digest() || block.state_root() != reader.root() {
+            Some(proof) => {
+                let verified = self.verifier.verify(
+                    proof.clone(),
+                    ProofQuery::Block(FinalizedBlockQuery::Height(proof.height)),
+                )?;
+                if verified.view().payload() != checkpoint.digest()
+                    || verified.view().state_root() != reader.root()
+                {
                     return Err(
                         "index publication differs from the recovered execution checkpoint".into(),
                     );
@@ -95,67 +99,27 @@ impl Publication {
         block: &HellasBlock,
         changes: Vec<(Digest, Option<Object>)>,
     ) -> Result<()> {
-        self.verifier.verify_block_epoch(block)?;
         let latest = self.index.store.latest()?;
         if let Some(latest) = &latest
-            && latest.height() >= block.height()
+            && latest.height >= block.height().get()
         {
-            let stored = self.index.store.block(block.height().get())?;
-            if stored.digest() != block.digest() {
+            let stored = self.index.store.read(None)?.proof(block.height().get())?;
+            if stored.payload != hex::encode(block.digest()) {
                 return Err("index checkpoint differs from finalized block".into());
             }
             return Ok(());
         }
-        if latest.as_ref().map_or(1, |p| p.height().get() + 1) != block.height().get() {
+        if latest.as_ref().map_or(1, |p| p.height + 1) != block.height().get() {
             return Err("index must replay every finalized block".into());
         }
-        // Marshal archives a block only after verifying its certificate or its
-        // parent-hash path from a certified descendant. That durable boundary,
-        // rather than a second per-height network read, authorizes replay.
-        let (_, finalization) = self
-            .archive
-            .get_archive_block(block.digest())
-            .await?
-            .ok_or("finalized index block is absent from archive")?;
-        // Public evidence is optional; authenticated ancestry can exceed its bounds.
-        let proof = if let Some(finalization) = finalization {
-            let finalized = crate::FinalizedBlock {
-                snapshot: crate::LatestBlock {
-                    height: block.height().get(),
-                    payload: block.digest(),
-                    state_root: block.state_root(),
-                    finalization,
-                },
-                block: block.encode().to_vec(),
-            };
-            Some(
-                self.verifier
-                    .verify_finalized(
-                        finalized,
-                        ProofQuery::Block(FinalizedBlockQuery::Height(block.height().get())),
-                    )?
-                    .bundle()
-                    .clone(),
-            )
-        } else {
-            None
-        };
-        self.index.store.prepare_checkpoint(block, proof, changes)
-    }
-
-    fn verify_checkpoint_proof(
-        &self,
-        proof: crate::proof_verify::ProofBundle,
-        block: &HellasBlock,
-    ) -> Result<()> {
-        let verified = self.verifier.verify(
-            proof,
+        // The resolver retains each downloaded proof before delivering its block.
+        // Publication uses only local evidence; a checkpoint without it cannot commit.
+        let finalization = self.archive.finality_proof(block).await?;
+        let verified = self.verifier.verify_finalized(
+            crate::indexer::finalized_block(block, finalization),
             ProofQuery::Block(FinalizedBlockQuery::Height(block.height().get())),
         )?;
-        if verified.view().payload() != block.digest() {
-            return Err("index proof differs from executed block".into());
-        }
-        Ok(())
+        self.index.store.prepare(verified.bundle().clone(), changes)
     }
 
     pub(crate) async fn finalized<E: Context + Spawner + Send + Sync + 'static>(
@@ -168,7 +132,7 @@ impl Publication {
             return Err("index publication differs from executed state".into());
         }
         if let Some(latest) = self.index.store.latest()?
-            && latest.height() >= block.height()
+            && latest.height >= block.height().get()
         {
             return Ok(());
         }
@@ -177,12 +141,13 @@ impl Publication {
             .store
             .intent()?
             .ok_or("missing finalized index intent")?;
-        if intent.block()?.digest() != block.digest() {
+        if intent.proof.payload != hex::encode(block.digest()) {
             return Err("index intent differs from finalized block".into());
         }
-        if let Some(proof) = intent.proof {
-            self.verify_checkpoint_proof(proof, block)?;
-        }
+        self.verifier.verify(
+            intent.proof,
+            ProofQuery::Block(FinalizedBlockQuery::Height(block.height().get())),
+        )?;
         self.index.store.publish_intent()
     }
 

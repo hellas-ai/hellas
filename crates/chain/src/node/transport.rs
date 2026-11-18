@@ -252,27 +252,6 @@ impl SyncService {
 }
 #[allow(refining_impl_trait)]
 impl ChainSyncHandler for SyncService {
-    async fn get_archive_block(
-        &self,
-        request: pb::GetArchiveBlockRequest,
-    ) -> Result<pb::GetArchiveBlockResponse, WireStatus> {
-        self.progress.borrow().running()?;
-        let payload = Digest::decode(request.payload.as_slice()).map_err(|_| {
-            WireStatus::new(hellas_wire::WireCode::InvalidArgument, "invalid payload")
-        })?;
-        let archived = self.indexer.get_archive_block(payload).await?;
-        Ok(match archived {
-            Some((block, finalization)) => pb::GetArchiveBlockResponse {
-                block: Some(block.encode().to_vec()),
-                finalization,
-            },
-            None => pb::GetArchiveBlockResponse {
-                block: None,
-                finalization: None,
-            },
-        })
-    }
-
     async fn get_latest_block(
         &self,
         _: pb::GetLatestBlockRequest,
@@ -332,15 +311,6 @@ impl ChainSyncHandler for SyncService {
 #[cfg(test)]
 #[allow(refining_impl_trait)]
 impl ChainSyncHandler for FullNode {
-    async fn get_archive_block(
-        &self,
-        request: pb::GetArchiveBlockRequest,
-    ) -> Result<pb::GetArchiveBlockResponse, WireStatus> {
-        SyncService::new(&self.0.core, self.0.network.clone())
-            .get_archive_block(request)
-            .await
-    }
-
     async fn get_latest_block(
         &self,
         request: pb::GetLatestBlockRequest,

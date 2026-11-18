@@ -131,14 +131,16 @@ impl ChainIndexer {
         proof: crate::finality_proof::FinalityProof,
     ) -> Result<(), QueryError> {
         use commonware_consensus::{Reporter as _, simplex::types::Activity};
-        for candidate in std::iter::once(block).chain(proof.descendants) {
-            if !self
-                .marshal
-                .verified(candidate.context().round, candidate)
-                .await
-            {
-                return Err(QueryError::ChannelClosed);
-            }
+        // Store the certified terminal before its ancestors. Once the certificate
+        // is registered, every subsequently exposed ancestor has local evidence.
+        let mut blocks = std::iter::once(block).chain(proof.descendants).rev();
+        let terminal = blocks.next().expect("proof includes its target block");
+        if !self
+            .marshal
+            .verified(terminal.context().round, terminal)
+            .await
+        {
+            return Err(QueryError::ChannelClosed);
         }
         if !self
             .marshal
@@ -147,6 +149,15 @@ impl ChainIndexer {
             .accepted()
         {
             return Err(QueryError::ChannelClosed);
+        }
+        for candidate in blocks {
+            if !self
+                .marshal
+                .verified(candidate.context().round, candidate)
+                .await
+            {
+                return Err(QueryError::ChannelClosed);
+            }
         }
         Ok(())
     }
@@ -168,43 +179,6 @@ impl ChainIndexer {
             #[cfg(any(test, feature = "full-node"))]
             storage_floor: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
-    }
-
-    /// Hash-addressed canonical ancestry; absence of a standalone certificate
-    /// does not prevent a receiver from checking an authenticated parent link.
-    #[cfg(feature = "full-node")]
-    pub(crate) async fn get_archive_block(
-        &self,
-        payload: Digest,
-    ) -> Result<Option<(HellasBlock, Option<Vec<u8>>)>, QueryError> {
-        let Some((height, stored_payload)) = self.marshal.get_info(&payload).await else {
-            return Ok(None);
-        };
-        if height.get()
-            < self
-                .retained_from
-                .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return Ok(None);
-        }
-        let Some(block) = self.marshal.get_block(height).await else {
-            return Ok(None);
-        };
-        if stored_payload != payload || block.digest() != payload || block.height() != height {
-            return Err(QueryError::StateUnavailable(
-                "archive block index mismatch".into(),
-            ));
-        }
-        let finalization = self
-            .marshal
-            .get_finalization(height)
-            .await
-            .map(|certificate| {
-                crate::finality_proof::FinalityProof::encode(&certificate.encode(), &[])
-                    .map_err(|error| QueryError::StateUnavailable(error.to_string()))
-            })
-            .transpose()?;
-        Ok(Some((block, finalization)))
     }
 
     pub async fn get_finalization(&self, payload: Digest) -> Result<Option<Vec<u8>>, QueryError> {
@@ -275,6 +249,12 @@ impl ChainIndexer {
                 "finalized block digest did not match index".to_string(),
             ));
         }
+        let finalization = self.finality_proof(&block).await?;
+        Ok(Some(finalized_block(&block, finalization)))
+    }
+
+    pub(crate) async fn finality_proof(&self, block: &HellasBlock) -> Result<Vec<u8>, QueryError> {
+        let height = block.height();
         let mut descendants = Vec::new();
         let mut candidate = block.clone();
         let mut proof_bytes = 0usize;
@@ -294,7 +274,7 @@ impl ChainIndexer {
                 .map_err(|_| QueryError::FinalityProofUnavailable {
                     height: height.get(),
                 })?;
-                return Ok(Some(finalized_block(block, encoded)));
+                return Ok(encoded);
             }
             if descendants.len() >= crate::finality_proof::MAX_FINALITY_DESCENDANTS {
                 return Err(QueryError::FinalityProofUnavailable {
@@ -327,7 +307,7 @@ impl ChainIndexer {
     }
 }
 
-fn finalized_block(block: HellasBlock, finalization: Vec<u8>) -> FinalizedBlock {
+pub(crate) fn finalized_block(block: &HellasBlock, finalization: Vec<u8>) -> FinalizedBlock {
     FinalizedBlock {
         snapshot: LatestBlock {
             height: block.height().get(),

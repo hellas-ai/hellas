@@ -214,18 +214,7 @@ impl EdgeIndex {
         let mut envelope = self.metadata(read);
         envelope.evidence = heights
             .into_iter()
-            .map(|height| {
-                read.proof(height).map_err(|error| {
-                    if matches!(
-                        error.downcast_ref::<crate::QueryError>(),
-                        Some(crate::QueryError::FinalityProofUnavailable { .. })
-                    ) {
-                        EdgeIndexError::unavailable(error)
-                    } else {
-                        storage(error)
-                    }
-                })
-            })
+            .map(|height| read.proof(height).map_err(storage))
             .collect::<Result<_>>()?;
         envelope.evidence.sort_by(|a, b| a.payload.cmp(&b.payload));
         Ok(envelope)

@@ -503,7 +503,7 @@ impl Core {
         // may bootstrap their authenticated live state at a certified floor.
         if matches!(indexing, Indexing::Off)
             && plan.should_state_sync(true)
-            && let Some(head) = network.fetch(FinalizedBlockQuery::Latest).await
+            && let Some(head) = network.fetch(FinalizedBlockQuery::Latest).await?
         {
             let proof = crate::finality_proof::FinalityProof::decode(&head.snapshot.finalization)
                 .map_err(invalid)?;
