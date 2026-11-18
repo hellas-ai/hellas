@@ -157,7 +157,7 @@ let
       rustToolchain
       workspaceNativeBuildInputs
       ;
-    cargoDeps = nativePackages.cli.cargoDeps;
+    inherit (nativePkg) cargoVendorDir;
     extraChecks = kernel.checks;
   };
 
@@ -196,26 +196,26 @@ let
           # Compute). Off for the portable release; node packages enable it.
           compute ? false,
         }:
-        pkgSpec.mkHellasPackage (
-          pkgSpec.revEnv
-          // {
-            buildNoDefaultFeatures = true;
-            # Client, gateway and daemon share one native composition.
-            buildFeatures = lib.optional otel "otel" ++ lib.optional compute "compute";
-          }
-        )
+        pkgSpec.buildPackage {
+          cargoExtraArgs =
+            "--locked -p hellas-cli --no-default-features"
+            + lib.optionalString (otel || compute) (
+              " --features "
+              + lib.concatStringsSep "," (lib.optional otel "otel" ++ lib.optional compute "compute")
+            );
+          postBuild = pkgSpec.muslChecks;
+        }
       ) { };
       cli-validator = lib.makeOverridable (
         {
           otel ? false,
         }:
-        pkgSpec.mkHellasPackage (
-          pkgSpec.revEnv
-          // {
-            buildNoDefaultFeatures = true;
-            buildFeatures = [ "validator" ] ++ lib.optional otel "otel";
-          }
-        )
+        pkgSpec.buildPackage {
+          cargoExtraArgs =
+            "--locked -p hellas-cli --no-default-features --features "
+            + lib.concatStringsSep "," ([ "validator" ] ++ lib.optional otel "otel");
+          postBuild = pkgSpec.muslChecks;
+        }
       ) { };
     };
 
@@ -253,41 +253,21 @@ let
   # target. Output is whatever cargo produces in
   # `target/wasm32-unknown-unknown/release/` (rlib today; .wasm if/when the
   # crate adds `crate-type = ["cdylib"]`).
-  hellasRpcWasm =
-    let
-      wasmRust = rustToolchain.override { targets = [ "wasm32-unknown-unknown" ]; };
-      wasmPlatform = pkgs.makeRustPlatform {
-        rustc = wasmRust;
-        cargo = wasmRust;
-        stdenv = pkgs.clangStdenv;
-      };
-    in
-    wasmPlatform.buildRustPackage (
-      nativePkg.commonArgs
-      // nativePkg.revEnv
-      // {
-        pname = "hellas-rpc-wasm";
-        # cargoBuildHook passes the native --target explicitly, which overrides
-        # CARGO_BUILD_TARGET. Select the wasm target in the actual command.
-        buildPhase = ''
-          runHook preBuild
-          cargo build --offline --release --target wasm32-unknown-unknown -p hellas-rpc --no-default-features --jobs "$NIX_BUILD_CORES"
-          runHook postBuild
-        '';
-        # Wasm tests need a wasm test runtime.
-        doCheck = false;
-        dontStrip = true;
-        separateDebugInfo = false;
-        # The default Cargo install hook installs executables, not this rlib.
-        installPhase = ''
-          runHook preInstall
-          install -Dm644 target/wasm32-unknown-unknown/release/libhellas_rpc.rlib "$out/lib/libhellas_rpc.rlib"
-          mkdir -p "$out/lib/deps"
-          cp target/wasm32-unknown-unknown/release/deps/*.rlib "$out/lib/deps/"
-          runHook postInstall
-        '';
-      }
-    );
+  hellasRpcWasm = nativePkg.buildPackage {
+    pname = "hellas-rpc-wasm";
+    toolchain = rustToolchain.override { targets = [ "wasm32-unknown-unknown" ]; };
+    CARGO_BUILD_TARGET = "wasm32-unknown-unknown";
+    cargoExtraArgs = "--locked -p hellas-rpc --no-default-features";
+    # Wasm tests need a wasm test runtime.
+    doCheck = false;
+    dontStrip = true;
+    separateDebugInfo = false;
+    installPhaseCommand = ''
+      install -Dm644 target/wasm32-unknown-unknown/release/libhellas_rpc.rlib "$out/lib/libhellas_rpc.rlib"
+      mkdir -p "$out/lib/deps"
+      cp target/wasm32-unknown-unknown/release/deps/*.rlib "$out/lib/deps/"
+    '';
+  };
 
   linuxOutputs = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux (
     let

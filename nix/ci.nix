@@ -3,7 +3,7 @@
   clippyArgs,
   cargoSelections,
   denyCommand,
-  cargoDeps,
+  cargoVendorDir,
   pkgs,
   lib,
   rustToolchain,
@@ -26,17 +26,25 @@ let
 
   # Use the same fixed-output sources as release builds. In particular, Cargo
   # must not try SSH credentials for a private git dependency during linting.
-  cargoConfig = pkgs.runCommand "hellas-ci-cargo-config" { } ''
-    substitute ${cargoDeps}/.cargo/config.toml "$out" \
-      --replace-fail 'directory = "cargo-vendor-dir"' 'directory = "${cargoDeps}"'
-  '';
+  cargoConfig = "${cargoVendorDir}/config.toml";
 
-  # The audit needs registry index records to check crate yanks. Retain normal
-  # crates.io fetching there, while git dependencies still come from Nix.
-  cargoAuditConfig = pkgs.runCommand "hellas-ci-cargo-audit-config" { } ''
-    substitute ${cargoConfig} "$out" --replace-fail '[source.crates-io]
-    replace-with = "vendored-sources"' ""
-  '';
+  # Audit yanked versions against crates.io; pinned git sources stay vendored.
+  cargoAuditConfig =
+    pkgs.runCommand "hellas-ci-cargo-audit-config"
+      {
+        nativeBuildInputs = [ (pkgs.python3.withPackages (p: [ p.tomli-w ])) ];
+      }
+      ''
+        python3 - <<'PYTHON'
+        import os
+        import tomllib
+        import tomli_w
+        from pathlib import Path
+        config = tomllib.loads(Path("${cargoConfig}").read_text())
+        del config["source"]["crates-io"]["replace-with"]
+        Path(os.environ["out"]).write_text(tomli_w.dumps(config))
+        PYTHON
+      '';
 
   mkCargoConfigured =
     config: offline: name: cmd: environment:
@@ -48,7 +56,7 @@ let
         export CARGO_HOME="$cargo_home"
         # Native build scripts copy source permissions into OUT_DIR. Keep registry
         # builds and different read-only vendor snapshots in separate caches.
-        export CARGO_TARGET_DIR="''${CARGO_TARGET_DIR:-target/check/${builtins.baseNameOf cargoDeps}}"
+        export CARGO_TARGET_DIR="''${CARGO_TARGET_DIR:-target/check/${builtins.baseNameOf cargoVendorDir}}"
         export CARGO_NET_OFFLINE=${lib.boolToString offline}
         export SQLX_OFFLINE=true
         ${lib.optionalString pkgs.stdenv.hostPlatform.isDarwin ''
