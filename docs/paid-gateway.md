@@ -117,8 +117,7 @@ The custom JSON file contains the exact `genesis_json` bytes as a JSON string,
 `trust`, and a nonempty `validators` URL list. The buyer and gateway start
 no chain node. They authenticate remote state against the selected genesis and
 trust; relay URLs supply transport only.
-`transact` defaults to the embedded devnet trust and
-`wss://devnet.hellas.ai/ws/validator-{0..5}`. Local transport and settlement
+`transact` uses the trust and validator routes in the supplied chain file. Local transport and settlement
 keys are created on first use and retained with the identity.
 
 The buyer's principal key funds channels; on the devnet, `hellas --chain-config chain.json faucet --accounts faucet.json` gives it
