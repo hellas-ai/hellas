@@ -58,7 +58,7 @@ let
       ) "--network-id ${escapeShellArg validator.networkId}";
       genesisFlag = optionalString (
         validator.genesis != null
-      ) "--genesis ${escapeShellArg validator.genesis}";
+      ) "--genesis ${escapeShellArg "${validator.genesis}"}";
       relayFlags = concatStringsSep " " (
         map (url: "--relay-url ${escapeShellArg url}") validator.relayUrls
       );
