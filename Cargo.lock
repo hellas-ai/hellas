@@ -1230,7 +1230,7 @@ dependencies = [
  "commonware-storage",
  "commonware-utils",
  "futures",
- "prometheus-client",
+ "prometheus-client 0.25.2",
  "rand_core 0.10.1",
  "thiserror 2.0.21",
  "tracing",
@@ -1351,7 +1351,7 @@ dependencies = [
  "getrandom 0.4.3",
  "governor",
  "libc",
- "prometheus-client",
+ "prometheus-client 0.25.2",
  "rand 0.10.3",
  "rand_core 0.10.1",
  "rayon",
@@ -3150,7 +3150,7 @@ dependencies = [
  "hex",
  "iroh",
  "p256",
- "prometheus-client",
+ "prometheus-client 0.26.0",
  "prost",
  "rand 0.10.3",
  "rand_core 0.10.1",
@@ -3659,7 +3659,7 @@ dependencies = [
  "hellas-xet",
  "iroh",
  "libc",
- "lz4_flex 0.14.0",
+ "lz4_flex 0.14.1",
  "prost",
  "rcgen",
  "rustls",
@@ -4925,9 +4925,9 @@ dependencies = [
 
 [[package]]
 name = "lz4_flex"
-version = "0.14.0"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ecbdfe44b1bd960b68170b417450a628c43f7cf56bb3c5317e61cb230ee7f226"
+checksum = "0f5af6ecc17202a60aebe8502b4e8160bd745820e5a8417c8e5d048af838aec5"
 dependencies = [
  "twox-hash",
 ]
@@ -6514,6 +6514,18 @@ name = "prometheus-client"
 version = "0.25.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6d150ad7bf80e60f45769d18a0a8c01028ab8f56355f33ed7bfce3a31f82e696"
+dependencies = [
+ "dtoa",
+ "itoa",
+ "parking_lot",
+ "prometheus-client-derive-encode",
+]
+
+[[package]]
+name = "prometheus-client"
+version = "0.26.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f021d42d29841d029b61b45a25a7ef94feaf1d744913e59665103333a56045b8"
 dependencies = [
  "dtoa",
  "itoa",
