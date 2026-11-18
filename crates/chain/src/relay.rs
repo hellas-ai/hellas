@@ -196,7 +196,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             hex::encode(signature_bytes),
-            "0ad3692948f967636dbc8ee18414cb0aa1329f470ad3371105f411883decc1780b16bb763bc05032981443b5d1d02887f232aa36f2b7a39ceeb401fb205ba00b"
+            "13e9a5cad80a8eaa43ee09b357796e70b98ed19acfa0abab9816ecf680640ec13b3546b1bd3aad94b69919c3d7d0a42053cc99f751bb02e25bc4389d1bb1090b"
         );
         let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&public_key_bytes).unwrap();
         let signature = ed25519_dalek::Signature::from_bytes(&signature_bytes);
