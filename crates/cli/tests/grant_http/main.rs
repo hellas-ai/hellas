@@ -163,6 +163,11 @@ impl Cli {
         std::fs::write(&path, hex::encode(passkey)).unwrap();
         let home = root.join(name);
         std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("chain.json"),
+            serde_json::to_vec(&hellas_genesis::test_support::profile().to_file()).unwrap(),
+        )
+        .unwrap();
         Self {
             root: root.into(),
             identity: home.join("identity"),
@@ -215,6 +220,9 @@ impl Cli {
     fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_hellas"));
         command.arg("--home").arg(&self.home);
+        command
+            .arg("--chain-config")
+            .arg(self.home.join("chain.json"));
         if args.first() != Some(&"trust") {
             command.arg("--passkey").arg(&self.passkey);
         }
