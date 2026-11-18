@@ -57,6 +57,12 @@ fn describe_and_program_work_without_an_identity_or_original_weights() {
 #[test]
 fn local_model_commands_refuse_descriptors_before_reading_render_inputs() {
     let root = tempfile::tempdir().unwrap();
+    let chain = root.path().join("chain.json");
+    std::fs::write(
+        &chain,
+        serde_json::to_vec(&hellas_genesis::test_support::profile().to_file()).unwrap(),
+    )
+    .unwrap();
     for (fixture, metadata, command) in [
         (
             "../client/src/model/package/mini-qwen3.gguf",
@@ -89,6 +95,8 @@ fn local_model_commands_refuse_descriptors_before_reading_render_inputs() {
                 std::fs::write(descriptor.join(metadata), []).unwrap();
             }
             let output = Command::new(env!("CARGO_BIN_EXE_hellas"))
+                .arg("--chain-config")
+                .arg(&chain)
                 .arg("--home")
                 .arg(root.path().join("home"))
                 .args(&command)
