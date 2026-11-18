@@ -186,7 +186,8 @@ let
     SQLX_OFFLINE = "true";
     SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
     NIX_SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
-    buildInputs = [ ];
+    # MinGW's C dependencies need the pthread headers as well as the Rust link path.
+    buildInputs = lib.optionals stdenv.hostPlatform.isMinGW [ pkgs.windows.mingw_w64_pthreads ];
     nativeBuildInputs = workspaceNativeBuildInputs;
   }
   // crossEnv;
