@@ -167,7 +167,7 @@ mod tests {
             .unwrap();
             let check = |block: &HellasBlock, committee| {
                 let bundle = verifier.bundle(super::finalized_block(
-                    block.clone(),
+                    &block,
                     finality_envelope(committee, block),
                 ));
                 verifier.verify(
