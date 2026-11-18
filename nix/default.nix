@@ -474,6 +474,7 @@ in
   # Evaluated by the explicit Windows jobset in infra services/ci/hydra.nix.
   windowsJobs = lib.optionalAttrs isX86_64Linux {
     inherit (windowsPackages) cli;
+    cli-deps = windowsPackages.cli.cargoArtifacts;
     # Runs on the `wsl` builder (NixOS-WSL inside a Windows VM), whose sandbox
     # exposes WSL interop. Interop translates the working directory to a
     # Windows path, so exec from `/` -- the sandbox-only /build fails EINVAL.

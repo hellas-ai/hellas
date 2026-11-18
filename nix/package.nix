@@ -62,11 +62,16 @@ let
 
   rev = self.rev or self.dirtyRev or "unknown";
 
-  crossEnv = lib.optionalAttrs isCross {
-    # libffi-sys (via catena-lang) builds libffi with autoconf, whose link test
-    # fails on the static clang toolchain's missing libgcc_eh. Rust links its own unwinder.
-    "CFLAGS_${lib.replaceStrings [ "-" ] [ "_" ] targetTriple}" = "--unwindlib=none";
-  };
+  crossEnv =
+    lib.optionalAttrs isCross {
+      # libffi-sys (via catena-lang) builds libffi with autoconf, whose link test
+      # fails on the static clang toolchain's missing libgcc_eh. Rust links its own unwinder.
+      "CFLAGS_${lib.replaceStrings [ "-" ] [ "_" ] targetTriple}" = "--unwindlib=none";
+    }
+    // lib.optionalAttrs stdenv.hostPlatform.isMinGW {
+      # Clang otherwise finds the build host's ELF linker for Windows C probes.
+      NIX_CFLAGS_LINK = "--ld-path=${stdenv.cc.bintools}/bin/${stdenv.cc.targetPrefix}ld";
+    };
 
   muslTestBuild =
     lib.optionalString

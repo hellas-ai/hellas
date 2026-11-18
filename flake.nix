@@ -68,10 +68,7 @@
       # compiled dependencies, which GitHub-hosted checks substitute from
       # cache.hellas.ai; the checks themselves run on GitHub. A PR that changes
       # dependencies or the toolchain builds its own until it merges.
-      hydraJobs.x86_64-linux = {
-        inherit (perSystem.x86_64-linux.checks) cargo-deps;
-        cli-deps = perSystem.x86_64-linux.packages.cli.cargoArtifacts;
-      };
+      hydraJobs.x86_64-linux = { inherit (perSystem.x86_64-linux.checks) cargo-deps; };
       # Infra consumes these component jobs directly. Their checks are the
       # same derivations PR CI builds, with no separate validation environment.
       releaseJobs =
