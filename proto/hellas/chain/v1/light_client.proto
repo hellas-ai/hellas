@@ -4,11 +4,24 @@ package hellas.chain.v1;
 
 // Self-verifying finalized data shared by validators and executing full nodes.
 service ChainSync {
+  rpc GetArchiveBlock(GetArchiveBlockRequest) returns (GetArchiveBlockResponse);
   rpc GetLatestBlock(GetLatestBlockRequest) returns (GetFinalizedBlockResponse);
   rpc GetFinalizedBlock(GetFinalizedBlockRequest) returns (GetFinalizedBlockResponse);
   rpc SubscribeFinalized(GetLatestBlockRequest) returns (stream GetFinalizedBlockResponse);
   rpc GetFinalization(GetFinalizationRequest) returns (GetFinalizationResponse);
   rpc GetOperations(GetOperationsRequest) returns (GetOperationsResponse);
+}
+
+// Hash-addressed ancestry for a receiver following a verified checkpoint.
+// A block alone does not assert finality. The receiver must check its digest
+// against an authenticated parent link before admitting it to execution.
+message GetArchiveBlockRequest {
+  bytes payload = 1;
+}
+message GetArchiveBlockResponse {
+  optional bytes block = 1;
+  // A bounded proof with a direct certificate, when the archive retained one.
+  optional bytes finalization = 2;
 }
 
 // Authenticated QMDB operation ranges; the receiver verifies against a certified root.

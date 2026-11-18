@@ -551,7 +551,6 @@ impl Core {
                     index,
                     verifier: verifier.clone(),
                     archive: indexer.clone(),
-                    source: network.clone(),
                 })
             }
         };

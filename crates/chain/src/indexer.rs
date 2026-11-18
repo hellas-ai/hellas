@@ -170,6 +170,43 @@ impl ChainIndexer {
         }
     }
 
+    /// Hash-addressed canonical ancestry; absence of a standalone certificate
+    /// does not prevent a receiver from checking an authenticated parent link.
+    #[cfg(feature = "full-node")]
+    pub(crate) async fn get_archive_block(
+        &self,
+        payload: Digest,
+    ) -> Result<Option<(HellasBlock, Option<Vec<u8>>)>, QueryError> {
+        let Some((height, stored_payload)) = self.marshal.get_info(&payload).await else {
+            return Ok(None);
+        };
+        if height.get()
+            < self
+                .retained_from
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(None);
+        }
+        let Some(block) = self.marshal.get_block(height).await else {
+            return Ok(None);
+        };
+        if stored_payload != payload || block.digest() != payload || block.height() != height {
+            return Err(QueryError::StateUnavailable(
+                "archive block index mismatch".into(),
+            ));
+        }
+        let finalization = self
+            .marshal
+            .get_finalization(height)
+            .await
+            .map(|certificate| {
+                crate::finality_proof::FinalityProof::encode(&certificate.encode(), &[])
+                    .map_err(|error| QueryError::StateUnavailable(error.to_string()))
+            })
+            .transpose()?;
+        Ok(Some((block, finalization)))
+    }
+
     pub async fn get_finalization(&self, payload: Digest) -> Result<Option<Vec<u8>>, QueryError> {
         let Some((height, stored_payload)) = self.marshal.get_info(&payload).await else {
             return Ok(None);

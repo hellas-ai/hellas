@@ -594,6 +594,22 @@ struct CorruptSource(
 );
 #[allow(refining_impl_trait)]
 impl hellas_rpc::services::chain_sync::ChainSyncHandler for CorruptSource {
+    async fn get_archive_block(
+        &self,
+        request: hellas_rpc::pb::chain::GetArchiveBlockRequest,
+    ) -> Result<hellas_rpc::pb::chain::GetArchiveBlockResponse, hellas_wire::WireStatus> {
+        if let Some((node, _)) = &self.1 {
+            return hellas_rpc::services::chain_sync::ChainSyncHandler::get_archive_block(
+                node, request,
+            )
+            .await;
+        }
+        Ok(hellas_rpc::pb::chain::GetArchiveBlockResponse {
+            block: self.0.block.as_ref().map(|block| block.block.clone()),
+            finalization: None,
+        })
+    }
+
     async fn get_latest_block(
         &self,
         _: hellas_rpc::pb::chain::GetLatestBlockRequest,
@@ -690,6 +706,54 @@ impl hellas_rpc::services::chain_sync::ChainSyncHandler for CorruptSource {
             futures_util::stream::pending(),
         ))
     }
+}
+
+#[test]
+fn archive_block_requires_the_requested_hash_and_does_not_assert_finality() {
+    run_qmdb(|runtime| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let mut fixture = Fixture::new(runtime, directory.path()).await;
+        let block = fixture.next().await;
+        let (endpoint, serving) = serve_source(CorruptSource(
+            crate::server::finalized_block_response(Some(block.clone())),
+            None,
+            None,
+        ))
+        .await;
+        let node = FullNode::start(fixture.config.clone()).await.unwrap();
+        node.0.network.seed(endpoint.addr());
+        let fetcher = super::replication::ArchiveFetcher {
+            network: node.0.network.clone(),
+            archive: node.0.core.indexer.clone(),
+        };
+        use commonware_consensus::marshal::resolver::handler::Key;
+        use commonware_resolver::opaque::Fetcher as _;
+        assert_eq!(
+            fetcher
+                .fetch(Key::Block(block.snapshot.payload))
+                .await
+                .unwrap()
+                .as_ref(),
+            block.block
+        );
+        // A hash match is usable as ancestry, but is not a certified live tip.
+        assert_eq!(node.status().executed_height(), 0);
+        assert!(
+            fetcher
+                .fetch(Key::Block(Digest::from([99; 32])))
+                .await
+                .is_none()
+        );
+        assert!(
+            node.0
+                .manager
+                .is_blocked(super::replication::peer(endpoint.id()))
+        );
+        drop(fetcher);
+        node.shutdown().await.unwrap();
+        endpoint.close().await;
+        serving.abort();
+    });
 }
 
 #[test]
@@ -821,6 +885,157 @@ fn indexed_node_publishes_from_its_execution_database_and_reopens_pruned_state()
 
 #[cfg(feature = "indexer-api")]
 #[test]
+fn indexed_catch_up_with_pruned_certificates_crosses_many_proof_windows() {
+    run_qmdb(|runtime| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let mut fixture = Fixture::new(runtime, &directory.path().join("source")).await;
+        let source = FullNode::start(fixture.config.clone()).await.unwrap();
+        let count = crate::finality_proof::MAX_FINALITY_DESCENDANTS * 16;
+        let mut history = Vec::new();
+        for _ in 0..count {
+            let incoming = fixture.next().await;
+            let block = HellasBlock::decode(incoming.block.as_slice()).unwrap();
+            assert!(
+                source
+                    .0
+                    .core
+                    .indexer
+                    .marshal
+                    .verified(block.context().round, block)
+                    .await
+            );
+            history.push(incoming);
+        }
+        // Model certificate pruning: keep every canonical block but retain only
+        // the tip's certificate. No peer can manufacture a bounded proof at h=1.
+        let last = history.last().unwrap();
+        apply(&source, last.clone()).await.unwrap();
+        assert!(matches!(
+            source
+                .0
+                .core
+                .indexer
+                .get_finalized_block(FinalizedBlockQuery::Height(1))
+                .await,
+            Err(QueryError::FinalityProofUnavailable { height: 1 })
+        ));
+        assert!(
+            source
+                .0
+                .core
+                .indexer
+                .marshal
+                .get_finalization(Height::new(1))
+                .await
+                .is_none()
+        );
+        for (name, cached, reopen_during_replay) in [
+            ("cached", true, false),
+            ("fresh", false, false),
+            ("resume", true, true),
+        ] {
+            let mut config = fixture.config.clone();
+            config.chain = crate::chain_dir::ChainDir::open(
+                &hellas_private::StoreLocation::from_home(&directory.path().join(name), Crash),
+                &config.chain,
+            )
+            .unwrap();
+            let node = FullNode::start_indexed(config.clone(), "read".into())
+                .await
+                .unwrap();
+            if cached {
+                for incoming in &history {
+                    let block = HellasBlock::decode(incoming.block.as_slice()).unwrap();
+                    assert!(
+                        node.0
+                            .core
+                            .indexer
+                            .marshal
+                            .verified(block.context().round, block)
+                            .await
+                    );
+                }
+            }
+            node.0.network.seed(source.endpoint_addr());
+            node.0.network.discover(source.endpoint_addr()).await;
+            let node = if reopen_during_replay {
+                let mut progress = node.finalized();
+                progress
+                    .wait_for(|state| state.executed_height() >= count as u64 / 2)
+                    .await
+                    .unwrap();
+                assert!(node.status().executed_height() < last.snapshot.height);
+                node.shutdown().await.unwrap();
+                config.peers = vec![source.endpoint_addr()];
+                FullNode::start_indexed(config.clone(), "read".into())
+                    .await
+                    .unwrap()
+            } else {
+                node
+            };
+            // Fresh and cached cases finish in one process. The third case
+            // separately tests durable recovery from an uncertified height.
+            let view = node.wait_ready().await.unwrap();
+            assert_eq!(
+                view.client()
+                    .get_latest_block()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .payload,
+                last.snapshot.payload
+            );
+            let publication = node.publication().unwrap();
+            assert_eq!(publication.recovery_height().unwrap(), last.snapshot.height);
+            let near =
+                last.snapshot.height - crate::finality_proof::MAX_FINALITY_DESCENDANTS as u64;
+            let proof = publication
+                .archive
+                .get_finalized_block(FinalizedBlockQuery::Height(near))
+                .await
+                .unwrap()
+                .unwrap();
+            publication
+                .verifier
+                .verify_finalized(
+                    proof,
+                    crate::proof_verify::ProofQuery::Block(FinalizedBlockQuery::Height(near)),
+                )
+                .unwrap();
+            drop(publication);
+            drop(view);
+            node.shutdown().await.unwrap();
+            let reopened = FullNode::start_indexed(config, "read".into())
+                .await
+                .unwrap();
+            assert_eq!(
+                reopened.publication().unwrap().recovery_height().unwrap(),
+                last.snapshot.height
+            );
+            assert_eq!(
+                reopened
+                    .owner_proof(
+                        fixture.allocations[0].0,
+                        0,
+                        crate::owner_proof::OWNER_PAGE_LIMIT,
+                        None
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .block()
+                    .bundle()
+                    .payload,
+                hex::encode(last.snapshot.payload)
+            );
+            reopened.shutdown().await.unwrap();
+        }
+        source.shutdown().await.unwrap();
+    });
+}
+
+#[cfg(feature = "indexer-api")]
+#[test]
 fn indexed_catch_up_preserves_certificates_beyond_one_proof_window() {
     run_qmdb(|runtime| async move {
         let directory = tempfile::tempdir().unwrap();
@@ -881,26 +1096,6 @@ fn indexed_catch_up_preserves_certificates_beyond_one_proof_window() {
             );
             let publication = node.publication().unwrap();
             assert_eq!(publication.recovery_height().unwrap(), last.snapshot.height);
-            for incoming in &history {
-                let stored = publication
-                    .archive
-                    .get_finalized_block(FinalizedBlockQuery::Height(incoming.snapshot.height))
-                    .await
-                    .unwrap()
-                    .unwrap();
-                fixture
-                    .committee
-                    .verifier
-                    .verify_snapshot(&stored.snapshot, &stored.block)
-                    .unwrap();
-                assert!(
-                    crate::finality_proof::FinalityProof::decode(&stored.snapshot.finalization)
-                        .unwrap()
-                        .descendants
-                        .len()
-                        <= crate::finality_proof::MAX_FINALITY_DESCENDANTS
-                );
-            }
             drop(publication);
             drop(view);
             node.shutdown().await.unwrap();

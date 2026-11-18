@@ -6,7 +6,7 @@ use crate::{
     execution::store::{UtxoDatabase, UtxoDb},
     proof_verify::{ProofQuery, ProofVerifier, VerifiedAddress},
 };
-use commonware_codec::DecodeExt as _;
+use commonware_codec::Encode as _;
 use commonware_consensus::{Block as _, Heightable};
 use commonware_cryptography::Digestible;
 use commonware_glue::stateful::db::ManagedDb;
@@ -19,21 +19,16 @@ pub(crate) struct Publication {
     pub(crate) index: EdgeIndex,
     pub(crate) verifier: Arc<ProofVerifier>,
     pub(crate) archive: ChainIndexer,
-    pub(crate) source: crate::node::replication::Network,
 }
 impl Publication {
-    /// Publication can be one block ahead of Marshal's durable acknowledgment.
-    /// Replay that certified checkpoint before reconciling the recovered stores.
+    /// This is a replay target, not authority. Recovery binds it to Marshal's
+    /// authenticated archive and all three executed database commitments.
     pub(crate) fn recovery_height(&self) -> Result<u64> {
-        let Some(proof) = self.index.store.latest()? else {
-            return Ok(0);
-        };
-        let height = proof.height;
-        self.verifier.verify(
-            proof,
-            ProofQuery::Block(FinalizedBlockQuery::Height(height)),
-        )?;
-        Ok(height)
+        Ok(self
+            .index
+            .store
+            .latest()?
+            .map_or(0, |block| block.height().get()))
     }
 
     /// Reconcile the published index only after Stateful has restored execution,
@@ -56,12 +51,11 @@ impl Publication {
             return Err("index recovery checkpoint differs from executed database metadata".into());
         }
         if let Some(intent) = self.index.store.intent()? {
-            let verified = self.verifier.verify(
-                intent.proof.clone(),
-                ProofQuery::Block(FinalizedBlockQuery::Height(intent.proof.height)),
-            )?;
-            let block = HellasBlock::decode(intent.proof.canonical_block.as_slice())?;
-            if verified.view().payload() == checkpoint.digest() {
+            let block = intent.block()?;
+            if let Some(proof) = intent.proof {
+                self.verify_checkpoint_proof(proof, &block)?;
+            }
+            if block.digest() == checkpoint.digest() {
                 self.index.store.publish_intent()?;
             } else if checkpoint.height().get().checked_add(1) == Some(block.height().get())
                 && block.parent() == checkpoint.digest()
@@ -74,14 +68,11 @@ impl Publication {
             }
         }
         match self.index.store.latest()? {
-            Some(proof) => {
-                let verified = self.verifier.verify(
-                    proof.clone(),
-                    ProofQuery::Block(FinalizedBlockQuery::Height(proof.height)),
-                )?;
-                if verified.view().payload() != checkpoint.digest()
-                    || verified.view().state_root() != reader.root()
-                {
+            Some(block) => {
+                if let Some(proof) = self.index.store.proof_for_state_root(reader.root())? {
+                    self.verify_checkpoint_proof(proof, &block)?;
+                }
+                if block.digest() != checkpoint.digest() || block.state_root() != reader.root() {
                     return Err(
                         "index publication differs from the recovered execution checkpoint".into(),
                     );
@@ -102,49 +93,74 @@ impl Publication {
     ) -> Result<()> {
         let latest = self.index.store.latest()?;
         if let Some(latest) = &latest
-            && latest.height >= block.height().get()
+            && latest.height() >= block.height()
         {
-            let stored = self.index.store.read(None)?.proof(block.height().get())?;
-            if stored.payload != hex::encode(block.digest()) {
+            let stored = self.index.store.block(block.height().get())?;
+            if stored.digest() != block.digest() {
                 return Err("index checkpoint differs from finalized block".into());
             }
             return Ok(());
         }
-        if latest.as_ref().map_or(1, |p| p.height + 1) != block.height().get() {
+        if latest.as_ref().map_or(1, |p| p.height().get() + 1) != block.height().get() {
             return Err("index must replay every finalized block".into());
         }
-        let query = FinalizedBlockQuery::Height(block.height().get());
-        let (stored, repaired) = match self.archive.get_finalized_block(query).await {
-            // Older archives discarded the certificates of fetched ancestors.
-            // Repair that persisted history with a bounded, authenticated proof
-            // for this height, without changing proof limits or skipping execution.
-            Err(crate::QueryError::FinalityProofUnavailable { height }) => (
-                self.source
-                    .fetch(query)
-                    .await
-                    .ok_or(crate::QueryError::FinalityProofUnavailable { height })?,
-                true,
-            ),
-            result => (
-                result?.ok_or("finalized index block is absent from archive")?,
-                false,
-            ),
+        // Marshal archives a block only after verifying its certificate or its
+        // parent-hash path from a certified descendant. That durable boundary,
+        // rather than a second per-height network read, authorizes replay.
+        let archived = self
+            .archive
+            .marshal
+            .get_block(block.height())
+            .await
+            .ok_or("finalized index block is absent from archive")?;
+        if archived.digest() != block.digest() {
+            return Err("index checkpoint differs from authenticated archive".into());
+        }
+        // Public evidence is optional: a valid historical block need not have a
+        // certificate within the public proof's size/descendant bounds.
+        let proof = if let Some(certificate) =
+            self.archive.marshal.get_finalization(block.height()).await
+        {
+            let finalized = crate::FinalizedBlock {
+                snapshot: crate::LatestBlock {
+                    height: block.height().get(),
+                    payload: block.digest(),
+                    state_root: block.state_root(),
+                    finalization: crate::finality_proof::FinalityProof::encode(
+                        &certificate.encode(),
+                        &[],
+                    )?,
+                },
+                block: block.encode().to_vec(),
+            };
+            Some(
+                self.verifier
+                    .verify_finalized(
+                        finalized,
+                        ProofQuery::Block(FinalizedBlockQuery::Height(block.height().get())),
+                    )?
+                    .bundle()
+                    .clone(),
+            )
+        } else {
+            None
         };
-        let verified = self.verifier.verify_finalized(
-            stored,
+        self.index.store.prepare_checkpoint(block, proof, changes)
+    }
+
+    fn verify_checkpoint_proof(
+        &self,
+        proof: crate::proof_verify::ProofBundle,
+        block: &HellasBlock,
+    ) -> Result<()> {
+        let verified = self.verifier.verify(
+            proof,
             ProofQuery::Block(FinalizedBlockQuery::Height(block.height().get())),
         )?;
         if verified.view().payload() != block.digest() {
             return Err("index proof differs from executed block".into());
         }
-        if repaired {
-            let proof =
-                crate::finality_proof::FinalityProof::decode(&verified.bundle().finalization)?;
-            self.archive
-                .accept_verified_proof(block.clone(), proof)
-                .await?;
-        }
-        self.index.store.prepare(verified.bundle().clone(), changes)
+        Ok(())
     }
 
     pub(crate) async fn finalized<E: Context + Spawner + Send + Sync + 'static>(
@@ -157,7 +173,7 @@ impl Publication {
             return Err("index publication differs from executed state".into());
         }
         if let Some(latest) = self.index.store.latest()?
-            && latest.height >= block.height().get()
+            && latest.height() >= block.height()
         {
             return Ok(());
         }
@@ -166,13 +182,12 @@ impl Publication {
             .store
             .intent()?
             .ok_or("missing finalized index intent")?;
-        if intent.proof.payload != hex::encode(block.digest()) {
+        if intent.block()?.digest() != block.digest() {
             return Err("index intent differs from finalized block".into());
         }
-        self.verifier.verify(
-            intent.proof,
-            ProofQuery::Block(FinalizedBlockQuery::Height(block.height().get())),
-        )?;
+        if let Some(proof) = intent.proof {
+            self.verify_checkpoint_proof(proof, block)?;
+        }
         self.index.store.publish_intent()
     }
 
