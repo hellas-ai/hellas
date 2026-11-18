@@ -79,7 +79,7 @@ impl GenesisOwner {
     /// Panics if `index` is not in 0..100.
     pub fn faucet(index: u8) -> Self {
         let accounts: Vec<crate::genesis::FaucetAccount> =
-            serde_json::from_str(crate::genesis::HELLAS_DEVNET_3_FAUCET_JSON)
+            serde_json::from_str(crate::genesis::HELLAS_DEVNET_4_FAUCET_JSON)
                 .expect("the shipped faucet list parses");
         let account = accounts
             .into_iter()

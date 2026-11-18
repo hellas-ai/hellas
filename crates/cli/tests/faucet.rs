@@ -8,7 +8,7 @@ fn faucet_refuses_a_chain_without_faucet_accounts_before_creating_an_identity() 
     let mut trust = known.trust().clone();
     trust.network_id = "custom-faucet-test".into();
     let mut genesis: serde_json::Value =
-        serde_json::from_str(hellas_chain::genesis::HELLAS_DEVNET_3_JSON).unwrap();
+        serde_json::from_str(hellas_chain::genesis::HELLAS_DEVNET_4_JSON).unwrap();
     genesis["network_id"] = serde_json::json!("custom-faucet-test");
     let genesis_json = serde_json::to_string(&genesis).unwrap();
     trust.genesis_sha256 = hex::encode(sha2::Sha256::digest(genesis_json.as_bytes()));

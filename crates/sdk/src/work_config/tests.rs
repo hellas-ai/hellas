@@ -12,7 +12,7 @@ fn a_single_authenticated_route_is_usable() {
         .with_validators(vec![" WSS://EXAMPLE.COM:443 ".into()])
         .unwrap();
     assert_eq!(config.chain.validators(), ["wss://example.com/"]);
-    assert_eq!(config.network().as_str(), "hellas-devnet-3");
+    assert_eq!(config.network().as_str(), "hellas-devnet-4");
 }
 
 #[test]

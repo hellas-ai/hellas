@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "network_id": "hellas-devnet-3",
-  "genesis_sha256": "e7d27dbc4744f08b3e8ca3c0656b698ca3bcaa0f1d184cacce8cb8af2711c3d1",
+  "network_id": "hellas-devnet-4",
+  "genesis_sha256": "be1d1f9240f3eccd18afc8675d967454842c6a694e9ee8b4e457b3a5fd7c9901",
   "epochs": [
     {
       "epoch": 0,

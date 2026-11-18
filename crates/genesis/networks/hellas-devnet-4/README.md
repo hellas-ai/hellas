@@ -1,8 +1,12 @@
-# `hellas-devnet-3`
+# `hellas-devnet-4`
 
 This is the reset development-only genesis document consumed by Hellas
 validators, relays, indexers, and clients. It is not a released network and
 must not hold anything of value.
+
+Devnet-4 starts validators and the v4 proof index together. The previous chain
+no longer has a complete genesis archive. Chain state is namespaced by the new
+genesis and epoch-zero identity, so the existing service homes can be retained.
 
 The six validator identities are reproducible with validator seed `100`. The
 maker and taker P-256 development accounts are reproducible from the following
@@ -24,14 +28,14 @@ value-bearing deployment. Anyone can spend them; account selection does not
 reserve an account or replenish its balance.
 
 For index `N`, the 32-byte secret scalar is
-`SHA256(b"hellas-devnet-3/faucet/v1\0" || N.to_be_bytes())`, where `N` is an
+`SHA256(b"hellas-devnet-4/faucet/v1\0" || N.to_be_bytes())`, where `N` is an
 unsigned 32-bit integer and the domain ends in one zero byte. Interpret the
 digest as a big-endian P-256 scalar. All 100 digests are valid nonzero P-256
 scalars. The address is base58 of the 33-byte compressed SEC1 public key.
 For example, the scalar of account 7 can be reproduced with:
 
 ```sh
-python3 -c 'import hashlib; print(hashlib.sha256(b"hellas-devnet-3/faucet/v1\0" + (7).to_bytes(4, "big")).hexdigest())'
+python3 -c 'import hashlib; print(hashlib.sha256(b"hellas-devnet-4/faucet/v1\0" + (7).to_bytes(4, "big")).hexdigest())'
 ```
 
 `hellas faucet [--amount N]` picks one random account for that invocation,

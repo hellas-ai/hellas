@@ -1009,7 +1009,7 @@ mod tests {
         }
 
         let genesis: crate::genesis::Genesis =
-            serde_json::from_str(crate::genesis::HELLAS_DEVNET_3_JSON)
+            serde_json::from_str(crate::genesis::HELLAS_DEVNET_4_JSON)
                 .expect("shipped document parses");
         let funded: Vec<&str> = genesis
             .allocations
@@ -1028,11 +1028,11 @@ mod tests {
         // key is generated independently, not derived from a public scalar.
         expected.push("25uDmUCQcwYUHHyXthtEspGB2KVTmbys8vTSqAMXKNqRV".to_string());
         let accounts: Vec<crate::genesis::FaucetAccount> =
-            serde_json::from_str(crate::genesis::HELLAS_DEVNET_3_FAUCET_JSON).unwrap();
+            serde_json::from_str(crate::genesis::HELLAS_DEVNET_4_FAUCET_JSON).unwrap();
         assert_eq!(accounts.len(), 100);
         for (index, account) in accounts.iter().enumerate() {
             let mut hash = Sha256::new();
-            hash.update(b"hellas-devnet-3/faucet/v1\0");
+            hash.update(b"hellas-devnet-4/faucet/v1\0");
             hash.update((index as u32).to_be_bytes());
             let scalar: [u8; 32] = hash.finalize().into();
             let secret: String = scalar.iter().map(|b| format!("{b:02x}")).collect();
