@@ -262,6 +262,8 @@ let
     doCheck = false;
     dontStrip = true;
     separateDebugInfo = false;
+    # Do not ship the cached workspace placeholders alongside the real rlibs.
+    preBuild = "cargo clean --workspace --release --target wasm32-unknown-unknown";
     installPhaseCommand = ''
       install -Dm644 target/wasm32-unknown-unknown/release/libhellas_rpc.rlib "$out/lib/libhellas_rpc.rlib"
       mkdir -p "$out/lib/deps"

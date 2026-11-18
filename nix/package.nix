@@ -192,7 +192,7 @@ let
   // crossEnv;
 
   # Feature/target/profile-identical packages share a dependency derivation.
-  # Revision stamping and installation hooks belong only to the final package.
+  # Revision stamping and package hooks belong only to the final package.
   buildPackage =
     args:
     let
@@ -211,6 +211,7 @@ let
         // builtins.removeAttrs args [ "toolchain" ];
       cargoArtifacts = builder.buildDepsOnly (
         builtins.removeAttrs packageArgs [
+          "preBuild"
           "postBuild"
           "installPhaseCommand"
           "meta"
