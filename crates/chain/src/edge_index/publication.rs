@@ -39,6 +39,9 @@ impl Publication {
         database: &UtxoDatabase<E>,
         checkpoint: &HellasBlock,
     ) -> Result<()> {
+        if checkpoint.height().get() > 0 {
+            self.verifier.verify_block_epoch(checkpoint)?;
+        }
         let reader = database.read().await;
         if reader.root() != checkpoint.state_root() {
             return Err("index recovery checkpoint differs from executed state".into());
@@ -52,6 +55,7 @@ impl Publication {
         }
         if let Some(intent) = self.index.store.intent()? {
             let block = intent.block()?;
+            self.verifier.verify_block_epoch(&block)?;
             if let Some(proof) = intent.proof {
                 self.verify_checkpoint_proof(proof, &block)?;
             }
@@ -91,6 +95,7 @@ impl Publication {
         block: &HellasBlock,
         changes: Vec<(Digest, Option<Object>)>,
     ) -> Result<()> {
+        self.verifier.verify_block_epoch(block)?;
         let latest = self.index.store.latest()?;
         if let Some(latest) = &latest
             && latest.height() >= block.height()
@@ -107,29 +112,19 @@ impl Publication {
         // Marshal archives a block only after verifying its certificate or its
         // parent-hash path from a certified descendant. That durable boundary,
         // rather than a second per-height network read, authorizes replay.
-        let archived = self
+        let (_, finalization) = self
             .archive
-            .marshal
-            .get_block(block.height())
-            .await
+            .get_archive_block(block.digest())
+            .await?
             .ok_or("finalized index block is absent from archive")?;
-        if archived.digest() != block.digest() {
-            return Err("index checkpoint differs from authenticated archive".into());
-        }
-        // Public evidence is optional: a valid historical block need not have a
-        // certificate within the public proof's size/descendant bounds.
-        let proof = if let Some(certificate) =
-            self.archive.marshal.get_finalization(block.height()).await
-        {
+        // Public evidence is optional; authenticated ancestry can exceed its bounds.
+        let proof = if let Some(finalization) = finalization {
             let finalized = crate::FinalizedBlock {
                 snapshot: crate::LatestBlock {
                     height: block.height().get(),
                     payload: block.digest(),
                     state_root: block.state_root(),
-                    finalization: crate::finality_proof::FinalityProof::encode(
-                        &certificate.encode(),
-                        &[],
-                    )?,
+                    finalization,
                 },
                 block: block.encode().to_vec(),
             };

@@ -19,7 +19,6 @@ pub(super) type Result<T> = std::result::Result<T, Box<dyn std::error::Error + S
 const STORAGE_VERSION: u32 = 4;
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("edge_metadata_v1");
 // Canonical replay checkpoints are independent of bounded public proofs.
-// The old proof table remains readable, so existing indexes need no rebuild.
 const BLOCKS: TableDefinition<u64, &[u8]> = TableDefinition::new("edge_blocks_v1");
 const PROOFS: TableDefinition<u64, &[u8]> = TableDefinition::new("edge_block_proofs_v1");
 const EDGES: TableDefinition<&str, &[u8]> = TableDefinition::new("edge_history_v1");
@@ -50,24 +49,13 @@ pub(super) struct StoredEvent {
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct Intent {
-    #[serde(default)]
     pub canonical_block: Vec<u8>,
     pub proof: Option<ProofBundle>,
     pub changes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
 }
 impl Intent {
     pub fn block(&self) -> Result<HellasBlock> {
-        // Intents written before canonical checkpoints carried only a proof.
-        let bytes = if self.canonical_block.is_empty() {
-            self.proof
-                .as_ref()
-                .ok_or("index intent has no block")?
-                .canonical_block
-                .as_slice()
-        } else {
-            &self.canonical_block
-        };
-        Ok(HellasBlock::decode(bytes)?)
+        Ok(HellasBlock::decode(self.canonical_block.as_slice())?)
     }
 }
 #[derive(Clone)]
@@ -113,20 +101,16 @@ impl IndexStore {
         let write = db.begin_write()?;
         {
             let mut meta = write.open_table(META)?;
-            if meta.get("identity")?.is_some() {
-                let version = meta
+            if meta.get("identity")?.is_some()
+                && meta
                     .get("storage_version")?
                     .map(|v| decode::<u32>(v.value()))
-                    .transpose()?;
-                // Version 3's proof records and intents are still readable.
-                // Advancing the marker prevents an older reader from opening
-                // checkpoints that no longer require standalone public proofs.
-                if !matches!(version, Some(3 | STORAGE_VERSION)) {
-                    return Err(
-                        "edge index storage format changed; rebuild in a new storage directory"
-                            .into(),
-                    );
-                }
+                    .transpose()?
+                    != Some(STORAGE_VERSION)
+            {
+                return Err(
+                    "edge index storage format changed; rebuild in a new storage directory".into(),
+                );
             }
             meta.insert("storage_version", encode(&STORAGE_VERSION)?.as_slice())?;
             if let Some(previous) = meta.get("identity")? {
@@ -165,12 +149,12 @@ impl IndexStore {
             .map(|v| decode(v.value()))
             .transpose()?;
         height
-            .map(|height| read_block(&read.open_table(BLOCKS)?, &read.open_table(PROOFS)?, height))
+            .map(|height| read_block(&read.open_table(BLOCKS)?, height))
             .transpose()
     }
     pub fn block(&self, height: u64) -> Result<HellasBlock> {
         let read = self.db.begin_read()?;
-        read_block(&read.open_table(BLOCKS)?, &read.open_table(PROOFS)?, height)
+        read_block(&read.open_table(BLOCKS)?, height)
     }
     pub fn intent(&self) -> Result<Option<Intent>> {
         let read = self.db.begin_read()?;
@@ -188,7 +172,7 @@ impl IndexStore {
             .map(|v| decode(v.value()))
             .transpose()?;
         if let Some(height) = latest {
-            let block = read_block(&read.open_table(BLOCKS)?, &read.open_table(PROOFS)?, height)?;
+            let block = read_block(&read.open_table(BLOCKS)?, height)?;
             if block.state_root() == root {
                 return optional_proof(&read.open_table(PROOFS)?, height);
             }
@@ -255,13 +239,7 @@ impl IndexStore {
             let previous: Option<u64> =
                 meta.get("latest")?.map(|v| decode(v.value())).transpose()?;
             let previous = previous
-                .map(|height| {
-                    read_block(
-                        &write.open_table(BLOCKS)?,
-                        &write.open_table(PROOFS)?,
-                        height,
-                    )
-                })
+                .map(|height| read_block(&write.open_table(BLOCKS)?, height))
                 .transpose()?;
             if let Some(previous) = previous {
                 if previous.height().get() == height && previous.digest() == block.digest() {
@@ -347,11 +325,8 @@ impl IndexStore {
                         let opening = if edge.opened.height == height {
                             &block
                         } else {
-                            opening_block = read_block(
-                                &write.open_table(BLOCKS)?,
-                                &write.open_table(PROOFS)?,
-                                edge.opened.height,
-                            )?;
+                            opening_block =
+                                read_block(&write.open_table(BLOCKS)?, edge.opened.height)?;
                             &opening_block
                         };
                         let Transaction::Kernel(Tx::Open { terms, .. }) =
@@ -400,14 +375,13 @@ impl IndexStore {
                     }
                 }
             }
+            write
+                .open_table(BLOCKS)?
+                .insert(height, block.encode().as_ref())?;
             if let Some(proof) = intent.proof {
                 write
                     .open_table(PROOFS)?
                     .insert(height, proof.encode_to_vec().as_slice())?;
-            } else {
-                write
-                    .open_table(BLOCKS)?
-                    .insert(height, block.encode().as_ref())?;
             }
             meta.insert("latest", encode(&height)?.as_slice())?;
             meta.remove("intent")?;
@@ -449,7 +423,7 @@ impl ReadSnapshot {
             return Ok(proof);
         }
         let blocks = self.tx.open_table(BLOCKS)?;
-        let block = read_block(&blocks, &proofs, height)?;
+        let block = read_block(&blocks, height)?;
         let mut parent = block.digest();
         let mut descendants = Vec::new();
         let mut bytes = 0usize;
@@ -460,7 +434,7 @@ impl ReadSnapshot {
             else {
                 break;
             };
-            let child = read_block(&blocks, &proofs, child_height)?;
+            let child = read_block(&blocks, child_height)?;
             if child.height().get() != child_height || child.parent() != parent {
                 return Err("index ancestry is not contiguous".into());
             }
@@ -499,11 +473,7 @@ impl ReadSnapshot {
         {
             *cached = Some((
                 reference.height,
-                read_block(
-                    &self.tx.open_table(BLOCKS)?,
-                    &self.tx.open_table(PROOFS)?,
-                    reference.height,
-                )?,
+                read_block(&self.tx.open_table(BLOCKS)?, reference.height)?,
             ));
         }
         transaction_at(&cached.as_ref().expect("block loaded above").1, reference)
@@ -594,21 +564,9 @@ fn optional_proof(
         .map(|value| <ProofBundle as prost::Message>::decode(value.value()).map_err(Into::into))
         .transpose()
 }
-fn read_proof(table: &impl ReadableTable<u64, &'static [u8]>, height: u64) -> Result<ProofBundle> {
-    optional_proof(table, height)?
-        .ok_or_else(|| crate::QueryError::FinalityProofUnavailable { height }.into())
-}
-fn read_block(
-    blocks: &impl ReadableTable<u64, &'static [u8]>,
-    proofs: &impl ReadableTable<u64, &'static [u8]>,
-    height: u64,
-) -> Result<HellasBlock> {
-    if let Some(bytes) = blocks.get(height)? {
-        return Ok(HellasBlock::decode(bytes.value())?);
-    }
-    Ok(HellasBlock::decode(
-        read_proof(proofs, height)?.canonical_block.as_slice(),
-    )?)
+fn read_block(blocks: &impl ReadableTable<u64, &'static [u8]>, height: u64) -> Result<HellasBlock> {
+    let bytes = blocks.get(height)?.ok_or("canonical index block missing")?;
+    Ok(HellasBlock::decode(bytes.value())?)
 }
 fn transaction_at(block: &crate::HellasBlock, reference: &TransactionRef) -> Result<Transaction> {
     use commonware_cryptography::Digestible as _;
