@@ -65,6 +65,13 @@ let
     '';
   specifications = {
     cli = {
+      dependencies =
+        lib.optionalAttrs (x86 || darwin) { cli = nativePackages.cli.cargoArtifacts; }
+        // lib.optionalAttrs x86 {
+          portable-x86_64 = crossPackages.cross-x86_64-linux-musl-cli.cargoArtifacts;
+          portable-aarch64 = crossPackages.cross-aarch64-linux-musl-cli.cargoArtifacts;
+          wasm = hellasRpcWasm.cargoArtifacts;
+        };
       checks = [
         "cli"
         "cloud"
@@ -99,6 +106,7 @@ let
       ];
     };
     gpu = {
+      dependencies.cli-compute = (nativePackages.cli.override { compute = true; }).cargoArtifacts;
       checks = [
         "executor"
         "client-work"
@@ -111,6 +119,10 @@ let
       vms = [ ];
     };
     consensus = {
+      dependencies = {
+        validator = nativePackages.cli-validator.cargoArtifacts;
+        validator-otel = (nativePackages.cli-validator.override { otel = true; }).cargoArtifacts;
+      };
       checks = [
         "telemetry-collector"
         "chain-features"
@@ -165,7 +177,8 @@ let
     in
     {
       inherit checks tests required;
-      inherit (spec) artifacts;
+      # Named jobs keep compiled dependencies rooted when Hydra collects build inputs.
+      inherit (spec) artifacts dependencies;
       release = pkgs.runCommand "hellas-${component}-${system}-release" { } ''
         test -e ${required}
         test ! -e ${required}/nix-support/failed
