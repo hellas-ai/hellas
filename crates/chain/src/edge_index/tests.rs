@@ -417,6 +417,54 @@ impl Harness {
 }
 
 #[test]
+fn version_three_index_intent_upgrades_without_rebuilding_history() {
+    run_qmdb(|runtime| async move {
+        let mut h = Harness::new(runtime, Vec::new(), "old-intent").await;
+        let proof = h.append(Vec::new()).await;
+        let path = h.directory.path().join("version-three.redb");
+        let metadata: redb::TableDefinition<&str, &[u8]> =
+            redb::TableDefinition::new("edge_metadata_v1");
+        {
+            let db = redb::Database::create(&path).unwrap();
+            let write = db.begin_write().unwrap();
+            {
+                let mut meta = write.open_table(metadata).unwrap();
+                meta.insert(
+                    "identity",
+                    serde_json::to_vec(&h.index.store.identity)
+                        .unwrap()
+                        .as_slice(),
+                )
+                .unwrap();
+                meta.insert("storage_version", b"3".as_slice()).unwrap();
+                meta.insert(
+                    "intent",
+                    serde_json::to_vec(&serde_json::json!({"proof": proof, "changes": []}))
+                        .unwrap()
+                        .as_slice(),
+                )
+                .unwrap();
+            }
+            write.commit().unwrap();
+        }
+        let store = super::store::IndexStore::open(&path, h.index.store.identity.clone()).unwrap();
+        assert_eq!(
+            store.intent().unwrap().unwrap().block().unwrap().digest(),
+            h.head.digest()
+        );
+        store.publish_intent().unwrap();
+        assert_eq!(store.latest().unwrap().unwrap().digest(), h.head.digest());
+        let read = store.read(None).unwrap();
+        h.verifier
+            .verify(
+                read.proof(1).unwrap(),
+                ProofQuery::Block(FinalizedBlockQuery::Height(1)),
+            )
+            .unwrap();
+    });
+}
+
+#[test]
 fn canonical_index_history_preserves_public_proof_bounds() {
     run_qmdb(|runtime| async move {
         let mut h = Harness::new(runtime, Vec::new(), "sparse-proofs").await;

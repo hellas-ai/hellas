@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::{cell::RefCell, path::Path, sync::Arc};
 
 pub(super) type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
-const STORAGE_VERSION: u32 = 3;
+const STORAGE_VERSION: u32 = 4;
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("edge_metadata_v1");
 // Canonical replay checkpoints are independent of bounded public proofs.
 // The old proof table remains readable, so existing indexes need no rebuild.
@@ -113,16 +113,20 @@ impl IndexStore {
         let write = db.begin_write()?;
         {
             let mut meta = write.open_table(META)?;
-            if meta.get("identity")?.is_some()
-                && meta
+            if meta.get("identity")?.is_some() {
+                let version = meta
                     .get("storage_version")?
                     .map(|v| decode::<u32>(v.value()))
-                    .transpose()?
-                    != Some(STORAGE_VERSION)
-            {
-                return Err(
-                    "edge index storage format changed; rebuild in a new storage directory".into(),
-                );
+                    .transpose()?;
+                // Version 3's proof records and intents are still readable.
+                // Advancing the marker prevents an older reader from opening
+                // checkpoints that no longer require standalone public proofs.
+                if !matches!(version, Some(3 | STORAGE_VERSION)) {
+                    return Err(
+                        "edge index storage format changed; rebuild in a new storage directory"
+                            .into(),
+                    );
+                }
             }
             meta.insert("storage_version", encode(&STORAGE_VERSION)?.as_slice())?;
             if let Some(previous) = meta.get("identity")? {
@@ -273,9 +277,6 @@ impl IndexStore {
                 }
             } else if height != 1 {
                 return Err("edge index must begin at height one".into());
-            }
-            if block.height().get() != height {
-                return Err("edge index height mismatch".into());
             }
             let mut edges = write.open_table(EDGES)?;
             let mut lookup = write.open_table(LOOKUP)?;
