@@ -12,7 +12,7 @@ use std::time::Duration;
 use tokio::sync::{Notify, Semaphore, mpsc};
 
 fn test_proof_verifier() -> Arc<crate::proof_verify::ProofVerifier> {
-    let profile = hellas_genesis::test_support::profile();
+    let profile = crate::genesis::ChainProfile::known(crate::genesis::Chain::Devnet);
     Arc::new(crate::proof_verify::ProofVerifier::for_profile(&profile).unwrap())
 }
 

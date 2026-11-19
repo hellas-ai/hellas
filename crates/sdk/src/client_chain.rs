@@ -7,6 +7,16 @@ fn invalid(error: impl std::fmt::Display) -> QueryError {
     QueryError::Remote(error.to_string())
 }
 
+fn stale_reason(config: &WorkConfig) -> String {
+    match config.chain.known_chain() {
+        Some(chain) => format!(
+            "this binary is out of date for {}; please update",
+            chain.name()
+        ),
+        None => "endpoint consensus identity differs from the configured chain".into(),
+    }
+}
+
 pub async fn connect(
     config: &WorkConfig,
     timeout: Duration,
@@ -47,9 +57,7 @@ pub async fn connect_at(
                         if client.get_consensus_info().await?.network_id
                             != config.chain.network_id()
                         {
-                            return Err(invalid(
-                                "endpoint consensus identity differs from the configured chain",
-                            ));
+                            return Err(invalid(stale_reason(config)));
                         }
                         let latest = client.get_latest_block().await?.ok_or_else(|| {
                             QueryError::StateUnavailable("chain is catching up".into())

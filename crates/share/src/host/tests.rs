@@ -624,7 +624,7 @@ fn runtime(
         prover,
         chain: hellas_chain::chain_dir::ChainDir::open(
             &home,
-            &hellas_genesis::test_support::profile(),
+            &hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet),
         )
         .unwrap(),
         home,

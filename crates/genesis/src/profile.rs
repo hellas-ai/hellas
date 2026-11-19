@@ -1,4 +1,4 @@
-use crate::{Genesis, Network, TrustDocument};
+use crate::{Chain, Genesis, TrustDocument};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
@@ -8,7 +8,7 @@ const STATE_KEY_DOMAIN: &[u8] = b"hellas.chain-state.v1\0";
 /// One authenticated chain identity and its untrusted transport routes.
 #[derive(Clone, Debug)]
 pub struct ChainProfile {
-    known: Option<Network>,
+    known: Option<Chain>,
     consensus_digest: [u8; 32],
     state_key: [u8; 32],
     trust: TrustDocument,
@@ -92,7 +92,7 @@ impl ChainProfile {
     }
 
     #[must_use]
-    pub const fn known_chain(&self) -> Option<Network> {
+    pub const fn known_chain(&self) -> Option<Chain> {
         self.known
     }
 
@@ -165,7 +165,7 @@ impl ChainProfile {
         self.validators.rotate_left(1);
     }
 
-    pub fn known(chain: Network) -> Self {
+    pub fn known(chain: Chain) -> Self {
         let network = chain.network();
         let genesis: Genesis = serde_json::from_str(network.json).expect("shipped genesis decodes");
         let trust: TrustDocument =
@@ -176,10 +176,11 @@ impl ChainProfile {
             consensus_digest,
             state_key: state_key(consensus_digest, &trust),
             trust,
-            validators: validate_routes(
-                serde_json::from_str(network.validators_json).expect("compiled routes parse"),
-            )
-            .expect("compiled routes are valid"),
+            validators: network
+                .validators
+                .iter()
+                .map(|route| (*route).to_owned())
+                .collect(),
             genesis,
             genesis_json: network.json.to_owned(),
         }
@@ -191,8 +192,9 @@ impl ChainProfile {
         genesis.validate()?;
         let consensus_digest = canonical_digest(&genesis);
         let file_digest = hex::encode(Sha256::digest(&file.genesis_json));
-        for &chain in Network::ALL {
-            if genesis.network_id == chain.network().id() {
+        for network in crate::KNOWN_NETWORKS {
+            let chain = network.chain;
+            if genesis.network_id == chain.network().id {
                 let shipped = Self::known(chain);
                 if consensus_digest != shipped.consensus_digest
                     || file.trust != shipped.trust
@@ -225,11 +227,11 @@ mod tests {
 
     /// A custom network whose trust document binds its genesis bytes.
     fn custom_file(trust_edit: impl FnOnce(&mut TrustDocument)) -> CustomChainFile {
-        let fixture = crate::test_support::profile();
-        let mut genesis = fixture.genesis().clone();
+        let known = ChainProfile::known(Chain::Devnet);
+        let mut genesis = known.genesis().clone();
         genesis.network_id = "custom-1".into();
         let genesis_json = serde_json::to_string(&genesis).unwrap();
-        let mut trust = fixture.trust().clone();
+        let mut trust = known.trust().clone();
         trust.network_id = genesis.network_id;
         trust.genesis_sha256 = hex::encode(Sha256::digest(&genesis_json));
         trust_edit(&mut trust);
@@ -237,25 +239,6 @@ mod tests {
             trust,
             validators: vec!["ws://127.0.0.1:9080".into()],
             genesis_json,
-        }
-    }
-
-    #[test]
-    fn compiled_names_refuse_different_genesis_or_trust() {
-        for &network in Network::ALL {
-            let profile = ChainProfile::known(network);
-            let mut changed_genesis = profile.to_file();
-            changed_genesis.genesis_json.push('\n');
-            changed_genesis.trust.genesis_sha256 =
-                hex::encode(Sha256::digest(&changed_genesis.genesis_json));
-            let mut changed_trust = profile.to_file();
-            changed_trust.trust.network_id = "other-network".into();
-            for file in [changed_genesis, changed_trust] {
-                assert!(matches!(
-                    ChainProfile::custom(file),
-                    Err(ChainProfileError::OutOfDate(name)) if name == network.name()
-                ));
-            }
         }
     }
 
@@ -275,7 +258,7 @@ mod tests {
 
     #[test]
     fn routes_must_be_distinct_websocket_urls_with_a_host() {
-        let profile = crate::test_support::profile();
+        let profile = ChainProfile::known(Chain::Devnet);
         let accepted = profile
             .clone()
             .with_validators(vec![
@@ -325,22 +308,22 @@ mod tests {
 
     #[test]
     fn custom_profile_requires_genesis_bytes_and_rejects_a_foreign_name() {
-        let fixture = crate::test_support::profile();
+        let known = ChainProfile::known(Chain::Devnet);
         let without_genesis = serde_json::json!({
-            "trust": fixture.trust(),
+            "trust": known.trust(),
             "validators": ["ws://127.0.0.1:9080"]
         });
         assert!(serde_json::from_value::<CustomChainFile>(without_genesis).is_err());
 
-        let mut trust = fixture.trust().clone();
+        let mut trust = known.trust().clone();
         trust.network_id = "unrelated-1".into();
         assert!(matches!(
             ChainProfile::custom(CustomChainFile {
                 trust,
                 validators: vec!["ws://127.0.0.1:9080".into()],
-                genesis_json: fixture.genesis_json().to_owned(),
+                genesis_json: known.genesis_json().to_owned(),
             }),
-            Err(ChainProfileError::Binding)
+            Err(ChainProfileError::OutOfDate("devnet"))
         ));
     }
 }

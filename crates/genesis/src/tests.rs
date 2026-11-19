@@ -1,47 +1,5 @@
 use super::*;
 
-#[test]
-fn compiled_networks_have_distinct_identities_and_bound_documents() {
-    use sha2::{Digest as _, Sha256};
-    let mut names = BTreeSet::new();
-    let mut ids = BTreeSet::new();
-    let mut validators = BTreeSet::new();
-    let mut accounts = BTreeSet::new();
-    for &network in Network::ALL {
-        let data = network.network();
-        let profile = ChainProfile::known(network);
-        profile.genesis().validate().unwrap();
-        profile.trust().validate().unwrap();
-        assert!(names.insert(network.name()));
-        assert!(ids.insert(data.id()));
-        assert_eq!(profile.genesis_json(), data.json);
-        assert_eq!(profile.network_id(), profile.genesis().network_id);
-        assert_eq!(
-            profile.trust().genesis_sha256,
-            hex::encode(Sha256::digest(data.json))
-        );
-        for selector in [network.name(), &data.id()] {
-            assert_eq!(Network::parse(selector), Some(network));
-            assert_eq!(known_network(selector), Some(data));
-        }
-        assert!(profile.known_genesis_payload_pin().is_some());
-        let rebound = ChainProfile::custom(profile.to_file()).unwrap();
-        assert_eq!(rebound.known_chain(), Some(network));
-        assert_eq!(rebound.state_key(), profile.state_key());
-        for validator in &profile.genesis().validators {
-            assert!(validators.insert(validator.public_key.clone()));
-        }
-        for allocation in &profile.genesis().allocations {
-            assert!(accounts.insert(allocation.address.clone()));
-        }
-    }
-    assert_eq!(
-        known_network_names().into_iter().collect::<BTreeSet<_>>(),
-        names
-    );
-    assert_eq!(Network::parse("unknown-network"), None);
-}
-
 fn fixture() -> Genesis {
     Genesis {
         schema_version: GENESIS_SCHEMA_VERSION,
@@ -60,6 +18,96 @@ fn fixture() -> Genesis {
             address: "example-address".to_string(),
             balance: 100,
         }],
+    }
+}
+
+/// The id constant and the document are two copies of one fact;
+/// this is what keeps them from drifting apart.
+/// Every shipped document must parse, validate, and declare the id
+/// the registry claims for it. A registry entry that lies about its
+/// own id would put a node on a network it did not ask for.
+#[test]
+fn every_known_network_document_declares_the_id_the_registry_claims() {
+    use sha2::{Digest as _, Sha256};
+
+    assert!(!KNOWN_NETWORKS.is_empty());
+    assert_eq!(Chain::default(), KNOWN_NETWORKS[0].chain);
+    for network in KNOWN_NETWORKS {
+        let genesis: Genesis = serde_json::from_str(network.json)
+            .unwrap_or_else(|err| panic!("{} document parses: {err}", network.name));
+        genesis
+            .validate()
+            .unwrap_or_else(|err| panic!("{} document validates: {err}", network.name));
+        assert_eq!(genesis.network_id, network.id, "{}", network.name);
+        let trust: TrustDocument = serde_json::from_str(network.trust_json).unwrap();
+        trust.validate().unwrap();
+        assert_eq!(trust.network_id, network.id, "{} trust id", network.name);
+        assert_eq!(
+            trust.genesis_sha256,
+            hex::encode(Sha256::digest(network.json)),
+            "{} trust must bind exact shipped genesis bytes",
+            network.name
+        );
+        let mut routes = BTreeSet::new();
+        assert!(!network.validators.is_empty());
+        for route in network.validators {
+            let parsed = url::Url::parse(route).unwrap();
+            assert!(parsed.host_str().is_some() && matches!(parsed.scheme(), "ws" | "wss"));
+            assert!(routes.insert(parsed.to_string()), "duplicate shipped route");
+        }
+        assert_eq!(network.chain.name(), network.name);
+        assert_eq!(Chain::parse(network.name), Some(network.chain));
+        assert_eq!(Chain::parse(network.id), Some(network.chain));
+        assert_eq!(known_network(network.name), Some(network));
+        assert_eq!(known_network(network.id), Some(network));
+    }
+    assert_eq!(known_network("mainnet"), None);
+    assert_eq!(known_network("unknown-network"), None);
+    assert_eq!(known_network(""), None);
+    assert_eq!(Chain::parse("mainnet"), None);
+}
+
+/// No two shipped networks may share a name, an id, or — the one
+/// that actually matters — a validator committee. Two networks with
+/// the same committee are one network wearing two names, and every
+/// separation argument above it is decoration.
+#[test]
+fn shipped_networks_share_no_name_id_committee_or_account() {
+    let mut names = BTreeSet::new();
+    let mut chains = BTreeSet::new();
+    let mut ids = BTreeSet::new();
+    let mut keys = BTreeSet::new();
+    let mut addresses = BTreeSet::new();
+
+    for network in KNOWN_NETWORKS {
+        assert!(
+            chains.insert(network.chain),
+            "duplicate compiled Chain selector"
+        );
+        assert!(
+            names.insert(network.name),
+            "duplicate name {}",
+            network.name
+        );
+        assert!(ids.insert(network.id), "duplicate id {}", network.id);
+
+        let genesis: Genesis = serde_json::from_str(network.json).unwrap();
+        for validator in &genesis.validators {
+            assert!(
+                keys.insert(validator.public_key.clone()),
+                "{} reuses validator key {}",
+                network.name,
+                validator.public_key,
+            );
+        }
+        for allocation in &genesis.allocations {
+            assert!(
+                addresses.insert(allocation.address.clone()),
+                "{} reuses funded account {}",
+                network.name,
+                allocation.address,
+            );
+        }
     }
 }
 

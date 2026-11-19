@@ -33,7 +33,7 @@ fn grant_execution_requires_explicit_access_and_refuses_paid_options() {
 async fn an_expired_command_closes_the_endpoint_it_bound() {
     let root = tempfile::tempdir().unwrap();
     let identity = crate::identity::load_or_create(&root.path().join("identity")).unwrap();
-    let chain = hellas_genesis::test_support::profile();
+    let chain = hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet);
     let owner = hellas_kernel::SoftPasskey::from_secret_scalar([7; 32]).unwrap();
     let context = Context::new(
         &identity,
@@ -68,7 +68,7 @@ async fn paid_deadline_options_reach_the_signed_job_configuration() {
         &identity,
         Some(&owner),
         &location,
-        &hellas_genesis::test_support::profile(),
+        &hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet),
     )
     .unwrap();
     for (extra, expected) in [
@@ -88,7 +88,7 @@ async fn paid_deadline_options_reach_the_signed_job_configuration() {
         let args = fetch_args(&extra).client;
         let location = StoreLocation::for_test(root.path());
         let config = hellas_sdk::work_config::WorkConfig::for_chain(
-            hellas_genesis::test_support::profile(),
+            hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet),
             &location,
         )
         .unwrap();
@@ -131,7 +131,7 @@ fn repurchase_uses_a_new_attempt_and_missing_records_do_not_reexecute() {
     let root = tempfile::tempdir().unwrap();
     let chain = hellas_chain::chain_dir::ChainDir::open(
         &StoreLocation::from_home(root.path(), Crash),
-        &hellas_genesis::test_support::profile(),
+        &hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet),
     )
     .unwrap();
     let passkey = hellas_kernel::SoftPasskey::from_secret_scalar([1; 32]).unwrap();

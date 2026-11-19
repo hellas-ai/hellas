@@ -25,7 +25,6 @@ hellas-attestation.workspace = true
 hellas-authority = { workspace = true, features = ["test-support"] }
 hellas-chain = { workspace = true, features = ["chain-dir"] }
 hellas-channel = { workspace = true, features = ["test-support"] }
-hellas-genesis = { workspace = true, features = ["test-support"] }
 hellas-kernel.workspace = true
 hellas-providers = { workspace = true, features = ["test-support"] }
 hellas-sdk = { workspace = true, features = ["integration-tests"] }

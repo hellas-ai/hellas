@@ -79,7 +79,9 @@ impl Fixture {
         );
         use commonware_cryptography::{Hasher as _, Sha256};
         let genesis_json = serde_json::to_string(&genesis).unwrap();
-        let mut trust = hellas_genesis::test_support::profile().trust().clone();
+        let mut trust = hellas_genesis::ChainProfile::known(hellas_genesis::Chain::Devnet)
+            .trust()
+            .clone();
         trust.network_id = genesis.network_id.clone();
         trust.genesis_sha256 = hex::encode(Sha256::hash(genesis_json.as_bytes()));
         trust.epochs[0].threshold_identity = hex::encode(committee.assembler.identity().encode());

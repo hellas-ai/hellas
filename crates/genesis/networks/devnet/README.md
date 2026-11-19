@@ -1,10 +1,10 @@
-# Compiled development network
+# Development network
 
-`Network::Devnet` supplies these genesis, finality trust, genesis payload,
-public faucet accounts and validator transport routes. Its CLI name is `devnet`;
-its full network ID comes from genesis. Re-genesis replaces files here without
-changing Hellas source or tests.
+`Chain::Devnet` uses the genesis, finality trust, genesis payload and public
+faucet accounts in this directory. Its CLI name is `devnet`. `id.txt` contains
+the full genesis network ID without a trailing newline; the registry invariant
+checks it against genesis and trust.
 
-Trust binds the exact genesis bytes. Faucet keys must control their genesis
-allocations. Routes provide transport, not trust. Local tests may supply an
-independent profile with `--chain-config FILE`.
+Re-genesis replaces these data files. Trust binds the exact genesis bytes, and
+faucet keys must control their genesis allocations. Local tests use independent
+synthetic profiles.

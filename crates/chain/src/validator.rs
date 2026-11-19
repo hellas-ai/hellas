@@ -515,7 +515,7 @@ fn setup(args: SetupArgs) -> Result<(), ValidatorError> {
         None => Genesis {
             schema_version: crate::genesis::GENESIS_SCHEMA_VERSION,
             network_id: network_id
-                .unwrap_or_else(|| crate::genesis::Network::default().network().id()),
+                .unwrap_or_else(|| crate::genesis::Chain::default().network().id.to_string()),
             validators: generated_validators,
             allocations: genesis_allocations
                 .iter()
@@ -900,9 +900,14 @@ fn run(
         }
     };
     if scheme.identity().encode().as_ref() != expected_threshold_identity.as_slice() {
-        return Err(ValidatorError::Scheme(
-            "threshold identity differs from configured chain".into(),
-        ));
+        let reason = match profile.known_chain() {
+            Some(chain) => format!(
+                "this binary is out of date for {}; please update",
+                chain.name()
+            ),
+            None => "threshold identity differs from selected chain".into(),
+        };
+        return Err(ValidatorError::Scheme(reason));
     }
     let consensus_info = ConsensusInfo {
         validators: scheme

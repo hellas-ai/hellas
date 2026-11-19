@@ -438,9 +438,11 @@ async fn content_daemon(
         store,
         Arc::new(|| hellas_auth::authority::UnixMillis::now().unwrap()),
     );
-    let chain =
-        hellas_chain::chain_dir::ChainDir::open(&home, &hellas_genesis::test_support::profile())
-            .unwrap();
+    let chain = hellas_chain::chain_dir::ChainDir::open(
+        &home,
+        &hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet),
+    )
+    .unwrap();
     Core::open(
         Options {
             discovery: false,

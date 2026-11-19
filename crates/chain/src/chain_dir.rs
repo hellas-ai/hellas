@@ -167,7 +167,7 @@ fn directories(root: &StoreLocation) -> io::Result<Vec<StoreLocation>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::genesis::{CustomChainFile, Genesis};
+    use crate::genesis::{Chain, CustomChainFile, Genesis};
     use hellas_private::Durability::Crash;
     use sha2::{Digest as _, Sha256};
 
@@ -177,7 +177,7 @@ mod tests {
         let home = StoreLocation::from_home(&directory.path().join("home"), Crash);
         assert!(ChainDir::discover(&home).unwrap().is_empty());
         assert!(!home.exists(), "discovery must not create a home");
-        let profile = hellas_genesis::test_support::profile()
+        let profile = ChainProfile::known(Chain::Devnet)
             .with_validators(vec!["wss://example.com/chain".into()])
             .unwrap();
         let chain = ChainDir::open(&home, &profile).unwrap();
@@ -217,7 +217,7 @@ mod tests {
     fn store_locations_keep_the_selected_durability() {
         use hellas_private::Durability;
         let home = tempfile::tempdir().unwrap();
-        let profile = hellas_genesis::test_support::profile();
+        let profile = ChainProfile::known(Chain::Devnet);
         for durability in [Durability::Crash, Durability::Power] {
             let home = StoreLocation::from_home(home.path(), durability);
             let chain = ChainDir::open(&home, &profile).unwrap();
@@ -238,11 +238,11 @@ mod tests {
     fn same_genesis_with_another_initial_authority_cannot_read_state() {
         let directory = tempfile::tempdir().unwrap();
         let home = StoreLocation::from_home(directory.path(), Crash);
-        let fixture = hellas_genesis::test_support::profile();
-        let mut genesis: Genesis = fixture.genesis().clone();
+        let known = ChainProfile::known(Chain::Devnet);
+        let mut genesis: Genesis = known.genesis().clone();
         genesis.network_id = "custom-1".into();
         let genesis_json = serde_json::to_string(&genesis).unwrap();
-        let mut trust = fixture.trust().clone();
+        let mut trust = known.trust().clone();
         trust.network_id = genesis.network_id.clone();
         trust.genesis_sha256 = hex::encode(Sha256::digest(&genesis_json));
         let make = |trust| {

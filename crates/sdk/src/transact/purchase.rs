@@ -551,7 +551,7 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let chain = hellas_chain::chain_dir::ChainDir::open(
                 &hellas_private::StoreLocation::from_home(root.path(), durability),
-                &hellas_genesis::test_support::profile(),
+                &hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet),
             )
             .unwrap();
             let path =

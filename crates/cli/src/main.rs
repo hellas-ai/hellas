@@ -42,7 +42,7 @@ fn acts_for_principal(command: &Commands) -> bool {
 #[command(version = option_env!("GIT_REV").unwrap_or(env!("CARGO_PKG_VERSION")))]
 #[command(about = "Hellas node CLI")]
 struct Cli {
-    /// Select a compiled network by name or full network ID.
+    /// Select a compiled chain (default: the most senior compiled chain).
     #[arg(long, global = true, conflicts_with = "chain_config")]
     chain: Option<String>,
 
@@ -278,12 +278,12 @@ async fn async_main() {
     let selected_chain = if let Some(path) = &cli.chain_config {
         hellas_sdk::work_config::load_chain_profile(path).map_err(anyhow::Error::from)
     } else if let Some(name) = &cli.chain {
-        hellas_chain::genesis::Network::parse(name)
+        hellas_chain::genesis::Chain::parse(name)
             .map(hellas_chain::genesis::ChainProfile::known)
             .ok_or_else(|| anyhow::anyhow!("unknown compiled chain {name}"))
     } else {
         Ok(hellas_chain::genesis::ChainProfile::known(
-            hellas_chain::genesis::Network::default(),
+            hellas_chain::genesis::Chain::default(),
         ))
     };
     let selected_chain = match selected_chain {

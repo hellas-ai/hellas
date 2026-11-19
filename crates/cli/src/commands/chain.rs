@@ -271,7 +271,7 @@ pub enum ValidatorCommand {
     },
     /// Generate a TOML config for one validator
     Config {
-        /// Network ID for a newly generated genesis; defaults to the compiled network.
+        /// Network ID for a newly generated genesis; omitted for the shipped devnet.
         #[arg(long, conflicts_with = "genesis")]
         network_id: Option<String>,
         /// Total number of validators in the network
@@ -1092,7 +1092,7 @@ mod tests {
                 node: SettlementKey::from(Key::from_bytes([0; Key::LENGTH])),
             },
             None,
-            &hellas_genesis::test_support::profile(),
+            &ChainProfile::known(hellas_chain::genesis::Chain::Devnet),
             &hellas_private::StoreLocation::for_test(home.path()),
         )
         .await

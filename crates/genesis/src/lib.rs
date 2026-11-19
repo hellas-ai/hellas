@@ -8,7 +8,7 @@
 //! It is `std` and it is a crate, because the document is `String`s, `Vec`s
 //! and a `BTreeSet` of them, and because the readers are not all nodes: a
 //! `wasm32-unknown-unknown` browser build and a relay in another repository
-//! read the same compiled network documents. `hellas-chain`
+//! read the same shipped bytes as the validator does. `hellas-chain`
 //! re-exports it whole as `hellas_chain::genesis`.
 
 use std::collections::BTreeSet;
@@ -16,6 +16,21 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 pub const GENESIS_SCHEMA_VERSION: u16 = 1;
+
+/// The in-tree development network's document.
+pub const HELLAS_DEVNET_JSON: &str = include_str!("../networks/devnet/genesis.json");
+
+/// The id that document names.
+pub const HELLAS_DEVNET_ID: &str = include_str!("../networks/devnet/id.txt");
+
+/// Offline seed-100 finality trust bound to the shipped devnet genesis.
+pub const HELLAS_DEVNET_TRUST_JSON: &str = include_str!("../networks/devnet/trust.json");
+/// Genesis block payload independently derived from the shipped document.
+pub const HELLAS_DEVNET_GENESIS_PAYLOAD: &str =
+    include_str!("../networks/devnet/genesis-payload.hex");
+
+/// Intentionally public software-passkey credentials for the development network.
+pub const HELLAS_DEVNET_FAUCET_JSON: &str = include_str!("../networks/devnet/faucet.json");
 
 /// One public development account. Cryptographic consumers validate its key.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -28,36 +43,40 @@ pub struct FaucetAccount {
     pub secret_scalar: String,
 }
 
-/// A network whose identity and routes ship inside the binary.
+/// A network whose genesis document ships inside the binary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KnownNetwork {
+    /// The selector for this compiled identity.
+    pub chain: Chain,
+    /// Short name to select it by, e.g. `devnet`.
     pub name: &'static str,
+    /// Full network id the document declares.
+    pub id: &'static str,
+    /// The document itself.
     pub json: &'static str,
+    /// Independently authenticated finality trust for this immutable genesis.
     pub trust_json: &'static str,
+    /// Genesis block payload for full-node execution.
     pub genesis_payload_hex: &'static str,
-    pub validators_json: &'static str,
+    /// Default transport routes. They convey no trust.
+    pub validators: &'static [&'static str],
+    /// Public faucet credentials, when this known chain has one.
     pub faucet_json: Option<&'static str>,
 }
 
-impl KnownNetwork {
-    /// The full ID is data, so re-genesis never changes a Rust identifier.
-    #[must_use]
-    pub fn id(&self) -> String {
-        serde_json::from_str::<Genesis>(self.json)
-            .expect("compiled genesis parses")
-            .network_id
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
-pub enum Network {
-    #[default]
+/// Known chains in descending seniority. Only deployed chains are represented.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum Chain {
     Devnet,
 }
 
-impl Network {
-    pub const ALL: &[Self] = &[Self::Devnet];
+impl Default for Chain {
+    fn default() -> Self {
+        KNOWN_NETWORKS[0].chain
+    }
+}
 
+impl Chain {
     #[must_use]
     pub fn name(self) -> &'static str {
         self.network().name
@@ -65,36 +84,58 @@ impl Network {
 
     #[must_use]
     pub fn parse(selector: &str) -> Option<Self> {
-        Self::ALL
-            .iter()
-            .copied()
-            .find(|network| network.name() == selector || network.network().id() == selector)
+        known_network(selector).map(|network| network.chain)
     }
 
     #[must_use]
     pub fn network(self) -> &'static KnownNetwork {
-        match self {
-            Self::Devnet => &KnownNetwork {
-                name: "devnet",
-                json: include_str!("../networks/devnet/genesis.json"),
-                trust_json: include_str!("../networks/devnet/trust.json"),
-                genesis_payload_hex: include_str!("../networks/devnet/genesis-payload.hex"),
-                validators_json: include_str!("../networks/devnet/routes.json"),
-                faucet_json: Some(include_str!("../networks/devnet/faucet.json")),
-            },
-        }
+        KNOWN_NETWORKS
+            .iter()
+            .find(|network| network.chain == self)
+            .expect("compiled chain registry entry")
     }
 }
 
-/// Select a compiled network by its CLI name or the ID in its genesis.
+/// Every network this binary can join without being handed a file.
+///
+/// Compiled in on purpose: operators should not have to ship genesis
+/// JSON around to talk to a network everyone already agrees on, and a
+/// document passed by path is a document that can be swapped.
+///
+/// This registry supplies the default compiled Chain and explicit selection.
+/// A reset of this ephemeral devnet replaces its data and bumps its network id.
+/// Adding another deployed chain adds a separate entry.
+/// Callers resolve one Chain or provide a custom profile.
+pub const KNOWN_NETWORKS: &[KnownNetwork] = &[KnownNetwork {
+    chain: Chain::Devnet,
+    name: "devnet",
+    id: HELLAS_DEVNET_ID,
+    json: HELLAS_DEVNET_JSON,
+    trust_json: HELLAS_DEVNET_TRUST_JSON,
+    genesis_payload_hex: HELLAS_DEVNET_GENESIS_PAYLOAD,
+    validators: &[
+        "wss://devnet.hellas.ai/ws/validator-0",
+        "wss://devnet.hellas.ai/ws/validator-1",
+        "wss://devnet.hellas.ai/ws/validator-2",
+        "wss://devnet.hellas.ai/ws/validator-3",
+        "wss://devnet.hellas.ai/ws/validator-4",
+        "wss://devnet.hellas.ai/ws/validator-5",
+    ],
+    faucet_json: Some(HELLAS_DEVNET_FAUCET_JSON),
+}];
+
+/// Looks up a shipped network by its short name (`devnet`) or its full id.
 #[must_use]
 pub fn known_network(selector: &str) -> Option<&'static KnownNetwork> {
-    Network::parse(selector).map(Network::network)
+    KNOWN_NETWORKS
+        .iter()
+        .find(|network| network.name == selector || network.id == selector)
 }
 
+/// The short names a caller may pass, for help text and error messages.
 #[must_use]
 pub fn known_network_names() -> Vec<&'static str> {
-    Network::ALL.iter().map(|network| network.name()).collect()
+    KNOWN_NETWORKS.iter().map(|network| network.name).collect()
 }
 
 const PUBLIC_KEY_HEX_BYTES: usize = 64;

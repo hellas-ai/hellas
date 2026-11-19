@@ -306,7 +306,7 @@ mod tests {
             prover: None,
             chain: crate::test_support::chain_dir(
                 directory.path(),
-                hellas_kernel::NetworkId::new("test-network").unwrap(),
+                hellas_kernel::NetworkId::new("hellas-devnet-1").unwrap(),
             ),
             home,
             signer: Arc::new(PROVIDER.node_key()),

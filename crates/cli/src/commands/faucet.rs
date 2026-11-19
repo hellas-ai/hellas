@@ -19,7 +19,7 @@ pub async fn faucet(amount: u64, principal: &SoftPasskey, profile: &ChainProfile
     ensure!(amount > 0, "amount must be positive");
     let faucet_json = profile
         .faucet_json()
-        .context("configured chain has no faucet accounts")?;
+        .context("selected chain has no faucet accounts")?;
     let accounts: Vec<FaucetAccount> = serde_json::from_str(faucet_json)?;
     ensure!(!accounts.is_empty(), "compiled faucet accounts are empty");
     let account = &accounts[rand::random_range(0..accounts.len())];
@@ -159,8 +159,8 @@ mod tests {
 
     #[test]
     fn compiled_faucet_keys_control_their_genesis_allocations() {
-        for &network in hellas_chain::genesis::Network::ALL {
-            let profile = ChainProfile::known(network);
+        for network in hellas_chain::genesis::KNOWN_NETWORKS {
+            let profile = ChainProfile::known(network.chain);
             let Some(json) = profile.faucet_json() else {
                 continue;
             };

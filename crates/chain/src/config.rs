@@ -2,7 +2,9 @@ use crate::domain::{
     PublicKey, SettlementKey as UserSettlementKey, SettlementKeyError, ThresholdPolynomial,
     ThresholdShare,
 };
-pub use crate::genesis::{Genesis, GenesisAllocation as GenesisEntry, GenesisValidator};
+pub use crate::genesis::{
+    Genesis, GenesisAllocation as GenesisEntry, GenesisValidator, HELLAS_DEVNET_JSON,
+};
 use commonware_codec::{Decode, DecodeExt, Encode};
 use commonware_cryptography::bls12381::primitives::sharing::ModeVersion;
 use commonware_cryptography::{Signer, ed25519};

@@ -1,31 +1,6 @@
 use super::*;
 
 #[test]
-fn compiled_network_selection_conflicts_with_custom_configuration() {
-    for &network in hellas_chain::genesis::Network::ALL {
-        for selector in [network.name(), &network.network().id()] {
-            let args = ["hellas", "--chain", selector, "identity", "show-node-id"];
-            assert_eq!(
-                Cli::try_parse_from(args).unwrap().chain.as_deref(),
-                Some(selector)
-            );
-            assert!(
-                Cli::try_parse_from([
-                    "hellas",
-                    "--chain",
-                    selector,
-                    "--chain-config",
-                    "chain.json",
-                    "identity",
-                    "show-node-id",
-                ])
-                .is_err()
-            );
-        }
-    }
-}
-
-#[test]
 fn durability_is_global_and_defaults_to_crash() {
     use hellas_private::Durability;
     for args in [

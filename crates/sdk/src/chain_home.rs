@@ -206,7 +206,8 @@ mod tests {
     async fn invalid_client_roots_close_content_after_refusing_recovery() {
         let directory = tempfile::tempdir().unwrap();
         let home = StoreLocation::for_test(directory.path());
-        let profile = hellas_genesis::test_support::profile();
+        let profile =
+            hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet);
         let chain = ChainDir::open(&home, &profile).unwrap();
         let root = chain.client_journals("not-a-directory");
         std::fs::create_dir_all(root.parent().unwrap()).unwrap();

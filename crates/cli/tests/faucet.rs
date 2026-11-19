@@ -19,7 +19,7 @@ fn faucet_refuses_a_local_chain_without_creating_a_device_identity() {
         .unwrap();
     assert!(!output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("configured chain has no faucet accounts")
+        String::from_utf8_lossy(&output.stderr).contains("selected chain has no faucet accounts")
     );
     assert!(home.path().join("principal.key").exists());
     assert!(!home.path().join("identity").exists());

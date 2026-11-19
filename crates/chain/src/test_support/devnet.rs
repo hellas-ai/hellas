@@ -575,11 +575,11 @@ impl Devnet {
     /// A full-node configuration that submits through `validator` and
     /// syncs from it. The caller owns the node it starts.
     pub fn profile(&self, validator: usize) -> crate::genesis::ChainProfile {
-        use crate::genesis::{ChainProfile, CustomChainFile};
+        use crate::genesis::{Chain, ChainProfile, CustomChainFile};
         use commonware_cryptography::{Hasher as _, Sha256};
         let validator = &self.validators[validator];
         let genesis_json = serde_json::to_string(&self.document).unwrap();
-        let mut trust = hellas_genesis::test_support::profile().trust().clone();
+        let mut trust = ChainProfile::known(Chain::Devnet).trust().clone();
         trust.network_id = self.document.network_id.clone();
         trust.genesis_sha256 = hex::encode(Sha256::hash(genesis_json.as_bytes()));
         trust.epochs[0].threshold_identity = hex::encode(&self.consensus_info.threshold_identity);
