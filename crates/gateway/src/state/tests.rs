@@ -1,5 +1,6 @@
 use super::*;
 use crate::WorkExecutionBackend;
+use hellas_client::model::ModelRequest;
 use hellas_rpc::provenance::ExecutionProvenance;
 
 /// The tiny Qwen3 GGUF the client text package tests render.
@@ -94,16 +95,20 @@ async fn authenticated_prefixes_arrive_before_the_paid_terminal() {
         payment_ack: payment_ack.clone(),
     }))
     .await;
-    let mut live = state
-        .prepare_ids(
-            vec![0],
-            1,
-            None,
+    let (_, mut live) = state
+        .execution
+        .compute(
             &mut crate::test_support::selection(state.execution.work.clone()),
+            true,
+            |_| ModelRequest::Text {
+                prompt_ids: &[0],
+                max_new: 1,
+                stops: &[],
+            },
         )
         .await
         .unwrap();
-    let prefix = live.prepared.next().await.unwrap().unwrap();
+    let prefix = live.next().await.unwrap().unwrap();
     assert!(matches!(
         prefix,
         crate::WorkEvent::Output(ComputeEvent::Output(
@@ -111,7 +116,7 @@ async fn authenticated_prefixes_arrive_before_the_paid_terminal() {
         ))
     ));
     let terminal = {
-        let terminal = live.prepared.next();
+        let terminal = live.next();
         tokio::pin!(terminal);
         assert!(futures::poll!(terminal.as_mut()).is_pending());
         payment_ack.notify_one();
@@ -121,7 +126,7 @@ async fn authenticated_prefixes_arrive_before_the_paid_terminal() {
         terminal,
         crate::WorkEvent::Output(ComputeEvent::Done { .. })
     ));
-    assert!(live.prepared.next().await.is_none());
+    assert!(live.next().await.is_none());
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
@@ -150,15 +155,20 @@ async fn paid_capacity_is_a_retryable_error() {
     }
     let state = open(Arc::new(Busy)).await;
     let error = state
-        .prepare_ids(
-            vec![0],
-            1,
-            None,
+        .execution
+        .compute(
             &mut crate::test_support::selection(state.execution.work.clone()),
+            true,
+            |_| ModelRequest::Text {
+                prompt_ids: &[0],
+                max_new: 1,
+                stops: &[],
+            },
         )
         .await
         .err()
-        .expect("busy backend must reject admission");
+        .expect("busy backend must reject admission")
+        .into();
     assert_eq!(
         crate::backend_status(&error),
         axum::http::StatusCode::SERVICE_UNAVAILABLE
