@@ -29,6 +29,8 @@ mod budget;
 mod gateway;
 #[path = "native_execution/grant.rs"]
 mod grant;
+#[path = "paid_e2e/http_bounds.rs"]
+mod http_bounds;
 #[path = "paid_e2e/remote.rs"]
 mod remote;
 #[path = "paid_e2e/settlement.rs"]
@@ -389,6 +391,19 @@ async fn start_provider(
     PausedFetch,
     hellas_store::content::DiskStore,
 ) {
+    start_provider_for(root, config, identity, None).await
+}
+
+async fn start_provider_for(
+    root: &std::path::Path,
+    config: WorkConfig,
+    identity: &NodeIdentity,
+    http: Option<hellas_sdk::daemon_config::Backend>,
+) -> (
+    hellas_sdk::daemon::testing::Daemon,
+    PausedFetch,
+    hellas_store::content::DiskStore,
+) {
     let (routes, upstream) = routes();
     let content =
         hellas_channel::test_support::channel::content_store(&root.join("provider-state")).await;
@@ -414,7 +429,7 @@ async fn start_provider(
     let execution = hellas_executor::Executor::spawn_configured(executor)
         .await
         .unwrap();
-    let document = Document {
+    let mut document = Document {
         listeners: [(
             "work".into(),
             Listener::Iroh {
@@ -440,8 +455,15 @@ async fn start_provider(
         .into(),
         ..Default::default()
     };
+    let native = if let Some(http) = http {
+        document.backends.insert("fetch".into(), http.clone());
+        drop(execution);
+        http.open_fetch(signer.clone()).await.unwrap()
+    } else {
+        hellas_sdk::Backend::fetch(execution, work_policy())
+    };
     let backend = hellas_sdk::BackendEntry {
-        backend: hellas_sdk::Backend::fetch(execution, work_policy()),
+        backend: native,
         evaluator: None,
         max_in_flight: std::num::NonZeroUsize::MIN,
     };
@@ -957,6 +979,17 @@ fn paid_scenario(
 }
 
 async fn paid_fixture(runtime: commonware_runtime::tokio::Context) -> PaidScenario<()> {
+    paid_fixture_for(runtime, None).await
+}
+
+async fn paid_fixture_for(
+    runtime: commonware_runtime::tokio::Context,
+    http: Option<hellas_sdk::daemon_config::Backend>,
+) -> PaidScenario<()> {
+    let mut policy = paid_policy();
+    if let Some(http) = &http {
+        policy.invocation_policy = http.fetch_policy().unwrap();
+    }
     let root = tempfile::tempdir().unwrap();
     let identity = provider_identity();
     let now = UnixMillis(1);
@@ -1020,12 +1053,12 @@ async fn paid_fixture(runtime: commonware_runtime::tokio::Context) -> PaidScenar
     let config = work_config(&devnet, root.path().join("provider-journal"));
     let relays = remote::Relays::start(&devnet).await;
     let (provider, _, provider_content) =
-        start_provider(root.path(), config.clone(), &identity).await;
+        start_provider_for(root.path(), config.clone(), &identity, http.clone()).await;
     let authority = provider.administration().unwrap().node();
     let caller = hellas_authority::test_support::session(&authority, &secret).await;
     let command = || hellas_authority::model::grant::admin::WorkControlCommand::SetPaidPolicy {
         expected_revision: auth::Revision(0),
-        policy: Box::new(paid_policy()),
+        policy: Box::new(policy.clone()),
     };
     provider
         .administration()
@@ -1035,7 +1068,7 @@ async fn paid_fixture(runtime: commonware_runtime::tokio::Context) -> PaidScenar
         .unwrap();
     assert_eq!(
         authority.paid_policy().await.unwrap().unwrap().policy,
-        paid_policy()
+        policy.clone()
     );
     assert!(matches!(
         provider
@@ -1065,7 +1098,7 @@ async fn paid_fixture(runtime: commonware_runtime::tokio::Context) -> PaidScenar
                 auth::GrantId([0; 16]),
                 hellas_authority::model::grant::admin::WorkControlCommand::SetPaidPolicy {
                     expected_revision: auth::Revision(1),
-                    policy: Box::new(paid_policy())
+                    policy: Box::new(policy.clone())
                 }
             )
             .await,
@@ -1174,7 +1207,9 @@ async fn paid_fixture(runtime: commonware_runtime::tokio::Context) -> PaidScenar
     .await
     .unwrap();
     assert!(journals.setups.is_empty() && journals.unidentified.is_empty());
-    Box::pin(check_gateway_quote(&options, owner.clone())).await;
+    if http.is_none() {
+        Box::pin(check_gateway_quote(&options, owner.clone())).await;
+    }
     assert!(
         approvals.0.lock().unwrap().is_empty(),
         "discovery never approves money"

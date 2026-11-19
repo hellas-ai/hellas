@@ -23,26 +23,32 @@ impl super::Backend {
                 hellas_adaptors::openai::responses::fetch::responses_contract()?
             }
         };
+        let (fetch_limits, max_output_bytes) = match upstream {
+            Upstream::Http { .. } => hellas_rpc::http_fetch::response_bounds()?,
+            Upstream::OpenaiResponses { .. } => (
+                FetchLimits {
+                    max_request_body_bytes: hellas_rpc::fetch::MAX_FETCH_REQUEST_BODY_BYTES as u32,
+                    max_output_events: 65536,
+                    max_spool_bytes: hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES as u64,
+                    max_encoded_result_frame: hellas_rpc::protocol::invocation::MAX_INVOCATION_BYTES
+                        as u32,
+                    max_encoded_prepared_input:
+                        hellas_rpc::protocol::invocation::MAX_INVOCATION_BYTES as u32,
+                },
+                hellas_rpc::protocol::invocation::MAX_INVOCATION_BYTES as u64,
+            ),
+        };
         Ok(InvocationPolicy {
             admissions: vec![Admission::Fetch {
                 admission: FetchAdmission {
                     contract,
                     route: FetchRoutePolicy::sealed_route(service, method)?,
-                    limits: FetchLimits {
-                        max_request_body_bytes: hellas_rpc::fetch::MAX_FETCH_REQUEST_BODY_BYTES
-                            as u32,
-                        max_output_events: 65536,
-                        max_spool_bytes: hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES as u64,
-                        max_encoded_result_frame:
-                            hellas_rpc::protocol::invocation::MAX_INVOCATION_BYTES as u32,
-                        max_encoded_prepared_input:
-                            hellas_rpc::protocol::invocation::MAX_INVOCATION_BYTES as u32,
-                    },
+                    limits: fetch_limits,
                 },
             }],
             limits: Limits {
                 max_upload_bytes: hellas_rpc::protocol::invocation::MAX_INVOCATION_BYTES as u64,
-                max_output_bytes: hellas_rpc::protocol::invocation::MAX_INVOCATION_BYTES as u64,
+                max_output_bytes,
                 max_steps: 1,
                 execution_timeout_ms: 86_400_000,
             },

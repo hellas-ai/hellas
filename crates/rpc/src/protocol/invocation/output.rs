@@ -48,7 +48,7 @@ const CANONICALIZATION: &[u8] = b"hellas.invocation.output.v1";
 const RESULT_DOMAIN: &str = "hellas.invocation.result.v1";
 pub const MAX_CHUNK_BYTES: usize = 64 * 1024;
 
-pub(super) struct ComputeBounds {
+pub(crate) struct OutputBounds {
     pub events: u64,
     pub payload: u64,
     pub frame: u64,
@@ -67,13 +67,7 @@ fn cbor_header(bytes: u64) -> u64 {
 
 /// Reserve the signed output allowance plus its actual codec framing. A step
 /// emits one event; final artifacts use MAX_CHUNK_BYTES and may each be empty.
-pub(super) fn compute_bounds(limits: super::Limits) -> Result<ComputeBounds, CanonicalDecodeError> {
-    use crate::{
-        EventCommitment, InputCommitment, OutputEventBody, OutputEventBodyParts, SignedOutputEvent,
-        StreamId,
-    };
-    use hellas_auth::{Digest, ProducerId, Signature};
-
+pub(super) fn compute_bounds(limits: super::Limits) -> Result<OutputBounds, CanonicalDecodeError> {
     let bytes = limits.max_output_bytes;
     let chunks = limits
         .max_steps
@@ -118,6 +112,72 @@ pub(super) fn compute_bounds(limits: super::Limits) -> Result<ComputeBounds, Can
         .saturating_add(chunk_framing)
         .max(terminal_bytes);
 
+    let payload = bytes
+        .saturating_add(chunks.saturating_mul(chunk_framing))
+        .saturating_add(terminal_bytes);
+    envelope_bounds(events, payload, maximum_payload)
+}
+
+/// Bound one Fetch artifact, including framing each projected JSON event and
+/// splitting it into invocation chunks. The terminal contains only metadata.
+#[cfg(feature = "fetch")]
+pub(crate) fn fetch_bounds(
+    event_bytes: u64,
+    event_count: u64,
+    terminal_payload: &[u8],
+) -> Result<OutputBounds, CanonicalDecodeError> {
+    use super::fetch::{RESPONSE_EVENTS, RESPONSE_EVENTS_FORMAT};
+    let bytes = event_bytes.saturating_add(event_count.saturating_mul(4));
+    let chunks = event_count.saturating_add(bytes / MAX_CHUNK_BYTES as u64);
+    let framing = encode(&(
+        ARTIFACT_CHUNK,
+        ArtifactChunk {
+            name: RESPONSE_EVENTS.into(),
+            format: RESPONSE_EVENTS_FORMAT.into(),
+            offset: u64::MAX,
+            bytes: JsonBytes(vec![]),
+        },
+    ))?
+    .len() as u64
+        + cbor_header(MAX_CHUNK_BYTES as u64)
+        - 1;
+    let metadata = super::fetch::output(&[], terminal_payload)?.metadata;
+    let terminal_bytes = encode(&(
+        TERMINAL,
+        Terminal {
+            artifacts: vec![ArtifactEnd {
+                name: RESPONSE_EVENTS.into(),
+                format: RESPONSE_EVENTS_FORMAT.into(),
+                bytes,
+                content_id: ContentId::from_bytes([0; 32]),
+            }],
+            metadata,
+        },
+    ))?
+    .len() as u64;
+    let payload = bytes
+        .saturating_add(chunks.saturating_mul(framing))
+        .saturating_add(terminal_bytes);
+    envelope_bounds(
+        chunks.saturating_add(1),
+        payload,
+        bytes
+            .min(MAX_CHUNK_BYTES as u64)
+            .saturating_add(framing)
+            .max(terminal_bytes),
+    )
+}
+
+fn envelope_bounds(
+    events: u64,
+    payload: u64,
+    maximum_payload: u64,
+) -> Result<OutputBounds, CanonicalDecodeError> {
+    use crate::{
+        EventCommitment, InputCommitment, OutputEventBody, OutputEventBodyParts, SignedOutputEvent,
+        StreamId,
+    };
+    use hellas_auth::{Digest, ProducerId, Signature};
     // Size the real envelope type. Signature/key contents do not affect their
     // byte-string widths; no signature is produced or trusted here.
     let key = PublicKey::Secp256k1([0; 33]);
@@ -143,10 +203,7 @@ pub(super) fn compute_bounds(limits: super::Limits) -> Result<ComputeBounds, Can
     let event_framing = envelope_framing
         .max((4 * std::mem::size_of::<OutputEventEnvelope>() + ARTIFACT_CHUNK.len()) as u64)
         .max(1024);
-    let payload = bytes
-        .saturating_add(chunks.saturating_mul(chunk_framing))
-        .saturating_add(terminal_bytes);
-    Ok(ComputeBounds {
+    Ok(OutputBounds {
         events,
         payload,
         frame: maximum_payload

@@ -251,6 +251,17 @@ signed Fetch envelope and transcript limits as well as the granted or paid
 policy. Bodies that exceed those limits fail as incomplete rather than being
 silently truncated into a successful result.
 
+Generic HTTP Fetch admits up to 8 MiB of raw response bytes. Its default policy
+sizes event JSON, artifact framing, signed envelopes and retained memory
+separately; the raw allowance is not the transcript spool allowance. The signed
+policy also bounds the number of response events, so a stream fragmented into
+too many tiny deliveries can exhaust that allowance before reaching 8 MiB.
+A response whose Content-Length already exceeds the signed raw bound is refused
+before forwarding its head. With an unknown length, bytes within the bound can
+already have streamed: exceeding it terminates the signed job with `CallerLimit`
+and leaves the HTTP body incomplete. Failed jobs are not credited as completed
+responses.
+
 ## Telemetry
 
 An `otel` build enables `--metrics-port` and `--metrics-addr` for Prometheus.

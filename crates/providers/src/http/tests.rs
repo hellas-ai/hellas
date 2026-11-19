@@ -32,7 +32,7 @@ async fn server_with_pause(
     Arc<AtomicUsize>,
     tokio::task::JoinHandle<()>,
 ) {
-    server_fixture(status, bytes, location, pause, None).await
+    server_fixture(status, bytes, location, pause, None, false).await
 }
 
 async fn server_fixture(
@@ -41,6 +41,7 @@ async fn server_fixture(
     location: Option<String>,
     pause: Option<Arc<tokio::sync::Notify>>,
     capture: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+    chunked: bool,
 ) -> (
     HttpFetchRequest,
     Arc<AtomicUsize>,
@@ -114,6 +115,13 @@ async fn server_fixture(
                     } else {
                         ""
                     };
+                    if chunked {
+                        let _ = socket.write_all(format!("HTTP/1.1 {status} Test\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",bytes.len()).as_bytes()).await;
+                        let _ = socket.write_all(&bytes).await;
+                        let _ = socket.write_all(b"\r\n0\r\n\r\n").await;
+                        let _ = socket.shutdown().await;
+                        return;
+                    }
                     let header = format!(
                         "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: keep-alive\r\n{location}{retry_after}\r\n",
                         bytes.len()
@@ -301,20 +309,21 @@ async fn repeated_requests_reuse_https_but_still_validate_each_request() {
     assert!(provider.run(prepared(&forbidden)).await.is_err());
     forbidden.url = request.url.clone();
     forbidden.max_response_bytes = 1;
-    let mut response = provider.run(prepared(&forbidden)).await.unwrap();
-    assert!(response.stream.next().await.unwrap().is_err());
+    let error = provider.run(prepared(&forbidden)).await.err().unwrap();
+    assert_eq!(
+        error.kind(),
+        hellas_executor::FetchProviderErrorKind::CallerLimit
+    );
     assert_eq!(connections.load(Ordering::SeqCst), 1);
     task.abort();
 }
 
 #[tokio::test]
-async fn a_response_cut_at_the_signed_cap_is_a_caller_limit() {
+async fn a_known_oversized_response_is_refused_before_its_head() {
     use hellas_executor::FetchProviderErrorKind;
     let (mut request, _, _, task) = server(200, b"ok".to_vec(), None).await;
     request.max_response_bytes = 1;
-    let mut response = provider().run(prepared(&request)).await.unwrap();
-    assert_eq!(response.head.http.unwrap().status, 200);
-    let error = response.stream.next().await.unwrap().unwrap_err();
+    let error = provider().run(prepared(&request)).await.err().unwrap();
     assert_eq!(error.kind(), FetchProviderErrorKind::CallerLimit);
     task.abort();
 }
@@ -447,8 +456,11 @@ async fn signed_response_size_and_default_private_address_denial_are_enforced() 
     assert!(public.run(prepared(&request)).await.is_err());
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     request.max_response_bytes = 16;
-    let mut response = provider().run(prepared(&request)).await.unwrap();
-    assert!(response.stream.next().await.unwrap().is_err());
+    let error = provider().run(prepared(&request)).await.err().unwrap();
+    assert_eq!(
+        error.kind(),
+        hellas_executor::FetchProviderErrorKind::CallerLimit
+    );
     task.abort();
 }
 
@@ -551,6 +563,7 @@ async fn provider_injects_secret_without_disclosing_it_to_the_buyer() {
         None,
         None,
         Some(capture),
+        false,
     )
     .await;
     let url = request.parsed_url().unwrap();
@@ -663,7 +676,7 @@ async fn provider_injects_secret_without_disclosing_it_to_the_buyer() {
 async fn scope_selection_request(path: &str, expected: Option<&str>) {
     let (capture, mut captured) = tokio::sync::mpsc::unbounded_channel();
     let (mut request, _, _, server) =
-        server_fixture(200, b"ok".to_vec(), None, None, Some(capture)).await;
+        server_fixture(200, b"ok".to_vec(), None, None, Some(capture), false).await;
     let url = request.parsed_url().unwrap();
     let credential = |path: &str, secret: &str| HttpCredential {
         allowed_origins: vec![url.origin().ascii_serialization()],
@@ -724,4 +737,19 @@ fn scope_overlap_is_rejected_even_with_different_headers_or_roots() {
         der_base64: vec![STANDARD.encode(certificate.cert.der())],
     };
     assert!(HttpFetchProvider::new(HttpEgressPolicy::default(), vec![credential, other]).is_err());
+}
+
+#[tokio::test]
+async fn an_unknown_oversized_response_ends_with_typed_caller_limit() {
+    let (mut request, _, _, task) =
+        server_fixture(200, b"ok".to_vec(), None, None, None, true).await;
+    request.max_response_bytes = 1;
+    let mut response = provider().run(prepared(&request)).await.unwrap();
+    assert_eq!(response.head.http.unwrap().status, 200);
+    let error = response.stream.next().await.unwrap().unwrap_err();
+    assert_eq!(
+        error.kind(),
+        hellas_executor::FetchProviderErrorKind::CallerLimit
+    );
+    task.abort();
 }

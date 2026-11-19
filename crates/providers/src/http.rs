@@ -282,6 +282,16 @@ impl HttpFetchProvider {
                 fault("HTTPS transport or certificate verification failed")
             })?;
         trace.status(response.status().as_u16());
+        if !representation_length
+            && response.status().as_u16() != 304
+            && response
+                .content_length()
+                .is_some_and(|bytes| bytes > u64::from(request.max_response_bytes))
+        {
+            return Err(FetchProviderError::caller_limit(
+                "HTTPS response exceeds signed byte limit",
+            ));
+        }
         // A non-2xx status is still a completed HTTP exchange. Return it, with
         // its exact body, to the authenticated client; do not log it.
         // The signed head carries end-to-end headers only: hop-by-hop and
