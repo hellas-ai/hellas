@@ -169,6 +169,7 @@ impl Document {
                         };
                         let url = url::Url::parse(&target.route.url)?;
                         let https = resource.get_or_insert_with(|| HttpsResource {
+                            queries: Default::default(),
                             origin: url.origin().ascii_serialization(),
                             paths: vec![],
                             methods: vec!["POST".into()],

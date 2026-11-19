@@ -82,6 +82,7 @@ pub(crate) fn prepare_grant_input(
     policy: &hellas_authority::model::grant::records::GrantPolicy,
     offer: &hellas_authority::model::grant::records::SignedOffer,
     signer: &ProducerSigningKey,
+    assurance: hellas_rpc::Assurance,
 ) -> Result<hellas_rpc::protocol::invocation::PreparedInvocation> {
     input.admits(&policy.invocation_policy, false)?;
     let runner = hellas_auth::PublicKey::Secp256k1(
@@ -89,13 +90,14 @@ pub(crate) fn prepare_grant_input(
             .map_err(crate::grant_client::GrantClientError::from)?
             .to_bytes(),
     );
-    Ok(input.prepare(
+    Ok(input.prepare_for(
         &input.manifest()?,
         signer,
         rand::random(),
         runner,
         &policy.invocation_policy,
         false,
+        assurance,
     )?)
 }
 
@@ -965,8 +967,14 @@ pub(crate) async fn run_grant(
             false,
         )
         .map_err(pre)?;
-    let prepared = prepare_grant_input(&input, policy, session.offer(), session.execution_signer())
-        .map_err(pre)?;
+    let prepared = prepare_grant_input(
+        &input,
+        policy,
+        session.offer(),
+        session.execution_signer(),
+        assurance,
+    )
+    .map_err(pre)?;
     let content = input.content();
     let result = before_proposal(
         deadline,

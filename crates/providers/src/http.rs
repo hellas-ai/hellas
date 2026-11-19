@@ -135,7 +135,7 @@ impl HttpFetchProvider {
             }
             for path in &credential.allowed_paths {
                 hellas_rpc::http_fetch::path::validate_scope(path)
-                    .map_err(|_| fault("credential paths must be canonical paths with at most one {voice_id} segment"))?;
+                    .map_err(|_| fault("credential paths must be canonical paths with at most one {segment} segment"))?;
             }
             if credential.allowed_methods.iter().any(|method| {
                 !matches!(

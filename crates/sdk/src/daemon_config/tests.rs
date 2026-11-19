@@ -480,7 +480,7 @@ fn local_execution_queue_counts_active_work_and_allows_no_waiters() {
 }
 
 #[tokio::test]
-async fn voice_templates_are_validated_and_require_account_backing_for_covered_resources() {
+async fn segment_templates_are_validated_and_require_account_backing_for_covered_resources() {
     let mut document = Document::default();
     document
         .add_upstream("api", "https://example.com", Some("seller-key".into()))
@@ -493,15 +493,15 @@ async fn voice_templates_are_validated_and_require_account_backing_for_covered_r
         else {
             unreachable!()
         };
-        credentials[0].allowed_paths = vec!["/v1/text-to-speech/{segment}".into()];
+        credentials[0].allowed_paths = vec!["/v1/items/{segment}".into()];
         credentials[0].clone()
     };
     document.validate().unwrap();
     let mut https = hellas_authority::test_support::chat_resource("https://example.com", 8);
-    https.paths = vec!["/v1/text-to-speech/default".into()];
+    https.paths = vec!["/v1/items/default".into()];
     https.account_backed = false;
     document.resources.push(Resource::new(
-        "speech".into(),
+        "items".into(),
         "api".into(),
         ResourceKind::Https { https },
     ));
@@ -519,7 +519,7 @@ async fn voice_templates_are_validated_and_require_account_backing_for_covered_r
         unreachable!()
     };
     let mut exact = credential;
-    exact.allowed_paths = vec!["/v1/text-to-speech/default".into()];
+    exact.allowed_paths = vec!["/v1/items/default".into()];
     credentials.push(exact);
     assert_eq!(
         document.validate().unwrap_err(),

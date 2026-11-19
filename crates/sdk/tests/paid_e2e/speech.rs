@@ -1,4 +1,4 @@
-//! One bearer and one speech endpoint over paid Fetch and native Compute.
+//! One bearer and one speech endpoint across local and remote execution.
 use super::*;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use hellas_gateway::{Presentation, Route, WorkExecutionBackend as _};
@@ -27,7 +27,7 @@ fn reply(target: &str) -> Reply {
 }
 fn route(mock: &Mock) -> Route {
     Route {
-        backends: vec!["test".into()],
+        backends: vec!["remote".into(), "local".into()],
         presentation: Presentation::Speech {
             model: "hosted".into(),
             target: hellas_gateway::SpeechTarget::Hosted {
@@ -64,12 +64,12 @@ fn wav() -> Vec<u8> {
 }
 
 struct SpeechBackend {
-    paid: Arc<hellas_sdk::ExecutorGateway>,
+    fetch: Arc<hellas_sdk::ExecutorGateway>,
     native_calls: Arc<std::sync::atomic::AtomicUsize>,
 }
 impl hellas_gateway::WorkExecutionBackend for SpeechBackend {
     fn backends(&self) -> Vec<hellas_gateway::BackendInfo> {
-        let mut backends = self.paid.backends();
+        let mut backends = self.fetch.backends();
         backends.push(hellas_gateway::BackendInfo {
             id: "mms".into(),
             instance: 1,
@@ -89,7 +89,7 @@ impl hellas_gateway::WorkExecutionBackend for SpeechBackend {
         job: Arc<hellas_gateway::jobs::Job>,
         request: hellas_gateway::WorkFetchRequest,
     ) -> Result<hellas_gateway::WorkFetchStream, hellas_gateway::WorkGatewayError> {
-        self.paid.fetch(backend, job, request)
+        self.fetch.fetch(backend, job, request)
     }
     fn run(
         &self,
@@ -157,7 +157,7 @@ impl hellas_gateway::WorkExecutionBackend for SpeechBackend {
     fn drain(
         &self,
     ) -> futures::future::BoxFuture<'_, Result<(), hellas_gateway::WorkShutdownError>> {
-        self.paid.drain()
+        self.fetch.drain()
     }
 }
 
@@ -207,28 +207,41 @@ fn one_speech_gateway_selects_paid_hosted_or_native_by_model() {
     run(|runtime| {
         Box::pin(async move {
             let mock = Mock::start(reply).await;
-            let mut case = paid_fixture_for(runtime, Some(mock.backend(&[UPSTREAM]))).await;
-            let paid = hellas_sdk::ExecutorGateway::new(
-                [(
-                    "test".into(),
-                    hellas_sdk::BackendEntry {
-                        backend: hellas_sdk::Backend::paid(
-                            Some(case.quote.policy.invocation_policy.clone()),
-                            case.options.clone(),
-                            case.endpoint.clone(),
-                            client_settlement(),
-                            case.owner.clone(),
-                        ),
-                        evaluator: None,
-                        max_in_flight: std::num::NonZeroUsize::MIN,
-                    },
-                )]
+            let upstream = mock.backend(&[UPSTREAM]);
+            let mut case = paid_fixture_for(runtime, Some(upstream.clone())).await;
+            let signer = Arc::new(ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap());
+            let local_provider = hellas_rpc::provenance::encode_public_key(&signer.public_key());
+            let fetch = hellas_sdk::ExecutorGateway::new(
+                [
+                    (
+                        "remote".into(),
+                        hellas_sdk::BackendEntry {
+                            backend: hellas_sdk::Backend::paid(
+                                Some(case.quote.policy.invocation_policy.clone()),
+                                case.options.clone(),
+                                case.endpoint.clone(),
+                                client_settlement(),
+                                case.owner.clone(),
+                            ),
+                            evaluator: None,
+                            max_in_flight: std::num::NonZeroUsize::MIN,
+                        },
+                    ),
+                    (
+                        "local".into(),
+                        hellas_sdk::BackendEntry {
+                            backend: upstream.open_fetch(signer.clone()).await.unwrap(),
+                            evaluator: None,
+                            max_in_flight: std::num::NonZeroUsize::MIN,
+                        },
+                    ),
+                ]
                 .into(),
-                Arc::new(ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap()),
+                signer,
             );
             let native_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let gateway = Arc::new(SpeechBackend {
-                paid: paid.clone(),
+                fetch: fetch.clone(),
                 native_calls: native_calls.clone(),
             });
             let (node, access) = access(&case.root.path().join("speech-authority")).await;
@@ -241,18 +254,20 @@ fn one_speech_gateway_selects_paid_hosted_or_native_by_model() {
                     zdr: true,
                 },
                 gateway.clone(),
-                paid.jobs.clone(),
+                fetch.jobs.clone(),
                 routes,
             )
             .await
             .unwrap();
             let client = reqwest::Client::builder().no_proxy().build().unwrap();
-            let send = |body: &serde_json::Value| {
+            let request = || {
                 client
                     .post(format!("http://{}{PATH}", server.address()))
                     .bearer_auth(server.bearer())
-                    .json(body)
             };
+            let session_header = "x-hellas-session-id";
+            let send =
+                |body: &serde_json::Value| request().header(session_header, "primary").json(body);
             let work = async {
                 let mut body = serde_json::json!({"model":"hosted","input":"hello","voice":"default","response_format":"wav"});
                 for model in ["hosted", "mms"] {
@@ -261,7 +276,29 @@ fn one_speech_gateway_selects_paid_hosted_or_native_by_model() {
                     assert_eq!(response.status(), 200);
                     assert_eq!(response.headers()["content-type"], "audio/wav");
                     evidence(&response);
+                    assert_ne!(
+                        response.headers()[hellas_rpc::provenance::PROVIDER_KEY],
+                        local_provider.as_str()
+                    );
                     assert_eq!(response.bytes().await.unwrap().as_ref(), wav());
+                    if model == "hosted" {
+                        // The first session selects the first backend. A fresh session
+                        // selects the next backend through the ordinary route scheduler.
+                        let response = request()
+                            .header(session_header, "second")
+                            .json(&body)
+                            .send()
+                            .await
+                            .unwrap();
+                        assert_eq!(response.status(), 200);
+                        assert_eq!(response.headers()["content-type"], "audio/wav");
+                        evidence(&response);
+                        assert_eq!(
+                            response.headers()[hellas_rpc::provenance::PROVIDER_KEY],
+                            local_provider.as_str()
+                        );
+                        assert_eq!(response.bytes().await.unwrap().as_ref(), wav());
+                    }
                 }
                 body["model"] = "hosted".into();
                 body["voice"] = "voice two".into();
@@ -281,9 +318,8 @@ fn one_speech_gateway_selects_paid_hosted_or_native_by_model() {
                     "H4sIAAAAAAAC/xXKQQ6AIAwF0bt07Qm8DCH2E0kKJRRwYby7ZTkv81JRhtBJt9oA00G5tjk2QES9l+YL3owUpwyXDmtaDSFpL3G/T1z0/c5EgYNMAAAA",
                     "H4sIAAAAAAAC/6tWys1PSc1RslLKzS1W0lHKzCsoLQHyMlJzcvKB/LL8zORUID8lNS2xNKcEKFKUWlyQn1ecGp+WX5SbCFJbnlimVAsAqkf9WkkAAAA=",
                 ] {
-                    let response = client
-                        .post(format!("http://{}{PATH}", server.address()))
-                        .bearer_auth(server.bearer())
+                    let response = request()
+                        .header(session_header, "primary")
                         .header("content-type", "application/json")
                         .header("content-encoding", "gzip")
                         .header("x-hosted-key", "buyer-value")
@@ -347,10 +383,10 @@ fn one_speech_gateway_selects_paid_hosted_or_native_by_model() {
             gateway.drain().await.unwrap();
             assert_eq!(native_calls.load(std::sync::atomic::Ordering::SeqCst), 3);
             let seen = mock.seen.lock().unwrap().clone();
-            assert_eq!(seen.len(), 4);
-            for (request, voice) in seen
-                .iter()
-                .zip(["default", "voice%20two", "default", "error"])
+            assert_eq!(seen.len(), 5);
+            for (request, voice) in
+                seen.iter()
+                    .zip(["default", "default", "voice%20two", "default", "error"])
             {
                 let request = String::from_utf8(request.clone()).unwrap();
                 assert!(request.starts_with(&format!(

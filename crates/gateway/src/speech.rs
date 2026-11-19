@@ -1,8 +1,8 @@
-//! One speech presentation over Compute packages and prepared paid Fetch requests.
-#[cfg(test)]
-mod tests;
-
-use crate::{WorkEvent, WorkFetchRequest, WorkGatewayError, compute::Completion};
+//! One speech presentation over Compute packages and prepared Fetch requests.
+use crate::{
+    WorkFetchRequest, WorkGatewayError,
+    completion::{Completion, HttpReply},
+};
 use axum::{
     Extension, Router,
     extract::State,
@@ -10,11 +10,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
-use futures::StreamExt;
 pub(super) use hellas_adaptors::openai::audio_speech::PATH;
 use hellas_adaptors::openai::audio_speech::{HostedSpeech, SpeechRequest};
 use hellas_client::model::{ModelKind, ModelRequest, ModelResponse};
-use hellas_rpc::output::{AdaptorEvent, HttpResponseEvent, OutputEvent, StopReason};
 use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, sync::Arc};
 
@@ -74,12 +72,6 @@ pub(super) fn parse(
     Ok((request, hints))
 }
 
-struct Audio {
-    status: StatusCode,
-    headers: HeaderMap,
-    bytes: Vec<u8>,
-}
-
 async fn handle(
     State(state): State<Arc<StateData>>,
     Extension(mut selected): Extension<crate::routing::Selection>,
@@ -101,40 +93,20 @@ async fn handle(
                         },
                     )
                     .await?;
-                let Completion {
-                    output,
-                    accepted,
-                    transcript,
-                } = crate::compute::collect(stream).await;
-                let output = output.and_then(|output| {
-                    let audio = match package
-                        .decode(&output)
-                        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?
-                    {
+                Ok(crate::completion::compute(stream).await.map(|output| {
+                    let audio = match package.decode(&output).map_err(bad_gateway)? {
                         ModelResponse::Speech(audio) => audio,
-                        _ => {
-                            return Err((
-                                StatusCode::BAD_GATEWAY,
-                                "unexpected model response".into(),
-                            ));
-                        }
+                        _ => return Err(bad_gateway("unexpected model response")),
                     };
-                    Ok(Audio {
+                    Ok(HttpReply {
                         status: StatusCode::OK,
                         headers: HeaderMap::from_iter([(
                             axum::http::header::CONTENT_TYPE,
                             axum::http::HeaderValue::from_static("audio/wav"),
                         )]),
-                        bytes: audio
-                            .wav()
-                            .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?,
+                        bytes: audio.wav().map_err(bad_gateway)?,
                     })
-                });
-                Ok(Completion {
-                    output,
-                    accepted,
-                    transcript,
-                })
+                }))
             }
             SpeechTarget::Hosted {
                 service,
@@ -154,7 +126,7 @@ async fn handle(
                     .work
                     .fetch(&mut selected, |_| Ok(prepared.clone()))
                     .await?;
-                Ok(collect(stream, adaptor.max_response_bytes).await)
+                Ok(crate::completion::http(stream, adaptor.max_response_bytes).await)
             }
         }
     }
@@ -187,72 +159,6 @@ async fn handle(
     response
 }
 
-async fn collect(mut stream: crate::WorkFetchStream, limit: u32) -> Completion<Audio> {
-    let (mut accepted, mut transcript) = (None, None);
-    let output = async {
-        let mut audio: Option<Audio> = None;
-        while let Some(event) = stream.next().await {
-            match event? {
-                WorkEvent::Accepted(value) => accepted = Some(value),
-                WorkEvent::Transcript(value) => transcript = Some(value),
-                WorkEvent::Output(OutputEvent::Adaptor(AdaptorEvent::Http(
-                    HttpResponseEvent::Head { status, headers },
-                ))) if audio.is_none() && (200..=599).contains(&status) => {
-                    hellas_rpc::http_fetch::check_headers(&headers, false)
-                        .map_err(|e| WorkGatewayError::Execution(e.into()))?;
-                    let mut retained = HeaderMap::new();
-                    for (name, value) in headers {
-                        if matches!(
-                            name.as_str(),
-                            "content-type" | "content-encoding" | "retry-after"
-                        ) {
-                            retained.append(
-                                name.parse::<axum::http::HeaderName>().unwrap(),
-                                value
-                                    .parse()
-                                    .map_err(|e| WorkGatewayError::Execution(Box::new(e)))?,
-                            );
-                        }
-                    }
-                    audio = Some(Audio {
-                        status: StatusCode::from_u16(status).unwrap(),
-                        headers: retained,
-                        bytes: vec![],
-                    });
-                }
-                WorkEvent::Output(OutputEvent::Adaptor(AdaptorEvent::Http(
-                    HttpResponseEvent::Body { base64 },
-                ))) if audio.is_some() => {
-                    let bytes = hellas_rpc::http_fetch::decode_base64(&base64)
-                        .map_err(|e| WorkGatewayError::Execution(e.into()))?;
-                    let audio = audio.as_mut().unwrap();
-                    if bytes.len() > (limit as usize).saturating_sub(audio.bytes.len()) {
-                        return Err(WorkGatewayError::Execution(
-                            "speech response exceeds Fetch limit".into(),
-                        ));
-                    }
-                    audio.bytes.extend(bytes);
-                }
-                WorkEvent::Output(OutputEvent::Finished {
-                    stop_reason: StopReason::EndOfText,
-                    usage: None,
-                }) if audio.is_some() => return Ok(audio.unwrap()),
-                _ => {
-                    return Err(WorkGatewayError::Execution(
-                        "unexpected speech Fetch event".into(),
-                    ));
-                }
-            }
-        }
-        Err(WorkGatewayError::Execution(
-            "speech Fetch ended without verified completion".into(),
-        ))
-    }
-    .await
-    .map_err(crate::compute::failure);
-    Completion {
-        output,
-        accepted,
-        transcript,
-    }
+fn bad_gateway(error: impl ToString) -> (StatusCode, String) {
+    (StatusCode::BAD_GATEWAY, error.to_string())
 }

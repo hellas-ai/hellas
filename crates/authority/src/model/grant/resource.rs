@@ -6,6 +6,7 @@ use hellas_rpc::http_fetch::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 pub use crate::model::http_usage::AccountingProfile;
 
@@ -21,6 +22,9 @@ pub struct PathModelPolicy {
 pub struct HttpsResource {
     pub origin: String,
     pub paths: Vec<String>,
+    /// Exact serialized queries required on listed paths. Other paths are query-free.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub queries: BTreeMap<String, Vec<String>>,
     pub methods: Vec<String>,
     /// Consent metadata: at least one allowed request uses a provider credential.
     pub account_backed: bool,
@@ -88,6 +92,31 @@ impl HttpsResource {
         {
             return Err(TemplateError::PathMethod);
         }
+        if self
+            .queries
+            .values()
+            .flatten()
+            .map(String::len)
+            .sum::<usize>()
+            > 16 * 1024
+        {
+            return Err(TemplateError::PathMethod);
+        }
+        for (path, queries) in &self.queries {
+            if !self.paths.contains(path) || queries.is_empty() || queries.len() > 32 {
+                return Err(TemplateError::PathMethod);
+            }
+            for query in queries {
+                let target = format!("{}{path}?{query}", self.origin);
+                if query.is_empty() || target.len() > 8192 {
+                    return Err(TemplateError::PathMethod);
+                }
+                let url = url::Url::parse(&target).map_err(|_| TemplateError::PathMethod)?;
+                if url.path() != path || url.query() != Some(query) || url.fragment().is_some() {
+                    return Err(TemplateError::PathMethod);
+                }
+            }
+        }
         if self.max_response_bytes == 0 || self.max_response_bytes > MAX_HTTP_RESPONSE_BYTES {
             return Err(TemplateError::ResponseCap);
         }
@@ -131,7 +160,12 @@ impl HttpsResource {
         if url.origin().ascii_serialization() != self.origin {
             return Err(TemplateError::Origin);
         }
-        if url.query().is_some()
+        let query_allowed = match (self.queries.get(url.path()), url.query()) {
+            (None, None) => true,
+            (Some(allowed), Some(query)) => allowed.iter().any(|value| value == query),
+            _ => false,
+        };
+        if !query_allowed
             || !self.paths.iter().any(|p| p == url.path())
             || !self.methods.contains(&request.method)
         {

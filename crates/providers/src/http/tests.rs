@@ -755,28 +755,28 @@ async fn an_unknown_oversized_response_ends_with_typed_caller_limit() {
 }
 
 #[test]
-fn voice_templates_scope_credentials_without_prefix_or_encoding_escapes() {
+fn segment_templates_scope_credentials_without_prefix_or_encoding_escapes() {
     let credential = HttpCredential {
         trust_roots: HttpTrustRoots::WebPki,
-        allowed_origins: vec!["https://audio.example".into()],
-        allowed_paths: vec!["/v1/text-to-speech/{segment}".into()],
+        allowed_origins: vec!["https://upstream.example".into()],
+        allowed_paths: vec!["/v1/items/{segment}".into()],
         allowed_methods: vec!["POST".into()],
-        header_name: "x-hosted-key".into(),
+        header_name: "x-upstream-key".into(),
         header_value: "local-mock-seller-secret".into(),
     };
     let provider =
         HttpFetchProvider::new(HttpEgressPolicy::default(), vec![credential.clone()]).unwrap();
     for (path, covered) in [
-        ("/v1/text-to-speech/default", true),
-        ("/v1/text-to-speech/voice%20two", true),
-        ("/v1/text-to-speech/a/stream", false),
-        ("/v1/text-to-speech/%2F", false),
-        ("/v1/text-to-speech/%252F", false),
-        ("/v1/text-to-speech/%64efault", false),
-        ("/v1/voices", false),
+        ("/v1/items/default", true),
+        ("/v1/items/two%20words", true),
+        ("/v1/items/a/stream", false),
+        ("/v1/items/%2F", false),
+        ("/v1/items/%252F", false),
+        ("/v1/items/%64efault", false),
+        ("/v1/catalog", false),
     ] {
         let request = HttpFetchRequest {
-            url: format!("https://audio.example{path}"),
+            url: format!("https://upstream.example{path}"),
             method: "POST".into(),
             headers: vec![],
             body_base64: String::new(),
@@ -796,6 +796,6 @@ fn voice_templates_scope_credentials_without_prefix_or_encoding_escapes() {
         );
     }
     let mut exact = credential.clone();
-    exact.allowed_paths = vec!["/v1/text-to-speech/default".into()];
+    exact.allowed_paths = vec!["/v1/items/default".into()];
     assert!(HttpFetchProvider::new(HttpEgressPolicy::default(), vec![credential, exact]).is_err());
 }

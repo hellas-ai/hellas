@@ -1,7 +1,7 @@
 # Speech on one gateway
 
 `POST /v1/audio/speech` accepts JSON and returns audio bytes. The request's
-`model` selects either a hosted audio interface through paid Fetch or an MMS
+`model` selects either a hosted audio interface through Fetch or an MMS
 English package through Compute. Both use the existing listener and its bearer.
 
 ```sh
@@ -55,7 +55,12 @@ and enough output for the 1,920,000-byte waveform plus 16-byte descriptor.
 These entries belong in the shared daemon TOML document described in
 [HTTP gateway](http-gateway.md#shared-toml-configuration). Replace enrollment
 and node IDs with the providers' published identities and set accepted prices.
-A native provider may instead be an existing local or Grant backend.
+Choose execution placement with each route's `backends` list. The example uses
+remote paid providers. A native target can also use a local Compute backend or a
+remote grant backend. A hosted target can use a local `kind = "fetch"` backend
+with the same service, method and upstream policy, or a remote grant backend.
+Use the backend's `trust` settings for remote Apple App Attest. Native speech also
+requires a provider that supports the package's evaluator.
 
 ```toml
 [listeners.api]
@@ -108,6 +113,20 @@ including the gateway bearer, are not forwarded. JSON gzip/zstd bodies are
 decoded once before model selection.
 The seller injects its key through the ordinary Fetch credential machinery.
 
+For a hosted grant, provision an HTTPS resource for the exact translated path of
+each granted voice and an explicit list of permitted serialized queries per path.
+For example, an HTTPS resource can contain these fields:
+
+```toml
+paths = ["/v1/text-to-speech/default"]
+queries = { "/v1/text-to-speech/default" = ["output_format=UPSTREAM_WAV_FORMAT"] }
+```
+
+Use the exact encoded query produced by the configured format mapping. Entries
+with a query list require one entire listed query. Other paths remain query-free.
+Set the resource's TLS, response cap and account backing to agree with the
+upstream configuration. Add the speech route explicitly when using a grant.
+
 ## Seller scope
 
 The seller's Fetch backend uses the same service/method as the hosted target:
@@ -142,7 +161,7 @@ and exact credential scopes are rejected at configuration time.
 
 The integration test uses local TLS, a paid seller and buyer, and one HTTP
 listener/bearer. The same client switches only `model` between hosted speech
-and a test evaluator returning the MMS output ABI. It checks the real MMS
-rendered job, decoder and WAV encoder, upstream URL/body/key translation,
-explicit rejection, and paid completion. Actual GPU synthesis is a separate
-hardware validation step.
+and a test evaluator returning the MMS output ABI. The hosted alias also runs
+through local Fetch on that listener. The test checks the real MMS rendered
+job, decoder and WAV encoder, upstream URL/body/key translation, rejection,
+provenance and paid completion. GPU synthesis is a separate hardware check.

@@ -12,7 +12,7 @@ pub use routing::RoutingState;
 mod archive;
 mod audio;
 mod backend;
-mod compute;
+mod completion;
 mod dispatch;
 mod error;
 pub mod router;

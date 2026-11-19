@@ -113,23 +113,23 @@ mod tests {
     use super::*;
     #[test]
     fn a_scope_accepts_only_one_canonical_segment() {
-        let scope = "/v1/text-to-speech/{segment}";
+        let scope = "/v1/items/{segment}";
         validate_scope(scope).unwrap();
-        for voice in ["voice-a", "two words", "voix-é"] {
-            let segment = encode_segment(voice).unwrap();
-            assert!(matches(scope, &format!("/v1/text-to-speech/{segment}")));
-            assert!(overlaps(scope, &format!("/v1/text-to-speech/{segment}")));
+        for value in ["item-a", "two words", "entrée"] {
+            let segment = encode_segment(value).unwrap();
+            assert!(matches(scope, &format!("/v1/items/{segment}")));
+            assert!(overlaps(scope, &format!("/v1/items/{segment}")));
         }
         for segment in [
             "", ".", "..", "%2E", "%2F", "%2f", "%252F", "a/b", "a/stream", "a%5Cb", "%61", "a?b",
             "a#b",
         ] {
             assert!(
-                !matches(scope, &format!("/v1/text-to-speech/{segment}")),
+                !matches(scope, &format!("/v1/items/{segment}")),
                 "{segment}"
             );
         }
-        assert!(!overlaps(scope, "/v1/voices"));
+        assert!(!overlaps(scope, "/v1/catalog"));
         assert!(overlaps(scope, scope));
         for path in [
             "/a/{segment}/{segment}",
@@ -139,6 +139,6 @@ mod tests {
         ] {
             assert!(validate_scope(path).is_err(), "{path}");
         }
-        assert!(substitute("https://{segment}/v1/x", "voice").is_err());
+        assert!(substitute("https://{segment}/v1/x", "item").is_err());
     }
 }

@@ -69,6 +69,18 @@ pub(crate) async fn prepare(
             |purchase| purchase.request_nonce(channel, nonce),
         )
     };
+    let manifest = job.manifest();
+    let prepare = |nonce| {
+        job.input().prepare_for(
+            &manifest,
+            key,
+            request_nonce(nonce),
+            runner,
+            policy,
+            true,
+            session.assurance(),
+        )
+    };
     let (next, retained) = session
         .with_state(|state| {
             (
@@ -90,7 +102,7 @@ pub(crate) async fn prepare(
         .transpose()?
         .flatten()
     {
-        let prepared = job.prepare(key, request_nonce(nonce), runner, policy)?;
+        let prepared = prepare(nonce)?;
         let content = ContentRef::for_bytes(&prepared.canonical_bytes()?);
         if retained
             .iter()
@@ -108,12 +120,7 @@ pub(crate) async fn prepare(
     if resume {
         let mut found = None;
         for authorization in retained {
-            let prepared = job.prepare(
-                key,
-                request_nonce(authorization.proposal_nonce),
-                runner,
-                policy,
-            )?;
+            let prepared = prepare(authorization.proposal_nonce)?;
             if ContentRef::for_bytes(&prepared.canonical_bytes()?) == authorization.input_content {
                 if found.is_some() {
                     return Err(PaidClientError::AmbiguousRecovery.into());
@@ -126,10 +133,7 @@ pub(crate) async fn prepare(
         }
     }
     let nonce = next.ok_or(TransactError::NonceOverflow)?;
-    Ok((
-        nonce,
-        job.prepare(key, request_nonce(nonce), runner, policy)?,
-    ))
+    Ok((nonce, prepare(nonce)?))
 }
 
 /// Boxed rather than an `async fn`: callers nest it under deadlines and

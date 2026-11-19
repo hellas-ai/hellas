@@ -76,11 +76,11 @@ async fn handle(
         Ok(prepared) => prepared,
         Err(error) => return crate::work_error(error),
     };
-    let crate::compute::Completion {
+    let crate::completion::Completion {
         output,
         accepted,
         transcript,
-    } = crate::compute::collect(stream).await;
+    } = crate::completion::compute(stream).await;
     let (status, body) = match output {
         Ok(output) => {
             let png = tokio::task::spawn_blocking(

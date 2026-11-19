@@ -55,7 +55,7 @@ async fn fetch_completion_requires_a_bounded_verified_body_and_keeps_evidence() 
             Ok(WorkEvent::Transcript(b"fixture evidence".to_vec())),
         ])
         .chain(futures::stream::iter(events));
-        let completed = collect(Box::pin(stream), limit).await;
+        let completed = http(Box::pin(stream), limit).await;
         assert_eq!(
             completed.accepted.unwrap().commitment_id,
             accepted.commitment_id
