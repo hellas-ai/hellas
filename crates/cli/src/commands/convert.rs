@@ -79,6 +79,20 @@ pub fn whisper(checkpoint: &Checkpoint, output: &Path) -> CliResult<()> {
     );
     Ok(())
 }
+pub fn speech(checkpoint: &Checkpoint, output: &Path) -> CliResult<()> {
+    let scratch = scratch(output)?;
+    checkpoint.fetch(scratch.path(), hellas_client::model::speech::CHECKPOINT)?;
+    let object = hellas_client::model::speech::convert_speech(scratch.path(), output)?;
+    println!(
+        "weights: {} ({} bytes), {}",
+        object.id(),
+        object.bytes(),
+        output
+            .join(hellas_client::model::speech::WEIGHTS_FILE)
+            .display()
+    );
+    Ok(())
+}
 
 pub fn flux(checkpoint: &Checkpoint, output: &Path) -> CliResult<()> {
     use hellas_client::model::flux;

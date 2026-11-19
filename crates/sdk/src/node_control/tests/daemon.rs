@@ -790,6 +790,7 @@ async fn resources_require_a_backend_allowed_by_the_iroh_listener() {
         .unwrap();
     document.add_upstream_model("model", "api").unwrap();
     let https = hellas_authority::model::grant::resource::HttpsResource {
+        queries: Default::default(),
         origin: "https://api.example".into(),
         paths: vec!["/v1/responses".into()],
         methods: vec!["POST".into()],

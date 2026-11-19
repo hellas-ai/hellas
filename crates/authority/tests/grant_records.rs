@@ -13,6 +13,7 @@ use {
 };
 fn resource() -> HttpsResource {
     HttpsResource {
+        queries: Default::default(),
         origin: "https://glm.lan:8443".into(),
         paths: vec!["/v1/chat/completions".into()],
         methods: vec!["POST".into()],
@@ -39,6 +40,33 @@ fn request(body: serde_json::Value) -> http_fetch::HttpFetchRequest {
         tls: r.tls,
         max_response_bytes: r.max_response_bytes,
     }
+}
+
+#[test]
+fn grants_only_accept_exact_queries_on_their_configured_paths() {
+    let mut resource = resource();
+    let mut request = request(serde_json::json!({"max_tokens": 4}));
+    let url = request.url.clone();
+    request.url = format!("{url}?format=raw");
+    assert_eq!(
+        resource.prepare(&mut request),
+        Err(TemplateError::PathMethod)
+    );
+
+    resource
+        .queries
+        .insert(resource.paths[0].clone(), vec!["format=raw".into()]);
+    resource.validate().unwrap();
+    assert_eq!(resource.prepare(&mut request), Ok(4));
+    assert_eq!(resource.matches(&request), Ok(4));
+    for suffix in ["", "?format=other", "?format=raw&extra=1", "?format=%72aw"] {
+        request.url = format!("{url}{suffix}");
+        assert_eq!(resource.matches(&request), Err(TemplateError::PathMethod));
+    }
+    resource
+        .queries
+        .insert("/other".into(), vec!["format=raw".into()]);
+    assert!(resource.validate().is_err());
 }
 #[test]
 fn signed_template_is_exact_and_only_client_repairs_generation() {

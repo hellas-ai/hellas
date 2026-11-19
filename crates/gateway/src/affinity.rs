@@ -30,6 +30,30 @@ pub(super) struct Hints {
 }
 
 impl Hints {
+    pub fn session(headers: &HeaderMap) -> Result<Option<(String, String)>, &'static str> {
+        let mut session = None;
+        for name in [
+            "x-hellas-session-id",
+            "x-claude-code-session-id",
+            "session-id",
+            "thread-id",
+        ] {
+            if let Some(value) = headers.get(name) {
+                if headers.get_all(name).iter().count() != 1 {
+                    return Err("ambiguous session header");
+                }
+                let value = value.to_str().map_err(|_| "invalid session header")?;
+                if value.is_empty() || value.len() > 1024 {
+                    return Err("invalid session header");
+                }
+                if session.is_none() {
+                    session = Some((name.into(), value.into()));
+                }
+            }
+        }
+        Ok(session)
+    }
+
     pub fn read_optional(headers: &HeaderMap, body: &[u8]) -> Result<Self, &'static str> {
         let bytes = decoded_body(headers, body)?;
         let json_content = headers
@@ -61,26 +85,7 @@ impl Hints {
                 _ => Err("invalid model or session identifier"),
             }
         }
-        let mut session = None;
-        for name in [
-            "x-hellas-session-id",
-            "x-claude-code-session-id",
-            "session-id",
-            "thread-id",
-        ] {
-            if let Some(value) = headers.get(name) {
-                if headers.get_all(name).iter().count() != 1 {
-                    return Err("ambiguous session header");
-                }
-                let value = value.to_str().map_err(|_| "invalid session header")?;
-                if value.is_empty() || value.len() > 1024 {
-                    return Err("invalid session header");
-                }
-                if session.is_none() {
-                    session = Some((name.into(), value.into()));
-                }
-            }
-        }
+        let mut session = Self::session(headers)?;
         if session.is_none()
             && let Some(user) = value.pointer("/metadata/user_id").and_then(Value::as_str)
         {

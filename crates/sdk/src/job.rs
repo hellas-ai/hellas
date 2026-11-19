@@ -202,6 +202,33 @@ impl JobInput {
         policy: &InvocationPolicy,
         retain: bool,
     ) -> Result<PreparedInvocation> {
+        self.prepare_for(
+            manifest,
+            key,
+            nonce,
+            runner,
+            policy,
+            retain,
+            Assurance::ProducerSigned,
+        )
+    }
+
+    /// Compute assurance comes from the execution target. Fetch already binds
+    /// its assurance in the input, so remote sessions verify that value.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "invocation identity and admission terms"
+    )]
+    pub(crate) fn prepare_for(
+        &self,
+        manifest: &ProgramManifest,
+        key: &ProducerSigningKey,
+        nonce: [u8; 32],
+        runner: PublicKey,
+        policy: &InvocationPolicy,
+        retain: bool,
+        compute_assurance: Assurance,
+    ) -> Result<PreparedInvocation> {
         let prepared = match self {
             JobInput::Fetch {
                 contract,
@@ -232,7 +259,7 @@ impl JobInput {
                     input: input.content_id()?,
                     runner_public_key: runner,
                     nonce,
-                    assurance: Assurance::ProducerSigned,
+                    assurance: compute_assurance,
                     retain,
                 };
                 PreparedInvocation::new(request, manifest, input, policy.canonical_bytes()?)?

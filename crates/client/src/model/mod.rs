@@ -43,6 +43,8 @@ pub use package::{ComputeJob, ModelKind, ModelPackage, ModelRequest, ModelRespon
 #[cfg(feature = "models")]
 mod qwen3;
 #[cfg(feature = "models")]
+pub mod speech;
+#[cfg(feature = "models")]
 pub mod whisper;
 
 #[cfg(feature = "models")]

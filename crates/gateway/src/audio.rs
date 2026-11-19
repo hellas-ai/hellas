@@ -119,11 +119,11 @@ async fn handle(
         Ok(prepared) => prepared,
         Err(error) => return crate::work_error(error),
     };
-    let crate::compute::Completion {
+    let crate::completion::Completion {
         output,
         accepted,
         transcript,
-    } = crate::compute::collect(stream).await;
+    } = crate::completion::compute(stream).await;
     let mut response = match output {
         Ok(output) => match package.decode(&output) {
             Ok(ModelResponse::Transcription(result)) if text => {

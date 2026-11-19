@@ -37,10 +37,12 @@ pub enum ResourceKind {
 fn account_backed(https: &HttpsResource, credentials: &[Credential]) -> bool {
     credentials.iter().any(|credential| {
         credential.allowed_origins.contains(&https.origin)
-            && credential
-                .allowed_paths
-                .iter()
-                .any(|path| https.paths.contains(path))
+            && credential.allowed_paths.iter().any(|scope| {
+                https
+                    .paths
+                    .iter()
+                    .any(|path| hellas_rpc::http_fetch::path::matches(scope, path))
+            })
             && credential
                 .allowed_methods
                 .iter()
@@ -76,7 +78,7 @@ impl Document {
     ) -> BTreeMap<PathBuf, std::collections::BTreeSet<String>> {
         let mut requested: BTreeMap<PathBuf, std::collections::BTreeSet<String>> = BTreeMap::new();
         for route in &self.routes {
-            if let Presentation::Model { package, .. } = &route.presentation {
+            if let Some((_, package)) = route.model_package() {
                 let evaluators = requested.entry(package.clone()).or_default();
                 for id in &route.backends {
                     if let Some(evaluator) = info
@@ -136,9 +138,9 @@ impl Document {
             match &backend.kind {
                 BackendKind::Local { .. } => {
                     for route in self.routes.iter().filter(|r| r.backends.contains(id)) {
-                        if let Presentation::Model { model, package, .. } = &route.presentation {
+                        if let Some((model, package)) = route.model_package() {
                             let mut resource = Resource::new(
-                                model.clone(),
+                                model.to_owned(),
                                 id.clone(),
                                 ResourceKind::Model {
                                     package: package.clone(),
@@ -167,6 +169,7 @@ impl Document {
                         };
                         let url = url::Url::parse(&target.route.url)?;
                         let https = resource.get_or_insert_with(|| HttpsResource {
+                            queries: Default::default(),
                             origin: url.origin().ascii_serialization(),
                             paths: vec![],
                             methods: vec!["POST".into()],

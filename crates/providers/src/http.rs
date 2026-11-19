@@ -100,10 +100,12 @@ impl HttpFetchProvider {
                     .allowed_origins
                     .iter()
                     .any(|value| other.allowed_origins.contains(value))
-                    && credential
-                        .allowed_paths
-                        .iter()
-                        .any(|value| other.allowed_paths.contains(value))
+                    && credential.allowed_paths.iter().any(|value| {
+                        other
+                            .allowed_paths
+                            .iter()
+                            .any(|other| hellas_rpc::http_fetch::path::overlaps(value, other))
+                    })
                     && credential
                         .allowed_methods
                         .iter()
@@ -132,15 +134,8 @@ impl HttpFetchProvider {
                     .map_err(|_| fault("invalid credential header"))?;
             }
             for path in &credential.allowed_paths {
-                let parsed = Url::parse(&format!("https://scope.invalid{path}"))
-                    .map_err(|_| fault("invalid credential path"))?;
-                if !path.starts_with('/')
-                    || parsed.path() != path
-                    || parsed.query().is_some()
-                    || parsed.fragment().is_some()
-                {
-                    return Err(fault("credential paths must be exact canonical URL paths"));
-                }
+                hellas_rpc::http_fetch::path::validate_scope(path)
+                    .map_err(|_| fault("credential paths must be canonical paths with at most one {segment} segment"))?;
             }
             if credential.allowed_methods.iter().any(|method| {
                 !matches!(
@@ -181,7 +176,7 @@ impl HttpFetchProvider {
                 && credential
                     .allowed_paths
                     .iter()
-                    .any(|path| path == url.path())
+                    .any(|path| hellas_rpc::http_fetch::path::matches(path, url.path()))
                 && credential.allowed_methods.contains(&request.method)
         }) else {
             return Ok(None);

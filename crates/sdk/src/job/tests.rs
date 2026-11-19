@@ -170,6 +170,25 @@ async fn compute_folder_round_trip_binds_environment_plan_and_price() {
         .prepare(&key, [7; 32], runner(), &work_policy())
         .unwrap();
     assert_eq!(prepared.request.nonce, [7; 32]);
+    assert_eq!(prepared.request.assurance, Assurance::ProducerSigned);
+    let attested = loaded
+        .input()
+        .prepare_for(
+            &loaded.manifest(),
+            &key,
+            [7; 32],
+            runner(),
+            &work_policy(),
+            true,
+            Assurance::AppleAppAttest,
+        )
+        .unwrap();
+    assert_eq!(attested.request.assurance, Assurance::AppleAppAttest);
+    assert_ne!(
+        prepared.request.commitment().unwrap(),
+        attested.request.commitment().unwrap()
+    );
+    assert_eq!(prepared.input, attested.input);
     assert_eq!(
         prepared.manifest().unwrap(),
         environment()

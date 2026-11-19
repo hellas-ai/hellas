@@ -25,7 +25,7 @@ pub async fn router(
     let mut evaluators: BTreeMap<PathBuf, BTreeSet<String>> = BTreeMap::new();
     let backends = work.backends();
     for route in &routes {
-        if let Presentation::Model { package, .. } = &route.presentation {
+        if let Some((_, package)) = route.model_package() {
             for id in &route.backends {
                 let evaluator = backends
                     .iter()
@@ -91,8 +91,8 @@ pub async fn with_models(
     let mut errors = BTreeMap::new();
     for route in &routing.routes {
         let prepared: GatewayResult<Router> = async {
-            let packages = match &route.presentation {
-                Presentation::Model { package, .. } => models
+            let packages = match route.model_package() {
+                Some((_, package)) => models
                     .get(package)
                     .ok_or_else(|| {
                         crate::GatewayError::Presentation("model was not prepared".into())
@@ -120,6 +120,7 @@ pub async fn with_models(
                     hellas_client::model::ModelKind::Transcription => {
                         crate::audio::router(model.clone(), *max_tokens as usize, execution).await?
                     }
+                    hellas_client::model::ModelKind::Speech => unreachable!("validated route"),
                     hellas_client::model::ModelKind::Image => {
                         crate::image::router(model.clone(), execution).await?
                     }
@@ -137,6 +138,9 @@ pub async fn with_models(
                 ),
                 Presentation::Http { targets } => {
                     crate::http_fetch::router(targets.clone(), execution)?
+                }
+                Presentation::Speech { target, .. } => {
+                    crate::speech::router(target.clone(), execution)?
                 }
             })
         }
@@ -217,7 +221,20 @@ async fn dispatch(
             );
         }
     };
-    let hints = if path == crate::audio::PATH
+    let hints = if path == crate::speech::PATH
+        && parts.method == axum::http::Method::POST
+        && routing
+            .routes
+            .iter()
+            .any(|route| matches!(route.presentation, Presentation::Speech { .. }))
+    {
+        let (speech, hints) = match crate::speech::parse(&parts, &body) {
+            Ok(request) => request,
+            Err(message) => return path_error(&path, StatusCode::BAD_REQUEST, message),
+        };
+        parts.extensions.insert(speech);
+        hints
+    } else if path == crate::audio::PATH
         && routing.routes.iter().any(|route| {
             matches!(
                 &route.presentation,
@@ -226,7 +243,8 @@ async fn dispatch(
                     ..
                 }
             )
-        }) {
+        })
+    {
         match crate::audio::multipart_model(Request::from_parts(
             parts.clone(),
             Body::from(body.clone()),

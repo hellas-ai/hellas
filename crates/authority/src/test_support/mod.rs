@@ -187,6 +187,7 @@ pub fn definition(id: GrantId, client: PrincipalId) -> GrantDef {
 
 pub fn chat_resource(origin: &str, max_output_tokens: u64) -> resource::HttpsResource {
     resource::HttpsResource {
+        queries: Default::default(),
         origin: origin.into(),
         paths: vec!["/v1/chat/completions".into()],
         methods: vec!["POST".into()],

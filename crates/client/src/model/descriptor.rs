@@ -1,5 +1,5 @@
 //! A model's native metadata and the identity of its separately held weights.
-use super::{ModelKind, gguf, qwen3, whisper};
+use super::{ModelKind, gguf, qwen3, speech, whisper};
 use anyhow::{Result, bail, ensure};
 use hellas_rpc::ContentRef;
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,8 @@ pub(super) enum Layout {
     GgufDescriptor,
     Whisper,
     WhisperDescriptor,
+    Speech,
+    SpeechDescriptor,
     Flux,
 }
 
@@ -35,6 +37,10 @@ pub(super) enum Resolved {
         weights: ContentRef,
     },
     Whisper {
+        path: PathBuf,
+        weights: ContentRef,
+    },
+    Speech {
         path: PathBuf,
         weights: ContentRef,
     },
@@ -57,12 +63,17 @@ pub(super) fn classify(path: &Path) -> Result<Layout> {
     let whisper = whisper::METADATA.iter().try_fold(false, |found, name| {
         Ok::<_, std::io::Error>(path.join(name).try_exists()? || found)
     })?;
+    let speech = speech::METADATA[1..]
+        .iter()
+        .try_fold(false, |found, name| {
+            Ok::<_, std::io::Error>(path.join(name).try_exists()? || found)
+        })?;
     let flux = path.join("model_index.json").try_exists()?;
     ensure!(
-        !(flux && (manifest || gguf || whisper || weights)
-            || gguf && (whisper || weights)
+        !(flux && (manifest || gguf || whisper || speech || weights)
+            || gguf && (whisper || speech || weights)
             || manifest && weights),
-        "mixed model layout: descriptor, GGUF, Whisper and Flux files cannot overlap"
+        "mixed model layout: descriptor, GGUF, Whisper, MMS and Flux files cannot overlap"
     );
     if flux {
         return Ok(Layout::Flux);
@@ -70,6 +81,22 @@ pub(super) fn classify(path: &Path) -> Result<Layout> {
     if gguf {
         ensure!(manifest, "header.gguf requires descriptor.json");
         return Ok(Layout::GgufDescriptor);
+    }
+    if speech {
+        ensure!(
+            manifest || weights,
+            "MMS package requires weights or a descriptor"
+        );
+        ensure!(
+            !path.join("generation_config.json").try_exists()?
+                && !path.join("tokenizer.json").try_exists()?,
+            "mixed MMS and Whisper metadata"
+        );
+        return Ok(if manifest {
+            Layout::SpeechDescriptor
+        } else {
+            Layout::Speech
+        });
     }
     if manifest {
         ensure!(whisper, "descriptor.json requires GGUF or Whisper metadata");
@@ -88,10 +115,14 @@ impl Layout {
             Self::Gguf | Self::GgufDescriptor => ModelKind::Text,
             Self::Whisper | Self::WhisperDescriptor => ModelKind::Transcription,
             Self::Flux => ModelKind::Image,
+            Self::Speech | Self::SpeechDescriptor => ModelKind::Speech,
         }
     }
     pub(super) fn is_descriptor(self) -> bool {
-        matches!(self, Self::GgufDescriptor | Self::WhisperDescriptor)
+        matches!(
+            self,
+            Self::GgufDescriptor | Self::WhisperDescriptor | Self::SpeechDescriptor
+        )
     }
     pub(super) fn gguf_path(self, path: &Path) -> Result<PathBuf> {
         match self {
@@ -103,8 +134,11 @@ impl Layout {
     pub(super) fn weights_path(self, path: &Path) -> Option<PathBuf> {
         match self {
             Self::Gguf => Some(path.to_owned()),
-            Self::Whisper => Some(path.join(whisper::WEIGHTS_FILE)),
-            Self::GgufDescriptor | Self::WhisperDescriptor | Self::Flux => None,
+            Self::Whisper | Self::Speech => Some(path.join(whisper::WEIGHTS_FILE)),
+            Self::GgufDescriptor
+            | Self::WhisperDescriptor
+            | Self::SpeechDescriptor
+            | Self::Flux => None,
         }
     }
     pub(super) fn resolve(self, path: &Path, inspected: Option<ContentRef>) -> Result<Resolved> {
@@ -136,6 +170,14 @@ impl Layout {
                 weights: weights(&path.join(whisper::WEIGHTS_FILE))?,
             }),
             Self::WhisperDescriptor => Ok(Resolved::Whisper {
+                path: path.to_owned(),
+                weights: read_weights(path)?,
+            }),
+            Self::Speech => Ok(Resolved::Speech {
+                path: path.to_owned(),
+                weights: weights(&path.join(speech::WEIGHTS_FILE))?,
+            }),
+            Self::SpeechDescriptor => Ok(Resolved::Speech {
                 path: path.to_owned(),
                 weights: read_weights(path)?,
             }),
@@ -187,7 +229,23 @@ pub(super) fn describe(path: &Path, output: &Path) -> Result<ContentRef> {
                 whisper::validate_metadata(staging, object)
             },
         ),
-        Layout::GgufDescriptor | Layout::WhisperDescriptor => {
+        Layout::Speech => write_descriptor(
+            &path.join(speech::WEIGHTS_FILE),
+            output,
+            |staging, object| {
+                for name in speech::METADATA {
+                    std::fs::write(
+                        staging.join(name),
+                        hellas_private::read_bounded_regular_file(
+                            &path.join(name),
+                            speech::MAX_METADATA_BYTES,
+                        )?,
+                    )?;
+                }
+                speech::validate_metadata(staging, object)
+            },
+        ),
+        Layout::GgufDescriptor | Layout::WhisperDescriptor | Layout::SpeechDescriptor => {
             bail!("source is already a descriptor")
         }
         Layout::Flux => bail!("Flux already describes its assets in assets.json"),
