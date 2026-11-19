@@ -183,7 +183,7 @@ enum Commands {
         output: PathBuf,
     },
     /// Print the program manifest a model's jobs run, which `serve
-    /// --program` admits: a Qwen GGUF, converted Whisper package, or descriptor.
+    /// --program` admits: a Qwen GGUF, converted Whisper/MMS package, or descriptor.
     Program {
         #[arg(value_name = "PATH")]
         model: PathBuf,

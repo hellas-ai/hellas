@@ -98,8 +98,8 @@ package = "/srv/models/mms-remote"
 
 The adaptor maps `input` to upstream `text`, uses the configured upstream
 `model_id`, encodes `voice` as one path segment, and puts the mapped format in
-`output_format`. It forwards neither the gateway bearer nor a buyer-supplied
-upstream credential. JSON gzip/zstd bodies are decoded before translation.
+`output_format`. It strips the gateway bearer; the seller rejects a buyer-supplied
+header that would override its credential. JSON gzip/zstd bodies are decoded before translation.
 The seller injects its key through the ordinary Fetch credential machinery.
 
 ## Seller scope

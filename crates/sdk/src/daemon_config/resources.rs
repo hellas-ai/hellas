@@ -37,10 +37,12 @@ pub enum ResourceKind {
 fn account_backed(https: &HttpsResource, credentials: &[Credential]) -> bool {
     credentials.iter().any(|credential| {
         credential.allowed_origins.contains(&https.origin)
-            && credential
-                .allowed_paths
-                .iter()
-                .any(|path| https.paths.contains(path))
+            && credential.allowed_paths.iter().any(|scope| {
+                https
+                    .paths
+                    .iter()
+                    .any(|path| hellas_rpc::http_fetch::path::matches(scope, path))
+            })
             && credential
                 .allowed_methods
                 .iter()

@@ -265,15 +265,20 @@ impl Document {
             } = &backend.kind
             {
                 for (index, credential) in credentials.iter().enumerate() {
+                    for path in &credential.allowed_paths {
+                        hellas_rpc::http_fetch::path::validate_scope(path)
+                            .map_err(|_| "invalid HTTP credential path scope")?;
+                    }
                     if credentials[..index].iter().any(|other| {
                         credential
                             .allowed_origins
                             .iter()
                             .any(|value| other.allowed_origins.contains(value))
-                            && credential
-                                .allowed_paths
-                                .iter()
-                                .any(|value| other.allowed_paths.contains(value))
+                            && credential.allowed_paths.iter().any(|value| {
+                                other.allowed_paths.iter().any(|other| {
+                                    hellas_rpc::http_fetch::path::overlaps(value, other)
+                                })
+                            })
                             && credential
                                 .allowed_methods
                                 .iter()

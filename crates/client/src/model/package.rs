@@ -101,13 +101,13 @@ impl ModelPackage {
         Ok(())
     }
 
-    /// Create a new metadata-only package directory from a full Qwen or Whisper package.
+    /// Create a new metadata-only package directory from a full Qwen, Whisper or MMS package.
     pub async fn describe(path: &Path, output: &Path) -> Result<hellas_rpc::ContentRef> {
         let (path, output) = (path.to_owned(), output.to_owned());
         tokio::task::spawn_blocking(move || descriptor::describe(&path, &output)).await?
     }
 
-    /// A Qwen GGUF, converted Whisper or Flux package, or Qwen/Whisper descriptor,
+    /// A Qwen GGUF, converted Whisper, MMS or Flux package, or model descriptor,
     /// rendering programs with the renderer registered under `evaluator`.
     pub async fn open(path: &Path, evaluator: &str) -> Result<Self> {
         let dialect = super::renderer(evaluator)?;
