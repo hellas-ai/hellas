@@ -373,6 +373,7 @@ async fn removing_a_backend_preserves_its_accepted_request_and_routes_the_next_o
                                 service: "openai".into(),
                                 method: "responses".into(),
                                 route: hellas_gateway::HttpRoute {
+                                    hosted_speech: None,
                                     path: template.paths[0].clone(),
                                     method: "POST".into(),
                                     url: format!("{}{}", template.origin, template.paths[0]),

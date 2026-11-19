@@ -796,6 +796,7 @@ fn policy_http_routes(
                 .methods
                 .iter()
                 .map(move |verb| hellas_gateway::HttpRoute {
+                    hosted_speech: None,
                     path: http_route_path(path).into(),
                     method: verb.clone(),
                     url: format!("{}{}", template.origin, path),

@@ -35,6 +35,8 @@ mod http_bounds;
 mod remote;
 #[path = "paid_e2e/settlement.rs"]
 mod settlement_recovery;
+#[path = "paid_e2e/speech.rs"]
+mod speech;
 #[path = "paid_e2e/tracked.rs"]
 mod tracked;
 

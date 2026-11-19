@@ -120,6 +120,9 @@ pub async fn with_models(
                     hellas_client::model::ModelKind::Transcription => {
                         crate::audio::router(model.clone(), *max_tokens as usize, execution).await?
                     }
+                    hellas_client::model::ModelKind::Speech => {
+                        crate::speech::router(model.clone(), execution)
+                    }
                     hellas_client::model::ModelKind::Image => {
                         crate::image::router(model.clone(), execution).await?
                     }

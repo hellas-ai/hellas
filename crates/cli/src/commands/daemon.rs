@@ -450,6 +450,7 @@ pub fn print(view: &hellas_sdk::daemon::View) {
             Presentation::Model { modality, .. } => match modality {
                 hellas_client::model::ModelKind::Text => "text",
                 hellas_client::model::ModelKind::Transcription => "audio",
+                hellas_client::model::ModelKind::Speech => "speech",
                 hellas_client::model::ModelKind::Image => "image",
             },
             _ => "text",

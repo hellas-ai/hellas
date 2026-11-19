@@ -62,6 +62,7 @@ impl Document {
                             service: service.clone(),
                             method: method.clone(),
                             route: HttpRoute {
+                                hosted_speech: None,
                                 path: crate::gateway_work::http_route_path(upstream_path).into(),
                                 method: "POST".into(),
                                 url: format!("{origin}{upstream_path}"),

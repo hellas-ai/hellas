@@ -1,6 +1,8 @@
 //! Caller-signed HTTPS request vocabulary. Credential selection and secret values
 //! stay with the provider.
 
+pub mod path;
+
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 

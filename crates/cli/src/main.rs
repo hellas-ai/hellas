@@ -175,8 +175,15 @@ enum Commands {
         #[arg(short = 'o', long, value_name = "DIR")]
         output: PathBuf,
     },
+    /// Fetch and convert a pinned MMS English checkpoint.
+    ConvertSpeech {
+        /// `ORG/NAME@COMMIT`, pinned to a 40-hex commit.
+        checkpoint: commands::convert::Checkpoint,
+        #[arg(short = 'o', long, value_name = "DIR")]
+        output: PathBuf,
+    },
     /// Print the program manifest a model's jobs run, which `serve
-    /// --program` admits: a Qwen GGUF, converted Whisper package, or descriptor.
+    /// --program` admits: a Qwen GGUF, converted Whisper/MMS package, or descriptor.
     Program {
         #[arg(value_name = "PATH")]
         model: PathBuf,
@@ -414,6 +421,15 @@ async fn async_main() {
             }
             return;
         }
+        Commands::ConvertSpeech { checkpoint, output } => {
+            let result = commands::convert::speech(&checkpoint, &output);
+            tracer_provider.shutdown();
+            if let Err(error) = result {
+                eprintln!("error: {error:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
         Commands::Store(args) if args.profile.is_none() => {
             let result = commands::store::run(args, &home, None, passkey).await;
             tracer_provider.shutdown();
@@ -644,6 +660,7 @@ async fn async_main() {
             .await
         }
         Commands::ConvertWhisper { .. }
+        | Commands::ConvertSpeech { .. }
         | Commands::Model { .. }
         | Commands::ConvertFlux { .. }
         | Commands::Program { .. } => {

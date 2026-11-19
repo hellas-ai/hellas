@@ -478,3 +478,51 @@ fn local_execution_queue_counts_active_work_and_allows_no_waiters() {
     document.execution.queue_capacity = Some(usize::MAX);
     assert!(document.validate().is_err());
 }
+
+#[tokio::test]
+async fn voice_templates_are_validated_and_require_account_backing_for_covered_resources() {
+    let mut document = Document::default();
+    document
+        .add_upstream("api", "https://example.com", Some("seller-key".into()))
+        .unwrap();
+    let credential = {
+        let BackendKind::Fetch {
+            upstream: Upstream::Http { credentials, .. },
+            ..
+        } = &mut document.backends.get_mut("api").unwrap().kind
+        else {
+            unreachable!()
+        };
+        credentials[0].allowed_paths = vec!["/v1/text-to-speech/{voice_id}".into()];
+        credentials[0].clone()
+    };
+    document.validate().unwrap();
+    let mut https = hellas_authority::test_support::chat_resource("https://example.com", 8);
+    https.paths = vec!["/v1/text-to-speech/default".into()];
+    https.account_backed = false;
+    document.resources.push(Resource::new(
+        "speech".into(),
+        "api".into(),
+        ResourceKind::Https { https },
+    ));
+    assert!(document.configuration_for_test(&[]).await.is_err());
+    let ResourceKind::Https { https } = &mut document.resources[0].kind else {
+        unreachable!()
+    };
+    https.account_backed = true;
+    document.configuration_for_test(&[]).await.unwrap();
+    let BackendKind::Fetch {
+        upstream: Upstream::Http { credentials, .. },
+        ..
+    } = &mut document.backends.get_mut("api").unwrap().kind
+    else {
+        unreachable!()
+    };
+    let mut exact = credential;
+    exact.allowed_paths = vec!["/v1/text-to-speech/default".into()];
+    credentials.push(exact);
+    assert_eq!(
+        document.validate().unwrap_err(),
+        "overlapping HTTP credential scopes"
+    );
+}

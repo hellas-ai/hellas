@@ -1,0 +1,9 @@
+{
+  "language": "eng",
+  "normalize": true,
+  "add_blank": true,
+  "phonemize": false,
+  "is_uroman": false,
+  "pad_token": "k",
+  "unk_token": "<unk>"
+}

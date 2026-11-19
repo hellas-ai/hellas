@@ -753,3 +753,49 @@ async fn an_unknown_oversized_response_ends_with_typed_caller_limit() {
     );
     task.abort();
 }
+
+#[test]
+fn voice_templates_scope_credentials_without_prefix_or_encoding_escapes() {
+    let credential = HttpCredential {
+        trust_roots: HttpTrustRoots::WebPki,
+        allowed_origins: vec!["https://audio.example".into()],
+        allowed_paths: vec!["/v1/text-to-speech/{voice_id}".into()],
+        allowed_methods: vec!["POST".into()],
+        header_name: "x-hosted-key".into(),
+        header_value: "local-mock-seller-secret".into(),
+    };
+    let provider =
+        HttpFetchProvider::new(HttpEgressPolicy::default(), vec![credential.clone()]).unwrap();
+    for (path, covered) in [
+        ("/v1/text-to-speech/default", true),
+        ("/v1/text-to-speech/voice%20two", true),
+        ("/v1/text-to-speech/a/stream", false),
+        ("/v1/text-to-speech/%2F", false),
+        ("/v1/text-to-speech/%252F", false),
+        ("/v1/text-to-speech/%64efault", false),
+        ("/v1/voices", false),
+    ] {
+        let request = HttpFetchRequest {
+            url: format!("https://audio.example{path}"),
+            method: "POST".into(),
+            headers: vec![],
+            body_base64: String::new(),
+            tls: HttpTls {
+                roots: HttpTrustRoots::WebPki,
+                spki_sha256: vec![],
+            },
+            max_response_bytes: 1024,
+        };
+        assert_eq!(
+            provider
+                .credential(&request, &request.parsed_url().unwrap())
+                .unwrap()
+                .is_some(),
+            covered,
+            "{path}"
+        );
+    }
+    let mut exact = credential.clone();
+    exact.allowed_paths = vec!["/v1/text-to-speech/default".into()];
+    assert!(HttpFetchProvider::new(HttpEgressPolicy::default(), vec![credential, exact]).is_err());
+}
