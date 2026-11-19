@@ -117,11 +117,6 @@ async fn handle(
             .request(body.clone(), &parts.headers)
             .map_err(|e| super::WorkGatewayError::Rejected(e.into()))?;
         if let Some(query) = parts.uri.query() {
-            if target.route.hosted_speech.is_some() {
-                return Err(super::WorkGatewayError::Rejected(
-                    "speech does not accept query settings".into(),
-                ));
-            }
             upstream
                 .url
                 .push(if upstream.url.contains('?') { '&' } else { '?' });

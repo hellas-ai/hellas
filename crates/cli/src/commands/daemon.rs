@@ -260,7 +260,7 @@ impl ModelContext {
                             target.route.models = Some(vec![name.into()]);
                         }
                     }
-                    Presentation::Model { .. } => {
+                    Presentation::Model { .. } | Presentation::Speech { .. } => {
                         anyhow::bail!("model resource needs a local package")
                     }
                 }
@@ -319,11 +319,17 @@ fn package_route(package: PathBuf, backend: &str) -> Result<Route> {
         .to_owned();
     Ok(Route {
         backends: vec![backend.into()],
-        presentation: Presentation::Model {
-            modality: hellas_client::model::ModelKind::of(&package)?,
-            model,
-            package,
-            max_tokens: 128,
+        presentation: match hellas_client::model::ModelKind::of(&package)? {
+            hellas_client::model::ModelKind::Speech => Presentation::Speech {
+                model,
+                target: hellas_gateway::SpeechTarget::Native { package },
+            },
+            modality => Presentation::Model {
+                modality,
+                model,
+                package,
+                max_tokens: 128,
+            },
         },
     })
 }
@@ -401,7 +407,11 @@ pub async fn apply(document: &mut Document, edit: Edit, context: &ModelContext) 
             let mut removed = false;
             for route in &mut document.routes {
                 let matches = match &route.presentation {
-                    Presentation::Model { package: path, .. } => package.as_ref() == Some(path),
+                    Presentation::Model { package: path, .. }
+                    | Presentation::Speech {
+                        target: hellas_gateway::SpeechTarget::Native { package: path },
+                        ..
+                    } => package.as_ref() == Some(path),
                     _ => route
                         .keys()
                         .iter()
@@ -453,6 +463,7 @@ pub fn print(view: &hellas_sdk::daemon::View) {
                 hellas_client::model::ModelKind::Speech => "speech",
                 hellas_client::model::ModelKind::Image => "image",
             },
+            Presentation::Speech { .. } => "speech",
             _ => "text",
         };
         for (path, _, model) in route.keys() {

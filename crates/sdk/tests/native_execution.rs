@@ -31,6 +31,8 @@ mod gateway;
 mod grant;
 #[path = "paid_e2e/http_bounds.rs"]
 mod http_bounds;
+#[path = "paid_e2e/http_fixture.rs"]
+mod http_fixture;
 #[path = "paid_e2e/remote.rs"]
 mod remote;
 #[path = "paid_e2e/settlement.rs"]

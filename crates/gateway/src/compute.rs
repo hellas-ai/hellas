@@ -4,8 +4,8 @@ use axum::http::StatusCode;
 use futures::StreamExt;
 use hellas_rpc::{protocol::invocation::output::InvocationOutput, provenance::ExecutionProvenance};
 
-pub(super) struct Completion {
-    pub output: Result<InvocationOutput, (StatusCode, String)>,
+pub(super) struct Completion<T = InvocationOutput> {
+    pub output: Result<T, (StatusCode, String)>,
     pub accepted: Option<ExecutionProvenance>,
     pub transcript: Option<Vec<u8>>,
 }
@@ -34,7 +34,7 @@ pub(super) async fn collect(mut stream: crate::WorkOutputStream<ComputeEvent>) -
     }
 }
 
-fn failure(error: WorkGatewayError) -> (StatusCode, String) {
+pub(super) fn failure(error: WorkGatewayError) -> (StatusCode, String) {
     let error: hellas_adaptors::BackendError = error.into();
     (super::backend_status(&error), error.to_string())
 }

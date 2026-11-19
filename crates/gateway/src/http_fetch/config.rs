@@ -19,9 +19,6 @@ pub struct HttpRoute {
     /// Exact model identifiers for this path, when the resource restricts it.
     #[serde(default)]
     pub models: Option<Vec<String>>,
-    /// Translate the shared speech JSON into the hosted audio interface.
-    #[serde(default)]
-    pub hosted_speech: Option<hellas_adaptors::openai::audio_speech::HostedSpeech>,
 }
 
 fn default_response_bytes() -> u32 {
@@ -59,26 +56,7 @@ impl HttpRoute {
         {
             return Err(crate::GatewayConfigError::CredentialHeader.into());
         }
-        if let Some(adaptor) = &self.hosted_speech {
-            if self.path != hellas_adaptors::openai::audio_speech::PATH
-                || self.method != "POST"
-                || self.models.is_none()
-            {
-                return Err(crate::RoutingError(
-                    "hosted speech requires POST /v1/audio/speech and model aliases".into(),
-                )
-                .into());
-            }
-            adaptor
-                .validate(&self.url)
-                .map_err(|e| crate::RoutingError(e.message))?;
-            let mut route = self.clone();
-            route.hosted_speech = None;
-            route.url = hellas_rpc::http_fetch::path::substitute(&self.url, "voice")?.into();
-            route.request(Bytes::new(), &HeaderMap::new())?.validate()?;
-        } else {
-            route.request(Bytes::new(), &HeaderMap::new())?.validate()?;
-        }
+        route.request(Bytes::new(), &HeaderMap::new())?.validate()?;
         Ok(())
     }
 
@@ -115,36 +93,8 @@ impl HttpRoute {
                 headers.push((name.into(), value.to_str()?.into()));
             }
         }
-        let (url, body) = if let Some(adaptor) = &self.hosted_speech {
-            let decoded = hellas_authority::model::http_usage::decode_request_body(
-                incoming
-                    .get("content-encoding")
-                    .map(|v| v.to_str())
-                    .transpose()?,
-                &body,
-            )
-            .map_err(|e| crate::RoutingError(e.into()))?;
-            let request = hellas_adaptors::openai::audio_speech::SpeechRequest::parse(&decoded)
-                .map_err(|e| crate::RoutingError(e.message))?;
-            if !self
-                .models
-                .as_ref()
-                .is_some_and(|models| models.contains(&request.model))
-            {
-                return Err(crate::RoutingError("unknown hosted speech model".into()).into());
-            }
-            headers
-                .retain(|(name, _)| !matches!(name.as_str(), "content-type" | "content-encoding"));
-            headers.push(("content-type".into(), "application/json".into()));
-            let (url, body) = adaptor
-                .translate(&self.url, &request)
-                .map_err(|e| crate::RoutingError(e.message))?;
-            (url, Bytes::from(body))
-        } else {
-            (self.url.clone(), body)
-        };
         Ok(HttpFetchRequest {
-            url,
+            url: self.url.clone(),
             method: self.method.clone(),
             headers,
             body_base64: STANDARD.encode(body),

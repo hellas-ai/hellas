@@ -118,7 +118,6 @@ async fn both_listeners_keep_admitted_backends_when_fetch_configuration_changes(
                                 service: "openai".into(),
                                 method: "responses".into(),
                                 route: hellas_gateway::HttpRoute {
-                                    hosted_speech: None,
                                     path: template.paths[0].clone(),
                                     method: "POST".into(),
                                     url: format!("{}{}", template.origin, template.paths[0]),

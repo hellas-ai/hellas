@@ -1,5 +1,7 @@
 //! Shared speech request and the hosted audio interface translation.
 use super::RequestError;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use hellas_rpc::http_fetch::{HttpFetchRequest, HttpTls, HttpTrustRoots};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 pub const PATH: &str = "/v1/audio/speech";
@@ -13,7 +15,7 @@ fn format() -> String {
     "mp3".into()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpeechRequest {
     pub model: String,
@@ -39,14 +41,9 @@ impl SpeechRequest {
         if !request.speed.is_finite() || !(0.25..=4.).contains(&request.speed) {
             return Err(invalid("speed must be between 0.25 and 4"));
         }
-        hellas_rpc::http_fetch::path::voice_segment(&request.voice)
-            .map_err(|e| invalid(e.to_string()))?;
         Ok(request)
     }
-    pub fn native(&self, model: &str) -> Result<(), RequestError> {
-        if self.model != model {
-            return Err(invalid("unknown speech model"));
-        }
+    pub fn native(&self) -> Result<(), RequestError> {
         if self.response_format != "wav" {
             return Err(invalid("MMS speech supports response_format wav"));
         }
@@ -61,11 +58,25 @@ impl SpeechRequest {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostedSpeech {
+    pub url: String,
+    #[serde(default = "public_tls")]
+    pub tls: HttpTls,
+    #[serde(default = "response_limit")]
+    pub max_response_bytes: u32,
     pub model_id: String,
     pub formats: BTreeMap<String, String>,
 }
+fn public_tls() -> HttpTls {
+    HttpTls {
+        roots: HttpTrustRoots::WebPki,
+        spki_sha256: vec![],
+    }
+}
+fn response_limit() -> u32 {
+    hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES
+}
 impl HostedSpeech {
-    pub fn validate(&self, url: &str) -> Result<(), RequestError> {
+    pub fn validate(&self) -> Result<(), RequestError> {
         if self.model_id.is_empty()
             || self.model_id.len() > 256
             || self.formats.is_empty()
@@ -79,15 +90,11 @@ impl HostedSpeech {
                 "hosted speech requires a model id and explicit wav/mp3 format mappings",
             ));
         }
-        hellas_rpc::http_fetch::path::substitute(url, "voice")
+        let url = hellas_rpc::http_fetch::path::substitute(&self.url, "segment")
             .map_err(|e| invalid(e.to_string()))?;
-        Ok(())
+        self.prepared(url.into(), vec![]).map(|_| ())
     }
-    pub fn translate(
-        &self,
-        url: &str,
-        request: &SpeechRequest,
-    ) -> Result<(String, Vec<u8>), RequestError> {
+    pub fn translate(&self, request: &SpeechRequest) -> Result<HttpFetchRequest, RequestError> {
         if request.speed != 1. {
             return Err(invalid("hosted speech supports speed 1"));
         }
@@ -95,14 +102,26 @@ impl HostedSpeech {
             .formats
             .get(&request.response_format)
             .ok_or_else(|| invalid("unsupported hosted speech response_format"))?;
-        let mut url = hellas_rpc::http_fetch::path::substitute(url, &request.voice)
+        let mut url = hellas_rpc::http_fetch::path::substitute(&self.url, &request.voice)
             .map_err(|e| invalid(e.to_string()))?;
         url.query_pairs_mut().append_pair("output_format", output);
         let body = serde_json::to_vec(
             &serde_json::json!({"text": request.input, "model_id": self.model_id}),
         )
         .map_err(|e| invalid(e.to_string()))?;
-        Ok((url.into(), body))
+        self.prepared(url.into(), body)
+    }
+    fn prepared(&self, url: String, body: Vec<u8>) -> Result<HttpFetchRequest, RequestError> {
+        let request = HttpFetchRequest {
+            url,
+            method: "POST".into(),
+            tls: self.tls.clone(),
+            max_response_bytes: self.max_response_bytes,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body_base64: STANDARD.encode(body),
+        };
+        request.validate().map_err(|e| invalid(e.to_string()))?;
+        Ok(request)
     }
 }
 
@@ -112,30 +131,31 @@ mod tests {
     #[test]
     fn maps_only_supported_speech_fields() {
         let adaptor = HostedSpeech {
+            url: "https://audio.example/v1/text-to-speech/{segment}".into(),
+            tls: public_tls(),
+            max_response_bytes: response_limit(),
             model_id: "upstream-model".into(),
             formats: [("wav".into(), "pcm wav".into())].into(),
         };
-        let url = "https://audio.example/v1/text-to-speech/{voice_id}";
-        adaptor.validate(url).unwrap();
+        adaptor.validate().unwrap();
         let mut request = SpeechRequest::parse(
             br#"{"model":"hosted","input":"hello","voice":"voice two","response_format":"wav"}"#,
         )
         .unwrap();
-        let (url, body) = adaptor.translate(url, &request).unwrap();
+        let prepared = adaptor.translate(&request).unwrap();
         assert_eq!(
-            url,
+            prepared.url,
             "https://audio.example/v1/text-to-speech/voice%20two?output_format=pcm+wav"
         );
         assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::from_slice::<serde_json::Value>(
+                &STANDARD.decode(&prepared.body_base64).unwrap()
+            )
+            .unwrap(),
             serde_json::json!({"text":"hello","model_id":"upstream-model"})
         );
         request.speed = 2.;
-        assert!(
-            adaptor
-                .translate("https://audio.example/{voice_id}", &request)
-                .is_err()
-        );
+        assert!(adaptor.translate(&request).is_err());
         for extra in [
             r#", "instructions":"whisper""#,
             r#", "stream":true"#,

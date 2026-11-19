@@ -184,6 +184,17 @@ impl Routing {
         let backends = work.backends();
         let mut keys = BTreeMap::new();
         for (row, route) in routes.iter().enumerate() {
+            if matches!(
+                route.presentation,
+                crate::Presentation::Model {
+                    modality: hellas_client::model::ModelKind::Speech,
+                    ..
+                }
+            ) {
+                return Err(RoutingError(
+                    "speech packages require a speech target".into(),
+                ));
+            }
             let mut unique = std::collections::BTreeSet::new();
             if route.backends.is_empty()
                 || route

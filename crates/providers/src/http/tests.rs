@@ -759,7 +759,7 @@ fn voice_templates_scope_credentials_without_prefix_or_encoding_escapes() {
     let credential = HttpCredential {
         trust_roots: HttpTrustRoots::WebPki,
         allowed_origins: vec!["https://audio.example".into()],
-        allowed_paths: vec!["/v1/text-to-speech/{voice_id}".into()],
+        allowed_paths: vec!["/v1/text-to-speech/{segment}".into()],
         allowed_methods: vec!["POST".into()],
         header_name: "x-hosted-key".into(),
         header_value: "local-mock-seller-secret".into(),

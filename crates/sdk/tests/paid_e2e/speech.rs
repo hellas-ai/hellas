@@ -1,179 +1,47 @@
 //! One bearer and one speech endpoint over paid Fetch and native Compute.
 use super::*;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use hellas_gateway::{HttpRoute, HttpTarget, Presentation, Route, WorkExecutionBackend as _};
-use hellas_rpc::http_fetch::{HttpTls, HttpTrustRoots};
-use hellas_sdk::daemon_config::{Backend, BackendKind, Credential, Upstream};
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use hellas_gateway::{Presentation, Route, WorkExecutionBackend as _};
 
-const SECRET: &str = "local-mock-seller-secret";
+use super::http_fixture::{Mock, Reply, SECRET, access};
 const PATH: &str = "/v1/audio/speech";
-const UPSTREAM: &str = "/v1/text-to-speech/{voice_id}";
+const UPSTREAM: &str = "/v1/text-to-speech/{segment}";
 
-struct Mock {
-    origin: String,
-    tls: HttpTls,
-    seen: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
-    task: tokio::task::JoinHandle<()>,
-}
-impl Drop for Mock {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-impl Mock {
-    async fn start() -> Self {
-        let key = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-        let cert = key.cert.der().clone();
-        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(
-            vec![cert.clone()],
-            rustls::pki_types::PrivatePkcs8KeyDer::from(key.signing_key.serialize_der()).into(),
-        )
-        .unwrap();
-        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let origin = format!(
-            "https://localhost:{}",
-            listener.local_addr().unwrap().port()
-        );
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let capture = seen.clone();
-        let task = tokio::spawn(async move {
-            while let Ok((socket, _)) = listener.accept().await {
-                let (acceptor, capture) = (acceptor.clone(), capture.clone());
-                tokio::spawn(async move {
-                    let mut stream = acceptor.accept(socket).await.unwrap();
-                    let mut request = Vec::new();
-                    let mut buf = [0; 8192];
-                    let header_end = loop {
-                        let n = stream.read(&mut buf).await.unwrap();
-                        if n == 0 {
-                            return;
-                        }
-                        request.extend_from_slice(&buf[..n]);
-                        if let Some(i) = request.windows(4).position(|w| w == b"\r\n\r\n") {
-                            break i + 4;
-                        }
-                    };
-                    let header = String::from_utf8(request[..header_end].to_vec()).unwrap();
-                    let length = header
-                        .lines()
-                        .find_map(|line| {
-                            line.to_ascii_lowercase()
-                                .strip_prefix("content-length: ")
-                                .map(|n| n.parse::<usize>().unwrap())
-                        })
-                        .unwrap_or(0);
-                    while request.len() < header_end + length {
-                        let n = stream.read(&mut buf).await.unwrap();
-                        assert!(n > 0);
-                        request.extend_from_slice(&buf[..n]);
-                    }
-                    capture.lock().unwrap().push(request);
-                    let target = header.split_whitespace().nth(1).unwrap();
-                    let authorized = header
-                        .to_ascii_lowercase()
-                        .contains(&format!("x-hosted-key: {SECRET}\r\n"));
-                    assert!(authorized);
-                    assert!(target.starts_with("/v1/text-to-speech/"));
-                    let (status, content, bytes) = (200, "audio/wav", wav());
-                    let head = format!(
-                        "HTTP/1.1 {status} Test\r\ncontent-type: {content}\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n"
-                    );
-                    if stream.write_all(head.as_bytes()).await.is_err() {
-                        return;
-                    }
-                    for chunk in bytes.chunks(16384) {
-                        if stream
-                            .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                        if stream.write_all(chunk).await.is_err() {
-                            return;
-                        }
-                        if stream.write_all(b"\r\n").await.is_err() {
-                            return;
-                        }
-                        if stream.flush().await.is_err() {
-                            return;
-                        }
-                    }
-                    let _ = stream.write_all(b"0\r\n\r\n").await;
-                    let _ = stream.shutdown().await;
-                });
-            }
-        });
-        Self {
-            origin,
-            tls: HttpTls {
-                roots: HttpTrustRoots::Certificates {
-                    der_base64: vec![STANDARD.encode(cert)],
-                },
-                spki_sha256: vec![],
-            },
-            seen,
-            task,
+fn reply(target: &str) -> Reply {
+    assert!(target.starts_with("/v1/text-to-speech/"));
+    if target.contains("/error?") {
+        Reply {
+            status: 422,
+            content: "application/json",
+            bytes: br#"{"error":"unsupported voice"}"#.to_vec(),
+            chunked: true,
+        }
+    } else {
+        Reply {
+            status: 200,
+            content: "audio/wav",
+            bytes: wav(),
+            chunked: true,
         }
     }
-    fn backend(&self) -> Backend {
-        Backend {
-            max_in_flight: std::num::NonZeroUsize::MIN,
-            kind: BackendKind::Fetch {
+}
+fn route(mock: &Mock) -> Route {
+    Route {
+        backends: vec!["test".into()],
+        presentation: Presentation::Speech {
+            model: "hosted".into(),
+            target: hellas_gateway::SpeechTarget::Hosted {
                 service: "openai".into(),
                 method: "responses".into(),
-                upstream: Upstream::Http {
-                    allowed_hosts: vec!["localhost".into()],
-                    allow_private_addresses: true,
-                    credentials: vec![Credential {
-                        trust_roots: self.tls.roots.clone(),
-                        allowed_origins: vec![self.origin.clone()],
-                        allowed_paths: vec![UPSTREAM.into()],
-                        allowed_methods: vec!["GET".into(), "POST".into()],
-                        header_name: "x-hosted-key".into(),
-                        secret: Some(SECRET.into()),
-                    }],
+                adaptor: hellas_adaptors::openai::audio_speech::HostedSpeech {
+                    url: format!("{}{UPSTREAM}", mock.origin),
+                    tls: mock.tls.clone(),
+                    max_response_bytes: hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES,
+                    model_id: "hosted-test".into(),
+                    formats: [("wav".into(), "wav-test".into())].into(),
                 },
             },
-        }
-    }
-    fn route(&self, path: &str, method: &str) -> Route {
-        Route {
-            backends: vec!["test".into()],
-            presentation: Presentation::Http {
-                targets: [(
-                    "test".into(),
-                    HttpTarget {
-                        service: "openai".into(),
-                        method: "responses".into(),
-                        route: HttpRoute {
-                            path: path.into(),
-                            method: method.into(),
-                            url: format!("{}{UPSTREAM}", self.origin),
-                            tls: self.tls.clone(),
-                            headers: vec![],
-                            max_response_bytes: hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES,
-                            models: Some(vec!["hosted".into()]),
-                            hosted_speech: Some(
-                                hellas_adaptors::openai::audio_speech::HostedSpeech {
-                                    model_id: "hosted-test".into(),
-                                    formats: [("wav".into(), "wav-test".into())].into(),
-                                },
-                            ),
-                        },
-                    },
-                )]
-                .into(),
-            },
-        }
+        },
     }
 }
 fn wav() -> Vec<u8> {
@@ -193,72 +61,6 @@ fn wav() -> Vec<u8> {
         bytes.extend(sample.to_le_bytes());
     }
     bytes
-}
-
-async fn access(root: &std::path::Path) -> (NodeCoordinator, hellas_gateway::GatewayAccess) {
-    use auth::*;
-    use hellas_authority::{
-        node::{GATEWAY_INVOKE, host_resource},
-        test_support::{TestClock, common_node, ids::ROOT_GRANT},
-    };
-    let authority = AuthorityId(Digest::hash(b"audio gateway probe"));
-    let now = UnixMillis(1000);
-    let spec = common_node::admin_spec(
-        authority,
-        ROOT.principal(),
-        &[(GATEWAY_INVOKE, host_resource(authority))],
-        (now, UnixMillis(100_000)),
-        (99_000, 0),
-        &[],
-    );
-    let (store, admin) = NodeStore::bootstrap(
-        &StoreLocation::for_test(root),
-        hellas_authority::model::grant::grant_network(),
-        ROOT_GRANT,
-        common_node::approval_for(
-            Ownership::Bootstrap {
-                root: ROOT_GRANT,
-                target: None,
-            },
-            spec.clone(),
-            spec,
-        ),
-        None,
-        now,
-    )
-    .await
-    .unwrap();
-    let node = NodeCoordinator::new(store, TestClock::new(now).source());
-    let caller = hellas_authority::test_support::session(&node, &admin).await;
-    let scope = hellas_channel::test_support::Rights::new(authority, ROOT)
-        .allow(GATEWAY_INVOKE, host_resource(authority))
-        .valid_from(now)
-        .valid_until(UnixMillis(90_000))
-        .build();
-    let grant = GrantId([104; 16]);
-    node.grant(
-        &caller,
-        GrantCommand::Issue {
-            authorization: ROOT_GRANT,
-            id: grant,
-            spec: scope.clone(),
-        },
-    )
-    .await
-    .unwrap();
-    let (_, credential) = hellas_authority::test_support::credentials::issue_one(
-        &node,
-        &caller,
-        ROOT_GRANT,
-        scope,
-        CredentialHolder::Bearer,
-    )
-    .await
-    .unwrap();
-    let access = hellas_gateway::GatewayAccess::new(node.clone(), grant, credential)
-        .await
-        .unwrap();
-    (node, access)
 }
 
 struct SpeechBackend {
@@ -308,7 +110,8 @@ impl hellas_gateway::WorkExecutionBackend for SpeechBackend {
         let call = &job.plan.calls[0];
         assert_eq!(call.entry, "tts.synthesize");
         assert_eq!(call.args[1], Arg::U64(11)); // hello with interleaved blanks
-        assert_eq!(call.args[6], Arg::F32Bits(1f32.to_bits()));
+        let fail = call.args[6] == Arg::F32Bits(2f32.to_bits());
+        assert!(fail || call.args[6] == Arg::F32Bits(1f32.to_bits()));
         assert_eq!(job.environment.assets[0].object.bytes(), 56_546_102);
         assert_eq!(job.inputs[0].name, "tokens");
         let mut offset = 0;
@@ -329,6 +132,10 @@ impl hellas_gateway::WorkExecutionBackend for SpeechBackend {
         self.native_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(Box::pin(async_stream::stream! {
+            yield Ok(hellas_gateway::WorkEvent::Accepted(hellas_rpc::provenance::ExecutionProvenance {
+                commitment_id: [0x42; 32],
+                provider: ProducerSigningKey::from_secret_bytes([9;32]).unwrap().public_key(),
+            }));
             for source in &job.environment.sources {
                 let reader = job.content.0.open_verified(&job.content.1, *source, None).await.unwrap().unwrap();
                 let bytes = reader.read_all(*source, &job.content.0.ram_pool()).await.unwrap();
@@ -337,9 +144,10 @@ impl hellas_gateway::WorkExecutionBackend for SpeechBackend {
             // This evaluator fixture returns the real MMS ABI without opening a GPU.
             let mut samples = vec![0u8; 480000 * 4];
             for (slot, value) in samples.as_chunks_mut::<4>().0.iter_mut().zip([-0.5f32, 0., 0.5]) { slot.copy_from_slice(&value.to_le_bytes()); }
+            yield Ok(hellas_gateway::WorkEvent::Transcript(b"CPU evaluator fixture transcript".to_vec()));
             yield Ok(hellas_gateway::WorkEvent::Output(hellas_gateway::ComputeEvent::Done {
                 output: InvocationOutput { outcome: Outcome::Succeeded, metadata: hellas_rpc::JsonBytes(vec![]), artifacts: vec![
-                    Artifact::new("result", "catena.bytes.v1", [3u64.to_le_bytes(), 0u64.to_le_bytes()].concat()),
+                    Artifact::new("result", "catena.bytes.v1", [3u64.to_le_bytes(), u64::from(fail).to_le_bytes()].concat()),
                     Artifact::new("waveform", "catena.bytes.v1", samples),
                 ] },
                 provider: ProducerSigningKey::from_secret_bytes([9;32]).unwrap().public_key(),
@@ -377,12 +185,20 @@ fn native_route(root: &std::path::Path) -> Route {
     .unwrap();
     Route {
         backends: vec!["mms".into()],
-        presentation: Presentation::Model {
-            modality: hellas_client::model::ModelKind::Speech,
+        presentation: Presentation::Speech {
             model: "mms".into(),
-            package,
-            max_tokens: 1,
+            target: hellas_gateway::SpeechTarget::Native { package },
         },
+    }
+}
+
+fn evidence(response: &reqwest::Response) {
+    for name in [
+        hellas_rpc::provenance::COMMITMENT_KEY,
+        hellas_rpc::provenance::PROVIDER_KEY,
+        hellas_rpc::provenance::TRANSCRIPT_KEY,
+    ] {
+        assert!(response.headers().contains_key(name), "missing {name}");
     }
 }
 
@@ -390,8 +206,8 @@ fn native_route(root: &std::path::Path) -> Route {
 fn one_speech_gateway_selects_paid_hosted_or_native_by_model() {
     run(|runtime| {
         Box::pin(async move {
-            let mock = Mock::start().await;
-            let mut case = paid_fixture_for(runtime, Some(mock.backend())).await;
+            let mock = Mock::start(reply).await;
+            let mut case = paid_fixture_for(runtime, Some(mock.backend(&[UPSTREAM]))).await;
             let paid = hellas_sdk::ExecutorGateway::new(
                 [(
                     "test".into(),
@@ -416,7 +232,7 @@ fn one_speech_gateway_selects_paid_hosted_or_native_by_model() {
                 native_calls: native_calls.clone(),
             });
             let (node, access) = access(&case.root.path().join("speech-authority")).await;
-            let routes = vec![mock.route(PATH, "POST"), native_route(case.root.path())];
+            let routes = vec![route(&mock), native_route(case.root.path())];
             let server = hellas_gateway::test_server::serve(
                 node,
                 access.bearer(),
@@ -444,6 +260,7 @@ fn one_speech_gateway_selects_paid_hosted_or_native_by_model() {
                     let response = send(&body).send().await.unwrap();
                     assert_eq!(response.status(), 200);
                     assert_eq!(response.headers()["content-type"], "audio/wav");
+                    evidence(&response);
                     assert_eq!(response.bytes().await.unwrap().as_ref(), wav());
                 }
                 body["model"] = "hosted".into();
@@ -459,8 +276,61 @@ fn one_speech_gateway_selects_paid_hosted_or_native_by_model() {
                         .as_ref(),
                     wav()
                 );
+                // Gzip fixtures for the same two model-selected requests above.
+                for wire in [
+                    "H4sIAAAAAAAC/xXKQQ6AIAwF0bt07Qm8DCH2E0kKJRRwYby7ZTkv81JRhtBJt9oA00G5tjk2QES9l+YL3owUpwyXDmtaDSFpL3G/T1z0/c5EgYNMAAAA",
+                    "H4sIAAAAAAAC/6tWys1PSc1RslLKzS1W0lHKzCsoLQHyMlJzcvKB/LL8zORUID8lNS2xNKcEKFKUWlyQn1ecGp+WX5SbCFJbnlimVAsAqkf9WkkAAAA=",
+                ] {
+                    let response = client
+                        .post(format!("http://{}{PATH}", server.address()))
+                        .bearer_auth(server.bearer())
+                        .header("content-type", "application/json")
+                        .header("content-encoding", "gzip")
+                        .header("x-hosted-key", "buyer-value")
+                        .body(STANDARD.decode(wire).unwrap())
+                        .send()
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), 200);
+                    evidence(&response);
+                    assert_eq!(response.bytes().await.unwrap().as_ref(), wav());
+                }
+                body["model"] = "hosted".into();
+                body["voice"] = "error".into();
+                let response = send(&body).send().await.unwrap();
+                assert_eq!(response.status(), 422);
+                evidence(&response);
+                assert_eq!(
+                    response.json::<serde_json::Value>().await.unwrap(),
+                    serde_json::json!({"error":"unsupported voice"})
+                );
+                body["model"] = "mms".into();
+                body["voice"] = "default".into();
+                body["speed"] = 2.into(); // evaluator fixture returns a failed MMS status
+                let response = send(&body).send().await.unwrap();
+                assert_eq!(response.status(), 502);
+                evidence(&response);
+                assert!(
+                    response
+                        .json::<serde_json::Value>()
+                        .await
+                        .unwrap()
+                        .get("error")
+                        .is_some()
+                );
                 for model in ["hosted", "mms"] {
                     let base = serde_json::json!({"model":model,"input":"hello","voice":"default","response_format":"wav"});
+                    assert_eq!(
+                        client
+                            .post(format!("http://{}{PATH}?speed=2", server.address()))
+                            .bearer_auth(server.bearer())
+                            .json(&base)
+                            .send()
+                            .await
+                            .unwrap()
+                            .status(),
+                        400
+                    );
                     for (key, value) in [
                         ("response_format", serde_json::json!("opus")),
                         ("voice", serde_json::json!("../escape")),
@@ -475,16 +345,21 @@ fn one_speech_gateway_selects_paid_hosted_or_native_by_model() {
             };
             sealing_while(&mut case.devnet, Duration::from_secs(1), work).await;
             gateway.drain().await.unwrap();
-            assert_eq!(native_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(native_calls.load(std::sync::atomic::Ordering::SeqCst), 3);
             let seen = mock.seen.lock().unwrap().clone();
-            assert_eq!(seen.len(), 2);
-            for (request, voice) in seen.iter().zip(["default", "voice%20two"]) {
+            assert_eq!(seen.len(), 4);
+            for (request, voice) in seen
+                .iter()
+                .zip(["default", "voice%20two", "default", "error"])
+            {
                 let request = String::from_utf8(request.clone()).unwrap();
                 assert!(request.starts_with(&format!(
                     "POST /v1/text-to-speech/{voice}?output_format=wav-test HTTP/1.1"
                 )));
                 assert!(request.contains(&format!("x-hosted-key: {SECRET}")));
                 assert!(!request.to_lowercase().contains("authorization:"));
+                assert!(!request.to_lowercase().contains("content-encoding:"));
+                assert!(!request.contains("buyer-value"));
                 let body: serde_json::Value =
                     serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
                 assert_eq!(
@@ -508,8 +383,8 @@ fn one_speech_gateway_selects_paid_hosted_or_native_by_model() {
             session
                 .with_state(|state| {
                     assert_eq!(state.jobs().count(), 0);
-                    assert_eq!(state.terminals().count(), 2);
-                    assert_eq!(state.ledger().credited_cumulative(), 2 * PRICE);
+                    assert_eq!(state.terminals().count(), 4);
+                    assert_eq!(state.ledger().credited_cumulative(), 4 * PRICE);
                 })
                 .await
                 .unwrap();

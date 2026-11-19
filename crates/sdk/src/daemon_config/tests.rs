@@ -493,7 +493,7 @@ async fn voice_templates_are_validated_and_require_account_backing_for_covered_r
         else {
             unreachable!()
         };
-        credentials[0].allowed_paths = vec!["/v1/text-to-speech/{voice_id}".into()];
+        credentials[0].allowed_paths = vec!["/v1/text-to-speech/{segment}".into()];
         credentials[0].clone()
     };
     document.validate().unwrap();

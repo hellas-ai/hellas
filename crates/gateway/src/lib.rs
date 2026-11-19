@@ -18,6 +18,7 @@ mod error;
 pub mod router;
 mod speech;
 pub use error::{GatewayConfigError, GatewayError, GatewayResult};
+pub use speech::SpeechTarget;
 mod http_fetch;
 mod image;
 mod provenance_layer;

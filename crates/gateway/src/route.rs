@@ -32,6 +32,10 @@ pub enum Presentation {
     Http {
         targets: BTreeMap<String, HttpTarget>,
     },
+    Speech {
+        model: String,
+        target: crate::speech::SpeechTarget,
+    },
 }
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -46,6 +50,18 @@ fn default_tokens() -> u32 {
 }
 
 impl Route {
+    /// Packages needed by model presentations, including native speech.
+    pub fn model_package(&self) -> Option<(&str, &PathBuf)> {
+        match &self.presentation {
+            Presentation::Model { model, package, .. }
+            | Presentation::Speech {
+                model,
+                target: crate::speech::SpeechTarget::Native { package },
+            } => Some((model, package)),
+            _ => None,
+        }
+    }
+
     pub fn keys(&self) -> Vec<(String, String, Option<String>)> {
         let (paths, method, models) = match &self.presentation {
             Presentation::Model {
@@ -62,6 +78,9 @@ impl Route {
             ),
             Presentation::Responses { models, .. } => {
                 (vec![crate::responses_fetch::PATH], "POST", models.clone())
+            }
+            Presentation::Speech { model, .. } => {
+                (vec![crate::speech::PATH], "POST", vec![model.clone()])
             }
             Presentation::Http { targets } => {
                 let Some(target) = targets.values().next() else {

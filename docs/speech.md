@@ -23,7 +23,9 @@ capacity fail explicitly. Hosted speech accepts only the configured `wav`
 and/or `mp3` mappings and speed 1. Omitting `response_format` selects `mp3`,
 which therefore requires a hosted mp3 mapping; MMS callers must request wav.
 Unknown fields, unsupported settings and query parameters receive 400 before
-execution. Audio bytes from the hosted service retain its content type.
+execution. Both targets return a complete response after verified completion. Hosted audio
+retains its content type and encoding; upstream error statuses and bodies are
+preserved. Signed evidence accompanies successful and failed completions.
 
 ## Prepare the MMS package
 
@@ -72,34 +74,38 @@ max_price = 20
 evaluator = "hellas/catena-dfad87438018-hip"
 
 [[routes]]
-kind = "http"
+kind = "speech"
 backends = ["hosted"]
-[routes.targets.hosted]
+model = "hosted"
+[routes.target]
+kind = "hosted"
 service = "audio"
 method = "speech"
-[routes.targets.hosted.route]
-path = "/v1/audio/speech"
-method = "POST"
-url = "https://audio.example/v1/text-to-speech/{voice_id}"
-models = ["hosted"]
-[routes.targets.hosted.route.hosted_speech]
+[routes.target.adaptor]
+url = "https://audio.example/v1/text-to-speech/{segment}"
 model_id = "upstream-model"
-[routes.targets.hosted.route.hosted_speech.formats]
+[routes.target.adaptor.formats]
 wav = "UPSTREAM_WAV_FORMAT"
 mp3 = "UPSTREAM_MP3_FORMAT"
 
 [[routes]]
-kind = "model"
+kind = "speech"
 backends = ["native"]
-modality = "speech"
 model = "mms"
+[routes.target]
+kind = "native"
 package = "/srv/models/mms-remote"
 ```
 
+Each model alias has one speech target in the existing route table. Both target
+kinds share request parsing, response delivery and provenance. Generic HTTP
+passthrough has no speech configuration.
+
 The adaptor maps `input` to upstream `text`, uses the configured upstream
 `model_id`, encodes `voice` as one path segment, and puts the mapped format in
-`output_format`. It strips the gateway bearer; the seller rejects a buyer-supplied
-header that would override its credential. JSON gzip/zstd bodies are decoded before translation.
+`output_format`. It prepares only the translated JSON and its content type; caller headers,
+including the gateway bearer, are not forwarded. JSON gzip/zstd bodies are
+decoded once before model selection.
 The seller injects its key through the ordinary Fetch credential machinery.
 
 ## Seller scope
@@ -116,7 +122,7 @@ kind = "http"
 allowed_hosts = ["audio.example"]
 [[backends.audio.upstream.credentials]]
 allowed_origins = ["https://audio.example"]
-allowed_paths = ["/v1/text-to-speech/{voice_id}"]
+allowed_paths = ["/v1/text-to-speech/{segment}"]
 allowed_methods = ["POST"]
 header_name = "x-hosted-key"
 secret = "SELLER_SECRET"
@@ -127,7 +133,7 @@ redacted from the daemon's configuration echo and stays out of buyer requests
 and transcripts. Approve the seller's HTTP Fetch admission and per-request
 paid terms as described in [paid work](paid-gateway.md).
 
-A scope permits one complete `{voice_id}` segment, with exact surrounding path
+A scope permits one complete `{segment}` segment, with exact surrounding path
 segments, origin, method and trust roots. It does not cover `/stream` or another
 suffix. A second explicit scope is required for those paths. Slashes,
 backslashes, percent signs, query/fragment delimiters, dot segments and
