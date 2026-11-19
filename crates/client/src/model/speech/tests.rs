@@ -94,6 +94,13 @@ async fn converted_mms_and_descriptor_render_the_same_portable_synthesis_job() {
         assert_eq!(a.plan.calls[0].args.len(), 7 + tts::bindings().len());
         assert_eq!(a.environment.assets[0].object, object);
     }
+    std::fs::write(desc.join("config.json"), []).unwrap();
+    assert!(
+        ModelPackage::require_local_weights(&desc)
+            .unwrap_err()
+            .to_string()
+            .contains("local execution requires the full model weights")
+    );
 }
 
 fn output(samples: &[f32], count: u64, status: u64) -> InvocationOutput {

@@ -63,12 +63,17 @@ pub(super) fn classify(path: &Path) -> Result<Layout> {
     let whisper = whisper::METADATA.iter().try_fold(false, |found, name| {
         Ok::<_, std::io::Error>(path.join(name).try_exists()? || found)
     })?;
+    let speech = speech::METADATA[1..]
+        .iter()
+        .try_fold(false, |found, name| {
+            Ok::<_, std::io::Error>(path.join(name).try_exists()? || found)
+        })?;
     let flux = path.join("model_index.json").try_exists()?;
     ensure!(
-        !(flux && (manifest || gguf || whisper || weights)
-            || gguf && (whisper || weights)
+        !(flux && (manifest || gguf || whisper || speech || weights)
+            || gguf && (whisper || speech || weights)
             || manifest && weights),
-        "mixed model layout: descriptor, GGUF, Whisper and Flux files cannot overlap"
+        "mixed model layout: descriptor, GGUF, Whisper, MMS and Flux files cannot overlap"
     );
     if flux {
         return Ok(Layout::Flux);
@@ -77,18 +82,6 @@ pub(super) fn classify(path: &Path) -> Result<Layout> {
         ensure!(manifest, "header.gguf requires descriptor.json");
         return Ok(Layout::GgufDescriptor);
     }
-    let speech = if path.join("config.json").try_exists()? {
-        let bytes = hellas_private::read_bounded_regular_file(
-            &path.join("config.json"),
-            whisper::MAX_METADATA_BYTES,
-        )?;
-        serde_json::from_slice::<serde_json::Value>(&bytes)?
-            .get("model_type")
-            .and_then(|v| v.as_str())
-            == Some("vits")
-    } else {
-        false
-    };
     if speech {
         ensure!(
             manifest || weights,
