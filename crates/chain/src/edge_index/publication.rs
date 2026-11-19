@@ -19,7 +19,6 @@ pub(crate) struct Publication {
     pub(crate) index: EdgeIndex,
     pub(crate) verifier: Arc<ProofVerifier>,
     pub(crate) archive: ChainIndexer,
-    pub(crate) source: crate::node::replication::Network,
 }
 impl Publication {
     /// Publication can be one block ahead of Marshal's durable acknowledgment.
@@ -113,37 +112,13 @@ impl Publication {
         if latest.as_ref().map_or(1, |p| p.height + 1) != block.height().get() {
             return Err("index must replay every finalized block".into());
         }
-        let query = FinalizedBlockQuery::Height(block.height().get());
-        let (stored, repaired) = match self.archive.get_finalized_block(query).await {
-            // Older archives discarded the certificates of fetched ancestors.
-            // Repair that persisted history with a bounded, authenticated proof
-            // for this height, without changing proof limits or skipping execution.
-            Err(crate::QueryError::FinalityProofUnavailable { height }) => (
-                self.source
-                    .fetch(query)
-                    .await
-                    .ok_or(crate::QueryError::FinalityProofUnavailable { height })?,
-                true,
-            ),
-            result => (
-                result?.ok_or("finalized index block is absent from archive")?,
-                false,
-            ),
-        };
+        // The resolver retains each downloaded proof before delivering its block.
+        // Publication uses only local evidence; a checkpoint without it cannot commit.
+        let finalization = self.archive.finality_proof(block).await?;
         let verified = self.verifier.verify_finalized(
-            stored,
+            crate::indexer::finalized_block(block, finalization),
             ProofQuery::Block(FinalizedBlockQuery::Height(block.height().get())),
         )?;
-        if verified.view().payload() != block.digest() {
-            return Err("index proof differs from executed block".into());
-        }
-        if repaired {
-            let proof =
-                crate::finality_proof::FinalityProof::decode(&verified.bundle().finalization)?;
-            self.archive
-                .accept_verified_proof(block.clone(), proof)
-                .await?;
-        }
         self.index.store.prepare(verified.bundle().clone(), changes)
     }
 

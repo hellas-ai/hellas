@@ -1148,7 +1148,7 @@ fn response_deadline_ms() -> u64 {
 }
 
 fn network() -> NetworkId {
-    let Some(network) = NetworkId::new("hellas-devnet-1") else {
+    let Some(network) = NetworkId::new("test-network") else {
         panic!("a short ascii id is a network id");
     };
     network

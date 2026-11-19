@@ -131,14 +131,16 @@ impl ChainIndexer {
         proof: crate::finality_proof::FinalityProof,
     ) -> Result<(), QueryError> {
         use commonware_consensus::{Reporter as _, simplex::types::Activity};
-        for candidate in std::iter::once(block).chain(proof.descendants) {
-            if !self
-                .marshal
-                .verified(candidate.context().round, candidate)
-                .await
-            {
-                return Err(QueryError::ChannelClosed);
-            }
+        // Store the certified terminal before its ancestors. Once the certificate
+        // is registered, every subsequently exposed ancestor has local evidence.
+        let mut blocks = std::iter::once(block).chain(proof.descendants).rev();
+        let terminal = blocks.next().expect("proof includes its target block");
+        if !self
+            .marshal
+            .verified(terminal.context().round, terminal)
+            .await
+        {
+            return Err(QueryError::ChannelClosed);
         }
         if !self
             .marshal
@@ -147,6 +149,15 @@ impl ChainIndexer {
             .accepted()
         {
             return Err(QueryError::ChannelClosed);
+        }
+        for candidate in blocks {
+            if !self
+                .marshal
+                .verified(candidate.context().round, candidate)
+                .await
+            {
+                return Err(QueryError::ChannelClosed);
+            }
         }
         Ok(())
     }
@@ -238,6 +249,12 @@ impl ChainIndexer {
                 "finalized block digest did not match index".to_string(),
             ));
         }
+        let finalization = self.finality_proof(&block).await?;
+        Ok(Some(finalized_block(&block, finalization)))
+    }
+
+    pub(crate) async fn finality_proof(&self, block: &HellasBlock) -> Result<Vec<u8>, QueryError> {
+        let height = block.height();
         let mut descendants = Vec::new();
         let mut candidate = block.clone();
         let mut proof_bytes = 0usize;
@@ -257,7 +274,7 @@ impl ChainIndexer {
                 .map_err(|_| QueryError::FinalityProofUnavailable {
                     height: height.get(),
                 })?;
-                return Ok(Some(finalized_block(block, encoded)));
+                return Ok(encoded);
             }
             if descendants.len() >= crate::finality_proof::MAX_FINALITY_DESCENDANTS {
                 return Err(QueryError::FinalityProofUnavailable {
@@ -290,7 +307,7 @@ impl ChainIndexer {
     }
 }
 
-fn finalized_block(block: HellasBlock, finalization: Vec<u8>) -> FinalizedBlock {
+pub(crate) fn finalized_block(block: &HellasBlock, finalization: Vec<u8>) -> FinalizedBlock {
     FinalizedBlock {
         snapshot: LatestBlock {
             height: block.height().get(),

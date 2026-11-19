@@ -20,8 +20,7 @@ fn fixture_with_epochs(
     cross_epoch: bool,
 ) -> (ConsensusVerifier, Vec<HellasBlock>, Vec<u8>, Vec<u8>) {
     let (network, genesis) = if cross_epoch {
-        let document: hellas_genesis::Genesis =
-            serde_json::from_str(hellas_genesis::HELLAS_DEVNET_3_JSON).unwrap();
+        let document: hellas_genesis::Genesis = hellas_genesis::test_support::genesis();
         (
             crate::domain::network_id(&document).unwrap(),
             crate::genesis_digest(&document),
@@ -241,12 +240,14 @@ fn encoder_rejects_oversized_certificate_and_total_bytes() {
 fn descendant_finality_uses_the_certified_height_trust_and_checks_each_epoch() {
     use crate::proof_verify::{ProofBundle, ProofQuery, ProofVerifier};
     use commonware_cryptography::{Hasher as _, Sha256};
-    use hellas_genesis::{HELLAS_DEVNET_3_ID, HELLAS_DEVNET_3_JSON, TrustDocument, TrustEpoch};
+    use hellas_genesis::{TrustDocument, TrustEpoch};
     let (_, blocks, certificate, identity) = fixture_with_epochs(true);
     let mut trust = TrustDocument {
         schema_version: 1,
-        network_id: HELLAS_DEVNET_3_ID.into(),
-        genesis_sha256: hex::encode(Sha256::hash(HELLAS_DEVNET_3_JSON.as_bytes())),
+        network_id: "test-network".into(),
+        genesis_sha256: hex::encode(Sha256::hash(
+            hellas_genesis::test_support::GENESIS_JSON.as_bytes(),
+        )),
         epochs: vec![
             TrustEpoch {
                 epoch: 0,
@@ -262,8 +263,11 @@ fn descendant_finality_uses_the_certified_height_trust_and_checks_each_epoch() {
             },
         ],
     };
-    let verifier =
-        ProofVerifier::with_genesis(trust.clone(), HELLAS_DEVNET_3_JSON.as_bytes()).unwrap();
+    let verifier = ProofVerifier::with_genesis(
+        trust.clone(),
+        hellas_genesis::test_support::GENESIS_JSON.as_bytes(),
+    )
+    .unwrap();
     let target = &blocks[1];
     let bundle = ProofBundle {
         schema_version: 1,
@@ -291,6 +295,7 @@ fn descendant_finality_uses_the_certified_height_trust_and_checks_each_epoch() {
                 "ancestry-epoch-transition",
                 crate::config::Config::default(),
                 trust,
+                hellas_genesis::test_support::GENESIS_JSON.as_bytes(),
                 blocks[0].clone(),
             )
             .await
@@ -308,7 +313,8 @@ fn descendant_finality_uses_the_certified_height_trust_and_checks_each_epoch() {
     trust.epochs[0].end_height = Some(3);
     trust.epochs[1].start_height = 3;
     let wrong_schedule =
-        ProofVerifier::with_genesis(trust, HELLAS_DEVNET_3_JSON.as_bytes()).unwrap();
+        ProofVerifier::with_genesis(trust, hellas_genesis::test_support::GENESIS_JSON.as_bytes())
+            .unwrap();
     let mut wrong_bundle = bundle;
     wrong_bundle.trust_sha256 = wrong_schedule.trust_sha256().into();
     // The terminal certificate still belongs to epoch 1 at height 3, but the

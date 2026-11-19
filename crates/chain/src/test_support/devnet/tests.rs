@@ -9,16 +9,11 @@ async fn coin(client: &impl crate::LightClient, id: CoinId) -> Option<Coin> {
 }
 
 #[test]
-fn a_public_faucet_passkey_spends_on_all_six_validators() {
+fn a_passkey_spends_on_all_six_validators() {
     run(|runtime| async move {
-        let owners: Vec<_> = (0..100).map(GenesisOwner::faucet).collect();
-        let published: Vec<crate::genesis::FaucetAccount> =
-            serde_json::from_str(crate::genesis::HELLAS_DEVNET_3_FAUCET_JSON).unwrap();
-        for (owner, account) in owners.iter().zip(&published) {
-            assert_eq!(owner.key().to_string(), account.address);
-        }
-        let sender = owners[7];
-        let recipient = owners[8];
+        let sender = GenesisOwner::passkey(7);
+        let recipient = GenesisOwner::passkey(8);
+        let owners = vec![sender, recipient];
         let mut devnet = Devnet::start(
             runtime,
             DevnetConfig {
@@ -33,7 +28,7 @@ fn a_public_faucet_passkey_spends_on_all_six_validators() {
         let recipient_genesis = genesis_coin(devnet.allocations(), recipient.key());
         let (tx, outputs) = reshape_authorized(
             &[coin_object_id(input)],
-            &[(recipient.key(), None, 42), (sender.key(), None, 931_103)],
+            &[(recipient.key(), None, 42), (sender.key(), None, 9_958)],
             |hash| sender.authorize(hash),
         );
         assert_eq!(
@@ -47,7 +42,7 @@ fn a_public_faucet_passkey_spends_on_all_six_validators() {
             assert!(coin(&client, input).await.is_none());
             for (output, owner, value) in [
                 (outputs[0], recipient.key(), 42),
-                (outputs[1], sender.key(), 931_103),
+                (outputs[1], sender.key(), 9_958),
             ] {
                 let coin = coin(&client, CoinId::from_bytes(output.0)).await.unwrap();
                 assert_eq!(
@@ -69,7 +64,7 @@ fn a_public_faucet_passkey_spends_on_all_six_validators() {
                 .iter()
                 .map(|(_, c)| c.value)
                 .sum::<u64>(),
-            931_103
+            9_958
         );
         assert_eq!(
             devnet
@@ -78,7 +73,7 @@ fn a_public_faucet_passkey_spends_on_all_six_validators() {
                 .iter()
                 .map(|(_, c)| c.value)
                 .sum::<u64>(),
-            931_187
+            10_042
         );
         devnet.shutdown().await;
     });
@@ -292,7 +287,7 @@ fn unwinding_keeps_fixture_storage_until_aborted_tasks_finish() {
             runtime.child("fixture"),
             DevnetConfig {
                 name: "unwind_storage",
-                owners: vec![GenesisOwner::faucet(0)],
+                owners: vec![GenesisOwner::passkey(0)],
                 full_nodes: 0,
             },
         )

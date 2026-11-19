@@ -348,7 +348,7 @@ mod tests {
         let payload = "ef".repeat(32);
         let cursor = Cursor {
             v: SCHEMA_VERSION,
-            s: cursor_scope("hellas-devnet-1", &genesis, &trust),
+            s: cursor_scope("test-network", &genesis, &trust),
             p: payload.clone(),
             f: Filters {
                 s: "open".into(),
@@ -371,7 +371,7 @@ mod tests {
             ..Default::default()
         };
         let normalized =
-            normalize_list_request(request.clone(), "hellas-devnet-1", &genesis, &trust).unwrap();
+            normalize_list_request(request.clone(), "test-network", &genesis, &trust).unwrap();
         assert_eq!(normalized.payload, Some(payload));
         assert_eq!(normalized.kind, Some("work-payment".into()));
         assert_eq!(normalized.limit, Some(64));
@@ -380,10 +380,10 @@ mod tests {
         );
         let mut conflicting = request.clone();
         conflicting.state = Some("closed".into());
-        assert!(normalize_list_request(conflicting, "hellas-devnet-1", &genesis, &trust).is_err());
+        assert!(normalize_list_request(conflicting, "test-network", &genesis, &trust).is_err());
         let mut role = request.clone();
         role.role = Some("any".into());
-        assert!(normalize_list_request(role, "hellas-devnet-1", &genesis, &trust).is_err());
+        assert!(normalize_list_request(role, "test-network", &genesis, &trust).is_err());
         for mutation in 0..5 {
             let mut forged = cursor.clone();
             match mutation {
@@ -393,7 +393,7 @@ mod tests {
                 3 => forged.h = Some(1),
                 _ => forged.f.k = Some("unknown".into()),
             }
-            assert!(decode_cursor(&encode(&forged), "hellas-devnet-1", &genesis, &trust).is_err());
+            assert!(decode_cursor(&encode(&forged), "test-network", &genesis, &trust).is_err());
         }
         let mut event = cursor;
         event.f = Filters {
@@ -411,9 +411,9 @@ mod tests {
             cursor: Some(encode(&event)),
             ..Default::default()
         };
-        assert!(normalize_events_request(request, "hellas-devnet-1", &genesis, &trust).is_ok());
+        assert!(normalize_events_request(request, "test-network", &genesis, &trust).is_ok());
         event.f.k = Some("basic".into());
-        assert!(decode_cursor(&encode(&event), "hellas-devnet-1", &genesis, &trust).is_err());
+        assert!(decode_cursor(&encode(&event), "test-network", &genesis, &trust).is_err());
     }
 
     #[test]

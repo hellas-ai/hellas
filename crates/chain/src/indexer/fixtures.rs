@@ -97,31 +97,9 @@ where
     .await
 }
 
-#[cfg(all(test, feature = "indexer-api"))]
-pub async fn spawn_trusted_archive<E>(
-    context: E,
-    partition_prefix: &str,
-    config: Config,
-    trust: hellas_genesis::TrustDocument,
-    genesis_block: HellasBlock,
-) -> Result<(ArchiveSource, Handle<()>), Box<dyn std::error::Error + Send + Sync>>
-where
-    E: BufferPooler + Clock + Metrics + Spawner + Storage + CryptoRng,
-{
-    spawn_trusted_archive_with_genesis(
-        context,
-        partition_prefix,
-        config,
-        trust,
-        hellas_genesis::HELLAS_DEVNET_3_JSON.as_bytes(),
-        genesis_block,
-    )
-    .await
-}
-
 /// Construct source history using the production archive codec and epoch schedule.
 #[cfg(all(test, feature = "indexer-api"))]
-pub async fn spawn_trusted_archive_with_genesis<E>(
+pub async fn spawn_trusted_archive<E>(
     context: E,
     partition_prefix: &str,
     config: Config,

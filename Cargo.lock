@@ -3227,6 +3227,7 @@ dependencies = [
  "hellas-cloud",
  "hellas-executor",
  "hellas-gateway",
+ "hellas-genesis",
  "hellas-kernel",
  "hellas-presentation",
  "hellas-private",

@@ -118,6 +118,7 @@ hellas-chain = { workspace = true, features = ["client", "test-support"] }
 hellas-channel = { workspace = true, features = ["test-support"] }
 # Tests check rendered Catena programs against the compiler.
 hellas-executor = { workspace = true, features = ["compute"] }
+hellas-genesis = { workspace = true, features = ["test-support"] }
 hellas-providers = { workspace = true, features = ["test-support"] }
 p256.workspace = true
 reqwest = { workspace = true, features = ["json"] }

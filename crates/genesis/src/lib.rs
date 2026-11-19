@@ -18,20 +18,19 @@ use serde::{Deserialize, Serialize};
 pub const GENESIS_SCHEMA_VERSION: u16 = 1;
 
 /// The in-tree development network's document.
-pub const HELLAS_DEVNET_3_JSON: &str = include_str!("../networks/hellas-devnet-3/genesis.json");
+pub const HELLAS_DEVNET_JSON: &str = include_str!("../networks/devnet/genesis.json");
 
 /// The id that document names.
-pub const HELLAS_DEVNET_3_ID: &str = "hellas-devnet-3";
+pub const HELLAS_DEVNET_ID: &str = include_str!("../networks/devnet/id.txt");
 
 /// Offline seed-100 finality trust bound to the shipped devnet genesis.
-pub const HELLAS_DEVNET_3_TRUST_JSON: &str = include_str!("../networks/hellas-devnet-3/trust.json");
+pub const HELLAS_DEVNET_TRUST_JSON: &str = include_str!("../networks/devnet/trust.json");
 /// Genesis block payload independently derived from the shipped document.
-pub const HELLAS_DEVNET_3_GENESIS_PAYLOAD: &str =
-    include_str!("../networks/hellas-devnet-3/genesis-payload.hex");
+pub const HELLAS_DEVNET_GENESIS_PAYLOAD: &str =
+    include_str!("../networks/devnet/genesis-payload.hex");
 
 /// Intentionally public software-passkey credentials for the development network.
-pub const HELLAS_DEVNET_3_FAUCET_JSON: &str =
-    include_str!("../networks/hellas-devnet-3/faucet.json");
+pub const HELLAS_DEVNET_FAUCET_JSON: &str = include_str!("../networks/devnet/faucet.json");
 
 /// One public development account. Cryptographic consumers validate its key.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -51,7 +50,7 @@ pub struct KnownNetwork {
     pub chain: Chain,
     /// Short name to select it by, e.g. `devnet`.
     pub name: &'static str,
-    /// Full network id the document declares, e.g. `hellas-devnet-3`.
+    /// Full network id the document declares.
     pub id: &'static str,
     /// The document itself.
     pub json: &'static str,
@@ -104,16 +103,16 @@ impl Chain {
 /// document passed by path is a document that can be swapped.
 ///
 /// This registry supplies the default compiled Chain and explicit selection.
-/// A reset of this ephemeral devnet replaces its entry and bumps its network id.
+/// A reset of this ephemeral devnet replaces its data and bumps its network id.
 /// Adding another deployed chain adds a separate entry.
 /// Callers resolve one Chain or provide a custom profile.
 pub const KNOWN_NETWORKS: &[KnownNetwork] = &[KnownNetwork {
     chain: Chain::Devnet,
     name: "devnet",
-    id: HELLAS_DEVNET_3_ID,
-    json: HELLAS_DEVNET_3_JSON,
-    trust_json: HELLAS_DEVNET_3_TRUST_JSON,
-    genesis_payload_hex: HELLAS_DEVNET_3_GENESIS_PAYLOAD,
+    id: HELLAS_DEVNET_ID,
+    json: HELLAS_DEVNET_JSON,
+    trust_json: HELLAS_DEVNET_TRUST_JSON,
+    genesis_payload_hex: HELLAS_DEVNET_GENESIS_PAYLOAD,
     validators: &[
         "wss://devnet.hellas.ai/ws/validator-0",
         "wss://devnet.hellas.ai/ws/validator-1",
@@ -122,11 +121,10 @@ pub const KNOWN_NETWORKS: &[KnownNetwork] = &[KnownNetwork {
         "wss://devnet.hellas.ai/ws/validator-4",
         "wss://devnet.hellas.ai/ws/validator-5",
     ],
-    faucet_json: Some(HELLAS_DEVNET_3_FAUCET_JSON),
+    faucet_json: Some(HELLAS_DEVNET_FAUCET_JSON),
 }];
 
-/// Looks up a shipped network by its short name (`devnet`) or its full
-/// id (`hellas-devnet-3`).
+/// Looks up a shipped network by its short name (`devnet`) or its full id.
 #[must_use]
 pub fn known_network(selector: &str) -> Option<&'static KnownNetwork> {
     KNOWN_NETWORKS
@@ -267,3 +265,6 @@ mod trust;
 pub use trust::{TRUST_SCHEMA_VERSION, TrustDocument, TrustEpoch, TrustError};
 mod profile;
 pub use profile::{ChainProfile, ChainProfileError, CustomChainFile};
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;

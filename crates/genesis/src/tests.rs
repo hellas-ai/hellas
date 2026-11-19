@@ -3,7 +3,7 @@ use super::*;
 fn fixture() -> Genesis {
     Genesis {
         schema_version: GENESIS_SCHEMA_VERSION,
-        network_id: HELLAS_DEVNET_3_ID.to_string(),
+        network_id: "test-network".to_string(),
         validators: vec![
             GenesisValidator {
                 public_key: "11".repeat(32),
@@ -62,7 +62,7 @@ fn every_known_network_document_declares_the_id_the_registry_claims() {
         assert_eq!(known_network(network.id), Some(network));
     }
     assert_eq!(known_network("mainnet"), None);
-    assert_eq!(known_network("hellas-devnet-1"), None);
+    assert_eq!(known_network("unknown-network"), None);
     assert_eq!(known_network(""), None);
     assert_eq!(Chain::parse("mainnet"), None);
 }
@@ -109,60 +109,6 @@ fn shipped_networks_share_no_name_id_committee_or_account() {
             );
         }
     }
-}
-
-/// The shipped documents are pinned by their bytes, not by the
-/// facts a parser can be talked into agreeing with. `include_str!`
-/// takes a path, and a path is a thing that can be re-pointed by a
-/// move, a symlink, or a directory rename — after which every
-/// assertion above still passes while the committee has changed.
-/// Two networks differing in one hex digit are two networks, and a
-/// node that joined the wrong one has forked.
-#[test]
-fn shipped_documents_hash_to_the_bytes_that_were_reviewed() {
-    use sha2::{Digest as _, Sha256};
-
-    let digest = Sha256::digest(HELLAS_DEVNET_3_JSON.as_bytes());
-    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-    assert_eq!(
-        hex,
-        "e7d27dbc4744f08b3e8ca3c0656b698ca3bcaa0f1d184cacce8cb8af2711c3d1"
-    );
-}
-
-#[test]
-fn canonical_devnet_genesis_is_valid_and_matches_its_id_constant() {
-    let genesis: Genesis = serde_json::from_str(HELLAS_DEVNET_3_JSON).unwrap();
-    genesis.validate().unwrap();
-    assert_eq!(genesis.network_id, HELLAS_DEVNET_3_ID);
-    assert_eq!(genesis.validators.len(), 6);
-    assert_eq!(genesis.allocations.len(), 103);
-}
-
-#[test]
-fn every_public_faucet_account_has_exactly_931145_credits() {
-    let genesis: Genesis = serde_json::from_str(HELLAS_DEVNET_3_JSON).unwrap();
-    let accounts: Vec<FaucetAccount> = serde_json::from_str(HELLAS_DEVNET_3_FAUCET_JSON).unwrap();
-    assert_eq!(accounts.len(), 100);
-    let mut addresses = BTreeSet::new();
-    for (index, account) in accounts.iter().enumerate() {
-        assert_eq!(usize::from(account.index), index);
-        assert!(addresses.insert(&account.address));
-        assert_eq!(account.secret_scalar.len(), 64);
-        assert!(
-            account
-                .secret_scalar
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        );
-        let allocation = genesis
-            .allocations
-            .iter()
-            .find(|a| a.address == account.address)
-            .expect("each published account is funded in the shipped genesis");
-        assert_eq!(allocation.balance, 931_145, "faucet account {index}");
-    }
-    genesis.validate().unwrap();
 }
 
 #[test]

@@ -37,8 +37,8 @@ use hellas_rpc::{
 
 // ── Fixtures ──────────────────────────────────────────────────────────
 
-const NETWORK: &str = "hellas-devnet-1";
-const OTHER_NETWORK: &str = "hellas-devnet-32";
+const NETWORK: &str = "test-network";
+const OTHER_NETWORK: &str = "other-network";
 /// The channel's certificate capacity, from the kernel's own settlement
 /// arithmetic over an edge that locks a million and reserves nothing.
 fn capacity() -> WorkPaymentSettlement {
@@ -405,11 +405,11 @@ fn golden_digests_bind_the_encoded_network() {
     let channel = channel();
     assert_eq!(
         hex(channel.id().as_bytes()),
-        "9d96e55495d4871c2c41139dffb26ee19364cfde5a69e085bcf80d2138bea37d"
+        "86157817fa869a20ded85bdd6a777c63c5f8bf2d53a3cc42cdef9fc70d81538f"
     );
     assert_eq!(
         hex(&work_id(&channel, &authorization()).into_bytes()),
-        "9a680bd1df521e21e1f71b4e1f370dc0e28d2e2ab5fe379b07f9fe0f93f65114"
+        "7f9661452d3e7b53caf533ca782ad78a18ddbc18f9755bbb012b2ee49736969b"
     );
 
     let other = channel_on(
@@ -430,7 +430,7 @@ fn golden_digests_bind_the_encoded_network() {
     assert_eq!(Digest::hash(&preimage), other.id());
     assert_eq!(
         hex(other.id().as_bytes()),
-        "6cc62d6826231ad924b0268ce0d5e01e7981183d267a1da9a915a6bc9a5d6e0b"
+        "d2d98e0c45eba5c459c391eaa1f1b6a73673bde9c4d554e1a0d7932f52f90d07"
     );
 }
 
@@ -1315,11 +1315,8 @@ fn payment_binding_digest_binds_every_field() {
 /// `work.rs` streams into the allocation-free single-chunk hasher. If the
 /// domain, the network's length prefix, the channel argument, or the
 /// envelope-plus-body order in this file disagreed with the module's, the
-/// two would not meet here. The channel preimage was also hashed outside
-/// this workspace with `b3sum --keyed`, twice: once under the Xet DATA key
-/// and once under the zero key. The current result and payment-binding
-/// pins are this workspace's own; they catch later changes to the layout
-/// or committed values rather than disagreement with an outside implementation.
+/// two would not meet here. The pins cover synthetic inputs and catch changes
+/// to the layout or committed values.
 #[test]
 fn digest_preimages_are_reproducible_by_hand() {
     let channel = channel();
@@ -1332,7 +1329,7 @@ fn digest_preimages_are_reproducible_by_hand() {
     preimage.extend_from_slice(payment_terms().bond_edge.as_bytes());
     preimage.extend_from_slice(payment_terms().bond_terms_hash().as_bytes());
     assert_eq!(Digest::hash(&preimage), channel.id());
-    assert_eq!(preimage.len(), 22 + 16 + 128);
+    assert_eq!(preimage.len(), 22 + 1 + NETWORK.len() + 128);
 
     let result = job_result(work_id(&channel, &authorization()));
     let mut preimage = b"hellas.work.paid-job-result.v1".to_vec();
@@ -1348,10 +1345,10 @@ fn digest_preimages_are_reproducible_by_hand() {
     preimage.extend_from_slice(result.transcript_content.id().as_bytes());
     preimage.extend_from_slice(&result.transcript_content.bytes().to_be_bytes());
     assert_eq!(Digest::hash(&preimage), result_digest(&channel, &result));
-    assert_eq!(preimage.len(), 30 + 16 + 32 + 139);
+    assert_eq!(preimage.len(), 30 + 1 + NETWORK.len() + 32 + 139);
     assert_eq!(
         hex(&Digest::hash(&preimage).into_bytes()),
-        "574f95bea680f5376aa3f0600dfb44f2c866e60a4f96fb47f18c6fba1d7f456f"
+        "4a48426bc93ff28ef0a302e64d308cd1213a8135f2f210f0da3befecc952724a"
     );
 
     // The payment binding, whose three fields are all 32 bytes: a round
@@ -1370,14 +1367,14 @@ fn digest_preimages_are_reproducible_by_hand() {
     preimage.extend_from_slice(&[0xa1; 32]);
     preimage.extend_from_slice(&[0xa2; 32]);
     preimage.extend_from_slice(&[0xd0; 32]);
-    assert_eq!(preimage.len(), 30 + 16 + 32 + 98);
+    assert_eq!(preimage.len(), 30 + 1 + NETWORK.len() + 32 + 98);
     assert_eq!(
         Digest::hash(&preimage),
         payment_binding_digest(&channel, &binding)
     );
     assert_eq!(
         hex(&payment_binding_digest(&channel, &binding).into_bytes()),
-        "74c3f2b7ea983ffdad0847d8e556b4ac574b66853f98ad12be327bd8c64a76dc"
+        "332b5181af138a1b6f068ee6353a177e6d51f64e9fc17826bd84ec855e3e3c6c"
     );
 }
 

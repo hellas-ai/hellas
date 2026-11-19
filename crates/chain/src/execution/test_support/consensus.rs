@@ -26,12 +26,7 @@ pub(crate) fn consensus_fixture(seed: u64) -> ConsensusFixture {
     consensus_fixture_of(seed, 4)
 }
 
-/// The same committee, at a caller-chosen size.
-///
-/// The count is a parameter because the shipped devnet document names
-/// six validators and the suites written before it named four; a
-/// fixture that could only be four would make "the shipped validator
-/// count" untestable.
+/// A synthetic committee at a caller-chosen size.
 pub(crate) fn consensus_fixture_of(seed: u64, validators: u64) -> ConsensusFixture {
     consensus_fixture_in(
         seed,

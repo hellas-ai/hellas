@@ -32,8 +32,8 @@ use hellas_rpc::{
     },
     scheme_id,
 };
-const NETWORK: &str = "hellas-devnet-1";
-const OTHER_NETWORK: &str = "hellas-devnet-32";
+const NETWORK: &str = "test-network";
+const OTHER_NETWORK: &str = "other-network";
 const SALT: [u8; 32] = [0x5a; 32];
 const NONCE: [u8; 32] = [7; 32];
 const PROPOSAL_NONCE: u64 = 0x0102_0304_0506_0708;
@@ -340,14 +340,14 @@ fn golden_fetch_invocation_digests_are_pinned() {
         ("result", result_digest(&channel(), &r).to_string()),
     ];
     let expected = [
-        "19b8658a5210e07bc6ed3810f6cae5ae6a84d30051273f77ee4e2c1fd530d706",
-        "a39ec00175ae64810be2217c986931f237df26fc714b68852693db2dc7a6026b",
+        "8487331d1566ca77b2bb61bc860d86569e489b4c530d4717be723ef6510c0443",
+        "510a771ff76ab9140222fdfdd72dfb4e2df0e09fe88ce988ab1c6275016d4f22",
         "49de467ef4334be374b748326d015ed07fb439b7b8f16df04f8b9a3a41100198",
-        "582345acd2f5eceaa869fe9d53efed068ca1ac16b047ff73c8337528e444ab51",
+        "548e60a372822f9d90fc6af0c827f239b59c16c5c009c8ea137a5e664e5af8e7",
         "bccf5d4dd97b81660d9c0296f4039922ae875fa067a21b0e6940b5fccc679297",
         "413bc901a9367bc949f5d53dfbe151e10aa0d9b7da9d748436496b576bc4c368",
         "6e223dd82ad6548d1fa38373aaec2b6dc9baf3e856b1910f17e8c776ddcec1f0",
-        "1a1dd4e1623ac3befe2b542a87728edae9d810a9cd7bf951071133bb7d223eb5",
+        "7cc063cdc25047b72e9a60f2e34a47534d2afc0ac9b44d7f6a82e68389be5a0a",
     ];
     assert_eq!(
         values.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>(),

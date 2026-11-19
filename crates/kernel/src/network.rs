@@ -145,9 +145,9 @@ mod tests {
 
     #[test]
     fn round_trips_the_id_it_was_built_from() {
-        let network = NetworkId::new("hellas-devnet-1").expect("legal id");
-        assert_eq!(network.as_str(), "hellas-devnet-1");
-        assert_eq!(network.as_bytes(), b"hellas-devnet-1");
+        let network = NetworkId::new("test-network").expect("legal id");
+        assert_eq!(network.as_str(), "test-network");
+        assert_eq!(network.as_bytes(), b"test-network");
     }
 
     #[test]

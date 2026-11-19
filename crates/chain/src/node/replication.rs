@@ -198,61 +198,57 @@ impl Network {
         .await
         .cloned()
     }
-    pub async fn fetch(&self, query: FinalizedBlockQuery) -> Option<FinalizedBlock> {
-        let mut pending = futures_util::stream::iter(self.candidates())
-            .map(|id| async move {
-                let mut permit = self
-                    .manager()
-                    .acquire_method::<GetFinalizedBlock>(
-                        peer(id),
-                        RpcObservation::authenticated_transport("iroh"),
-                    )
-                    .ok()?;
-                let result = tokio::time::timeout(TIMEOUT, async {
-                    let client = self.client(id).await?;
-                    let response = client
-                        .get_finalized_block(crate::client::finalized_block_query_to_proto(query))
-                        .await
-                        .map_err(QueryError::from)?;
-                    let Some(wire) = response.block else {
-                        return Ok(None);
-                    };
-                    let block = crate::client::finalized_block_from_proto(wire).map_err(invalid)?;
-                    self.trust.verify(&block)?;
-                    if match query {
-                        FinalizedBlockQuery::Height(h) => h != block.snapshot.height,
-                        FinalizedBlockQuery::Payload(d) => d != block.snapshot.payload,
-                        FinalizedBlockQuery::Latest => false,
-                    } {
-                        return Err(invalid("peer answered another block query"));
-                    }
-                    Ok::<_, Error>(Some(block))
-                })
-                .await;
-                match result {
-                    Ok(Ok(block)) => {
-                        permit.finish_ok();
-                        block
-                    }
-                    Ok(Err(error @ Error::InvalidBlock(_))) => {
-                        permit.finish_err(error.to_string());
-                        self.block(id);
-                        None
-                    }
-                    error => {
-                        permit.finish_err(format!("{error:?}"));
-                        self.clients.lock().unwrap().remove(&id);
-                        None
+    pub async fn fetch(&self, query: FinalizedBlockQuery) -> Result<Option<FinalizedBlock>, Error> {
+        for id in self.candidates() {
+            // Only the peer actually queried spends a token. Admission waits
+            // happen before the RPC deadline and do not reach resolver retries.
+            let mut permit = self
+                .manager()
+                .acquire_method_wait::<GetFinalizedBlock>(
+                    peer(id),
+                    RpcObservation::authenticated_transport("iroh"),
+                )
+                .await
+                .map_err(|error| storage(format!("ChainSync admission: {error}")))?;
+            let result = tokio::time::timeout(TIMEOUT, async {
+                let client = self.client(id).await?;
+                let response = client
+                    .get_finalized_block(crate::client::finalized_block_query_to_proto(query))
+                    .await
+                    .map_err(QueryError::from)?;
+                let Some(wire) = response.block else {
+                    return Ok(None);
+                };
+                let block = crate::client::finalized_block_from_proto(wire).map_err(invalid)?;
+                self.trust.verify(&block)?;
+                if match query {
+                    FinalizedBlockQuery::Height(h) => h != block.snapshot.height,
+                    FinalizedBlockQuery::Payload(d) => d != block.snapshot.payload,
+                    FinalizedBlockQuery::Latest => false,
+                } {
+                    return Err(invalid("peer answered another block query"));
+                }
+                Ok::<_, Error>(Some(block))
+            })
+            .await;
+            match result {
+                Ok(Ok(block)) => {
+                    permit.finish_ok();
+                    if block.is_some() {
+                        return Ok(block);
                     }
                 }
-            })
-            .buffer_unordered(8);
-        while let Some(block) = pending.next().await {
-            if block.is_some() {
-                return block;
+                Ok(Err(error @ Error::InvalidBlock(_))) => {
+                    permit.finish_err(error.to_string());
+                    self.block(id);
+                }
+                error => {
+                    permit.finish_err(format!("{error:?}"));
+                    self.clients.lock().unwrap().remove(&id);
+                }
             }
         }
-        None
+        Ok(None)
     }
     /// Background discovery. Registry capability observations select feeders.
     pub async fn discover_periodically(&self) {
@@ -362,7 +358,13 @@ impl opaque::Fetcher for ArchiveFetcher {
             handler::Key::Finalized { height } => FinalizedBlockQuery::Height(height.get()),
             handler::Key::Notarized { .. } => return None,
         };
-        let block = self.network.fetch(query).await?;
+        let block = match self.network.fetch(query).await {
+            Ok(block) => block?,
+            Err(error) => {
+                tracing::error!(%error, "ChainSync local admission failed");
+                return None;
+            }
+        };
         let decoded = HellasBlock::decode(block.block.as_slice()).ok()?;
         let proof =
             crate::finality_proof::FinalityProof::decode(&block.snapshot.finalization).ok()?;

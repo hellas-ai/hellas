@@ -154,7 +154,7 @@ validator = [
 ]
 # The six-validator devnet harness (`test_support::devnet`) other crates'
 # tests run a chain with. No shipped build enables it.
-test-support = ["validator", "dep:tempfile"]
+test-support = ["validator", "dep:tempfile", "hellas-genesis/test-support"]
 wasm-client = ["client-core", "hellas-wire/ws-wasm"]
 # The block source a paid endpoint's settlement watcher reads. It is its
 # own feature because a paid endpoint needs both the block codec and the
@@ -236,6 +236,7 @@ hellas-channel = { workspace = true, features = ["test-support"] }
 # opinion about the very thing under test. `hellas-client` does not
 # depend on `hellas-chain`, so this edge is test-only and acyclic.
 hellas-client = { workspace = true, features = ["work"] }
+hellas-genesis = { workspace = true, features = ["test-support"] }
 hellas-kernel = { workspace = true, features = ["test-support"] }
 # The settlement test drives the endpoint's own close builders against a
 # real database, so the bytes a provider would submit are the bytes

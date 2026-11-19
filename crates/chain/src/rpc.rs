@@ -841,6 +841,7 @@ impl LightClient for LocalLightClient {
             return history
                 .fetch(FinalizedBlockQuery::Height(height))
                 .await
+                .map_err(|error| QueryError::StateUnavailable(error.to_string()))?
                 .ok_or_else(|| {
                     QueryError::StateUnavailable(
                         "no peer retains the required finalized block".into(),

@@ -7,8 +7,6 @@ fn invalid(error: impl std::fmt::Display) -> QueryError {
     QueryError::Remote(error.to_string())
 }
 
-/// A known chain whose endpoint reports another network id means this binary
-/// predates a devnet reset (G19 bumps the id); say so instead of a proof error.
 fn stale_reason(config: &WorkConfig) -> String {
     match config.chain.known_chain() {
         Some(chain) => format!(

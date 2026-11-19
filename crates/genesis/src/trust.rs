@@ -96,11 +96,10 @@ fn canonical_hex(value: &str, len: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::HELLAS_DEVNET_3_ID;
     fn document() -> TrustDocument {
         TrustDocument {
             schema_version: 1,
-            network_id: HELLAS_DEVNET_3_ID.into(),
+            network_id: "test-network".into(),
             genesis_sha256: "ab".repeat(32),
             epochs: vec![
                 TrustEpoch {

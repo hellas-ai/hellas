@@ -28,6 +28,7 @@ use super::{
 pub struct PeerManager {
     registry: Arc<Mutex<PeerRegistry>>,
     changed: watch::Sender<()>,
+    released: watch::Sender<()>,
     base: Instant,
 }
 
@@ -46,6 +47,7 @@ impl PeerManager {
         Self {
             registry: Arc::new(Mutex::new(PeerRegistry::with_config(config))),
             changed: watch::Sender::new(()),
+            released: watch::Sender::new(()),
             base: Instant::now(),
         }
     }
@@ -243,6 +245,41 @@ impl PeerManager {
         self.acquire_rpc(peer, RequestKind::for_method::<M>(), observation)
     }
 
+    /// Queue an outbound request until its slot or token is available. A local
+    /// admission limit is backpressure, not a failed RPC or a missing response.
+    #[cfg(not(target_family = "wasm"))]
+    pub async fn acquire_method_wait<M: RpcMethod>(
+        &self,
+        peer: PeerId,
+        observation: RpcObservation,
+    ) -> Result<RpcPermitGuard, PeerManagerError> {
+        let mut released = self.released.subscribe();
+        loop {
+            released.mark_unchanged();
+            match self.acquire_method::<M>(peer, observation) {
+                Err(PeerManagerError::Admission(AcquireDenied::RateLimited {
+                    retry_after_ms: Some(ms),
+                    ..
+                })) => {
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "admission backpressure: wait for token refill before sending an RPC"
+                    )]
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                }
+                Err(PeerManagerError::Admission(
+                    AcquireDenied::InFlightPeer { .. } | AcquireDenied::InFlightTotal { .. },
+                )) => {
+                    released
+                        .changed()
+                        .await
+                        .map_err(|_| PeerManagerError::Unavailable)?;
+                }
+                result => return result,
+            }
+        }
+    }
+
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, PeerRegistry>, PeerManagerError> {
         self.registry
             .lock()
@@ -430,6 +467,7 @@ impl RpcPermitGuard {
         if let Ok(mut registry) = self.manager.lock() {
             registry.release(now, permit, outcome);
         }
+        self.manager.released.send_replace(());
     }
 }
 

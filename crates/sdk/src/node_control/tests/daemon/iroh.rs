@@ -383,7 +383,7 @@ async fn one_step_port_change_retains_the_live_paid_setup() {
         crate::provider::tests::node::write_setup_journal(opts.home.as_ref()).await;
         opts.chain = crate::test_support::chain_dir(
             opts.home.as_ref(),
-            hellas_kernel::NetworkId::new("hellas-devnet-1").unwrap(),
+            hellas_kernel::NetworkId::new("test-network").unwrap(),
         );
         assert!(
             !hellas_channel::work_store::journal::Journal::stems(&opts.chain.provider_journals())

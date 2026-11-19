@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::{cell::RefCell, path::Path, sync::Arc};
 
 pub(super) type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
-const STORAGE_VERSION: u32 = 3;
+const STORAGE_VERSION: u32 = 4;
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("edge_metadata_v1");
 const PROOFS: TableDefinition<u64, &[u8]> = TableDefinition::new("edge_block_proofs_v1");
 const EDGES: TableDefinition<&str, &[u8]> = TableDefinition::new("edge_history_v1");

@@ -4,7 +4,7 @@
 The included native origin follows the chain archive and listens only on loopback.
 
 Provision a `hellas_genesis::TrustDocument` independently of the RPC peer. It has
-`schema_version: 1`, `network_id: "hellas-devnet-3"`, the SHA-256 of the exact
+`schema_version: 1`, a `network_id`, the SHA-256 of the exact
 genesis JSON bytes, and a nonempty contiguous epoch schedule. Each epoch supplies
 an ID, a height range, and the 96-character compressed BLS MinPk threshold
 identity. Schedules start at height zero, have no gaps or overlaps, and use
@@ -92,7 +92,8 @@ validator and finalization metadata as unverified.
 `ProofVerifier::with_genesis(trust, genesis_bytes)` pins the full document;
 `ProofVerifier::with_digest(trust, canonical_digest)` accepts a derived
 light-client pin. Without `--chain-config`, CLI commands
-select the compiled Devnet profile.
+select the compiled Devnet profile. Re-genesis replaces the files in
+`crates/genesis/networks/devnet/` and rebuilds the binary.
 
 `hellas --chain-config chain.json chain indexer serve --rpc wss://relay.example/ws
 --home /var/lib/hellas/explorer --listen 127.0.0.1:8788` starts the local

@@ -193,3 +193,47 @@ fn disclosure_writes_signal_subscribers_and_slot_release_does_not() {
         .expect("registry should be writable");
     assert!(signalled());
 }
+
+#[cfg(not(target_family = "wasm"))]
+#[tokio::test]
+async fn queued_admission_wakes_on_release_and_refill_and_surfaces_permanent_denial() {
+    use crate::peers::test_markers::GetNodeInfo;
+    let manager = PeerManager::with_config(PeerRegistryConfig {
+        max_in_flight_per_peer: 1,
+        bucket_capacity: 1.0,
+        bucket_refill_per_sec: 64.0,
+        ..config()
+    });
+    let observation = RpcObservation::authenticated_transport("iroh");
+    let first = manager
+        .acquire_method::<GetNodeInfo>(peer(1), observation)
+        .unwrap();
+    let second = manager.acquire_method_wait::<GetNodeInfo>(peer(1), observation);
+    tokio::pin!(second);
+    assert!(futures::poll!(second.as_mut()).is_pending());
+    drop(first);
+    let second = second.await.unwrap();
+    assert_eq!(manager.snapshot().unwrap().total_in_flight(), 1);
+    drop(second);
+    assert_eq!(manager.snapshot().unwrap().total_in_flight(), 0);
+
+    let manager = PeerManager::with_config(PeerRegistryConfig {
+        bucket_capacity: 1.0,
+        bucket_refill_per_sec: 0.0,
+        ..config()
+    });
+    drop(
+        manager
+            .acquire_method::<GetNodeInfo>(peer(1), observation)
+            .unwrap(),
+    );
+    assert!(matches!(
+        manager
+            .acquire_method_wait::<GetNodeInfo>(peer(1), observation)
+            .await,
+        Err(PeerManagerError::Admission(AcquireDenied::RateLimited {
+            retry_after_ms: None,
+            ..
+        }))
+    ));
+}
