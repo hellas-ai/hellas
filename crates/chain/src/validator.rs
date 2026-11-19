@@ -514,9 +514,11 @@ fn setup(args: SetupArgs) -> Result<(), ValidatorError> {
         }
         None => Genesis {
             schema_version: crate::genesis::GENESIS_SCHEMA_VERSION,
-            network_id: network_id.ok_or_else(|| {
-                ValidatorError::InvalidSetup("--network-id is required without --genesis".into())
-            })?,
+            network_id: network_id.unwrap_or_else(|| {
+                crate::genesis::ChainProfile::default()
+                    .network_id()
+                    .to_owned()
+            }),
             validators: generated_validators,
             allocations: genesis_allocations
                 .iter()

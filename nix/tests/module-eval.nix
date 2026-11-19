@@ -20,7 +20,6 @@ let
           system.stateVersion = "26.05";
           services.hellas = {
             inherit package;
-            chainConfig = "/run/hellas/chain.json";
           }
           // settings;
         }
@@ -47,7 +46,6 @@ let
     settings:
     eval {
       gateway = {
-        chainConfig = "/run/hellas/chain.json";
         enable = true;
         settings = gatewaySettings;
       }
@@ -71,7 +69,6 @@ let
     (eval {
       otel.enable = true;
       gateway = {
-        chainConfig = "/run/hellas/chain.json";
         enable = true;
         settings = gatewaySettings // {
           models = [ "gpt-5@upstream" ];
@@ -120,8 +117,6 @@ let
           system.stateVersion = "26.05";
           services.hellas-chain-validators.devnet = {
             enable = true;
-            chainConfig = "/run/hellas/chain.json";
-            networkId = "test-network";
             package = validatorPackageFixture;
           }
           // validator;

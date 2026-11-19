@@ -90,9 +90,9 @@ validator and finalization metadata as unverified.
 
 `ProofVerifier::with_genesis(trust, genesis_bytes)` pins the full document;
 `ProofVerifier::with_digest(trust, canonical_digest)` accepts a derived
-light-client pin. Chain commands require `--chain-config FILE`; there is no
-built-in network. The operator distributes the genesis, trust and faucet files.
-A re-genesis changes those inputs without rebuilding Hellas.
+light-client pin. CLI commands use the one compiled network by default. `--chain-config FILE`
+supplies an independent local/test profile. Re-genesis replaces the files in
+`crates/genesis/network/` and rebuilds the binary.
 
 `hellas --chain-config chain.json chain indexer serve --rpc wss://relay.example/ws
 --home /var/lib/hellas/explorer --listen 127.0.0.1:8788` starts the local

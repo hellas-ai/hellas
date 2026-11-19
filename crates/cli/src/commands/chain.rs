@@ -271,8 +271,8 @@ pub enum ValidatorCommand {
     },
     /// Generate a TOML config for one validator
     Config {
-        /// Network ID for a newly generated genesis.
-        #[arg(long, conflicts_with = "genesis", required_unless_present = "genesis")]
+        /// Network ID for a newly generated genesis; defaults to the compiled network.
+        #[arg(long, conflicts_with = "genesis")]
         network_id: Option<String>,
         /// Total number of validators in the network
         #[arg(short = 'n', long)]
@@ -334,15 +334,9 @@ pub enum ValidatorCommand {
 pub async fn run(
     command: ChainCommand,
     owner: Option<&hellas_kernel::SoftPasskey>,
-    profile: Option<&ChainProfile>,
+    profile: &ChainProfile,
     _home: &hellas_private::StoreLocation,
 ) -> CliResult {
-    #[cfg(feature = "validator")]
-    let command = match command {
-        ChainCommand::Validator { command } => return run_validator(command, profile, _home).await,
-        command => command,
-    };
-    let profile = profile.context("--chain-config FILE is required")?;
     match command {
         ChainCommand::Delegate { coins, node, split } => {
             anyhow::ensure!(
@@ -377,7 +371,7 @@ pub async fn run(
         #[cfg(feature = "indexer")]
         ChainCommand::Indexer { command } => run_indexer(command, profile, _home).await,
         #[cfg(feature = "validator")]
-        ChainCommand::Validator { .. } => unreachable!("validator commands handled above"),
+        ChainCommand::Validator { command } => run_validator(command, profile, _home).await,
     }
 }
 
@@ -949,7 +943,7 @@ fn parse_chain_peer(raw: &str) -> Result<iroh::EndpointAddr, String> {
 #[cfg(feature = "validator")]
 async fn run_validator(
     command: ValidatorCommand,
-    profile: Option<&ChainProfile>,
+    profile: &ChainProfile,
     home: &hellas_private::StoreLocation,
 ) -> CliResult {
     let command = match command {
@@ -1014,12 +1008,12 @@ async fn run_validator(
         },
         ValidatorCommand::Run { config } => hellas_chain::validator::Command::Run {
             config,
-            profile: profile.context("--chain-config FILE is required")?.clone(),
+            profile: profile.clone(),
             home: home.clone(),
         },
         ValidatorCommand::CheckConfig { config } => hellas_chain::validator::Command::CheckConfig {
             config,
-            profile: profile.context("--chain-config FILE is required")?.clone(),
+            profile: profile.clone(),
         },
     };
     tokio::task::spawn_blocking(move || hellas_chain::validator::run_command(command)).await??;
@@ -1098,7 +1092,7 @@ mod tests {
                 node: SettlementKey::from(Key::from_bytes([0; Key::LENGTH])),
             },
             None,
-            Some(&hellas_genesis::test_support::profile()),
+            &hellas_genesis::test_support::profile(),
             &hellas_private::StoreLocation::for_test(home.path()),
         )
         .await

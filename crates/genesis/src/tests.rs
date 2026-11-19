@@ -1,5 +1,17 @@
 use super::*;
 
+#[test]
+fn compiled_network_trust_binds_the_genesis_bytes() {
+    use sha2::{Digest as _, Sha256};
+    let profile = ChainProfile::default();
+    assert_eq!(profile.genesis_json(), NETWORK_JSON);
+    assert_eq!(profile.network_id(), profile.genesis().network_id);
+    assert_eq!(
+        profile.trust().genesis_sha256,
+        hex::encode(Sha256::digest(NETWORK_JSON))
+    );
+}
+
 fn fixture() -> Genesis {
     Genesis {
         schema_version: GENESIS_SCHEMA_VERSION,

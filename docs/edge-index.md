@@ -4,7 +4,7 @@ The Explorer origin runs a finalized EdgeIndex alongside its Commonware follower
 It owns global edge discovery and the complete canonical object projection; no
 browser, Worker or validator has to build another global index.
 
-Run the existing `hellas --chain-config chain.json chain indexer serve` command with independently
+Run the existing `hellas chain indexer serve` command with independently
 provisioned genesis and trust files. The origin remains loopback-only. It serves:
 
 - `GET /api/v1/edges?state=open&limit=32`

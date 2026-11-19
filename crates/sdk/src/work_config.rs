@@ -46,7 +46,7 @@ impl WorkConfig {
     }
 }
 
-/// Load the operator-supplied chain file without remote identity discovery.
+/// Load an explicit local/test chain file without remote identity discovery.
 pub fn load_chain_profile(path: &Path) -> Result<ChainProfile> {
     let bytes = hellas_private::read_bounded_regular_file(
         path,

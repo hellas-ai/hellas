@@ -4,7 +4,6 @@ use hellas_private::StoreLocation;
 #[macro_use]
 extern crate tracing;
 
-use anyhow::Context as _;
 use clap::{Parser, Subcommand};
 use iroh::EndpointId;
 use std::net::SocketAddr;
@@ -43,7 +42,7 @@ fn acts_for_principal(command: &Commands) -> bool {
 #[command(version = option_env!("GIT_REV").unwrap_or(env!("CARGO_PKG_VERSION")))]
 #[command(about = "Hellas node CLI")]
 struct Cli {
-    /// Authenticated chain profile; required for commands that use a chain.
+    /// Complete independently authenticated custom chain profile.
     #[arg(long, global = true, value_name = "FILE")]
     chain_config: Option<PathBuf>,
     /// Process state home (default: HELLAS_HOME or $HOME/.hellas).
@@ -204,9 +203,6 @@ enum Commands {
     Store(commands::store::StoreArgs),
     /// Get devnet coins for this principal from a public faucet account.
     Faucet {
-        /// Public faucet accounts supplied by the network operator.
-        #[arg(long, value_name = "FILE")]
-        accounts: PathBuf,
         #[arg(long, default_value_t = commands::faucet::DEFAULT_AMOUNT)]
         amount: u64,
     },
@@ -275,11 +271,10 @@ async fn async_main() {
         }
     };
     let identity_path = home.join("identity");
-    let selected_chain = cli
-        .chain_config
-        .as_deref()
-        .map(hellas_sdk::work_config::load_chain_profile)
-        .transpose();
+    let selected_chain = match &cli.chain_config {
+        Some(path) => hellas_sdk::work_config::load_chain_profile(path),
+        None => Ok(hellas_chain::genesis::ChainProfile::default()),
+    };
     let selected_chain = match selected_chain {
         Ok(chain) => chain,
         Err(error) => {
@@ -421,18 +416,12 @@ async fn async_main() {
     };
 
     let command = match command {
-        Commands::Faucet { amount, accounts } => {
-            let result = async {
-                commands::faucet::faucet(
-                    amount,
-                    &accounts,
-                    owner.as_ref().expect("the faucet pays the principal"),
-                    selected_chain
-                        .as_ref()
-                        .context("--chain-config FILE is required")?,
-                )
-                .await
-            }
+        Commands::Faucet { amount } => {
+            let result = commands::faucet::faucet(
+                amount,
+                owner.as_ref().expect("the faucet pays the principal"),
+                &selected_chain,
+            )
             .await;
             tracer_provider.shutdown();
             if let Err(err) = result {
@@ -443,7 +432,7 @@ async fn async_main() {
         }
         Commands::Chain { command } => {
             let result =
-                commands::chain::run(command, owner.as_ref(), selected_chain.as_ref(), &home).await;
+                commands::chain::run(command, owner.as_ref(), &selected_chain, &home).await;
             tracer_provider.shutdown();
             if let Err(err) = result {
                 eprintln!("error: {err:#}");
@@ -501,9 +490,7 @@ async fn async_main() {
                     &home,
                     &local_identity,
                     owner.as_ref(),
-                    selected_chain
-                        .as_ref()
-                        .context("--chain-config FILE is required")?,
+                    &selected_chain,
                     port,
                     config_file,
                     #[cfg(feature = "otel")]
@@ -520,9 +507,7 @@ async fn async_main() {
                     &home,
                     &local_identity,
                     owner.as_ref(),
-                    selected_chain
-                        .as_ref()
-                        .context("--chain-config FILE is required")?,
+                    &selected_chain,
                     #[cfg(feature = "otel")]
                     metrics,
                 )
@@ -565,9 +550,7 @@ async fn async_main() {
                         &local_identity,
                         owner.as_ref(),
                         &home,
-                        selected_chain
-                            .as_ref()
-                            .context("--chain-config FILE is required")?,
+                        &selected_chain,
                     )?,
                 )
                 .await
@@ -582,9 +565,7 @@ async fn async_main() {
                         &local_identity,
                         owner.as_ref(),
                         &home,
-                        selected_chain
-                            .as_ref()
-                            .context("--chain-config FILE is required")?,
+                        &selected_chain,
                     )?,
                 )
                 .await
@@ -599,9 +580,7 @@ async fn async_main() {
                         &local_identity,
                         owner.as_ref(),
                         &home,
-                        selected_chain
-                            .as_ref()
-                            .context("--chain-config FILE is required")?,
+                        &selected_chain,
                     )?,
                 )
                 .await
@@ -616,9 +595,7 @@ async fn async_main() {
                         &local_identity,
                         owner.as_ref(),
                         &home,
-                        selected_chain
-                            .as_ref()
-                            .context("--chain-config FILE is required")?,
+                        &selected_chain,
                     )?,
                 )
                 .await
@@ -633,9 +610,7 @@ async fn async_main() {
                         &local_identity,
                         owner.as_ref(),
                         &home,
-                        selected_chain
-                            .as_ref()
-                            .context("--chain-config FILE is required")?,
+                        &selected_chain,
                     )?,
                 )
                 .await
@@ -650,9 +625,7 @@ async fn async_main() {
                         &local_identity,
                         owner.as_ref(),
                         &home,
-                        selected_chain
-                            .as_ref()
-                            .context("--chain-config FILE is required")?,
+                        &selected_chain,
                     )?,
                 )
                 .await

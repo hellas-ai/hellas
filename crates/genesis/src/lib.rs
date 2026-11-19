@@ -8,7 +8,7 @@
 //! It is `std` and it is a crate, because the document is `String`s, `Vec`s
 //! and a `BTreeSet` of them, and because the readers are not all nodes: a
 //! `wasm32-unknown-unknown` browser build and a relay in another repository
-//! read operator-supplied documents. `hellas-chain`
+//! read the same compiled network documents. `hellas-chain`
 //! re-exports it whole as `hellas_chain::genesis`.
 
 use std::collections::BTreeSet;
@@ -16,6 +16,12 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 pub const GENESIS_SCHEMA_VERSION: u16 = 1;
+
+/// The single network compiled into this binary.
+pub const NETWORK_JSON: &str = include_str!("../network/genesis.json");
+pub const NETWORK_TRUST_JSON: &str = include_str!("../network/trust.json");
+pub const NETWORK_FAUCET_JSON: &str = include_str!("../network/faucet.json");
+const NETWORK_ROUTES_JSON: &str = include_str!("../network/routes.json");
 
 /// One public development account. Cryptographic consumers validate its key.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

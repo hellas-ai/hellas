@@ -77,6 +77,19 @@ fn validate_routes(routes: Vec<String>) -> Result<Vec<String>, ChainProfileError
     Ok(out)
 }
 
+impl Default for ChainProfile {
+    fn default() -> Self {
+        Self::from_file(ChainFile {
+            genesis_json: crate::NETWORK_JSON.into(),
+            trust: serde_json::from_str(crate::NETWORK_TRUST_JSON)
+                .expect("compiled trust document parses"),
+            validators: serde_json::from_str(crate::NETWORK_ROUTES_JSON)
+                .expect("compiled validator routes parse"),
+        })
+        .expect("compiled network is valid")
+    }
+}
+
 impl ChainProfile {
     /// The complete authenticated input, preserving the exact genesis bytes.
     #[must_use]

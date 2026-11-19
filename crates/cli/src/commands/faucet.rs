@@ -15,15 +15,15 @@ pub const DEFAULT_AMOUNT: u64 = 1000;
 /// Sends `amount` from a random public faucet account of the selected chain
 /// to `principal`, waits until the payment is final, and prints the
 /// principal's balance.
-pub async fn faucet(
-    amount: u64,
-    accounts: &std::path::Path,
-    principal: &SoftPasskey,
-    profile: &ChainProfile,
-) -> CliResult {
+pub async fn faucet(amount: u64, principal: &SoftPasskey, profile: &ChainProfile) -> CliResult {
     ensure!(amount > 0, "amount must be positive");
-    let accounts: Vec<FaucetAccount> = serde_json::from_slice(&std::fs::read(accounts)?)?;
-    ensure!(!accounts.is_empty(), "faucet accounts file is empty");
+    ensure!(
+        profile.state_key() == ChainProfile::default().state_key(),
+        "configured chain has no faucet accounts"
+    );
+    let accounts: Vec<FaucetAccount> =
+        serde_json::from_str(hellas_chain::genesis::NETWORK_FAUCET_JSON)?;
+    ensure!(!accounts.is_empty(), "compiled faucet accounts are empty");
     let account = &accounts[rand::random_range(0..accounts.len())];
     eprintln!(
         "devnet faucet account {}: {}",
@@ -158,6 +158,26 @@ fn faucet_passkey(account: &FaucetAccount) -> anyhow::Result<SoftPasskey> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compiled_faucet_keys_control_their_genesis_allocations() {
+        let profile = ChainProfile::default();
+        let accounts: Vec<FaucetAccount> =
+            serde_json::from_str(hellas_chain::genesis::NETWORK_FAUCET_JSON).unwrap();
+        assert!(!accounts.is_empty());
+        for account in accounts {
+            let address =
+                SettlementKey::from(faucet_passkey(&account).unwrap().party_key()).to_string();
+            assert_eq!(address, account.address);
+            let allocation = profile
+                .genesis()
+                .allocations
+                .iter()
+                .find(|a| a.address == address)
+                .unwrap();
+            assert!(allocation.balance >= DEFAULT_AMOUNT);
+        }
+    }
 
     #[test]
     fn the_faucet_pays_the_principal_and_waits_until_the_payment_is_final() {

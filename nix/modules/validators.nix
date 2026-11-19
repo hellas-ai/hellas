@@ -91,6 +91,7 @@ let
         ${genesisFlag} \
         ${allocationFlags} \
         > "$out"
+      ${cli} chain validator check-config --config "$out"
     '';
 
   validatorOptions =
@@ -213,7 +214,7 @@ let
         genesis = mkOption {
           type = types.nullOr types.path;
           default = null;
-          description = "Genesis JSON used when generating validator configuration.";
+          description = "Canonical genesis JSON embedded in every validator config.";
         };
         networkId = mkOption {
           type = types.nullOr types.str;
@@ -278,7 +279,7 @@ let
         chainConfig = mkOption {
           type = types.nullOr (types.strMatching "/.*");
           default = null;
-          description = "Authenticated chain profile supplied by the operator.";
+          description = "Authenticated custom chain profile outside the Nix store.";
         };
         memoryMax = mkOption {
           type = types.nullOr types.str;
@@ -322,8 +323,9 @@ in
           message = "services.hellas-chain-validators.${name}.networkId cannot be combined with genesis.";
         }
         {
-          assertion = validator.chainConfig != null;
-          message = "services.hellas-chain-validators.${name}.chainConfig is required.";
+          assertion =
+            validator.chainConfig == null || hellas.runtimePathIsOutsideStore lib validator.chainConfig;
+          message = "services.hellas-chain-validators.${name}.chainConfig must be runtime data outside the Nix store.";
         }
         {
           assertion = validator.home == null || hellas.runtimePathIsOutsideStore lib validator.home;
@@ -452,7 +454,7 @@ in
                 startLimitBurst = 5;
                 startLimitIntervalSec = 60;
                 serviceConfig = {
-                  ExecStart = "${getExe validator.package} --home ${escapeShellArg home}${chainArgs} chain validator run --config ${configFile}";
+                  ExecStart = "${getExe validator.package} --home ${escapeShellArg home} chain validator run --config ${configFile}${chainArgs}";
                   Type = "simple";
                   Restart = "on-failure";
                   RestartSec = 5;

@@ -30,7 +30,7 @@ pub mod indexer_api;
 pub mod owner_proof;
 #[cfg(feature = "proof-verify")]
 pub mod proof_verify;
-/// Portable genesis and trust documents supplied by the operator.
+/// Portable documents for the compiled network and explicit local profiles.
 #[cfg(feature = "domain")]
 pub use hellas_genesis as genesis;
 #[cfg(any(feature = "indexer", feature = "validator"))]

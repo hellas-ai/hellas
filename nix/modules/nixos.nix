@@ -141,6 +141,7 @@ let
     ++ lib.attrValues service.credentials
     ++ lib.filter (path: path != null) [
       service.configFile
+      service.chainConfig
       service.passkey
       service.environmentFile
     ]
@@ -291,14 +292,6 @@ in
         message = "services.hellas.extraArgs may not override module-managed runtime, content, identity, trust, or configuration flags; use the corresponding option instead.";
       }
       {
-        assertion = !cfg.enable || cfg.chainConfig != null;
-        message = "services.hellas.chainConfig is required.";
-      }
-      {
-        assertion = !gateway.enable || gateway.chainConfig != null;
-        message = "services.hellas.gateway.chainConfig is required.";
-      }
-      {
         assertion = hellas.extraArgsAreSafe lib hellas.protectedGatewayExtraArgs gateway.extraArgs;
         message = "services.hellas.gateway.extraArgs may not override module-managed runtime, content, identity, trust, or configuration flags; use the corresponding option instead.";
       }
@@ -327,7 +320,7 @@ in
         # Pull in external model/content mounts even when they are declared
         # `nofail`; starting against an empty mountpoint would index the wrong
         # filesystem and make an otherwise satisfiable environment disappear.
-        RequiresMountsFor = providerRuntimePaths ++ lib.optional (cfg.chainConfig != null) cfg.chainConfig;
+        RequiresMountsFor = providerRuntimePaths;
       };
       path = lib.optionals providerGpuConfigured gpuPackages;
       environment = hellas.renderEnvironment (
@@ -406,8 +399,7 @@ in
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
       unitConfig = lib.optionalAttrs (gatewayRuntimePaths != [ ]) {
-        RequiresMountsFor =
-          gatewayRuntimePaths ++ lib.optional (gateway.chainConfig != null) gateway.chainConfig;
+        RequiresMountsFor = gatewayRuntimePaths;
       };
       path = lib.optionals gatewayGpuConfigured gpuPackages;
       environment = hellas.renderEnvironment (
