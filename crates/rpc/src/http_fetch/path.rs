@@ -87,7 +87,7 @@ pub fn overlaps(a: &str, b: &str) -> bool {
             *a == b || (*a == VOICE && canonical_segment(b)) || (b == VOICE && canonical_segment(a))
         })
 }
-pub fn substitute(url: &str, voice: &str) -> Result<String, HttpRequestError> {
+pub fn substitute(url: &str, voice: &str) -> Result<url::Url, HttpRequestError> {
     // URL parsing escapes braces; inspect the literal path before substitution.
     if url.matches(VOICE).count() != 1 {
         return Err(invalid());
@@ -103,7 +103,7 @@ pub fn substitute(url: &str, voice: &str) -> Result<String, HttpRequestError> {
         return Err(invalid());
     }
     validate_scope(path)?;
-    Ok(url.replace(VOICE, &voice_segment(voice)?))
+    url::Url::parse(&url.replace(VOICE, &voice_segment(voice)?)).map_err(|_| invalid())
 }
 
 #[cfg(test)]

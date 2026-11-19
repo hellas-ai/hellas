@@ -74,7 +74,7 @@ impl HttpRoute {
                 .map_err(|e| crate::RoutingError(e.message))?;
             let mut route = self.clone();
             route.hosted_speech = None;
-            route.url = hellas_rpc::http_fetch::path::substitute(&self.url, "voice")?;
+            route.url = hellas_rpc::http_fetch::path::substitute(&self.url, "voice")?.into();
             route.request(Bytes::new(), &HeaderMap::new())?.validate()?;
         } else {
             route.request(Bytes::new(), &HeaderMap::new())?.validate()?;

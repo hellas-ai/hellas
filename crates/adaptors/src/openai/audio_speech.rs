@@ -95,9 +95,8 @@ impl HostedSpeech {
             .formats
             .get(&request.response_format)
             .ok_or_else(|| invalid("unsupported hosted speech response_format"))?;
-        let url = hellas_rpc::http_fetch::path::substitute(url, &request.voice)
+        let mut url = hellas_rpc::http_fetch::path::substitute(url, &request.voice)
             .map_err(|e| invalid(e.to_string()))?;
-        let mut url = url::Url::parse(&url).map_err(|e| invalid(e.to_string()))?;
         url.query_pairs_mut().append_pair("output_format", output);
         let body = serde_json::to_vec(
             &serde_json::json!({"text": request.input, "model_id": self.model_id}),
