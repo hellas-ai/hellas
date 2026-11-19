@@ -10,8 +10,16 @@ fn compiled_network_selection_conflicts_with_custom_configuration() {
                 Some(selector)
             );
             assert!(
-                Cli::try_parse_from(args.into_iter().chain(["--chain-config", "chain.json"]))
-                    .is_err()
+                Cli::try_parse_from([
+                    "hellas",
+                    "--chain",
+                    selector,
+                    "--chain-config",
+                    "chain.json",
+                    "identity",
+                    "show-node-id",
+                ])
+                .is_err()
             );
         }
     }
