@@ -336,7 +336,7 @@ impl hellas_gateway::WorkExecutionBackend for SpeechBackend {
             }
             // This evaluator fixture returns the real MMS ABI without opening a GPU.
             let mut samples = vec![0u8; 480000 * 4];
-            for (slot, value) in samples.chunks_exact_mut(4).zip([-0.5f32, 0., 0.5]) { slot.copy_from_slice(&value.to_le_bytes()); }
+            for (slot, value) in samples.as_chunks_mut::<4>().0.iter_mut().zip([-0.5f32, 0., 0.5]) { slot.copy_from_slice(&value.to_le_bytes()); }
             yield Ok(hellas_gateway::WorkEvent::Output(hellas_gateway::ComputeEvent::Done {
                 output: InvocationOutput { outcome: Outcome::Succeeded, metadata: hellas_rpc::JsonBytes(vec![]), artifacts: vec![
                     Artifact::new("result", "catena.bytes.v1", [3u64.to_le_bytes(), 0u64.to_le_bytes()].concat()),

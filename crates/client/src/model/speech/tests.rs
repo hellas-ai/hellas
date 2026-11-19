@@ -98,7 +98,7 @@ async fn converted_mms_and_descriptor_render_the_same_portable_synthesis_job() {
 
 fn output(samples: &[f32], count: u64, status: u64) -> InvocationOutput {
     let mut waveform = vec![0u8; tts::MAX_SAMPLES * 4];
-    for (slot, sample) in waveform.chunks_exact_mut(4).zip(samples) {
+    for (slot, sample) in waveform.as_chunks_mut::<4>().0.iter_mut().zip(samples) {
         slot.copy_from_slice(&sample.to_le_bytes());
     }
     InvocationOutput {
