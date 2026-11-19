@@ -1473,3 +1473,78 @@ fn the_step_bound_is_the_largest_admitted_step_loop() {
         assert!(plan.validate_bounds(&limits).is_err());
     }
 }
+
+#[test]
+fn http_bounds_cover_raw_audio_headers_framing_and_retained_envelopes() {
+    use crate::http_fetch::{
+        MAX_HTTP_HEADERS, MAX_HTTP_HEADERS_BYTES, MAX_HTTP_RESPONSE_BYTES, response_bounds,
+    };
+    use crate::output::{AdaptorEvent, HttpResponseEvent, OutputEvent, StopReason};
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    let (limits, payload_limit) = response_bounds().unwrap();
+    assert!(limits.max_spool_bytes <= MAX_INVOCATION_BYTES as u64);
+    assert!(limits.max_output_events <= crate::fetch::MAX_FETCH_OUTPUT_EVENTS as u32);
+    let mut headers = vec![("x".to_owned(), String::new()); MAX_HTTP_HEADERS];
+    headers[0].1 = "\t".repeat(MAX_HTTP_HEADERS_BYTES - MAX_HTTP_HEADERS);
+    crate::http_fetch::check_headers(&headers, false).unwrap();
+    let encode_event = |event| {
+        crate::fetch::encode_fetch_event_payload(&OutputEvent::Adaptor(AdaptorEvent::Http(event)))
+            .unwrap()
+    };
+    let mut payloads = vec![encode_event(HttpResponseEvent::Head {
+        status: 200,
+        headers,
+    })];
+    let raw = vec![255; MAX_HTTP_RESPONSE_BYTES as usize];
+    // Odd boundaries exercise base64 padding and invocation chunk splitting.
+    for bytes in raw.chunks(65537) {
+        payloads.push(encode_event(HttpResponseEvent::Body {
+            base64: STANDARD.encode(bytes),
+        }));
+    }
+    assert!(payloads.iter().map(Vec::len).sum::<usize>() as u64 <= payload_limit);
+    let terminal = crate::fetch::encode_fetch_terminal_payload(&OutputEvent::Finished {
+        stop_reason: StopReason::EndOfText,
+        usage: None,
+    })
+    .unwrap();
+    let output = fetch::output(&payloads, &terminal).unwrap();
+    let prepared = prepared("https://example.com/", false, Retention::Ephemeral);
+    let runner = runner();
+    let mut stream =
+        output::OutputStream::new(&prepared.request, &runner, limits.max_spool_bytes as usize)
+            .unwrap();
+    let mut offset = 0;
+    for payload in &payloads {
+        for bytes in fetch::frame_event(payload)
+            .unwrap()
+            .chunks(output::MAX_CHUNK_BYTES)
+        {
+            stream
+                .push(
+                    fetch::RESPONSE_EVENTS,
+                    fetch::RESPONSE_EVENTS_FORMAT,
+                    offset,
+                    bytes,
+                )
+                .unwrap();
+            offset += bytes.len() as u64;
+        }
+    }
+    let (result, events) = stream
+        .finish_or_fail(output, output::MAX_CHUNK_BYTES)
+        .unwrap();
+    assert!(result.is_success());
+    assert!(encode(&events).unwrap().len() as u64 <= limits.max_spool_bytes);
+    let retained: usize = events
+        .iter()
+        .map(|event| {
+            event.retained_heap_bytes().unwrap()
+                + 4 * std::mem::size_of::<crate::OutputEventEnvelope>()
+        })
+        .sum();
+    assert!(retained as u64 <= limits.max_spool_bytes);
+    for event in events {
+        assert!(encode(&event).unwrap().len() <= limits.max_encoded_result_frame as usize);
+    }
+}

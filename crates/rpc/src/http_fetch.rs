@@ -8,6 +8,73 @@ pub const MAX_HTTP_RESPONSE_BYTES: u32 = 8 * 1024 * 1024;
 pub const MAX_HTTP_HEADERS_BYTES: usize = 16 * 1024;
 pub const MAX_HTTP_HEADERS: usize = 64;
 
+/// Admission for the advertised raw response ceiling. Its event count is the
+/// largest that fits both the Fetch payload limit and the invocation spool.
+/// Fragmentation is independently bounded; streaming never buffers to EOF.
+pub fn response_bounds()
+-> Result<(crate::protocol::invocation::fetch::FetchLimits, u64), HttpRequestError> {
+    use crate::fetch::{
+        MAX_FETCH_OUTPUT_EVENTS, MAX_FETCH_OUTPUT_PAYLOAD_BYTES, encode_fetch_event_payload,
+        encode_fetch_terminal_payload,
+    };
+    use crate::output::{AdaptorEvent, HttpResponseEvent, OutputEvent, StopReason};
+    use crate::protocol::invocation::{
+        MAX_INVOCATION_BYTES, fetch::FetchLimits, output::fetch_bounds,
+    };
+    let encode = |event| {
+        encode_fetch_event_payload(&OutputEvent::Adaptor(AdaptorEvent::Http(event)))
+            .map_err(|_| HttpRequestError("response bounds codec"))
+    };
+    // Header syntax allows ASCII and tab; JSON escaping costs at most two
+    // bytes per source byte. Empty pairs account for separators and quotes.
+    let head = encode(HttpResponseEvent::Head {
+        status: 599,
+        headers: vec![(String::new(), String::new()); MAX_HTTP_HEADERS],
+    })?
+    .len() as u64
+        + 2 * MAX_HTTP_HEADERS_BYTES as u64;
+    let body = encode(HttpResponseEvent::Body {
+        base64: String::new(),
+    })?
+    .len() as u64;
+    let terminal = encode_fetch_terminal_payload(&OutputEvent::Finished {
+        stop_reason: StopReason::EndOfText,
+        usage: None,
+    })
+    .map_err(|_| HttpRequestError("response bounds codec"))?;
+    let bound = |events: u64| {
+        let bodies = events - 2; // response head and terminal
+        // Allow base64 padding on every separate upstream delivery.
+        let bytes = head + 4 * u64::from(MAX_HTTP_RESPONSE_BYTES).div_ceil(3) + bodies * (body + 4);
+        let bounds = fetch_bounds(bytes, events - 1, &terminal)
+            .map_err(|_| HttpRequestError("response bounds codec"))?;
+        Ok::<_, HttpRequestError>((bytes, bounds))
+    };
+    let (mut low, mut high) = (2, MAX_FETCH_OUTPUT_EVENTS as u64);
+    while low < high {
+        let candidate = low + (high - low).div_ceil(2);
+        let (bytes, bounds) = bound(candidate)?;
+        if bytes + terminal.len() as u64 <= MAX_FETCH_OUTPUT_PAYLOAD_BYTES as u64
+            && bounds.spool <= MAX_INVOCATION_BYTES as u64
+        {
+            low = candidate;
+        } else {
+            high = candidate - 1;
+        }
+    }
+    let (bytes, bounds) = bound(low)?;
+    Ok((
+        FetchLimits {
+            max_request_body_bytes: crate::fetch::MAX_FETCH_REQUEST_BODY_BYTES as u32,
+            max_output_events: low as u32,
+            max_spool_bytes: bounds.spool,
+            max_encoded_result_frame: bounds.frame as u32,
+            max_encoded_prepared_input: MAX_INVOCATION_BYTES as u32,
+        },
+        bytes,
+    ))
+}
+
 /// Headers reserved for provider-owned credentials.
 pub const CREDENTIAL_HEADERS: &[&str] = &[
     "authorization",
