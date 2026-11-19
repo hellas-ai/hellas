@@ -212,7 +212,7 @@ async fn descriptors_render_identical_jobs_without_the_original_weights() {
             .unwrap();
         for (evaluator, package) in packages {
             let described = &described[&evaluator];
-            assert_eq!(package.program().unwrap(), described.program().unwrap());
+            assert_eq!(package.programs().unwrap(), described.programs().unwrap());
             let requests = match kind {
                 ModelKind::Text => vec![
                     ModelRequest::Text {

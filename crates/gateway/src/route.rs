@@ -116,13 +116,24 @@ pub(crate) struct RouteExecution {
 }
 
 impl RouteExecution {
-    pub async fn compute(
+    pub fn require_kind(&self, kind: ModelKind) -> crate::GatewayResult<()> {
+        if self.packages.is_empty() || self.packages.values().any(|package| package.kind() != kind)
+        {
+            return Err(crate::GatewayError::Presentation(
+                "model package does not match presentation".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn compute<'r>(
         &self,
         selection: &mut crate::routing::Selection,
-        request: &ModelRequest<'_>,
+        needs_step_bound: bool,
+        request: impl Fn(Option<u64>) -> ModelRequest<'r>,
     ) -> Result<(Arc<ModelPackage>, WorkOutputStream<crate::ComputeEvent>), WorkGatewayError> {
-        let mut last = WorkGatewayError::Busy(crate::WorkGatewayBusy);
-        while let Some(id) = selection.next() {
+        let request = &request;
+        execute(selection, |id, job| async move {
             let evaluator = self
                 .work
                 .backends()
@@ -133,42 +144,19 @@ impl RouteExecution {
             let package = self
                 .packages
                 .get(&evaluator)
-                .ok_or(WorkGatewayError::Unsupported)?
-                .clone();
-            let attempt = async {
-                let bounded;
-                let request = match request {
-                    ModelRequest::Text {
-                        prompt_ids,
-                        max_new,
-                        stops,
-                    } => {
-                        let max_steps = self.work.max_steps(&id).await?.unwrap_or(u64::MAX);
-                        bounded = ModelRequest::Text {
-                            prompt_ids,
-                            max_new: (*max_new).min(max_steps),
-                            stops,
-                        };
-                        &bounded
-                    }
-                    _ => request,
-                };
-                let job = package
-                    .render_job(request)
-                    .await
-                    .map_err(|error| WorkGatewayError::Rejected(error.into()))?;
-                first(self.work.run(&id, selection.job.clone(), job)).await
+                .ok_or(WorkGatewayError::Unsupported)?;
+            let steps = if needs_step_bound {
+                self.work.max_steps(&id).await?
+            } else {
+                None
             };
-            match attempt.await {
-                Ok(stream) => {
-                    selection.accept(&id);
-                    return Ok((package, stream));
-                }
-                Err(WorkGatewayError::PreProposal(error)) => last = *error,
-                Err(error) => return Err(error),
-            }
-        }
-        Err(last)
+            let prepared = package
+                .render_job(&request(steps))
+                .await
+                .map_err(|error| WorkGatewayError::Rejected(error.into()))?;
+            Ok((package.clone(), self.work.run(&id, job, prepared)?))
+        })
+        .await
     }
 
     pub async fn fetch(
@@ -176,34 +164,45 @@ impl RouteExecution {
         selection: &mut crate::routing::Selection,
         request: impl Fn(&str) -> Result<WorkFetchRequest, WorkGatewayError>,
     ) -> Result<crate::WorkFetchStream, WorkGatewayError> {
-        let mut last = WorkGatewayError::Busy(crate::WorkGatewayBusy);
-        while let Some(id) = selection.next() {
-            match first(self.work.fetch(&id, selection.job.clone(), request(&id)?)).await {
-                Ok(stream) => {
-                    selection.accept(&id);
-                    return Ok(stream);
-                }
-                Err(WorkGatewayError::PreProposal(error)) => last = *error,
-                Err(error) => return Err(error),
-            }
-        }
-        Err(last)
+        let request = &request;
+        execute(selection, |id, job| async move {
+            Ok(((), self.work.fetch(&id, job, request(&id)?)?))
+        })
+        .await
+        .map(|(_, stream)| stream)
     }
 }
 
-// No presentation sees output until the failover boundary has been resolved.
-async fn first<E: Send + 'static>(
-    stream: Result<WorkOutputStream<E>, WorkGatewayError>,
-) -> Result<WorkOutputStream<E>, WorkGatewayError> {
+// No presentation sees output until the shared failover boundary is resolved.
+async fn execute<T, E: Send + 'static, F>(
+    selection: &mut crate::routing::Selection,
+    attempt: impl Fn(String, Arc<crate::jobs::Job>) -> F,
+) -> Result<(T, WorkOutputStream<E>), WorkGatewayError>
+where
+    F: std::future::Future<Output = Result<(T, WorkOutputStream<E>), WorkGatewayError>>,
+{
     use futures::StreamExt;
-    let mut stream = stream?;
-    match stream.next().await {
-        Some(Err(error)) => Err(error),
-        Some(Ok(event)) => Ok(Box::pin(
-            futures::stream::once(std::future::ready(Ok(event))).chain(stream),
-        )),
-        None => Err(WorkGatewayError::Execution(
-            "execution ended before acceptance".into(),
-        )),
+    let mut last = WorkGatewayError::Busy(crate::WorkGatewayBusy);
+    while let Some(id) = selection.next() {
+        let started = async {
+            let (target, mut stream) = attempt(id.clone(), selection.job.clone()).await?;
+            let first = stream.next().await.ok_or_else(|| {
+                WorkGatewayError::Execution("execution ended before acceptance".into())
+            })??;
+            Ok((
+                target,
+                Box::pin(futures::stream::iter([Ok(first)]).chain(stream)) as WorkOutputStream<E>,
+            ))
+        }
+        .await;
+        match started {
+            Ok(stream) => {
+                selection.accept(&id);
+                return Ok(stream);
+            }
+            Err(WorkGatewayError::PreProposal(error)) => last = *error,
+            Err(error) => return Err(error),
+        }
     }
+    Err(last)
 }

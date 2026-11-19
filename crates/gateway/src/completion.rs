@@ -18,9 +18,15 @@ pub(super) struct Completion<T = InvocationOutput> {
 }
 
 impl<T> Completion<T> {
-    pub fn map<U>(self, map: impl FnOnce(T) -> Result<U, (StatusCode, String)>) -> Completion<U> {
+    pub async fn map<U>(
+        self,
+        map: impl AsyncFnOnce(T) -> Result<U, (StatusCode, String)>,
+    ) -> Completion<U> {
         Completion {
-            output: self.output.and_then(map),
+            output: match self.output {
+                Ok(output) => map(output).await,
+                Err(error) => Err(error),
+            },
             accepted: self.accepted,
             transcript: self.transcript,
         }

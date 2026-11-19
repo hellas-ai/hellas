@@ -8,7 +8,7 @@ use hellas_authority::model::grant::{
     responses::ResponsesResource,
 };
 use hellas_gateway::Presentation;
-use hellas_rpc::protocol::invocation::{Admission, ComputePrograms, InvocationPolicy, Limits};
+use hellas_rpc::protocol::invocation::{Admission, InvocationPolicy, Limits};
 
 /// Operator terms for a named resource. Core derives the executable policy and
 /// the authority journal assigns its revision at commit.
@@ -268,19 +268,9 @@ impl Resource {
                     .map_err(|error| error.clone())?
                     .get(evaluator)
                     .ok_or("model evaluator was not prepared")?;
-                let programs = if package.is_image() {
-                    ComputePrograms::Any {}
-                } else {
-                    ComputePrograms::Only {
-                        manifests: vec![package.program()?.manifest],
-                    }
-                };
                 (
                     InvocationPolicy {
-                        admissions: vec![Admission::Compute {
-                            evaluator: evaluator.into(),
-                            programs,
-                        }],
+                        admissions: vec![Admission::compute_only(&package.programs()?)?],
                         limits: Limits {
                             max_upload_bytes: 8 << 20,
                             max_output_bytes: 4 << 20,

@@ -394,8 +394,12 @@ async fn async_main() {
         Commands::Program { model, backend } => {
             let result = hellas_client::model::ModelPackage::open(&model, &backend)
                 .await
-                .and_then(|package| package.program())
-                .map(|program| println!("{program}"));
+                .and_then(|package| package.programs())
+                .map(|programs| {
+                    for program in programs {
+                        println!("{program}");
+                    }
+                });
             tracer_provider.shutdown();
             if let Err(error) = result {
                 eprintln!("error: {error:#}");

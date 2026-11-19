@@ -1,5 +1,7 @@
 use super::*;
 use crate::WorkExecutionBackend;
+use hellas_client::model::ModelRequest;
+use hellas_rpc::provenance::ExecutionProvenance;
 
 /// The tiny Qwen3 GGUF the client text package tests render.
 fn text_model() -> std::path::PathBuf {
@@ -93,16 +95,20 @@ async fn authenticated_prefixes_arrive_before_the_paid_terminal() {
         payment_ack: payment_ack.clone(),
     }))
     .await;
-    let mut live = state
-        .prepare_ids(
-            vec![0],
-            1,
-            None,
+    let (_, mut live) = state
+        .execution
+        .compute(
             &mut crate::test_support::selection(state.execution.work.clone()),
+            true,
+            |_| ModelRequest::Text {
+                prompt_ids: &[0],
+                max_new: 1,
+                stops: &[],
+            },
         )
         .await
         .unwrap();
-    let prefix = live.prepared.next().await.unwrap().unwrap();
+    let prefix = live.next().await.unwrap().unwrap();
     assert!(matches!(
         prefix,
         crate::WorkEvent::Output(ComputeEvent::Output(
@@ -110,7 +116,7 @@ async fn authenticated_prefixes_arrive_before_the_paid_terminal() {
         ))
     ));
     let terminal = {
-        let terminal = live.prepared.next();
+        let terminal = live.next();
         tokio::pin!(terminal);
         assert!(futures::poll!(terminal.as_mut()).is_pending());
         payment_ack.notify_one();
@@ -120,7 +126,7 @@ async fn authenticated_prefixes_arrive_before_the_paid_terminal() {
         terminal,
         crate::WorkEvent::Output(ComputeEvent::Done { .. })
     ));
-    assert!(live.prepared.next().await.is_none());
+    assert!(live.next().await.is_none());
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
@@ -149,15 +155,20 @@ async fn paid_capacity_is_a_retryable_error() {
     }
     let state = open(Arc::new(Busy)).await;
     let error = state
-        .prepare_ids(
-            vec![0],
-            1,
-            None,
+        .execution
+        .compute(
             &mut crate::test_support::selection(state.execution.work.clone()),
+            true,
+            |_| ModelRequest::Text {
+                prompt_ids: &[0],
+                max_new: 1,
+                stops: &[],
+            },
         )
         .await
         .err()
-        .expect("busy backend must reject admission");
+        .expect("busy backend must reject admission")
+        .into();
     assert_eq!(
         crate::backend_status(&error),
         axum::http::StatusCode::SERVICE_UNAVAILABLE
@@ -249,14 +260,16 @@ async fn text_routes_carry_provenance_at_start_and_end() {
     let commitment = "5a".repeat(32);
     let provider = format!("secp256k1:{}", "02".repeat(33));
     let encoded = base64::engine::general_purpose::STANDARD.encode(&transcript);
-    let state = Arc::new(
-        open(Arc::new(Accepting {
+    let app = test_router(
+        Arc::new(Accepting {
             provenance,
             transcript,
-        }))
-        .await,
-    );
-    let app = test_router(state).layer(crate::provenance_layer::ProvenanceLayer);
+        }),
+        text_model(),
+        "m",
+    )
+    .await
+    .layer(crate::provenance_layer::ProvenanceLayer);
     let user = json!([{"role": "user", "content": "hi"}]);
     let routes = [
         (
@@ -531,8 +544,8 @@ async fn custom_stop_sequences_are_rejected_before_any_output() {
     let work = Arc::new(Capturing {
         jobs: std::sync::Mutex::new(Vec::new()),
     });
-    let state = Arc::new(open(work.clone()).await);
-    let response = test_router(state)
+    let response = test_router(work.clone(), text_model(), "m")
+        .await
         .oneshot(
             axum::http::Request::post("/v1/chat/completions")
                 .header("content-type", "application/json")
@@ -675,7 +688,7 @@ async fn anthropic_controls_are_rejected_before_submitting_a_job() {
     let work = Arc::new(Capturing {
         jobs: std::sync::Mutex::new(Vec::new()),
     });
-    let router = test_router(Arc::new(open(work.clone()).await));
+    let router = test_router(work.clone(), text_model(), "m").await;
     for (field, value) in [
         ("temperature", json!(0.4)),
         ("top_p", json!(0.8)),
@@ -703,9 +716,24 @@ async fn anthropic_controls_are_rejected_before_submitting_a_job() {
     assert!(work.jobs.lock().unwrap().is_empty());
 }
 
-fn test_router(state: Arc<TextState>) -> Router {
-    let selection = crate::test_support::selection(state.execution.work.clone());
-    super::router(state).layer(axum::Extension(selection))
+async fn test_router(
+    work: Arc<dyn WorkExecutionBackend>,
+    package: std::path::PathBuf,
+    name: &str,
+) -> Router {
+    crate::router::router(
+        vec![crate::test_support::route(crate::Presentation::Model {
+            modality: hellas_client::model::ModelKind::Text,
+            model: name.into(),
+            package,
+            max_tokens: 128,
+        })],
+        work,
+        Arc::new(crate::jobs::Jobs::default()),
+        Default::default(),
+    )
+    .await
+    .unwrap()
 }
 
 /// A budget beyond the work source's terms is cut to them rather than
@@ -832,7 +860,7 @@ async fn undecodable_output_is_reported_as_unprocessable() {
             "Anthropic Messages",
             context(),
             Undecodable,
-            &serde_json::to_vec(&request).unwrap(),
+            request,
         )
         .await;
         let status = response.status();
@@ -853,7 +881,7 @@ async fn undecodable_output_is_reported_as_unprocessable() {
             "OpenAI Responses",
             context(),
             Undecodable,
-            &serde_json::to_vec(&request).unwrap(),
+            request,
         )
         .await;
         let status = response.status();
@@ -885,7 +913,8 @@ async fn sampled_temperatures_are_refused_by_name() {
     let work = Arc::new(Capturing {
         jobs: std::sync::Mutex::new(Vec::new()),
     });
-    let response = test_router(Arc::new(open(work.clone()).await))
+    let response = test_router(work.clone(), text_model(), "gpt-5.4-nano")
+        .await
         .oneshot(
             axum::http::Request::post("/v1/responses")
                 .header("content-type", "application/json")
@@ -930,23 +959,8 @@ async fn opencode_session_creates_a_job() {
     model[offset..offset + 4].copy_from_slice(&8192u32.to_le_bytes());
     let file = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(file.path(), model).unwrap();
-    let state = TextState::open(
-        file.path().to_owned(),
-        128,
-        crate::test_support::execution(
-            work.clone(),
-            crate::Presentation::Model {
-                modality: hellas_client::model::ModelKind::Text,
-                model: "mini-qwen3".into(),
-                package: file.path().to_owned(),
-                max_tokens: 128,
-            },
-        )
-        .await,
-    )
-    .await
-    .unwrap();
-    let response = test_router(Arc::new(state))
+    let response = test_router(work.clone(), file.path().to_owned(), "gpt-4.1-mini")
+        .await
         .oneshot(
             axum::http::Request::post("/v1/responses")
                 .header("content-type", "application/json")

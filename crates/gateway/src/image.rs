@@ -1,17 +1,18 @@
-//! Image preparation and PNG encoding stay on the caller's side of Compute.
-use super::{GatewayError, GatewayResult, json_error, route::RouteExecution};
+//! Image request shape and PNG encoding.
+use super::{
+    GatewayResult, json_error,
+    pipeline::{self, Operation, Reply},
+    route::RouteExecution,
+};
 use axum::{
-    Json, Router,
-    extract::{DefaultBodyLimit, State, rejection::JsonRejection},
-    http::StatusCode,
+    Extension, Router,
+    extract::State,
+    http::{HeaderMap, StatusCode},
     response::Response,
     routing::post,
 };
-use hellas_adaptors::openai::{
-    error_json,
-    images::{self, ImageGeneration},
-};
-use hellas_client::model::{ModelRequest, ModelResponse, flux::ImageRequest};
+use hellas_adaptors::openai::images::{self, ImageGeneration};
+use hellas_client::model::{ModelKind, ModelRequest, ModelResponse, flux::ImageRequest};
 use std::sync::Arc;
 
 pub(super) const PATH: &str = "/v1/images/generations";
@@ -20,20 +21,10 @@ struct ImageState {
     name: String,
     work: Arc<RouteExecution>,
 }
-pub(super) async fn router(model_name: String, work: Arc<RouteExecution>) -> GatewayResult<Router> {
-    let package = work
-        .packages
-        .values()
-        .next()
-        .ok_or_else(|| GatewayError::Presentation("image route needs a renderer".into()))?;
-    if !package.is_image() {
-        return Err(GatewayError::Presentation(
-            "image route requires a Flux model".into(),
-        ));
-    }
+pub(super) fn router(model_name: String, work: Arc<RouteExecution>) -> GatewayResult<Router> {
+    work.require_kind(ModelKind::Image)?;
     Ok(Router::new()
         .route(PATH, post(handle))
-        .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(Arc::new(ImageState {
             name: model_name,
             work,
@@ -41,80 +32,35 @@ pub(super) async fn router(model_name: String, work: Arc<RouteExecution>) -> Gat
 }
 async fn handle(
     State(state): State<Arc<ImageState>>,
-    axum::Extension(mut selection): axum::Extension<crate::routing::Selection>,
-    request: Result<Json<serde_json::Value>, JsonRejection>,
+    Extension(selected): Extension<crate::routing::Selection>,
+    Extension(body): Extension<serde_json::Value>,
+    headers: HeaderMap,
 ) -> Response {
-    let request = match request {
-        Ok(Json(request)) => request,
-        Err(error) => {
-            return json_error(
-                if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
-                    error.status()
-                } else {
-                    StatusCode::BAD_REQUEST
-                },
-                error.body_text(),
-            );
-        }
-    };
-    let request = match ImageGeneration::parse(request, &state.name) {
+    if !crate::affinity::json_content_type(&headers) {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "Expected request with `Content-Type: application/json`",
+        );
+    }
+    let request = match ImageGeneration::parse(body, &state.name) {
         Ok(request) => request,
         Err(error) => return crate::request_error(error),
     };
+    let request = image_request(&request);
     let (width, height) = (request.width, request.height);
-    if let Err(error) = image_request(&request).validate() {
-        return json_error(StatusCode::BAD_REQUEST, error.to_string());
-    }
-    let (package, stream) = match state
-        .work
-        .compute(
-            &mut selection,
-            &ModelRequest::Image(image_request(&request)),
-        )
-        .await
-    {
-        Ok(prepared) => prepared,
-        Err(error) => return crate::work_error(error),
-    };
-    let crate::completion::Completion {
-        output,
-        accepted,
-        transcript,
-    } = crate::completion::compute(stream).await;
-    let (status, body) = match output {
-        Ok(output) => {
-            let png = tokio::task::spawn_blocking(
-                move || -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-                    let ModelResponse::Image(image) = package.decode(&output)? else {
-                        return Err("unexpected model response".into());
-                    };
-                    image.png(width, height).map_err(Into::into)
-                },
-            );
-            match png.await {
-                Ok(Ok(png)) => (
-                    StatusCode::OK,
-                    images::render(&png, crate::now_unix() as u64),
-                ),
-                Ok(Err(error)) => (StatusCode::BAD_GATEWAY, error_json(error.to_string())),
-                Err(error) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    error_json(error.to_string()),
-                ),
-            }
-        }
-        Err((status, message)) => (status, error_json(message)),
-    };
-    let mut response = crate::backend::provenance::json_response(
-        status,
-        body,
-        accepted.as_ref(),
-        transcript.as_deref(),
-    );
-    if let Some(accepted) = accepted {
-        response.extensions_mut().insert(accepted);
-    }
-    response
+    pipeline::buffered(
+        &state.work,
+        selected,
+        Operation::Compute(ModelRequest::Image(request)),
+        move |output| {
+            let ModelResponse::Image(image) = output else {
+                return Err(pipeline::invalid_output("unexpected model response"));
+            };
+            let png = image.png(width, height).map_err(pipeline::invalid_output)?;
+            Ok(Reply::Json(images::render(&png, crate::now_unix() as u64)))
+        },
+    )
+    .await
 }
 fn image_request(request: &ImageGeneration) -> ImageRequest<'_> {
     ImageRequest {

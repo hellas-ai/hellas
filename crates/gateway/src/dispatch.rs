@@ -26,7 +26,7 @@ pub(super) async fn serve<A, B>(
     surface: &'static str,
     context: RenderContext,
     backend: B,
-    body: &[u8],
+    body: JsonValue,
 ) -> Response
 where
     A: WireAdaptor + Send + 'static,
@@ -52,9 +52,9 @@ where
 
 fn parse<A: WireAdaptor>(
     adaptor: &A,
-    body: &[u8],
+    body: JsonValue,
 ) -> AdaptorResult<(A::ParsedRequest, BackendRequest)> {
-    let raw = RawRequest::from_slice(body)?;
+    let raw = RawRequest::from_value(body)?;
     let parsed = adaptor.parse(raw.clone())?;
     let execution = adaptor.to_execution_request(&parsed)?;
     Ok((parsed, BackendRequest::new(execution, raw)))

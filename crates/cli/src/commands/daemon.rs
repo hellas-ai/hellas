@@ -175,6 +175,10 @@ impl ModelContext {
         } else {
             Default::default()
         };
+        let package_programs = packages
+            .iter()
+            .map(|(evaluator, package)| Ok((evaluator, package.programs()?)))
+            .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
         let mut matches = vec![];
         for policy in bundle
             .offers
@@ -188,19 +192,12 @@ impl ModelContext {
                         programs,
                     } = admission
                     {
-                        let opened = &packages[evaluator];
-                        if let Ok(program) = opened.program() {
-                            match programs {
-                                hellas_rpc::protocol::invocation::ComputePrograms::Any {} => {}
-                                hellas_rpc::protocol::invocation::ComputePrograms::Only {
-                                    manifests,
-                                } if manifests.contains(&program.manifest) => {}
-                                _ => continue,
-                            }
-                        } else if !matches!(
-                            programs,
-                            hellas_rpc::protocol::invocation::ComputePrograms::Any {}
-                        ) {
+                        if let hellas_rpc::protocol::invocation::ComputePrograms::Only { manifests } =
+                            programs
+                            && !package_programs[evaluator]
+                                .iter()
+                                .all(|program| manifests.contains(&program.manifest))
+                        {
                             continue;
                         }
                         matches.push((policy.clone(), Some(evaluator.clone())));
@@ -1039,7 +1036,7 @@ mod tests {
             hellas_client::model::ModelPackage::open_many(&path, [evaluator.clone()], Some(&store))
                 .await
                 .unwrap();
-        packages[&evaluator].program().unwrap();
+        packages[&evaluator].programs().unwrap();
         assert_weights_once(before);
         store.close().await;
     }

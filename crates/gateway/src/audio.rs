@@ -1,12 +1,14 @@
-//! Multipart audio is extracted here, interpreted by
-//! `hellas_adaptors::openai::audio_transcriptions`, and decoded through one
-//! Compute job.
-use super::backend::provenance::json_response;
-use super::{GatewayError, GatewayResult, json_error, route::RouteExecution};
+//! Multipart transcription request and response shapes.
+use super::{
+    GatewayError, GatewayResult, json_error,
+    pipeline::{self, Operation, Reply},
+    route::RouteExecution,
+};
 use axum::{
-    Router,
-    extract::{DefaultBodyLimit, FromRequest, Multipart, Request, State},
-    http::StatusCode,
+    Extension, Router,
+    body::{Body, Bytes},
+    extract::{FromRequest, Multipart, Request, State},
+    http::{StatusCode, request::Parts},
     response::{IntoResponse, Response},
     routing::post,
 };
@@ -17,18 +19,11 @@ pub(super) const PATH: &str = "/v1/audio/transcriptions";
 pub(super) const MAX_REQUEST_BYTES: usize = wav::MAX_WAV_BYTES + (64 << 10);
 
 struct AudioState {
-    model_name: String,
     max_tokens: usize,
     work: Arc<RouteExecution>,
 }
-pub(super) async fn router(
-    model_name: String,
-    max_tokens: usize,
-    work: Arc<RouteExecution>,
-) -> GatewayResult<Router> {
-    if max_tokens == 0 {
-        return Err(super::GatewayConfigError::MaxTokens.into());
-    }
+
+pub(super) fn router(max_tokens: usize, work: Arc<RouteExecution>) -> GatewayResult<Router> {
     let package = work
         .packages
         .values()
@@ -37,166 +32,91 @@ pub(super) async fn router(
     let capacity = package
         .transcription_capacity()
         .ok_or_else(|| GatewayError::Presentation("audio route requires a Whisper model".into()))?;
-    if max_tokens > capacity {
+    if max_tokens == 0 || max_tokens > capacity {
         return Err(super::GatewayConfigError::MaxTokens.into());
     }
-    let state = Arc::new(AudioState {
-        model_name,
-        max_tokens,
-        work,
-    });
     Ok(Router::new()
         .route(PATH, post(handle))
-        .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
-        .with_state(state))
-}
-fn multipart_error(error: axum::extract::multipart::MultipartError) -> Response {
-    json_error(error.status(), error.body_text())
+        .with_state(Arc::new(AudioState { max_tokens, work })))
 }
 
-pub(super) async fn multipart_model(request: Request) -> Result<String, Box<Response>> {
-    let mut multipart = Multipart::from_request(request, &())
+#[derive(Clone)]
+struct AudioRequest {
+    file: Bytes,
+    language: Option<String>,
+    text: bool,
+}
+
+pub(super) fn decode<'a>(
+    parts: &'a mut Parts,
+    body: &'a Bytes,
+) -> futures::future::BoxFuture<'a, Result<crate::affinity::Hints, Box<Response>>> {
+    Box::pin(async move {
+        let mut multipart = Multipart::from_request(
+            Request::from_parts(parts.clone(), Body::from(body.clone())),
+            &(),
+        )
         .await
         .map_err(IntoResponse::into_response)?;
-    let mut form = TranscriptionForm::default();
-    while let Some(field) = multipart.next_field().await.map_err(multipart_error)? {
-        if field.name() == Some("model") {
-            form.admit("model").map_err(crate::request_error)?;
+        let mut form = TranscriptionForm::default();
+        let multipart_error = |error: axum::extract::multipart::MultipartError| {
+            json_error(error.status(), error.body_text())
+        };
+        while let Some(field) = multipart.next_field().await.map_err(multipart_error)? {
+            let name = field.name().unwrap_or_default().to_owned();
+            form.admit(&name).map_err(crate::request_error)?;
             let bytes = field.bytes().await.map_err(multipart_error)?;
-            form.insert("model", bytes.into())
+            if name == "file" && bytes.len() > wav::MAX_WAV_BYTES {
+                return Err(Box::new(StatusCode::PAYLOAD_TOO_LARGE.into_response()));
+            }
+            form.insert(&name, bytes.into())
                 .map_err(crate::request_error)?;
         }
-    }
-    Ok(form.model().map_err(crate::request_error)?.to_owned())
+        let model = form.model().map_err(crate::request_error)?.to_owned();
+        let (file, language, text) = form.finish(&model).map_err(crate::request_error)?;
+        parts.extensions.insert(AudioRequest {
+            file: Bytes::from(file),
+            language,
+            text,
+        });
+        Ok(crate::affinity::Hints {
+            model: Some(model),
+            ..Default::default()
+        })
+    })
 }
 
 async fn handle(
     State(state): State<Arc<AudioState>>,
-    axum::Extension(mut selection): axum::Extension<crate::routing::Selection>,
-    mut form: Multipart,
+    Extension(selected): Extension<crate::routing::Selection>,
+    Extension(AudioRequest {
+        file,
+        language,
+        text,
+    }): Extension<AudioRequest>,
 ) -> Response {
-    let mut fields = TranscriptionForm::default();
-    while let Some(field) = match form.next_field().await {
-        Ok(field) => field,
-        Err(error) => return multipart_error(error),
-    } {
-        let name = field.name().unwrap_or_default().to_owned();
-        if let Err(error) = fields.admit(&name) {
-            return crate::request_error(error);
-        }
-        let bytes = match field.bytes().await {
-            Ok(bytes) => bytes,
-            Err(error) => return multipart_error(error),
-        };
-        if name == "file" && bytes.len() > wav::MAX_WAV_BYTES {
-            return StatusCode::PAYLOAD_TOO_LARGE.into_response();
-        }
-        if let Err(error) = fields.insert(&name, bytes.into()) {
-            return crate::request_error(error);
-        }
-    }
-    let (file, language, text) = match fields.finish(&state.model_name) {
-        Ok(fields) => fields,
-        Err(error) => return crate::request_error(error),
-    };
     let samples = match tokio::task::spawn_blocking(move || wav::decode(&file)).await {
         Ok(Ok(samples)) => samples,
         Ok(Err(error)) => return json_error(StatusCode::BAD_REQUEST, error.to_string()),
         Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
     };
-    let (package, stream) = match state
-        .work
-        .compute(
-            &mut selection,
-            &ModelRequest::Transcription {
-                samples: &samples,
-                language: language.as_deref(),
-                max_new_tokens: state.max_tokens,
-            },
-        )
-        .await
-    {
-        Ok(prepared) => prepared,
-        Err(error) => return crate::work_error(error),
-    };
-    let crate::completion::Completion {
-        output,
-        accepted,
-        transcript,
-    } = crate::completion::compute(stream).await;
-    let mut response = match output {
-        Ok(output) => match package.decode(&output) {
-            Ok(ModelResponse::Transcription(result)) if text => {
-                text_response(result.text, transcript.as_deref())
+    pipeline::buffered(
+        &state.work,
+        selected,
+        Operation::Compute(ModelRequest::Transcription {
+            samples: &samples,
+            language: language.as_deref(),
+            max_new_tokens: state.max_tokens,
+        }),
+        move |output| match output {
+            ModelResponse::Transcription(result) if text => Ok(Reply::PlainText(result.text)),
+            ModelResponse::Transcription(result) => {
+                Ok(Reply::Json(serde_json::json!({"text":result.text})))
             }
-            Ok(ModelResponse::Transcription(result)) => json_response(
-                StatusCode::OK,
-                serde_json::json!({"text":result.text}),
-                accepted.as_ref(),
-                transcript.as_deref(),
-            ),
-            Ok(_) => audio_error(
-                StatusCode::BAD_GATEWAY,
-                "unexpected model response",
-                accepted.as_ref(),
-                transcript.as_deref(),
-            ),
-            Err(error) => audio_error(
-                StatusCode::BAD_GATEWAY,
-                error.to_string(),
-                accepted.as_ref(),
-                transcript.as_deref(),
-            ),
+            _ => Err(pipeline::invalid_output("unexpected model response")),
         },
-        Err((status, message)) => {
-            audio_error(status, message, accepted.as_ref(), transcript.as_deref())
-        }
-    };
-    if let Some(accepted) = accepted {
-        response.extensions_mut().insert(accepted);
-    }
-    response
-}
-
-fn audio_error(
-    status: StatusCode,
-    message: impl Into<String>,
-    accepted: Option<&hellas_rpc::provenance::ExecutionProvenance>,
-    transcript: Option<&[u8]>,
-) -> Response {
-    json_response(
-        status,
-        hellas_adaptors::openai::error_json(message),
-        accepted,
-        transcript,
     )
-}
-
-/// Keep the transcription's text bytes intact; trail its signed evidence.
-fn text_response(text: String, transcript: Option<&[u8]>) -> Response {
-    use crate::backend::provenance::transcript_header;
-    use axum::{
-        body::Body,
-        http::{HeaderMap, HeaderValue, header},
-    };
-    use http_body::Frame;
-
-    let Some(transcript) = transcript else {
-        return text.into_response();
-    };
-    let (name, signed) = transcript_header(transcript);
-    let trailer = HeaderValue::from_str(name.as_str()).expect("a header name is a valid token");
-    let frames = futures::stream::iter([
-        Ok::<_, std::convert::Infallible>(Frame::data(axum::body::Bytes::from(text))),
-        Ok(Frame::trailers(HeaderMap::from_iter([(name, signed)]))),
-    ]);
-    let mut response = Response::new(Body::new(http_body_util::StreamBody::new(frames)));
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response.headers_mut().insert(header::TRAILER, trailer);
-    response
+    .await
 }
 #[cfg(test)]
 #[expect(

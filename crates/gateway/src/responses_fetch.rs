@@ -1,7 +1,7 @@
 //! Responses presentation over an already funded, authenticated Work backend.
-use super::backend::provenance::{completed_provenance, provenance_from_execution};
+use super::backend::provenance::completed_provenance;
 use super::{WorkEvent, WorkFetchRequest, route::RouteExecution};
-use axum::{Router, body::Bytes, extract::State, response::Response, routing::post};
+use axum::{Extension, Router, extract::State, response::Response, routing::post};
 use futures::StreamExt;
 use hellas_adaptors::{
     BackendError, BackendEvent, BackendFuture, BackendRequest, BackendStream, ExecutionBackend,
@@ -42,14 +42,14 @@ struct FetchBackend {
 async fn handle(
     State(state): State<Arc<ResponsesState>>,
     axum::Extension(selection): axum::Extension<crate::routing::Selection>,
-    body: Bytes,
+    Extension(body): Extension<Value>,
 ) -> Response {
     super::dispatch::serve(
         OpenAiResponsesAdaptor,
         "OpenAI Responses",
         super::dispatch::render_context("resp"),
         FetchBackend { state, selection },
-        &body,
+        body,
     )
     .await
 }
@@ -77,7 +77,7 @@ impl ExecutionBackend for FetchBackend {
             body.extend(self.state.overrides.clone());
             body.insert("stream".into(), Value::Bool(true));
             body.insert("store".into(), Value::Bool(false));
-            let mut events = self
+            let events = self
                 .state
                 .work
                 .fetch(&mut self.selection.clone(), |_| {
@@ -90,9 +90,7 @@ impl ExecutionBackend for FetchBackend {
                 })
                 .await
                 .map_err(BackendError::from)?;
-            let accepted = crate::accepted(&mut events).await;
-            let initial = accepted.as_ref().map(provenance_from_execution);
-            Ok(BackendStream::new(
+            Ok(crate::pipeline::streaming(events, |events, accepted| {
                 events.filter_map(move |event| {
                     std::future::ready(match event {
                         Ok(WorkEvent::Output(event)) => Some(Ok(event.into())),
@@ -105,9 +103,9 @@ impl ExecutionBackend for FetchBackend {
                         Ok(WorkEvent::Accepted(_)) => None,
                         Err(error) => Some(Err(BackendError::from(error))),
                     })
-                }),
-                initial,
-            ))
+                })
+            })
+            .await)
         })
     }
 }

@@ -1,8 +1,6 @@
 //! Raw response boundaries through the paid seller, buyer and HTTP listener.
 use super::*;
 use futures::StreamExt as _;
-use hellas_authority::node::NodeCoordinator;
-use hellas_authority::work_store::grant::NodeStore;
 use hellas_gateway::{HttpRoute, HttpTarget, Presentation, Route, WorkExecutionBackend as _};
 
 use super::http_fixture::{Mock, Reply, SECRET, access};

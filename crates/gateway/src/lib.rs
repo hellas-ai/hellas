@@ -21,6 +21,7 @@ pub use error::{GatewayConfigError, GatewayError, GatewayResult};
 pub use speech::SpeechTarget;
 mod http_fetch;
 mod image;
+mod pipeline;
 mod provenance_layer;
 mod responses_fetch;
 mod state;

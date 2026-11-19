@@ -4,7 +4,6 @@ use hellas_adaptors::{
     BackendError, BackendFuture, BackendRequest, BackendStream, ExecutionBackend,
 };
 
-mod generation;
 pub(crate) mod provenance;
 #[cfg_attr(feature = "otel", path = "telemetry/otel.rs")]
 #[cfg_attr(not(feature = "otel"), path = "telemetry/noop.rs")]
@@ -12,7 +11,7 @@ pub(crate) mod telemetry;
 mod text;
 
 use self::text::text_events;
-use super::state::TextState;
+use super::state::{PreparedGeneration, TextState};
 
 #[derive(Clone)]
 pub(super) struct GatewayBackend {
@@ -40,26 +39,26 @@ impl ExecutionBackend for GatewayBackend {
                 }
                 Err(error) => Err(error),
             };
-            let mut prepared = match prepared {
+            let prepared = match prepared {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     inference.fail(&error);
                     return Err(error);
                 }
             };
-            if let Err(error) = prepared.accept().await {
-                inference.fail(&error);
-                return Err(error);
-            }
             inference.response_model(&request.execution.canonical.model.name);
-            let initial_provenance = prepared
-                .provenance
-                .as_ref()
-                .map(self::provenance::provenance_from_execution);
-            Ok(BackendStream::new(
-                inference.stream(text_events(prepared)),
-                initial_provenance,
-            ))
+            Ok(
+                crate::pipeline::streaming(prepared.prepared, move |events, accepted| {
+                    inference.stream(text_events(
+                        PreparedGeneration {
+                            prepared: events,
+                            ..prepared
+                        },
+                        accepted,
+                    ))
+                })
+                .await,
+            )
         })
     }
 }

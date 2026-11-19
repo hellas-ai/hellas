@@ -11,7 +11,7 @@ use serde::Deserialize;
 use std::{
     collections::BTreeMap,
     fs::File,
-    io::{BufWriter, Write},
+    io::{BufWriter, Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -68,6 +68,61 @@ const METADATA: [&str; 6] = [
     "tokenizer/tokenizer.json",
 ];
 
+const VARIANTS_FILE: &str = "variants.json";
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(deny_unknown_fields)]
+struct Variant {
+    width: usize,
+    height: usize,
+    steps: usize,
+}
+impl Variant {
+    fn validate(self) -> Result<()> {
+        dimensions(self.width, self.height)?;
+        ensure!(
+            (1..=MAX_STEPS).contains(&self.steps),
+            "image steps must be between 1 and {MAX_STEPS}"
+        );
+        Ok(())
+    }
+
+    fn read(directory: &Path) -> Result<Vec<Self>> {
+        use hellas_rpc::protocol::invocation::policy::MAX_COMPUTE_PROGRAMS;
+        let file = match File::open(directory.join(VARIANTS_FILE)) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(vec![Self {
+                    width: 512,
+                    height: 512,
+                    steps: 4,
+                }]);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut bytes = Vec::new();
+        file.take(8193).read_to_end(&mut bytes)?;
+        ensure!(
+            bytes.len() <= 8192,
+            "image variants document exceeds 8192 bytes"
+        );
+        let variants: Vec<Self> = serde_json::from_slice(&bytes)?;
+        ensure!(
+            (1..=MAX_COMPUTE_PROGRAMS).contains(&variants.len()),
+            "image package requires 1 to {MAX_COMPUTE_PROGRAMS} variants"
+        );
+        let mut unique = std::collections::BTreeSet::new();
+        for &variant in &variants {
+            variant.validate()?;
+            ensure!(
+                unique.insert(variant),
+                "duplicate image variant {variant:?}"
+            );
+        }
+        Ok(variants)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ImageRequest<'a> {
     pub prompt: &'a str,
@@ -77,12 +132,16 @@ pub struct ImageRequest<'a> {
     pub steps: usize,
 }
 impl ImageRequest<'_> {
+    fn variant(&self) -> Variant {
+        Variant {
+            width: self.width,
+            height: self.height,
+            steps: self.steps,
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
-        dimensions(self.width, self.height)?;
-        ensure!(
-            (1..=MAX_STEPS).contains(&self.steps),
-            "image steps must be between 1 and {MAX_STEPS}"
-        );
+        self.variant().validate()?;
         ensure!(
             !self.prompt.trim().is_empty() && self.prompt.len() <= 16 << 10,
             "image prompt must contain 1 to 16384 bytes"
@@ -211,6 +270,7 @@ pub(super) struct Flux {
     config: Config,
     assets: Vec<NamedAsset>,
     args: [Vec<Arg>; 3],
+    variants: Vec<Variant>,
     dialect: super::GpuDialect,
 }
 impl Flux {
@@ -247,11 +307,50 @@ impl Flux {
             config,
             assets,
             args,
+            variants: Variant::read(directory)?,
             dialect,
         })
     }
+    fn program(&self, variant: Variant) -> Result<(Environment, String)> {
+        let source = super::program::render(
+            &self
+                .config
+                .source(variant.width, variant.height, variant.steps)?,
+            self.dialect,
+        )?;
+        ensure!(
+            source.len() as u64 <= MAX_SOURCE_BYTES,
+            "image program exceeds source limit"
+        );
+        let environment = Environment {
+            sources: vec![hellas_rpc::ContentRef::for_bytes(source.as_bytes())],
+            assets: self.assets.clone(),
+        };
+        Ok((environment, source))
+    }
+
+    pub fn programs(&self, evaluator: &str) -> Result<Vec<ProgramId>> {
+        self.variants
+            .iter()
+            .map(|&variant| {
+                Ok(ProgramId {
+                    evaluator: evaluator.into(),
+                    manifest: self.program(variant)?.0.manifest(evaluator)?.content_id(),
+                })
+            })
+            .collect()
+    }
+
     pub fn render_job(&self, request: &ImageRequest<'_>) -> Result<(ComputeJob, String)> {
         request.validate()?;
+        let variant = request.variant();
+        ensure!(
+            self.variants.contains(&variant),
+            "image variant {}x{} with {} steps is not configured",
+            variant.width,
+            variant.height,
+            variant.steps
+        );
         let tokens = text::tokenize(&self.directory, request.prompt)?;
         ensure!(tokens.valid > 0, "empty tokenized prompt");
         ensure!(
@@ -267,20 +366,7 @@ impl Flux {
             ))),
             Scope::Owner,
         );
-        let source = super::program::render(
-            &self
-                .config
-                .source(request.width, request.height, request.steps)?,
-            self.dialect,
-        )?;
-        ensure!(
-            source.len() as u64 <= MAX_SOURCE_BYTES,
-            "image program exceeds source limit"
-        );
-        let environment = Environment {
-            sources: vec![hellas_rpc::ContentRef::for_bytes(source.as_bytes())],
-            assets: self.assets.clone(),
-        };
+        let (environment, source) = self.program(variant)?;
         let input = |object: &str| Arg::Input {
             object: object.into(),
         };
