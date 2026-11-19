@@ -54,6 +54,7 @@ impl Route {
                 match modality {
                     ModelKind::Text => crate::state::PATHS.to_vec(),
                     ModelKind::Transcription => vec![crate::audio::PATH],
+                    ModelKind::Speech => vec![crate::speech::PATH],
                     ModelKind::Image => vec![crate::image::PATH],
                 },
                 "POST",

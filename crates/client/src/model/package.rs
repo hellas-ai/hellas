@@ -3,6 +3,7 @@ use super::{
     descriptor,
     flux::{Flux, Image, ImageRequest},
     qwen3::Qwen3,
+    speech::{Speech, SpeechAudio},
     whisper::Whisper,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -21,6 +22,7 @@ enum Family {
     Qwen3(Arc<Qwen3>),
     Whisper(Arc<Whisper>),
     Flux(Arc<Flux>),
+    Speech(Arc<Speech>),
 }
 
 pub struct ModelPackage {
@@ -38,6 +40,8 @@ pub enum ModelKind {
     Transcription,
     /// A converted Flux package directory.
     Image,
+    /// A converted MMS English package or descriptor.
+    Speech,
 }
 
 impl ModelKind {
@@ -47,6 +51,10 @@ impl ModelKind {
 }
 
 pub enum ModelRequest<'a> {
+    Speech {
+        text: &'a str,
+        speed: f32,
+    },
     Image(ImageRequest<'a>),
     Text {
         prompt_ids: &'a [u64],
@@ -75,6 +83,7 @@ pub enum ModelResponse {
     Tokens(Vec<u32>),
     Transcription(super::whisper::Transcription),
     Image(Image),
+    Speech(SpeechAudio),
 }
 
 impl ModelPackage {
@@ -157,6 +166,9 @@ impl ModelPackage {
         Ok(Self {
             evaluator: evaluator.into(),
             family: match source {
+                descriptor::Resolved::Speech { path, weights } => {
+                    Family::Speech(Arc::new(Speech::open(path, dialect, *weights).await?))
+                }
                 descriptor::Resolved::Flux(path) => Family::Flux(Arc::new({
                     let path = path.clone();
                     tokio::task::spawn_blocking(move || Flux::open(&path, dialect)).await??
@@ -180,6 +192,7 @@ impl ModelPackage {
     pub fn program(&self) -> Result<hellas_rpc::protocol::invocation::compute::ProgramId> {
         let environment = match &self.family {
             Family::Whisper(model) => model.environment(),
+            Family::Speech(model) => model.environment(),
             Family::Qwen3(model) => model.environment(),
             Family::Flux(_) => bail!("an image program depends on each request's size and steps"),
         };
@@ -195,11 +208,15 @@ impl ModelPackage {
     pub fn transcription_capacity(&self) -> Option<usize> {
         match &self.family {
             Family::Whisper(model) => Some(model.transcription_capacity()),
-            Family::Qwen3(_) | Family::Flux(_) => None,
+            Family::Qwen3(_) | Family::Flux(_) | Family::Speech(_) => None,
         }
     }
     pub async fn render_job(&self, request: &ModelRequest<'_>) -> Result<ComputeJob> {
         match (&self.family, request) {
+            (Family::Speech(model), ModelRequest::Speech { text, speed }) => {
+                let (model, text, speed) = (model.clone(), text.to_string(), *speed);
+                tokio::task::spawn_blocking(move || model.render_job(&text, speed)).await?
+            }
             (Family::Flux(model), ModelRequest::Image(request)) => {
                 let model = model.clone();
                 let prompt = request.prompt.to_owned();
@@ -265,6 +282,7 @@ impl ModelPackage {
             output.outcome
         );
         match &self.family {
+            Family::Speech(_) => Ok(ModelResponse::Speech(Speech::decode(output)?)),
             Family::Flux(_) => Ok(ModelResponse::Image(Image::decode(output)?)),
             Family::Whisper(model) => Ok(ModelResponse::Transcription(model.decode(output)?)),
             Family::Qwen3(_) => {

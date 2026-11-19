@@ -665,6 +665,7 @@ fn http(path: &str, models: Option<Vec<String>>) -> crate::Route {
                         service: "http".into(),
                         method: "request".into(),
                         route: HttpRoute {
+                            hosted_speech: None,
                             path: path.into(),
                             method: "POST".into(),
                             url: format!("https://example.com{path}"),

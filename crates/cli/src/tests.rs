@@ -38,11 +38,13 @@ fn durability_is_global_and_defaults_to_crash() {
 fn image_cli_and_gateway_surfaces_are_available() {
     let commit = "ab".repeat(20);
     let snapshot = format!("org/klein@{commit}");
-    for command in ["convert-flux", "convert-whisper"] {
+    for command in ["convert-flux", "convert-whisper", "convert-speech"] {
         let convert = Cli::try_parse_from(["hellas", command, &snapshot, "-o", "out"]).unwrap();
         assert!(matches!(
             convert.command,
-            Commands::ConvertFlux { .. } | Commands::ConvertWhisper { .. }
+            Commands::ConvertFlux { .. }
+                | Commands::ConvertWhisper { .. }
+                | Commands::ConvertSpeech { .. }
         ));
         assert!(
             Cli::try_parse_from(["hellas", command, "--checkpoint", "dir", "-o", "out"]).is_err()

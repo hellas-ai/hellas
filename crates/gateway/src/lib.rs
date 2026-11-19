@@ -16,6 +16,7 @@ mod compute;
 mod dispatch;
 mod error;
 pub mod router;
+mod speech;
 pub use error::{GatewayConfigError, GatewayError, GatewayResult};
 mod http_fetch;
 mod image;
