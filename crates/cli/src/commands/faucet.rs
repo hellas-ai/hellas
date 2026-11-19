@@ -17,12 +17,10 @@ pub const DEFAULT_AMOUNT: u64 = 1000;
 /// principal's balance.
 pub async fn faucet(amount: u64, principal: &SoftPasskey, profile: &ChainProfile) -> CliResult {
     ensure!(amount > 0, "amount must be positive");
-    ensure!(
-        profile.state_key() == ChainProfile::default().state_key(),
-        "configured chain has no faucet accounts"
-    );
-    let accounts: Vec<FaucetAccount> =
-        serde_json::from_str(hellas_chain::genesis::NETWORK_FAUCET_JSON)?;
+    let faucet_json = profile
+        .faucet_json()
+        .context("configured chain has no faucet accounts")?;
+    let accounts: Vec<FaucetAccount> = serde_json::from_str(faucet_json)?;
     ensure!(!accounts.is_empty(), "compiled faucet accounts are empty");
     let account = &accounts[rand::random_range(0..accounts.len())];
     eprintln!(
@@ -161,21 +159,25 @@ mod tests {
 
     #[test]
     fn compiled_faucet_keys_control_their_genesis_allocations() {
-        let profile = ChainProfile::default();
-        let accounts: Vec<FaucetAccount> =
-            serde_json::from_str(hellas_chain::genesis::NETWORK_FAUCET_JSON).unwrap();
-        assert!(!accounts.is_empty());
-        for account in accounts {
-            let address =
-                SettlementKey::from(faucet_passkey(&account).unwrap().party_key()).to_string();
-            assert_eq!(address, account.address);
-            let allocation = profile
-                .genesis()
-                .allocations
-                .iter()
-                .find(|a| a.address == address)
-                .unwrap();
-            assert!(allocation.balance >= DEFAULT_AMOUNT);
+        for &network in hellas_chain::genesis::Network::ALL {
+            let profile = ChainProfile::known(network);
+            let Some(json) = profile.faucet_json() else {
+                continue;
+            };
+            let accounts: Vec<FaucetAccount> = serde_json::from_str(json).unwrap();
+            assert!(!accounts.is_empty());
+            for account in accounts {
+                let address =
+                    SettlementKey::from(faucet_passkey(&account).unwrap().party_key()).to_string();
+                assert_eq!(address, account.address);
+                let allocation = profile
+                    .genesis()
+                    .allocations
+                    .iter()
+                    .find(|a| a.address == address)
+                    .unwrap();
+                assert!(allocation.balance >= DEFAULT_AMOUNT);
+            }
         }
     }
 

@@ -32,7 +32,7 @@ fn paid_client_accepts_scheduled_keys_without_a_static_threshold() {
     next.start_height = 2;
     next.end_height = None;
     trust.epochs.push(next);
-    let profile = ChainProfile::from_file(ChainFile {
+    let profile = ChainProfile::custom(CustomChainFile {
         trust,
         validators: vec!["ws://127.0.0.1:9080".into()],
         genesis_json,

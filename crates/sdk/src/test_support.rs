@@ -5,7 +5,7 @@ use hellas_private::StoreLocation;
 pub(crate) use crate::provider::tests::host::{Host, RemoteHost, provider_enrollment};
 use crate::work_config::WorkConfig;
 use hellas_auth::ProducerSigningKey;
-use hellas_chain::genesis::{ChainFile, ChainProfile};
+use hellas_chain::genesis::{ChainProfile, CustomChainFile};
 
 pub(crate) fn chain_dir(
     home: &std::path::Path,
@@ -27,7 +27,7 @@ pub(crate) fn chain_dir_with_genesis(
     let mut trust = fixture.trust().clone();
     trust.network_id = genesis.network_id.clone();
     trust.genesis_sha256 = hex::encode(Sha256::hash(genesis_json.as_bytes()));
-    let profile = ChainProfile::from_file(ChainFile {
+    let profile = ChainProfile::custom(CustomChainFile {
         trust,
         validators: vec!["ws://unused.invalid".into()],
         genesis_json,

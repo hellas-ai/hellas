@@ -83,8 +83,8 @@ presents any other enrollment, before anything is signed or funded.
 Paid jobs act for the home's principal key, `<home>/principal.key`, created on
 first use; `--passkey FILE` points at a key held outside the home. `hellas
 faucet [--amount N]` pays it devnet coins from a random public faucet account
-and waits until the payment is final. The compiled network is the default. For a
-local/test network, pass one authenticated JSON profile with `--chain-config FILE`.
+and waits until the payment is final. The default chain is the shipped devnet. Select a compiled chain with
+`--chain devnet`, or pass one authenticated JSON profile with `--chain-config FILE`.
 The profile contains the exact `genesis_json` bytes as a JSON string, `trust`,
 and a nonempty `validators` URL list. `--timeout 90s` bounds the whole operation;
 without it the command waits until the job is done. `--home DIR` selects the directory for identity and requester state.

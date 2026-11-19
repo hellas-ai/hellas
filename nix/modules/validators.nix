@@ -276,6 +276,11 @@ let
           default = null;
           description = "Optional home base for this cluster. Each validator uses a distinct nodeN subdirectory; null uses its systemd StateDirectory.";
         };
+        chain = mkOption {
+          type = types.nullOr (types.enum [ "devnet" ]);
+          default = null;
+          description = "Compiled chain; null uses the binary default.";
+        };
         chainConfig = mkOption {
           type = types.nullOr (types.strMatching "/.*");
           default = null;
@@ -321,6 +326,10 @@ in
         {
           assertion = validator.genesis == null || validator.networkId == null;
           message = "services.hellas-chain-validators.${name}.networkId cannot be combined with genesis.";
+        }
+        {
+          assertion = validator.chain == null || validator.chainConfig == null;
+          message = "services.hellas-chain-validators.${name}.chain and chainConfig are mutually exclusive.";
         }
         {
           assertion =
@@ -435,9 +444,11 @@ in
                   "${validator.home}/node${toString index}";
               usesRuntimeConfig = validator.runtimeConfigFiles != [ ];
               configFile = if usesRuntimeConfig then "%d/validator-config" else mkConfigFile validator index;
-              chainArgs = optionalString (
-                validator.chainConfig != null
-              ) " --chain-config ${escapeShellArg validator.chainConfig}";
+              chainArgs =
+                optionalString (validator.chain != null) " --chain ${escapeShellArg validator.chain}"
+                + optionalString (
+                  validator.chainConfig != null
+                ) " --chain-config ${escapeShellArg validator.chainConfig}";
             in
             {
               name = serviceName;

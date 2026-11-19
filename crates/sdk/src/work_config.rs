@@ -7,7 +7,7 @@ mod tests;
 pub use error::WorkConfigError;
 type Result<T> = std::result::Result<T, WorkConfigError>;
 use hellas_chain::chain_dir::ChainDir;
-use hellas_chain::genesis::{ChainFile, ChainProfile};
+use hellas_chain::genesis::{ChainProfile, CustomChainFile};
 
 /// One process chain and where its journals live. How often channels are
 /// read and how old a read may be are the channel crate's, derived from
@@ -56,12 +56,12 @@ pub fn load_chain_profile(path: &Path) -> Result<ChainProfile> {
         path: path.to_path_buf(),
         source,
     })?;
-    let file: ChainFile =
+    let file: CustomChainFile =
         serde_json::from_slice(&bytes).map_err(|source| WorkConfigError::Parse {
             path: path.to_path_buf(),
             source,
         })?;
-    Ok(ChainProfile::from_file(file)?)
+    Ok(ChainProfile::custom(file)?)
 }
 
 /// Packs typed funding coins without imposing a provider/client funding policy.

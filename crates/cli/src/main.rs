@@ -42,6 +42,10 @@ fn acts_for_principal(command: &Commands) -> bool {
 #[command(version = option_env!("GIT_REV").unwrap_or(env!("CARGO_PKG_VERSION")))]
 #[command(about = "Hellas node CLI")]
 struct Cli {
+    /// Select a compiled network by name or full network ID.
+    #[arg(long, global = true, conflicts_with = "chain_config")]
+    chain: Option<String>,
+
     /// Complete independently authenticated custom chain profile.
     #[arg(long, global = true, value_name = "FILE")]
     chain_config: Option<PathBuf>,
@@ -271,9 +275,16 @@ async fn async_main() {
         }
     };
     let identity_path = home.join("identity");
-    let selected_chain = match &cli.chain_config {
-        Some(path) => hellas_sdk::work_config::load_chain_profile(path),
-        None => Ok(hellas_chain::genesis::ChainProfile::default()),
+    let selected_chain = if let Some(path) = &cli.chain_config {
+        hellas_sdk::work_config::load_chain_profile(path).map_err(anyhow::Error::from)
+    } else if let Some(name) = &cli.chain {
+        hellas_chain::genesis::Network::parse(name)
+            .map(hellas_chain::genesis::ChainProfile::known)
+            .ok_or_else(|| anyhow::anyhow!("unknown compiled chain {name}"))
+    } else {
+        Ok(hellas_chain::genesis::ChainProfile::known(
+            hellas_chain::genesis::Network::default(),
+        ))
     };
     let selected_chain = match selected_chain {
         Ok(chain) => chain,

@@ -147,6 +147,10 @@ in
           message = "programs.hellas.serve.extraArgs may not override module-managed runtime, content, identity, trust, or configuration flags; use the corresponding option instead.";
         }
         {
+          assertion = cfg.serve.chain == null || cfg.serve.chainConfig == null;
+          message = "programs.hellas.serve.chain and chainConfig are mutually exclusive.";
+        }
+        {
           assertion = lib.all outsideStoreString userEnvironmentStrings;
           message = "programs.hellas.environment string values must not use file: URIs or point into the Nix store; use runtime paths or programs.hellas.serve.environmentFile for runtime data and secrets.";
         }

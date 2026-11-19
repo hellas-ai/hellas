@@ -486,6 +486,13 @@ impl Core {
         )
         .await;
         let genesis = application.genesis_block();
+        if config
+            .chain
+            .known_genesis_payload_pin()
+            .is_some_and(|pin| genesis.digest().0 != pin)
+        {
+            return Err(Error::Config("genesis payload differs from its pin".into()));
+        }
         let owner = application.owner_index();
         let mut plan = SyncPlan::<_, crate::domain::Scheme, Standard<HellasBlock>>::init(
             &context.child("startup"),

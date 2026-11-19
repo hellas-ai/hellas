@@ -226,6 +226,7 @@ rec {
     "--log-file"
     "--config"
     "--port"
+    "--chain"
     "--chain-config"
     "--passkey"
     "--metrics-port"
@@ -235,6 +236,7 @@ rec {
     "--home"
     "--log-file"
     "--config"
+    "--chain"
     "--chain-config"
     "--passkey"
     "--model"
@@ -377,10 +379,15 @@ rec {
         default = "crash";
         description = "Crash survives process crashes; OS crashes or power loss may roll back recent payment and authority commits with no time bound. Power flushes journal commits and content publication.";
       };
+      chain = mkOption {
+        type = types.nullOr (types.enum [ "devnet" ]);
+        default = null;
+        description = "Compiled chain selection; null uses the binary default.";
+      };
       chainConfig = mkOption {
         type = types.nullOr runtimePath;
         default = null;
-        description = "Authenticated chain profile passed as --chain-config.";
+        description = "Authenticated custom chain profile passed as --chain-config.";
       };
       passkey = mkOption {
         type = types.nullOr runtimePath;
@@ -413,10 +420,15 @@ rec {
     (configurationOptions { inherit lib pkgs; })
     // {
       enable = mkEnableOption "Hellas HTTP gateway";
+      chain = mkOption {
+        type = types.nullOr (types.enum [ "devnet" ]);
+        default = null;
+        description = "Compiled chain selection; null uses the binary default.";
+      };
       chainConfig = mkOption {
         type = types.nullOr runtimePath;
         default = null;
-        description = "Authenticated chain profile passed as --chain-config.";
+        description = "Authenticated custom chain profile passed as --chain-config.";
       };
       metricsAddress = mkOption {
         type = types.str;
@@ -503,6 +515,7 @@ rec {
     ]
     ++ optArg "--config" serve.configFile
     ++ lib.optionals (serve.configFile == null) (optArg "--port" serve.port)
+    ++ optArg "--chain" serve.chain
     ++ optArg "--chain-config" serve.chainConfig
     ++ optArg "--passkey" serve.passkey
     ++ lib.optionals (otel.enable && serve.metricsPort != null) [
@@ -537,6 +550,7 @@ rec {
       "--config"
       gateway.configFile
     ]
+    ++ optArg "--chain" gateway.chain
     ++ optArg "--chain-config" gateway.chainConfig
     ++ optArg "--passkey" gateway.passkey
     ++ lib.optionals (otel.enable && gateway.metricsPort != null) [

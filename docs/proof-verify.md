@@ -54,8 +54,8 @@ only after deterministic replay matches the certified state and owner roots.
 
 ## Run the native origin
 
-Give generated genesis an explicit `--network-id` and export the public
-epoch-zero trust from the validator configuration:
+For a local network, give generated genesis a fresh `--network-id` and export
+its epoch-zero trust. A compiled network ID keeps its shipped genesis and trust:
 
 ```sh
 hellas chain validator export-trust --config network/validator-0.toml --genesis network/genesis.json > network/trust.json
@@ -90,9 +90,10 @@ validator and finalization metadata as unverified.
 
 `ProofVerifier::with_genesis(trust, genesis_bytes)` pins the full document;
 `ProofVerifier::with_digest(trust, canonical_digest)` accepts a derived
-light-client pin. CLI commands use the one compiled network by default. `--chain-config FILE`
-supplies an independent local/test profile. Re-genesis replaces the files in
-`crates/genesis/network/` and rebuilds the binary.
+light-client pin. CLI commands default to `Network::Devnet`. `--chain` selects
+a compiled network by name or full network ID; `--chain-config FILE` supplies an independent
+local/test profile. Re-genesis replaces `crates/genesis/networks/devnet/` files
+and rebuilds the binary.
 
 `hellas --chain-config chain.json chain indexer serve --rpc wss://relay.example/ws
 --home /var/lib/hellas/explorer --listen 127.0.0.1:8788` starts the local

@@ -1,5 +1,5 @@
 //! Synthetic documents for tests; no deployed network identity.
-use crate::{ChainFile, ChainProfile, Genesis, TrustDocument, TrustEpoch};
+use crate::{ChainProfile, CustomChainFile, Genesis, TrustDocument, TrustEpoch};
 use sha2::{Digest as _, Sha256};
 
 pub const NETWORK_ID: &str = "test-network";
@@ -10,7 +10,7 @@ pub fn genesis() -> Genesis {
 }
 
 pub fn profile() -> ChainProfile {
-    ChainProfile::from_file(ChainFile {
+    ChainProfile::custom(CustomChainFile {
         trust: TrustDocument {
             schema_version: crate::TRUST_SCHEMA_VERSION,
             network_id: NETWORK_ID.into(),

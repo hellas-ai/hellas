@@ -208,12 +208,12 @@ impl Runtime {
 
     pub(super) fn chain(
         &self,
-        profile: &Option<hellas_chain::genesis::ChainFile>,
+        profile: &Option<hellas_chain::genesis::CustomChainFile>,
     ) -> Result<hellas_chain::chain_dir::ChainDir> {
         match profile {
             Some(profile) => Ok(hellas_chain::chain_dir::ChainDir::prepare(
                 &self.options.home,
-                &hellas_chain::genesis::ChainProfile::from_file(profile.clone())?,
+                &hellas_chain::genesis::ChainProfile::custom(profile.clone())?,
             )?),
             None => Ok(self.options.chain.clone()),
         }

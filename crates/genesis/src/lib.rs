@@ -17,12 +17,6 @@ use serde::{Deserialize, Serialize};
 
 pub const GENESIS_SCHEMA_VERSION: u16 = 1;
 
-/// The single network compiled into this binary.
-pub const NETWORK_JSON: &str = include_str!("../network/genesis.json");
-pub const NETWORK_TRUST_JSON: &str = include_str!("../network/trust.json");
-pub const NETWORK_FAUCET_JSON: &str = include_str!("../network/faucet.json");
-const NETWORK_ROUTES_JSON: &str = include_str!("../network/routes.json");
-
 /// One public development account. Cryptographic consumers validate its key.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -32,6 +26,75 @@ pub struct FaucetAccount {
     pub address: String,
     /// Hex-encoded, big-endian 32-byte P-256 secret scalar.
     pub secret_scalar: String,
+}
+
+/// A network whose identity and routes ship inside the binary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KnownNetwork {
+    pub name: &'static str,
+    pub json: &'static str,
+    pub trust_json: &'static str,
+    pub genesis_payload_hex: &'static str,
+    pub validators_json: &'static str,
+    pub faucet_json: Option<&'static str>,
+}
+
+impl KnownNetwork {
+    /// The full ID is data, so re-genesis never changes a Rust identifier.
+    #[must_use]
+    pub fn id(&self) -> String {
+        serde_json::from_str::<Genesis>(self.json)
+            .expect("compiled genesis parses")
+            .network_id
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
+pub enum Network {
+    #[default]
+    Devnet,
+}
+
+impl Network {
+    pub const ALL: &[Self] = &[Self::Devnet];
+
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        self.network().name
+    }
+
+    #[must_use]
+    pub fn parse(selector: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|network| network.name() == selector || network.network().id() == selector)
+    }
+
+    #[must_use]
+    pub fn network(self) -> &'static KnownNetwork {
+        match self {
+            Self::Devnet => &KnownNetwork {
+                name: "devnet",
+                json: include_str!("../networks/devnet/genesis.json"),
+                trust_json: include_str!("../networks/devnet/trust.json"),
+                genesis_payload_hex: include_str!("../networks/devnet/genesis-payload.hex"),
+                validators_json: include_str!("../networks/devnet/routes.json"),
+                faucet_json: Some(include_str!("../networks/devnet/faucet.json")),
+            },
+        }
+    }
+}
+
+/// Select a compiled network by its CLI name or the ID in its genesis.
+#[must_use]
+pub fn known_network(selector: &str) -> Option<&'static KnownNetwork> {
+    Network::parse(selector).map(Network::network)
+}
+
+#[must_use]
+pub fn known_network_names() -> Vec<&'static str> {
+    Network::ALL.iter().map(|network| network.name()).collect()
 }
 
 const PUBLIC_KEY_HEX_BYTES: usize = 64;
@@ -160,7 +223,7 @@ mod tests;
 mod trust;
 pub use trust::{TRUST_SCHEMA_VERSION, TrustDocument, TrustEpoch, TrustError};
 mod profile;
-pub use profile::{ChainFile, ChainProfile, ChainProfileError};
+pub use profile::{ChainProfile, ChainProfileError, CustomChainFile};
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;

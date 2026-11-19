@@ -14,7 +14,7 @@ use tokio::sync::watch;
 
 pub(super) struct Bound {
     pub port: u16,
-    pub profile: Option<hellas_chain::genesis::ChainFile>,
+    pub profile: Option<hellas_chain::genesis::CustomChainFile>,
     pub endpoint: iroh::Endpoint,
     alpns: Vec<Vec<u8>>,
     open: Arc<ProviderOpen>,
@@ -44,7 +44,7 @@ impl Bound {
     pub async fn prepare(
         core: &Arc<Core>,
         port: u16,
-        profile: &Option<hellas_chain::genesis::ChainFile>,
+        profile: &Option<hellas_chain::genesis::CustomChainFile>,
     ) -> Result<Self> {
         let options = &core.runtime.options;
         let chain = crate::work_config::WorkConfig::from_chain_dir(core.runtime.chain(profile)?)?;

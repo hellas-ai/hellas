@@ -112,8 +112,8 @@ metadata. The client includes the program with every job; a provider may dedupli
 received sources by content ID, but never needs a preinstalled model program.
 Weights remain a separate ordinary content-addressed asset.
 
-The process uses its compiled network. For local networks, `--chain-config FILE`
-supplies an independent profile.
+The process selects a compiled network with `--chain devnet` or supplies an
+independent local profile with `--chain-config FILE`.
 The custom JSON file contains the exact `genesis_json` bytes as a JSON string,
 `trust`, and a nonempty `validators` URL list. The buyer and gateway start
 no chain node. They authenticate remote state against the selected genesis and

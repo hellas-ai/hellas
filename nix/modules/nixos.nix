@@ -292,6 +292,14 @@ in
         message = "services.hellas.extraArgs may not override module-managed runtime, content, identity, trust, or configuration flags; use the corresponding option instead.";
       }
       {
+        assertion = cfg.chain == null || cfg.chainConfig == null;
+        message = "services.hellas.chain and chainConfig are mutually exclusive.";
+      }
+      {
+        assertion = gateway.chain == null || gateway.chainConfig == null;
+        message = "services.hellas.gateway.chain and chainConfig are mutually exclusive.";
+      }
+      {
         assertion = hellas.extraArgsAreSafe lib hellas.protectedGatewayExtraArgs gateway.extraArgs;
         message = "services.hellas.gateway.extraArgs may not override module-managed runtime, content, identity, trust, or configuration flags; use the corresponding option instead.";
       }

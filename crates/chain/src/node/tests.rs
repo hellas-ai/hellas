@@ -83,7 +83,7 @@ impl Fixture {
         trust.network_id = genesis.network_id.clone();
         trust.genesis_sha256 = hex::encode(Sha256::hash(genesis_json.as_bytes()));
         trust.epochs[0].threshold_identity = hex::encode(committee.assembler.identity().encode());
-        let profile = hellas_genesis::ChainProfile::from_file(hellas_genesis::ChainFile {
+        let profile = hellas_genesis::ChainProfile::custom(hellas_genesis::CustomChainFile {
             trust,
             validators: vec!["ws://unused.invalid".into()],
             genesis_json,
@@ -1751,7 +1751,7 @@ fn nonindexed_full_node_refuses_an_expiring_threshold_key() {
     next.start_height = 2;
     next.end_height = None;
     trust.epochs.push(next);
-    let profile = hellas_genesis::ChainProfile::from_file(hellas_genesis::ChainFile {
+    let profile = hellas_genesis::ChainProfile::custom(hellas_genesis::CustomChainFile {
         trust,
         validators: vec!["ws://127.0.0.1:9080".into()],
         genesis_json,

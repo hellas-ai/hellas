@@ -1,5 +1,5 @@
 //! Native storage paths for one validated chain profile.
-use crate::genesis::{ChainFile, ChainProfile, ChainProfileError};
+use crate::genesis::{ChainProfile, ChainProfileError, CustomChainFile};
 use hellas_private::StoreLocation;
 use std::{io, path::Path};
 
@@ -67,8 +67,9 @@ impl ChainDir {
                         error
                     }
                 })?;
-                let file: ChainFile = serde_json::from_slice(&bytes).map_err(invalid_profile)?;
-                let profile = ChainProfile::from_file(file).map_err(invalid_profile)?;
+                let file: CustomChainFile =
+                    serde_json::from_slice(&bytes).map_err(invalid_profile)?;
+                let profile = ChainProfile::custom(file).map_err(invalid_profile)?;
                 if root.file_name() != Some(std::ffi::OsStr::new(&profile.state_key())) {
                     return Err(invalid_profile(format!(
                         "chain profile does not match directory {}",
@@ -166,7 +167,7 @@ fn directories(root: &StoreLocation) -> io::Result<Vec<StoreLocation>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::genesis::{ChainFile, Genesis};
+    use crate::genesis::{CustomChainFile, Genesis};
     use hellas_private::Durability::Crash;
     use sha2::{Digest as _, Sha256};
 
@@ -201,7 +202,7 @@ mod tests {
         swapped.genesis_json = serde_json::to_string(&genesis).unwrap();
         swapped.trust.network_id = genesis.network_id;
         swapped.trust.genesis_sha256 = hex::encode(Sha256::digest(&swapped.genesis_json));
-        let swapped = ChainProfile::from_file(swapped).unwrap();
+        let swapped = ChainProfile::custom(swapped).unwrap();
         assert_ne!(swapped.state_key(), profile.state_key());
         std::fs::write(&file, serde_json::to_vec(&swapped.to_file()).unwrap()).unwrap();
         assert!(
@@ -245,7 +246,7 @@ mod tests {
         trust.network_id = genesis.network_id.clone();
         trust.genesis_sha256 = hex::encode(Sha256::digest(&genesis_json));
         let make = |trust| {
-            ChainProfile::from_file(ChainFile {
+            ChainProfile::custom(CustomChainFile {
                 trust,
                 validators: vec!["ws://127.0.0.1:9080".into()],
                 genesis_json: genesis_json.clone(),

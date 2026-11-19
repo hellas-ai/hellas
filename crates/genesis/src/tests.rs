@@ -1,15 +1,45 @@
 use super::*;
 
 #[test]
-fn compiled_network_trust_binds_the_genesis_bytes() {
+fn compiled_networks_have_distinct_identities_and_bound_documents() {
     use sha2::{Digest as _, Sha256};
-    let profile = ChainProfile::default();
-    assert_eq!(profile.genesis_json(), NETWORK_JSON);
-    assert_eq!(profile.network_id(), profile.genesis().network_id);
+    let mut names = BTreeSet::new();
+    let mut ids = BTreeSet::new();
+    let mut validators = BTreeSet::new();
+    let mut accounts = BTreeSet::new();
+    for &network in Network::ALL {
+        let data = network.network();
+        let profile = ChainProfile::known(network);
+        profile.genesis().validate().unwrap();
+        profile.trust().validate().unwrap();
+        assert!(names.insert(network.name()));
+        assert!(ids.insert(data.id()));
+        assert_eq!(profile.genesis_json(), data.json);
+        assert_eq!(profile.network_id(), profile.genesis().network_id);
+        assert_eq!(
+            profile.trust().genesis_sha256,
+            hex::encode(Sha256::digest(data.json))
+        );
+        for selector in [network.name(), &data.id()] {
+            assert_eq!(Network::parse(selector), Some(network));
+            assert_eq!(known_network(selector), Some(data));
+        }
+        assert!(profile.known_genesis_payload_pin().is_some());
+        let rebound = ChainProfile::custom(profile.to_file()).unwrap();
+        assert_eq!(rebound.known_chain(), Some(network));
+        assert_eq!(rebound.state_key(), profile.state_key());
+        for validator in &profile.genesis().validators {
+            assert!(validators.insert(validator.public_key.clone()));
+        }
+        for allocation in &profile.genesis().allocations {
+            assert!(accounts.insert(allocation.address.clone()));
+        }
+    }
     assert_eq!(
-        profile.trust().genesis_sha256,
-        hex::encode(Sha256::digest(NETWORK_JSON))
+        known_network_names().into_iter().collect::<BTreeSet<_>>(),
+        names
     );
+    assert_eq!(Network::parse("unknown-network"), None);
 }
 
 fn fixture() -> Genesis {
