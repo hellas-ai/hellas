@@ -3,12 +3,15 @@ use hellas_auth::test_support::{
     Actor,
     actors::{AGENT, OPERATOR, STRANGER},
 };
+use hellas_authority::node::NodeCoordinator;
+use hellas_authority::work_store::grant::NodeStore;
 use hellas_channel::model::offer::{SignedPaidOffer, request_digest};
 use hellas_channel::work::{
     BackendFault, WorkBackend,
     admission::{CapacityDomain, WorkPermit},
 };
 use hellas_channel::work_store::{Role, SetupAbort, SetupEnd, SetupStore};
+use hellas_kernel::{Funding, List};
 use hellas_private::StoreLocation;
 use hellas_rpc::pb::work::{
     ExchangeSetupRequest, OfferRefusalCode, RequestOfferRequest, RequestOfferResponse,

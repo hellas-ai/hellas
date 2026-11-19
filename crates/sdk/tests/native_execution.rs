@@ -42,8 +42,6 @@ use std::time::Duration;
 use hellas_auth::authority::{self as auth, UnixMillis};
 use hellas_auth::test_support::actors::{FRIEND, ROOT};
 use hellas_auth::{Digest, ProducerSigningKey};
-use hellas_authority::node::NodeCoordinator;
-use hellas_authority::work_store::grant::NodeStore;
 use hellas_chain::client::RemoteLightClient;
 use hellas_chain::domain::SettlementKey;
 use hellas_chain::test_support::devnet::{
@@ -56,7 +54,7 @@ use hellas_executor::{
     FetchAdaptorError, FetchAdaptorFactory, FetchAdaptorSession, FetchCall, FetchProjector,
     FetchRequestView, MockFetchProvider, PreparedFetchRequest, ProjectedFetch,
 };
-use hellas_kernel::{CoinId, EdgeValues, Fees, Funding, Key, List, Secp256k1Signer};
+use hellas_kernel::{CoinId, EdgeValues, Fees, Key, Secp256k1Signer};
 use hellas_rpc::output::{OutputEvent, StopReason, TextChannel};
 use hellas_rpc::protocol::invocation::{
     self as invocation, Admission, InvocationPolicy, Limits, PreparedInvocation,
