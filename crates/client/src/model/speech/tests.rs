@@ -80,7 +80,7 @@ async fn converted_mms_and_descriptor_render_the_same_portable_synthesis_job() {
         let evaluator = crate::model::evaluator(dialect);
         let a = ModelPackage::open(&full, &evaluator).await.unwrap();
         let b = ModelPackage::open(&desc, &evaluator).await.unwrap();
-        assert_eq!(a.program().unwrap(), b.program().unwrap());
+        assert_eq!(a.programs().unwrap(), b.programs().unwrap());
         let request = ModelRequest::Speech {
             text: "Hello",
             speed: 1.,

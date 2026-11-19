@@ -431,7 +431,11 @@ async fn compute_is_rendered_for_each_selected_evaluator() {
         stops: &[],
     };
     let (_, mut stream) = execution
-        .compute(&mut choose(&routing, Some("tiny"), None).unwrap(), &request)
+        .compute(
+            &mut choose(&routing, Some("tiny"), None).unwrap(),
+            false,
+            |_| request,
+        )
         .await
         .unwrap();
     assert!(matches!(

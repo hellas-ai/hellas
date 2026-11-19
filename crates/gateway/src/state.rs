@@ -2,7 +2,6 @@
 use super::route::RouteExecution;
 use crate::ComputeEvent;
 use axum::Router;
-use axum::body::Bytes;
 use axum::extract::State;
 use axum::routing::{MethodRouter, post};
 use hellas_adaptors::anthropic::AnthropicMessagesAdaptor;
@@ -15,7 +14,6 @@ use hellas_adaptors::{
     WireAdaptor,
 };
 use hellas_presentation::TextPresentation;
-use hellas_rpc::provenance::ExecutionProvenance;
 use std::sync::Arc;
 
 /// Reject controls the native executor cannot enforce before creating a job.
@@ -106,10 +104,10 @@ where
     post(
         move |State(state): State<Arc<TextState>>,
               axum::Extension(selection): axum::Extension<crate::routing::Selection>,
-              body: Bytes| async move {
+              axum::Extension(body): axum::Extension<serde_json::Value>| async move {
             let backend = super::backend::GatewayBackend::new(state, selection);
             let context = super::dispatch::render_context(id);
-            super::dispatch::serve(adaptor, surface, context, backend, &body).await
+            super::dispatch::serve(adaptor, surface, context, backend, body).await
         },
     )
 }
@@ -126,9 +124,6 @@ pub(super) type TextEvents = crate::WorkOutputStream<ComputeEvent>;
 pub(super) struct PreparedGeneration {
     pub(super) chat: Option<hellas_presentation::chat::ChatTurn>,
     pub(super) prepared: TextEvents,
-    /// The job identity the provider accepted, once [`Self::accept`] has
-    /// seen it; `None` for a source that reports no acceptance.
-    pub(super) provenance: Option<ExecutionProvenance>,
     pub(super) prompt_tokens: u32,
     pub(super) presentation: Arc<TextPresentation>,
 }
@@ -172,46 +167,28 @@ impl TextState {
         let chat = self.presentation.prepare(canonical).map_err(|err| {
             BackendError::rejected(format!("Failed to prepare model input: {err:#}"))
         })?;
-        self.prepare_ids(chat.input_ids, max_tokens, Some(chat.turn), selection)
-            .await
-    }
-
-    /// Render a prompt into a text job and start it on the work source.
-    async fn prepare_ids(
-        &self,
-        input_ids: Vec<u32>,
-        max_tokens: u32,
-        chat: Option<hellas_presentation::chat::ChatTurn>,
-        selection: &mut crate::routing::Selection,
-    ) -> Result<PreparedGeneration, BackendError> {
-        let prompt_tokens = input_ids.len() as u32;
-        let prompt = input_ids.into_iter().map(u64::from).collect::<Vec<_>>();
+        let prompt_tokens = chat.input_ids.len() as u32;
+        let prompt = chat
+            .input_ids
+            .into_iter()
+            .map(u64::from)
+            .collect::<Vec<_>>();
         let (_, prepared) = self
             .execution
-            .compute(
-                selection,
-                &hellas_client::model::ModelRequest::Text {
+            .compute(selection, true, |steps| {
+                hellas_client::model::ModelRequest::Text {
                     prompt_ids: &prompt,
-                    max_new: u64::from(max_tokens),
+                    max_new: u64::from(max_tokens).min(steps.unwrap_or(u64::MAX)),
                     stops: &[],
-                },
-            )
+                }
+            })
             .await?;
         Ok(PreparedGeneration {
-            chat,
+            chat: Some(chat.turn),
             prepared,
-            provenance: None,
             prompt_tokens,
             presentation: self.presentation.clone(),
         })
-    }
-}
-
-impl PreparedGeneration {
-    /// Wait for acceptance so its identity can head the response.
-    pub(super) async fn accept(&mut self) -> Result<(), BackendError> {
-        self.provenance = crate::accepted(&mut self.prepared).await;
-        Ok(())
     }
 }
 

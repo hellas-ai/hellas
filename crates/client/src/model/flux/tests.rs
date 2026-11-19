@@ -119,6 +119,16 @@ async fn image_job_bundles_three_stages_and_passes_state_in_slots() {
     .unwrap();
     assert_eq!(job.environment.sources.len(), 1);
     assert_eq!(job.environment.assets.len(), 3);
+    let programs = package.programs().unwrap();
+    assert_eq!(programs.len(), 2);
+    assert_ne!(programs[0].manifest, programs[1].manifest);
+    let manifest = job.environment.manifest(&programs[0].evaluator).unwrap();
+    let admission = hellas_rpc::protocol::invocation::Admission::compute_only(&programs).unwrap();
+    assert!(admission.admits_manifest(&manifest));
+    let mut unrelated = job.environment.clone();
+    unrelated.sources = vec![ContentRef::for_bytes(b"unrelated source")];
+    assert!(!admission.admits_manifest(&unrelated.manifest(&programs[0].evaluator).unwrap()));
+
     for asset in &job.environment.assets {
         assert!(
             hellas_channel::content::read(
@@ -207,6 +217,7 @@ async fn image_bounds_are_checked_before_rendering_or_allocating_noise() {
         (usize::MAX, 16, 1),
         (16, 16, 0),
         (16, 16, MAX_STEPS + 1),
+        (16, 16, 2), // valid dimensions and steps, outside the package's variants
     ] {
         assert!(
             model
@@ -244,7 +255,7 @@ async fn image_bounds_are_checked_before_rendering_or_allocating_noise() {
 #[tokio::test]
 async fn tokenizer_ids_outside_the_model_vocabulary_are_refused() {
     let directory = tempfile::tempdir().unwrap();
-    for name in METADATA.into_iter().chain(["assets.json"]) {
+    for name in METADATA.into_iter().chain(["assets.json", VARIANTS_FILE]) {
         let target = directory.path().join(name);
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
         std::fs::copy(fixture().join(name), target).unwrap();

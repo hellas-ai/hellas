@@ -242,11 +242,12 @@ assets (`text.bin`, `denoise.bin`, `vae.bin`), plus client metadata and a
 tokenizer. Text norms and VAE weights use F32; other weights use BF16, matching
 catena-models. A provider adds the package with `route add /absolute/path/klein`, or
 uses Jobs pins in its content store; see the
-[content store guide](../crates/store/README.md). An image program depends on
-each request's size and steps, so `hellas program` prints no manifest for it: a
-provider admits image jobs only through paid terms or grants that admit those
-exact programs, or explicitly admit arbitrary programs. Sharing the latter
-requires `share --knowingly-unsafe`.
+[content store guide](../crates/store/README.md). The package's default image
+variant is 512×512 with four steps. To select other variants, put an explicit
+list of 1–64 unique `{ "width": 512, "height": 512, "steps": 4 }` entries in
+`klein/variants.json` as a JSON array. Keep it with the package metadata on both
+client and provider. `hellas program klein --backend EVALUATOR` prints one ID
+per variant. Grants derived from a package pin exactly those manifests.
 The client needs the package's JSON files; it does not upload the weights.
 For 512×512 images, the provider must admit a 3 MiB output; allow 2 MiB of
 uploads for the program, token IDs and noise. Set its execution budget for
@@ -275,8 +276,8 @@ curl http://127.0.0.1:8080/v1/images/generations \
 
 The response contains `data[0].b64_json` and signed evidence in `hellas`.
 The model name is the package directory name. Width and height must each be
-multiples of 16 from 16 through 512; steps must be 1–50. Defaults are 512×512,
-four steps and seed zero. The API accepts one image (`n: 1`) in `b64_json`
+multiples of 16 from 16 through 512 and steps must be 1–50. Requests must match
+a package variant. Request defaults are 512×512, four steps and seed zero. The API accepts one image (`n: 1`) in `b64_json`
 format; unsupported fields are rejected before work starts.
 
 ## Fetch jobs

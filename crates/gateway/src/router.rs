@@ -1,7 +1,7 @@
 //! One exact route table for all HTTP presentations.
 use crate::{
-    GatewayResult, Presentation, Route, WorkExecutionBackend, affinity::Hints, path_error,
-    route::RouteExecution, routing::Routing,
+    GatewayResult, Presentation, Route, WorkExecutionBackend, path_error, route::RouteExecution,
+    routing::Routing,
 };
 use axum::{
     Json, Router, body::Body, extract::Request, http::StatusCode, response::Response, routing::get,
@@ -118,11 +118,11 @@ pub async fn with_models(
                             .await?,
                     )),
                     hellas_client::model::ModelKind::Transcription => {
-                        crate::audio::router(model.clone(), *max_tokens as usize, execution).await?
+                        crate::audio::router(*max_tokens as usize, execution)?
                     }
                     hellas_client::model::ModelKind::Speech => unreachable!("validated route"),
                     hellas_client::model::ModelKind::Image => {
-                        crate::image::router(model.clone(), execution).await?
+                        crate::image::router(model.clone(), execution)?
                     }
                 },
                 Presentation::Responses {
@@ -167,10 +167,30 @@ pub async fn with_models(
         };
         presentations.push(router);
     }
+    let decoders: BTreeMap<_, crate::pipeline::Decode> = routing
+        .routes
+        .iter()
+        .filter_map(|route| match route.presentation {
+            Presentation::Speech { .. } => Some((
+                crate::speech::PATH,
+                crate::speech::decode as crate::pipeline::Decode,
+            )),
+            Presentation::Model {
+                modality: hellas_client::model::ModelKind::Transcription,
+                ..
+            } => Some((
+                crate::audio::PATH,
+                crate::audio::decode as crate::pipeline::Decode,
+            )),
+            _ => None,
+        })
+        .collect();
+    let decoders = Arc::new(decoders);
     let handler = move |request| {
         dispatch(
             routing.clone(),
             presentations.clone(),
+            decoders.clone(),
             jobs.clone(),
             request,
         )
@@ -193,6 +213,7 @@ pub async fn with_models(
 async fn dispatch(
     routing: Arc<Routing>,
     presentations: Vec<Router>,
+    decoders: Arc<BTreeMap<&'static str, crate::pipeline::Decode>>,
     jobs: Arc<crate::jobs::Jobs>,
     request: Request,
 ) -> Response {
@@ -221,47 +242,21 @@ async fn dispatch(
             );
         }
     };
-    let hints = if path == crate::speech::PATH
-        && parts.method == axum::http::Method::POST
-        && routing
-            .routes
-            .iter()
-            .any(|route| matches!(route.presentation, Presentation::Speech { .. }))
+    let hints = match decoders
+        .get(path.as_str())
+        .filter(|_| parts.method == axum::http::Method::POST)
     {
-        let (speech, hints) = match crate::speech::parse(&parts, &body) {
-            Ok(request) => request,
-            Err(message) => return path_error(&path, StatusCode::BAD_REQUEST, message),
-        };
-        parts.extensions.insert(speech);
-        hints
-    } else if path == crate::audio::PATH
-        && routing.routes.iter().any(|route| {
-            matches!(
-                &route.presentation,
-                Presentation::Model {
-                    modality: hellas_client::model::ModelKind::Transcription,
-                    ..
-                }
-            )
-        })
-    {
-        match crate::audio::multipart_model(Request::from_parts(
-            parts.clone(),
-            Body::from(body.clone()),
-        ))
-        .await
-        {
-            Ok(model) => Hints {
-                model: Some(model),
-                ..Default::default()
-            },
-            Err(response) => return *response,
-        }
-    } else {
-        match Hints::read_optional(&parts.headers, &body) {
+        Some(decode) => match decode(&mut parts, &body).await {
             Ok(hints) => hints,
+            Err(response) => return *response,
+        },
+        None => match crate::affinity::Hints::read(&parts.headers, &body) {
+            Ok((hints, value)) => {
+                parts.extensions.insert(value);
+                hints
+            }
             Err(message) => return path_error(&path, StatusCode::BAD_REQUEST, message),
-        }
+        },
     };
     let connection = parts
         .extensions

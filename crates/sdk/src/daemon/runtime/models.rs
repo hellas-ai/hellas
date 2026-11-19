@@ -1,7 +1,7 @@
 use super::{Result, Runtime};
 use crate::daemon_config::{BackendKind, Document, ResourceKind};
 use hellas_client::model::ModelPackage;
-use hellas_gateway::{BackendInfo, Presentation, router::Models};
+use hellas_gateway::{BackendInfo, router::Models};
 use hellas_rpc::ContentRef;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -75,10 +75,7 @@ impl Runtime {
                     .routes
                     .iter()
                     .filter(|route| route.backends.contains(id))
-                    .filter_map(|route| match &route.presentation {
-                        Presentation::Model { package, .. } => Some(package.clone()),
-                        _ => None,
-                    }),
+                    .filter_map(|route| route.model_package().map(|(_, package)| package.clone())),
             );
             paths.extend(
                 document

@@ -50,6 +50,7 @@ impl ModelKind {
     }
 }
 
+#[derive(Clone, Copy)]
 pub enum ModelRequest<'a> {
     Speech {
         text: &'a str,
@@ -186,23 +187,27 @@ impl ModelPackage {
             },
         })
     }
-    /// The program id (evaluator and manifest) every job this model renders runs, which a
-    /// provider admits with `serve --program`. An image program depends on
-    /// each request's size and steps, so an image model has none.
-    pub fn program(&self) -> Result<hellas_rpc::protocol::invocation::compute::ProgramId> {
+    /// The exact programs this package can render for its evaluator.
+    pub fn programs(&self) -> Result<Vec<hellas_rpc::protocol::invocation::compute::ProgramId>> {
         let environment = match &self.family {
             Family::Whisper(model) => model.environment(),
             Family::Speech(model) => model.environment(),
             Family::Qwen3(model) => model.environment(),
-            Family::Flux(_) => bail!("an image program depends on each request's size and steps"),
+            Family::Flux(model) => return model.programs(&self.evaluator),
         };
-        Ok(hellas_rpc::protocol::invocation::compute::ProgramId {
+        Ok(vec![hellas_rpc::protocol::invocation::compute::ProgramId {
             evaluator: self.evaluator.clone(),
             manifest: environment.manifest(&self.evaluator)?.content_id(),
-        })
+        }])
     }
-    pub fn is_image(&self) -> bool {
-        matches!(self.family, Family::Flux(_))
+
+    pub fn kind(&self) -> ModelKind {
+        match self.family {
+            Family::Whisper(_) => ModelKind::Transcription,
+            Family::Speech(_) => ModelKind::Speech,
+            Family::Qwen3(_) => ModelKind::Text,
+            Family::Flux(_) => ModelKind::Image,
+        }
     }
     /// Maximum generated tokens when this is a transcription model.
     pub fn transcription_capacity(&self) -> Option<usize> {

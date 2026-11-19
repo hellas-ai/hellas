@@ -54,16 +54,9 @@ impl Hints {
         Ok(session)
     }
 
-    pub fn read_optional(headers: &HeaderMap, body: &[u8]) -> Result<Self, &'static str> {
+    pub fn read(headers: &HeaderMap, body: &[u8]) -> Result<(Self, Value), &'static str> {
         let bytes = decoded_body(headers, body)?;
-        let json_content = headers
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| {
-                v.split(';')
-                    .next()
-                    .is_some_and(|v| v.trim().eq_ignore_ascii_case("application/json"))
-            });
+        let json_content = json_content_type(headers);
         let looks_json = bytes
             .iter()
             .copied()
@@ -105,15 +98,34 @@ impl Hints {
             session = field(value.get("prompt_cache_key"))?.map(|v| ("prompt-cache".into(), v));
         }
         let conversation = value.get("conversation");
-        Ok(Self {
-            model: hellas_authority::model::http_usage::request_model(&value)?.map(str::to_owned),
-            session,
-            previous: field(value.get("previous_response_id"))?,
-            conversation: field(
-                conversation.and_then(|v| if v.is_object() { v.get("id") } else { Some(v) }),
-            )?,
-        })
+        Ok((
+            Self {
+                model: hellas_authority::model::http_usage::request_model(&value)?
+                    .map(str::to_owned),
+                session,
+                previous: field(value.get("previous_response_id"))?,
+                conversation: field(
+                    conversation.and_then(|v| if v.is_object() { v.get("id") } else { Some(v) }),
+                )?,
+            },
+            value,
+        ))
     }
+}
+
+pub(super) fn json_content_type(headers: &HeaderMap) -> bool {
+    headers
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .and_then(|media| media.trim().split_once('/'))
+        .is_some_and(|(kind, subtype)| {
+            kind.eq_ignore_ascii_case("application")
+                && (subtype.eq_ignore_ascii_case("json")
+                    || subtype.rsplit_once('+').is_some_and(|(name, suffix)| {
+                        !name.is_empty() && suffix.eq_ignore_ascii_case("json")
+                    }))
+        })
 }
 
 pub(super) fn family(path: &str) -> &str {
@@ -138,7 +150,7 @@ mod tests {
             "content-encoding".parse().unwrap(),
             HeaderValue::from_static("gzip"),
         )]);
-        let hints = Hints::read_optional(&headers, &wire).unwrap();
+        let (hints, _) = Hints::read(&headers, &wire).unwrap();
         assert_eq!(hints.model.as_deref(), Some("k3"));
         assert_eq!(hints.session.unwrap().1, "kimi-session");
         let compressed = zstd::stream::encode_all(body.as_slice(), 1).unwrap();
@@ -147,8 +159,9 @@ mod tests {
             HeaderValue::from_static("zstd"),
         )]);
         assert_eq!(
-            Hints::read_optional(&headers, &compressed)
+            Hints::read(&headers, &compressed)
                 .unwrap()
+                .0
                 .model
                 .as_deref(),
             Some("k3")
@@ -156,27 +169,24 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("session-id", HeaderValue::from_static("codex-session"));
         assert_eq!(
-            Hints::read_optional(&headers, body)
-                .unwrap()
-                .session
-                .unwrap()
-                .1,
+            Hints::read(&headers, body).unwrap().0.session.unwrap().1,
             "codex-session"
         );
         let body=serde_json::to_vec(&serde_json::json!({"model":"claude", "metadata":{"user_id":"{\"device_id\":\"not-a-session\",\"session_id\":\"claude-session\"}"}})).unwrap();
         assert_eq!(
-            Hints::read_optional(&HeaderMap::new(), &body)
+            Hints::read(&HeaderMap::new(), &body)
                 .unwrap()
+                .0
                 .session
                 .unwrap()
                 .1,
             "claude-session"
         );
         headers.append("session-id", HeaderValue::from_static("ambiguous"));
-        assert!(Hints::read_optional(&headers, &body).is_err());
-        assert!(Hints::read_optional(&HeaderMap::new(), br#"{"model":4}"#).is_err());
+        assert!(Hints::read(&headers, &body).is_err());
+        assert!(Hints::read(&HeaderMap::new(), br#"{"model":4}"#).is_err());
         assert!(
-            Hints::read_optional(
+            Hints::read(
                 &HeaderMap::new(),
                 br#"{"model":"k3","previous_response_id":{}}"#
             )
