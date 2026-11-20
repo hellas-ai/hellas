@@ -39,7 +39,7 @@ fn route(mock: &Mock, path: &str, method: &str) -> Route {
                         path: path.into(),
                         method: method.into(),
                         url: format!("{}{path}", mock.origin),
-                        tls: mock.tls.clone(),
+                        tls: Some(mock.tls.clone()),
                         headers: vec![],
                         max_response_bytes: hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES,
                         models: None,

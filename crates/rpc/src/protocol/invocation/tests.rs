@@ -242,14 +242,14 @@ fn prepared_for(
         method: "GET".into(),
         headers: vec![],
         body_base64: String::new(),
-        tls: crate::http_fetch::HttpTls {
+        tls: Some(crate::http_fetch::HttpTls {
             roots: crate::http_fetch::HttpTrustRoots::WebPki,
             spki_sha256: if pinned {
                 vec!["11".repeat(32)]
             } else {
                 vec![]
             },
-        },
+        }),
         max_response_bytes: 64,
     };
     let events = crate::fetch::build_input_events_with_retention(

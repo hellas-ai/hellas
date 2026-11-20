@@ -148,6 +148,7 @@ impl Mock {
                 service: "openai".into(),
                 method: "responses".into(),
                 upstream: Upstream::Http {
+                    plain_http_hosts: vec![],
                     allowed_hosts: vec!["localhost".into()],
                     allow_private_addresses: true,
                     credentials: vec![Credential {

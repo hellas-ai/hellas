@@ -1,4 +1,4 @@
-# Caller-signed HTTPS Fetch
+# Caller-signed HTTP Fetch
 
 The `http` environment signs raw HTTP metadata and bytes, allowing OpenAI,
 Anthropic, Google, Kimi or another API without adding a vendor to the app.
@@ -36,11 +36,30 @@ at least one must match when supplied. Pins add constraints to chain validation.
 Provider credentials require the exact trust roots configured by the operator;
 a caller cannot substitute different roots.
 
+Plain HTTP requests omit `tls`. It must be present exactly for HTTPS; supplying
+it on an HTTP URL is an error. HTTPS request bytes and signed transcripts are
+unchanged. The signed request records the HTTP URL and absence of TLS, so a
+verifier can see that the fetch has no transport authenticity. Plain HTTP relies
+on the provider's honesty and its network path; use it only on networks the
+operator controls.
+
+Providers deny plaintext by default. To enable it, put each exact canonical
+host in `plain_http_hosts` (no ports, suffixes or wildcards). The normal
+`allowed_hosts` and DNS address checks still apply. A private service also needs
+`allow_private_addresses: true` and its host in `allowed_hosts`. HTTP and HTTPS
+use separate connection pools. Provider credential origins remain HTTPS-only,
+and credential headers on plaintext requests are rejected with
+`credentials require HTTPS`.
+
+Gateway routes resolve omitted TLS settings when validated: HTTPS uses public
+WebPKI and HTTP uses no TLS. Explicit TLS settings on an HTTP route are rejected.
+
 The operator configures credential scopes separately:
 
 ```json
 {
   "allowed_hosts": [],
+  "plain_http_hosts": [],
   "allow_private_addresses": false,
   "credentials": [
     {

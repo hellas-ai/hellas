@@ -1,4 +1,4 @@
-//! Caller-signed HTTPS request vocabulary. Credential selection and secret values
+//! Caller-signed HTTP request vocabulary. Credential selection and secret values
 //! stay with the provider.
 
 pub mod path;
@@ -100,7 +100,8 @@ pub struct HttpFetchRequest {
     pub headers: Vec<(String, String)>,
     #[serde(default)]
     pub body_base64: String,
-    pub tls: HttpTls,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<HttpTls>,
     pub max_response_bytes: u32,
 }
 
@@ -124,7 +125,7 @@ pub enum HttpTrustRoots {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("invalid HTTPS Fetch request: {0}")]
+#[error("invalid HTTP Fetch request: {0}")]
 pub struct HttpRequestError(pub &'static str);
 
 impl HttpFetchRequest {
@@ -139,7 +140,13 @@ impl HttpFetchRequest {
     }
 
     pub fn validate(&self) -> Result<(), HttpRequestError> {
-        self.parsed_url()?;
+        let url = self.parsed_url()?;
+        if (url.scheme() == "https") != self.tls.is_some() {
+            return Err(HttpRequestError("`tls` must be present exactly for HTTPS"));
+        }
+        if url.scheme() == "http" && self.headers.iter().any(|(name, _)| credential_header(name)) {
+            return Err(HttpRequestError("credentials require HTTPS"));
+        }
         if !matches!(
             self.method.as_str(),
             "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS"
@@ -151,7 +158,10 @@ impl HttpFetchRequest {
             return Err(HttpRequestError("response byte limit"));
         }
         self.body()?;
-        self.tls.validate()
+        if let Some(tls) = &self.tls {
+            tls.validate()?;
+        }
+        Ok(())
     }
 
     pub fn parsed_url(&self) -> Result<url::Url, HttpRequestError> {
@@ -159,14 +169,14 @@ impl HttpFetchRequest {
             return Err(HttpRequestError("URL length"));
         }
         let url = url::Url::parse(&self.url).map_err(|_| HttpRequestError("URL"))?;
-        if url.scheme() != "https"
+        if !matches!(url.scheme(), "https" | "http")
             || url.host_str().is_none()
             || !url.username().is_empty()
             || url.password().is_some()
             || url.fragment().is_some()
         {
             return Err(HttpRequestError(
-                "URL must be HTTPS without userinfo or fragment",
+                "URL must be HTTP or HTTPS without userinfo or fragment",
             ));
         }
         Ok(url)
@@ -355,13 +365,43 @@ mod tests {
             method: "POST".into(),
             headers: vec![],
             body_base64: "e30=".into(),
-            tls: HttpTls {
+            tls: Some(HttpTls {
                 roots: HttpTrustRoots::WebPki,
                 spki_sha256: vec![],
-            },
+            }),
             max_response_bytes: 3,
         }
     }
+    #[test]
+    fn transport_is_explicit_and_https_bytes_are_unchanged() {
+        let mut request = request();
+        let golden = br#"{"url":"https://example.com/v1/messages","method":"POST","headers":[],"body_base64":"e30=","tls":{"roots":{"mode":"web_pki"},"spki_sha256":[]},"max_response_bytes":3}"#;
+        assert_eq!(serde_json::to_vec(&request).unwrap(), golden);
+        assert_eq!(HttpFetchRequest::decode(golden).unwrap(), request);
+        request.url = "http://example.com/v1/messages".into();
+        assert_eq!(
+            request.validate().unwrap_err().0,
+            "`tls` must be present exactly for HTTPS"
+        );
+        request.tls = None;
+        let bytes = serde_json::to_vec(&request).unwrap();
+        assert!(!std::str::from_utf8(&bytes).unwrap().contains("\"tls\""));
+        assert_eq!(HttpFetchRequest::decode(&bytes).unwrap(), request);
+        request
+            .headers
+            .push(("authorization".into(), "secret".into()));
+        assert_eq!(
+            request.validate().unwrap_err().0,
+            "credentials require HTTPS"
+        );
+        request.headers.clear();
+        request.url = "https://example.com/v1/messages".into();
+        assert_eq!(
+            request.validate().unwrap_err().0,
+            "`tls` must be present exactly for HTTPS"
+        );
+    }
+
     fn output(events: Vec<HttpResponseEvent>) -> crate::fetch::FetchOutput {
         let key = ProducerSigningKey::from_secret_bytes([1; 32]).unwrap();
         crate::fetch::FetchOutput::from_authenticated_payloads(

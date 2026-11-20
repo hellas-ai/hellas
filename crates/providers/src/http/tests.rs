@@ -148,12 +148,12 @@ async fn server_fixture(
             method: "GET".into(),
             headers: vec![],
             body_base64: String::new(),
-            tls: HttpTls {
+            tls: Some(HttpTls {
                 roots: HttpTrustRoots::Certificates {
                     der_base64: vec![STANDARD.encode(&cert)],
                 },
                 spki_sha256: vec![pin],
-            },
+            }),
             max_response_bytes: 4096,
         },
         calls,
@@ -218,6 +218,7 @@ async fn small_stream_delivery_does_not_wait_for_record_capacity_or_eof() {
 fn provider() -> HttpFetchProvider {
     HttpFetchProvider::new(
         HttpEgressPolicy {
+            plain_http_hosts: vec![],
             allowed_hosts: vec!["localhost".into()],
             allow_private_addresses: true,
         },
@@ -225,6 +226,75 @@ fn provider() -> HttpFetchProvider {
     )
     .unwrap()
 }
+#[tokio::test]
+async fn plaintext_requires_both_host_and_address_permission_and_never_injects_credentials() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let request = HttpFetchRequest {
+        url: format!("http://{address}/resource"),
+        method: "GET".into(),
+        headers: vec![],
+        body_base64: String::new(),
+        tls: None,
+        max_response_bytes: 4096,
+    };
+    let credential = HttpCredential {
+        allowed_origins: vec![format!("https://{address}")],
+        allowed_paths: vec!["/resource".into()],
+        allowed_methods: vec!["GET".into()],
+        trust_roots: HttpTrustRoots::WebPki,
+        header_name: "authorization".into(),
+        header_value: "secret".into(),
+    };
+    for (plain_http_hosts, allowed_hosts, allow_private_addresses) in [
+        (vec![], vec!["127.0.0.1".into()], true),
+        (vec!["localhost".into()], vec!["127.0.0.1".into()], true),
+        (vec!["127.0.0.1".into()], vec!["127.0.0.1".into()], false),
+        (vec!["127.0.0.1".into()], vec!["localhost".into()], true),
+    ] {
+        let provider = HttpFetchProvider::new(
+            HttpEgressPolicy {
+                plain_http_hosts,
+                allowed_hosts,
+                allow_private_addresses,
+            },
+            vec![],
+        )
+        .unwrap();
+        assert!(provider.run(prepared(&request)).await.is_err());
+    }
+    let policy = HttpEgressPolicy {
+        plain_http_hosts: vec!["127.0.0.1".into()],
+        allowed_hosts: vec!["127.0.0.1".into()],
+        allow_private_addresses: true,
+    };
+    let provider = HttpFetchProvider::new(policy.clone(), vec![credential.clone()]).unwrap();
+    let mut cleartext_credential = credential;
+    cleartext_credential.allowed_origins = vec![format!("http://{address}")];
+    assert!(HttpFetchProvider::new(policy, vec![cleartext_credential]).is_err());
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            request.push(socket.read_u8().await.unwrap());
+        }
+        assert!(
+            !String::from_utf8(request)
+                .unwrap()
+                .contains("authorization")
+        );
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await
+            .unwrap();
+    });
+    assert_eq!(
+        collect(provider.run(prepared(&request)).await.unwrap()).await,
+        b"ok"
+    );
+    server.await.unwrap();
+}
+
 fn prepared(request: &HttpFetchRequest) -> PreparedFetchRequest {
     let call = FetchCall::new(
         "http",
@@ -258,13 +328,14 @@ async fn custom_roots_and_spki_deliver_exact_binary_bytes() {
 async fn wrong_pin_wrong_roots_and_wrong_hostname_send_no_http_request() {
     let (valid, calls, _, task) = server(200, b"ok".to_vec(), None).await;
     let mut wrong_pin = valid.clone();
-    wrong_pin.tls.spki_sha256 = vec!["00".repeat(32)];
+    wrong_pin.tls.as_mut().unwrap().spki_sha256 = vec!["00".repeat(32)];
     let mut wrong_root = valid.clone();
-    wrong_root.tls.roots = HttpTrustRoots::WebPki;
+    wrong_root.tls.as_mut().unwrap().roots = HttpTrustRoots::WebPki;
     let mut wrong_name = valid.clone();
     wrong_name.url = wrong_name.url.replace("localhost", "127.0.0.1");
     let configured = HttpFetchProvider::new(
         HttpEgressPolicy {
+            plain_http_hosts: vec![],
             allowed_hosts: vec!["localhost".into(), "127.0.0.1".into()],
             allow_private_addresses: true,
         },
@@ -361,7 +432,7 @@ async fn client_pools_separate_dns_answers_and_tls_settings_and_evict() {
         "a new DNS answer must not reuse the old address"
     );
     assert_eq!(calls.load(Ordering::SeqCst), 2);
-    request.tls.spki_sha256 = vec!["00".repeat(32)];
+    request.tls.as_mut().unwrap().spki_sha256 = vec!["00".repeat(32)];
     let client = clients.get(&request, &url, vec![address, other]).unwrap();
     assert!(client.get(url.clone()).send().await.is_err());
     assert_eq!(
@@ -370,10 +441,10 @@ async fn client_pools_separate_dns_answers_and_tls_settings_and_evict() {
         "wrong pins must not reuse a verified socket"
     );
     drop(client);
-    request.tls.spki_sha256.clear();
+    request.tls.as_mut().unwrap().spki_sha256.clear();
     // More distinct policies than the cache admits must evict its old pools.
     for index in 0..40 {
-        request.tls.spki_sha256 = vec![format!("{index:064x}")];
+        request.tls.as_mut().unwrap().spki_sha256 = vec![format!("{index:064x}")];
         clients.get(&request, &url, vec![address]).unwrap();
     }
     let before = connections.load(Ordering::SeqCst);
@@ -480,10 +551,10 @@ fn credentials_only_cover_declared_requests_and_reject_changed_roots() {
         method: "POST".into(),
         headers: vec![],
         body_base64: String::new(),
-        tls: HttpTls {
+        tls: Some(HttpTls {
             roots: HttpTrustRoots::WebPki,
             spki_sha256: vec![],
-        },
+        }),
         max_response_bytes: 1024,
     };
     assert!(
@@ -515,7 +586,7 @@ fn credentials_only_cover_declared_requests_and_reject_changed_roots() {
             .is_none()
     );
     request.url = "https://api.example.com/path".into();
-    request.tls.roots = HttpTrustRoots::Certificates { der_base64: vec![] };
+    request.tls.as_mut().unwrap().roots = HttpTrustRoots::Certificates { der_base64: vec![] };
     assert!(
         provider
             .credential(&request, &request.parsed_url().unwrap(),)
@@ -569,11 +640,12 @@ async fn provider_injects_secret_without_disclosing_it_to_the_buyer() {
     let url = request.parsed_url().unwrap();
     let provider = HttpFetchProvider::new(
         HttpEgressPolicy {
+            plain_http_hosts: vec![],
             allowed_hosts: vec!["localhost".into()],
             allow_private_addresses: true,
         },
         vec![HttpCredential {
-            trust_roots: request.tls.roots.clone(),
+            trust_roots: request.tls.as_ref().unwrap().roots.clone(),
             allowed_origins: vec![url.origin().ascii_serialization()],
             allowed_paths: vec!["/resource".into()],
             allowed_methods: vec!["GET".into()],
@@ -583,7 +655,7 @@ async fn provider_injects_secret_without_disclosing_it_to_the_buyer() {
     )
     .unwrap();
     let mut substituted = request.clone();
-    substituted.tls.roots = HttpTrustRoots::WebPki;
+    substituted.tls.as_mut().unwrap().roots = HttpTrustRoots::WebPki;
     assert!(provider.run(prepared(&substituted)).await.is_err());
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     let buyer = ProducerSigningKey::from_secret_bytes([71; 32]).unwrap();
@@ -682,12 +754,13 @@ async fn scope_selection_request(path: &str, expected: Option<&str>) {
         allowed_origins: vec![url.origin().ascii_serialization()],
         allowed_paths: vec![path.into()],
         allowed_methods: vec!["GET".into()],
-        trust_roots: request.tls.roots.clone(),
+        trust_roots: request.tls.as_ref().unwrap().roots.clone(),
         header_name: "authorization".into(),
         header_value: secret.into(),
     };
     let provider = HttpFetchProvider::new(
         HttpEgressPolicy {
+            plain_http_hosts: vec![],
             allowed_hosts: vec!["localhost".into()],
             allow_private_addresses: true,
         },
@@ -780,10 +853,10 @@ fn segment_templates_scope_credentials_without_prefix_or_encoding_escapes() {
             method: "POST".into(),
             headers: vec![],
             body_base64: String::new(),
-            tls: HttpTls {
+            tls: Some(HttpTls {
                 roots: HttpTrustRoots::WebPki,
                 spki_sha256: vec![],
-            },
+            }),
             max_response_bytes: 1024,
         };
         assert_eq!(

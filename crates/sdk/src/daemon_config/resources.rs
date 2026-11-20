@@ -168,13 +168,18 @@ impl Document {
                             continue;
                         };
                         let url = url::Url::parse(&target.route.url)?;
+                        let tls = target
+                            .route
+                            .validate()?
+                            .tls
+                            .ok_or("HTTPS model resources require TLS")?;
                         let https = resource.get_or_insert_with(|| HttpsResource {
                             queries: Default::default(),
                             origin: url.origin().ascii_serialization(),
                             paths: vec![],
                             methods: vec!["POST".into()],
                             account_backed: false,
-                            tls: target.route.tls.clone(),
+                            tls,
                             accounting: AccountingProfile::None,
                             max_output_tokens: 0,
                             max_response_bytes: target.route.max_response_bytes,
