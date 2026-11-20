@@ -939,7 +939,8 @@ fn tracked_recovery_requires_attempt_and_request_bindings() {
                     }
                     "nonce" => wrong["proposal"][field] = serde_json::json!(nonce + 1),
                     "accepted" => {
-                        wrong["proposal"][field]["work"] = serde_json::json!([0x55u8; 32])
+                        wrong["proposal"][field]["work"] =
+                            serde_json::to_value([0x55u8; 32]).unwrap()
                     }
                     "network" => wrong["target"][field] = serde_json::json!("wrong-network"),
                     "provider" => {
