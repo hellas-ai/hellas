@@ -113,7 +113,7 @@ fn http_raw_response_bound_is_deliverable_over_paid_fetch() {
                     let mut body = response.bytes_stream();
                     while let Some(chunk) = body.next().await {
                         received.extend_from_slice(&chunk.unwrap_or_else(|e| {
-                            panic!("size={size} received={} error={e}", received.len())
+                            panic!("size={size} received={} error={e:?}", received.len())
                         }));
                     }
                     assert_eq!(received, audio(size));

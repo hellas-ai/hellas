@@ -658,6 +658,54 @@ async fn a_defaulted_job_is_not_paid_for_as_well() {
 }
 
 #[tokio::test]
+async fn payment_waits_for_observation_before_signing_but_not_for_retransmission() {
+    use hellas_channel::work::ClientService;
+    let fixture = checked_job().await;
+    let mut client = ClientService::new(fixture.client);
+    let observer = client.observer();
+    let (transport, server) = transport_pair();
+    let serving = serve(server, fixture.service.clone());
+    let wire = WorkClientImpl::new(transport);
+    let mut payment = Box::pin(admit_payment(&wire, &mut client, fixture.id));
+    assert!(
+        futures::poll!(payment.as_mut()).is_pending(),
+        "a stale observation must wait before signing or sending payment"
+    );
+    assert_eq!(
+        observer
+            .with_state(|state| state.ledger().credited_cumulative())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_nothing_credited(&fixture.service, "waiting for the client's observer").await;
+    observer.observe_ready(fixture.ready).await.unwrap();
+    assert_eq!(payment.await.unwrap(), PRICE);
+    observer.suspend().await.unwrap();
+    assert_eq!(
+        admit_payment(&wire, &mut client, fixture.id).await.unwrap(),
+        PRICE,
+        "retained certificates do not need another fresh observation"
+    );
+    assert_eq!(
+        observer
+            .with_state(|state| state.ledger().credited_cumulative())
+            .await
+            .unwrap(),
+        PRICE
+    );
+    assert_eq!(
+        fixture
+            .service
+            .with_state(|state| state.ledger().credited_cumulative())
+            .await
+            .unwrap(),
+        PRICE
+    );
+    stop(serving).await;
+}
+
+#[tokio::test]
 async fn stale_observation_blocks_new_money_but_preserves_retransmission() {
     use hellas_channel::work::{ClientChannel as _, ClientService, EndpointError};
     let fixture = checked_job().await;

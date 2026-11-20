@@ -3729,7 +3729,7 @@ where
     T::Error: std::error::Error + Send + Sync + 'static,
     T::Stream: 'static,
 {
-    let request = endpoint.client().await?.pay(work_id).await?;
+    let request = endpoint.payment(work_id).await?;
     let response = client.admit_certificate(request).await?;
     endpoint.client().await?.acknowledged(work_id, &response)
 }

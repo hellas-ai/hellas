@@ -13,6 +13,16 @@ pub trait ClientChannel: Send {
         Output = Result<impl DerefMut<Target = ClientEndpoint> + Send, EndpointError>,
     > + Send;
 
+    /// Commits one payment before its certificate leaves the endpoint.
+    /// Shared clients wait for fresh observation before signing new money.
+    fn payment(
+        &mut self,
+        work_id: Digest,
+    ) -> impl core::future::Future<Output = Result<AdmitCertificateRequest, PaymentError>> + Send
+    {
+        async move { self.client().await?.pay(work_id).await }
+    }
+
     /// Applies one certified read under the channel's driver.
     fn observe(
         &mut self,
@@ -267,6 +277,26 @@ impl ClientChannel for ClientService {
         &mut self,
     ) -> Result<impl DerefMut<Target = ClientEndpoint> + Send, EndpointError> {
         self.observer.endpoint().await
+    }
+
+    async fn payment(&mut self, work_id: Digest) -> Result<AdmitCertificateRequest, PaymentError> {
+        let mut changed = self.observer.changed.subscribe();
+        loop {
+            let mut endpoint = self.observer.endpoint().await?;
+            let waiting = endpoint.state().payment(work_id).is_none()
+                && !endpoint.state().is_closing()
+                && matches!(
+                    endpoint.observation.as_ref().map(Observation::check),
+                    Some(Err(EndpointError::ObservationStale))
+                );
+            if !waiting {
+                return endpoint.pay(work_id).await;
+            }
+            // Result verification can outlast a confirmation. Let the observer
+            // renew it before signing, without holding its journal lock.
+            drop(endpoint);
+            let _ = changed.changed().await;
+        }
     }
 
     async fn observe(&mut self, observed: &ObservedChannel<'_>) -> Result<u64, CatchUpError> {
