@@ -273,8 +273,10 @@ One job runs `flux.encode-text`, `flux.denoise` and `flux.decode-image`, passing
 conditioning and latents in slots. Tokenization and seeded ChaCha8 noise are
 client inputs; PNG encoding is client presentation of the signed RGB buffer.
 
-The gateway exposes the same package with `gateway --model klein` and
-`--access`, `--pay` or `--local` as usual:
+The gateway exposes the same package locally with `gateway --model klein`.
+For a remote contact, use `gateway --model klein@CONTACT`; see the
+[HTTP gateway guide](http-gateway.md). Local paths select local execution
+automatically, without a `--local` gateway flag:
 
 ```sh
 curl http://127.0.0.1:8080/v1/images/generations \

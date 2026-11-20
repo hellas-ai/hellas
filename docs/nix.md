@@ -40,7 +40,7 @@ the URL and bearer and shuts down the gateway when the child exits.
 
 ```sh
 nix run github:hellas-ai/hellas#cli-cuda -- convert-speech facebook/mms-tts-eng@c71de0fe7204c83f1c10820a7d696d0b450048ba -o ./mms
-nix run github:hellas-ai/hellas#cli-cuda -- gateway --model ./mms --local --wrap sh -- -c 'curl -fsS "$OPENAI_BASE_URL/audio/speech" -H "Authorization: Bearer $OPENAI_API_KEY" --json "{\"model\":\"mms\",\"input\":\"Hello from Hellas.\",\"voice\":\"default\",\"response_format\":\"wav\"}" -o tts.wav'
+nix run github:hellas-ai/hellas#cli-cuda -- gateway --model ./mms --wrap sh -- -c 'curl -fsS "$OPENAI_BASE_URL/audio/speech" -H "Authorization: Bearer $OPENAI_API_KEY" --json "{\"model\":\"mms\",\"input\":\"Hello from Hellas.\",\"voice\":\"default\",\"response_format\":\"wav\"}" -o tts.wav'
 ```
 
 ### Image
@@ -52,10 +52,12 @@ nix run github:hellas-ai/hellas#cli-cuda -- image --model ./klein --prompt 'a sm
 
 ### Gateway for all four models
 
-After the preparation commands above, start a shell connected to one gateway:
+Local model paths select local execution automatically; `gateway` does not
+accept `--local`. After the preparation commands above, start a shell connected
+to one gateway:
 
 ```sh
-nix run github:hellas-ai/hellas#cli-cuda -- gateway --model ./qwen3.gguf --model ./whisper-tiny --model ./mms --model ./klein --local --wrap bash
+nix run github:hellas-ai/hellas#cli-cuda -- gateway --model ./qwen3.gguf --model ./whisper-tiny --model ./mms --model ./klein --wrap bash
 ```
 
 Run these in that shell. Model names come from the package filenames. Exit the
