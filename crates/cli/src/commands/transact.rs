@@ -1,6 +1,7 @@
 //! Job folders and helpers share the SDK transaction and its existing journals.
 use anyhow::{Context as _, bail, ensure};
 use clap::Args;
+use futures::TryFutureExt as _;
 use hellas_auth::authority::ResourceId;
 use hellas_rpc::Assurance;
 use hellas_sdk::BackendState;
@@ -496,7 +497,7 @@ async fn run_quoted(
         )
         .await?;
         let result = async {
-            let price = within(deadline, target.backend.quote()).await?;
+            let price = within(deadline, target.backend.quote().err_into()).await?;
             let job = build(price).await?;
             let directory = save.unwrap_or_else(|| {
                 context
@@ -659,7 +660,7 @@ pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
         )
         .await?;
         let result = async {
-            let price = within(deadline, target.backend.quote()).await?;
+            let price = within(deadline, target.backend.quote().err_into()).await?;
             let policy = target.backend.policy().cloned();
             let policy = policy
                 .context("local execution runs Compute jobs; Fetch needs --provider or --access")?;
