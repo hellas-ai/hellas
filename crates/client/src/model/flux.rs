@@ -275,6 +275,12 @@ pub(super) struct Flux {
 }
 impl Flux {
     pub fn open(directory: &Path, dialect: super::GpuDialect) -> Result<Self> {
+        // We use the graph generators directly, so FluxPipeline's backend
+        // validation does not run. Its WMMA kernels require HIP on gfx11.
+        ensure!(
+            dialect == super::GpuDialect::Hip,
+            "Flux WMMA requires HIP on gfx11; CUDA image generation is unsupported"
+        );
         let config = Config::read(directory)?;
         let tensors = config.tensors()?;
         let assets: Vec<NamedAsset> =

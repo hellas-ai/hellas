@@ -230,6 +230,10 @@ The result then also carries an `emitted` output with every emitted value.
 
 ## Image jobs
 
+Flux2 Klein currently requires HIP on a gfx11 GPU. The pinned catena-models
+pipeline uses gfx11 WMMA kernels; CUDA image packages are rejected before
+rendering a job.
+
 Convert the distilled Flux2 Klein 4B snapshot once, pinned to a 40-hex commit.
 The converter fetches the published files it reads at that commit:
 
