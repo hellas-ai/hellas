@@ -224,13 +224,41 @@ impl ExecutionAttempt {
         input: &JobInput,
         price: u64,
     ) -> Result<Self> {
-        Self::open_inner(
-            path.as_path(),
-            Some(path),
+        let job = Job::from_input(price, input.clone())?;
+        Self::reopen_paid(path, job.digest(), input.tracking_digest(), price)
+    }
+
+    /// Reopen an existing paid attempt after its input has been purged.
+    /// Persist `Job::digest()`, `JobInput::tracking_digest()` and the price
+    /// before deleting the input. A missing or mismatched purchase is refused.
+    /// Reconcile through `ExecutionSession::recover` on a retained session;
+    /// reopening neither creates an attempt nor proposes work.
+    pub fn reopen_paid(
+        path: &PaidAttemptPath,
+        job: Digest,
+        input: Digest,
+        price: u64,
+    ) -> Result<Self> {
+        Self::check_path(path.as_path())?;
+        Ok(Self {
+            path: path.as_path().to_owned(),
             input,
-            ExecutionTerms::Paid { price },
-            false,
-        )
+            terms: ExecutionTerms::Paid { price },
+            record: AttemptRecord::Paid(Purchase::open_existing_tracked(path, job, price)?),
+            newly_bound: false,
+        })
+    }
+
+    fn check_path(path: &Path) -> Result<()> {
+        // Keep caller records out of the reserved completion namespace so one
+        // attempt cannot overwrite another attempt's payload or receipt.
+        if path.components().any(|component| {
+            matches!(component,
+            std::path::Component::Normal(name) if name == ".hellas-execution")
+        }) {
+            return Err(ExecutionError::Identity);
+        }
+        Ok(())
     }
 
     fn open_inner(
@@ -240,24 +268,13 @@ impl ExecutionAttempt {
         terms: ExecutionTerms,
         create: bool,
     ) -> Result<Self> {
-        // Keep caller records out of the reserved completion namespace so one
-        // attempt cannot overwrite another attempt's payload or receipt.
-        if path.components().any(|component| {
-            matches!(component,
-            std::path::Component::Normal(name) if name == ".hellas-execution")
-        }) {
-            return Err(ExecutionError::Identity);
-        }
+        Self::check_path(path)?;
         let digest = input.tracking_digest();
         let record = match terms {
             ExecutionTerms::Paid { price } => {
                 let job = Job::from_input(price, input.clone())?;
                 let paid_path = paid_path.ok_or(ExecutionError::Identity)?;
-                AttemptRecord::Paid(if create {
-                    Purchase::open_tracked(paid_path, &job)?
-                } else {
-                    Purchase::open_existing_tracked(paid_path, &job)?
-                })
+                AttemptRecord::Paid(Purchase::open_tracked(paid_path, &job)?)
             }
             ExecutionTerms::Grant { resource } => {
                 let parent = path.parent().ok_or(ExecutionError::Identity)?;

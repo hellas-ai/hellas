@@ -166,14 +166,23 @@ impl Purchase {
     }
     /// Open a caller-owned attempt without clearing a terminal record.
     pub(crate) fn open_tracked(path: &PaidAttemptPath, job: &Job) -> Result<Self> {
-        Self::open_tracked_inner(path, job, true)
+        Self::open_tracked_inner(path, job.digest(), job.price(), true)
     }
 
-    pub(crate) fn open_existing_tracked(path: &PaidAttemptPath, job: &Job) -> Result<Self> {
-        Self::open_tracked_inner(path, job, false)
+    pub(crate) fn open_existing_tracked(
+        path: &PaidAttemptPath,
+        job: Digest,
+        price: u64,
+    ) -> Result<Self> {
+        Self::open_tracked_inner(path, job, price, false)
     }
 
-    fn open_tracked_inner(path: &PaidAttemptPath, job: &Job, create: bool) -> Result<Self> {
+    fn open_tracked_inner(
+        path: &PaidAttemptPath,
+        job: Digest,
+        price: u64,
+        create: bool,
+    ) -> Result<Self> {
         let state_key = path.state_key().to_owned();
         let durability = path.durability();
         let path = path.as_path();
@@ -186,8 +195,8 @@ impl Purchase {
             Ok(bytes) => (serde_json::from_slice::<Record>(&bytes)?, false),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => (
                 Record {
-                    job: *job.digest().as_bytes(),
-                    price: job.price(),
+                    job: *job.as_bytes(),
+                    price,
                     attempt_nonce: rand::random(),
                     target: None,
                     proposal: None,
@@ -199,7 +208,7 @@ impl Purchase {
             }
             Err(error) => return Err(error.into()),
         };
-        if record.job != *job.digest().as_bytes() || record.price != job.price() {
+        if record.job != *job.as_bytes() || record.price != price {
             return Err(PurchaseError::Identity);
         }
         let purchase = Self {
@@ -470,7 +479,9 @@ mod tests {
                     .unwrap()
                     .contains("private-input-sentinel")
             );
-            let recovered = Purchase::open_existing_tracked(&tracked(&path), &job).unwrap();
+            let recovered =
+                Purchase::open_existing_tracked(&tracked(&path), job.digest(), job.price())
+                    .unwrap();
             assert_eq!(recovered.bound_channel(), Some((channel, bond)));
             assert_eq!(recovered.outcome(), Some((work, paid)));
             assert!(recovered.has_proposal_intent());
@@ -529,7 +540,8 @@ mod tests {
         let first = Purchase::open_tracked(&tracked(&path), &job).unwrap();
         let nonce = first.request_nonce(channel, 1);
         drop(first);
-        let reopened = Purchase::open_existing_tracked(&tracked(&path), &job).unwrap();
+        let reopened =
+            Purchase::open_existing_tracked(&tracked(&path), job.digest(), job.price()).unwrap();
         assert_eq!(reopened.request_nonce(channel, 1), nonce);
         let second = Purchase::open_tracked(&tracked(&root.path().join("second")), &job).unwrap();
         assert_ne!(second.request_nonce(channel, 1), nonce);

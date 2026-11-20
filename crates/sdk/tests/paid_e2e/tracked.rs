@@ -149,6 +149,120 @@ fn paid_path<S>(
 }
 
 #[test]
+fn paid_attempt_reopens_after_input_is_purged() {
+    run(|runtime| {
+        Box::pin(async move {
+            let mut case = paid_fixture(runtime).await;
+            case.provider.shutdown().await.unwrap();
+            case.provider_content.close().await;
+            let (provider, upstream, provider_content) = start_provider(
+                case.root.path(),
+                work_config(&case.devnet, case.root.path().join("provider-journal")),
+                &case.identity,
+            )
+            .await;
+            case.options.provider_addrs = addresses(&provider);
+            case.provider = provider;
+            case.provider_content = provider_content;
+            fund(&mut case).await;
+            let job = job();
+            let job_root = case.root.path().join("caller-job");
+            job.save(&job_root).await.unwrap();
+            let identity_path = case.root.path().join("recovery.json");
+            std::fs::write(
+                &identity_path,
+                serde_json::to_vec(&(job.digest(), job.input().tracking_digest(), job.price()))
+                    .unwrap(),
+            )
+            .unwrap();
+            let path = paid_path(&case, &job, "purged-input");
+            let mut attempt = ExecutionAttempt::open_paid(&path, job.input(), PRICE).unwrap();
+            let mut session = open_attempt(
+                &mut attempt,
+                job.input(),
+                case.options.clone(),
+                case.endpoint.clone(),
+                client_settlement(),
+                case.owner.clone(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+            let signer = ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap();
+            let (work, nonce) =
+                accept_paused(&mut session, &mut attempt, &job, &signer, &upstream).await;
+            session.shutdown().await;
+            drop(session);
+            drop(attempt);
+            drop(job);
+            std::fs::remove_dir_all(&job_root).unwrap();
+            assert!(!job_root.exists());
+
+            let (job, input, price): (Digest, Digest, u64) =
+                serde_json::from_slice(&std::fs::read(&identity_path).unwrap()).unwrap();
+            let missing = path.with_nonce([0xff; 16]);
+            assert!(ExecutionAttempt::reopen_paid(&missing, job, input, price).is_err());
+            assert!(!missing.as_path().exists());
+            assert!(
+                ExecutionAttempt::reopen_paid(&path, Digest::hash(b"other"), input, price).is_err()
+            );
+            assert!(ExecutionAttempt::reopen_paid(&path, job, input, price + 1).is_err());
+            let mut attempt = ExecutionAttempt::reopen_paid(&path, job, input, price).unwrap();
+            assert_eq!(attempt.inspect().unwrap().work, None);
+            let mut session = PaidWorkSession::open(
+                case.options.clone(),
+                case.endpoint.clone(),
+                client_settlement(),
+                case.owner.clone(),
+                SessionOpenMode::Retained,
+                SessionFundingOptions {
+                    max_funding: Some(0),
+                    approval: None,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(
+                session
+                    .with_state(|state| state.job_by_id(work).unwrap().prepared_input().is_empty())
+                    .await
+                    .unwrap()
+            );
+            let facts = ExecutionSession::Paid(&mut session)
+                .recover(&mut attempt)
+                .await
+                .unwrap();
+            assert_eq!(facts.work, Some(work));
+            assert_eq!(facts.acceptance, Acceptance::Accepted);
+            assert_eq!(facts.payment, Payment::Pending);
+            assert!(!facts.result_available);
+            assert_eq!(
+                session
+                    .with_state(|state| (
+                        state.proposal_nonce_high_water(),
+                        state.ledger().credited_cumulative()
+                    ))
+                    .await
+                    .unwrap(),
+                (nonce, 0)
+            );
+            assert_eq!(case.approvals.0.lock().unwrap().len(), 1);
+            assert_eq!(upstream.calls("openai", "responses", BODY), 1);
+            upstream
+                .pause
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            upstream.release.notify_one();
+            session.shutdown().await;
+            case.endpoint.close().await;
+            case.provider.shutdown().await.unwrap();
+            case.provider_content.close().await;
+            case.relays.shutdown().await;
+            case.devnet.shutdown().await;
+        })
+    });
+}
+
+#[test]
 fn paid_output_survives_settlement_identity_failure_and_replays_offline() {
     run(|runtime| {
         Box::pin(async move {
@@ -237,8 +351,11 @@ fn paid_output_survives_settlement_identity_failure_and_replays_offline() {
             // An older paid marker may have no completion receipt at all.
             std::fs::remove_file(result_path.with_extension("receipt")).unwrap();
             std::fs::write(&path, paid_marker).unwrap();
+            let identity = (job.digest(), job.input().tracking_digest(), job.price());
+            drop(job);
             let attempt =
-                ExecutionAttempt::open_existing_paid(&paid_path, job.input(), PRICE).unwrap();
+                ExecutionAttempt::reopen_paid(&paid_path, identity.0, identity.1, identity.2)
+                    .unwrap();
             let facts = attempt.inspect().unwrap();
             assert_eq!(facts.payment, Payment::Paid);
             assert!(!facts.reported);
