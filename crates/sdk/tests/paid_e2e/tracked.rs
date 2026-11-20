@@ -896,8 +896,8 @@ fn tracked_recovery_requires_attempt_and_request_bindings() {
             session.shutdown().await;
             drop(session);
             drop(attempt);
-            // The durable prefix after JobAccepted: the original nonce and its
-            // request commitment, no work ID.
+            // The durable prefix retains the original nonce, request commitment
+            // and signed acceptance identity without an outcome.
             write_marker(&path, &prefix);
             let mut attempt =
                 ExecutionAttempt::open_existing_paid(&interrupted_path, job.input(), PRICE)
@@ -923,11 +923,23 @@ fn tracked_recovery_requires_attempt_and_request_bindings() {
                     .unwrap(),
                 "this restart exercises metadata-only replay"
             );
-            for field in ["channel", "bond", "network", "provider"] {
+            for field in [
+                "channel",
+                "bond",
+                "network",
+                "provider",
+                "nonce",
+                "request_commitment",
+                "accepted",
+            ] {
                 let mut wrong = prefix.clone();
                 match field {
-                    "channel" | "bond" => {
+                    "channel" | "bond" | "request_commitment" => {
                         wrong["proposal"][field] = serde_json::to_value([0x55u8; 32]).unwrap()
+                    }
+                    "nonce" => wrong["proposal"][field] = serde_json::json!(nonce + 1),
+                    "accepted" => {
+                        wrong["proposal"][field]["work"] = serde_json::json!([0x55u8; 32])
                     }
                     "network" => wrong["target"][field] = serde_json::json!("wrong-network"),
                     "provider" => {
@@ -955,6 +967,10 @@ fn tracked_recovery_requires_attempt_and_request_bindings() {
             let pending_path = pending_paid_path.as_path().to_path_buf();
             let mut pending = prefix.clone();
             pending["proposal"]["nonce"] = serde_json::json!(nonce + 1);
+            pending["proposal"]
+                .as_object_mut()
+                .unwrap()
+                .remove("accepted");
             write_marker(&pending_path, &pending);
             let mut pending_attempt =
                 ExecutionAttempt::open_existing_paid(&pending_paid_path, job.input(), PRICE)
