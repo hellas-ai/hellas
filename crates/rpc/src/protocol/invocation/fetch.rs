@@ -356,7 +356,11 @@ pub fn validate_input(
         let request = crate::http_fetch::HttpFetchRequest::decode(input.body.as_bytes())
             .map_err(|e| error(e.to_string()))?;
         let url = request.parsed_url().map_err(|e| error(e.to_string()))?;
-        if (*require_spki_pin && request.tls.spki_sha256.is_empty())
+        if (*require_spki_pin
+            && request
+                .tls
+                .as_ref()
+                .is_none_or(|tls| tls.spki_sha256.is_empty()))
             || (!allowed_hosts.is_empty()
                 && !allowed_hosts
                     .iter()

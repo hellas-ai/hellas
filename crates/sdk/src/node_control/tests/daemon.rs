@@ -376,7 +376,7 @@ async fn removing_a_backend_preserves_its_accepted_request_and_routes_the_next_o
                                     path: template.paths[0].clone(),
                                     method: "POST".into(),
                                     url: format!("{}{}", template.origin, template.paths[0]),
-                                    tls: template.tls.clone(),
+                                    tls: Some(template.tls.clone()),
                                     headers: vec![],
                                     max_response_bytes: template.max_response_bytes,
                                     models: None,

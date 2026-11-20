@@ -86,6 +86,7 @@ impl Upstream {
         Ok(match self {
             Self::Http {
                 allowed_hosts,
+                plain_http_hosts,
                 allow_private_addresses,
                 credentials,
             } => {
@@ -111,6 +112,7 @@ impl Upstream {
                     Arc::new(hellas_providers::HttpFetchProvider::new(
                         hellas_providers::HttpEgressPolicy {
                             allowed_hosts: allowed_hosts.clone(),
+                            plain_http_hosts: plain_http_hosts.clone(),
                             allow_private_addresses: *allow_private_addresses,
                         },
                         credentials,

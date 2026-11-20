@@ -10,8 +10,7 @@ pub struct HttpRoute {
     pub path: String,
     pub method: String,
     pub url: String,
-    #[serde(default = "public_tls")]
-    pub tls: HttpTls,
+    pub tls: Option<HttpTls>,
     #[serde(default)]
     pub headers: Vec<(String, String)>,
     #[serde(default = "default_response_bytes")]
@@ -33,8 +32,12 @@ pub(super) fn public_tls() -> HttpTls {
 }
 
 impl HttpRoute {
-    pub fn validate(&self) -> crate::GatewayResult<()> {
-        let route = self;
+    pub fn validate(&self) -> crate::GatewayResult<Self> {
+        let mut route = self.clone();
+        let request = route.request(Bytes::new(), &HeaderMap::new())?;
+        if request.parsed_url()?.scheme() == "https" && route.tls.is_none() {
+            route.tls = Some(public_tls());
+        }
         if let Some(models) = &route.models {
             let mut unique = std::collections::BTreeSet::new();
             if models.is_empty()
@@ -57,7 +60,7 @@ impl HttpRoute {
             return Err(crate::GatewayConfigError::CredentialHeader.into());
         }
         route.request(Bytes::new(), &HeaderMap::new())?.validate()?;
-        Ok(())
+        Ok(route)
     }
 
     pub(super) fn request(
