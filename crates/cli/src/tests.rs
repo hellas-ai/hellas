@@ -219,7 +219,7 @@ fn an_unreadable_settlement_identity_is_a_startup_failure() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("identity");
     std::fs::write(&path, b"not an identity").unwrap();
-    let Err(error) = identity::load_or_create(&path) else {
+    let Err(error) = hellas_sdk::identity::load_or_create(&path) else {
         panic!("an identity file that is not one is not a key to settle with");
     };
 

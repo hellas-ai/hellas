@@ -1144,9 +1144,11 @@ mod signer {
     //! no command accepts a scalar value directly.
 
     use hellas_authority::authenticator::{Authenticator, kernel_auth};
-    use std::{fs, path::Path};
+    #[cfg(test)]
+    use std::fs;
+    use std::path::Path;
 
-    use anyhow::{Context as _, Result, anyhow};
+    use anyhow::{Result, anyhow};
     use clap::ValueEnum;
     use hellas_kernel::{Auth, Key, PayloadHash, Secp256k1Signer, SoftPasskey};
 
@@ -1167,11 +1169,8 @@ mod signer {
         Native(Secp256k1Signer),
     }
 
-    /// Loads a software passkey from a 32-byte P-256 scalar file.
-    pub(crate) fn passkey(path: &Path) -> Result<SoftPasskey> {
-        SoftPasskey::from_secret_scalar(read_scalar(path)?)
-            .map_err(|_| anyhow!("P-256 key file contains an invalid secret scalar"))
-    }
+    pub(crate) use hellas_sdk::identity::load_principal as passkey;
+    use hellas_sdk::identity::read_scalar;
 
     impl DevSigner {
         /// Loads one exact 32-byte scalar from `path`.
@@ -1219,26 +1218,6 @@ mod signer {
                 Self::Native(signer) => Ok(Auth::native(signer.sign(hash))),
             }
         }
-    }
-
-    fn read_scalar(path: &Path) -> Result<[u8; SCALAR_LENGTH]> {
-        let bytes = fs::read(path)
-            .with_context(|| format!("failed to read key file {}", path.display()))?;
-        let trimmed = bytes.trim_ascii();
-        let material =
-            if trimmed.len() == 2 * SCALAR_LENGTH && trimmed.iter().all(u8::is_ascii_hexdigit) {
-                hex::decode(trimmed)
-                    .with_context(|| format!("invalid hex key file {}", path.display()))?
-            } else {
-                bytes
-            };
-        let actual = material.len();
-        material.try_into().map_err(|_| {
-            anyhow!(
-                "key file {} must contain 32 raw bytes or 64 hex digits, got {actual} bytes",
-                path.display()
-            )
-        })
     }
 
     #[cfg(test)]

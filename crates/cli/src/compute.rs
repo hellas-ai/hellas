@@ -72,39 +72,6 @@ pub(crate) async fn content(
     Ok(content)
 }
 
-/// One-shot local execution uses the same native constructor as the daemon.
-#[cfg(feature = "compute")]
-pub(crate) async fn local(
-    content: hellas_store::content::DiskStore,
-    native: LocalArgs,
-    signer: std::sync::Arc<hellas_auth::ProducerSigningKey>,
-) -> CliResult<hellas_sdk::execution::local::LocalExecution> {
-    let prepared = async {
-        let backend = hellas_sdk::execution::local::spawn(
-            signer,
-            hellas_executor::GpuConfig {
-                backend: native
-                    .gpu
-                    .evaluator
-                    .unwrap_or_else(hellas_executor::catena::default_gpu),
-                session_programs: native.gpu.gpu_session_programs,
-                session_asset_bytes: native.gpu.gpu_session_asset_bytes,
-            },
-            &Default::default(),
-        )
-        .await?;
-        Ok::<_, anyhow::Error>(hellas_sdk::execution::local::LocalExecution {
-            backend,
-            content: content.clone(),
-        })
-    }
-    .await;
-    if prepared.is_err() {
-        content.close().await;
-    }
-    prepared
-}
-
 #[cfg(all(test, feature = "compute"))]
 mod tests {
     use super::*;

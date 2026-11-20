@@ -131,7 +131,7 @@ impl Startup {
 
 async fn pending(
     home: &StoreLocation,
-    identity: &crate::identity::LocalIdentity,
+    identity: &hellas_sdk::identity::LocalIdentity,
     owner: &dyn Authenticator,
 ) -> Result<Startup> {
     let administrator = super::owner::administrator(owner.public_key()?)?;
@@ -162,7 +162,7 @@ async fn pending(
 
 pub(super) async fn prepare_local(
     home: &StoreLocation,
-    identity: &crate::identity::LocalIdentity,
+    identity: &hellas_sdk::identity::LocalIdentity,
     owner: &dyn Authenticator,
     _ownership: &StartupLock,
 ) -> Result<(NodeStore, CredentialSecret)> {
@@ -242,7 +242,7 @@ pub(super) async fn prepare_local(
 /// at its newly inspected revision, never an automatic replay or reset.
 pub(super) async fn rebind_local(
     home: &StoreLocation,
-    identity: &crate::identity::LocalIdentity,
+    identity: &hellas_sdk::identity::LocalIdentity,
     owner: &dyn Authenticator,
     expected: Revision,
 ) -> Result<()> {
@@ -285,7 +285,7 @@ mod tests {
     async fn startup_ownership_covers_pending_tls_and_open_store() {
         let directory = tempfile::tempdir().unwrap();
         let home = StoreLocation::from_home(directory.path(), hellas_private::Durability::Crash);
-        let identity = crate::identity::load_or_create(&home.join("identity")).unwrap();
+        let identity = hellas_sdk::identity::load_or_create(&home.join("identity")).unwrap();
         let owner = hellas_kernel::SoftPasskey::from_secret_scalar([17; 32]).unwrap();
         let lock = StartupLock::acquire(&home.child("provider/authority")).unwrap();
         assert!(StartupLock::acquire(&home.child("provider/authority")).is_err());
@@ -333,7 +333,7 @@ mod tests {
     async fn explicit_rebind_renews_expired_root_and_one_canonical_credential() {
         let directory = tempfile::tempdir().unwrap();
         let home = StoreLocation::from_home(directory.path(), hellas_private::Durability::Crash);
-        let identity = crate::identity::load_or_create(&home.join("identity")).unwrap();
+        let identity = hellas_sdk::identity::load_or_create(&home.join("identity")).unwrap();
         let owner = hellas_kernel::SoftPasskey::from_secret_scalar([17; 32]).unwrap();
         let lock = StartupLock::acquire(&home.child("provider/authority")).unwrap();
         let mut scope = super::super::owner::administrator(owner.public_key().unwrap()).unwrap();
