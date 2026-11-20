@@ -6,10 +6,9 @@ use hellas_rpc::Assurance;
 use hellas_sdk::BackendState;
 use hellas_sdk::{
     Backend,
-    execution::{Completed, ExecutionAttempt, ExecutionError, Executor, RequestStopped},
+    execution::{Completed, ExecutionError, Executor, RequestStopped},
     job::{Job, JobInput},
     paid_client::PaidWorkOptions,
-    transact::PaidAttemptPath,
 };
 use std::{
     io::Write as _,
@@ -212,35 +211,13 @@ pub struct FetchArgs {
     target: TargetArgs,
 }
 
-use hellas_sdk::home::{Home as Context, PaidSettings, TargetSpec};
+use hellas_sdk::home::{Home as Context, TargetSpec};
 
 impl ClientArgs {
     fn paid_provider(&self) -> super::CliResult<&Provider> {
         self.provider
             .as_ref()
             .context("paid execution requires --provider")
-    }
-
-    fn root(&self, context: &Context) -> PathBuf {
-        context.chain.client().into_path_buf()
-    }
-    /// The attempt `owner` keeps for `job` at this provider. Takes the
-    /// owner rather than opening it: the funding wallet is one exclusive
-    /// lock, and the job's executor already holds it.
-    fn purchase(
-        &self,
-        context: &Context,
-        job: &Job,
-        options: &PaidWorkOptions,
-        owner: &hellas_sdk::client_owner::ClientOwner,
-    ) -> super::CliResult<ExecutionAttempt> {
-        let path = PaidAttemptPath::new(
-            &context.chain,
-            options.provider,
-            owner.principal(),
-            job.digest(),
-        );
-        select_attempt(&path, job, self.buy_again)
     }
 
     fn options_with_config(
@@ -251,48 +228,50 @@ impl ClientArgs {
         config: hellas_sdk::work_config::WorkConfig,
         content: hellas_store::content::DiskStore,
     ) -> super::CliResult<PaidWorkOptions> {
-        self.settings()?.options(
-            self.paid_provider()?.address,
-            price,
-            assurance,
-            config,
-            content,
-            hellas_sdk::identity::assertion_counters(&context.home)?,
-        )
-    }
-
-    fn trust(&self) -> super::CliResult<Option<hellas_sdk::daemon_config::Trust>> {
-        match (&self.trust_store, &self.trust_policy) {
-            (Some(store), Some(policy)) => Ok(Some(hellas_sdk::daemon_config::Trust {
-                store: store.clone(),
-                policy: policy.clone(),
-            })),
-            (None, None) => Ok(None),
-            _ => bail!("Apple providers require --trust-store and --trust-policy"),
-        }
-    }
-    fn settings(&self) -> super::CliResult<PaidSettings> {
         let provider = self.paid_provider()?;
-        Ok(PaidSettings {
-            addresses: provider
+        Ok(PaidWorkOptions {
+            content,
+            config,
+            provider: provider.address,
+            provider_addrs: provider
                 .addresses
                 .iter()
                 .chain(&self.addresses)
                 .copied()
                 .collect(),
-            validators: self.validators.clone(),
-            trust: self.trust()?,
+            apple_trust: self.trust(context, assurance)?,
+            assurance,
+            expected_price: price,
             acceptance_blocks: self.acceptance_blocks,
             terminal_blocks: self.terminal_blocks,
             payment_blocks: self.payment_blocks,
             timeout: self.timeout,
         })
     }
+
+    fn trust(
+        &self,
+        context: &Context,
+        assurance: Assurance,
+    ) -> super::CliResult<Option<hellas_client::ProviderTrustAnchor>> {
+        match (&self.trust_store, &self.trust_policy, assurance) {
+            (Some(store), Some(policy), _) => Ok(Some(
+                hellas_sdk::trust_policy::TrustPolicyStore::new(store).resolve(
+                    policy,
+                    assurance,
+                    hellas_sdk::identity::assertion_counters(&context.home)?,
+                )?,
+            )),
+            (None, None, Assurance::ProducerSigned) => Ok(None),
+            _ => bail!("Apple providers require --trust-store and --trust-policy"),
+        }
+    }
 }
 
+#[cfg(test)]
 use hellas_sdk::home::select_attempt;
 #[cfg(test)]
-use hellas_sdk::home::select_policy;
+use hellas_sdk::{home::select_policy, transact::PaidAttemptPath};
 
 /// One deadline for the whole command, from `--timeout`; without one, wait
 /// until it is done. The endpoints the command bound close however it ends,
@@ -334,15 +313,6 @@ async fn within<T>(
 struct ResolvedBackend {
     backend: Backend,
     attempt: Option<PathBuf>,
-}
-
-impl From<Backend> for ResolvedBackend {
-    fn from(backend: Backend) -> Self {
-        Self {
-            backend,
-            attempt: None,
-        }
-    }
 }
 
 impl TargetArgs {
@@ -405,22 +375,24 @@ impl TargetArgs {
                 .content(context)
                 .await?
                 .context("local content is not prepared")?;
-            return Ok(context
-                .target(TargetSpec::Local {
-                    content,
-                    gpu: hellas_executor::GpuConfig {
-                        backend: self
-                            .native
-                            .gpu
-                            .evaluator
-                            .unwrap_or_else(hellas_executor::catena::default_gpu),
-                        session_programs: self.native.gpu.gpu_session_programs,
-                        session_asset_bytes: self.native.gpu.gpu_session_asset_bytes,
-                    },
-                    timeout: client.timeout.unwrap_or(Duration::from_secs(86_400)),
-                })
-                .await?
-                .into());
+            return Ok(ResolvedBackend {
+                backend: context
+                    .target(TargetSpec::Local {
+                        content,
+                        gpu: hellas_executor::GpuConfig {
+                            backend: self
+                                .native
+                                .gpu
+                                .evaluator
+                                .unwrap_or_else(hellas_executor::catena::default_gpu),
+                            session_programs: self.native.gpu.gpu_session_programs,
+                            session_asset_bytes: self.native.gpu.gpu_session_asset_bytes,
+                        },
+                        timeout: client.timeout.unwrap_or(Duration::from_secs(86_400)),
+                    })
+                    .await?,
+                attempt: None,
+            });
         }
         let spec = match self.access {
             Some(file) => {
@@ -433,17 +405,17 @@ impl TargetArgs {
                 TargetSpec::Access {
                     file,
                     provider: client.provider.as_ref().map(|p| p.address),
-                    trust: client.trust()?,
+                    trust: client.trust(context, assurance)?.map(Box::new),
                     resource: self.resource,
-                    assurance,
                 }
             }
-            None => TargetSpec::Paid {
-                provider: client.paid_provider()?.address,
-                max_price: pay,
+            None => TargetSpec::Paid(Box::new(client.options_with_config(
+                context,
+                pay,
                 assurance,
-                settings: client.settings()?,
-            },
+                client::config(client, context).await?,
+                hellas_sdk::chain_home::open_client_content(&context.chain).await?,
+            )?)),
         };
         Ok(ResolvedBackend {
             backend: context.target(spec).await?,
@@ -453,17 +425,6 @@ impl TargetArgs {
 }
 
 impl ResolvedBackend {
-    async fn quote(
-        &mut self,
-    ) -> super::CliResult<(
-        Option<hellas_rpc::protocol::invocation::InvocationPolicy>,
-        u64,
-    )> {
-        let price = self.backend.quote().await?;
-        let policy = self.backend.policy().cloned();
-        Ok((policy, price))
-    }
-
     /// Commands add their durable attempt to the same executor gateways use.
     async fn executor(
         &self,
@@ -471,16 +432,9 @@ impl ResolvedBackend {
         context: &Context,
         job: &Job,
     ) -> super::CliResult<(Executor, String)> {
-        let mut executor = if client.buy_again {
-            let BackendState::Paid(paid) = &self.backend.state else {
-                bail!("only paid work can be bought again")
-            };
-            let mut executor = Executor::new(self.backend.clone());
-            executor.attempt = Some(client.purchase(context, job, &paid.options, &paid.owner)?);
-            executor
-        } else {
-            self.backend.executor(job, self.attempt.as_deref())?
-        };
+        let mut executor = self
+            .backend
+            .executor(job, self.attempt.as_deref(), client.buy_again)?;
         executor.settle = client.settle;
         let provider = match &self.backend.state {
             BackendState::Paid(paid) => paid.options.provider.to_string(),
@@ -542,11 +496,12 @@ async fn run_quoted(
         )
         .await?;
         let result = async {
-            let (_, price) = within(deadline, target.quote()).await?;
+            let price = within(deadline, target.backend.quote()).await?;
             let job = build(price).await?;
             let directory = save.unwrap_or_else(|| {
-                client
-                    .root(context)
+                context
+                    .chain
+                    .client()
                     .join("jobs")
                     .join(job.digest().to_string())
             });
@@ -704,7 +659,8 @@ pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
         )
         .await?;
         let result = async {
-            let (policy, price) = within(deadline, target.quote()).await?;
+            let price = within(deadline, target.backend.quote()).await?;
+            let policy = target.backend.policy().cloned();
             let policy = policy
                 .context("local execution runs Compute jobs; Fetch needs --provider or --access")?;
             let admission = policy
@@ -742,8 +698,9 @@ pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
                 assurance,
             )?;
             let directory = args.save_job.clone().unwrap_or_else(|| {
-                args.client
-                    .root(&context)
+                context
+                    .chain
+                    .client()
                     .join("jobs")
                     .join(job.digest().to_string())
             });

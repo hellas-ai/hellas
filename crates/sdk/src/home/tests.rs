@@ -13,7 +13,7 @@ async fn a_home_contact_receives_access_and_executes_a_compute_job() {
     let chain = hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet);
     let home = Home::open(&location, &chain).unwrap();
     let principal = home.principal().unwrap();
-    let holder = NodeKey::from_public_key(home.producer().public_key()).unwrap();
+    let holder = NodeKey::from_public_key(home.producer.public_key()).unwrap();
     let assertion = home
         .owner()
         .unwrap()
@@ -94,7 +94,6 @@ async fn a_home_contact_receives_access_and_executes_a_compute_job() {
             provider: None,
             trust: None,
             resource: None,
-            assurance: Assurance::ProducerSigned,
         })
         .await
         .unwrap();
@@ -117,9 +116,9 @@ async fn a_home_contact_receives_access_and_executes_a_compute_job() {
     )
     .unwrap();
     let run = || {
-        target.executor(&job, None).unwrap().run(
+        target.executor(&job, None, false).unwrap().run(
             &job,
-            home.producer(),
+            &home.producer,
             None,
             crate::execution::stop_on(std::future::pending()),
             Default::default(),
@@ -140,10 +139,7 @@ async fn a_home_contact_receives_access_and_executes_a_compute_job() {
     host.content.close().await;
     let reopened = Home::open(&location, &chain).unwrap();
     assert_eq!(reopened.principal().unwrap(), principal);
-    assert_eq!(
-        reopened.producer().public_key(),
-        home.producer().public_key()
-    );
-    assert_eq!(reopened.client_root(), home.client_root());
+    assert_eq!(reopened.producer.public_key(), home.producer.public_key());
+    assert_eq!(reopened.chain.client(), home.chain.client());
     reopened.close().await;
 }

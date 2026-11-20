@@ -21,7 +21,7 @@ use std::{
 pub use crate::Backend as Target;
 
 pub struct Home {
-    pub transport: iroh::SecretKey,
+    transport: iroh::SecretKey,
     pub settlement: Secp256k1Signer,
     pub producer: ProducerSigningKey,
     owner: std::sync::OnceLock<hellas_kernel::SoftPasskey>,
@@ -86,7 +86,7 @@ impl Home {
         Ok(self.paid_endpoint.get_or_try_init(bind).await?.clone())
     }
 
-    pub async fn grant_endpoint(&self) -> anyhow::Result<iroh::Endpoint> {
+    async fn grant_endpoint(&self) -> anyhow::Result<iroh::Endpoint> {
         let bind = || crate::grant_client::bind_endpoint(self.transport.clone());
         Ok(self.grant_endpoint.get_or_try_init(bind).await?.clone())
     }
@@ -167,23 +167,21 @@ pub fn select_attempt(
     Ok(attempt)
 }
 
-pub fn select_policy(
-    policies: &[hellas_authority::model::grant::records::GrantPolicy],
+pub fn select_policy<'a>(
+    policies: impl IntoIterator<Item = &'a hellas_authority::model::grant::records::GrantPolicy>,
     resource: Option<ResourceId>,
-) -> anyhow::Result<&hellas_authority::model::grant::records::GrantPolicy> {
-    match resource {
-        Some(id) => policies
-            .iter()
-            .find(|policy| policy.resource == id)
-            .context("selected --resource is absent from the offer"),
-        None => {
-            ensure!(
-                policies.len() == 1,
-                "offer must contain one policy unless --resource selects an explicit resource ID"
-            );
-            Ok(&policies[0])
-        }
-    }
+) -> anyhow::Result<&'a hellas_authority::model::grant::records::GrantPolicy> {
+    let mut selected = policies
+        .into_iter()
+        .filter(|policy| resource.is_none_or(|id| policy.resource == id));
+    let policy = selected
+        .next()
+        .context("grant contains no matching resource")?;
+    ensure!(
+        selected.next().is_none(),
+        "grant resource is ambiguous; select --resource"
+    );
+    Ok(policy)
 }
 
 /// Inputs for placement. Model rendering stays with the client.
@@ -191,89 +189,16 @@ pub enum TargetSpec {
     Access {
         file: PathBuf,
         provider: Option<hellas_client::ProviderAddress>,
-        trust: Option<crate::daemon_config::Trust>,
+        trust: Option<Box<hellas_client::ProviderTrustAnchor>>,
         resource: Option<ResourceId>,
-        assurance: Assurance,
     },
-    Paid {
-        provider: hellas_client::ProviderAddress,
-        max_price: u64,
-        assurance: Assurance,
-        settings: PaidSettings,
-    },
+    Paid(Box<PaidWorkOptions>),
     #[cfg(feature = "compute")]
     Local {
         content: hellas_store::content::DiskStore,
         gpu: hellas_executor::GpuConfig,
         timeout: Duration,
     },
-}
-
-/// Paid work settings shared by command and gateway configuration.
-pub struct PaidSettings {
-    pub addresses: Vec<std::net::SocketAddr>,
-    pub validators: Vec<String>,
-    pub trust: Option<crate::daemon_config::Trust>,
-    pub acceptance_blocks: u64,
-    pub terminal_blocks: u64,
-    pub payment_blocks: u64,
-    pub timeout: Option<Duration>,
-}
-impl Default for PaidSettings {
-    fn default() -> Self {
-        Self {
-            addresses: vec![],
-            validators: vec![],
-            trust: None,
-            acceptance_blocks: 300,
-            terminal_blocks: 3000,
-            payment_blocks: 600,
-            timeout: None,
-        }
-    }
-}
-impl PaidSettings {
-    pub fn options(
-        &self,
-        provider: hellas_client::ProviderAddress,
-        max_price: u64,
-        assurance: Assurance,
-        config: crate::work_config::WorkConfig,
-        content: hellas_store::content::DiskStore,
-        counters: Arc<dyn hellas_attestation::AssertionCounterStore + Send + Sync>,
-    ) -> anyhow::Result<PaidWorkOptions> {
-        Ok(PaidWorkOptions {
-            content,
-            config,
-            provider,
-            provider_addrs: self.addresses.clone(),
-            apple_trust: resolve_trust(self.trust.as_ref(), assurance, counters)?,
-            assurance,
-            expected_price: max_price,
-            acceptance_blocks: self.acceptance_blocks,
-            terminal_blocks: self.terminal_blocks,
-            payment_blocks: self.payment_blocks,
-            timeout: self.timeout,
-        })
-    }
-}
-
-pub fn resolve_trust(
-    trust: Option<&crate::daemon_config::Trust>,
-    assurance: Assurance,
-    counters: Arc<dyn hellas_attestation::AssertionCounterStore + Send + Sync>,
-) -> anyhow::Result<Option<hellas_client::ProviderTrustAnchor>> {
-    match (trust, assurance) {
-        (Some(trust), _) => Ok(Some(
-            crate::trust_policy::TrustPolicyStore::new(&trust.store).resolve(
-                &trust.policy,
-                assurance,
-                counters,
-            )?,
-        )),
-        (None, Assurance::ProducerSigned) => Ok(None),
-        _ => bail!("Apple providers require --trust-store and --trust-policy"),
-    }
 }
 
 impl Home {
@@ -286,16 +211,10 @@ impl Home {
         let principal = crate::identity::principal(location)?;
         Self::new(&identity, Some(&principal), location, chain)
     }
-    pub fn producer(&self) -> &ProducerSigningKey {
-        &self.producer
-    }
     pub fn principal(&self) -> anyhow::Result<PrincipalId> {
         Ok(PrincipalId::from_public_key(hellas_auth::PublicKey::P256(
             self.owner()?.party_key().to_bytes(),
         ))?)
-    }
-    pub fn client_root(&self) -> StoreLocation {
-        self.chain.client()
     }
     pub async fn close(&self) {
         for endpoint in [self.paid_endpoint.get(), self.grant_endpoint.get()]
@@ -312,7 +231,6 @@ impl Home {
                 provider,
                 trust,
                 resource,
-                assurance,
             } => {
                 let principal = self.principal()?;
                 let holder = NodeKey::from_public_key(self.producer.public_key())?;
@@ -322,43 +240,21 @@ impl Home {
                     bundle.offers.len() == 1,
                     "a job uses an access file with one offer"
                 );
-                let trust = resolve_trust(
-                    trust.as_ref(),
-                    assurance,
-                    crate::identity::assertion_counters(&self.home)?,
-                )?;
                 access_target(
                     bundle,
                     resource,
                     provider,
-                    trust,
+                    trust.map(|trust| *trust),
                     Arc::new(self.producer.clone()),
                     &self.home,
                     self.grant_endpoint().await?,
                 )
             }
-            TargetSpec::Paid {
-                provider,
-                max_price,
-                assurance,
-                settings,
-            } => {
+            TargetSpec::Paid(options) => {
                 ensure!(
-                    max_price > 0,
+                    options.expected_price > 0,
                     "paid execution requires --pay MAX; select --access for grant work"
                 );
-                let mut chain = self.chain.clone();
-                if !settings.validators.is_empty() {
-                    chain = chain.with_validators(settings.validators.clone())?;
-                }
-                let options = settings.options(
-                    provider,
-                    max_price,
-                    assurance,
-                    crate::work_config::WorkConfig::from_chain_dir(chain)?,
-                    crate::chain_home::open_client_content(&self.chain).await?,
-                    crate::identity::assertion_counters(&self.home)?,
-                )?;
                 let owner = Arc::new(crate::client_owner::ClientOwner::new(
                     Arc::new(self.owner()?.clone()),
                     self.settlement.party_key(),
@@ -366,7 +262,7 @@ impl Home {
                 )?);
                 Ok(Target::paid(
                     None,
-                    options,
+                    *options,
                     self.paid_endpoint().await?,
                     self.settlement.clone(),
                     owner,
@@ -400,7 +296,7 @@ impl Home {
 }
 
 /// Resolve the same signed grant for an access file or an embedded gateway document.
-pub fn access_target(
+pub(crate) fn access_target(
     bundle: crate::access_bundle::AccessBundle,
     resource: Option<ResourceId>,
     expected: Option<hellas_client::ProviderAddress>,
@@ -411,32 +307,23 @@ pub fn access_target(
 ) -> anyhow::Result<Target> {
     let principal = bundle.subject;
     let (offers, application) = bundle.into_parts();
-    let (offer, policy) = if let [offer] = offers.as_slice() {
-        (
-            offer,
-            select_policy(&offer.offer().grant.policies, resource)?,
-        )
-    } else {
-        let mut selected = offers
+    let policy = select_policy(
+        offers
             .iter()
-            .flat_map(|offer| {
-                offer
-                    .offer()
-                    .grant
-                    .policies
-                    .iter()
-                    .map(move |policy| (offer, policy))
-            })
-            .filter(|(_, policy)| resource.is_none_or(|id| policy.resource == id));
-        let (offer, policy) = selected
-            .next()
-            .context("grant contains no matching resource")?;
-        ensure!(
-            selected.next().is_none(),
-            "grant resource is ambiguous; select --resource"
-        );
-        (offer, policy)
-    };
+            .flat_map(|offer| &offer.offer().grant.policies),
+        resource,
+    )?;
+    let offer = offers
+        .iter()
+        .find(|offer| {
+            offer
+                .offer()
+                .grant
+                .policies
+                .iter()
+                .any(|p| p.resource == policy.resource)
+        })
+        .context("selected grant offer is missing")?;
     let provider = hellas_client::ProviderAddress::of(&offer.offer().provider)?;
     ensure!(
         expected.is_none_or(|expected| provider == expected),
@@ -455,7 +342,7 @@ pub fn access_target(
             principal,
             signer,
             application: Arc::new(application),
-            journal_root: client_journal_root(home, &principal)?,
+            journal_root: home.child(data_root(home, &principal)?).child("channels"),
             control_timeout: Duration::from_secs(90),
         },
         crate::grant_client::GrantTransport::Remote(endpoint),
@@ -467,16 +354,18 @@ pub fn data_root(home: &Path, principal: &PrincipalId) -> anyhow::Result<PathBuf
     let base = crate::identity::grant_data_path(home);
     Ok(base.join(format!("p256-{}", hex::encode(principal.as_bytes()))))
 }
-pub fn client_journal_root(
-    home: &StoreLocation,
-    identity: &PrincipalId,
-) -> anyhow::Result<StoreLocation> {
-    Ok(home.child(data_root(home, identity)?).child("channels"))
-}
-
 impl Target {
     /// Construct a job executor using the existing journals and attempt format.
-    pub fn executor(&self, job: &Job, attempt: Option<&Path>) -> anyhow::Result<Executor> {
+    pub fn executor(
+        &self,
+        job: &Job,
+        attempt: Option<&Path>,
+        buy_again: bool,
+    ) -> anyhow::Result<Executor> {
+        ensure!(
+            !buy_again || matches!(self.state, BackendState::Paid(_)),
+            "only paid work can be bought again"
+        );
         let mut executor = Executor::new(self.clone());
         match &self.state {
             BackendState::Unavailable(error) => bail!("{error}"),
@@ -491,7 +380,7 @@ impl Target {
                     attempt.is_none(),
                     "explicit attempt paths are for grant work"
                 );
-                executor.attempt = Some(select_attempt(&path, job, false)?);
+                executor.attempt = Some(select_attempt(&path, job, buy_again)?);
             }
             BackendState::Grant(grant) => {
                 let crate::GrantBackend {

@@ -334,29 +334,25 @@ impl Runtime {
                 let provider = provider.parse()?;
                 let chain = self.chain(chain)?;
                 let endpoint = self.consumer_endpoint().await?;
-                let assurance = self
-                    .trust(trust, counters.clone())?
-                    .as_ref()
-                    .map_or(hellas_rpc::Assurance::ProducerSigned, |trust| {
-                        trust.required_assurance
-                    });
-                let settings = crate::home::PaidSettings {
-                    addresses: addresses.clone(),
-                    validators: vec![],
-                    trust: trust.clone(),
+                let apple_trust = self.trust(trust, counters.clone())?;
+                let options = crate::paid_client::PaidWorkOptions {
+                    // Quoting reads no content. Activation supplies the recovered client store.
+                    content: self.options.content.clone(),
+                    config: crate::work_config::WorkConfig::from_chain_dir(chain)?,
+                    provider,
+                    provider_addrs: addresses.clone(),
+                    assurance: apple_trust
+                        .as_ref()
+                        .map_or(hellas_rpc::Assurance::ProducerSigned, |trust| {
+                            trust.required_assurance
+                        }),
+                    apple_trust,
+                    expected_price: *max_price,
                     acceptance_blocks: *acceptance_blocks,
                     terminal_blocks: *terminal_blocks,
                     payment_blocks: *payment_blocks,
                     timeout: timeout_seconds.map(std::time::Duration::from_secs),
                 };
-                let options = settings.options(
-                    provider,
-                    *max_price,
-                    assurance,
-                    crate::work_config::WorkConfig::from_chain_dir(chain)?,
-                    self.options.content.clone(),
-                    counters.clone(),
-                )?;
                 return Ok(PreparedBackend::Paid {
                     options: Box::new(options),
                     endpoint,
