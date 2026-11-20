@@ -248,6 +248,41 @@ fn paid_attempt_reopens_after_input_is_purged() {
             );
             assert_eq!(case.approvals.0.lock().unwrap().len(), 1);
             assert_eq!(upstream.calls("openai", "responses", BODY), 1);
+            let bond = session.descriptor().bond_edge();
+            session.shutdown().await;
+            drop(session);
+            sealing_while(
+                &mut case.devnet,
+                Duration::from_millis(100),
+                hellas_sdk::paid_client::settle_channel(
+                    &case.options,
+                    bond,
+                    case.owner.principal(),
+                    &client_settlement(),
+                ),
+            )
+            .await
+            .unwrap();
+            // Expired input is still absent. Recovery must finish accounting
+            // even after the original channel's payment coin has been closed.
+            let mut session = PaidWorkSession::open(
+                case.options.clone(),
+                case.endpoint.clone(),
+                client_settlement(),
+                case.owner.clone(),
+                SessionOpenMode::Retained,
+                SessionFundingOptions {
+                    max_funding: Some(0),
+                    approval: None,
+                },
+            )
+            .await
+            .expect("reconcile the expired attempt after settlement");
+            let facts = ExecutionSession::Paid(&mut session)
+                .recover(&mut attempt)
+                .await
+                .unwrap();
+            assert_eq!(facts.payment, Payment::Unpaid);
             upstream
                 .pause
                 .store(false, std::sync::atomic::Ordering::SeqCst);
