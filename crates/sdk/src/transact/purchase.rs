@@ -117,6 +117,8 @@ struct Proposal {
     nonce: u64,
     request_commitment: [u8; 32],
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    accepted: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     outcome: Option<Outcome>,
 }
 
@@ -256,7 +258,13 @@ impl Purchase {
         self.record.target.as_ref() == Some(target)
     }
     pub(crate) fn work_id(&self) -> Option<Digest> {
-        self.outcome().map(|(work, _)| work)
+        self.outcome().map(|(work, _)| work).or_else(|| {
+            self.record
+                .proposal
+                .as_ref()?
+                .accepted
+                .map(Digest::from_bytes)
+        })
     }
     /// Terminal work and whether it was paid.
     pub(crate) fn outcome(&self) -> Option<(Digest, bool)> {
@@ -272,7 +280,7 @@ impl Purchase {
     /// has checked both signatures. The request commitment distinguishes this
     /// intent from a later attempt that reused a nonce never proposed here.
     pub(crate) fn accepted_work(
-        &self,
+        &mut self,
         state: &hellas_channel::work_store::Channel,
     ) -> Result<Option<Digest>> {
         let Some(proposal) = &self.record.proposal else {
@@ -281,6 +289,11 @@ impl Purchase {
         let channel = state.channel().id();
         if proposal.channel != *channel.as_bytes() {
             return Err(PurchaseError::Identity);
+        }
+        if let Some(work) = proposal.accepted.map(Digest::from_bytes)
+            && state.terminal_by_id(work).is_some()
+        {
+            return Ok(Some(work));
         }
         let Some(job) = state
             .jobs()
@@ -317,7 +330,45 @@ impl Purchase {
                 return Err(PurchaseError::Identity);
             }
         }
-        Ok(Some(job.work_id()))
+        let work = job.work_id();
+        if proposal
+            .accepted
+            .is_some_and(|held| held != *work.as_bytes())
+        {
+            return Err(PurchaseError::Identity);
+        }
+        if proposal.accepted.is_none() {
+            self.record
+                .proposal
+                .as_mut()
+                .expect("checked proposal")
+                .accepted = Some(*work.as_bytes());
+            self.persist()?;
+        }
+        Ok(Some(work))
+    }
+
+    /// Reconcile the same signed acceptance and terminal on live or closed journals.
+    pub(crate) fn reconcile(
+        &mut self,
+        state: &hellas_channel::work_store::Channel,
+    ) -> Result<Option<Digest>> {
+        if let Some((work, _)) = self.outcome() {
+            return Ok(Some(work));
+        }
+        let work = self.accepted_work(state)?;
+        if let Some(work) = work
+            && let Some(terminal) = state.terminal_by_id(work)
+        {
+            self.finish(
+                work,
+                matches!(
+                    terminal.outcome,
+                    hellas_channel::work_store::TerminalOutcome::Certified { .. }
+                ),
+            )?;
+        }
+        Ok(work)
     }
 
     /// A recorded proposal is an irrevocable intent for tracked attempts.
@@ -380,6 +431,7 @@ impl Purchase {
             bond: bond.to_bytes(),
             nonce,
             request_commitment: *request_commitment.as_bytes(),
+            accepted: None,
             outcome: None,
         };
         match &self.record.proposal {
@@ -405,6 +457,12 @@ impl Purchase {
             .proposal
             .as_mut()
             .ok_or(PurchaseError::Identity)?;
+        if proposal
+            .accepted
+            .is_some_and(|accepted| accepted != *work.as_bytes())
+        {
+            return Err(PurchaseError::Identity);
+        }
         let outcome = Outcome {
             work: *work.as_bytes(),
             paid,

@@ -208,7 +208,7 @@ fn paid_attempt_reopens_after_input_is_purged() {
             );
             assert!(ExecutionAttempt::reopen_paid(&path, job, input, price + 1).is_err());
             let mut attempt = ExecutionAttempt::reopen_paid(&path, job, input, price).unwrap();
-            assert_eq!(attempt.inspect().unwrap().work, None);
+            assert_eq!(attempt.inspect().unwrap().work, Some(work));
             let mut session = PaidWorkSession::open(
                 case.options.clone(),
                 case.endpoint.clone(),
@@ -263,31 +263,32 @@ fn paid_attempt_reopens_after_input_is_purged() {
             )
             .await
             .unwrap();
-            // Expired input is still absent. Recovery must finish accounting
-            // even after the original channel's payment coin has been closed.
-            let mut session = PaidWorkSession::open(
-                case.options.clone(),
-                case.endpoint.clone(),
-                client_settlement(),
-                case.owner.clone(),
-                SessionOpenMode::Retained,
-                SessionFundingOptions {
-                    max_funding: Some(0),
-                    approval: None,
-                },
-            )
-            .await
-            .expect("reconcile the expired attempt after settlement");
-            let facts = ExecutionSession::Paid(&mut session)
-                .recover(&mut attempt)
+            // Crash after closing but before recording the purchase outcome.
+            drop(attempt);
+            let mut attempt = ExecutionAttempt::reopen_paid(&path, job, input, price).unwrap();
+            let facts = attempt
+                .settle_paid(&case.options, case.owner.principal(), &client_settlement())
                 .await
                 .unwrap();
+            assert_eq!(facts.work, Some(work));
             assert_eq!(facts.payment, Payment::Unpaid);
+            assert!(!facts.result_available);
+            assert_eq!(case.approvals.0.lock().unwrap().len(), 1);
+            assert_eq!(upstream.calls("openai", "responses", BODY), 1);
+            drop(attempt);
+            let mut attempt = ExecutionAttempt::reopen_paid(&path, job, input, price).unwrap();
+            assert_eq!(
+                attempt
+                    .settle_paid(&case.options, case.owner.principal(), &client_settlement())
+                    .await
+                    .unwrap()
+                    .payment,
+                Payment::Unpaid
+            );
             upstream
                 .pause
                 .store(false, std::sync::atomic::Ordering::SeqCst);
             upstream.release.notify_one();
-            session.shutdown().await;
             case.endpoint.close().await;
             case.provider.shutdown().await.unwrap();
             case.provider_content.close().await;
