@@ -1,8 +1,6 @@
 #![recursion_limit = "256"]
 
 use hellas_private::StoreLocation;
-#[macro_use]
-extern crate tracing;
 
 use clap::{Parser, Subcommand};
 use iroh::EndpointId;
@@ -340,7 +338,9 @@ async fn async_main() {
         return;
     }
     let owner = match cli.owner.load(&home).and_then(|owner| match owner {
-        None if acts_for_principal(&cli.command) => owner::principal(&home).map(Some),
+        None if acts_for_principal(&cli.command) => {
+            hellas_sdk::identity::principal(&home).map(Some)
+        }
         owner => Ok(owner),
     }) {
         Ok(owner) => owner,
@@ -475,7 +475,7 @@ async fn async_main() {
     };
 
     // Before anything binds, and before any other startup work.
-    let local_identity = match identity::load_or_create(&identity_path) {
+    let local_identity = match hellas_sdk::identity::load_or_create(&identity_path) {
         Ok(identity) => identity,
         Err(err) => {
             eprintln!("error: {err:#}");
@@ -577,7 +577,7 @@ async fn async_main() {
             async {
                 commands::transact::run(
                     args,
-                    commands::transact::Context::new(
+                    hellas_sdk::home::Home::new(
                         &local_identity,
                         owner.as_ref(),
                         &home,
@@ -592,7 +592,7 @@ async fn async_main() {
             async {
                 commands::transact::fetch(
                     args,
-                    commands::transact::Context::new(
+                    hellas_sdk::home::Home::new(
                         &local_identity,
                         owner.as_ref(),
                         &home,
@@ -607,7 +607,7 @@ async fn async_main() {
             async {
                 commands::transact::run_program(
                     args,
-                    commands::transact::Context::new(
+                    hellas_sdk::home::Home::new(
                         &local_identity,
                         owner.as_ref(),
                         &home,
@@ -622,7 +622,7 @@ async fn async_main() {
             async {
                 commands::transact::transcribe(
                     args,
-                    commands::transact::Context::new(
+                    hellas_sdk::home::Home::new(
                         &local_identity,
                         owner.as_ref(),
                         &home,
@@ -637,7 +637,7 @@ async fn async_main() {
             async {
                 commands::transact::text(
                     args,
-                    commands::transact::Context::new(
+                    hellas_sdk::home::Home::new(
                         &local_identity,
                         owner.as_ref(),
                         &home,
@@ -652,7 +652,7 @@ async fn async_main() {
             async {
                 commands::transact::image(
                     args,
-                    commands::transact::Context::new(
+                    hellas_sdk::home::Home::new(
                         &local_identity,
                         owner.as_ref(),
                         &home,

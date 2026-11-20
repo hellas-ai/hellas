@@ -16,7 +16,7 @@ pub(crate) struct IrohBackend {
     pub assurance: hellas_rpc::Assurance,
 }
 impl Backend {
-    fn executor(&self) -> Result<&hellas_executor::ExecutorHandle, BackendFault> {
+    fn executor_handle(&self) -> Result<&hellas_executor::ExecutorHandle, BackendFault> {
         match &self.state {
             BackendState::Unavailable(error) => Err(BackendFault::caused_by(
                 std::io::Error::other(error.clone()),
@@ -112,7 +112,7 @@ impl WorkBackend for IrohBackend {
             .try_acquire_owned()
             .map_err(|_| AdmissionError::Capacity)?;
         let permit = inner
-            .executor()?
+            .executor_handle()?
             .try_admit(key, caller)?
             .cancellable(job.cancellation());
         Ok(permit.retaining(reserved(inner, job, slot)))
@@ -142,7 +142,7 @@ impl WorkBackend for IrohBackend {
                 .await
                 .map_err(|_| AdmissionError::Closed)?;
             let permit = inner
-                .executor()?
+                .executor_handle()?
                 .reserve(&key)
                 .await?
                 .cancellable(job.cancellation());
@@ -174,7 +174,10 @@ fn reserved(
                 let (inner, job, _) = &*selected;
                 job.running(&inner.id);
                 job.accepted();
-                let result = inner.executor()?.execute_stream(input, progress).await;
+                let result = inner
+                    .executor_handle()?
+                    .execute_stream(input, progress)
+                    .await;
                 if job.is_cancelled() {
                     job.stopped();
                 } else {

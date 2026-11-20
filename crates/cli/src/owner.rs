@@ -2,7 +2,8 @@
 //! use, or one held outside the home.
 use clap::Args;
 use hellas_kernel::SoftPasskey;
-use std::io::Write as _;
+#[cfg(test)]
+use hellas_sdk::identity::principal;
 use std::path::{Path, PathBuf};
 
 /// The principal key every command acting for a principal uses by default.
@@ -28,30 +29,6 @@ impl OwnerArgs {
             .then(|| crate::commands::chain::passkey(&path))
             .transpose()
     }
-}
-
-/// The home principal key, created on first use: a private P-256 software
-/// key that never leaves this machine.
-pub(crate) fn principal(home: &Path) -> anyhow::Result<SoftPasskey> {
-    let path = home.join(PRINCIPAL_KEY);
-    if !path.try_exists()? {
-        hellas_private::create_dir_all_durable(home)?;
-        let secret = loop {
-            let secret = rand::random::<[u8; 32]>();
-            if SoftPasskey::from_secret_scalar(secret).is_ok() {
-                break secret;
-            }
-        };
-        let mut file = hellas_private::private_tempfile(home, ".principal-", ".new")?;
-        file.write_all(&secret)?;
-        file.as_file().sync_all()?;
-        // A concurrent first use created it; both use the one that won.
-        if file.persist_noclobber(&path).is_ok() {
-            hellas_private::sync_directory(home)?;
-            eprintln!("Created principal key: {}", path.display());
-        }
-    }
-    crate::commands::chain::passkey(&path)
 }
 
 #[cfg(test)]

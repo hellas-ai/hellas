@@ -1,21 +1,14 @@
 //! Job folders and helpers share the SDK transaction and its existing journals.
 use anyhow::{Context as _, bail, ensure};
 use clap::Args;
-use hellas_auth::ProducerSigningKey;
-use hellas_auth::authority::{NodeKey, ResourceId, UnixMillis};
-use hellas_kernel::Secp256k1Signer;
-use hellas_private::StoreLocation;
+use hellas_auth::authority::ResourceId;
 use hellas_rpc::Assurance;
 use hellas_sdk::BackendState;
 use hellas_sdk::{
     Backend,
-    execution::{
-        Completed, ExecutionAttempt, ExecutionError, ExecutionTarget, ExecutionTerms, Executor,
-        RequestStopped,
-    },
-    grant_client::{GrantSessionOptions, UnpinnedOffer},
+    execution::{Completed, ExecutionAttempt, ExecutionError, Executor, RequestStopped},
     job::{Job, JobInput},
-    paid_client::{PaidWorkOptions, bind_paid_endpoint},
+    paid_client::PaidWorkOptions,
     transact::PaidAttemptPath,
 };
 use std::{
@@ -219,77 +212,7 @@ pub struct FetchArgs {
     target: TargetArgs,
 }
 
-pub struct Context {
-    pub transport: iroh::SecretKey,
-    pub settlement: Secp256k1Signer,
-    pub producer: ProducerSigningKey,
-    owner: std::sync::OnceLock<hellas_kernel::SoftPasskey>,
-    pub home: StoreLocation,
-    pub chain: hellas_chain::chain_dir::ChainDir,
-    /// Bound on first use; [`bounded`] closes them however the command ends,
-    /// after the executor that borrowed them has finished.
-    paid_endpoint: tokio::sync::OnceCell<iroh::Endpoint>,
-    grant_endpoint: tokio::sync::OnceCell<iroh::Endpoint>,
-    #[cfg(feature = "compute")]
-    local_content: tokio::sync::OnceCell<hellas_store::content::DiskStore>,
-}
-
-impl Context {
-    pub(crate) fn new(
-        identity: &crate::identity::LocalIdentity,
-        owner: Option<&hellas_kernel::SoftPasskey>,
-        home: &StoreLocation,
-        chain: &hellas_chain::genesis::ChainProfile,
-    ) -> super::CliResult<Self> {
-        Ok(Self {
-            transport: identity.transport_key.clone(),
-            settlement: crate::identity::settlement_signer(identity)?,
-            producer: identity.node_key.clone(),
-            owner: owner
-                .cloned()
-                .map_or_else(std::sync::OnceLock::new, Into::into),
-            home: home.clone(),
-            chain: hellas_chain::chain_dir::ChainDir::open(home, chain)?,
-            paid_endpoint: tokio::sync::OnceCell::new(),
-            grant_endpoint: tokio::sync::OnceCell::new(),
-            #[cfg(feature = "compute")]
-            local_content: tokio::sync::OnceCell::new(),
-        })
-    }
-
-    /// Model preparation can open local content before execution has a backend.
-    async fn model_command(
-        &self,
-        work: impl std::future::Future<Output = super::CliResult<()>>,
-    ) -> super::CliResult<()> {
-        let result = work.await;
-        #[cfg(feature = "compute")]
-        if let Some(content) = self.local_content.get() {
-            content.close().await;
-        }
-        result
-    }
-
-    /// Paid and granted work act for the principal, whose home key is
-    /// created on first use; local work needs none.
-    fn owner(&self) -> super::CliResult<&hellas_kernel::SoftPasskey> {
-        if let Some(owner) = self.owner.get() {
-            return Ok(owner);
-        }
-        let owner = crate::owner::principal(&self.home)?;
-        Ok(self.owner.get_or_init(|| owner))
-    }
-
-    async fn paid_endpoint(&self) -> super::CliResult<iroh::Endpoint> {
-        let bind = || bind_paid_endpoint(self.transport.clone());
-        Ok(self.paid_endpoint.get_or_try_init(bind).await?.clone())
-    }
-
-    async fn grant_endpoint(&self) -> super::CliResult<iroh::Endpoint> {
-        let bind = || hellas_sdk::grant_client::bind_endpoint(self.transport.clone());
-        Ok(self.grant_endpoint.get_or_try_init(bind).await?.clone())
-    }
-}
+use hellas_sdk::home::{Home as Context, PaidSettings, TargetSpec};
 
 impl ClientArgs {
     fn paid_provider(&self) -> super::CliResult<&Provider> {
@@ -300,16 +223,6 @@ impl ClientArgs {
 
     fn root(&self, context: &Context) -> PathBuf {
         context.chain.client().into_path_buf()
-    }
-    fn owner(
-        &self,
-        context: &Context,
-    ) -> super::CliResult<Arc<hellas_sdk::client_owner::ClientOwner>> {
-        Ok(Arc::new(hellas_sdk::client_owner::ClientOwner::new(
-            Arc::new(context.owner()?.clone()),
-            context.settlement.party_key(),
-            &context.chain,
-        )?))
     }
     /// The attempt `owner` keeps for `job` at this provider. Takes the
     /// owner rather than opening it: the funding wallet is one exclusive
@@ -330,18 +243,6 @@ impl ClientArgs {
         select_attempt(&path, job, self.buy_again)
     }
 
-    async fn options(
-        &self,
-        context: &Context,
-        price: u64,
-        assurance: Assurance,
-    ) -> super::CliResult<PaidWorkOptions> {
-        self.paid_provider()?;
-        let config = client::config(self, context).await?;
-        let content = hellas_sdk::chain_home::open_client_content(&context.chain).await?;
-        self.options_with_config(context, price, assurance, config, content)
-    }
-
     fn options_with_config(
         &self,
         context: &Context,
@@ -350,31 +251,37 @@ impl ClientArgs {
         config: hellas_sdk::work_config::WorkConfig,
         content: hellas_store::content::DiskStore,
     ) -> super::CliResult<PaidWorkOptions> {
-        let provider = self.paid_provider()?;
-        let apple_trust = match (&self.trust_store, &self.trust_policy, assurance) {
-            (Some(directory), Some(id), _) => Some(
-                hellas_sdk::trust_policy::TrustPolicyStore::new(directory).resolve(
-                    id,
-                    assurance,
-                    crate::identity::assertion_counters(&context.home)?,
-                )?,
-            ),
-            (None, None, Assurance::ProducerSigned) => None,
-            _ => bail!("Apple providers require --trust-store and --trust-policy"),
-        };
-        Ok(PaidWorkOptions {
-            content,
+        self.settings()?.options(
+            self.paid_provider()?.address,
+            price,
+            assurance,
             config,
-            provider: provider.address,
-            provider_addrs: provider
+            content,
+            hellas_sdk::identity::assertion_counters(&context.home)?,
+        )
+    }
+
+    fn trust(&self) -> super::CliResult<Option<hellas_sdk::daemon_config::Trust>> {
+        match (&self.trust_store, &self.trust_policy) {
+            (Some(store), Some(policy)) => Ok(Some(hellas_sdk::daemon_config::Trust {
+                store: store.clone(),
+                policy: policy.clone(),
+            })),
+            (None, None) => Ok(None),
+            _ => bail!("Apple providers require --trust-store and --trust-policy"),
+        }
+    }
+    fn settings(&self) -> super::CliResult<PaidSettings> {
+        let provider = self.paid_provider()?;
+        Ok(PaidSettings {
+            addresses: provider
                 .addresses
                 .iter()
                 .chain(&self.addresses)
                 .copied()
                 .collect(),
-            assurance,
-            apple_trust,
-            expected_price: price,
+            validators: self.validators.clone(),
+            trust: self.trust()?,
             acceptance_blocks: self.acceptance_blocks,
             terminal_blocks: self.terminal_blocks,
             payment_blocks: self.payment_blocks,
@@ -383,80 +290,9 @@ impl ClientArgs {
     }
 }
 
-fn select_attempt(
-    path: &PaidAttemptPath,
-    job: &Job,
-    buy_again: bool,
-) -> super::CliResult<ExecutionAttempt> {
-    let parent = path
-        .as_path()
-        .parent()
-        .context("purchase directory is missing")?;
-    path.durability().create_dir_all(parent)?;
-    let pointer = path.as_path().with_extension("latest");
-    struct AttemptPointerLock(std::fs::File);
-    impl Drop for AttemptPointerLock {
-        fn drop(&mut self) {
-            let _ = self.0.unlock();
-        }
-    }
-    let lock = hellas_private::open_lock_beside(&pointer)?;
-    lock.try_lock()
-        .map_err(|_| anyhow::anyhow!("another command is selecting this job's attempt"))?;
-    let _lock = AttemptPointerLock(lock);
-    let existing = match hellas_private::read_bounded_regular_file(&pointer, 32) {
-        Ok(bytes) => Some(bytes),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.into()),
-    };
-    if !buy_again && let Some(id) = existing {
-        let id = std::str::from_utf8(&id)?;
-        ensure!(
-            id.len() == 32
-                && id
-                    .bytes()
-                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
-            "invalid purchase attempt pointer"
-        );
-        let nonce: [u8; 16] = hex::decode(id)?
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("invalid purchase attempt pointer"))?;
-        let attempt_path = path.with_nonce(nonce);
-        return Ok(ExecutionAttempt::open_existing_paid(
-            &attempt_path,
-            job.input(),
-            job.price(),
-        )?);
-    }
-    if !buy_again {
-        let prefix = format!("{}.", job.digest());
-        for entry in std::fs::read_dir(parent)? {
-            let name = entry?.file_name();
-            let Some(name) = name.to_str() else { continue };
-            if let Some(id) = name
-                .strip_prefix(&prefix)
-                .and_then(|name| name.strip_suffix(".json"))
-                && id.len() == 32
-                && id.bytes().all(|byte| byte.is_ascii_hexdigit())
-            {
-                bail!(
-                    "purchase attempt pointer is missing; recover the existing attempt before starting another"
-                );
-            }
-        }
-    }
-    let nonce = rand::random::<[u8; 16]>();
-    let id = hex::encode(nonce);
-    let attempt_path = path.with_nonce(nonce);
-    ensure!(
-        !attempt_path.as_path().try_exists()?,
-        "purchase attempt identity already exists"
-    );
-    let attempt = ExecutionAttempt::open_paid(&attempt_path, job.input(), job.price())?;
-    path.durability()
-        .write_atomically(&pointer, ".writing", id.as_bytes())?;
-    Ok(attempt)
-}
+use hellas_sdk::home::select_attempt;
+#[cfg(test)]
+use hellas_sdk::home::select_policy;
 
 /// One deadline for the whole command, from `--timeout`; without one, wait
 /// until it is done. The endpoints the command bound close however it ends,
@@ -477,12 +313,7 @@ async fn bounded<T>(
             _ => error,
         }
     });
-    for endpoint in [context.paid_endpoint.get(), context.grant_endpoint.get()]
-        .into_iter()
-        .flatten()
-    {
-        endpoint.close().await;
-    }
+    context.close().await;
     result
 }
 
@@ -574,81 +405,50 @@ impl TargetArgs {
                 .content(context)
                 .await?
                 .context("local content is not prepared")?;
-            let execution =
-                crate::compute::local(content, self.native, Arc::new(context.producer.clone()))
-                    .await?;
-            return Ok(ResolvedBackend {
-                backend: Backend::local(
-                    execution,
-                    client.timeout.unwrap_or(Duration::from_secs(86_400)),
-                ),
-                attempt: None,
-            });
+            return Ok(context
+                .target(TargetSpec::Local {
+                    content,
+                    gpu: hellas_executor::GpuConfig {
+                        backend: self
+                            .native
+                            .gpu
+                            .evaluator
+                            .unwrap_or_else(hellas_executor::catena::default_gpu),
+                        session_programs: self.native.gpu.gpu_session_programs,
+                        session_asset_bytes: self.native.gpu.gpu_session_asset_bytes,
+                    },
+                    timeout: client.timeout.unwrap_or(Duration::from_secs(86_400)),
+                })
+                .await?
+                .into());
         }
-        let Some(access) = self.access.as_deref() else {
-            ensure!(
-                pay > 0,
-                "paid execution requires --pay MAX; select --access for grant work"
-            );
-            return Ok(Backend::paid(
-                None,
-                client.options(context, pay, assurance).await?,
-                context.paid_endpoint().await?,
-                context.settlement.clone(),
-                client.owner(context)?,
-            )
-            .into());
-        };
-        let principal = super::contributions::principal(context.owner()?)?;
-        let holder = NodeKey::from_public_key(context.producer.public_key())?;
-        let (offers, application) =
-            hellas_sdk::access_bundle::AccessBundle::load(access, &principal, &holder)
-                .with_context(|| format!("access file {}", access.display()))?
-                .into_parts();
-        let [offer] = <[_; 1]>::try_from(offers)
-            .map_err(|_| anyhow::anyhow!("a job uses an access file with one offer"))?;
-        let provider = hellas_sdk::client::ProviderAddress::of(&offer.offer().provider)?;
-        if let Some(expected) = &client.provider {
-            ensure!(
-                expected.addresses.is_empty(),
-                "grant addresses come from the signed offer"
-            );
-            ensure!(
-                provider == expected.address,
-                "offer does not match --provider"
-            );
-        }
-        let trust = match (&client.trust_store, &client.trust_policy, assurance) {
-            (Some(directory), Some(id), assurance) => {
-                hellas_sdk::trust_policy::TrustPolicyStore::new(directory).resolve(
-                    id,
+        let spec = match self.access {
+            Some(file) => {
+                if let Some(provider) = &client.provider {
+                    ensure!(
+                        provider.addresses.is_empty(),
+                        "grant addresses come from the signed offer"
+                    );
+                }
+                TargetSpec::Access {
+                    file,
+                    provider: client.provider.as_ref().map(|p| p.address),
+                    trust: client.trust()?,
+                    resource: self.resource,
                     assurance,
-                    crate::identity::assertion_counters(&context.home)?,
-                )?
+                }
             }
-            (None, None, Assurance::ProducerSigned) => hellas_client::ProviderTrustAnchor {
-                expected_genesis: provider.enrollment,
-                required_assurance: Assurance::ProducerSigned,
-                apple_app_attest: None,
+            None => TargetSpec::Paid {
+                provider: client.paid_provider()?.address,
+                max_price: pay,
+                assurance,
+                settings: client.settings()?,
             },
-            _ => bail!("Apple providers require --trust-store and --trust-policy"),
         };
-        let target = UnpinnedOffer::decode(&offer.encode()?, UnixMillis(0))?.pin(&trust)?;
-        let policy = select_policy(&offer.offer().grant.policies, self.resource)?.clone();
-        let mut resolved = ResolvedBackend::from(Backend::grant(
-            policy,
-            GrantSessionOptions {
-                target,
-                principal,
-                signer: Arc::new(context.producer.clone()),
-                application: Arc::new(application),
-                journal_root: super::contributions::client_journal_root(&context.home, &principal)?,
-                control_timeout: Duration::from_secs(90),
-            },
-            hellas_sdk::grant_client::GrantTransport::Remote(context.grant_endpoint().await?),
-        ));
-        resolved.attempt = self.attempt;
-        Ok(resolved)
+        Ok(ResolvedBackend {
+            backend: context.target(spec).await?,
+            attempt: self.attempt,
+        })
     }
 }
 
@@ -671,46 +471,24 @@ impl ResolvedBackend {
         context: &Context,
         job: &Job,
     ) -> super::CliResult<(Executor, String)> {
-        let mut executor = Executor::new(self.backend.clone());
-        let provider = match &executor.backend.state {
-            BackendState::Unavailable(error) => anyhow::bail!("{error}"),
-            BackendState::Paid(paid) => {
-                let hellas_sdk::PaidBackend { options, owner, .. } = paid.as_ref();
-                executor.attempt = Some(client.purchase(context, job, options, owner)?);
-                executor.settle = client.settle;
-                options.provider.to_string()
-            }
+        let mut executor = if client.buy_again {
+            let BackendState::Paid(paid) = &self.backend.state else {
+                bail!("only paid work can be bought again")
+            };
+            let mut executor = Executor::new(self.backend.clone());
+            executor.attempt = Some(client.purchase(context, job, &paid.options, &paid.owner)?);
+            executor
+        } else {
+            self.backend.executor(job, self.attempt.as_deref())?
+        };
+        executor.settle = client.settle;
+        let provider = match &self.backend.state {
+            BackendState::Paid(paid) => paid.options.provider.to_string(),
             BackendState::Grant(grant) => {
-                let hellas_sdk::GrantBackend {
-                    options, policy, ..
-                } = grant.as_ref();
-                job.input().admits(&policy.invocation_policy, false)?;
-                let offer = options.target.offer();
-                let provider = hellas_sdk::client::ProviderAddress::of(&offer.provider)?;
-                let default_attempt = context
-                    .home
-                    .join("grants")
-                    .join("grant-attempts")
-                    .join(provider.to_string())
-                    .join(offer.grant.id.to_string())
-                    .join(format!("{}.json", job.digest()));
-                let mut attempt = ExecutionAttempt::open(
-                    self.attempt.as_deref().unwrap_or(&default_attempt),
-                    job.input(),
-                    ExecutionTerms::Grant {
-                        resource: policy.resource,
-                    },
-                )?;
-                attempt.bind_target(ExecutionTarget {
-                    network: offer.network,
-                    provider,
-                })?;
-                executor.attempt = Some(attempt);
-                provider.to_string()
+                hellas_sdk::client::ProviderAddress::of(&grant.options.target.offer().provider)?
+                    .to_string()
             }
-            BackendState::Fetch { .. } | BackendState::Local { .. } => {
-                hex::encode(context.producer.public_key().bytes())
-            }
+            _ => hex::encode(context.producer.public_key().bytes()),
         };
         Ok((executor, provider))
     }
@@ -722,25 +500,6 @@ impl ResolvedBackend {
             BackendState::Unavailable(_) | BackendState::Fetch { .. } | BackendState::Grant(_) => {}
         }
         Ok(())
-    }
-}
-
-fn select_policy(
-    policies: &[hellas_authority::model::grant::records::GrantPolicy],
-    resource: Option<ResourceId>,
-) -> anyhow::Result<&hellas_authority::model::grant::records::GrantPolicy> {
-    match resource {
-        Some(id) => policies
-            .iter()
-            .find(|policy| policy.resource == id)
-            .context("selected --resource is absent from the offer"),
-        None => {
-            ensure!(
-                policies.len() == 1,
-                "offer must contain one policy unless --resource selects an explicit resource ID"
-            );
-            Ok(&policies[0])
-        }
     }
 }
 
