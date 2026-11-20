@@ -1,13 +1,84 @@
 # Nix, Docker and NixOS
 
 The main outputs are `.#cli` (the portable client, node and gateway, without
-local Catena Compute), `.#cli-validator`, and the `.#docker`, `.#docker-hip`
-and `.#docker-cuda` images. The NixOS module and the GPU images build the CLI
+local Catena Compute), `.#cli-validator`, `.#cli-cuda`, `.#cli-hip`, and the
+`.#docker`, `.#docker-hip` and `.#docker-cuda` images. The GPU CLI packages,
+NixOS module and GPU images build the CLI
 with Compute (`cli.override { compute = true; }`), which adds `--local` and
 serving Compute jobs.
 Hellas imports only `catena-lang` from the Catena workspace, pinned to a
 published Git revision in `Cargo.toml` and `Cargo.lock`. Nix vendors the same
 locked dependency; a sibling Catena checkout is not required.
+
+## Local GPU one-liners
+
+On x86_64 Linux, `cli-cuda` supplies the Compute CLI and NVIDIA runtime
+compiler environment. Use `cli-hip` instead for AMD. These packages share
+their runtime environment with the GPU images; the host supplies the driver.
+Run the preparation commands once in a writable directory. Model revisions
+are pinned, and conversion destinations must not already exist.
+
+### Text
+
+```sh
+curl -fLo qwen3.gguf https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/50968a4468ef4233ed78cd7c3de230dd1d61a56b/Qwen3-0.6B-BF16.gguf
+nix run github:hellas-ai/hellas#cli-cuda -- text --model ./qwen3.gguf --prompt 'Say hello. /no_think' --max-tokens 32 --local
+```
+
+### Transcription
+
+```sh
+nix run github:hellas-ai/hellas#cli-cuda -- convert-whisper openai/whisper-tiny@169d4a4341b33bc18d8881c4b69c2e104e1cc0af -o ./whisper-tiny
+curl -fLo sample.wav https://raw.githubusercontent.com/ggml-org/whisper.cpp/b0a11594aec50892a02cd8d129eee2dfe93a8bb8/samples/jfk.wav
+nix run github:hellas-ai/hellas#cli-cuda -- transcribe --model ./whisper-tiny --audio sample.wav --local
+```
+
+### Speech
+
+MMS English synthesis uses the gateway's speech API. `--wrap` gives the child
+the URL and bearer and shuts down the gateway when the child exits.
+
+```sh
+nix run github:hellas-ai/hellas#cli-cuda -- convert-speech facebook/mms-tts-eng@c71de0fe7204c83f1c10820a7d696d0b450048ba -o ./mms
+nix run github:hellas-ai/hellas#cli-cuda -- gateway --model ./mms --wrap sh -- -c 'curl -fsS "$OPENAI_BASE_URL/audio/speech" -H "Authorization: Bearer $OPENAI_API_KEY" --json "{\"model\":\"mms\",\"input\":\"Hello from Hellas.\",\"voice\":\"default\",\"response_format\":\"wav\"}" -o tts.wav'
+```
+
+### Image
+
+```sh
+nix run github:hellas-ai/hellas#cli-cuda -- convert-flux black-forest-labs/FLUX.2-klein-4B@e7b7dc27f91deacad38e78976d1f2b499d76a294 -o ./klein
+nix run github:hellas-ai/hellas#cli-cuda -- image --model ./klein --prompt 'a small red fox' --seed 42 --width 512 --height 512 --steps 4 --local -o fox.png
+```
+
+### Gateway for all four models
+
+Local model paths select local execution automatically; `gateway` does not
+accept `--local`. After the preparation commands above, start a shell connected
+to one gateway:
+
+```sh
+nix run github:hellas-ai/hellas#cli-cuda -- gateway --model ./qwen3.gguf --model ./whisper-tiny --model ./mms --model ./klein --wrap bash
+```
+
+Run these in that shell. Model names come from the package filenames. Exit the
+shell to stop the gateway.
+
+```sh
+curl -fsS "$OPENAI_BASE_URL/models" -H "Authorization: Bearer $OPENAI_API_KEY"
+curl -fsS "$OPENAI_BASE_URL/chat/completions" -H "Authorization: Bearer $OPENAI_API_KEY" --json '{"model":"qwen3","messages":[{"role":"user","content":"Say hello. /no_think"}],"max_tokens":32}'
+curl -fsS "$OPENAI_BASE_URL/responses" -H "Authorization: Bearer $OPENAI_API_KEY" --json '{"model":"qwen3","input":"Say hello. /no_think","max_output_tokens":32}'
+curl -fsS "$OPENAI_BASE_URL/completions" -H "Authorization: Bearer $OPENAI_API_KEY" --json '{"model":"qwen3","prompt":"Say hello. /no_think","max_tokens":32}'
+curl -fsS "$ANTHROPIC_BASE_URL/v1/messages" -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" --json '{"model":"qwen3","messages":[{"role":"user","content":"Say hello. /no_think"}],"max_tokens":32}'
+curl -fsS "$OPENAI_BASE_URL/audio/transcriptions" -H "Authorization: Bearer $OPENAI_API_KEY" -F model=whisper-tiny -F file=@sample.wav
+curl -fsS "$OPENAI_BASE_URL/audio/speech" -H "Authorization: Bearer $OPENAI_API_KEY" --json '{"model":"mms","input":"Hello from Hellas.","voice":"default","response_format":"wav"}' -o gateway-tts.wav
+curl -fsS "$OPENAI_BASE_URL/images/generations" -H "Authorization: Bearer $OPENAI_API_KEY" --json '{"model":"klein","prompt":"a small red fox","seed":42,"size":"512x512","steps":4}' -o gateway-image.json
+```
+
+The image response contains `data[0].b64_json`. Local routes share one
+serialized GPU executor; its resident weight cache and execution buffers must
+fit the available VRAM. See [jobs](jobs.md) for signed outputs and image variants.
+
+## Development and deployment
 
 Enter an x86_64 Linux GPU development shell with:
 
