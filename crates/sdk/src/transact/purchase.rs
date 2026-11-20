@@ -431,7 +431,7 @@ impl Purchase {
             bond: bond.to_bytes(),
             nonce,
             request_commitment: *request_commitment.as_bytes(),
-            accepted: None,
+            accepted: self.record.proposal.as_ref().and_then(|held| held.accepted),
             outcome: None,
         };
         match &self.record.proposal {
