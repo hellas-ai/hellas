@@ -273,6 +273,11 @@ let
 
   linuxOutputs = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux (
     let
+      gpuCli =
+        backend:
+        (import ./gpu-runtime.nix { inherit pkgs backend; }).wrap (
+          nativePackages.cli.override { compute = true; }
+        );
       docker = import ./docker.nix {
         inherit
           pkgs
@@ -314,6 +319,8 @@ let
           }).image;
       }
       // lib.optionalAttrs isX86_64Linux {
+        cli-cuda = gpuCli "cuda";
+        cli-hip = gpuCli "hip";
         docker-cuda = dockerCuda.image;
         docker-hip = dockerHip.image;
       };
