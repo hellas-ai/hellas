@@ -679,23 +679,30 @@ async fn tcp_connections_without_a_websocket_upgrade_hit_the_handshake_deadline(
     use tokio::io::AsyncReadExt as _;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let (client, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
+    let mut client = client.unwrap();
+    let (stream, _) = accepted.unwrap();
     let (activity, _) = broadcast::channel(1);
-    let server = tokio::spawn(serve_listener(
-        listener,
-        MempoolClient::default(),
-        activity,
-        LightClientRpcState::default(),
-        hellas_wire::admission::ConnectionSlots::new(3, 2, 3),
+    let mut server = Box::pin(serve_connection(
+        stream,
+        LightClientRpc::new(MempoolClient::default(), activity),
     ));
-    let mut client = TcpStream::connect(addr).await.unwrap();
-    // Paused time: the deadline elapses virtually, so this costs no wall time.
-    let started = tokio::time::Instant::now();
-    let closed = tokio::time::timeout(HANDSHAKE_TIMEOUT + HANG_GUARD, client.read_u8())
+    // Arm the server's timer before advancing its clock; TCP setup is complete.
+    let started = Instant::now();
+    assert!(futures_util::poll!(&mut server).is_pending());
+    tokio::time::advance(HANDSHAKE_TIMEOUT / 2).await;
+    assert!(futures_util::poll!(&mut server).is_pending());
+    assert_eq!(
+        client.try_read(&mut [0]).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock,
+    );
+    let error = server
         .await
-        .expect("an incomplete HTTP upgrade must not retain its connection slot forever");
-    assert!(closed.is_err());
+        .expect_err("an incomplete HTTP upgrade must hit the server's deadline");
+    assert!(error.is::<tokio::time::error::Elapsed>());
     assert!(started.elapsed() >= HANDSHAKE_TIMEOUT);
-    server.abort();
+    // Observe the real socket only after the server has finished closing it.
+    assert!(client.read_u8().await.is_err());
 }
 
 #[tokio::test]
