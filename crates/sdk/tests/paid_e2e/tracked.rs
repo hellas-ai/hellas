@@ -66,6 +66,19 @@ fn paid_public_boundaries_reject_another_chain_before_proposal() {
             recover_attempt.bind_target(target).unwrap();
             let recover_marker = std::fs::read(recover_path.as_path()).unwrap();
             assert!(matches!(
+                recover_attempt
+                    .settle_paid(&case.options, case.owner.principal(), &client_settlement())
+                    .await,
+                Err(ExecutionError::Identity)
+                    | Err(ExecutionError::Purchase(
+                        hellas_sdk::transact::PurchaseError::Identity
+                    ))
+            ));
+            assert_eq!(
+                std::fs::read(recover_path.as_path()).unwrap(),
+                recover_marker
+            );
+            assert!(matches!(
                 ExecutionSession::Paid(&mut session)
                     .recover(&mut recover_attempt)
                     .await,

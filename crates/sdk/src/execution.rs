@@ -1410,14 +1410,7 @@ impl<'a> ExecutionSession<'a> {
                 {
                     purchase.paid(work)?;
                 }
-                let mut facts = attempt.inspect()?;
-                if let Some(work) = accepted
-                    && facts.work.is_none()
-                {
-                    facts.work = Some(work);
-                    facts.acceptance = Acceptance::Accepted;
-                }
-                return Ok(facts);
+                return attempt.inspect();
             }
             Self::Grant(session) => {
                 let tracker = attempt.grant_on(session)?;
