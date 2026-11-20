@@ -1241,6 +1241,44 @@ impl ExecutionAttempt {
         }))
     }
 
+    /// Delete this attempt's retained output and transcript, including interrupted
+    /// writes. Keep its identifiers, payment outcome and delivery acknowledgement.
+    /// Safe to repeat after a crash; this never permits another execution.
+    pub fn purge_result(&mut self) -> Result<()> {
+        let durability = self.sidecar_durability();
+        if let Some(mut receipt) = self.read_receipt()?
+            && receipt.retained
+        {
+            receipt.retained = false;
+            durability.write_atomically(
+                &self.sidecar(".receipt")?,
+                ".writing",
+                &serde_json::to_vec(&receipt)?,
+            )?;
+        }
+        let path = self.sidecar(".result")?;
+        let directory = path.parent().ok_or(ExecutionError::Identity)?;
+        let name = path.file_name().ok_or(ExecutionError::Identity)?;
+        let prefix = format!(".{}.", name.to_string_lossy());
+        let entries = match std::fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let entry_name = entry.file_name();
+            let interrupted = entry_name
+                .to_str()
+                .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".writing"));
+            if entry_name == name || interrupted {
+                std::fs::remove_file(entry.path())?;
+            }
+        }
+        durability.sync_directory(directory)?;
+        Ok(())
+    }
+
     /// Record delivery only after the caller has committed its own result.
     pub fn reported(&mut self) -> Result<()> {
         let mut receipt = self

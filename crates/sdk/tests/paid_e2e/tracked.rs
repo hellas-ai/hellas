@@ -342,20 +342,43 @@ fn paid_output_survives_settlement_identity_failure_and_replays_offline() {
                         Digest::hash(path.file_name().unwrap().as_encoded_bytes()).as_bytes()
                     ),
                 ));
-            std::fs::remove_file(&result_path).unwrap();
+            let interrupted = result_path.with_file_name(format!(
+                ".{}.interrupted.writing",
+                result_path.file_name().unwrap().to_str().unwrap()
+            ));
+            std::fs::write(&interrupted, b"partial private output").unwrap();
+            let other_result = result_path.with_file_name("another-attempt.result");
+            std::fs::write(&other_result, b"another attempt's output").unwrap();
+            let identity = (job.digest(), job.input().tracking_digest(), job.price());
+            drop(job);
+            attempt.purge_result().unwrap();
+            attempt.purge_result().unwrap();
+            assert!(!result_path.exists());
+            assert!(!interrupted.exists());
+            assert!(other_result.exists());
+            assert_eq!(std::fs::read(&path).unwrap(), paid_marker);
+            drop(attempt);
+            let attempt =
+                ExecutionAttempt::reopen_paid(&paid_path, identity.0, identity.1, identity.2)
+                    .unwrap();
+            let facts = attempt.inspect().unwrap();
+            assert_eq!(facts.payment, Payment::Paid);
+            assert!(facts.reported);
+            assert!(!facts.result_available);
             assert!(matches!(
                 attempt.retained_paid_result(),
                 Err(ExecutionError::ResultUnavailable)
             ));
             drop(attempt);
-            // An older paid marker may have no completion receipt at all.
+            // A crash can leave a paid marker and output without a completion receipt.
             std::fs::remove_file(result_path.with_extension("receipt")).unwrap();
+            std::fs::write(&result_path, b"orphan private output").unwrap();
             std::fs::write(&path, paid_marker).unwrap();
-            let identity = (job.digest(), job.input().tracking_digest(), job.price());
-            drop(job);
-            let attempt =
+            let mut attempt =
                 ExecutionAttempt::reopen_paid(&paid_path, identity.0, identity.1, identity.2)
                     .unwrap();
+            attempt.purge_result().unwrap();
+            assert!(!result_path.exists());
             let facts = attempt.inspect().unwrap();
             assert_eq!(facts.payment, Payment::Paid);
             assert!(!facts.reported);
