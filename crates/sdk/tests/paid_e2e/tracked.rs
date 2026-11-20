@@ -734,23 +734,26 @@ fn tracked_attempts_reuse_retained_policy_with_zero_funding_cap() {
                         .await
                         .unwrap()
                 );
-                let before = std::fs::read(&lost_path).unwrap();
                 let mut lost =
                     ExecutionAttempt::open_existing_paid(&lost_attempt_path, job.input(), PRICE)
                         .unwrap();
-                assert!(matches!(
+                let facts = ExecutionSession::Paid(&mut session)
+                    .recover(&mut lost)
+                    .await
+                    .unwrap();
+                assert_eq!(facts.work, Some(result.work_id));
+                assert_eq!(facts.payment, Payment::Paid);
+                assert!(!facts.result_available);
+                let recovered = std::fs::read(&lost_path).unwrap();
+                assert_eq!(
                     ExecutionSession::Paid(&mut session)
                         .recover(&mut lost)
-                        .await,
-                    Err(ExecutionError::Purchase(
-                        hellas_sdk::transact::PurchaseError::Unfinished {
-                            reason: "the proposal nonce was consumed but no active request-bound acceptance remains",
-                            ..
-                        }
-                    ))
-                ));
-                assert_eq!(std::fs::read(&lost_path).unwrap(), before);
-                assert_eq!(lost.inspect().unwrap().work, None);
+                        .await
+                        .unwrap()
+                        .payment,
+                    Payment::Paid
+                );
+                assert_eq!(std::fs::read(&lost_path).unwrap(), recovered);
                 assert_eq!(
                     session
                         .with_state(|state| state.ledger().credited_cumulative())
