@@ -2,6 +2,7 @@
 use super::super::job::Job;
 use hellas_auth::Digest;
 use hellas_auth::authority::PrincipalId;
+use hellas_channel::model::work::{PaidJobAuthorizationV2, PrivateRecord, work_id};
 use hellas_kernel::EdgeId;
 use hellas_private::Durability;
 use serde::{Deserialize, Serialize};
@@ -117,7 +118,17 @@ struct Proposal {
     nonce: u64,
     request_commitment: [u8; 32],
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    accepted: Option<Accepted>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     outcome: Option<Outcome>,
+}
+
+/// Authorization metadata binds a retained acceptance after the active job is archived.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct Accepted {
+    work: [u8; 32],
+    authorization: Vec<u8>,
 }
 
 /// Terminal work, kept so a paid attempt whose result was lost is refused
@@ -256,7 +267,14 @@ impl Purchase {
         self.record.target.as_ref() == Some(target)
     }
     pub(crate) fn work_id(&self) -> Option<Digest> {
-        self.outcome().map(|(work, _)| work)
+        self.outcome().map(|(work, _)| work).or_else(|| {
+            self.record
+                .proposal
+                .as_ref()?
+                .accepted
+                .as_ref()
+                .map(|accepted| Digest::from_bytes(accepted.work))
+        })
     }
     /// Terminal work and whether it was paid.
     pub(crate) fn outcome(&self) -> Option<(Digest, bool)> {
@@ -272,7 +290,7 @@ impl Purchase {
     /// has checked both signatures. The request commitment distinguishes this
     /// intent from a later attempt that reused a nonce never proposed here.
     pub(crate) fn accepted_work(
-        &self,
+        &mut self,
         state: &hellas_channel::work_store::Channel,
     ) -> Result<Option<Digest>> {
         let Some(proposal) = &self.record.proposal else {
@@ -282,11 +300,33 @@ impl Purchase {
         if proposal.channel != *channel.as_bytes() {
             return Err(PurchaseError::Identity);
         }
+        if let Some(accepted) = &proposal.accepted {
+            let authorization = PaidJobAuthorizationV2::decode(&accepted.authorization)
+                .map_err(|_| PurchaseError::Identity)?;
+            let work = Digest::from_bytes(accepted.work);
+            if authorization.channel_id != channel
+                || authorization.proposal_nonce != proposal.nonce
+                || authorization.price != self.record.price
+                || *authorization.request_commitment.digest().as_bytes()
+                    != proposal.request_commitment
+                || work_id(state.channel(), &authorization) != work
+            {
+                return Err(PurchaseError::Identity);
+            }
+            if let Some(terminal) = state.terminal_by_id(work) {
+                if terminal.phase == hellas_channel::work_store::JobPhase::HalfSigned {
+                    return Err(PurchaseError::Identity);
+                }
+                return Ok(Some(work));
+            }
+        }
         let Some(job) = state
             .jobs()
             .find(|job| job.authorization().proposal_nonce == proposal.nonce)
         else {
-            return if proposal.nonce <= state.proposal_nonce_high_water() {
+            return if proposal.accepted.is_some()
+                || proposal.nonce <= state.proposal_nonce_high_water()
+            {
                 Err(self.unfinished(
                     "the proposal nonce was consumed but no active request-bound acceptance remains",
                 ))
@@ -317,7 +357,49 @@ impl Purchase {
                 return Err(PurchaseError::Identity);
             }
         }
-        Ok(Some(job.work_id()))
+        let work = job.work_id();
+        if proposal
+            .accepted
+            .as_ref()
+            .is_some_and(|held| held.work != *work.as_bytes())
+        {
+            return Err(PurchaseError::Identity);
+        }
+        if proposal.accepted.is_none() {
+            self.record
+                .proposal
+                .as_mut()
+                .expect("checked proposal")
+                .accepted = Some(Accepted {
+                work: *work.as_bytes(),
+                authorization: authorization.encode(),
+            });
+            self.persist()?;
+        }
+        Ok(Some(work))
+    }
+
+    /// Reconcile the same signed acceptance and terminal on live or closed journals.
+    pub(crate) fn reconcile(
+        &mut self,
+        state: &hellas_channel::work_store::Channel,
+    ) -> Result<Option<Digest>> {
+        if let Some((work, _)) = self.outcome() {
+            return Ok(Some(work));
+        }
+        let work = self.accepted_work(state)?;
+        if let Some(work) = work
+            && let Some(terminal) = state.terminal_by_id(work)
+        {
+            self.finish(
+                work,
+                matches!(
+                    terminal.outcome,
+                    hellas_channel::work_store::TerminalOutcome::Certified { .. }
+                ),
+            )?;
+        }
+        Ok(work)
     }
 
     /// A recorded proposal is an irrevocable intent for tracked attempts.
@@ -380,6 +462,11 @@ impl Purchase {
             bond: bond.to_bytes(),
             nonce,
             request_commitment: *request_commitment.as_bytes(),
+            accepted: self
+                .record
+                .proposal
+                .as_ref()
+                .and_then(|held| held.accepted.clone()),
             outcome: None,
         };
         match &self.record.proposal {
@@ -405,6 +492,13 @@ impl Purchase {
             .proposal
             .as_mut()
             .ok_or(PurchaseError::Identity)?;
+        if proposal
+            .accepted
+            .as_ref()
+            .is_some_and(|accepted| accepted.work != *work.as_bytes())
+        {
+            return Err(PurchaseError::Identity);
+        }
         let outcome = Outcome {
             work: *work.as_bytes(),
             paid,

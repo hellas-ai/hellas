@@ -66,6 +66,19 @@ fn paid_public_boundaries_reject_another_chain_before_proposal() {
             recover_attempt.bind_target(target).unwrap();
             let recover_marker = std::fs::read(recover_path.as_path()).unwrap();
             assert!(matches!(
+                recover_attempt
+                    .settle_paid(&case.options, case.owner.principal(), &client_settlement())
+                    .await,
+                Err(ExecutionError::Identity)
+                    | Err(ExecutionError::Purchase(
+                        hellas_sdk::transact::PurchaseError::Identity
+                    ))
+            ));
+            assert_eq!(
+                std::fs::read(recover_path.as_path()).unwrap(),
+                recover_marker
+            );
+            assert!(matches!(
                 ExecutionSession::Paid(&mut session)
                     .recover(&mut recover_attempt)
                     .await,
@@ -208,7 +221,7 @@ fn paid_attempt_reopens_after_input_is_purged() {
             );
             assert!(ExecutionAttempt::reopen_paid(&path, job, input, price + 1).is_err());
             let mut attempt = ExecutionAttempt::reopen_paid(&path, job, input, price).unwrap();
-            assert_eq!(attempt.inspect().unwrap().work, None);
+            assert_eq!(attempt.inspect().unwrap().work, Some(work));
             let mut session = PaidWorkSession::open(
                 case.options.clone(),
                 case.endpoint.clone(),
@@ -248,11 +261,47 @@ fn paid_attempt_reopens_after_input_is_purged() {
             );
             assert_eq!(case.approvals.0.lock().unwrap().len(), 1);
             assert_eq!(upstream.calls("openai", "responses", BODY), 1);
+            let bond = session.descriptor().bond_edge();
+            session.shutdown().await;
+            drop(session);
+            sealing_while(
+                &mut case.devnet,
+                Duration::from_millis(100),
+                hellas_sdk::paid_client::settle_channel(
+                    &case.options,
+                    bond,
+                    case.owner.principal(),
+                    &client_settlement(),
+                ),
+            )
+            .await
+            .unwrap();
+            // Crash after closing but before recording the purchase outcome.
+            drop(attempt);
+            let mut attempt = ExecutionAttempt::reopen_paid(&path, job, input, price).unwrap();
+            let facts = attempt
+                .settle_paid(&case.options, case.owner.principal(), &client_settlement())
+                .await
+                .unwrap();
+            assert_eq!(facts.work, Some(work));
+            assert_eq!(facts.payment, Payment::Unpaid);
+            assert!(!facts.result_available);
+            assert_eq!(case.approvals.0.lock().unwrap().len(), 1);
+            assert_eq!(upstream.calls("openai", "responses", BODY), 1);
+            drop(attempt);
+            let mut attempt = ExecutionAttempt::reopen_paid(&path, job, input, price).unwrap();
+            assert_eq!(
+                attempt
+                    .settle_paid(&case.options, case.owner.principal(), &client_settlement())
+                    .await
+                    .unwrap()
+                    .payment,
+                Payment::Unpaid
+            );
             upstream
                 .pause
                 .store(false, std::sync::atomic::Ordering::SeqCst);
             upstream.release.notify_one();
-            session.shutdown().await;
             case.endpoint.close().await;
             case.provider.shutdown().await.unwrap();
             case.provider_content.close().await;
@@ -685,23 +734,26 @@ fn tracked_attempts_reuse_retained_policy_with_zero_funding_cap() {
                         .await
                         .unwrap()
                 );
-                let before = std::fs::read(&lost_path).unwrap();
                 let mut lost =
                     ExecutionAttempt::open_existing_paid(&lost_attempt_path, job.input(), PRICE)
                         .unwrap();
-                assert!(matches!(
+                let facts = ExecutionSession::Paid(&mut session)
+                    .recover(&mut lost)
+                    .await
+                    .unwrap();
+                assert_eq!(facts.work, Some(result.work_id));
+                assert_eq!(facts.payment, Payment::Paid);
+                assert!(!facts.result_available);
+                let recovered = std::fs::read(&lost_path).unwrap();
+                assert_eq!(
                     ExecutionSession::Paid(&mut session)
                         .recover(&mut lost)
-                        .await,
-                    Err(ExecutionError::Purchase(
-                        hellas_sdk::transact::PurchaseError::Unfinished {
-                            reason: "the proposal nonce was consumed but no active request-bound acceptance remains",
-                            ..
-                        }
-                    ))
-                ));
-                assert_eq!(std::fs::read(&lost_path).unwrap(), before);
-                assert_eq!(lost.inspect().unwrap().work, None);
+                        .await
+                        .unwrap()
+                        .payment,
+                    Payment::Paid
+                );
+                assert_eq!(std::fs::read(&lost_path).unwrap(), recovered);
                 assert_eq!(
                     session
                         .with_state(|state| state.ledger().credited_cumulative())
@@ -844,8 +896,8 @@ fn tracked_recovery_requires_attempt_and_request_bindings() {
             session.shutdown().await;
             drop(session);
             drop(attempt);
-            // The durable prefix after JobAccepted: the original nonce and its
-            // request commitment, no work ID.
+            // The durable prefix retains the original nonce, request commitment
+            // and signed acceptance identity without an outcome.
             write_marker(&path, &prefix);
             let mut attempt =
                 ExecutionAttempt::open_existing_paid(&interrupted_path, job.input(), PRICE)
@@ -871,11 +923,24 @@ fn tracked_recovery_requires_attempt_and_request_bindings() {
                     .unwrap(),
                 "this restart exercises metadata-only replay"
             );
-            for field in ["channel", "bond", "network", "provider"] {
+            for field in [
+                "channel",
+                "bond",
+                "network",
+                "provider",
+                "nonce",
+                "request_commitment",
+                "accepted",
+            ] {
                 let mut wrong = prefix.clone();
                 match field {
-                    "channel" | "bond" => {
+                    "channel" | "bond" | "request_commitment" => {
                         wrong["proposal"][field] = serde_json::to_value([0x55u8; 32]).unwrap()
+                    }
+                    "nonce" => wrong["proposal"][field] = serde_json::json!(nonce + 1),
+                    "accepted" => {
+                        wrong["proposal"][field]["work"] =
+                            serde_json::to_value([0x55u8; 32]).unwrap()
                     }
                     "network" => wrong["target"][field] = serde_json::json!("wrong-network"),
                     "provider" => {
@@ -903,6 +968,10 @@ fn tracked_recovery_requires_attempt_and_request_bindings() {
             let pending_path = pending_paid_path.as_path().to_path_buf();
             let mut pending = prefix.clone();
             pending["proposal"]["nonce"] = serde_json::json!(nonce + 1);
+            pending["proposal"]
+                .as_object_mut()
+                .unwrap()
+                .remove("accepted");
             write_marker(&pending_path, &pending);
             let mut pending_attempt =
                 ExecutionAttempt::open_existing_paid(&pending_paid_path, job.input(), PRICE)

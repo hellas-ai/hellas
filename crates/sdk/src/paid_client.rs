@@ -16,6 +16,7 @@ pub use content::recover_content;
 pub use error::PaidClientError;
 pub use funding::{RecoveredFundingChannel, recover_funding_channels, recover_funding_intent};
 pub use offer::{PaidQuote, request_paid_quote};
+pub(crate) use settlement::settle_attempt;
 pub use settlement::{
     FinalizedChannelSettlement, RetainedSettlementChannel, channel_is_settled,
     finalized_channel_settlement, retained_settlement_channels, settle_channel,
@@ -780,23 +781,6 @@ impl PaidWorkSession {
         Ok(true)
     }
 
-    pub(crate) async fn recorded_terminal(
-        &self,
-        work: hellas_auth::Digest,
-    ) -> Result<Option<bool>> {
-        self.client
-            .with_state(|state| {
-                state.terminal_by_id(work).map(|terminal| {
-                    matches!(
-                        terminal.outcome,
-                        hellas_channel::work_store::TerminalOutcome::Certified { .. }
-                    )
-                })
-            })
-            .await
-            .map_err(Into::into)
-    }
-
     pub(crate) async fn propose_job(
         &mut self,
         job: &crate::job::Job,
@@ -1355,7 +1339,7 @@ impl PaidDelivery {
         self,
         progress: Option<&hellas_channel::work::PaidProgress>,
         accepted: Option<&crate::transact::Accepted>,
-        purchase: Option<&mut crate::transact::Purchase>,
+        mut purchase: Option<&mut crate::transact::Purchase>,
     ) -> Result<PaidWorkResult> {
         let Self {
             mut client,
@@ -1368,6 +1352,11 @@ impl PaidDelivery {
         } = self;
         let client = &mut client;
         let ready = &ready;
+        if let Some(purchase) = purchase.as_deref_mut() {
+            client
+                .with_state(|state| purchase.accepted_work(state))
+                .await??;
+        }
         if let Some(accepted) = accepted {
             accepted(hellas_rpc::provenance::ExecutionProvenance {
                 commitment_id: *work_id.as_bytes(),

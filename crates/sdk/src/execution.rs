@@ -1338,8 +1338,8 @@ impl ExecutionAttempt {
                 (
                     purchase.has_target(),
                     purchase.has_proposal_intent(),
-                    outcome.map(|(work, _)| work),
-                    if outcome.is_some() {
+                    purchase.work_id(),
+                    if purchase.work_id().is_some() {
                         Acceptance::Accepted
                     } else {
                         Acceptance::Unknown
@@ -1401,34 +1401,16 @@ impl<'a> ExecutionSession<'a> {
         match self {
             Self::Paid(session) => {
                 let purchase = attempt.paid_on(session)?;
-                // Unfinished accepted work is re-derived from the signed
-                // journal on each recovery; only its outcome is recorded.
-                let accepted = match purchase.outcome() {
-                    Some(_) => None,
-                    None => {
-                        session
-                            .with_state(|state| purchase.accepted_work(state))
-                            .await??
-                    }
-                };
-                if let Some(work) = accepted {
-                    match session.recorded_terminal(work).await? {
-                        Some(true) => purchase.paid(work)?,
-                        Some(false) => purchase.unpaid(work)?,
-                        None if session.recover_verified_payment(work).await? => {
-                            purchase.paid(work)?
-                        }
-                        None => (),
-                    }
-                }
-                let mut facts = attempt.inspect()?;
-                if let Some(work) = accepted
-                    && facts.work.is_none()
+                let accepted = session
+                    .with_state(|state| purchase.reconcile(state))
+                    .await??;
+                if purchase.outcome().is_none()
+                    && let Some(work) = accepted
+                    && session.recover_verified_payment(work).await?
                 {
-                    facts.work = Some(work);
-                    facts.acceptance = Acceptance::Accepted;
+                    purchase.paid(work)?;
                 }
-                return Ok(facts);
+                return attempt.inspect();
             }
             Self::Grant(session) => {
                 let tracker = attempt.grant_on(session)?;
@@ -1479,6 +1461,30 @@ impl<'a> ExecutionSession<'a> {
 }
 
 impl ExecutionAttempt {
+    /// Resolve this paid attempt by closing its original retained channel when
+    /// needed. No input, provider connection, proposal or funding is required.
+    /// Shut down any session owning that channel first. Cancellation preserves
+    /// acceptance and close records; reopening by identifiers can finish it.
+    pub async fn settle_paid(
+        &mut self,
+        options: &PaidWorkOptions,
+        owner: hellas_auth::authority::PrincipalId,
+        signer: &hellas_kernel::Secp256k1Signer,
+    ) -> Result<ExecutionFacts> {
+        let AttemptRecord::Paid(purchase) = &mut self.record else {
+            return Err(ExecutionError::Identity);
+        };
+        purchase.ensure_state_key(&options.config.chain.state_key())?;
+        if !purchase.matches_target(&PurchaseTarget {
+            network: options.config.network().as_str().into(),
+            provider: options.provider,
+        }) {
+            return Err(ExecutionError::Identity);
+        }
+        crate::paid_client::settle_attempt(options, purchase, owner, signer).await?;
+        self.inspect()
+    }
+
     /// Inspect the canonical grant journal without opening a network session or
     /// changing its clock. The caller supplies its existing session options.
     pub async fn inspect_grant(

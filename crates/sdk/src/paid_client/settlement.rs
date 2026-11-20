@@ -317,6 +317,42 @@ async fn settle_channel_inner(
     Ok(value)
 }
 
+/// Resolve only the attempt's original channel, including a close from an earlier process.
+pub(crate) async fn settle_attempt(
+    args: &PaidWorkOptions,
+    purchase: &mut crate::transact::Purchase,
+    owner: PrincipalId,
+    signer: &Secp256k1Signer,
+) -> Result<()> {
+    let Some((channel, bond)) = purchase.bound_channel() else {
+        return Ok(());
+    };
+    let recovery = open_settlement(args, bond, owner, signer.party_key()).await?;
+    let mut endpoint = ClientEndpoint::recover(recovery.journal, signer.clone())?;
+    let result: Result<()> = async {
+        if endpoint.state().channel().id() != channel {
+            return Err(PaidClientError::InputMismatch("attempt channel"));
+        }
+        // Persist the signed acceptance before closing can archive its active job.
+        purchase.reconcile(endpoint.state())?;
+        if purchase.outcome().is_none() {
+            settle_close(
+                &mut endpoint,
+                &args.config,
+                super::read_timeout(args.timeout),
+            )
+            .await?;
+            purchase.reconcile(endpoint.state())?;
+        }
+        Ok(())
+    }
+    .await;
+    let closed = endpoint.close().await;
+    result?;
+    closed?;
+    Ok(())
+}
+
 struct SettlementRecovery {
     journal: ChannelStore,
     chain: WorkBlocks<RemoteLightClient>,
