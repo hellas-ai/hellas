@@ -17,6 +17,20 @@ fn request() -> ImageRequest<'static> {
 }
 
 #[tokio::test]
+async fn cuda_image_packages_are_rejected_before_rendering() {
+    let result = ModelPackage::open(
+        &fixture(),
+        &crate::model::evaluator(crate::model::GpuDialect::Cuda),
+    )
+    .await;
+    let error = result.err().expect("Flux must reject CUDA");
+    assert!(
+        format!("{error:#}").contains("Flux WMMA requires HIP on gfx11"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[tokio::test]
 async fn shared_stage_helpers_must_have_identical_types_and_definitions() {
     let helper = "(def program flux.shared : unit -> unit = identity)";
     let model = bundle_stages([helper, helper]).unwrap();
