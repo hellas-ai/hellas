@@ -200,7 +200,7 @@ enum Commands {
     Transcribe(commands::transact::TranscribeArgs),
     /// Answer one prompt with a client-rendered Qwen text job.
     Text(commands::transact::TextArgs),
-    /// Fetch a published distilled Flux2 Klein 4B snapshot and convert it
+    /// Fetch a published distilled Flux2 Klein snapshot (4B or 9B) and convert it
     /// into client metadata and provider assets.
     ConvertFlux {
         /// `ORG/NAME@COMMIT`, pinned to a 40-hex commit.

@@ -43,7 +43,7 @@ axum = "0.8"
 base64 = "0.23"
 bytes = "1"
 catena-lang = { git = "https://github.com/hellas-ai/catena-lang.git", branch = "master", default-features = false }
-catena-models = { git = "https://github.com/hellas-ai/catena-models.git", rev = "7275653a989a589155998784c3dde40f867b6623" }
+catena-models = { git = "https://github.com/hellas-ai/catena-models.git", rev = "0de495a59fecbe6695467071c00ac49043d4bb8b" }
 cc = "1"
 ciborium = "0.2"
 commonware-actor = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "36fabc5cd7bad6675ab83b6784a2912cc80d94f1" }

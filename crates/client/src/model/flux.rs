@@ -1,7 +1,7 @@
 //! Flux2 Klein stages share one program and pass their outputs through slots.
 use super::package::ComputeJob;
 use anyhow::{Context, Result, ensure};
-use catena_models::flux::{config, graph, text};
+use catena_models::flux::{config, graph, text, transformer, vae};
 use hellas_channel::content::DEFAULT_MAX_STAGING_BYTES;
 use hellas_rpc::protocol::invocation::{Artifact, compute::*, output::InvocationOutput};
 use hellas_store::content::{LocalStore, MemoryStore, Reservations, Scope};
@@ -186,8 +186,12 @@ impl Config {
         let vae = graph::vae(&self.vae, 16, 16, false)?;
         Ok([
             weights::text(&self.text),
-            weights::transformer(&denoise.weights)?,
-            weights::vae(&vae.weights)?,
+            weights::ordered(
+                &denoise.weights,
+                transformer::weight_shapes(&self.transformer),
+                false,
+            )?,
+            weights::ordered(&vae.weights, vae::weight_shapes(), true)?,
         ])
     }
     fn source(&self, width: usize, height: usize, steps: usize) -> Result<String> {
@@ -218,7 +222,7 @@ fn bundle_stages<'a>(stages: impl IntoIterator<Item = &'a str>) -> Result<String
     Ok(graph::bundle(&raw.to_hexpr_text()))
 }
 
-/// Convert a local distilled Klein 4B snapshot into immutable provider assets
+/// Convert a local distilled Klein snapshot into immutable provider assets
 /// and client metadata. Providers index the three `.bin` files; callers need
 /// only the metadata and tokenizer after conversion.
 pub fn convert_flux(checkpoint: &Path, destination: &Path) -> Result<Vec<NamedAsset>> {

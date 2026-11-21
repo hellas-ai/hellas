@@ -230,7 +230,8 @@ The result then also carries an `emitted` output with every emitted value.
 
 ## Image jobs
 
-Convert the distilled Flux2 Klein 4B snapshot once, pinned to a 40-hex commit.
+Convert a distilled Flux2 Klein snapshot (4B or 9B) once, pinned to a 40-hex
+commit.
 The converter fetches the published files it reads at that commit:
 
 ```sh

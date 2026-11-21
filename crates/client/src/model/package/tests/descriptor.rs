@@ -327,7 +327,7 @@ async fn whisper_descriptors_reject_invalid_weight_lengths_and_generation_metada
     assert!(
         error
             .to_string()
-            .contains("generation token exceeds vocabulary"),
+            .contains("generation config contains out-of-range tokens"),
         "{error:#}"
     );
 }
