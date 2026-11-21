@@ -1,6 +1,7 @@
 //! A model's native metadata and the identity of its separately held weights.
 use super::{ModelKind, gguf, qwen3, speech, whisper};
 use anyhow::{Result, bail, ensure};
+use catena_models::checkpoint::read_gguf_model_config;
 use hellas_rpc::ContentRef;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -27,6 +28,7 @@ pub(super) enum Layout {
     WhisperDescriptor,
     Speech,
     SpeechDescriptor,
+    Phonon,
     Flux,
 }
 
@@ -44,6 +46,7 @@ pub(super) enum Resolved {
         path: PathBuf,
         weights: ContentRef,
     },
+    Phonon(PathBuf),
     Flux(PathBuf),
 }
 
@@ -69,14 +72,19 @@ pub(super) fn classify(path: &Path) -> Result<Layout> {
             Ok::<_, std::io::Error>(path.join(name).try_exists()? || found)
         })?;
     let flux = path.join("model_index.json").try_exists()?;
+    let phonon = path.join(speech::phonon::MARKER).try_exists()?;
     ensure!(
-        !(flux && (manifest || gguf || whisper || speech || weights)
+        !((flux || phonon) && (manifest || gguf || whisper || speech || weights)
+            || flux && phonon
             || gguf && (whisper || speech || weights)
             || manifest && weights),
-        "mixed model layout: descriptor, GGUF, Whisper, MMS and Flux files cannot overlap"
+        "mixed model layout: descriptor, GGUF, Whisper, MMS, Phonon and Flux files cannot overlap"
     );
     if flux {
         return Ok(Layout::Flux);
+    }
+    if phonon {
+        return Ok(Layout::Phonon);
     }
     if gguf {
         ensure!(manifest, "header.gguf requires descriptor.json");
@@ -110,13 +118,20 @@ pub(super) fn classify(path: &Path) -> Result<Layout> {
 }
 
 impl Layout {
-    pub(super) fn kind(self) -> ModelKind {
-        match self {
-            Self::Gguf | Self::GgufDescriptor => ModelKind::Text,
+    pub(super) fn kind(self, path: &Path) -> Result<ModelKind> {
+        Ok(match self {
+            Self::Gguf | Self::GgufDescriptor => {
+                let config = read_gguf_model_config(&self.gguf_path(path)?)?;
+                if qwen3::is_decision(&config) {
+                    ModelKind::Decision
+                } else {
+                    ModelKind::Text
+                }
+            }
             Self::Whisper | Self::WhisperDescriptor => ModelKind::Transcription,
             Self::Flux => ModelKind::Image,
-            Self::Speech | Self::SpeechDescriptor => ModelKind::Speech,
-        }
+            Self::Speech | Self::SpeechDescriptor | Self::Phonon => ModelKind::Speech,
+        })
     }
     pub(super) fn is_descriptor(self) -> bool {
         matches!(
@@ -138,6 +153,7 @@ impl Layout {
             Self::GgufDescriptor
             | Self::WhisperDescriptor
             | Self::SpeechDescriptor
+            | Self::Phonon
             | Self::Flux => None,
         }
     }
@@ -181,6 +197,7 @@ impl Layout {
                 path: path.to_owned(),
                 weights: read_weights(path)?,
             }),
+            Self::Phonon => Ok(Resolved::Phonon(path.to_owned())),
             Self::Flux => Ok(Resolved::Flux(path.to_owned())),
         }
     }
@@ -248,7 +265,9 @@ pub(super) fn describe(path: &Path, output: &Path) -> Result<ContentRef> {
         Layout::GgufDescriptor | Layout::WhisperDescriptor | Layout::SpeechDescriptor => {
             bail!("source is already a descriptor")
         }
-        Layout::Flux => bail!("Flux already describes its assets in assets.json"),
+        Layout::Flux | Layout::Phonon => {
+            bail!("the package already describes its assets in assets.json")
+        }
     }
 }
 

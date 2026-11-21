@@ -3,15 +3,13 @@ use super::package::ComputeJob;
 use anyhow::{Context, Result, bail, ensure};
 use catena_models::{
     weights::{Weights, f32_to_bf16},
-    whisper::{Config, audio, graph},
+    whisper::{Config, Generation, audio, graph, weight_shapes},
 };
-use hellas_channel::content::{DEFAULT_MAX_STAGING_BYTES, upload_object};
 use hellas_rpc::{
     ContentRef,
     protocol::invocation::{Artifact, compute::*, output::InvocationOutput},
 };
-use hellas_store::content::{LocalStore, MemoryStore, Reservations, Scope};
-use serde::Deserialize;
+use hellas_store::content::{LocalStore, Scope};
 use std::{
     collections::BTreeMap,
     fs::File,
@@ -25,52 +23,6 @@ pub(super) const MAX_METADATA_BYTES: usize = 64 << 20;
 pub(super) const METADATA: [&str; 3] = ["config.json", "generation_config.json", "tokenizer.json"];
 /// The published checkpoint files [`convert_whisper`] reads.
 pub const CHECKPOINT: [&str; 4] = [METADATA[0], METADATA[1], METADATA[2], "model.safetensors"];
-
-#[derive(Deserialize)]
-struct Generation {
-    lang_to_id: BTreeMap<String, u32>,
-    task_to_id: BTreeMap<String, u32>,
-    no_timestamps_token_id: u32,
-    #[serde(default)]
-    suppress_tokens: Vec<u32>,
-    #[serde(default)]
-    begin_suppress_tokens: Vec<u32>,
-}
-impl Generation {
-    fn validate(&self, config: &Config) -> Result<()> {
-        ensure!(
-            !self.lang_to_id.is_empty() && self.task_to_id.contains_key("transcribe"),
-            "missing language or transcribe tokens"
-        );
-        ensure!(
-            self.lang_to_id
-                .values()
-                .chain(self.task_to_id.values())
-                .chain(&self.suppress_tokens)
-                .chain(&self.begin_suppress_tokens)
-                .chain(std::iter::once(&self.no_timestamps_token_id))
-                .all(|id| (*id as usize) < config.vocab_size),
-            "generation token exceeds vocabulary"
-        );
-        Ok(())
-    }
-    fn masks(&self, config: &Config) -> [Vec<f32>; 3] {
-        let mut language = vec![f32::NEG_INFINITY; config.vocab_size];
-        for &id in self.lang_to_id.values() {
-            language[id as usize] = 0.;
-        }
-        let mut text = vec![0.; config.vocab_size];
-        text[config.eos_token_id as usize + 1..].fill(f32::NEG_INFINITY);
-        for &id in &self.suppress_tokens {
-            text[id as usize] = f32::NEG_INFINITY;
-        }
-        let mut begin = vec![0.; config.vocab_size];
-        for &id in &self.begin_suppress_tokens {
-            begin[id as usize] = f32::NEG_INFINITY;
-        }
-        [language, text, begin]
-    }
-}
 
 fn metadata(dir: &Path) -> Result<(Config, Generation, tokenizers::Tokenizer)> {
     let read =
@@ -88,36 +40,16 @@ fn metadata(dir: &Path) -> Result<(Config, Generation, tokenizers::Tokenizer)> {
     Ok((config, generation, tokenizer))
 }
 
-// The public graph lists specify the call ABI. Shapes follow Whisper's validated
-// architecture; offsets always refer to the once-converted, all-BF16 asset.
+// The public graph lists specify the call ABI; offsets always refer to the
+// once-converted, all-BF16 asset.
 fn tensors(config: &Config) -> Vec<(String, Vec<usize>)> {
-    let d = config.d_model;
+    let shapes: BTreeMap<_, _> = weight_shapes(config).into_iter().collect();
     graph::encoder_names(config)
         .into_iter()
         .chain(graph::cross_names(config))
         .chain(graph::decoder_names(config))
         .map(|name| {
-            let shape = if name == "model.encoder.conv1.weight" {
-                vec![d, config.num_mel_bins, 3]
-            } else if name == "model.encoder.conv2.weight" {
-                vec![d, d, 3]
-            } else if name == "model.encoder.embed_positions.weight" {
-                vec![config.max_source_positions, d]
-            } else if name == "model.decoder.embed_positions.weight" {
-                vec![config.max_target_positions, d]
-            } else if name == "model.decoder.embed_tokens.weight" {
-                vec![config.vocab_size, d]
-            } else if name.ends_with("fc1.weight") {
-                vec![config.encoder_ffn_dim, d]
-            } else if name.ends_with("fc2.weight") {
-                vec![d, config.decoder_ffn_dim]
-            } else if name.ends_with("fc1.bias") {
-                vec![config.encoder_ffn_dim]
-            } else if name.ends_with("bias") || name.contains("layer_norm") {
-                vec![d]
-            } else {
-                vec![d, d]
-            };
+            let shape = shapes[&name].clone();
             (name, shape)
         })
         .collect()
@@ -221,21 +153,14 @@ impl Whisper {
                 Ok((config, generation, tokenizer, views, object, source))
             })
             .await??;
-        let content = (
-            LocalStore::Memory(MemoryStore::new(Reservations::ram(
-                DEFAULT_MAX_STAGING_BYTES,
-            ))),
-            Scope::Owner,
-        );
-        let source = upload_object(&content.0, source.as_bytes()).await?;
-        let environment = Environment {
-            sources: vec![source],
-            assets: vec![NamedAsset {
+        let (environment, content) = super::program::environment(
+            &source,
+            vec![NamedAsset {
                 name: "weights".into(),
                 object,
             }],
-        };
-        upload_object(&content.0, &environment.canonical_bytes()?).await?;
+        )
+        .await?;
         Ok(Self {
             config,
             generation,
@@ -275,7 +200,10 @@ impl Whisper {
         let mut inputs = vec![floats("features", &features)];
         for (name, values) in ["language-mask", "text-mask", "begin-mask"]
             .into_iter()
-            .zip(self.generation.masks(&self.config))
+            .zip(<[_; 3]>::from(
+                self.generation
+                    .masks(self.config.vocab_size, self.config.eos_token_id),
+            ))
         {
             inputs.push(floats(name, &values));
         }

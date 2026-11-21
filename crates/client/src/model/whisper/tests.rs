@@ -190,22 +190,6 @@ async fn converted_asset_and_program_are_stable_and_ship_with_every_job() {
 }
 
 #[tokio::test]
-async fn masks_match_the_upstream_language_text_and_first_token_rules() {
-    let root = tempfile::tempdir().unwrap();
-    checkpoint(root.path());
-    let (config, generation, _) = metadata(root.path()).unwrap();
-    let n = f32::NEG_INFINITY;
-    assert_eq!(
-        generation.masks(&config),
-        [
-            vec![n, n, n, n, n, 0., n, n],
-            vec![0., 0., n, 0., n, n, n, n],
-            vec![n, 0., 0., n, 0., 0., 0., 0.],
-        ]
-    );
-}
-
-#[tokio::test]
 async fn decode_validates_the_result_header_and_decodes_client_side() {
     let root = tempfile::tempdir().unwrap();
     let original = root.path().join("original");

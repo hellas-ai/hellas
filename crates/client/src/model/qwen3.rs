@@ -1,9 +1,10 @@
-//! Qwen text generation as a client-rendered Compute job.
+//! Qwen text generation and d1 decisions as client-rendered Compute jobs.
 //!
 //! The provider runs only the opaque program: catena-models renders the Hex
-//! from the GGUF configuration, this package maps its weight order onto byte
-//! ranges of the GGUF asset, and the provider's step loop feeds each emitted
-//! token back until a stop id or the token budget.
+//! from the GGUF configuration and this package maps its weight order onto
+//! byte ranges of the GGUF asset. For text, the provider's step loop feeds each
+//! emitted token back until a stop id or the token budget. A decision model
+//! instead prefills each prompt once and returns its final logits.
 use super::gguf::{self, Dtype};
 use super::package::ComputeJob;
 use anyhow::{Context, Result, ensure};
@@ -13,13 +14,15 @@ use catena_models::{
     checkpoint::read_gguf_model_config,
     spec::{ModelArchitecture, ModelConfig, WeightDtype, weight_specs},
 };
-use hellas_channel::content::{DEFAULT_MAX_STAGING_BYTES, upload_object};
-use hellas_rpc::protocol::invocation::{Artifact, compute::*};
-use hellas_store::content::{LocalStore, MemoryStore, Reservations, Scope};
+use hellas_rpc::protocol::invocation::{
+    Artifact, MAX_ARTIFACTS, compute::*, output::InvocationOutput,
+};
+use hellas_store::content::{LocalStore, Scope};
 use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 const PROMPT: &str = "prompt";
 const WEIGHTS: &str = "weights";
+const LOGITS: &str = "logits";
 
 pub(super) struct Qwen3 {
     config: ModelConfig,
@@ -34,13 +37,6 @@ pub(super) fn metadata(
     header: &gguf::Header,
 ) -> Result<(ModelConfig, Vec<(u64, u64)>)> {
     let config = read_gguf_model_config(path)?;
-    ensure!(
-        config
-            .lfm3
-            .as_ref()
-            .is_none_or(|lfm3| lfm3.causal_attention),
-        "bidirectional decision models do not generate text"
-    );
     let tensors: BTreeMap<_, _> = header
         .tensors
         .iter()
@@ -101,21 +97,14 @@ impl Qwen3 {
                 Ok((config, views, object, source, states))
             })
             .await??;
-        let content = (
-            LocalStore::Memory(MemoryStore::new(Reservations::ram(
-                DEFAULT_MAX_STAGING_BYTES,
-            ))),
-            Scope::Owner,
-        );
-        let source = upload_object(&content.0, source.as_bytes()).await?;
-        let environment = Environment {
-            sources: vec![source],
-            assets: vec![NamedAsset {
+        let (environment, content) = super::program::environment(
+            &source,
+            vec![NamedAsset {
                 name: WEIGHTS.into(),
                 object,
             }],
-        };
-        upload_object(&content.0, &environment.canonical_bytes()?).await?;
+        )
+        .await?;
         Ok(Self {
             config,
             environment,
@@ -128,6 +117,110 @@ impl Qwen3 {
     pub(super) fn environment(&self) -> &Environment {
         &self.environment
     }
+    /// Bidirectional models answer decisions and do not generate text.
+    pub(super) fn is_decision(&self) -> bool {
+        is_decision(&self.config)
+    }
+    fn weights(&self) -> impl Iterator<Item = Arg> {
+        self.views.iter().map(|&(offset, bytes)| Arg::Asset {
+            name: WEIGHTS.into(),
+            offset,
+            bytes,
+        })
+    }
+    fn logits_bytes(&self) -> u64 {
+        self.config.vocabulary_size as u64 * 2
+    }
+    /// One full prefill per prompt, each returning its final-position logits.
+    pub fn render_decisions(&self, prompts: &[Vec<u64>]) -> Result<ComputeJob> {
+        ensure!(self.is_decision(), "model does not answer decisions");
+        ensure!(
+            (1..=MAX_ARTIFACTS).contains(&prompts.len()),
+            "a decision job answers 1 to {MAX_ARTIFACTS} questions"
+        );
+        let (mut calls, mut inputs, mut outputs) = (Vec::new(), Vec::new(), Vec::new());
+        for (i, prompt) in prompts.iter().enumerate() {
+            let capacity = prompt.len() as u64;
+            ensure!(
+                capacity > 0 && capacity <= self.config.max_position_embeddings as u64,
+                "decision prompt exceeds model context"
+            );
+            ensure!(
+                prompt
+                    .iter()
+                    .all(|id| *id < self.config.vocabulary_size as u64),
+                "token id exceeds vocabulary"
+            );
+            let (object, slot) = (format!("{PROMPT}-{i:02}"), format!("{LOGITS}-{i:02}"));
+            calls.push(Call {
+                entry: "qwen3.init".into(),
+                args: vec![Arg::U64(capacity)],
+                bind: self.states.iter().cloned().map(Bind::Name).collect(),
+            });
+            let mut args = vec![Arg::Input {
+                object: object.clone(),
+            }];
+            args.extend(
+                self.states
+                    .iter()
+                    .map(|name| Arg::Slot { name: name.clone() }),
+            );
+            args.extend([Arg::U64(capacity), Arg::U64(0)]);
+            args.extend(self.weights());
+            calls.push(Call {
+                entry: "qwen3".into(),
+                args,
+                bind: self
+                    .states
+                    .iter()
+                    .map(|_| Bind::Discard)
+                    .chain([Bind::Name(slot.clone()), Bind::Discard])
+                    .collect(),
+            });
+            inputs.push(tokens(&object, prompt));
+            outputs.push(Declared {
+                slot,
+                kind: OutputKind::Buffer {
+                    max_bytes: self.logits_bytes(),
+                },
+            });
+        }
+        Ok(ComputeJob {
+            environment: self.environment.clone(),
+            plan: Plan {
+                calls,
+                step: None,
+                outputs,
+            },
+            inputs,
+            content: self.content.clone(),
+        })
+    }
+    /// The BF16 logits of each prompt, widened to F32, in prompt order.
+    pub fn decode_logits(&self, output: &InvocationOutput) -> Result<Vec<Vec<f32>>> {
+        (0..output.artifacts.len())
+            .map(|i| {
+                let name = format!("{LOGITS}-{i:02}");
+                let artifact = output
+                    .artifacts
+                    .iter()
+                    .find(|a| a.name == name)
+                    .with_context(|| format!("missing {name}"))?;
+                let bytes = artifact.bytes.as_bytes();
+                ensure!(
+                    artifact.format == "catena.bytes.v1"
+                        && bytes.len() as u64 == self.logits_bytes(),
+                    "invalid logits artifact"
+                );
+                Ok(bytes
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_bits(u32::from(u16::from_le_bytes(*b)) << 16))
+                    .collect())
+            })
+            .collect()
+    }
     /// Stops are the caller's ids plus the GGUF end-of-sequence id.
     pub fn render_job(
         &self,
@@ -135,6 +228,7 @@ impl Qwen3 {
         max_new: u64,
         stops: &[u64],
     ) -> Result<ComputeJob> {
+        ensure!(!self.is_decision(), "decision models do not generate text");
         let prompt = u64::try_from(prompt_ids.len())?;
         ensure!(
             prompt > 0 && max_new > 0,
@@ -178,13 +272,7 @@ impl Qwen3 {
                 then: Arg::Counter { base: prompt - 1 },
             },
         ]);
-        args.extend(self.views.iter().map(|(offset, bytes)| {
-            StepArg::Arg(Arg::Asset {
-                name: WEIGHTS.into(),
-                offset: *offset,
-                bytes: *bytes,
-            })
-        }));
+        args.extend(self.weights().map(StepArg::Arg));
         let plan = Plan {
             calls: vec![Call {
                 entry: "qwen3.init".into(),
@@ -212,12 +300,23 @@ impl Qwen3 {
         Ok(ComputeJob {
             environment: self.environment.clone(),
             plan,
-            inputs: vec![Artifact::new(
-                PROMPT,
-                OutputKind::Scalar(ValueKind::U64).format(),
-                prompt_ids.iter().flat_map(|n| n.to_le_bytes()).collect(),
-            )],
+            inputs: vec![tokens(PROMPT, prompt_ids)],
             content: self.content.clone(),
         })
     }
+}
+
+pub(super) fn is_decision(config: &ModelConfig) -> bool {
+    config
+        .lfm3
+        .as_ref()
+        .is_some_and(|lfm3| !lfm3.causal_attention)
+}
+
+fn tokens(name: &str, ids: &[u64]) -> Artifact {
+    Artifact::new(
+        name,
+        OutputKind::Scalar(ValueKind::U64).format(),
+        ids.iter().flat_map(|n| n.to_le_bytes()).collect(),
+    )
 }

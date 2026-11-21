@@ -94,11 +94,55 @@ pub fn speech(checkpoint: &Checkpoint, output: &Path) -> CliResult<()> {
     Ok(())
 }
 
+pub fn phonon(
+    model: &Checkpoint,
+    codec: &str,
+    voices: &str,
+    names: &[String],
+    output: &Path,
+) -> CliResult<()> {
+    use hellas_client::model::speech::phonon;
+    let scratch = scratch(output)?;
+    let codec: Checkpoint = format!("{}@{codec}", phonon::CODEC_REPO).parse()?;
+    let catalog: Checkpoint = format!("{}@{voices}", phonon::VOICE_REPO).parse()?;
+    let directory = |name: &str| scratch.path().join(name);
+    model.fetch(&directory("model"), phonon::MODEL_FILES)?;
+    codec.fetch(&directory("codec"), phonon::CODEC_FILES)?;
+    catalog.fetch(&directory("voices"), [phonon::VOICE_CATALOG])?;
+    let listing = String::from_utf8(super::read_bounded_regular_file(
+        &directory("voices").join(phonon::VOICE_CATALOG),
+        "voice catalog",
+        1 << 20,
+    )?)?;
+    let mut selected = Vec::new();
+    for name in names {
+        // The catalog names the file: check it before it becomes a local path.
+        let file = phonon::voice_file(&listing, name)?;
+        catalog.fetch(&directory("voices"), [file.as_str()])?;
+        selected.push((name.clone(), directory("voices").join(file)));
+    }
+    for asset in phonon::convert(&directory("model"), &directory("codec"), &selected, output)? {
+        println!(
+            "{}: {} ({} bytes)",
+            asset.name,
+            asset.object.id(),
+            asset.object.bytes()
+        );
+    }
+    Ok(())
+}
+
 pub fn flux(checkpoint: &Checkpoint, output: &Path) -> CliResult<()> {
     use hellas_client::model::flux;
     let scratch = scratch(output)?;
     checkpoint.fetch(scratch.path(), flux::CHECKPOINT)?;
-    let shards = flux::text_shards(scratch.path())?;
+    let mut shards = flux::shards(scratch.path(), flux::TEXT_INDEX)?;
+    if checkpoint.0.publishes(flux::TRANSFORMER_INDEX)? {
+        checkpoint.fetch(scratch.path(), [flux::TRANSFORMER_INDEX])?;
+        shards.extend(flux::shards(scratch.path(), flux::TRANSFORMER_INDEX)?);
+    } else {
+        shards.insert(flux::TRANSFORMER.into());
+    }
     checkpoint.fetch(scratch.path(), shards.iter().map(String::as_str))?;
     for asset in flux::convert_flux(scratch.path(), output)? {
         println!(
@@ -130,6 +174,102 @@ mod tests {
             format!("openai/../x@{commit}"),
         ] {
             assert!(value.parse::<Checkpoint>().is_err(), "{value}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod phonon_tests {
+    use hellas_client::model::{GpuDialect, ModelKind, ModelPackage, ModelRequest, evaluator};
+    use std::path::PathBuf;
+
+    /// Converts the published snapshots and checks every rendered call against
+    /// the signatures of the compiled program.
+    #[tokio::test]
+    #[ignore = "needs HELLAS_TEST_PHONON_MODEL, HELLAS_TEST_PHONON_CODEC and HELLAS_TEST_PHONON_VOICE"]
+    async fn converted_phonon_plans_validate_against_the_compiled_bundle() {
+        let path = |name: &str| PathBuf::from(std::env::var(name).unwrap());
+        let root = tempfile::tempdir().unwrap();
+        let package = root.path().join("phonon");
+        let assets = hellas_client::model::speech::phonon::convert(
+            &path("HELLAS_TEST_PHONON_MODEL"),
+            &path("HELLAS_TEST_PHONON_CODEC"),
+            &[("Easton".into(), path("HELLAS_TEST_PHONON_VOICE"))],
+            &package,
+        )
+        .unwrap();
+        assert_eq!(assets.len(), 2);
+        assert_eq!(ModelKind::of(&package).unwrap(), ModelKind::Speech);
+        let model = ModelPackage::open(&package, &evaluator(GpuDialect::Hip))
+            .await
+            .unwrap();
+        let speech = |text: &'static str, voice: &'static str, speed| ModelRequest::Speech {
+            text,
+            voice,
+            speed,
+        };
+        for request in [
+            speech("Hello.", "Other", 1.),
+            speech("Hello.", "Easton", 2.),
+        ] {
+            assert!(model.render_job(&request).await.is_err());
+        }
+        let long = "The quick brown fox jumps over the lazy dog. ".repeat(12);
+        let long: &'static str = long.leak();
+        let short = model
+            .render_job(&speech("Hello.", "Easton", 1.))
+            .await
+            .unwrap();
+        let job = model.render_job(&speech(long, "Easton", 1.)).await.unwrap();
+        // Each weight starts where a separately allocated tensor could.
+        for call in &job.plan.calls {
+            for arg in &call.args {
+                if let hellas_rpc::protocol::invocation::compute::Arg::Asset { offset, .. } = arg {
+                    assert_eq!(offset % 4, 0);
+                }
+            }
+        }
+        assert_eq!(short.plan.calls.len(), 2);
+        assert!(job.plan.calls.len() > 2);
+        assert_eq!(job.environment, short.environment);
+        let source = hellas_channel::content::read(
+            &job.content.0,
+            &job.content.1,
+            job.environment.sources[0],
+            hellas_rpc::protocol::invocation::compute::MAX_SOURCE_BYTES,
+        )
+        .await
+        .unwrap();
+        let module = hellas_executor::catena::compile::compile_sources(
+            &[String::from_utf8(source.to_vec()).unwrap()],
+            catena_lang::codegen::GpuDialect::Hip,
+        )
+        .unwrap();
+        let limits = hellas_rpc::protocol::invocation::Limits {
+            max_upload_bytes: 16 << 20,
+            max_output_bytes: 64 << 20,
+            max_steps: 1,
+            execution_timeout_ms: 90000,
+        };
+        for job in [short, job] {
+            let inputs = job
+                .inputs
+                .iter()
+                .map(|a| {
+                    (
+                        a.name.clone(),
+                        hellas_rpc::ContentRef::for_bytes(a.bytes.as_bytes()),
+                    )
+                })
+                .collect();
+            hellas_executor::catena::validate::validate(
+                &module,
+                &job.environment,
+                &inputs,
+                &job.plan,
+                &limits,
+            )
+            .unwrap();
         }
     }
 }

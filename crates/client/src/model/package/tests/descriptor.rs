@@ -238,7 +238,7 @@ async fn descriptors_render_identical_jobs_without_the_original_weights() {
                         max_new_tokens: 2,
                     },
                 ],
-                ModelKind::Image | ModelKind::Speech => unreachable!(),
+                ModelKind::Decision | ModelKind::Image | ModelKind::Speech => unreachable!(),
             };
             for request in requests {
                 let full = package.render_job(&request).await.unwrap();
@@ -327,7 +327,7 @@ async fn whisper_descriptors_reject_invalid_weight_lengths_and_generation_metada
     assert!(
         error
             .to_string()
-            .contains("generation token exceeds vocabulary"),
+            .contains("generation config contains out-of-range tokens"),
         "{error:#}"
     );
 }

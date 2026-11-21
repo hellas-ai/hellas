@@ -1,7 +1,7 @@
 //! Flux2 Klein stages share one program and pass their outputs through slots.
 use super::package::ComputeJob;
 use anyhow::{Context, Result, ensure};
-use catena_models::flux::{config, graph, text};
+use catena_models::flux::{config, graph, text, transformer, vae};
 use hellas_channel::content::DEFAULT_MAX_STAGING_BYTES;
 use hellas_rpc::protocol::invocation::{Artifact, compute::*, output::InvocationOutput};
 use hellas_store::content::{LocalStore, MemoryStore, Reservations, Scope};
@@ -21,41 +21,43 @@ pub const MAX_DIMENSION: usize = 512;
 pub const MAX_STEPS: usize = 50;
 pub const OUTPUT: &str = "image";
 const ASSETS: [&str; 3] = ["text", "denoise", "vae"];
-const SOURCES: [&str; 3] = [
-    "text_encoder/model.safetensors.index.json",
-    "transformer/diffusion_pytorch_model.safetensors",
-    "vae/diffusion_pytorch_model.safetensors",
-];
-/// The published snapshot files [`convert_flux`] reads, besides the text
-/// encoder shards its index names ([`text_shards`]).
-pub const CHECKPOINT: [&str; 9] = [
+pub const TEXT_INDEX: &str = "text_encoder/model.safetensors.index.json";
+/// A published transformer is this one file, or shards named by its index.
+pub const TRANSFORMER: &str = "transformer/diffusion_pytorch_model.safetensors";
+pub const TRANSFORMER_INDEX: &str = "transformer/diffusion_pytorch_model.safetensors.index.json";
+const VAE: &str = "vae/diffusion_pytorch_model.safetensors";
+/// The published snapshot files [`convert_flux`] reads, besides the
+/// transformer and the shards the indexes name ([`shards`]).
+pub const CHECKPOINT: [&str; 8] = [
     METADATA[0],
     METADATA[1],
     METADATA[2],
     METADATA[3],
     METADATA[4],
     METADATA[5],
-    SOURCES[0],
-    SOURCES[1],
-    SOURCES[2],
+    TEXT_INDEX,
+    VAE,
 ];
 
-/// The text encoder shard files the snapshot's index names.
-pub fn text_shards(checkpoint: &Path) -> Result<std::collections::BTreeSet<String>> {
+/// The shard files the snapshot's `index` names, beside it.
+pub fn shards(checkpoint: &Path, index: &str) -> Result<std::collections::BTreeSet<String>> {
     #[derive(Deserialize)]
     struct Index {
         weight_map: BTreeMap<String, String>,
     }
-    let index: Index = serde_json::from_reader(File::open(checkpoint.join(SOURCES[0]))?)?;
+    let directory = index
+        .rsplit_once('/')
+        .map_or("", |(directory, _)| directory);
+    let index: Index = serde_json::from_reader(File::open(checkpoint.join(index))?)?;
     index
         .weight_map
         .into_values()
         .map(|shard| {
             ensure!(
                 !shard.is_empty() && !shard.contains(['/', '\\']) && shard != "." && shard != "..",
-                "invalid text encoder shard {shard:?}"
+                "invalid checkpoint shard {shard:?}"
             );
-            Ok(format!("text_encoder/{shard}"))
+            Ok(format!("{directory}/{shard}"))
         })
         .collect()
 }
@@ -186,8 +188,12 @@ impl Config {
         let vae = graph::vae(&self.vae, 16, 16, false)?;
         Ok([
             weights::text(&self.text),
-            weights::transformer(&denoise.weights)?,
-            weights::vae(&vae.weights)?,
+            weights::ordered(
+                &denoise.weights,
+                transformer::weight_shapes(&self.transformer),
+                false,
+            )?,
+            weights::ordered(&vae.weights, vae::weight_shapes(), true)?,
         ])
     }
     fn source(&self, width: usize, height: usize, steps: usize) -> Result<String> {
@@ -218,7 +224,7 @@ fn bundle_stages<'a>(stages: impl IntoIterator<Item = &'a str>) -> Result<String
     Ok(graph::bundle(&raw.to_hexpr_text()))
 }
 
-/// Convert a local distilled Klein 4B snapshot into immutable provider assets
+/// Convert a local distilled Klein snapshot into immutable provider assets
 /// and client metadata. Providers index the three `.bin` files; callers need
 /// only the metadata and tokenizer after conversion.
 pub fn convert_flux(checkpoint: &Path, destination: &Path) -> Result<Vec<NamedAsset>> {
@@ -234,8 +240,13 @@ pub fn convert_flux(checkpoint: &Path, destination: &Path) -> Result<Vec<NamedAs
         .prefix(".flux-")
         .tempdir_in(parent)?;
     let mut assets = Vec::new();
-    for ((name, tensors), source) in ASSETS.into_iter().zip(tensors).zip(SOURCES) {
-        let checkpoint = catena_models::weights::Weights::open(&checkpoint.join(source))?;
+    let sources = [
+        checkpoint.join(TEXT_INDEX),
+        config::transformer_checkpoint(checkpoint),
+        checkpoint.join(VAE),
+    ];
+    for ((name, tensors), source) in ASSETS.into_iter().zip(tensors).zip(sources) {
+        let checkpoint = catena_models::weights::Weights::open(&source)?;
         let path = staging.path().join(format!("{name}.bin"));
         let mut file = BufWriter::new(File::create(&path)?);
         for tensor in tensors {

@@ -45,10 +45,7 @@ impl SpeechRequest {
     }
     pub fn native(&self) -> Result<(), RequestError> {
         if self.response_format != "wav" {
-            return Err(invalid("MMS speech supports response_format wav"));
-        }
-        if self.voice != "default" {
-            return Err(invalid("MMS English supports voice default"));
+            return Err(invalid("native speech supports response_format wav"));
         }
         Ok(())
     }

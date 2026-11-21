@@ -182,8 +182,25 @@ enum Commands {
         #[arg(short = 'o', long, value_name = "DIR")]
         output: PathBuf,
     },
+    /// Fetch and convert a pinned Phonon speech checkpoint with its codec
+    /// and the named voices.
+    ConvertPhonon {
+        /// `ORG/NAME@COMMIT`, pinned to a 40-hex commit.
+        checkpoint: commands::convert::Checkpoint,
+        /// The 40-hex commit of the codec repository the checkpoint names.
+        #[arg(long, value_name = "COMMIT")]
+        codec: String,
+        /// The 40-hex commit of the voice catalog repository.
+        #[arg(long, value_name = "COMMIT")]
+        voices: String,
+        /// A voice name from the catalog; repeat for more voices.
+        #[arg(long = "voice", value_name = "NAME", required = true)]
+        voice: Vec<String>,
+        #[arg(short = 'o', long, value_name = "DIR")]
+        output: PathBuf,
+    },
     /// Print the program manifest a model's jobs run, which `serve
-    /// --program` admits: a Qwen GGUF, converted Whisper/MMS package, or descriptor.
+    /// --program` admits: a GGUF, converted package, or descriptor.
     Program {
         #[arg(value_name = "PATH")]
         model: PathBuf,
@@ -200,7 +217,9 @@ enum Commands {
     Transcribe(commands::transact::TranscribeArgs),
     /// Answer one prompt with a client-rendered Qwen text job.
     Text(commands::transact::TextArgs),
-    /// Fetch a published distilled Flux2 Klein 4B snapshot and convert it
+    /// Answer one decision request with a client-rendered d1 job.
+    Decide(commands::transact::DecideArgs),
+    /// Fetch a published distilled Flux2 Klein snapshot (4B or 9B) and convert it
     /// into client metadata and provider assets.
     ConvertFlux {
         /// `ORG/NAME@COMMIT`, pinned to a 40-hex commit.
@@ -434,6 +453,21 @@ async fn async_main() {
             }
             return;
         }
+        Commands::ConvertPhonon {
+            checkpoint,
+            codec,
+            voices,
+            voice,
+            output,
+        } => {
+            let result = commands::convert::phonon(&checkpoint, &codec, &voices, &voice, &output);
+            tracer_provider.shutdown();
+            if let Err(error) = result {
+                eprintln!("error: {error:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
         Commands::Store(args) if args.profile.is_none() => {
             let result = commands::store::run(args, &home, None, passkey).await;
             tracer_provider.shutdown();
@@ -633,6 +667,21 @@ async fn async_main() {
             }
             .await
         }
+        Commands::Decide(args) => {
+            async {
+                commands::transact::decide(
+                    args,
+                    commands::transact::Context::new(
+                        &local_identity,
+                        owner.as_ref(),
+                        &home,
+                        &selected_chain,
+                    )?,
+                )
+                .await
+            }
+            .await
+        }
         Commands::Text(args) => {
             async {
                 commands::transact::text(
@@ -665,6 +714,7 @@ async fn async_main() {
         }
         Commands::ConvertWhisper { .. }
         | Commands::ConvertSpeech { .. }
+        | Commands::ConvertPhonon { .. }
         | Commands::Model { .. }
         | Commands::ConvertFlux { .. }
         | Commands::Program { .. } => {

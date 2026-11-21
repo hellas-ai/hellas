@@ -129,7 +129,7 @@ hellas transcribe --model whisper-tiny --audio speech.wav --pay 20 \
 ```
 
 `--local` is available in GPU builds. NVIDIA providers use the CUDA evaluator.
-See [jobs](docs/jobs.md) for text, image, Fetch and prepared-program commands.
+See [jobs](docs/jobs.md) for text, image, decision, Fetch and prepared-program commands.
 
 ## More
 

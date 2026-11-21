@@ -506,10 +506,7 @@ impl Repo {
         repo.validate()?;
         Ok(repo)
     }
-    /// Copies the published bytes of one file at this repository's
-    /// immutable commit, `{hub}/{repo}/resolve/{commit}/{path}`, into `out`.
-    /// The node's HF credential goes only to HF origins.
-    pub fn download(&self, path: &str, out: &mut impl std::io::Write) -> Result<u64> {
+    fn resolve_url(&self, path: &str) -> Result<String> {
         self.validate()?;
         if !immutable_sha(&self.revision) {
             return Err(FetchError::Malformed(
@@ -522,10 +519,32 @@ impl Repo {
             RepoKind::Model => "",
             RepoKind::Dataset => "datasets/",
         };
-        let url = format!(
+        Ok(format!(
             "https://huggingface.co/{kind}{}/resolve/{}/{path}",
             self.id, self.revision
-        );
+        ))
+    }
+    /// Whether the repository publishes `path` at its immutable commit.
+    pub fn publishes(&self, path: &str) -> Result<bool> {
+        let url = self.resolve_url(path)?;
+        let mut request = http().head(&url);
+        if let Some(token) = node_token() {
+            request = request.header("Authorization", &format!("Bearer {token}"));
+        }
+        match request.call() {
+            Ok(_) => Ok(true),
+            Err(ureq::Error::StatusCode(404)) => Ok(false),
+            Err(source) => Err(FetchError::Http {
+                context: format!("HEAD {url}"),
+                source: Box::new(source),
+            }),
+        }
+    }
+    /// Copies the published bytes of one file at this repository's
+    /// immutable commit, `{hub}/{repo}/resolve/{commit}/{path}`, into `out`.
+    /// The node's HF credential goes only to HF origins.
+    pub fn download(&self, path: &str, out: &mut impl std::io::Write) -> Result<u64> {
+        let url = self.resolve_url(path)?;
         let context = || format!("GET {url}");
         let mut response = authenticated_get(&url, node_token().as_deref())
             .call()
