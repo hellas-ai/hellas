@@ -281,6 +281,76 @@ multiples of 16 from 16 through 512 and steps must be 1–50. Requests must matc
 a package variant. Request defaults are 512×512, four steps and seed zero. The API accepts one image (`n: 1`) in `b64_json`
 format; unsupported fields are rejected before work starts.
 
+## Decision jobs
+
+A d1 decision model answers questions about a state without generating text.
+Its BF16 GGUF is the package: no conversion is needed, and `hellas model
+describe` makes a descriptor for clients that do not hold the weights. A
+provider adds the GGUF with `route add`, as for a text model.
+
+The request names a `state` (a string or any JSON value) and one or more
+`questions`, each of type `noul` (yes or no), `choice` or `score`:
+
+```json
+{
+  "state": "I was charged twice this month, please refund one of them.",
+  "questions": {
+    "refund": {"type": "noul", "instructions": "Is the customer asking for a refund?"},
+    "team": {
+      "type": "choice",
+      "instructions": "Which team should handle this?",
+      "criteria": {"billing": "Charges, refunds, invoices", "technical": "App or site faults"}
+    },
+    "urgency": {
+      "type": "score",
+      "instructions": "How urgent is this?",
+      "criteria": ["Can wait", "Today", "Blocking the customer now"]
+    }
+  }
+}
+```
+
+```sh
+hellas decide --provider ENROLLMENT_ID@NODE_ID --model d1.gguf \
+  --request request.json --backend hellas/catena-dfad87438018-hip --pay 20
+```
+
+`decide` reads the request from `--request FILE`, or from standard input by
+default, and prints the response JSON:
+
+```json
+{
+  "model": "d1",
+  "answers": {
+    "refund": {"type": "noul", "noul": 0.97},
+    "team": {"type": "choice", "choice": "billing", "confidence": 0.99, "probabilities": {"billing": 0.99, "technical": 0.01}},
+    "urgency": {"type": "score", "score": 1.0, "confidence": 0.6, "probabilities": {"0": 0.1, "1": 0.6, "2": 0.3}, "legend": {"0": "Can wait", "1": "Today", "2": "Blocking the customer now"}}
+  },
+  "usage": {"input_tokens": 212, "output_tokens": 0}
+}
+```
+
+The client expands each question into one complete prompt, using the request
+format stored in the GGUF. One job then runs `qwen3.init` and `qwen3` once per
+question and returns each prompt's final vocabulary logits; the client reads
+the answers from them. A job answers at most 64 questions. The provider must
+admit two bytes of output per vocabulary entry for each question (256 kB per
+question for d1) and uploads for the program and token IDs.
+
+Requests are text only: `images` and `files` are rejected before work starts.
+`model` is optional for `decide`, which otherwise names the model by its file.
+
+The gateway exposes the same model with `gateway --model d1.gguf` and
+`--access`, `--pay` or `--local` as usual. `POST /v1/systemone` takes the same
+body, with `model` set to the package's file name without its extension, and
+returns the same response with signed evidence in `hellas`:
+
+```sh
+curl http://127.0.0.1:8080/v1/systemone \
+  -H "Authorization: Bearer $(cat ~/.hellas/gateway/bearer)" -H 'Content-Type: application/json' \
+  -d "$(jq '.model = "d1"' request.json)"
+```
+
 ## Fetch jobs
 
 ```toml

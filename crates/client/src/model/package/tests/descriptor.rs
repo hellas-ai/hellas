@@ -238,7 +238,7 @@ async fn descriptors_render_identical_jobs_without_the_original_weights() {
                         max_new_tokens: 2,
                     },
                 ],
-                ModelKind::Image | ModelKind::Speech => unreachable!(),
+                ModelKind::Decision | ModelKind::Image | ModelKind::Speech => unreachable!(),
             };
             for request in requests {
                 let full = package.render_job(&request).await.unwrap();

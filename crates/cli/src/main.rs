@@ -200,6 +200,8 @@ enum Commands {
     Transcribe(commands::transact::TranscribeArgs),
     /// Answer one prompt with a client-rendered Qwen text job.
     Text(commands::transact::TextArgs),
+    /// Answer one decision request with a client-rendered d1 job.
+    Decide(commands::transact::DecideArgs),
     /// Fetch a published distilled Flux2 Klein snapshot (4B or 9B) and convert it
     /// into client metadata and provider assets.
     ConvertFlux {
@@ -621,6 +623,21 @@ async fn async_main() {
         Commands::Transcribe(args) => {
             async {
                 commands::transact::transcribe(
+                    args,
+                    commands::transact::Context::new(
+                        &local_identity,
+                        owner.as_ref(),
+                        &home,
+                        &selected_chain,
+                    )?,
+                )
+                .await
+            }
+            .await
+        }
+        Commands::Decide(args) => {
+            async {
+                commands::transact::decide(
                     args,
                     commands::transact::Context::new(
                         &local_identity,

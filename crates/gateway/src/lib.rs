@@ -13,6 +13,7 @@ mod archive;
 mod audio;
 mod backend;
 mod completion;
+mod decision;
 mod dispatch;
 mod error;
 pub mod router;

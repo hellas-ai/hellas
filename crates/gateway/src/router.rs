@@ -117,6 +117,9 @@ pub async fn with_models(
                         crate::state::TextState::open(package.clone(), *max_tokens, execution)
                             .await?,
                     )),
+                    hellas_client::model::ModelKind::Decision => {
+                        crate::decision::router(model.clone(), package.clone(), execution).await?
+                    }
                     hellas_client::model::ModelKind::Transcription => {
                         crate::audio::router(*max_tokens as usize, execution)?
                     }
@@ -292,6 +295,8 @@ pub(crate) fn request_limit(path: &str) -> usize {
         crate::audio::MAX_REQUEST_BYTES
     } else if path == crate::image::PATH {
         crate::image::MAX_REQUEST_BYTES
+    } else if path == crate::decision::PATH {
+        crate::decision::MAX_REQUEST_BYTES
     } else {
         hellas_rpc::fetch::MAX_FETCH_REQUEST_BODY_BYTES
     }

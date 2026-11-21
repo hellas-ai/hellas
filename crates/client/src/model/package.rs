@@ -36,6 +36,8 @@ pub struct ModelPackage {
 pub enum ModelKind {
     /// A Qwen GGUF file or descriptor directory.
     Text,
+    /// A d1 decision GGUF file or descriptor directory.
+    Decision,
     /// A converted Whisper package or descriptor directory.
     Transcription,
     /// A converted Flux package directory.
@@ -46,7 +48,7 @@ pub enum ModelKind {
 
 impl ModelKind {
     pub fn of(path: &Path) -> Result<Self> {
-        Ok(descriptor::classify(path)?.kind())
+        descriptor::classify(path)?.kind(path)
     }
 }
 
@@ -61,6 +63,10 @@ pub enum ModelRequest<'a> {
         prompt_ids: &'a [u64],
         max_new: u64,
         stops: &'a [u64],
+    },
+    /// One complete prompt per question; see [`super::decision`].
+    Decision {
+        prompts: &'a [Vec<u64>],
     },
     Transcription {
         samples: &'a [f32],
@@ -82,6 +88,8 @@ pub struct ComputeJob {
 #[derive(Debug)]
 pub enum ModelResponse {
     Tokens(Vec<u32>),
+    /// Final-position vocabulary logits of each decision prompt.
+    Logits(Vec<Vec<f32>>),
     Transcription(super::whisper::Transcription),
     Image(Image),
     Speech(SpeechAudio),
@@ -202,9 +210,10 @@ impl ModelPackage {
     }
 
     pub fn kind(&self) -> ModelKind {
-        match self.family {
+        match &self.family {
             Family::Whisper(_) => ModelKind::Transcription,
             Family::Speech(_) => ModelKind::Speech,
+            Family::Qwen3(model) if model.is_decision() => ModelKind::Decision,
             Family::Qwen3(_) => ModelKind::Text,
             Family::Flux(_) => ModelKind::Image,
         }
@@ -258,6 +267,10 @@ impl ModelPackage {
                 tokio::task::spawn_blocking(move || model.render_job(&prompt, max_new, &stops))
                     .await?
             }
+            (Family::Qwen3(model), ModelRequest::Decision { prompts }) => {
+                let (model, prompts) = (model.clone(), prompts.to_vec());
+                tokio::task::spawn_blocking(move || model.render_decisions(&prompts)).await?
+            }
             (
                 Family::Whisper(model),
                 ModelRequest::Transcription {
@@ -290,6 +303,9 @@ impl ModelPackage {
             Family::Speech(_) => Ok(ModelResponse::Speech(Speech::decode(output)?)),
             Family::Flux(_) => Ok(ModelResponse::Image(Image::decode(output)?)),
             Family::Whisper(model) => Ok(ModelResponse::Transcription(model.decode(output)?)),
+            Family::Qwen3(model) if model.is_decision() => {
+                Ok(ModelResponse::Logits(model.decode_logits(output)?))
+            }
             Family::Qwen3(_) => {
                 let artifact = output
                     .artifacts

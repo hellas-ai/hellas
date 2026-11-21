@@ -12,8 +12,8 @@ hellas gateway \
   --model gpt-5@openrouter
 ```
 
-A local path accepts Qwen GGUF, converted Whisper, MMS speech or Flux directories, and
-Qwen, Whisper or MMS descriptor directories. The package determines the modality
+A local path accepts Qwen or d1 decision GGUF, converted Whisper, MMS speech or Flux
+directories, and GGUF, Whisper or MMS descriptor directories. The package determines the modality
 and API paths. Remote Compute uses `PATH@CONTACT`: the gateway needs that
 local package to render the invocation for the contact's evaluator. A Fetch
 grant uses `NAME@CONTACT`, checked against the models in its signed offer.

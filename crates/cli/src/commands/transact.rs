@@ -35,6 +35,8 @@ mod image;
 pub use image::{ImageArgs, image};
 mod text;
 pub use text::{TextArgs, text};
+mod decide;
+pub use decide::{DecideArgs, decide};
 #[cfg(test)]
 mod tests;
 
