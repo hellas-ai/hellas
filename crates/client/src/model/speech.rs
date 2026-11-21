@@ -5,12 +5,11 @@ use catena_models::{
     tts,
     weights::{Weights, f32_to_bf16},
 };
-use hellas_channel::content::{DEFAULT_MAX_STAGING_BYTES, upload_object};
 use hellas_rpc::{
     ContentRef,
     protocol::invocation::{Artifact, compute::*, output::InvocationOutput},
 };
-use hellas_store::content::{LocalStore, MemoryStore, Reservations, Scope};
+use hellas_store::content::{LocalStore, Scope};
 use std::{
     fs::File,
     io::{BufWriter, Cursor, Write},
@@ -167,21 +166,14 @@ impl Speech {
             ))
         })
         .await??;
-        let content = (
-            LocalStore::Memory(MemoryStore::new(Reservations::ram(
-                DEFAULT_MAX_STAGING_BYTES,
-            ))),
-            Scope::Owner,
-        );
-        let source = upload_object(&content.0, source.as_bytes()).await?;
-        let environment = Environment {
-            sources: vec![source],
-            assets: vec![NamedAsset {
+        let (environment, content) = super::program::environment(
+            &source,
+            vec![NamedAsset {
                 name: "weights".into(),
                 object,
             }],
-        };
-        upload_object(&content.0, &environment.canonical_bytes()?).await?;
+        )
+        .await?;
         Ok(Self {
             tokenizer,
             environment,

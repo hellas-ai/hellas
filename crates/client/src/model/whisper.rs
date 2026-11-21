@@ -5,12 +5,11 @@ use catena_models::{
     weights::{Weights, f32_to_bf16},
     whisper::{Config, Generation, audio, graph, weight_shapes},
 };
-use hellas_channel::content::{DEFAULT_MAX_STAGING_BYTES, upload_object};
 use hellas_rpc::{
     ContentRef,
     protocol::invocation::{Artifact, compute::*, output::InvocationOutput},
 };
-use hellas_store::content::{LocalStore, MemoryStore, Reservations, Scope};
+use hellas_store::content::{LocalStore, Scope};
 use std::{
     collections::BTreeMap,
     fs::File,
@@ -154,21 +153,14 @@ impl Whisper {
                 Ok((config, generation, tokenizer, views, object, source))
             })
             .await??;
-        let content = (
-            LocalStore::Memory(MemoryStore::new(Reservations::ram(
-                DEFAULT_MAX_STAGING_BYTES,
-            ))),
-            Scope::Owner,
-        );
-        let source = upload_object(&content.0, source.as_bytes()).await?;
-        let environment = Environment {
-            sources: vec![source],
-            assets: vec![NamedAsset {
+        let (environment, content) = super::program::environment(
+            &source,
+            vec![NamedAsset {
                 name: "weights".into(),
                 object,
             }],
-        };
-        upload_object(&content.0, &environment.canonical_bytes()?).await?;
+        )
+        .await?;
         Ok(Self {
             config,
             generation,

@@ -14,11 +14,10 @@ use catena_models::{
     checkpoint::read_gguf_model_config,
     spec::{ModelArchitecture, ModelConfig, WeightDtype, weight_specs},
 };
-use hellas_channel::content::{DEFAULT_MAX_STAGING_BYTES, upload_object};
 use hellas_rpc::protocol::invocation::{
     Artifact, MAX_ARTIFACTS, compute::*, output::InvocationOutput,
 };
-use hellas_store::content::{LocalStore, MemoryStore, Reservations, Scope};
+use hellas_store::content::{LocalStore, Scope};
 use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 const PROMPT: &str = "prompt";
@@ -98,21 +97,14 @@ impl Qwen3 {
                 Ok((config, views, object, source, states))
             })
             .await??;
-        let content = (
-            LocalStore::Memory(MemoryStore::new(Reservations::ram(
-                DEFAULT_MAX_STAGING_BYTES,
-            ))),
-            Scope::Owner,
-        );
-        let source = upload_object(&content.0, source.as_bytes()).await?;
-        let environment = Environment {
-            sources: vec![source],
-            assets: vec![NamedAsset {
+        let (environment, content) = super::program::environment(
+            &source,
+            vec![NamedAsset {
                 name: WEIGHTS.into(),
                 object,
             }],
-        };
-        upload_object(&content.0, &environment.canonical_bytes()?).await?;
+        )
+        .await?;
         Ok(Self {
             config,
             environment,
