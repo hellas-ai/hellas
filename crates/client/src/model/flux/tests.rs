@@ -420,7 +420,7 @@ async fn image_output_is_checked_and_png_quantization_matches_upstream() {
 #[test]
 fn the_snapshot_files_include_every_text_encoder_shard_its_index_names() {
     let directory = tempfile::tempdir().unwrap();
-    let index = directory.path().join(SOURCES[0]);
+    let index = directory.path().join(TEXT_INDEX);
     std::fs::create_dir_all(index.parent().unwrap()).unwrap();
     std::fs::write(
         &index,
@@ -428,7 +428,7 @@ fn the_snapshot_files_include_every_text_encoder_shard_its_index_names() {
     )
     .unwrap();
     assert_eq!(
-        text_shards(directory.path())
+        shards(directory.path(), TEXT_INDEX)
             .unwrap()
             .into_iter()
             .collect::<Vec<_>>(),
@@ -437,9 +437,9 @@ fn the_snapshot_files_include_every_text_encoder_shard_its_index_names() {
             "text_encoder/model-2.safetensors"
         ]
     );
-    assert!(CHECKPOINT.contains(&SOURCES[0]));
+    assert!(CHECKPOINT.contains(&TEXT_INDEX));
     for shard in ["../escape", "a/b", ""] {
         std::fs::write(&index, format!(r#"{{"weight_map":{{"a":{shard:?}}}}}"#)).unwrap();
-        assert!(text_shards(directory.path()).is_err(), "{shard}");
+        assert!(shards(directory.path(), TEXT_INDEX).is_err(), "{shard}");
     }
 }

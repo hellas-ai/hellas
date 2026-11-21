@@ -98,7 +98,13 @@ pub fn flux(checkpoint: &Checkpoint, output: &Path) -> CliResult<()> {
     use hellas_client::model::flux;
     let scratch = scratch(output)?;
     checkpoint.fetch(scratch.path(), flux::CHECKPOINT)?;
-    let shards = flux::text_shards(scratch.path())?;
+    let mut shards = flux::shards(scratch.path(), flux::TEXT_INDEX)?;
+    if checkpoint.0.publishes(flux::TRANSFORMER_INDEX)? {
+        checkpoint.fetch(scratch.path(), [flux::TRANSFORMER_INDEX])?;
+        shards.extend(flux::shards(scratch.path(), flux::TRANSFORMER_INDEX)?);
+    } else {
+        shards.insert(flux::TRANSFORMER.into());
+    }
     checkpoint.fetch(scratch.path(), shards.iter().map(String::as_str))?;
     for asset in flux::convert_flux(scratch.path(), output)? {
         println!(
