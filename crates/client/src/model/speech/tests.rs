@@ -1,6 +1,7 @@
 use super::*;
 use crate::model::{GpuDialect, ModelKind, ModelPackage, ModelRequest, ModelResponse};
 use hellas_rpc::protocol::invocation::output::Outcome;
+use std::io::Cursor;
 
 fn fixture(dir: &Path) {
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/model/speech/fixture");
@@ -83,8 +84,15 @@ async fn converted_mms_and_descriptor_render_the_same_portable_synthesis_job() {
         assert_eq!(a.programs().unwrap(), b.programs().unwrap());
         let request = ModelRequest::Speech {
             text: "Hello",
+            voice: "default",
             speed: 1.,
         };
+        let other = ModelRequest::Speech {
+            text: "Hello",
+            voice: "other",
+            speed: 1.,
+        };
+        assert!(a.render_job(&other).await.is_err());
         let a = a.render_job(&request).await.unwrap();
         let b = b.render_job(&request).await.unwrap();
         assert_eq!(a.plan, b.plan);
@@ -123,8 +131,8 @@ fn output(samples: &[f32], count: u64, status: u64) -> InvocationOutput {
 }
 #[test]
 fn output_descriptor_is_checked_and_only_valid_samples_enter_wav() {
-    let audio = Speech::decode(&output(&[-2., 0., 0.5, 2.], 4, 0)).unwrap();
-    let encoded = audio.wav().unwrap();
+    let audio = Speech::decode_mms(&output(&[-2., 0., 0.5, 2.], 4, 0)).unwrap();
+    let encoded = audio.wav_bytes().unwrap();
     let mut wav = hound::WavReader::new(Cursor::new(encoded)).unwrap();
     assert_eq!(wav.spec().channels, 1);
     assert_eq!(wav.spec().sample_rate, 16000);
@@ -138,12 +146,12 @@ fn output_descriptor_is_checked_and_only_valid_samples_enter_wav() {
         output(&[0.], 1, 1),
         output(&[f32::NAN], 1, 0),
     ] {
-        assert!(Speech::decode(&invalid).is_err());
+        assert!(Speech::decode_mms(&invalid).is_err());
     }
     let mut extra = output(&[0.], 1, 0);
     extra
         .artifacts
         .push(Artifact::new("extra", "catena.bytes.v1", vec![]));
-    assert!(Speech::decode(&extra).is_err());
+    assert!(Speech::decode_mms(&extra).is_err());
     let _response = ModelResponse::Speech(audio);
 }

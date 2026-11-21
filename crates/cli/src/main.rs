@@ -182,8 +182,25 @@ enum Commands {
         #[arg(short = 'o', long, value_name = "DIR")]
         output: PathBuf,
     },
+    /// Fetch and convert a pinned Phonon speech checkpoint with its codec
+    /// and the named voices.
+    ConvertPhonon {
+        /// `ORG/NAME@COMMIT`, pinned to a 40-hex commit.
+        checkpoint: commands::convert::Checkpoint,
+        /// The 40-hex commit of the codec repository the checkpoint names.
+        #[arg(long, value_name = "COMMIT")]
+        codec: String,
+        /// The 40-hex commit of the voice catalog repository.
+        #[arg(long, value_name = "COMMIT")]
+        voices: String,
+        /// A voice name from the catalog; repeat for more voices.
+        #[arg(long = "voice", value_name = "NAME", required = true)]
+        voice: Vec<String>,
+        #[arg(short = 'o', long, value_name = "DIR")]
+        output: PathBuf,
+    },
     /// Print the program manifest a model's jobs run, which `serve
-    /// --program` admits: a Qwen GGUF, converted Whisper/MMS package, or descriptor.
+    /// --program` admits: a GGUF, converted package, or descriptor.
     Program {
         #[arg(value_name = "PATH")]
         model: PathBuf,
@@ -429,6 +446,21 @@ async fn async_main() {
         }
         Commands::ConvertSpeech { checkpoint, output } => {
             let result = commands::convert::speech(&checkpoint, &output);
+            tracer_provider.shutdown();
+            if let Err(error) = result {
+                eprintln!("error: {error:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        Commands::ConvertPhonon {
+            checkpoint,
+            codec,
+            voices,
+            voice,
+            output,
+        } => {
+            let result = commands::convert::phonon(&checkpoint, &codec, &voices, &voice, &output);
             tracer_provider.shutdown();
             if let Err(error) = result {
                 eprintln!("error: {error:#}");
@@ -682,6 +714,7 @@ async fn async_main() {
         }
         Commands::ConvertWhisper { .. }
         | Commands::ConvertSpeech { .. }
+        | Commands::ConvertPhonon { .. }
         | Commands::Model { .. }
         | Commands::ConvertFlux { .. }
         | Commands::Program { .. } => {

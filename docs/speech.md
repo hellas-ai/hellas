@@ -1,8 +1,9 @@
 # Speech on one gateway
 
 `POST /v1/audio/speech` accepts JSON and returns audio bytes. The request's
-`model` selects either a hosted audio interface through Fetch or an MMS
-English package through Compute. Both use the existing listener and its bearer.
+`model` selects either a hosted audio interface through Fetch or a native
+package, MMS English or Phonon, through Compute. All use the existing listener
+and its bearer.
 
 ```sh
 curl -H "Authorization: Bearer $(cat "$HOME/gateway.bearer")" \
@@ -13,7 +14,8 @@ curl -H "Authorization: Bearer $(cat "$HOME/gateway.bearer")" \
 
 Change only `model` to `mms` to use the native route in the example below.
 The hosted service must support the requested voice and configured format;
-its voice identifiers remain its own. MMS has one voice, named `default`.
+its voice identifiers remain its own. MMS has one voice, named `default`. A
+Phonon package serves the voices converted into it, under their catalog names.
 
 MMS accepts `response_format: "wav"` and finite `speed` between 0.25 and 4
 (default 1). The result is mono 16 kHz, signed 16-bit PCM WAV. Text uses the
@@ -21,7 +23,12 @@ pinned MMS English tokenizer and must fit its 512-token limit after blank
 insertion. Invalid durations or audio longer than the model's 30-second
 capacity fail explicitly. Hosted speech accepts only the configured `wav`
 and/or `mp3` mappings and speed 1. Omitting `response_format` selects `mp3`,
-which therefore requires a hosted mp3 mapping; MMS callers must request wav.
+which therefore requires a hosted mp3 mapping; native callers must request wav.
+
+Phonon accepts `response_format: "wav"` and speed 1. The result is mono 24 kHz,
+signed 16-bit PCM WAV. Text longer than 50 tokens is split at sentence, clause
+or word boundaries into at most 32 utterances, joined by 120 ms pauses. Sampling
+uses a fixed seed, so the same request renders the same job.
 Unknown fields, unsupported settings and query parameters receive 400 before
 execution. Both targets return a complete response after verified completion. Hosted audio
 retains its content type and encoding; upstream error statuses and bodies are
@@ -49,6 +56,32 @@ its descriptor. The native model validates the two output artifacts, checks
 status and sample count, and encodes only the valid finite waveform prefix.
 Configure provider Compute admission for the program printed by `hellas program`
 and enough output for the 1,920,000-byte waveform plus 16-byte descriptor.
+
+## Prepare a Phonon package
+
+A Phonon package combines a model checkpoint, the codec it names and one or
+more voices from the voice catalog, each at an immutable 40-hex revision:
+
+```sh
+hellas convert-phonon MODEL@MODEL_COMMIT --codec CODEC_COMMIT \
+  --voices VOICES_COMMIT --voice Easton --voice Zoey -o ./phonon
+hellas program ./phonon --backend hellas/catena-dfad87438018-hip
+```
+
+`MODEL` is the checkpoint's repository, such as the English `phonon-31m-en`
+or a 40M language checkpoint. The codec and voice catalog repositories are
+fixed by the model family, so only their revisions are given. Voice names are
+those of the catalog's `voices.jsonl`, and must be plain file names.
+
+The package contains `weights.bin` (model weights as BF16, codec weights as
+F32), one `voices/NAME.bf16` per voice, the model and codec configuration and
+tokenizer, and `assets.json`, which names each of those files' content. A
+client that only renders jobs needs the JSON files, not the weights or voices.
+The provider indexes the full package. One job runs `phonon.setup` for the
+voice and `phonon.synthesize` per utterance. Each utterance returns a 16-byte
+descriptor and a waveform of up to `ceil((tokens + 6) * 25 / 6)` frames of
+7,680 bytes, about 1.8 MB for 50 tokens; configure provider Compute admission
+for the program printed by `hellas program` and that much output per utterance.
 
 ## Gateway configuration
 
@@ -102,7 +135,8 @@ kind = "native"
 package = "/srv/models/mms-remote"
 ```
 
-Each model alias has one speech target in the existing route table. Both target
+A Phonon package uses the same `kind = "native"` target with its package
+directory. Each model alias has one speech target in the existing route table. Both target
 kinds share request parsing, response delivery and provenance. Generic HTTP
 passthrough has no speech configuration.
 

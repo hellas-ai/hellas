@@ -3,7 +3,7 @@ use super::{
     descriptor,
     flux::{Flux, Image, ImageRequest},
     qwen3::Qwen3,
-    speech::{Speech, SpeechAudio},
+    speech::{Audio, Speech},
     whisper::Whisper,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -42,7 +42,7 @@ pub enum ModelKind {
     Transcription,
     /// A converted Flux package directory.
     Image,
-    /// A converted MMS English package or descriptor.
+    /// A converted MMS English package or descriptor, or a converted Phonon package.
     Speech,
 }
 
@@ -56,6 +56,7 @@ impl ModelKind {
 pub enum ModelRequest<'a> {
     Speech {
         text: &'a str,
+        voice: &'a str,
         speed: f32,
     },
     Image(ImageRequest<'a>),
@@ -92,7 +93,7 @@ pub enum ModelResponse {
     Logits(Vec<Vec<f32>>),
     Transcription(super::whisper::Transcription),
     Image(Image),
-    Speech(SpeechAudio),
+    Speech(Audio),
 }
 
 impl ModelPackage {
@@ -178,6 +179,9 @@ impl ModelPackage {
                 descriptor::Resolved::Speech { path, weights } => {
                     Family::Speech(Arc::new(Speech::open(path, dialect, *weights).await?))
                 }
+                descriptor::Resolved::Phonon(path) => {
+                    Family::Speech(Arc::new(Speech::open_phonon(path, dialect).await?))
+                }
                 descriptor::Resolved::Flux(path) => Family::Flux(Arc::new({
                     let path = path.clone();
                     tokio::task::spawn_blocking(move || Flux::open(&path, dialect)).await??
@@ -227,9 +231,10 @@ impl ModelPackage {
     }
     pub async fn render_job(&self, request: &ModelRequest<'_>) -> Result<ComputeJob> {
         match (&self.family, request) {
-            (Family::Speech(model), ModelRequest::Speech { text, speed }) => {
-                let (model, text, speed) = (model.clone(), text.to_string(), *speed);
-                tokio::task::spawn_blocking(move || model.render_job(&text, speed)).await?
+            (Family::Speech(model), ModelRequest::Speech { text, voice, speed }) => {
+                let (model, text, voice, speed) =
+                    (model.clone(), text.to_string(), voice.to_string(), *speed);
+                tokio::task::spawn_blocking(move || model.render_job(&text, &voice, speed)).await?
             }
             (Family::Flux(model), ModelRequest::Image(request)) => {
                 let model = model.clone();
@@ -300,7 +305,7 @@ impl ModelPackage {
             output.outcome
         );
         match &self.family {
-            Family::Speech(_) => Ok(ModelResponse::Speech(Speech::decode(output)?)),
+            Family::Speech(model) => Ok(ModelResponse::Speech(model.decode(output)?)),
             Family::Flux(_) => Ok(ModelResponse::Image(Image::decode(output)?)),
             Family::Whisper(model) => Ok(ModelResponse::Transcription(model.decode(output)?)),
             Family::Qwen3(model) if model.is_decision() => {

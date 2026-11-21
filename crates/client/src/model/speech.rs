@@ -1,4 +1,5 @@
-//! MMS English preprocessing and the portable synthesis ABI.
+//! Speech synthesis: MMS English and Phonon render one request shape into
+//! their portable synthesis ABIs and decode one audio shape back.
 use super::package::ComputeJob;
 use anyhow::{Context, Result, ensure};
 use catena_models::{
@@ -12,9 +13,12 @@ use hellas_rpc::{
 use hellas_store::content::{LocalStore, Scope};
 use std::{
     fs::File,
-    io::{BufWriter, Cursor, Write},
+    io::{BufWriter, Write},
     path::Path,
 };
+
+pub mod phonon;
+pub use catena_models::tts::Audio;
 
 pub const WEIGHTS_FILE: &str = "weights.bf16";
 pub const WAVEFORM: &str = "waveform";
@@ -120,38 +124,16 @@ pub fn convert_speech(checkpoint: &Path, destination: &Path) -> Result<ContentRe
 }
 
 pub(super) struct Speech {
-    tokenizer: tts::tokenizer::Tokenizer,
     environment: Environment,
     content: (LocalStore, Scope),
-    views: Vec<(u64, u64)>,
+    model: Model,
 }
-#[derive(Debug)]
-pub struct SpeechAudio {
-    pub samples: Vec<f32>,
-}
-impl SpeechAudio {
-    /// Mono, 16 kHz, signed 16-bit PCM WAV.
-    pub fn wav(&self) -> Result<Vec<u8>> {
-        ensure!(
-            !self.samples.is_empty() && self.samples.iter().all(|x| x.is_finite()),
-            "invalid synthesized waveform"
-        );
-        let mut bytes = Cursor::new(Vec::new());
-        let mut writer = hound::WavWriter::new(
-            &mut bytes,
-            hound::WavSpec {
-                channels: 1,
-                sample_rate: tts::SAMPLE_RATE,
-                bits_per_sample: 16,
-                sample_format: hound::SampleFormat::Int,
-            },
-        )?;
-        for &sample in &self.samples {
-            writer.write_sample((sample.clamp(-1., 1.) * 32767.).round() as i16)?;
-        }
-        writer.finalize()?;
-        Ok(bytes.into_inner())
-    }
+enum Model {
+    Mms {
+        tokenizer: tts::tokenizer::Tokenizer,
+        views: Vec<(u64, u64)>,
+    },
+    Phonon(Box<phonon::Phonon>),
 }
 impl Speech {
     pub async fn open(dir: &Path, dialect: super::GpuDialect, object: ContentRef) -> Result<Self> {
@@ -175,21 +157,41 @@ impl Speech {
         )
         .await?;
         Ok(Self {
-            tokenizer,
             environment,
             content,
-            views,
+            model: Model::Mms { tokenizer, views },
+        })
+    }
+    pub async fn open_phonon(dir: &Path, dialect: super::GpuDialect) -> Result<Self> {
+        let dir = dir.to_owned();
+        let (model, source, assets) = tokio::task::spawn_blocking(move || -> Result<_> {
+            let (model, bundle, assets) = phonon::Phonon::open(&dir)?;
+            Ok((model, super::program::render(&bundle, dialect)?, assets))
+        })
+        .await??;
+        let (environment, content) = super::program::environment(&source, assets).await?;
+        Ok(Self {
+            environment,
+            content,
+            model: Model::Phonon(Box::new(model)),
         })
     }
     pub(super) fn environment(&self) -> &Environment {
         &self.environment
     }
-    pub fn render_job(&self, text: &str, speed: f32) -> Result<ComputeJob> {
+    pub fn render_job(&self, text: &str, voice: &str, speed: f32) -> Result<ComputeJob> {
         ensure!(
             speed.is_finite() && (0.25..=4.).contains(&speed),
             "speed must be between 0.25 and 4"
         );
-        let tokens = self.tokenizer.encode(text)?;
+        let (tokenizer, views) = match &self.model {
+            Model::Mms { tokenizer, views } => (tokenizer, views),
+            Model::Phonon(model) => {
+                return model.render_job(&self.environment, &self.content, text, voice, speed);
+            }
+        };
+        ensure!(voice == "default", "MMS English has one voice, default");
+        let tokens = tokenizer.encode(text)?;
         let options = tts::Options::default();
         let mut args = vec![
             Arg::Input {
@@ -202,7 +204,7 @@ impl Speech {
             Arg::F32Bits(options.noise_scale.to_bits()),
             Arg::F32Bits(speed.to_bits()),
         ];
-        args.extend(self.views.iter().map(|&(offset, bytes)| Arg::Asset {
+        args.extend(views.iter().map(|&(offset, bytes)| Arg::Asset {
             name: "weights".into(),
             offset,
             bytes,
@@ -237,7 +239,13 @@ impl Speech {
             },
         })
     }
-    pub fn decode(output: &InvocationOutput) -> Result<SpeechAudio> {
+    pub fn decode(&self, output: &InvocationOutput) -> Result<Audio> {
+        match self.model {
+            Model::Mms { .. } => Self::decode_mms(output),
+            Model::Phonon(_) => phonon::decode(output),
+        }
+    }
+    fn decode_mms(output: &InvocationOutput) -> Result<Audio> {
         ensure!(
             output.artifacts.len() == 2,
             "expected waveform and result descriptor"
@@ -265,19 +273,25 @@ impl Speech {
             "invalid speech sample count"
         );
         let waveform = artifact(WAVEFORM, tts::MAX_SAMPLES * 4)?;
-        let samples: Vec<_> = waveform[..count * 4]
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .copied()
-            .map(f32::from_le_bytes)
-            .collect();
+        let samples = floats_f32(&waveform[..count * 4]);
         ensure!(
             samples.iter().all(|x| x.is_finite()),
             "nonfinite speech waveform"
         );
-        Ok(SpeechAudio { samples })
+        Ok(Audio {
+            samples,
+            sample_rate: tts::SAMPLE_RATE,
+        })
     }
+}
+fn floats_f32(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .copied()
+        .map(f32::from_le_bytes)
+        .collect()
 }
 
 #[cfg(test)]

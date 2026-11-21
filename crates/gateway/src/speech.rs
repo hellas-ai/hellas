@@ -84,6 +84,7 @@ async fn handle(
             }
             Operation::Compute(ModelRequest::Speech {
                 text: &request.input,
+                voice: &request.voice,
                 speed: request.speed,
             })
         }
@@ -120,7 +121,7 @@ async fn handle(
                 axum::http::header::CONTENT_TYPE,
                 axum::http::HeaderValue::from_static("audio/wav"),
             )]),
-            bytes: audio.wav().map_err(pipeline::invalid_output)?,
+            bytes: audio.wav_bytes().map_err(pipeline::invalid_output)?,
         }))
     })
     .await
