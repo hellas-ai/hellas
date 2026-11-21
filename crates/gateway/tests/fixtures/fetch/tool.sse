@@ -1,24 +1,24 @@
 event: response.created
-data: {"response":{"created_at":1700000000,"id":"resp-fixture","model":"fixture","object":"response","output":[],"status":"queued"},"sequence_number":0,"type":"response.created"}
+data: {"response":{"id":"resp-fixture","object":"response","created_at":1700000000,"status":"queued","model":"fixture","output":[]},"type":"response.created","sequence_number":0}
 
 event: response.in_progress
-data: {"response":{"created_at":1700000000,"id":"resp-fixture","model":"fixture","object":"response","output":[],"status":"in_progress"},"sequence_number":1,"type":"response.in_progress"}
+data: {"response":{"id":"resp-fixture","object":"response","created_at":1700000000,"status":"in_progress","model":"fixture","output":[]},"type":"response.in_progress","sequence_number":1}
 
 event: response.output_item.added
-data: {"item":{"arguments":"","call_id":"call-fixture","id":"call-fixture","name":"weather","status":"in_progress","type":"function_call"},"output_index":0,"sequence_number":2,"type":"response.output_item.added"}
+data: {"output_index":0,"item":{"id":"call-fixture","type":"function_call","call_id":"call-fixture","name":"weather","arguments":"","status":"in_progress"},"type":"response.output_item.added","sequence_number":2}
 
 event: response.function_call_arguments.delta
-data: {"delta":"{\"city\":","item_id":"call-fixture","output_index":0,"sequence_number":3,"type":"response.function_call_arguments.delta"}
+data: {"item_id":"call-fixture","output_index":0,"delta":"{\"city\":","type":"response.function_call_arguments.delta","sequence_number":3}
 
 event: response.function_call_arguments.delta
-data: {"delta":"\"Zürich\"}","item_id":"call-fixture","output_index":0,"sequence_number":4,"type":"response.function_call_arguments.delta"}
+data: {"item_id":"call-fixture","output_index":0,"delta":"\"Zürich\"}","type":"response.function_call_arguments.delta","sequence_number":4}
 
 event: response.function_call_arguments.done
-data: {"arguments":"{\"city\":\"Zürich\"}","item_id":"call-fixture","output_index":0,"sequence_number":5,"type":"response.function_call_arguments.done"}
+data: {"item_id":"call-fixture","output_index":0,"arguments":"{\"city\":\"Zürich\"}","type":"response.function_call_arguments.done","sequence_number":5}
 
 event: response.output_item.done
-data: {"item":{"arguments":"{\"city\":\"Zürich\"}","call_id":"call-fixture","id":"call-fixture","name":"weather","status":"completed","type":"function_call"},"output_index":0,"sequence_number":6,"type":"response.output_item.done"}
+data: {"output_index":0,"item":{"id":"call-fixture","type":"function_call","call_id":"call-fixture","name":"weather","arguments":"{\"city\":\"Zürich\"}","status":"completed"},"type":"response.output_item.done","sequence_number":6}
 
 event: response.completed
-data: {"response":{"created_at":1700000000,"id":"resp-fixture","model":"fixture","object":"response","output":[{"arguments":"{\"city\":\"Zürich\"}","call_id":"call-fixture","id":"call-fixture","name":"weather","status":"completed","type":"function_call"}],"status":"completed","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}},"sequence_number":7,"type":"response.completed"}
+data: {"response":{"id":"resp-fixture","object":"response","created_at":1700000000,"status":"completed","model":"fixture","output":[{"id":"call-fixture","type":"function_call","call_id":"call-fixture","name":"weather","arguments":"{\"city\":\"Zürich\"}","status":"completed"}],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}},"type":"response.completed","sequence_number":7}
 

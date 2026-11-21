@@ -782,10 +782,11 @@ dependencies = [
 [[package]]
 name = "catena-models"
 version = "0.1.0"
-source = "git+https://github.com/hellas-ai/catena-models.git?rev=4bb7fddf71c6e795fa0894b6c316fbeeed32f9c4#4bb7fddf71c6e795fa0894b6c316fbeeed32f9c4"
+source = "git+https://github.com/hellas-ai/catena-models.git?rev=7275653a989a589155998784c3dde40f867b6623#7275653a989a589155998784c3dde40f867b6623"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "catena-lang",
  "clap",
  "hf-hub",
@@ -812,6 +813,7 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "tracing-subscriber",
+ "unicode_categories",
 ]
 
 [[package]]
@@ -5095,6 +5097,7 @@ version = "2.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "86886cf6dbf4e614b19c9a1eec9775f021869d7eadde0fc73921a81b90c9b4c9"
 dependencies = [
+ "indexmap 2.14.0",
  "memo-map",
  "serde",
  "serde_json",
@@ -6579,7 +6582,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6e4d69d0fa3e7f6f9cf6b53a0e83e4fc99ba3586f65ce166cff30bd13bb4ad2"
 dependencies = [
  "heck",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "log",
  "multimap",
  "petgraph",
@@ -6598,7 +6601,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ad9c5423459fa2f729b8d9235fab810aa29628b171467744fc86d21460ad70d"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -7480,6 +7483,8 @@ version = "1.0.154"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6"
 dependencies = [
+ "foldhash 0.2.0",
+ "indexmap 2.14.0",
  "itoa",
  "memchr",
  "serde",

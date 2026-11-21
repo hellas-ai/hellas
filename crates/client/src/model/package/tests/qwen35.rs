@@ -91,6 +91,7 @@ fn fixture(moe: bool) -> tempfile::NamedTempFile {
             bytes.extend_from_slice(&(*n as u64).to_le_bytes());
         }
         let (dtype, size) = match spec.dtype {
+            WeightDtype::F16 => unreachable!("Qwen weights are F32 or BF16"),
             WeightDtype::F32 => (0u32, 4),
             WeightDtype::Bf16 => (30u32, 2),
         };

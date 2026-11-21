@@ -34,6 +34,13 @@ pub(super) fn metadata(
     header: &gguf::Header,
 ) -> Result<(ModelConfig, Vec<(u64, u64)>)> {
     let config = read_gguf_model_config(path)?;
+    ensure!(
+        config
+            .lfm3
+            .as_ref()
+            .is_none_or(|lfm3| lfm3.causal_attention),
+        "bidirectional decision models do not generate text"
+    );
     let tensors: BTreeMap<_, _> = header
         .tensors
         .iter()
@@ -45,6 +52,7 @@ pub(super) fn metadata(
             .get(spec.gguf_name.as_str())
             .with_context(|| format!("missing weight {}", spec.gguf_name))?;
         let dtype = match spec.dtype {
+            WeightDtype::F16 => anyhow::bail!("unsupported F16 weight {}", spec.gguf_name),
             WeightDtype::F32 => Dtype::F32,
             WeightDtype::Bf16 => Dtype::Bf16,
         };
@@ -70,10 +78,12 @@ impl Qwen3 {
         let (config, views, object, source, states) =
             tokio::task::spawn_blocking(move || -> Result<_> {
                 let (config, views) = metadata(&path, &header)?;
-                // Qwen3.5 prefills with matrix cores; Qwen3 has only SIMT kernels.
+                // Qwen3.5 and LFM3 prefill with matrix cores; Qwen3 uses SIMT kernels.
                 let wmma = matches!(
                     config.architecture,
-                    ModelArchitecture::Qwen35Dense | ModelArchitecture::Qwen35Moe
+                    ModelArchitecture::Qwen35Dense
+                        | ModelArchitecture::Qwen35Moe
+                        | ModelArchitecture::Lfm3
                 );
                 let options = InferenceOptions::default().with_wmma_prefill(wmma);
                 let model = catena::generated_model_source_for_options(&config, options)?;
