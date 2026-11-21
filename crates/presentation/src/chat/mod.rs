@@ -62,9 +62,11 @@ impl TextPresentation {
             let directory = Arc::new(ToolDirectory::new(selected)?);
             let codec: Box<dyn sentinel_engine::PayloadCodec> = match self.architecture {
                 ModelArchitecture::Qwen3Dense => Box::new(codecs::json::JsonObjectOrArrayCodec),
-                ModelArchitecture::Qwen35Dense | ModelArchitecture::Qwen35Moe => Box::new(
-                    codecs::xml_function::XmlFunctionCodec::new(directory.clone()),
-                ),
+                ModelArchitecture::Qwen35Dense
+                | ModelArchitecture::Qwen35Moe
+                | ModelArchitecture::Lfm3 => Box::new(codecs::xml_function::XmlFunctionCodec::new(
+                    directory.clone(),
+                )),
             };
             Box::new(sentinel_engine::SentinelEngine::new_pair(
                 directory,

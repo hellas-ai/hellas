@@ -25,6 +25,8 @@ pub struct TextPresentation {
 /// The model-provided Jinja chat template, independent of execution policy.
 pub struct ChatTemplate {
     environment: minijinja::Environment<'static>,
+    bos_token: String,
+    eos_token: String,
 }
 
 /// Chat messages supplied by a host application.
@@ -36,7 +38,7 @@ pub struct ChatMessage {
 }
 
 impl ChatTemplate {
-    pub fn new(source: String) -> Result<Self> {
+    pub fn new(source: String, bos_token: &str, eos_token: &str) -> Result<Self> {
         let mut environment = minijinja::Environment::new();
         environment
             .set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
@@ -49,8 +51,21 @@ impl ChatTemplate {
                 ))
             },
         );
+        // Generation blocks mark training targets; inference renders their body.
+        let source = [
+            "{%- generation -%}",
+            "{%- endgeneration -%}",
+            "{% generation %}",
+            "{% endgeneration %}",
+        ]
+        .into_iter()
+        .fold(source, |source, tag| source.replace(tag, ""));
         environment.add_template_owned("chat", source)?;
-        Ok(Self { environment })
+        Ok(Self {
+            environment,
+            bos_token: bos_token.into(),
+            eos_token: eos_token.into(),
+        })
     }
 
     pub fn render(&self, messages: &[ChatMessage], tools: &[serde_json::Value]) -> Result<String> {
@@ -61,7 +76,7 @@ impl ChatTemplate {
                 messages => minijinja::value::Serde(messages),
                 tools => minijinja::value::Serde(tools), enable_thinking => false,
                 add_generation_prompt => true, add_vision_id => false,
-                bos_token => "<|endoftext|>", eos_token => "<|im_end|>",
+                bos_token => &self.bos_token, eos_token => &self.eos_token,
             })
             .context("failed to render GGUF chat template")
     }
@@ -81,6 +96,8 @@ impl TextPresentation {
                 .chat_template()
                 .context("GGUF has no chat template")?
                 .to_owned(),
+            tokenizer.bos_token(),
+            tokenizer.eos_token(),
         )?;
         Ok(Self {
             tokenizer,
@@ -182,6 +199,8 @@ mod tests {
                 include_str!("../tests/fixtures/qwen3_chat.jinja")
             }
             .into(),
+            "<|endoftext|>",
+            "<|im_end|>",
         )
         .unwrap()
     }
