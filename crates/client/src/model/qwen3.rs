@@ -26,6 +26,7 @@ const WEIGHTS: &str = "weights";
 const LOGITS: &str = "logits";
 
 pub(super) struct Qwen3 {
+    pub(super) path: Arc<super::descriptor::GgufPath>,
     config: ModelConfig,
     environment: Environment,
     content: (LocalStore, Scope),
@@ -74,17 +75,18 @@ pub(super) fn metadata(
 
 impl Qwen3 {
     pub async fn open(
-        path: &Path,
+        path: Arc<super::descriptor::GgufPath>,
         dialect: super::GpuDialect,
         object: hellas_rpc::ContentRef,
         header: Arc<gguf::Header>,
     ) -> Result<Self> {
-        let path = path.to_owned();
+        let metadata_path = path.clone();
         let (config, views, object, source, states, decisions) =
             tokio::task::spawn_blocking(move || -> Result<_> {
-                let (config, views) = metadata(&path, &header)?;
-                let decisions = is_decision(&path)?
-                    .then(|| Decisions::read(&path, usize::MAX))
+                let path = metadata_path.as_ref().as_ref();
+                let (config, views) = metadata(path, &header)?;
+                let decisions = is_decision(path)?
+                    .then(|| Decisions::read(path, usize::MAX))
                     .transpose()?;
                 // Qwen3.5 and LFM3 prefill with matrix cores; Qwen3 uses SIMT kernels.
                 let wmma = matches!(
@@ -118,6 +120,7 @@ impl Qwen3 {
         )
         .await?;
         Ok(Self {
+            path,
             config,
             environment,
             content,

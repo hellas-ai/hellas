@@ -109,13 +109,12 @@ pub async fn with_models(
             Ok(match &route.presentation {
                 Presentation::Model {
                     model,
-                    package,
+                    package: _,
                     max_tokens,
                     modality,
                 } => match modality {
                     hellas_client::model::ModelKind::Text => crate::state::router(Arc::new(
-                        crate::state::TextState::open(package.clone(), *max_tokens, execution)
-                            .await?,
+                        crate::state::TextState::open(*max_tokens, execution).await?,
                     )),
                     hellas_client::model::ModelKind::Decision => {
                         crate::decision::router(model.clone(), execution)?

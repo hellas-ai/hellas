@@ -868,8 +868,7 @@ async fn a_descriptor_cannot_activate_a_local_model_backend() {
     let f = fixture().await;
     let descriptor = f.directory.path().join("descriptor");
     hellas_client::model::ModelPackage::describe(
-        &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../client/src/model/package/mini-qwen3.gguf"),
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../client/src/model/whisper/mini"),
         &descriptor,
     )
     .await

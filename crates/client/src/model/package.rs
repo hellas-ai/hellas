@@ -13,10 +13,7 @@ use hellas_rpc::protocol::invocation::{
     output::InvocationOutput,
 };
 use hellas_store::content::{DiskStore, LocalStore, Scope};
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{path::Path, sync::Arc};
 
 enum Family {
     Qwen3(Arc<Qwen3>),
@@ -34,9 +31,9 @@ pub struct ModelPackage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelKind {
-    /// A Qwen GGUF file or descriptor directory.
+    /// A local or pinned Hub text GGUF.
     Text,
-    /// A d1 decision GGUF file or descriptor directory.
+    /// A local or pinned Hub d1 GGUF.
     Decision,
     /// A converted Whisper package or descriptor directory.
     Transcription,
@@ -48,8 +45,30 @@ pub enum ModelKind {
 
 impl ModelKind {
     pub fn of(path: &Path) -> Result<Self> {
-        descriptor::classify(path)?.kind(path)
+        Ok(Self::named(path)?.0)
     }
+    /// Gateway and request name, taken from the selected model file.
+    pub fn named(path: &Path) -> Result<(Self, String)> {
+        if let Some(uri) = super::hf_uri(path) {
+            let descriptor::Resolved::Gguf { path, .. } = descriptor::remote(uri)? else {
+                unreachable!()
+            };
+            return Ok((
+                descriptor::Layout::Gguf.kind(path.as_ref().as_ref())?,
+                model_name(path.source())?.to_owned(),
+            ));
+        }
+        Ok((
+            descriptor::classify(path)?.kind(path)?,
+            model_name(path)?.to_owned(),
+        ))
+    }
+}
+
+fn model_name(path: &Path) -> Result<&str> {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .context("model needs a UTF-8 name")
 }
 
 #[derive(Clone, Copy)]
@@ -97,21 +116,30 @@ pub enum ModelResponse {
 }
 
 impl ModelPackage {
-    /// Native GGUF metadata, whether held in a full file or a descriptor directory.
-    pub fn gguf_path(path: &Path) -> Result<PathBuf> {
-        descriptor::classify(path)?.gguf_path(path)
+    /// GGUF metadata used by this package's tokenizer and template.
+    pub fn gguf_path(&self) -> Result<&Path> {
+        match &self.family {
+            Family::Qwen3(model) => Ok(model.path.as_ref().as_ref()),
+            _ => bail!("model package is not GGUF"),
+        }
     }
 
+    pub fn gguf_name(&self) -> Result<&str> {
+        match &self.family {
+            Family::Qwen3(model) => model_name(model.path.source()),
+            _ => bail!("model package is not GGUF"),
+        }
+    }
     /// A local executing backend must have the full model package.
     pub fn require_local_weights(path: &Path) -> Result<()> {
         ensure!(
-            !descriptor::classify(path)?.is_descriptor(),
+            super::hf_uri(path).is_some() || !descriptor::classify(path)?.is_descriptor(),
             "local execution requires the full model weights, not a descriptor"
         );
         Ok(())
     }
 
-    /// Create a new metadata-only package directory from a full Qwen, Whisper or MMS package.
+    /// Create a new metadata-only package directory from a converted Whisper or MMS package.
     pub async fn describe(path: &Path, output: &Path) -> Result<hellas_rpc::ContentRef> {
         let (path, output) = (path.to_owned(), output.to_owned());
         tokio::task::spawn_blocking(move || descriptor::describe(&path, &output)).await?
@@ -153,6 +181,10 @@ impl ModelPackage {
     }
 
     async fn resolve(path: &Path, store: Option<&DiskStore>) -> Result<descriptor::Resolved> {
+        if let Some(uri) = super::hf_uri(path) {
+            let uri = uri.to_owned();
+            return tokio::task::spawn_blocking(move || descriptor::remote(&uri)).await?;
+        }
         let layout = descriptor::classify(path)?;
         let inspected = match (store, layout.weights_path(path)) {
             (Some(store), Some(path)) => Some(
@@ -194,7 +226,7 @@ impl ModelPackage {
                     header,
                     weights,
                 } => Family::Qwen3(Arc::new(
-                    Qwen3::open(path, dialect, *weights, header.clone()).await?,
+                    Qwen3::open(path.clone(), dialect, *weights, header.clone()).await?,
                 )),
             },
         })

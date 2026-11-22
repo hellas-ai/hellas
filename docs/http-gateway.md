@@ -13,7 +13,7 @@ hellas gateway \
 ```
 
 A local path accepts Qwen or d1 decision GGUF, converted Whisper, MMS or Phonon speech
-or Flux directories, and GGUF, Whisper or MMS descriptor directories. The package determines the modality
+or Flux directories, and Whisper or MMS descriptor directories. The package determines the modality
 and API paths. Remote Compute uses `PATH@CONTACT`: the gateway needs that
 local package to render the invocation for the contact's evaluator. A Fetch
 grant uses `NAME@CONTACT`, checked against the models in its signed offer.
@@ -25,40 +25,20 @@ home). The bundle cannot approve or replace those pins.
 
 ## Model packages and descriptors
 
-Remote Compute needs the model's rendering metadata and the weights' content
-reference. Produce a descriptor once from a full package:
+For a GGUF, give the gateway a pinned Hub reference. Append the contact name to run on a grant provider:
 
 ```sh
-hellas model describe ./qwen3.gguf -o ./qwen3
-hellas model describe ./whisper-tiny -o ./whisper-remote
-hellas gateway --model ./qwen3@alice --model ./whisper-remote@alice
+hellas gateway --model hf://LiquidAI/LFM3-1.7B-GGUF@cd0c74c575b5c416f3011b5b4c298077f26ca8c2/LFM3-1.7B-BF16.gguf@alice
 ```
 
-The output is a new directory with `descriptor.json`, a JSON object with one
-`weights` field containing the original asset's `ContentRef` (`id` and `bytes`).
-A Qwen descriptor also contains `header.gguf`: exactly the GGUF header,
-metadata, tensor table and alignment padding, ending before tensor data. A
-Whisper descriptor contains `config.json`, `generation_config.json` and
-`tokenizer.json`; its config determines the converted tensor layout. There are
-no weights in either descriptor. Flux already names its assets in `assets.json`
-and needs no descriptor conversion.
+The gateway reads the GGUF header for the tokenizer, template and tensor ranges. The provider acquires and verifies the weight file. Local GGUF paths also work.
 
-`ModelPackage::open`, `hellas program`, `text` and `transcribe` accept these
-directories just as they accept full packages. Descriptors preserve the native
-tokenizer metadata and produce the same program, environment and call-plan
-bytes for the same request and evaluator. The path's file stem is the gateway's model name: `qwen3.remote` is served as
-`qwen3`.
+A converted Whisper or MMS package can supply a metadata-only descriptor for remote execution. It contains the tokenizer and model configuration and a `descriptor.json` naming the verified weights.
 
-Describing a package hashes its weights once. A gateway opening a full package
-shares that hash across offer matching, evaluators and content indexing. Opening
-a descriptor reads only its metadata. Keep model packages immutable while loaded.
-
-A descriptor is for rendering remote jobs. A local executing backend requires
-the full package; the provider's content store verifies actual weight bytes
-against the job's content reference. A descriptor cannot supply or substitute
-for those bytes. Hand-edited descriptors are trusted renderer input: an incorrect
-weights reference or metadata can produce a job that the provider refuses or
-executes with meaningless results.
+```sh
+hellas model describe ./whisper-tiny -o ./whisper-remote
+hellas gateway --model ./whisper-remote@alice
+```
 
 ## Upstreams and HTTP access
 

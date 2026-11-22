@@ -108,9 +108,9 @@ impl ModelContext {
     }
 
     async fn add(&self, document: &mut Document, model: &str) -> Result<()> {
-        let Some((name, destination)) = model.rsplit_once('@') else {
-            let path =
-                std::fs::canonicalize(model).with_context(|| format!("model package {model}"))?;
+        let (name, destination) = split_model(model);
+        let Some(destination) = destination else {
+            let path = model_path(name)?.with_context(|| format!("model package {model}"))?;
             document
                 .backends
                 .entry("local".into())
@@ -122,7 +122,7 @@ impl ModelContext {
                     },
                 });
             document
-                .add_route(package_route(path, "local")?)
+                .add_route(package_route(path, "local").await?)
                 .map_err(anyhow::Error::from_boxed)?;
             return Ok(());
         };
@@ -155,10 +155,7 @@ impl ModelContext {
                 store: self.home.join("trust"),
                 policy: destination.into(),
             });
-        let package = Path::new(name)
-            .exists()
-            .then(|| std::fs::canonicalize(name))
-            .transpose()?;
+        let package = model_path(name)?;
         let packages = if let Some(path) = &package {
             let evaluators = bundle
                 .offers
@@ -237,7 +234,7 @@ impl ModelContext {
         );
         if let Some(package) = package {
             document
-                .add_route(package_route(package, &id)?)
+                .add_route(package_route(package, &id).await?)
                 .map_err(anyhow::Error::from_boxed)?;
         } else {
             for mut route in hellas_sdk::grant_routes(&policy, &id).map_err(anyhow::Error::from)? {
@@ -308,15 +305,39 @@ fn grant_backend(
     id
 }
 
-fn package_route(package: PathBuf, backend: &str) -> Result<Route> {
-    let model = package
-        .file_stem()
-        .and_then(|name| name.to_str())
-        .context("model package needs a UTF-8 name")?
-        .to_owned();
+fn split_model(value: &str) -> (&str, Option<&str>) {
+    let Some((source, contact)) = value.rsplit_once('@') else {
+        return (value, None);
+    };
+    if value.starts_with("hf://")
+        && (!source.contains('@')
+            || (value.to_ascii_lowercase().ends_with(".gguf")
+                && !source.to_ascii_lowercase().ends_with(".gguf")))
+    {
+        (value, None)
+    } else {
+        (source, Some(contact))
+    }
+}
+
+fn model_path(source: &str) -> Result<Option<PathBuf>> {
+    if source.starts_with("hf://") {
+        return Ok(Some(source.into()));
+    }
+    Ok(Path::new(source)
+        .exists()
+        .then(|| std::fs::canonicalize(source))
+        .transpose()?)
+}
+
+async fn package_route(package: PathBuf, backend: &str) -> Result<Route> {
+    let input = package.clone();
+    let (modality, model) =
+        tokio::task::spawn_blocking(move || hellas_client::model::ModelKind::named(&input))
+            .await??;
     Ok(Route {
         backends: vec![backend.into()],
-        presentation: match hellas_client::model::ModelKind::of(&package)? {
+        presentation: match modality {
             hellas_client::model::ModelKind::Speech => Presentation::Speech {
                 model,
                 target: hellas_gateway::SpeechTarget::Native { package },
@@ -394,13 +415,8 @@ pub async fn apply(document: &mut Document, edit: Edit, context: &ModelContext) 
                 .insert("api".into(), Listener::http(bind));
         }
         Edit::Route(RouteCommand::Rm { model }) => {
-            let (name, destination) = model
-                .rsplit_once('@')
-                .map_or((model.as_str(), None), |(a, b)| (a, Some(b)));
-            let package = Path::new(name)
-                .exists()
-                .then(|| std::fs::canonicalize(name))
-                .transpose()?;
+            let (name, destination) = split_model(&model);
+            let package = model_path(name)?;
             let mut removed = false;
             for route in &mut document.routes {
                 let matches = match &route.presentation {

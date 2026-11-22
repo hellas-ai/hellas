@@ -49,10 +49,19 @@ renders one chat turn with the GGUF's tokenizer and embedded Jinja chat template
 runs it as a Compute job
 and prints the decoded reply.
 
-For remote jobs, `text`, `transcribe` and `program` also accept a
-[model descriptor](http-gateway.md#model-packages-and-descriptors), produced by
-`hellas model describe PATH -o DIR`. It retains rendering metadata and the
-weights' content reference; the executing provider holds the real weights.
+A pinned Hub GGUF works with `text`, `decide`, `program` and the gateway. Give the 40-hex revision and the file path when the repository holds multiple GGUFs.
+
+```sh
+hellas text --model hf://LiquidAI/LFM3-1.7B-GGUF@cd0c74c575b5c416f3011b5b4c298077f26ca8c2/LFM3-1.7B-BF16.gguf --prompt 'What is the capital of France?' --local
+```
+
+For remote jobs the client reads only the header. The provider can pre-acquire the file, or configure its content allow-list with the same repository, revision, file path, content ID and size. For example:
+
+```sh
+hellas store acquire hf://LiquidAI/LFM3-1.7B-GGUF@cd0c74c575b5c416f3011b5b4c298077f26ca8c2 --path LFM3-1.7B-BF16.gguf --expect a4896de517cae418383c2fd9954bc5ac33d8112b810c7895fb3feb70dca622dc --bytes 3466626336 --pin models/lfm3 --policy jobs
+```
+
+The provider checks the published Xet hash against the canonical content ID. It rejects files published with legacy Xet chunking. With `--local`, the local executor acquires the weights into its own content store.
 
 `hellas transact --job DIR` executes a caller-owned job folder for any
 application. `hellas run` (one call of a Catena program) and `hellas fetch`
@@ -286,12 +295,11 @@ format; unsupported fields are rejected before work starts.
 Ask a d1 model a yes-or-no question on the local GPU:
 
 ```sh
-echo '{"state":"I was charged twice.","questions":{"billing":{"type":"noul","instructions":"Is this about billing?"}}}' | hellas decide --model ./d1.gguf --local
+echo '{"state":"I was charged twice.","questions":{"billing":{"type":"noul","instructions":"Is this about billing?"}}}' | hellas decide --model hf://LiquidAI/d1-2B-GGUF@4a181094d1b6addfaa3a0956f78e7ab2aa406a0c/d1-2B-BF16.gguf --local
 ```
 
 A d1 decision model answers questions about a state without generating text.
-Its BF16 GGUF is the package: no conversion is needed, and `hellas model
-describe` makes a descriptor for clients that do not hold the weights. A
+Its BF16 GGUF supplies the weights and request metadata. A
 provider adds the GGUF with `route add`, as for a text model.
 
 The request names a `state` (a string or any JSON value) and one or more

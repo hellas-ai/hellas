@@ -10,7 +10,7 @@ const MAX_REQUEST_BYTES: usize = 1 << 20;
 pub struct DecideArgs {
     #[command(flatten)]
     client: ClientArgs,
-    /// d1 decision GGUF or descriptor; the provider holds the matching weights.
+    /// Local or pinned Hub d1 GGUF; the provider holds the matching weights.
     #[arg(long, value_name = "PATH")]
     model: PathBuf,
     /// Request JSON file; `-` reads standard input.
@@ -58,11 +58,7 @@ pub async fn decide(mut args: DecideArgs, context: Context) -> super::super::Cli
             let request =
                 tokio::task::spawn_blocking(move || preparing.decision_request(body)).await??;
             // The model's name is its file's, as on a gateway route.
-            let name = args
-                .model
-                .file_stem()
-                .and_then(|name| name.to_str())
-                .context("model needs a UTF-8 name")?;
+            let name = package.gguf_name()?;
             ensure!(
                 request.model().is_none_or(|model| model == name),
                 "request names another model than {name}"
@@ -99,7 +95,7 @@ mod tests {
     #[tokio::test]
     async fn decision_plan_validates_against_the_compiled_bundle() {
         let path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../client/src/model/package/mini-d1");
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../client/src/model/package/mini-d1.gguf");
         let package = ModelPackage::open(
             &path,
             &hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip),

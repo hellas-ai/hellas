@@ -30,6 +30,8 @@
 use std::io::Read as _;
 
 use hellas_xet::XetHash;
+mod file;
+pub use file::PinnedFile;
 
 /// Which kind of repository a model lives in. The API path pluralises
 /// it, which is why this is not just a string.

@@ -1,9 +1,4 @@
-"""Write the small decision-model GGUF behind the `mini-d1` descriptor fixture.
-
-Tensor data is deliberately zero. The fixture keeps only the header:
-
-    python3 make_mini_d1_gguf.py full.gguf && hellas model describe full.gguf -o mini-d1
-"""
+"""Write the zero-weight decision-model fixture: python3 make_mini_d1_gguf.py mini-d1.gguf."""
 import struct
 import sys
 

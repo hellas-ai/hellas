@@ -6,7 +6,7 @@ use std::path::PathBuf;
 pub enum ModelCommand {
     /// Keep a model's rendering metadata and weights identity, without its weights.
     Describe {
-        /// Full Qwen GGUF or converted Whisper package.
+        /// Converted Whisper or MMS package.
         path: PathBuf,
         /// New descriptor directory.
         #[arg(short = 'o', long, value_name = "DIR")]

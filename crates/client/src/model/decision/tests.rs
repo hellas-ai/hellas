@@ -34,7 +34,7 @@ fn body() -> Value {
 
 #[tokio::test]
 async fn decisions_prefill_each_question_and_read_its_logits() {
-    let path = fixture("mini-d1");
+    let path = fixture("mini-d1.gguf");
     assert_eq!(ModelKind::of(&path).unwrap(), ModelKind::Decision);
     let package = ModelPackage::open(&path, &evaluator(GpuDialect::Hip))
         .await
@@ -122,7 +122,7 @@ async fn decisions_prefill_each_question_and_read_its_logits() {
 
 #[tokio::test]
 async fn decisions_reject_images_and_text_models() {
-    let decision = ModelPackage::open(&fixture("mini-d1"), &evaluator(GpuDialect::Hip))
+    let decision = ModelPackage::open(&fixture("mini-d1.gguf"), &evaluator(GpuDialect::Hip))
         .await
         .unwrap();
     let mut png = Vec::new();

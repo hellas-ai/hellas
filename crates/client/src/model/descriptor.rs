@@ -3,15 +3,13 @@ use super::{ModelKind, gguf, qwen3, speech, whisper};
 use anyhow::{Result, bail, ensure};
 use hellas_rpc::ContentRef;
 use serde::{Deserialize, Serialize};
+use std::{fs::File, io::Write as _};
 use std::{
-    fs::File,
-    io::{Read, Write},
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 const MANIFEST: &str = "descriptor.json";
-const GGUF: &str = "header.gguf";
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -22,7 +20,6 @@ struct Descriptor {
 #[derive(Clone, Copy)]
 pub(super) enum Layout {
     Gguf,
-    GgufDescriptor,
     Whisper,
     WhisperDescriptor,
     Speech,
@@ -31,9 +28,41 @@ pub(super) enum Layout {
     Flux,
 }
 
+pub(super) enum GgufPath {
+    Local(PathBuf),
+    Header(tempfile::NamedTempFile, PathBuf),
+}
+impl GgufPath {
+    pub(super) fn source(&self) -> &Path {
+        match self {
+            Self::Local(path) | Self::Header(_, path) => path,
+        }
+    }
+}
+impl AsRef<Path> for GgufPath {
+    fn as_ref(&self) -> &Path {
+        match self {
+            Self::Local(path) => path,
+            Self::Header(file, _) => file.path(),
+        }
+    }
+}
+
+pub(super) fn remote(uri: &str) -> Result<Resolved> {
+    let file = super::pinned_gguf(uri)?;
+    let (header, bytes) = gguf::remote_header(&file)?;
+    let mut output = tempfile::Builder::new().suffix(".gguf").tempfile()?;
+    std::io::Write::write_all(&mut output, &bytes)?;
+    Ok(Resolved::Gguf {
+        path: Arc::new(GgufPath::Header(output, file.path.into())),
+        header: Arc::new(header),
+        weights: file.object,
+    })
+}
+
 pub(super) enum Resolved {
     Gguf {
-        path: PathBuf,
+        path: Arc<GgufPath>,
         header: Arc<gguf::Header>,
         weights: ContentRef,
     },
@@ -60,7 +89,6 @@ pub(super) fn classify(path: &Path) -> Result<Layout> {
         "model package is not a regular file or directory"
     );
     let manifest = path.join(MANIFEST).try_exists()?;
-    let gguf = path.join(GGUF).try_exists()?;
     let weights = path.join(whisper::WEIGHTS_FILE).try_exists()?;
     let whisper = whisper::METADATA.iter().try_fold(false, |found, name| {
         Ok::<_, std::io::Error>(path.join(name).try_exists()? || found)
@@ -73,9 +101,8 @@ pub(super) fn classify(path: &Path) -> Result<Layout> {
     let flux = path.join("model_index.json").try_exists()?;
     let phonon = path.join(speech::phonon::MARKER).try_exists()?;
     ensure!(
-        !((flux || phonon) && (manifest || gguf || whisper || speech || weights)
+        !((flux || phonon) && (manifest || whisper || speech || weights)
             || flux && phonon
-            || gguf && (whisper || speech || weights)
             || manifest && weights),
         "mixed model layout: descriptor, GGUF, Whisper, MMS, Phonon and Flux files cannot overlap"
     );
@@ -84,10 +111,6 @@ pub(super) fn classify(path: &Path) -> Result<Layout> {
     }
     if phonon {
         return Ok(Layout::Phonon);
-    }
-    if gguf {
-        ensure!(manifest, "header.gguf requires descriptor.json");
-        return Ok(Layout::GgufDescriptor);
     }
     if speech {
         ensure!(
@@ -119,8 +142,8 @@ pub(super) fn classify(path: &Path) -> Result<Layout> {
 impl Layout {
     pub(super) fn kind(self, path: &Path) -> Result<ModelKind> {
         Ok(match self {
-            Self::Gguf | Self::GgufDescriptor => {
-                if qwen3::is_decision(&self.gguf_path(path)?)? {
+            Self::Gguf => {
+                if qwen3::is_decision(path)? {
                     ModelKind::Decision
                 } else {
                     ModelKind::Text
@@ -132,27 +155,13 @@ impl Layout {
         })
     }
     pub(super) fn is_descriptor(self) -> bool {
-        matches!(
-            self,
-            Self::GgufDescriptor | Self::WhisperDescriptor | Self::SpeechDescriptor
-        )
-    }
-    pub(super) fn gguf_path(self, path: &Path) -> Result<PathBuf> {
-        match self {
-            Self::Gguf => Ok(path.to_owned()),
-            Self::GgufDescriptor => Ok(path.join(GGUF)),
-            _ => bail!("model package is not GGUF"),
-        }
+        matches!(self, Self::WhisperDescriptor | Self::SpeechDescriptor)
     }
     pub(super) fn weights_path(self, path: &Path) -> Option<PathBuf> {
         match self {
             Self::Gguf => Some(path.to_owned()),
             Self::Whisper | Self::Speech => Some(path.join(whisper::WEIGHTS_FILE)),
-            Self::GgufDescriptor
-            | Self::WhisperDescriptor
-            | Self::SpeechDescriptor
-            | Self::Phonon
-            | Self::Flux => None,
+            Self::WhisperDescriptor | Self::SpeechDescriptor | Self::Phonon | Self::Flux => None,
         }
     }
     pub(super) fn resolve(self, path: &Path, inspected: Option<ContentRef>) -> Result<Resolved> {
@@ -160,25 +169,12 @@ impl Layout {
             |file: &Path| inspected.map_or_else(|| hellas_store::content::file_content(file), Ok);
         match self {
             Self::Gguf => Ok(Resolved::Gguf {
-                path: path.to_owned(),
+                path: Arc::new(GgufPath::Local(path.to_owned())),
                 header: Arc::new(gguf::read_header(&mut hellas_private::open_regular_file(
                     path,
                 )?)?),
                 weights: weights(path)?,
             }),
-            Self::GgufDescriptor => {
-                let weights = read_weights(path)?;
-                let path = path.join(GGUF);
-                let header = gguf::read_descriptor(
-                    &mut hellas_private::open_regular_file(&path)?,
-                    weights.bytes(),
-                )?;
-                Ok(Resolved::Gguf {
-                    path,
-                    header: Arc::new(header),
-                    weights,
-                })
-            }
             Self::Whisper => Ok(Resolved::Whisper {
                 path: path.to_owned(),
                 weights: weights(&path.join(whisper::WEIGHTS_FILE))?,
@@ -215,21 +211,7 @@ fn read_weights(path: &Path) -> Result<ContentRef> {
 pub(super) fn describe(path: &Path, output: &Path) -> Result<ContentRef> {
     ensure!(!output.try_exists()?, "destination already exists");
     match classify(path)? {
-        Layout::Gguf => write_descriptor(path, output, |staging, object| {
-            let mut input = hellas_private::open_regular_file(path)?;
-            let header = gguf::read_header(&mut input)?;
-            use std::io::{Seek, SeekFrom};
-            input.seek(SeekFrom::Start(0))?;
-            let header_path = staging.join(GGUF);
-            let mut out = File::create(&header_path)?;
-            ensure!(
-                std::io::copy(&mut input.take(header.data_offset), &mut out)? == header.data_offset,
-                "GGUF header changed while describing model"
-            );
-            let header = gguf::read_descriptor(&mut File::open(&header_path)?, object.bytes())?;
-            qwen3::metadata(&header_path, &header)?;
-            Ok(())
-        }),
+        Layout::Gguf => bail!("use a pinned hf:// reference or the local GGUF file"),
         Layout::Whisper => write_descriptor(
             &path.join(whisper::WEIGHTS_FILE),
             output,
@@ -260,7 +242,7 @@ pub(super) fn describe(path: &Path, output: &Path) -> Result<ContentRef> {
                 speech::validate_metadata(staging, object)
             },
         ),
-        Layout::GgufDescriptor | Layout::WhisperDescriptor | Layout::SpeechDescriptor => {
+        Layout::WhisperDescriptor | Layout::SpeechDescriptor => {
             bail!("source is already a descriptor")
         }
         Layout::Flux | Layout::Phonon => {

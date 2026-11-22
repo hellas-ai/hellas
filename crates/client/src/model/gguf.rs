@@ -60,35 +60,38 @@ pub struct Header {
 /// Tensor data is not read; every returned range is checked against file length.
 pub fn read_header<R: Read + Seek>(input: &mut R) -> Result<Header, Error> {
     let file_bytes = input.seek(SeekFrom::End(0))?;
-    read_header_for_bytes(input, file_bytes, file_bytes)
+    read_header_for_bytes(input, file_bytes, |_, _, _| Ok(()))
 }
 
-/// A descriptor keeps exactly the header, but its ranges name a separate asset.
+/// Grow the prefix only into bytes required by the remaining GGUF records.
 #[cfg(feature = "models")]
-pub(super) fn read_descriptor<R: Read + Seek>(
-    input: &mut R,
-    weights_bytes: u64,
-) -> Result<Header, Error> {
-    let file_bytes = input.seek(SeekFrom::End(0))?;
-    bounded(file_bytes, MAX_HEADER_BYTES, "header bytes")?;
-    let header = read_header_for_bytes(input, file_bytes, weights_bytes)?;
-    if file_bytes != header.data_offset {
-        return Err(Error::Invalid(
-            "descriptor must contain only the GGUF header",
-        ));
-    }
-    Ok(header)
+pub(super) fn remote_header(
+    file: &hellas_store::hf::PinnedFile,
+) -> Result<(Header, Vec<u8>), Error> {
+    let mut prefix = io::Cursor::new(Vec::new());
+    let size = file.object.bytes();
+    let header = read_header_for_bytes(&mut prefix, size, |cursor, needed, through| {
+        let start = cursor.get_ref().len() as u64;
+        if needed > start {
+            file.read_range(start..through, cursor.get_mut())
+                .map_err(io::Error::other)?;
+        }
+        Ok(())
+    })?;
+    Ok((header, prefix.into_inner()))
 }
 
 fn read_header_for_bytes<R: Read + Seek>(
     input: &mut R,
     file_bytes: u64,
-    weights_bytes: u64,
+    fetch: impl FnMut(&mut R, u64, u64) -> io::Result<()>,
 ) -> Result<Header, Error> {
     input.seek(SeekFrom::Start(0))?;
     let mut reader = HeaderReader {
         input,
         position: 0,
+        remaining: 0,
+        fetch,
         file_bytes,
     };
     if reader.read::<4>()? != *b"GGUF" {
@@ -102,7 +105,9 @@ fn read_header_for_bytes<R: Read + Seek>(
     let metadata_count = bounded(reader.u64()?, MAX_METADATA, "metadata count")?;
     let mut alignment = 32;
     let mut aligned = false;
-    for _ in 0..metadata_count {
+    // Each remaining tensor record needs at least 24 bytes, metadata keys 12.
+    for i in 0..metadata_count {
+        reader.remaining = tensor_count * 24 + (metadata_count - i - 1) * 12;
         let key = reader.string(65_535, "metadata key")?;
         if key.is_empty() || !key.is_ascii() {
             return Err(Error::Invalid("metadata key"));
@@ -131,7 +136,8 @@ fn read_header_for_bytes<R: Read + Seek>(
     }
     // Grow only for entries actually read, never from an untrusted count.
     let mut tensors = Vec::new();
-    for _ in 0..tensor_count {
+    for i in 0..tensor_count {
+        reader.remaining = (tensor_count - i - 1) * 24;
         let name = reader.string(64, "tensor name")?;
         if name.is_empty() {
             return Err(Error::Invalid("empty tensor name"));
@@ -191,7 +197,7 @@ fn read_header_for_bytes<R: Read + Seek>(
             .offset
             .checked_add(tensor.bytes)
             .ok_or(Error::Invalid("tensor range overflow"))?;
-        if end > weights_bytes {
+        if end > file_bytes {
             return Err(Error::Invalid("tensor range exceeds file"));
         }
         ranges.push((tensor.offset, end));
@@ -203,6 +209,8 @@ fn read_header_for_bytes<R: Read + Seek>(
     {
         return Err(Error::Invalid("tensor ranges partially overlap"));
     }
+    bounded(data_offset, MAX_HEADER_BYTES, "header bytes")?;
+    (reader.fetch)(reader.input, data_offset, data_offset)?;
     reader.input.seek(SeekFrom::Start(data_offset))?;
     Ok(Header {
         data_offset,
@@ -218,12 +226,14 @@ fn bounded(value: u64, limit: u64, field: &'static str) -> Result<u64, Error> {
     }
 }
 
-struct HeaderReader<'a, R> {
+struct HeaderReader<'a, R, F> {
+    fetch: F,
+    remaining: u64,
     input: &'a mut R,
     position: u64,
     file_bytes: u64,
 }
-impl<R: Read + Seek> HeaderReader<'_, R> {
+impl<R: Read + Seek, F: FnMut(&mut R, u64, u64) -> io::Result<()>> HeaderReader<'_, R, F> {
     fn advance(&mut self, bytes: u64) -> Result<(), Error> {
         let end = self
             .position
@@ -233,6 +243,13 @@ impl<R: Read + Seek> HeaderReader<'_, R> {
         if end > self.file_bytes {
             return Err(Error::Invalid("truncated header"));
         }
+        (self.fetch)(
+            self.input,
+            end,
+            (end + self.remaining)
+                .min(self.file_bytes)
+                .min(MAX_HEADER_BYTES),
+        )?;
         self.position = end;
         Ok(())
     }
@@ -286,9 +303,12 @@ impl<R: Read + Seek> HeaderReader<'_, R> {
                 if let Some(width) = width {
                     self.skip(count * width)
                 } else {
-                    for _ in 0..count {
+                    let outer = self.remaining;
+                    for i in 0..count {
+                        self.remaining = outer + (count - i - 1) * 8;
                         self.skip_value(element, depth + 1)?;
                     }
+                    self.remaining = outer;
                     Ok(())
                 }
             }

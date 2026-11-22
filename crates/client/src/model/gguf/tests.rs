@@ -451,3 +451,24 @@ impl Seek for SparseFile {
         Ok(self.position)
     }
 }
+
+#[test]
+fn ranged_reader_stops_at_the_first_tensor_byte() {
+    let bytes = include_bytes!("../package/mini-qwen3.gguf");
+    let expected = read_header(&mut Cursor::new(bytes)).unwrap();
+    let mut prefix = Cursor::new(Vec::new());
+    let length = bytes.len() as u64;
+    let header = read_header_for_bytes(&mut prefix, length, |prefix, needed, through| {
+        assert!(needed <= through && through <= expected.data_offset);
+        let start = prefix.get_ref().len();
+        if needed > start as u64 {
+            prefix
+                .get_mut()
+                .extend_from_slice(&bytes[start..through as usize]);
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(expected.tensors, header.tensors);
+    assert_eq!(prefix.into_inner(), bytes[..header.data_offset as usize]);
+}

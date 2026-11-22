@@ -78,7 +78,7 @@ async fn app(work: Arc<Fake>) -> Router {
             modality: ModelKind::Decision,
             model: "mini".into(),
             package: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../client/src/model/package/mini-d1"),
+                .join("../client/src/model/package/mini-d1.gguf"),
             max_tokens: 128,
         })],
         work,

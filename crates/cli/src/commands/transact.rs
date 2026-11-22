@@ -327,9 +327,6 @@ impl TargetArgs {
     ) -> super::CliResult<Option<hellas_store::content::DiskStore>> {
         #[cfg(feature = "compute")]
         if self.local {
-            for path in &self.models {
-                hellas_client::model::ModelPackage::require_local_weights(path)?;
-            }
             return Ok(Some(
                 context
                     .local_content

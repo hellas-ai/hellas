@@ -10,6 +10,7 @@ use std::{
 };
 
 pub(in crate::daemon) type Files = BTreeMap<PathBuf, ContentRef>;
+pub(in crate::daemon) type ModelIndex = (Files, Vec<hellas_store::hf::PinnedFile>);
 pub(super) struct Cached {
     files: Files,
     packages: BTreeMap<String, Arc<ModelPackage>>,
@@ -19,7 +20,10 @@ impl Runtime {
         &self,
         document: &Document,
         info: &[BackendInfo],
-    ) -> (Models, BTreeMap<String, std::result::Result<Files, String>>) {
+    ) -> (
+        Models,
+        BTreeMap<String, std::result::Result<ModelIndex, String>>,
+    ) {
         let requested = document.model_evaluators(info);
         let mut cache = self.models.lock().await;
         cache.retain(|path, _| requested.contains_key(path));
@@ -29,11 +33,14 @@ impl Runtime {
                 if evaluators.is_empty() {
                     return Err("model has no registered evaluator".into());
                 }
-                let files = self
-                    .options
-                    .content
-                    .inspect_files(vec![path.clone()])
-                    .await?;
+                let files = if hellas_client::model::hf_uri(&path).is_some() {
+                    Files::new()
+                } else {
+                    self.options
+                        .content
+                        .inspect_files(vec![path.clone()])
+                        .await?
+                };
                 let cached = cache.entry(path.clone()).or_insert_with(|| Cached {
                     files: Files::new(),
                     packages: BTreeMap::new(),
@@ -87,32 +94,29 @@ impl Runtime {
                         _ => None,
                     }),
             );
-            if let Err(error) = paths
-                .iter()
-                .try_for_each(|path| ModelPackage::require_local_weights(path))
-            {
-                index.insert(id.clone(), Err(error.to_string()));
-                continue;
+            let files: Result<_> = async {
+                let mut files = hellas_client::model::ModelFiles::resolve(paths).await?;
+                files.local.extend(content.iter().cloned());
+                Ok((
+                    self.options.content.inspect_files(files.local).await?,
+                    files.hub,
+                ))
             }
-            paths.extend(content.iter().cloned());
-            index.insert(
-                id.clone(),
-                self.options
-                    .content
-                    .inspect_files(paths.into_iter().collect())
-                    .await
-                    .map_err(|error| error.to_string()),
-            );
+            .await;
+            index.insert(id.clone(), files.map_err(|err| err.to_string()));
         }
         (models, index)
     }
 
     /// Cache inspection is read-only; activation publishes the exact prepared objects.
     #[cfg(feature = "compute")]
-    pub async fn index(&self, files: Files) -> Result<()> {
+    pub async fn index(&self, (files, hub): ModelIndex) -> Result<()> {
         use hellas_store::content::{
             ContentStore, IndexMode, PinName, PinPolicy, PinValue, Scope, Target,
         };
+        for file in hub {
+            file.acquire(&self.options.content).await?;
+        }
         let mut indexed = self.indexed.lock().await;
         if files
             .iter()

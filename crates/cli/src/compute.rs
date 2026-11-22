@@ -41,10 +41,11 @@ pub(crate) async fn content(
     let mut configuration =
         crate::content_configuration::ContentConfiguration::load(native.content_config.clone())?
             .with_default_upper(home.join("provider/content"));
+    let models = hellas_client::model::ModelFiles::resolve(models.to_vec()).await?;
     let paths = native
         .content
         .iter()
-        .chain(models)
+        .chain(&models.local)
         .map(std::path::absolute)
         .collect::<std::io::Result<Vec<_>>>()?;
     let mut initial = configuration.config().clone();
@@ -62,6 +63,9 @@ pub(crate) async fn content(
         content.finish_recovery().await?;
         configuration.add_content(&content, paths).await?;
         configuration.apply(&content).await?;
+        for file in models.hub {
+            file.acquire(&content).await?;
+        }
         Ok(())
     }
     .await;

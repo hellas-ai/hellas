@@ -130,19 +130,23 @@ pub(super) struct PreparedGeneration {
 
 impl TextState {
     pub(super) async fn open(
-        path: std::path::PathBuf,
         default_max_tokens: u32,
         execution: Arc<RouteExecution>,
     ) -> crate::GatewayResult<Self> {
         if default_max_tokens == 0 {
             return Err(crate::GatewayConfigError::MaxTokens.into());
         }
-        let presentation = tokio::task::spawn_blocking(move || {
-            TextPresentation::from_gguf(&hellas_client::model::ModelPackage::gguf_path(&path)?)
-        })
-        .await
-        .map_err(crate::GatewayError::Task)?
-        .map_err(|error| crate::GatewayError::Presentation(error.into()))?;
+        let package = execution
+            .packages
+            .values()
+            .next()
+            .ok_or_else(|| crate::GatewayError::Presentation("missing text model".into()))?
+            .clone();
+        let presentation =
+            tokio::task::spawn_blocking(move || TextPresentation::from_gguf(package.gguf_path()?))
+                .await
+                .map_err(crate::GatewayError::Task)?
+                .map_err(|error| crate::GatewayError::Presentation(error.into()))?;
         Ok(Self {
             inference_metrics: super::backend::telemetry::InferenceMetrics::new(),
             default_max_tokens,

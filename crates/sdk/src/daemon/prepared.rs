@@ -10,7 +10,7 @@ pub(super) struct Prepared {
     pub revision: Revision,
     pub document: Document,
     pub models: hellas_gateway::router::Models,
-    pub index: BTreeMap<String, runtime::Files>,
+    pub index: BTreeMap<String, runtime::ModelIndex>,
     pub entries: BTreeMap<String, runtime::PreparedBackend>,
     pub reuse: BTreeSet<String>,
     pub work: Arc<PreparedWork>,
