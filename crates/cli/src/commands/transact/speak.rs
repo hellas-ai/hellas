@@ -92,7 +92,16 @@ mod tests {
     #[test]
     fn speak_reads_stdin_unless_text_is_supplied() {
         let parse = |extra: &[&str]| {
-            let base = ["hellas", "speak", "--model", "model", "-o", "out.wav"];
+            let base = [
+                "hellas",
+                "speak",
+                "--model",
+                "model",
+                "--access",
+                "shared.access",
+                "-o",
+                "out.wav",
+            ];
             let cli =
                 crate::Cli::try_parse_from(base.into_iter().chain(extra.iter().copied())).unwrap();
             let crate::Commands::Speak(args) = cli.command else {
