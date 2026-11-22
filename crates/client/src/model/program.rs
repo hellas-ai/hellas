@@ -21,11 +21,16 @@ pub(super) async fn environment(
         ))),
         Scope::Owner,
     );
-    let source = upload_object(&content.0, source.as_bytes()).await?;
-    let environment = Environment {
-        sources: vec![source],
-        assets,
-    };
+    let environment = describe(source, assets);
+    upload_object(&content.0, source.as_bytes()).await?;
     upload_object(&content.0, &environment.canonical_bytes()?).await?;
     Ok((environment, content))
+}
+
+/// The environment of one rendered program over `assets`.
+pub(super) fn describe(source: &str, assets: Vec<NamedAsset>) -> Environment {
+    Environment {
+        sources: vec![hellas_rpc::ContentRef::for_bytes(source.as_bytes())],
+        assets,
+    }
 }

@@ -1,10 +1,7 @@
 //! Flux2 Klein stages share one program and pass their outputs through slots.
-use super::package::ComputeJob;
 use anyhow::{Context, Result, ensure};
 use catena_models::flux::{config, graph, text, transformer, vae};
-use hellas_channel::content::DEFAULT_MAX_STAGING_BYTES;
 use hellas_rpc::protocol::invocation::{Artifact, compute::*, output::InvocationOutput};
-use hellas_store::content::{LocalStore, MemoryStore, Reservations, Scope};
 use rand_chacha::rand_core::SeedableRng;
 use rand_distr::{Distribution, StandardNormal};
 use serde::Deserialize;
@@ -22,7 +19,8 @@ pub const MAX_STEPS: usize = 50;
 pub const OUTPUT: &str = "image";
 const ASSETS: [&str; 3] = ["text", "denoise", "vae"];
 pub const TEXT_INDEX: &str = "text_encoder/model.safetensors.index.json";
-/// A published transformer is this one file, or shards named by its index.
+/// A published transformer is this one file, or shards named by its index;
+/// [`convert_flux`] takes whichever the snapshot holds.
 pub const TRANSFORMER: &str = "transformer/diffusion_pytorch_model.safetensors";
 pub const TRANSFORMER_INDEX: &str = "transformer/diffusion_pytorch_model.safetensors.index.json";
 const VAE: &str = "vae/diffusion_pytorch_model.safetensors";
@@ -39,16 +37,18 @@ pub const CHECKPOINT: [&str; 8] = [
     VAE,
 ];
 
-/// The shard files the snapshot's `index` names, beside it.
-pub fn shards(checkpoint: &Path, index: &str) -> Result<std::collections::BTreeSet<String>> {
+/// The shard files a snapshot's weight `source` names, beside it: those of an
+/// index, and none for a single weight file.
+pub fn shards(checkpoint: &Path, source: &str) -> Result<std::collections::BTreeSet<String>> {
     #[derive(Deserialize)]
     struct Index {
         weight_map: BTreeMap<String, String>,
     }
-    let directory = index
-        .rsplit_once('/')
-        .map_or("", |(directory, _)| directory);
-    let index: Index = serde_json::from_reader(File::open(checkpoint.join(index))?)?;
+    if !source.ends_with(".index.json") {
+        return Ok(Default::default());
+    }
+    let directory = Path::new(source).parent().unwrap_or(Path::new(""));
+    let index: Index = serde_json::from_reader(File::open(checkpoint.join(source))?)?;
     index
         .weight_map
         .into_values()
@@ -57,7 +57,11 @@ pub fn shards(checkpoint: &Path, index: &str) -> Result<std::collections::BTreeS
                 !shard.is_empty() && !shard.contains(['/', '\\']) && shard != "." && shard != "..",
                 "invalid checkpoint shard {shard:?}"
             );
-            Ok(format!("{directory}/{shard}"))
+            directory
+                .join(&shard)
+                .into_os_string()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("invalid checkpoint shard {shard:?}"))
         })
         .collect()
 }
@@ -227,7 +231,11 @@ fn bundle_stages<'a>(stages: impl IntoIterator<Item = &'a str>) -> Result<String
 /// Convert a local distilled Klein snapshot into immutable provider assets
 /// and client metadata. Providers index the three `.bin` files; callers need
 /// only the metadata and tokenizer after conversion.
-pub fn convert_flux(checkpoint: &Path, destination: &Path) -> Result<Vec<NamedAsset>> {
+pub fn convert_flux(
+    checkpoint: &Path,
+    transformer: &str,
+    destination: &Path,
+) -> Result<Vec<NamedAsset>> {
     ensure!(!destination.exists(), "destination already exists");
     let config = Config::read(checkpoint)?;
     let tensors = config.tensors()?;
@@ -242,7 +250,7 @@ pub fn convert_flux(checkpoint: &Path, destination: &Path) -> Result<Vec<NamedAs
     let mut assets = Vec::new();
     let sources = [
         checkpoint.join(TEXT_INDEX),
-        config::transformer_checkpoint(checkpoint),
+        checkpoint.join(transformer),
         checkpoint.join(VAE),
     ];
     for ((name, tensors), source) in ASSETS.into_iter().zip(tensors).zip(sources) {
@@ -320,7 +328,7 @@ impl Flux {
             dialect,
         })
     }
-    fn program(&self, variant: Variant) -> Result<(Environment, String)> {
+    fn program(&self, variant: Variant) -> Result<String> {
         let source = super::program::render(
             &self
                 .config
@@ -331,11 +339,10 @@ impl Flux {
             source.len() as u64 <= MAX_SOURCE_BYTES,
             "image program exceeds source limit"
         );
-        let environment = Environment {
-            sources: vec![hellas_rpc::ContentRef::for_bytes(source.as_bytes())],
-            assets: self.assets.clone(),
-        };
-        Ok((environment, source))
+        Ok(source)
+    }
+    pub fn assets(&self) -> Vec<NamedAsset> {
+        self.assets.clone()
     }
 
     pub fn programs(&self, evaluator: &str) -> Result<Vec<ProgramId>> {
@@ -344,13 +351,16 @@ impl Flux {
             .map(|&variant| {
                 Ok(ProgramId {
                     evaluator: evaluator.into(),
-                    manifest: self.program(variant)?.0.manifest(evaluator)?.content_id(),
+                    manifest: super::program::describe(&self.program(variant)?, self.assets())
+                        .manifest(evaluator)?
+                        .content_id(),
                 })
             })
             .collect()
     }
 
-    pub fn render_job(&self, request: &ImageRequest<'_>) -> Result<(ComputeJob, String)> {
+    /// The plan and inputs of one request, and the program they run.
+    pub fn render_job(&self, request: &ImageRequest<'_>) -> Result<(Plan, Vec<Artifact>, String)> {
         request.validate()?;
         let variant = request.variant();
         ensure!(
@@ -369,13 +379,7 @@ impl Flux {
                 .all(|id| *id < self.config.text.vocabulary_size as u64),
             "image token exceeds vocabulary"
         );
-        let content = (
-            LocalStore::Memory(MemoryStore::new(Reservations::ram(
-                DEFAULT_MAX_STAGING_BYTES,
-            ))),
-            Scope::Owner,
-        );
-        let (environment, source) = self.program(variant)?;
+        let source = self.program(variant)?;
         let input = |object: &str| Arg::Input {
             object: object.into(),
         };
@@ -413,26 +417,19 @@ impl Flux {
             }],
         };
         let noise = noise(request.seed, request.width, request.height)?;
-        Ok((
-            ComputeJob {
-                environment,
-                plan,
-                content,
-                inputs: vec![
-                    Artifact::new(
-                        "noise",
-                        "catena.f32le.v1",
-                        noise.into_iter().flat_map(f32::to_le_bytes).collect(),
-                    ),
-                    Artifact::new(
-                        "tokens",
-                        "catena.u64le.v1",
-                        tokens.ids.into_iter().flat_map(u64::to_le_bytes).collect(),
-                    ),
-                ],
-            },
-            source,
-        ))
+        let inputs = vec![
+            Artifact::new(
+                "noise",
+                "catena.f32le.v1",
+                noise.into_iter().flat_map(f32::to_le_bytes).collect(),
+            ),
+            Artifact::new(
+                "tokens",
+                "catena.u64le.v1",
+                tokens.ids.into_iter().flat_map(u64::to_le_bytes).collect(),
+            ),
+        ];
+        Ok((plan, inputs, source))
     }
 }
 

@@ -438,6 +438,16 @@ fn the_snapshot_files_include_every_text_encoder_shard_its_index_names() {
         ]
     );
     assert!(CHECKPOINT.contains(&TEXT_INDEX));
+    // A single weight file names no shards, and a root index names bare files.
+    assert!(shards(directory.path(), TRANSFORMER).unwrap().is_empty());
+    std::fs::copy(&index, directory.path().join("root.index.json")).unwrap();
+    assert_eq!(
+        shards(directory.path(), "root.index.json")
+            .unwrap()
+            .into_iter()
+            .collect::<Vec<_>>(),
+        ["model-1.safetensors", "model-2.safetensors"]
+    );
     for shard in ["../escape", "a/b", ""] {
         std::fs::write(&index, format!(r#"{{"weight_map":{{"a":{shard:?}}}}}"#)).unwrap();
         assert!(shards(directory.path(), TEXT_INDEX).is_err(), "{shard}");

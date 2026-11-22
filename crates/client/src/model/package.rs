@@ -247,7 +247,8 @@ impl ModelPackage {
                 let prompt = request.prompt.to_owned();
                 let (seed, width, height, steps) =
                     (request.seed, request.width, request.height, request.steps);
-                let (job, source) = tokio::task::spawn_blocking(move || {
+                let assets = model.assets();
+                let (plan, inputs, source) = tokio::task::spawn_blocking(move || {
                     model.render_job(&ImageRequest {
                         prompt: &prompt,
                         seed,
@@ -257,13 +258,13 @@ impl ModelPackage {
                     })
                 })
                 .await??;
-                hellas_channel::content::upload_object(&job.content.0, source.as_bytes()).await?;
-                hellas_channel::content::upload_object(
-                    &job.content.0,
-                    &job.environment.canonical_bytes()?,
-                )
-                .await?;
-                Ok(job)
+                let (environment, content) = super::program::environment(&source, assets).await?;
+                Ok(ComputeJob {
+                    environment,
+                    plan,
+                    inputs,
+                    content,
+                })
             }
             (
                 Family::Qwen3(model),

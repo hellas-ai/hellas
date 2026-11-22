@@ -475,7 +475,14 @@ fn authenticated_get(
     url: &str,
     bearer: Option<&str>,
 ) -> ureq::RequestBuilder<ureq::typestate::WithoutBody> {
-    let request = http().get(url);
+    authenticated(http().get(url), url, bearer)
+}
+/// The bearer goes only to HF origins.
+fn authenticated(
+    request: ureq::RequestBuilder<ureq::typestate::WithoutBody>,
+    url: &str,
+    bearer: Option<&str>,
+) -> ureq::RequestBuilder<ureq::typestate::WithoutBody> {
     if let Some(token) = bearer.filter(|_| hf_origin(url)) {
         request.header("Authorization", &format!("Bearer {token}"))
     } else {
@@ -527,11 +534,7 @@ impl Repo {
     /// Whether the repository publishes `path` at its immutable commit.
     pub fn publishes(&self, path: &str) -> Result<bool> {
         let url = self.resolve_url(path)?;
-        let mut request = http().head(&url);
-        if let Some(token) = node_token() {
-            request = request.header("Authorization", &format!("Bearer {token}"));
-        }
-        match request.call() {
+        match authenticated(http().head(&url), &url, node_token().as_deref()).call() {
             Ok(_) => Ok(true),
             Err(ureq::Error::StatusCode(404)) => Ok(false),
             Err(source) => Err(FetchError::Http {
