@@ -30,12 +30,12 @@ With the compute-enabled package (the NixOS module and the CUDA/HIP images;
 the portable release has no local compute), every Compute command also accepts
 `--local`: the job runs on this machine's executor under your own limits, with
 no chain, channel, grant or attempt record. A helper serves the model's weights
-from its `--model` file or directory; `run` and `transact --job` read assets
+from its local checkpoint or pinned Hub source; `run` and `transact --job` read assets
 through `--content PATH` or `--content-config`. `--timeout` bounds it like any other job.
 
 ```sh
 hellas transcribe --model ./whisper-tiny --audio speech.wav --local
-hellas text --model ./qwen3.gguf --prompt 'Why is the sky blue?' --local
+hellas text --model hf://ggml-org/Qwen3-0.6B-GGUF@afe8ad3577aa22500b3cd1c880f153b3b0e1cae8/Qwen3-0.6B-BF16.gguf --prompt 'Why is the sky blue?' --local
 ```
 
 A Compute job names the evaluator its program is rendered for. Remote Compute
@@ -44,7 +44,7 @@ registers (such as `hellas/catena-dfad87438018-hip`), before they ask for a
 quote; the provider refuses a program for an evaluator it did not register.
 `--local` renders for this machine's GPU runtime.
 
-`hellas text --model FILE.gguf --prompt TEXT [--system TEXT] [--max-tokens N]`
+`hellas text --model MODEL --prompt TEXT [--system TEXT] [--max-tokens N]`
 renders one chat turn with the GGUF's tokenizer and embedded Jinja chat template,
 runs it as a Compute job
 and prints the decoded reply.
@@ -313,7 +313,7 @@ The request names a `state` (a string or any JSON value) and one or more
 ```
 
 ```sh
-hellas decide --provider ENROLLMENT_ID@NODE_ID --model d1.gguf \
+hellas decide --provider ENROLLMENT_ID@NODE_ID --model hf://LiquidAI/d1-2B-GGUF@4a181094d1b6addfaa3a0956f78e7ab2aa406a0c/d1-2B-BF16.gguf \
   --request request.json --backend hellas/catena-dfad87438018-hip --pay 20
 ```
 
@@ -322,7 +322,7 @@ default, and prints the response JSON:
 
 ```json
 {
-  "model": "d1",
+  "model": "d1-2B-BF16",
   "answers": {
     "refund": {"type": "noul", "noul": 0.97},
     "team": {"type": "choice", "choice": "billing", "confidence": 0.99, "probabilities": {"billing": 0.99, "technical": 0.01}},

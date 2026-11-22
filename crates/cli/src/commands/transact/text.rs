@@ -9,7 +9,7 @@ pub struct TextArgs {
     #[command(flatten)]
     client: ClientArgs,
     /// Local or pinned Hub GGUF; the provider holds the matching weights.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "MODEL")]
     model: PathBuf,
     #[arg(long)]
     prompt: String,

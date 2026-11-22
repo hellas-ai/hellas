@@ -11,7 +11,7 @@ pub struct DecideArgs {
     #[command(flatten)]
     client: ClientArgs,
     /// Local or pinned Hub d1 GGUF; the provider holds the matching weights.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "MODEL")]
     model: PathBuf,
     /// Request JSON file; `-` reads standard input.
     #[arg(long, value_name = "FILE", default_value = "-")]

@@ -6,16 +6,18 @@ grants and API upstreams can appear together:
 
 ```sh
 hellas gateway \
-  --model ./qwen3.gguf --model ./whisper-tiny --model ./flux \
-  --model ./qwen3.gguf@alice \
+  --model hf://ggml-org/Qwen3-0.6B-GGUF@afe8ad3577aa22500b3cd1c880f153b3b0e1cae8/Qwen3-0.6B-BF16.gguf \
+  --model ./whisper-tiny \
+  --model hf://black-forest-labs/FLUX.2-klein-4B@e7b7dc27f91deacad38e78976d1f2b499d76a294 \
+  --model hf://ggml-org/Qwen3-0.6B-GGUF@afe8ad3577aa22500b3cd1c880f153b3b0e1cae8/Qwen3-0.6B-BF16.gguf@alice \
   --upstream openrouter=https://openrouter.ai/api,key-file="$HOME/or.key" \
   --model gpt-5@openrouter
 ```
 
-A local path accepts Qwen or d1 decision GGUF, converted Whisper, MMS or Phonon speech
-or Flux directories, and Whisper or MMS descriptor directories. The package determines the modality
-and API paths. Remote Compute uses `PATH@CONTACT`: the gateway needs that
-local package to render the invocation for the contact's evaluator. A Fetch
+The gateway serves local or pinned GGUF text and decision models, original
+OmniVoice, Flux and Phonon checkpoints, and converted Whisper or MMS packages
+and descriptors. It discovers the modality and API paths from the model.
+Append `@CONTACT` to a model path or pinned URI to use a remote Compute grant. A Fetch
 grant uses `NAME@CONTACT`, checked against the models in its signed offer.
 Import contacts and access with `hellas pair … --name CONTACT`. For an App
 Attest provider, independently approve its pins under the same contact name:
@@ -53,18 +55,18 @@ Every request requires a scoped `gateway.invoke` bearer. The foreground
 command prints its bearer to the terminal, or passes it directly to a child:
 
 ```sh
-hellas gateway --model ./qwen3.gguf --wrap claude
+hellas gateway --model hf://ggml-org/Qwen3-0.6B-GGUF@afe8ad3577aa22500b3cd1c880f153b3b0e1cae8/Qwen3-0.6B-BF16.gguf --wrap claude
 ```
 
 `--wrap` supplies OpenAI and Anthropic URLs and tokens, and drains accepted
 work when the child exits. For headless clients, use `--bearer-file PATH`:
 
 ```sh
-hellas gateway --model ./qwen3.gguf --bearer-file "$HOME/gateway.bearer"
+hellas gateway --model hf://ggml-org/Qwen3-0.6B-GGUF@afe8ad3577aa22500b3cd1c880f153b3b0e1cae8/Qwen3-0.6B-BF16.gguf --bearer-file "$HOME/gateway.bearer"
 # In another shell:
 curl -H "Authorization: Bearer $(cat "$HOME/gateway.bearer")" \
   -H "Content-Type: application/json" \
-  -d '{"model":"qwen3","messages":[{"role":"user","content":"Hello"}]}' \
+  -d '{"model":"Qwen3-0.6B-BF16","messages":[{"role":"user","content":"Hello"}]}' \
   http://127.0.0.1:8080/v1/chat/completions
 ```
 

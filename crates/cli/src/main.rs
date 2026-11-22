@@ -180,13 +180,12 @@ enum Commands {
         #[arg(short = 'o', long, value_name = "DIR")]
         output: PathBuf,
     },
-    /// Print the program manifest a model's jobs run, which `serve
-    /// --program` admits: a GGUF, converted package, or descriptor.
+    /// Print the program manifests for a local model or pinned hf:// checkpoint.
     Program {
         /// Named voice whose exact speech program the provider admits.
         #[arg(long)]
         voice: Vec<String>,
-        #[arg(value_name = "PATH")]
+        #[arg(value_name = "MODEL")]
         model: PathBuf,
         /// The registered renderer (evaluator id) the program is compiled for.
         #[arg(long, value_name = "EVALUATOR")]

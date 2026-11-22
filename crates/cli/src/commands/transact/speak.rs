@@ -7,7 +7,7 @@ pub struct SpeakArgs {
     #[command(flatten)]
     client: ClientArgs,
     /// Local speech model directory or pinned Hub checkpoint.
-    #[arg(long, value_name = "DIR")]
+    #[arg(long, value_name = "MODEL")]
     model: PathBuf,
     /// Text to synthesize. Reads standard input when omitted.
     #[arg(long)]
