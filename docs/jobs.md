@@ -26,7 +26,7 @@ Grant Compute uses ephemeral provider retention for job payloads. Compiled
 programs are cached independently of payload retention. A signed failed result
 makes the command fail on both first delivery and saved-result replay.
 
-With the compute-enabled package (the NixOS module and the CUDA/HIP images;
+With the compute-enabled package (`cli-cuda`, `cli-hip`, the NixOS module or the CUDA/HIP images;
 the portable release has no local compute), every Compute command also accepts
 `--local`: the job runs on this machine's executor under your own limits, with
 no chain, channel, grant or attempt record. A helper serves the model's weights
@@ -37,6 +37,11 @@ through `--content PATH` or `--content-config`. `--timeout` bounds it like any o
 hellas transcribe --model ./whisper-tiny --audio speech.wav --local
 hellas text --model ./qwen3.gguf --prompt 'Why is the sky blue?' --local
 ```
+
+The [Nix one-liners](nix.md#local-gpu-one-liners) include pinned preparation
+and execution commands for text, transcription, MMS speech, Flux images and
+one gateway serving them together. The same `cli-cuda` or `cli-hip` output
+runs every modality; no development shell is needed.
 
 A Compute job names the evaluator its program is rendered for. Remote Compute
 commands render for `--backend EVALUATOR`, the id the provider's GPU runtime
@@ -234,8 +239,11 @@ Convert the distilled Flux2 Klein 4B snapshot once, pinned to a 40-hex commit.
 The converter fetches the published files it reads at that commit:
 
 ```sh
-hellas convert-flux black-forest-labs/FLUX.2-klein-4B@COMMIT -o klein
+nix run github:hellas-ai/hellas#cli-cuda -- convert-flux black-forest-labs/FLUX.2-klein-4B@e7b7dc27f91deacad38e78976d1f2b499d76a294 -o ./klein
+nix run github:hellas-ai/hellas#cli-cuda -- image --model ./klein --prompt 'a small red fox' --seed 42 --width 512 --height 512 --steps 4 --local -o fox.png
 ```
+
+Use `cli-hip` for AMD. Both outputs include the Compute CLI and runtime compiler.
 
 The converter validates the checkpoint and creates three ordinary provider
 assets (`text.bin`, `denoise.bin`, `vae.bin`), plus client metadata and a
@@ -265,8 +273,10 @@ One job runs `flux.encode-text`, `flux.denoise` and `flux.decode-image`, passing
 conditioning and latents in slots. Tokenization and seeded ChaCha8 noise are
 client inputs; PNG encoding is client presentation of the signed RGB buffer.
 
-The gateway exposes the same package with `gateway --model klein` and
-`--access`, `--pay` or `--local` as usual:
+The gateway exposes the same package locally with `gateway --model klein`.
+For a remote contact, use `gateway --model klein@CONTACT`; see the
+[HTTP gateway guide](http-gateway.md). Local paths select local execution
+automatically, without a `--local` gateway flag:
 
 ```sh
 curl http://127.0.0.1:8080/v1/images/generations \
