@@ -3,19 +3,15 @@ use super::CliResult;
 use hellas_auth::authority::{ContactCard, PrincipalId};
 use hellas_authority::authenticator::Authenticator;
 use hellas_authority::model::grant::records::SignedOffer;
-use hellas_private::StoreLocation;
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use hellas_sdk::home::data_root;
+use std::path::Path;
 
 /// The principal controlled by this authenticator.
 pub fn principal(passkey: &dyn Authenticator) -> CliResult<PrincipalId> {
     Ok(PrincipalId::from_public_key(hellas_auth::PublicKey::P256(
         passkey.public_key()?.to_compressed(),
     ))?)
-}
-/// One private tree per principal, named by its curve and compressed key.
-pub(crate) fn data_root(home: &Path, principal: &PrincipalId) -> CliResult<PathBuf> {
-    let base = crate::identity::grant_data_path(home);
-    Ok(base.join(format!("p256-{}", hex::encode(principal.as_bytes()))))
 }
 pub(super) fn save(path: &Path, bytes: &[u8]) -> CliResult<()> {
     let directory = path
@@ -49,13 +45,6 @@ pub(super) fn offer_fingerprints(offer: &SignedOffer) -> CliResult<()> {
         offer.offer().provider.content_id()
     );
     Ok(())
-}
-
-pub fn client_journal_root(
-    home: &StoreLocation,
-    identity: &PrincipalId,
-) -> CliResult<StoreLocation> {
-    Ok(home.child(data_root(home, identity)?).child("channels"))
 }
 
 #[cfg(test)]

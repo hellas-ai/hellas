@@ -3,7 +3,7 @@ use crate::{
     Backend, BackendEntry, BackendState,
     daemon_config::{BackendKind, Trust},
 };
-use hellas_auth::authority::{NodeKey, PrincipalId, UnixMillis};
+use hellas_auth::authority::{NodeKey, PrincipalId};
 use hellas_store::content::DiskStore;
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 mod models;
@@ -297,57 +297,25 @@ impl Runtime {
             } => {
                 let principal = self.principal()?;
                 let holder = NodeKey::from_public_key(self.options.signer.public_key())?;
-                let (offers, application) = crate::access_bundle::AccessBundle::decode(
+                let bundle = crate::access_bundle::AccessBundle::decode(
                     &base64::Engine::decode(
                         &base64::engine::general_purpose::STANDARD,
                         access.as_deref().ok_or("missing grant access")?,
                     )?,
                     &principal,
                     &holder,
-                )?
-                .into_parts();
-                let (offer, policy) = {
-                    let mut selected = offers.iter().flat_map(|offer| {
-                        offer.offer().grant.policies.iter().map(move |policy: &hellas_authority::model::grant::records::GrantPolicy| (offer, policy))
-                    }).filter(|(_, policy)| resource.is_none_or(|id| policy.resource == id));
-                    let (offer, policy) = selected
-                        .next()
-                        .ok_or("grant contains no matching resource")?;
-                    if selected.next().is_some() {
-                        return Err("grant resource is ambiguous".into());
-                    }
-                    (offer.clone(), policy.clone())
-                };
-                let provider = hellas_client::ProviderAddress::of(&offer.offer().provider)?;
-                let trust = self.trust(trust, counters.clone())?.unwrap_or(
-                    hellas_client::ProviderTrustAnchor {
-                        expected_genesis: provider.enrollment,
-                        required_assurance: hellas_rpc::Assurance::ProducerSigned,
-                        apple_app_attest: None,
-                    },
-                );
-                let target =
-                    crate::grant_client::UnpinnedOffer::decode(&offer.encode()?, UnixMillis(0))?
-                        .pin(&trust)?;
-                let endpoint = self.consumer_endpoint().await?;
+                )?;
+                let trust = self.trust(trust, counters.clone())?;
                 (
-                    Backend::grant(
-                        policy.clone(),
-                        crate::grant_client::GrantSessionOptions {
-                            target,
-                            principal,
-                            signer: self.options.signer.clone(),
-                            application: Arc::new(application),
-                            journal_root: self
-                                .options
-                                .home
-                                .child("grants")
-                                .child(format!("p256-{}", hex::encode(principal.as_bytes())))
-                                .child("channels"),
-                            control_timeout: std::time::Duration::from_secs(90),
-                        },
-                        crate::grant_client::GrantTransport::Remote(endpoint),
-                    ),
+                    crate::home::access_target(
+                        bundle,
+                        *resource,
+                        None,
+                        trust,
+                        self.options.signer.clone(),
+                        &self.options.home,
+                        self.consumer_endpoint().await?,
+                    )?,
                     evaluator.clone(),
                 )
             }

@@ -1,11 +1,12 @@
 //! Owner content operations over authenticated daemon RPC or a checked local upper.
-use crate::{commands::CliResult, identity::LocalIdentity};
+use crate::commands::CliResult;
 use anyhow::{Context as _, ensure};
 use clap::{Args, Subcommand};
 use futures::StreamExt as _;
 use hellas_authority::{authenticator::Authenticator, node::SessionKey};
 use hellas_private::StoreLocation;
 use hellas_rpc::{ContentRef, services::resolve::ResolveClientImpl};
+use hellas_sdk::identity::LocalIdentity;
 use hellas_sdk::node_control::profile::ClientProfile;
 use hellas_store::content::{self, config::Reconciler, owner_pin as find_pin, *};
 use hellas_wire::StreamTransport;

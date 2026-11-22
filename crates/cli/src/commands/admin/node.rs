@@ -1,5 +1,5 @@
 use super::{AdminArgs, AdminCommand, OfflineArgs};
-use crate::{commands::contributions::offer_fingerprints, identity::LocalIdentity};
+use crate::commands::contributions::offer_fingerprints;
 use anyhow::{Context, Result, ensure};
 use hellas_auth::authority::{
     AdministrationCommand, AdministrationRecord, Credential, CredentialCommand, CredentialHolder,
@@ -18,6 +18,7 @@ use hellas_rpc::{
     protocol::value::{canonical_dag_cbor, decode_dag_cbor},
     services::host_control::HostControlClientImpl,
 };
+use hellas_sdk::identity::LocalIdentity;
 use hellas_sdk::node_control::{self, profile};
 mod share;
 use hellas_wire::{ServiceMarker, StreamTransport};

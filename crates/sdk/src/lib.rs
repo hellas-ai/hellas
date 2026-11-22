@@ -34,6 +34,8 @@ pub mod local {
 }
 
 pub mod chain_home;
+pub mod home;
+pub mod identity;
 pub mod paid_provider;
 pub mod work_config;
 pub mod work_router;

@@ -1,8 +1,6 @@
 #![recursion_limit = "256"]
 
 use hellas_private::StoreLocation;
-#[macro_use]
-extern crate tracing;
 
 use clap::{Parser, Subcommand};
 use iroh::EndpointId;
@@ -340,7 +338,9 @@ async fn async_main() {
         return;
     }
     let owner = match cli.owner.load(&home).and_then(|owner| match owner {
-        None if acts_for_principal(&cli.command) => owner::principal(&home).map(Some),
+        None if acts_for_principal(&cli.command) => {
+            hellas_sdk::identity::principal(&home).map(Some)
+        }
         owner => Ok(owner),
     }) {
         Ok(owner) => owner,
@@ -475,7 +475,7 @@ async fn async_main() {
     };
 
     // Before anything binds, and before any other startup work.
-    let local_identity = match identity::load_or_create(&identity_path) {
+    let local_identity = match hellas_sdk::identity::load_or_create(&identity_path) {
         Ok(identity) => identity,
         Err(err) => {
             eprintln!("error: {err:#}");
@@ -483,6 +483,8 @@ async fn async_main() {
         }
     };
     let secret_key = local_identity.transport_key.clone();
+    let job_home =
+        || hellas_sdk::home::Home::new(&local_identity, owner.as_ref(), &home, &selected_chain);
 
     let result = match command {
         Commands::Contact { name } => {
@@ -574,95 +576,17 @@ async fn async_main() {
             node_addrs,
         } => commands::rpc::run(node_id, node_addrs, secret_key).await,
         Commands::Transact(args) => {
-            async {
-                commands::transact::run(
-                    args,
-                    commands::transact::Context::new(
-                        &local_identity,
-                        owner.as_ref(),
-                        &home,
-                        &selected_chain,
-                    )?,
-                )
-                .await
-            }
-            .await
+            async { commands::transact::run(args, job_home()?).await }.await
         }
-        Commands::Fetch(args) => {
-            async {
-                commands::transact::fetch(
-                    args,
-                    commands::transact::Context::new(
-                        &local_identity,
-                        owner.as_ref(),
-                        &home,
-                        &selected_chain,
-                    )?,
-                )
-                .await
-            }
-            .await
-        }
+        Commands::Fetch(args) => async { commands::transact::fetch(args, job_home()?).await }.await,
         Commands::Run(args) => {
-            async {
-                commands::transact::run_program(
-                    args,
-                    commands::transact::Context::new(
-                        &local_identity,
-                        owner.as_ref(),
-                        &home,
-                        &selected_chain,
-                    )?,
-                )
-                .await
-            }
-            .await
+            async { commands::transact::run_program(args, job_home()?).await }.await
         }
         Commands::Transcribe(args) => {
-            async {
-                commands::transact::transcribe(
-                    args,
-                    commands::transact::Context::new(
-                        &local_identity,
-                        owner.as_ref(),
-                        &home,
-                        &selected_chain,
-                    )?,
-                )
-                .await
-            }
-            .await
+            async { commands::transact::transcribe(args, job_home()?).await }.await
         }
-        Commands::Text(args) => {
-            async {
-                commands::transact::text(
-                    args,
-                    commands::transact::Context::new(
-                        &local_identity,
-                        owner.as_ref(),
-                        &home,
-                        &selected_chain,
-                    )?,
-                )
-                .await
-            }
-            .await
-        }
-        Commands::Image(args) => {
-            async {
-                commands::transact::image(
-                    args,
-                    commands::transact::Context::new(
-                        &local_identity,
-                        owner.as_ref(),
-                        &home,
-                        &selected_chain,
-                    )?,
-                )
-                .await
-            }
-            .await
-        }
+        Commands::Text(args) => async { commands::transact::text(args, job_home()?).await }.await,
+        Commands::Image(args) => async { commands::transact::image(args, job_home()?).await }.await,
         Commands::ConvertWhisper { .. }
         | Commands::ConvertSpeech { .. }
         | Commands::Model { .. }
