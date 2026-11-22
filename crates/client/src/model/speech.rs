@@ -164,26 +164,23 @@ impl Speech {
             model: Model::Mms { tokenizer, views },
         })
     }
-    pub async fn open_phonon(dir: &Path, dialect: super::GpuDialect) -> Result<Self> {
-        let dir = dir.to_owned();
-        let (model, source, assets) = tokio::task::spawn_blocking(move || -> Result<_> {
-            let (model, bundle, assets) = phonon::Phonon::open(&dir)?;
-            Ok((model, super::program::render(&bundle, dialect)?, assets))
-        })
-        .await??;
-        let (environment, content) = super::program::environment(&source, assets).await?;
-        Ok(Self {
-            environment,
-            content,
-            model: Model::Phonon(Box::new(model)),
-        })
-    }
-    pub async fn open_omni(
+    pub async fn open_native(
         source: super::native::Native,
+        kind: super::native::Kind,
         dialect: super::GpuDialect,
     ) -> Result<Self> {
-        let (model, program, assets) = tokio::task::spawn_blocking(move || -> Result<_> {
-            let (model, bundle) = omnivoice::OmniVoice::open(&source, dialect)?;
+        let (model, source, assets) = tokio::task::spawn_blocking(move || -> Result<_> {
+            let (model, bundle) = match kind {
+                super::native::Kind::Phonon => {
+                    let (m, s) = phonon::Phonon::open(&source, dialect)?;
+                    (Model::Phonon(Box::new(m)), s)
+                }
+                super::native::Kind::OmniVoice => {
+                    let (m, s) = omnivoice::OmniVoice::open(&source, dialect)?;
+                    (Model::OmniVoice(Box::new(m)), s)
+                }
+                super::native::Kind::Flux => unreachable!(),
+            };
             Ok((
                 model,
                 super::program::render(&bundle, dialect)?,
@@ -191,11 +188,11 @@ impl Speech {
             ))
         })
         .await??;
-        let (environment, content) = super::program::environment(&program, assets).await?;
+        let (environment, content) = super::program::environment(&source, assets).await?;
         Ok(Self {
             environment,
             content,
-            model: Model::OmniVoice(Box::new(model)),
+            model,
         })
     }
     pub(super) fn setup_entries(&self) -> &'static [&'static str] {
@@ -276,6 +273,9 @@ impl Speech {
             Model::Phonon(_) => phonon::decode(output),
             Model::OmniVoice(_) => omnivoice::decode(output),
         }
+    }
+    pub(super) fn decode_phonon(output: &InvocationOutput) -> Result<Audio> {
+        phonon::decode(output)
     }
     fn decode_mms(output: &InvocationOutput) -> Result<Audio> {
         ensure!(

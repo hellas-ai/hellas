@@ -71,14 +71,21 @@ impl ModelFiles {
     pub async fn resolve(
         models: impl IntoIterator<Item = std::path::PathBuf>,
     ) -> anyhow::Result<Self> {
+        Self::for_voices(models, &[]).await
+    }
+    pub async fn for_voices(
+        models: impl IntoIterator<Item = std::path::PathBuf>,
+        voices: &[String],
+    ) -> anyhow::Result<Self> {
         let paths: Vec<_> = models.into_iter().collect();
+        let voices = voices.to_vec();
         tokio::task::spawn_blocking(move || {
             let mut all = Self {
                 local: Vec::new(),
                 hub: Vec::new(),
             };
             for path in paths {
-                let files = descriptor::Source::open(&path)?.files()?;
+                let files = descriptor::Source::open(&path)?.files(&voices)?;
                 all.local.extend(files.local);
                 all.hub.extend(files.hub);
             }
@@ -86,4 +93,14 @@ impl ModelFiles {
         })
         .await?
     }
+}
+
+#[cfg(feature = "models")]
+pub fn voice_allowed(voices: &[String], voice: &str) -> bool {
+    let selected = if voice == "default" {
+        catena_models::phonon::DEFAULT_VOICE
+    } else {
+        voice
+    };
+    native::selected_voices(voices).contains(selected)
 }

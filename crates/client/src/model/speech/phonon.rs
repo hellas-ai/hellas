@@ -1,38 +1,21 @@
-//! Phonon voices, weight packaging and the portable synthesis ABI.
+//! Phonon speech plans over original model, codec and catalog voice tensors.
 use super::{Audio, floats_f32};
-use crate::model::package::ComputeJob;
+use crate::model::{native::Native, package::ComputeJob};
 use anyhow::{Context, Result, bail, ensure};
-/// The codec and voice repositories every checkpoint shares, and the
-/// published files a conversion reads.
-pub use catena_models::phonon::{
-    CODEC as CODEC_REPO, CODEC_FILES, CODEC_REVISION, MODEL_FILES, VOICE_CATALOG, VOICE_REPO,
-    VOICE_REPO_REVISION,
-};
+use catena_lang::codegen::GpuDialect;
 use catena_models::{
-    phonon::{self, Binding, Config, Prompt},
-    weights::{Weights, f32_to_bf16},
+    phonon::{
+        self, Config, Prompt,
+        preparation::{Program, VOICE_ENTRY, WEIGHT_ENTRY},
+    },
+    weights::preparation::Binding,
 };
 use hellas_rpc::protocol::invocation::{
     Artifact, MAX_ARTIFACTS, compute::*, output::InvocationOutput,
 };
 use hellas_store::content::{LocalStore, Scope};
-use std::{
-    collections::BTreeMap,
-    fs::File,
-    io::{BufWriter, Write},
-    path::{Path, PathBuf},
-};
+use std::path::Path;
 
-const WEIGHTS: &str = "weights";
-const ASSETS_FILE: &str = "assets.json";
-const MODEL: &str = "model";
-const CODEC: &str = "codec";
-const VOICES: &str = "voices";
-/// A converted package holds the model's processor configuration here.
-pub(in crate::model) const MARKER: &str = "model/processor_config.json";
-/// Bytes per frame of a converted BF16 voice.
-const VOICE_FRAME_BYTES: u64 = phonon::VOICE_CHANNELS as u64 * 2;
-/// Sampling is seeded; the speech API has no seed, so every request uses this.
 const SEED: u64 = 0;
 
 /// A voice name as a single file name: it names a package file and an asset.
@@ -63,235 +46,66 @@ pub fn voice_file(catalog: &str, name: &str) -> Result<String> {
     Ok(file)
 }
 
-fn voice_asset(name: &str) -> String {
-    format!("voice-{name}")
-}
-
-/// The frames of a converted voice, which must leave room for text.
-fn voice_frames(bytes: u64) -> Result<u64> {
-    let frames = bytes / VOICE_FRAME_BYTES;
-    ensure!(bytes == frames * VOICE_FRAME_BYTES, "invalid voice length");
-    phonon::text_limit(usize::try_from(frames)?)?;
-    Ok(frames)
-}
-
-/// Byte ranges of the weight asset: each distinct binding once, in entry
-/// order, then the two latent statistics. Every range starts on a four-byte
-/// boundary, as separately allocated tensors would.
-struct Views {
-    bindings: BTreeMap<Vec<String>, (u64, u64)>,
-    latents: [(u64, u64); 2],
-    bytes: u64,
-}
-const LATENTS: [&str; 2] = [phonon::LATENT_STD, phonon::LATENT_MEAN];
-const LATENT_BYTES: u64 = phonon::LATENT as u64 * 2;
-
-fn entries(config: &Config) -> Result<[Vec<Binding>; 2]> {
-    Ok([
-        phonon::bindings(config, "setup")?,
-        phonon::bindings(config, "synthesize")?,
-    ])
-}
-
-fn distinct(entries: &[Vec<Binding>; 2]) -> impl Iterator<Item = &Binding> {
-    let mut seen = std::collections::BTreeSet::new();
-    entries
-        .iter()
-        .flatten()
-        .filter(move |binding| seen.insert(&binding.names))
-}
-
-fn views(entries: &[Vec<Binding>; 2]) -> Views {
-    let mut end = 0u64;
-    let mut place = |bytes: u64| {
-        let offset = end.next_multiple_of(4);
-        end = offset + bytes;
-        (offset, bytes)
-    };
-    let bindings = distinct(entries)
-        .map(|binding| (binding.names.clone(), place(binding.bytes() as u64)))
-        .collect();
-    let latents = [place(LATENT_BYTES), place(LATENT_BYTES)];
-    Views {
-        bindings,
-        latents,
-        bytes: end,
-    }
-}
-
-fn read_config(dir: &Path) -> Result<Config> {
-    Config::read(&dir.join(MODEL), &dir.join(CODEC))
-}
-
-/// Convert published model and codec snapshots and catalog voices into one
-/// package. `voices` pairs each voice name with its checkpoint file.
-pub fn convert(
-    model: &Path,
-    codec: &Path,
-    voices: &[(String, PathBuf)],
-    destination: &Path,
-) -> Result<Vec<NamedAsset>> {
-    ensure!(!destination.try_exists()?, "destination already exists");
-    ensure!(!voices.is_empty(), "a speech package needs a voice");
-    let config = Config::read(model, codec)?;
-    phonon::read_tokenizer(model)?;
-    let (model_weights, codec_weights) = (
-        Weights::open(&model.join("model.safetensors"))?,
-        Weights::open(&codec.join("model.safetensors"))?,
-    );
-    phonon::validate_weights(&model_weights, &codec_weights, &config)?;
-    let parent = destination
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let staging = tempfile::Builder::new()
-        .prefix(".speech-")
-        .tempdir_in(parent)?;
-    let asset =
-        |name: String, path: &Path, values: &mut dyn FnMut(&mut dyn Write) -> Result<()>| {
-            let mut file = BufWriter::new(File::create(path)?);
-            values(&mut file)?;
-            file.flush()?;
-            file.get_ref().sync_all()?;
-            drop(file);
-            Ok::<_, anyhow::Error>(NamedAsset {
-                name,
-                object: hellas_store::content::file_content(path)?,
-            })
-        };
-    let bf16 = |file: &mut dyn Write, values: &[f32]| -> Result<()> {
-        for &value in values {
-            file.write_all(&f32_to_bf16(value).to_le_bytes())?;
-        }
-        Ok(())
-    };
-    let entries = entries(&config)?;
-    let layout = views(&entries);
-    let mut assets = vec![asset(
-        WEIGHTS.into(),
-        &staging.path().join("weights.bin"),
-        &mut |file| {
-            let mut written = 0;
-            let mut put = |(offset, bytes): (u64, u64), values: &[f32], f32: bool| {
-                let mut encoded = Vec::new();
-                if f32 {
-                    encoded.extend(values.iter().flat_map(|value| value.to_le_bytes()));
-                } else {
-                    bf16(&mut encoded, values)?;
-                }
-                ensure!(
-                    encoded.len() as u64 == bytes,
-                    "weight has an unexpected size"
-                );
-                file.write_all(&vec![0; (offset - written) as usize])?;
-                written = offset + bytes;
-                file.write_all(&encoded)?;
-                Ok(())
-            };
-            for binding in distinct(&entries) {
-                let values = phonon::materialize(&model_weights, &codec_weights, binding)?;
-                put(layout.bindings[&binding.names], &values, binding.codec)?;
-            }
-            for (name, view) in LATENTS.into_iter().zip(layout.latents) {
-                put(view, &model_weights.host_f32(name)?, false)?;
-            }
-            Ok(())
-        },
-    )?];
-    ensure!(
-        assets[0].object.bytes() == layout.bytes,
-        "derived weight file has wrong length"
-    );
-    std::fs::create_dir(staging.path().join(VOICES))?;
-    for (name, path) in voices {
-        validate_voice(name)?;
-        let voice = phonon::read_voice(path)?;
-        let path = staging.path().join(VOICES).join(format!("{name}.bf16"));
-        let voice = asset(voice_asset(name), &path, &mut |file| {
-            bf16(file, &voice.values)
-        })?;
-        voice_frames(voice.object.bytes())?;
-        ensure!(
-            assets.iter().all(|asset| asset.name != voice.name),
-            "duplicate voice {name:?}"
-        );
-        assets.push(voice);
-    }
-    for (directory, source, files) in [
-        (MODEL, model, &phonon::MODEL_FILES[..]),
-        (CODEC, codec, &phonon::CODEC_FILES[..]),
-    ] {
-        std::fs::create_dir(staging.path().join(directory))?;
-        for name in files.iter().filter(|name| name.ends_with(".json")) {
-            std::fs::copy(source.join(name), staging.path().join(directory).join(name))?;
-        }
-    }
-    std::fs::write(
-        staging.path().join(ASSETS_FILE),
-        serde_json::to_vec_pretty(&assets)?,
-    )?;
-    std::fs::rename(staging.path(), destination)?;
-    Ok(assets)
-}
-
 pub(in crate::model) struct Phonon {
     tokenizer: tokenizers::Tokenizer,
-    entries: [Vec<Binding>; 2],
-    views: Views,
-    /// Frames of each packaged voice, by name.
-    voices: BTreeMap<String, u64>,
+    program: Program<Arg>,
+    voice: String,
+    voice_arg: Arg,
+    frames: u64,
 }
 
 impl Phonon {
-    /// The package's program source and assets.
-    pub fn open(dir: &Path) -> Result<(Self, String, Vec<NamedAsset>)> {
-        let config = read_config(dir)?;
-        let assets: Vec<NamedAsset> = serde_json::from_reader(File::open(dir.join(ASSETS_FILE))?)?;
-        let entries = entries(&config)?;
-        let views = views(&entries);
-        let (weights, voice_assets) = assets.split_first().context("package has no assets")?;
+    pub(crate) fn open(source: &Native, _dialect: GpuDialect) -> Result<(Self, String)> {
+        let config = Config::read(&source.dir().join("model"), &source.dir().join("codec"))?;
+        let tokenizer = phonon::read_tokenizer(&source.dir().join("model"))?;
         ensure!(
-            weights.name == WEIGHTS && weights.object.bytes() == views.bytes,
-            "derived weight file has wrong length"
+            source.voices.len() == 1,
+            "each Phonon manifest selects one voice"
         );
-        let mut voices = BTreeMap::new();
-        for asset in voice_assets {
-            let name = asset
-                .name
-                .strip_prefix("voice-")
-                .context("unexpected package asset")?;
-            validate_voice(name)?;
-            ensure!(
-                voices
-                    .insert(name.to_owned(), voice_frames(asset.object.bytes())?)
-                    .is_none(),
-                "duplicate voice {name:?}"
-            );
-        }
-        ensure!(!voices.is_empty(), "a speech package needs a voice");
+        let (voice, key) = source
+            .voices
+            .first_key_value()
+            .context("missing catalog voice")?;
+        let tensor = source.tensor(key, "speaker_wavs")?;
+        let frames = phonon::voice_frames(&tensor.shape)? as u64;
+        let mut program =
+            phonon::preparation::build(&config, tensor.dtype, |codec, name, shape| {
+                let file = if codec {
+                    "codec/model.safetensors"
+                } else {
+                    "model/model.safetensors"
+                };
+                let tensor = source.tensor(file, name)?;
+                ensure!(
+                    tensor.shape == shape,
+                    "wrong shape for Phonon tensor {name}"
+                );
+                let Arg::Asset { offset, .. } = &tensor.arg else {
+                    bail!("expected asset range")
+                };
+                Ok((tensor.arg.clone(), tensor.dtype, usize::try_from(*offset)?))
+            })?;
+        let hex = std::mem::take(&mut program.source);
         Ok((
             Self {
-                tokenizer: phonon::read_tokenizer(&dir.join(MODEL))?,
-                entries,
-                views,
-                voices,
+                tokenizer,
+                program,
+                voice: voice.clone(),
+                voice_arg: tensor.arg.clone(),
+                frames,
             },
-            phonon::bundle(&config),
-            assets,
+            hex,
         ))
     }
 
-    fn weights(&self, entry: usize) -> impl Iterator<Item = Arg> {
-        self.entries[entry].iter().map(|binding| {
-            let (offset, bytes) = self.views.bindings[&binding.names];
-            Arg::Asset {
-                name: WEIGHTS.into(),
-                offset,
-                bytes,
-            }
-        })
+    fn operand(operand: &Binding<Arg>) -> Arg {
+        match operand {
+            Binding::Asset(asset) => asset.clone(),
+            Binding::Prepared(index) => Arg::Slot {
+                name: format!("weight-{index}"),
+            },
+        }
     }
-
     pub fn render_job(
         &self,
         environment: &Environment,
@@ -301,10 +115,16 @@ impl Phonon {
         speed: f32,
     ) -> Result<ComputeJob> {
         ensure!(speed == 1., "this speech model supports speed 1 only");
-        let frames = *self
-            .voices
-            .get(voice)
-            .with_context(|| format!("unknown voice {voice:?}"))?;
+        let voice = if voice == "default" {
+            phonon::DEFAULT_VOICE
+        } else {
+            voice
+        };
+        ensure!(
+            voice == self.voice,
+            "voice {voice:?} is outside this manifest"
+        );
+        let frames = self.frames;
         let prompts = Prompt::split(&self.tokenizer, text)?;
         ensure!(
             prompts.len() <= MAX_ARTIFACTS / 2,
@@ -312,25 +132,32 @@ impl Phonon {
             MAX_ARTIFACTS / 2
         );
         let slot = |name: &str| Arg::Slot { name: name.into() };
-        let mut setup = vec![
-            Arg::Asset {
-                name: voice_asset(voice),
-                offset: 0,
-                bytes: frames * VOICE_FRAME_BYTES,
+        let mut setup = vec![slot("speaker"), Arg::U64(frames)];
+        setup.extend(self.program.setup.iter().map(Self::operand));
+        let mut calls = vec![
+            Call {
+                entry: WEIGHT_ENTRY.into(),
+                args: self.program.raw.clone(),
+                bind: (0..self.program.outputs)
+                    .map(|i| Bind::Name(format!("weight-{i}")))
+                    .collect(),
             },
-            Arg::U64(frames),
+            Call {
+                entry: VOICE_ENTRY.into(),
+                args: vec![self.voice_arg.clone()],
+                bind: vec![Bind::Name("speaker".into())],
+            },
+            Call {
+                entry: "phonon.setup".into(),
+                args: setup,
+                // The text budget is checked when the package is opened.
+                bind: ["voice", "cond", "bos", "time"]
+                    .map(|name| Bind::Name(name.into()))
+                    .into_iter()
+                    .chain([Bind::Discard])
+                    .collect(),
+            },
         ];
-        setup.extend(self.weights(0));
-        let mut calls = vec![Call {
-            entry: "phonon.setup".into(),
-            args: setup,
-            // The text budget is checked when the package is opened.
-            bind: ["voice", "cond", "bos", "time"]
-                .map(|name| Bind::Name(name.into()))
-                .into_iter()
-                .chain([Bind::Discard])
-                .collect(),
-        }];
         let (mut inputs, mut outputs) = (Vec::new(), Vec::new());
         for (i, prompt) in prompts.iter().enumerate() {
             let (ids, waveform, result) = (
@@ -339,11 +166,7 @@ impl Phonon {
                 format!("result-{i:02}"),
             );
             let tokens = prompt.ids.len();
-            let [std, mean] = self.views.latents.map(|(offset, bytes)| Arg::Asset {
-                name: WEIGHTS.into(),
-                offset,
-                bytes,
-            });
+            let [std, mean] = self.program.latents.each_ref().map(Self::operand);
             let mut args = vec![
                 Arg::Input {
                     object: ids.clone(),
@@ -363,7 +186,7 @@ impl Phonon {
                 Arg::U64(SEED),
                 Arg::U64(i as u64),
             ];
-            args.extend(self.weights(1));
+            args.extend(self.program.synth.iter().map(Self::operand));
             calls.push(Call {
                 entry: "phonon.synthesize".into(),
                 args,

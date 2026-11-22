@@ -13,6 +13,7 @@ pub(in crate::daemon) type Files = BTreeMap<PathBuf, ContentRef>;
 pub(in crate::daemon) type ModelIndex = (Files, Vec<hellas_store::hf::PinnedFile>);
 pub(super) struct Cached {
     files: Files,
+    voices: Vec<String>,
     packages: BTreeMap<String, Arc<ModelPackage>>,
 }
 impl Runtime {
@@ -33,13 +34,14 @@ impl Runtime {
                 if evaluators.is_empty() {
                     return Err("model has no registered evaluator".into());
                 }
+                let voices = document.model_voices(&path, None);
                 let files = if hellas_client::model::hf_uri(&path).is_some() {
                     Files::new()
                 } else {
                     let paths = if ModelPackage::is_descriptor(&path)? {
                         vec![path.clone()]
                     } else {
-                        hellas_client::model::ModelFiles::resolve([path.clone()])
+                        hellas_client::model::ModelFiles::for_voices([path.clone()], &voices)
                             .await?
                             .local
                     };
@@ -47,9 +49,11 @@ impl Runtime {
                 };
                 let cached = cache.entry(path.clone()).or_insert_with(|| Cached {
                     files: Files::new(),
+                    voices: Vec::new(),
                     packages: BTreeMap::new(),
                 });
-                if cached.files != files {
+                if cached.files != files || cached.voices != voices {
+                    cached.voices = voices.clone();
                     cached.packages.clear();
                     cached.files = files;
                 }
@@ -60,8 +64,13 @@ impl Runtime {
                     .collect::<Vec<_>>();
                 if !missing.is_empty() {
                     cached.packages.extend(
-                        ModelPackage::open_many(&path, missing, Some(&self.options.content))
-                            .await?,
+                        ModelPackage::open_many_with_voices(
+                            &path,
+                            missing,
+                            Some(&self.options.content),
+                            &voices,
+                        )
+                        .await?,
                     );
                 }
                 Ok(cached
@@ -94,12 +103,22 @@ impl Runtime {
                     .iter()
                     .filter(|resource| resource.backend == *id)
                     .filter_map(|resource| match &resource.kind {
-                        ResourceKind::Model { package } => Some(package.clone()),
+                        ResourceKind::Model { package, .. } => Some(package.clone()),
                         _ => None,
                     }),
             );
             let files: Result<_> = async {
-                let mut files = hellas_client::model::ModelFiles::resolve(paths).await?;
+                let mut files = hellas_client::model::ModelFiles {
+                    local: vec![],
+                    hub: vec![],
+                };
+                for path in paths {
+                    let voices = document.model_voices(&path, Some(id));
+                    let resolved =
+                        hellas_client::model::ModelFiles::for_voices([path], &voices).await?;
+                    files.local.extend(resolved.local);
+                    files.hub.extend(resolved.hub);
+                }
                 files.local.extend(content.iter().cloned());
                 Ok((
                     self.options.content.inspect_files(files.local).await?,

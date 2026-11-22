@@ -6,7 +6,7 @@ use std::io::Read;
 pub struct SpeakArgs {
     #[command(flatten)]
     client: ClientArgs,
-    /// Converted speech package directory.
+    /// Local speech model directory or pinned Hub checkpoint.
     #[arg(long, value_name = "DIR")]
     model: PathBuf,
     /// Text to synthesize. Reads standard input when omitted.
@@ -27,14 +27,19 @@ pub async fn speak(mut args: SpeakArgs, context: Context) -> super::super::CliRe
     context
         .model_command(async {
             args.target.models = vec![args.model.clone()];
+            args.target.voices = vec![args.voice.clone()];
             let evaluator = args.target.renderer()?;
             let content = args.target.content(&context).await?;
             let text = speech_text(args.text, std::io::stdin())?;
-            let package =
-                ModelPackage::open_many(&args.model, [evaluator.clone()], content.as_ref())
-                    .await?
-                    .remove(&evaluator)
-                    .context("model evaluator is not prepared")?;
+            let package = ModelPackage::open_many_with_voices(
+                &args.model,
+                [evaluator.clone()],
+                content.as_ref(),
+                &args.target.voices,
+            )
+            .await?
+            .remove(&evaluator)
+            .context("model evaluator is not prepared")?;
             let rendered = package
                 .render_job(&ModelRequest::Speech {
                     text: &text,

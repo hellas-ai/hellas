@@ -187,7 +187,10 @@ fn native_route(root: &std::path::Path) -> Route {
         backends: vec!["mms".into()],
         presentation: Presentation::Speech {
             model: "mms".into(),
-            target: hellas_gateway::SpeechTarget::Native { package },
+            target: hellas_gateway::SpeechTarget::Native {
+                package,
+                voices: vec![],
+            },
         },
     }
 }

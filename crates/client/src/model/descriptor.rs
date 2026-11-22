@@ -24,7 +24,6 @@ pub(super) enum Layout {
     WhisperDescriptor,
     Speech,
     SpeechDescriptor,
-    Phonon,
     Native(native::Kind),
 }
 
@@ -73,7 +72,6 @@ pub(super) enum Resolved {
         path: PathBuf,
         weights: ContentRef,
     },
-    Phonon(PathBuf),
     Native(native::Kind, Arc<native::Native>),
 }
 
@@ -153,7 +151,7 @@ impl Source {
             }
         }
     }
-    pub fn files(self) -> Result<super::ModelFiles> {
+    pub fn files(self, voices: &[String]) -> Result<super::ModelFiles> {
         Ok(match self {
             Self::Local(layout, path) => {
                 ensure!(
@@ -169,15 +167,21 @@ impl Source {
                 local: vec![],
                 hub: vec![file],
             },
-            Self::Checkpoint(kind, origin, _) => native::Snapshot::open(origin, kind)?.files(),
+            Self::Checkpoint(kind, origin, _) => {
+                native::Snapshot::open(origin, kind, voices)?.files()
+            }
         })
     }
-    pub fn resolve(self, store: Option<&hellas_store::content::DiskStore>) -> Result<Resolved> {
+    pub fn resolve(
+        self,
+        voices: &[String],
+        store: Option<&hellas_store::content::DiskStore>,
+    ) -> Result<Resolved> {
         match self {
             Self::Gguf(file) => remote_gguf(file),
             Self::Checkpoint(kind, origin, _) => Ok(Resolved::Native(
                 kind,
-                Arc::new(native::Snapshot::open(origin, kind)?.resolve(store)?),
+                Arc::new(native::Snapshot::open(origin, kind, voices)?.resolve(store)?),
             )),
             Self::Local(layout, path) => {
                 let inspected = match (store, layout.weights_path(&path)) {
@@ -211,10 +215,6 @@ pub(super) fn classify(path: &Path) -> Result<Layout> {
             "mixed model layout: native checkpoint and converted metadata"
         );
         return Ok(Layout::Native(kind));
-    }
-    if path.join(speech::phonon::MARKER).try_exists()? {
-        ensure!(!manifest && !weights, "mixed model layout");
-        return Ok(Layout::Phonon);
     }
     let whisper = whisper::METADATA.iter().try_fold(false, |found, name| {
         Ok::<_, std::io::Error>(path.join(name).try_exists()? || found)
@@ -267,9 +267,7 @@ impl Layout {
             }
             Self::Whisper | Self::WhisperDescriptor => ModelKind::Transcription,
             Self::Native(native::Kind::Flux) => ModelKind::Image,
-            Self::Speech | Self::SpeechDescriptor | Self::Phonon | Self::Native(_) => {
-                ModelKind::Speech
-            }
+            Self::Speech | Self::SpeechDescriptor | Self::Native(_) => ModelKind::Speech,
         })
     }
     pub(super) fn is_descriptor(self) -> bool {
@@ -279,9 +277,7 @@ impl Layout {
         match self {
             Self::Gguf => Some(path.to_owned()),
             Self::Whisper | Self::Speech => Some(path.join(whisper::WEIGHTS_FILE)),
-            Self::WhisperDescriptor | Self::SpeechDescriptor | Self::Phonon | Self::Native(_) => {
-                None
-            }
+            Self::WhisperDescriptor | Self::SpeechDescriptor | Self::Native(_) => None,
         }
     }
     pub(super) fn resolve(self, path: &Path, inspected: Option<ContentRef>) -> Result<Resolved> {
@@ -311,7 +307,6 @@ impl Layout {
                 path: path.to_owned(),
                 weights: read_weights(path)?,
             }),
-            Self::Phonon => Ok(Resolved::Phonon(path.to_owned())),
             Self::Native(_) => unreachable!("native source resolved from checkpoints"),
         }
     }
@@ -365,7 +360,6 @@ pub(super) fn describe(path: &Path, output: &Path) -> Result<ContentRef> {
         Layout::WhisperDescriptor | Layout::SpeechDescriptor => {
             bail!("source is already a descriptor")
         }
-        Layout::Phonon => bail!("the package already describes its assets in assets.json"),
         Layout::Native(_) => {
             bail!("native checkpoints already identify their original assets")
         }

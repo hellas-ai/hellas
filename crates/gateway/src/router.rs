@@ -45,11 +45,25 @@ pub async fn router(
     }
     let mut models = Models::new();
     for (path, evaluators) in evaluators {
+        let mut voices = BTreeSet::new();
+        for route in &routes {
+            if route.model_package().is_some_and(|(_, p)| p == &path) {
+                if route.model_voices().is_empty() {
+                    voices.insert("default".to_string());
+                }
+                voices.extend(route.model_voices().iter().cloned());
+            }
+        }
         models.insert(
             path.clone(),
-            Ok(ModelPackage::open_many(&path, evaluators, None)
-                .await
-                .map_err(|error| crate::GatewayError::Presentation(error.into()))?),
+            Ok(ModelPackage::open_many_with_voices(
+                &path,
+                evaluators,
+                None,
+                &voices.into_iter().collect::<Vec<_>>(),
+            )
+            .await
+            .map_err(|error| crate::GatewayError::Presentation(error.into()))?),
         );
     }
     let (router, errors) = with_models(routes, work, jobs, memory, &models).await?;

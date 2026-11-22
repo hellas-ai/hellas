@@ -176,6 +176,8 @@ pub(super) struct TargetArgs {
     /// from; local execution reads the jobs' weights from them.
     #[arg(skip)]
     pub(super) models: Vec<PathBuf>,
+    #[arg(skip)]
+    pub(super) voices: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -331,8 +333,11 @@ impl TargetArgs {
                 context
                     .local_content
                     .get_or_try_init(|| async {
-                        let files =
-                            hellas_client::model::ModelFiles::resolve(self.models.clone()).await?;
+                        let files = hellas_client::model::ModelFiles::for_voices(
+                            self.models.clone(),
+                            &self.voices,
+                        )
+                        .await?;
                         crate::compute::content(
                             &context.home,
                             &self.native,

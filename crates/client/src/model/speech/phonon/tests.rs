@@ -27,10 +27,9 @@ fn voice_names_and_catalog_files_cannot_leave_their_directory() {
 
 #[test]
 fn voices_must_be_whole_frames_that_leave_room_for_text() {
-    assert_eq!(voice_frames(250 * 1024).unwrap(), 250);
-    for bytes in [0, 1023, 1025, 8192 * 1024, 8161 * 1024] {
-        assert!(voice_frames(bytes).is_err(), "{bytes}");
-    }
+    assert_eq!(phonon::voice_frames(&[1, 512, 250]).unwrap(), 250);
+    assert!(phonon::voice_frames(&[1, 512, 0]).is_err());
+    assert!(phonon::voice_frames(&[1, 256, 250]).is_err());
 }
 
 fn output(utterances: &[(&[f32], u64, u64)]) -> InvocationOutput {

@@ -15,11 +15,14 @@ mod config;
 #[derive(clap::Args)]
 pub struct GatewayArgs {
     /// TOML routing and listener configuration.
-    #[arg(long, conflicts_with_all = ["models", "upstreams", "bind"])]
+    #[arg(long, conflicts_with_all = ["models", "upstreams", "bind","voices"])]
     pub config: Option<PathBuf>,
-    /// Qwen GGUF, Whisper/Flux package or descriptor; PATH@CONTACT or NAME@UPSTREAM.
+    /// Model path or pinned hf:// checkpoint, PATH@CONTACT, or NAME@UPSTREAM.
     #[arg(long = "model", required_unless_present = "config")]
     pub models: Vec<String>,
+    /// Named voices to serve with a native Phonon model (repeatable).
+    #[arg(long = "voice")]
+    pub voices: Vec<String>,
     /// NAME=HTTPS_API_URL,key-file=PATH (an OpenAI-compatible service).
     #[arg(long = "upstream")]
     pub upstreams: Vec<String>,
@@ -74,6 +77,7 @@ pub enum Edit {
 }
 
 pub struct ModelContext {
+    voices: Vec<String>,
     pub home: PathBuf,
     pub principal: Option<PrincipalId>,
     pub holder: NodeKey,
@@ -86,6 +90,7 @@ impl ModelContext {
         owner: Option<&dyn Authenticator>,
     ) -> Result<Self> {
         Ok(Self {
+            voices: vec![],
             home: home.into(),
             content: None,
             holder: NodeKey::from_public_key(identity.node_key.public_key())?,
@@ -104,7 +109,13 @@ impl ModelContext {
         path: &Path,
         evaluators: impl IntoIterator<Item = String>,
     ) -> Result<std::collections::BTreeMap<String, Arc<hellas_client::model::ModelPackage>>> {
-        hellas_client::model::ModelPackage::open_many(path, evaluators, self.content.as_ref()).await
+        hellas_client::model::ModelPackage::open_many_with_voices(
+            path,
+            evaluators,
+            self.content.as_ref(),
+            &self.voices,
+        )
+        .await
     }
 
     async fn add(&self, document: &mut Document, model: &str) -> Result<()> {
@@ -122,7 +133,7 @@ impl ModelContext {
                     },
                 });
             document
-                .add_route(package_route(path, "local").await?)
+                .add_route(package_route(path, "local", &self.voices).await?)
                 .map_err(anyhow::Error::from_boxed)?;
             return Ok(());
         };
@@ -174,7 +185,7 @@ impl ModelContext {
         };
         let package_programs = packages
             .iter()
-            .map(|(evaluator, package)| Ok((evaluator, package.programs()?)))
+            .map(|(evaluator, package)| Ok((evaluator.clone(), package.programs()?)))
             .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
         let mut matches = vec![];
         for policy in bundle
@@ -183,22 +194,24 @@ impl ModelContext {
             .flat_map(|offer| &offer.offer().grant.policies)
         {
             if package.is_some() {
-                for admission in &policy.invocation_policy.admissions {
-                    if let hellas_rpc::protocol::invocation::Admission::Compute {
-                        evaluator,
-                        programs,
-                    } = admission
-                    {
-                        if let hellas_rpc::protocol::invocation::ComputePrograms::Only {
-                            manifests,
-                            ..
-                        } = programs
-                            && !package_programs[evaluator]
-                                .iter()
-                                .all(|program| manifests.contains(&program.manifest))
-                        {
-                            continue;
-                        }
+                use hellas_rpc::protocol::invocation::{Admission, ComputePrograms};
+                for (evaluator, programs) in &package_programs {
+                    if programs.iter().all(|id| {
+                        policy.invocation_policy.admissions.iter().any(
+                            |admission| match admission {
+                                Admission::Compute {
+                                    evaluator: target,
+                                    programs,
+                                } if target == evaluator => match programs {
+                                    ComputePrograms::Any {} => true,
+                                    ComputePrograms::Only { manifests, .. } => {
+                                        manifests.contains(&id.manifest)
+                                    }
+                                },
+                                _ => false,
+                            },
+                        )
+                    }) {
                         matches.push((policy.clone(), Some(evaluator.clone())));
                     }
                 }
@@ -236,7 +249,7 @@ impl ModelContext {
         );
         if let Some(package) = package {
             document
-                .add_route(package_route(package, &id).await?)
+                .add_route(package_route(package, &id, &self.voices).await?)
                 .map_err(anyhow::Error::from_boxed)?;
         } else {
             for mut route in hellas_sdk::grant_routes(&policy, &id).map_err(anyhow::Error::from)? {
@@ -332,7 +345,7 @@ fn model_path(source: &str) -> Result<Option<PathBuf>> {
         .transpose()?)
 }
 
-async fn package_route(package: PathBuf, backend: &str) -> Result<Route> {
+async fn package_route(package: PathBuf, backend: &str, voices: &[String]) -> Result<Route> {
     let input = package.clone();
     let (modality, model) =
         tokio::task::spawn_blocking(move || hellas_client::model::ModelKind::named(&input))
@@ -342,7 +355,10 @@ async fn package_route(package: PathBuf, backend: &str) -> Result<Route> {
         presentation: match modality {
             hellas_client::model::ModelKind::Speech => Presentation::Speech {
                 model,
-                target: hellas_gateway::SpeechTarget::Native { package },
+                target: hellas_gateway::SpeechTarget::Native {
+                    package,
+                    voices: voices.to_vec(),
+                },
             },
             modality => Presentation::Model {
                 modality,
@@ -424,7 +440,7 @@ pub async fn apply(document: &mut Document, edit: Edit, context: &ModelContext) 
                 let matches = match &route.presentation {
                     Presentation::Model { package: path, .. }
                     | Presentation::Speech {
-                        target: hellas_gateway::SpeechTarget::Native { package: path },
+                        target: hellas_gateway::SpeechTarget::Native { package: path, .. },
                         ..
                     } => package.as_ref() == Some(path),
                     _ => route
@@ -644,6 +660,7 @@ pub async fn gateway(
         identity,
         owner.map(|owner| owner as &dyn Authenticator),
     )?;
+    context.voices = args.voices;
     hellas_private::create_dir_all_durable(home)?;
     let temporary = tempfile::Builder::new()
         .prefix(".gateway-")
@@ -909,6 +926,7 @@ mod tests {
 
     pub(super) fn model_context(home: &Path) -> ModelContext {
         ModelContext {
+            voices: vec![],
             home: home.into(),
             principal: None,
             content: None,

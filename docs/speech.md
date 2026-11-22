@@ -2,12 +2,11 @@
 
 ## Synthesize a WAV locally
 
-With a GPU build, use the pinned OmniVoice checkpoint or a converted package directory. OmniVoice accepts the default voice and speed 1.
-Choose a voice included in the Phonon package, or use the default MMS voice.
+With a GPU build, use a pinned checkpoint for OmniVoice or Phonon, or a local MMS package. Set `PHONON_ORG` to the publisher of the Phonon model.
 
 ```sh
 hellas speak --model hf://k2-fsa/OmniVoice@3fc979d1cd72492cd679c5ac2611e0d7ac047ba1 --text 'Hello from Hellas.' -o omni.wav --local
-hellas speak --model ./phonon --text 'Hello from Hellas.' --voice Easton -o phonon.wav --local
+hellas speak --model "hf://${PHONON_ORG}/phonon-31m-en@8f7a37c94a4c58b04c8287300c53f11d2e208eae" --text 'Hello from Hellas.' --voice Easton -o phonon.wav --local
 hellas speak --model ./mms --text 'Hello from Hellas.' -o mms.wav --local
 ```
 
@@ -17,7 +16,7 @@ Omit `--text` to read from standard input.
 
 `POST /v1/audio/speech` accepts JSON and returns audio bytes. The request's
 `model` selects either a hosted audio interface through Fetch or a native
-package, MMS English or Phonon, through Compute. All use the existing listener
+model through Compute (MMS English, OmniVoice or Phonon). All use the existing listener
 and its bearer.
 
 ```sh
@@ -29,8 +28,7 @@ curl -H "Authorization: Bearer $(cat "$HOME/gateway.bearer")" \
 
 Change only `model` to `mms` to use the native route in the example below.
 The hosted service must support the requested voice and configured format;
-its voice identifiers remain its own. MMS has one voice, named `default`. A
-Phonon package serves the voices converted into it, under their catalog names.
+its voice identifiers remain its own. MMS has one voice, named `default`. Phonon serves the configured catalog voices. Its default is Easton. OmniVoice supports the default voice and speed 1.
 
 MMS accepts `response_format: "wav"` and finite `speed` between 0.25 and 4
 (default 1). The result is mono 16 kHz, signed 16-bit PCM WAV. Text uses the
@@ -72,30 +70,23 @@ status and sample count, and encodes only the valid finite waveform prefix.
 Configure provider Compute admission for the program printed by `hellas program`
 and enough output for the 1,920,000-byte waveform plus 16-byte descriptor.
 
-## Prepare a Phonon package
+## Original speech checkpoints
 
-A Phonon package combines a model checkpoint, the codec it names and one or
-more voices from the voice catalog, each at an immutable 40-hex revision:
+OmniVoice keeps its model weights and audio tokenizer in one repository.
+Phonon uses the model revision you select and fixed revisions for its codec
+and voice catalog. The client reads the catalog and tensor headers. The provider
+acquires the original model, codec and selected voice files. Each Phonon voice
+has its own signed program.
 
 ```sh
-hellas convert-phonon MODEL@MODEL_COMMIT --voice Easton --voice Zoey -o ./phonon
-hellas program ./phonon --backend hellas/catena-dfad87438018-hip
+hellas program "hf://${PHONON_ORG}/phonon-31m-en@8f7a37c94a4c58b04c8287300c53f11d2e208eae" --voice Easton --backend hellas/catena-dfad87438018-hip
 ```
 
-`MODEL` is the checkpoint's repository, such as the English `phonon-31m-en`
-or a 40M language checkpoint. The codec and voice catalog repositories are
-pinned by the model family. Voice names are
-those of the catalog's `voices.jsonl`, and must be plain file names.
-
-The package contains `weights.bin` (model weights as BF16, codec weights as
-F32), one `voices/NAME.bf16` per voice, the model and codec configuration and
-tokenizer, and `assets.json`, which names each of those files' content. A
-client that only renders jobs needs the JSON files, not the weights or voices.
-The provider indexes the full package. One job runs `phonon.setup` for the
-voice and `phonon.synthesize` per utterance. Each utterance returns a 16-byte
-descriptor and a waveform of up to `ceil((tokens + 6) * 25 / 6)` frames of
-7,680 bytes, about 1.8 MB for 50 tokens; configure provider Compute admission
-for the program printed by `hellas program` and that much output per utterance.
+A local OmniVoice snapshot has the same files as its Hub repository. An offline
+Phonon directory contains the original `model/`, `codec/` and `voices/`
+snapshots, including `voices/voices.jsonl` and the voice files named by the
+catalog. A standalone local Phonon model directory uses the pinned Hub
+dependencies.
 
 ## Gateway configuration
 
@@ -149,10 +140,9 @@ kind = "native"
 package = "/srv/models/mms-remote"
 ```
 
-A Phonon package uses the same `kind = "native"` target with its package
-directory. Each model alias has one speech target in the existing route table. Both target
-kinds share request parsing, response delivery and provenance. Generic HTTP
-passthrough has no speech configuration.
+For Phonon set `package` to its pinned Hub URI and add
+`voices = ["Easton", "Zoey"]` to the native target. Use the same list on the
+provider's model resource. Omitting the list serves Easton.
 
 The adaptor maps `input` to upstream `text`, uses the configured upstream
 `model_id`, encodes `voice` as one path segment, and puts the mapped format in

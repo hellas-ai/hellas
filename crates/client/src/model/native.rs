@@ -1,7 +1,7 @@
 //! Resolve the published checkpoint once for local and Hub-backed model renderers.
 use super::{ModelFiles, flux};
 use anyhow::{Context, Result, bail, ensure};
-use catena_models::omnivoice;
+use catena_models::{omnivoice, phonon};
 use hellas_rpc::{
     ContentRef,
     protocol::invocation::compute::{Arg, NamedAsset},
@@ -21,6 +21,7 @@ use std::{
 pub(super) enum Kind {
     Flux,
     OmniVoice,
+    Phonon,
 }
 
 pub(super) enum Origin {
@@ -53,6 +54,8 @@ impl Origin {
             Some(Kind::Flux)
         } else if self.has("audio_tokenizer/config.json")? {
             Some(Kind::OmniVoice)
+        } else if self.has(phonon::TOKENIZER)? || self.has("model/processor_config.json")? {
+            Some(Kind::Phonon)
         } else {
             None
         })
@@ -97,6 +100,7 @@ pub(super) struct Snapshot {
     metadata: Vec<PathBuf>,
     weights: BTreeMap<String, Weight>,
     indexed_names: BTreeMap<String, BTreeSet<String>>,
+    voices: BTreeMap<String, String>,
 }
 
 fn relative(name: &str) -> Result<()> {
@@ -163,12 +167,13 @@ impl Snapshot {
         }
         Ok(())
     }
-    pub(super) fn open(origin: Origin, kind: Kind) -> Result<Self> {
+    pub(super) fn open(origin: Origin, kind: Kind, voices: &[String]) -> Result<Self> {
         let mut result = Self {
             dir: Arc::new(tempfile::tempdir()?),
             metadata: vec![],
             weights: BTreeMap::new(),
             indexed_names: BTreeMap::new(),
+            voices: BTreeMap::new(),
         };
         match kind {
             Kind::OmniVoice => {
@@ -191,6 +196,46 @@ impl Snapshot {
                 };
                 result.shards(&origin, transformer)?;
                 result.add(&origin, "", flux::VAE)?;
+            }
+            Kind::Phonon => {
+                let (model, codec, catalog) = match origin {
+                    Origin::Local(root)
+                        if root.join("model/processor_config.json").try_exists()? =>
+                    {
+                        (
+                            Origin::Local(root.join("model")),
+                            Origin::Local(root.join("codec")),
+                            Origin::Local(root.join("voices")),
+                        )
+                    }
+                    model => {
+                        let dep = |id, revision| {
+                            Ok::<_, anyhow::Error>(Origin::Hub(
+                                hub(&format!("hf://{id}@{revision}"))?.0,
+                            ))
+                        };
+                        (
+                            model,
+                            dep(phonon::CODEC, phonon::CODEC_REVISION)?,
+                            dep(phonon::VOICE_REPO, phonon::VOICE_REPO_REVISION)?,
+                        )
+                    }
+                };
+                for key in phonon::MODEL_FILES {
+                    result.add(&model, "model/", key)?;
+                }
+                for key in phonon::CODEC_FILES {
+                    result.add(&codec, "codec/", key)?;
+                }
+                result.add(&catalog, "voices/", phonon::VOICE_CATALOG)?;
+                let listing = std::fs::read_to_string(
+                    result.dir.path().join("voices").join(phonon::VOICE_CATALOG),
+                )?;
+                for name in selected_voices(voices) {
+                    let key = super::speech::phonon::voice_file(&listing, &name)?;
+                    result.add(&catalog, "voices/", &key)?;
+                    result.voices.insert(name, format!("voices/{key}"));
+                }
             }
         }
         Ok(result)
@@ -277,8 +322,25 @@ impl Snapshot {
         Ok(Native {
             dir: self.dir,
             files: Arc::new(files),
+            voices: self.voices,
         })
     }
+}
+
+pub(super) fn selected_voices(voices: &[String]) -> BTreeSet<String> {
+    if voices.is_empty() {
+        return [phonon::DEFAULT_VOICE.to_owned()].into_iter().collect();
+    }
+    voices
+        .iter()
+        .map(|v| {
+            if v == "default" {
+                phonon::DEFAULT_VOICE.to_owned()
+            } else {
+                v.clone()
+            }
+        })
+        .collect()
 }
 
 pub(crate) struct Tensor {
@@ -291,6 +353,7 @@ type Files = BTreeMap<String, (ContentRef, BTreeMap<String, Tensor>)>;
 pub(crate) struct Native {
     dir: Arc<tempfile::TempDir>,
     files: Arc<Files>,
+    pub voices: BTreeMap<String, String>,
 }
 impl Native {
     pub fn dir(&self) -> &Path {
@@ -299,6 +362,9 @@ impl Native {
     pub fn assets(&self) -> Vec<NamedAsset> {
         self.files
             .iter()
+            .filter(|(key, _)| {
+                !key.starts_with("voices/") || self.voices.values().any(|f| f == *key)
+            })
             .map(|(name, (object, _))| NamedAsset {
                 name: name.clone(),
                 object: *object,
@@ -344,6 +410,7 @@ impl Native {
         Self {
             dir: Arc::new(root),
             files: Arc::new(files),
+            voices: Default::default(),
         }
     }
 }
@@ -376,7 +443,7 @@ mod tests {
         for name in ["model.safetensors", "audio_tokenizer/model.safetensors"] {
             std::os::unix::fs::symlink(&object_path, snapshot.join(name))?;
         }
-        let parsed = Snapshot::open(Origin::Local(snapshot.clone()), Kind::OmniVoice)?;
+        let parsed = Snapshot::open(Origin::Local(snapshot.clone()), Kind::OmniVoice, &[])?;
         let files = parsed.files();
         assert!(files.hub.is_empty());
         assert!(
@@ -402,5 +469,14 @@ mod tests {
         assert_eq!(std::fs::read(model.dir().join("config.json"))?, b"{}");
         assert!(!model.dir().join("model.safetensors").exists());
         Ok(())
+    }
+
+    #[test]
+    fn configured_voices_control_the_signed_voice_selection() {
+        assert!(super::super::voice_allowed(&[], "default"));
+        assert!(super::super::voice_allowed(&[], "Easton"));
+        assert!(!super::super::voice_allowed(&[], "Zoey"));
+        assert!(super::super::voice_allowed(&["Zoey".into()], "Zoey"));
+        assert!(!super::super::voice_allowed(&["Zoey".into()], "default"));
     }
 }

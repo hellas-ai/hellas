@@ -56,9 +56,20 @@ impl Route {
             Presentation::Model { model, package, .. }
             | Presentation::Speech {
                 model,
-                target: crate::speech::SpeechTarget::Native { package },
+                target: crate::speech::SpeechTarget::Native { package, .. },
             } => Some((model, package)),
             _ => None,
+        }
+    }
+
+    /// Voices whose exact programs are prepared for this native speech route.
+    pub fn model_voices(&self) -> &[String] {
+        match &self.presentation {
+            Presentation::Speech {
+                target: crate::speech::SpeechTarget::Native { voices, .. },
+                ..
+            } => voices,
+            _ => &[],
         }
     }
 
