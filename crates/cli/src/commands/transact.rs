@@ -28,6 +28,8 @@ mod image;
 pub use image::{ImageArgs, image};
 mod text;
 pub use text::{TextArgs, text};
+mod speak;
+pub use speak::{SpeakArgs, speak};
 mod decide;
 pub use decide::{DecideArgs, decide};
 #[cfg(test)]

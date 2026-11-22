@@ -1,4 +1,18 @@
-# Speech on one gateway
+# Speech
+
+## Synthesize a WAV locally
+
+With a converted package and a GPU build, use the package directory as the model.
+Choose a voice included in the Phonon package, or use the default MMS voice.
+
+```sh
+hellas speak --model ./phonon --text 'Hello from Hellas.' --voice Easton -o phonon.wav --local
+hellas speak --model ./mms --text 'Hello from Hellas.' -o mms.wav --local
+```
+
+Omit `--text` to read from standard input.
+
+## Speech on one gateway
 
 `POST /v1/audio/speech` accepts JSON and returns audio bytes. The request's
 `model` selects either a hosted audio interface through Fetch or a native

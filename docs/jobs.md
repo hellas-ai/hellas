@@ -18,7 +18,7 @@ selects one when it has several. Reusing the same access file and job returns
 its retained result without executing again. An unresolved attempt reports its
 recorded status instead of submitting new work. A new attempt path (`--attempt
 FILE`) is an explicit request to execute again and consume the allowance.
-`run`, `image`, `transcribe`, `text` and `fetch` accept `--access FILE` as the
+`run`, `image`, `transcribe`, `speak`, `decide`, `text` and `fetch` accept `--access FILE` as the
 alternative to `--pay`; they save a zero-price job and use this same route.
 Grant channel journals and attempts live under `<home>/grants`; paid execution
 lives under `<home>/chains/<full consensus digest>/`.
@@ -282,6 +282,12 @@ a package variant. Request defaults are 512×512, four steps and seed zero. The 
 format; unsupported fields are rejected before work starts.
 
 ## Decision jobs
+
+Ask a d1 model a yes-or-no question on the local GPU:
+
+```sh
+echo '{"state":"I was charged twice.","questions":{"billing":{"type":"noul","instructions":"Is this about billing?"}}}' | hellas decide --model ./d1.gguf --local
+```
 
 A d1 decision model answers questions about a state without generating text.
 Its BF16 GGUF is the package: no conversion is needed, and `hellas model

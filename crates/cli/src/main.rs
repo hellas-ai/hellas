@@ -211,6 +211,8 @@ enum Commands {
         #[command(subcommand)]
         command: commands::model::ModelCommand,
     },
+    /// Synthesize a WAV with a client-rendered speech job.
+    Speak(commands::transact::SpeakArgs),
     /// Transcribe one WAV with a client-rendered Whisper job.
     Transcribe(commands::transact::TranscribeArgs),
     /// Answer one prompt with a client-rendered Qwen text job.
@@ -616,6 +618,7 @@ async fn async_main() {
         Commands::Run(args) => {
             async { commands::transact::run_program(args, job_home()?).await }.await
         }
+        Commands::Speak(args) => async { commands::transact::speak(args, job_home()?).await }.await,
         Commands::Transcribe(args) => {
             async { commands::transact::transcribe(args, job_home()?).await }.await
         }
