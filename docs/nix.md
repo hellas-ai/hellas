@@ -1,13 +1,65 @@
 # Nix, Docker and NixOS
 
 The main outputs are `.#cli` (the portable client, node and gateway, without
-local Catena Compute), `.#cli-validator`, and the `.#docker`, `.#docker-hip`
-and `.#docker-cuda` images. The NixOS module and the GPU images build the CLI
+local Catena Compute), `.#cli-validator`, `.#cli-cuda`, `.#cli-hip`, and the
+`.#docker`, `.#docker-hip` and `.#docker-cuda` images. The GPU CLI packages,
+NixOS module and GPU images build the CLI
 with Compute (`cli.override { compute = true; }`), which adds `--local` and
 serving Compute jobs.
 Hellas imports only `catena-lang` from the Catena workspace, pinned to a
 published Git revision in `Cargo.toml` and `Cargo.lock`. Nix vendors the same
 locked dependency; a sibling Catena checkout is not required.
+
+## Local GPU one-liners
+
+On x86_64 Linux, `cli-cuda` supplies the Compute CLI and NVIDIA runtime
+compiler environment. Use `cli-hip` instead for AMD. These packages share
+their runtime environment with the GPU images; the host supplies the driver.
+Models are pinned Hub checkpoints; the local executor acquires and verifies the
+weights, and the client reads only their headers and metadata.
+
+### Text
+
+```sh
+nix run github:hellas-ai/hellas#cli-cuda -- text --model hf://ggml-org/Qwen3-0.6B-GGUF@afe8ad3577aa22500b3cd1c880f153b3b0e1cae8/Qwen3-0.6B-BF16.gguf --prompt 'Say hello. /no_think' --max-tokens 32 --local
+```
+
+### Decisions
+
+```sh
+echo '{"state":"I was charged twice.","questions":{"billing":{"type":"noul","instructions":"Is this about billing?"}}}' | nix run github:hellas-ai/hellas#cli-cuda -- decide --model hf://LiquidAI/d1-2B-GGUF@4a181094d1b6addfaa3a0956f78e7ab2aa406a0c/d1-2B-BF16.gguf --local
+```
+
+### Transcription
+
+```sh
+curl -fLo sample.wav https://raw.githubusercontent.com/ggml-org/whisper.cpp/b0a11594aec50892a02cd8d129eee2dfe93a8bb8/samples/jfk.wav
+nix run github:hellas-ai/hellas#cli-cuda -- transcribe --model hf://unsloth/whisper-tiny@34457cb234c8624f23ac716000773b367000df6e --audio sample.wav --local
+```
+
+### Speech
+
+See [speech](speech.md) for OmniVoice and Phonon.
+
+```sh
+nix run github:hellas-ai/hellas#cli-cuda -- speak --model hf://whatever0705/mms-tts-eng-with-discriminator@3975d411eef6e0a05ab701ce981a93dc3a2cfdae --text 'Hello from Hellas.' -o tts.wav --local
+```
+
+### Image
+
+```sh
+nix run github:hellas-ai/hellas#cli-cuda -- image --model hf://black-forest-labs/FLUX.2-klein-4B@e7b7dc27f91deacad38e78976d1f2b499d76a294 --prompt 'a small red fox' --seed 42 --width 512 --height 512 --steps 4 --local -o fox.png
+```
+
+### One gateway for several models
+
+`--wrap` starts a shell connected to the gateway and stops the gateway when it exits:
+
+```sh
+nix run github:hellas-ai/hellas#cli-cuda -- gateway --model hf://ggml-org/Qwen3-0.6B-GGUF@afe8ad3577aa22500b3cd1c880f153b3b0e1cae8/Qwen3-0.6B-BF16.gguf --model hf://unsloth/whisper-tiny@34457cb234c8624f23ac716000773b367000df6e --model hf://whatever0705/mms-tts-eng-with-discriminator@3975d411eef6e0a05ab701ce981a93dc3a2cfdae --model hf://black-forest-labs/FLUX.2-klein-4B@e7b7dc27f91deacad38e78976d1f2b499d76a294 --wrap bash
+```
+
+## Development and deployment
 
 Enter an x86_64 Linux GPU development shell with:
 

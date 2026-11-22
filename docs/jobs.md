@@ -26,7 +26,7 @@ Grant Compute uses ephemeral provider retention for job payloads. Compiled
 programs are cached independently of payload retention. A signed failed result
 makes the command fail on both first delivery and saved-result replay.
 
-With the compute-enabled package (the NixOS module and the CUDA/HIP images;
+With the compute-enabled package (`cli-cuda`, `cli-hip`, the NixOS module or the CUDA/HIP images;
 the portable release has no local compute), every Compute command also accepts
 `--local`: the job runs on this machine's executor under your own limits, with
 no chain, channel, grant or attempt record. A helper serves the model's weights
@@ -37,6 +37,10 @@ through `--content PATH` or `--content-config`. `--timeout` bounds it like any o
 hellas transcribe --model hf://unsloth/whisper-tiny@34457cb234c8624f23ac716000773b367000df6e --audio speech.wav --local
 hellas text --model hf://ggml-org/Qwen3-0.6B-GGUF@afe8ad3577aa22500b3cd1c880f153b3b0e1cae8/Qwen3-0.6B-BF16.gguf --prompt 'Why is the sky blue?' --local
 ```
+
+The [Nix one-liners](nix.md#local-gpu-one-liners) include pinned commands for text, transcription, MMS speech, Flux images and
+one gateway serving them together. The same `cli-cuda` or `cli-hip` output
+runs every modality; no development shell is needed.
 
 A Compute job names the evaluator its program is rendered for. Remote Compute
 commands render for `--backend EVALUATOR`, the id the provider's GPU runtime
@@ -246,6 +250,12 @@ The default image variant is 512×512 with four steps. A local snapshot can
 include `variants.json` with 1–64 unique width, height and step configurations.
 Keep the same file on the client and provider. `hellas program` prints the
 exact program for each allowed variant.
+
+```sh
+nix run github:hellas-ai/hellas#cli-cuda -- image --model hf://black-forest-labs/FLUX.2-klein-4B@e7b7dc27f91deacad38e78976d1f2b499d76a294 --prompt 'a small red fox' --seed 42 --width 512 --height 512 --steps 4 --local -o fox.png
+```
+
+Use `cli-hip` for AMD. Both outputs include the Compute CLI and runtime compiler.
 
 For 512×512 images, the provider must admit a 3 MiB output; allow 2 MiB of
 uploads for the program, token IDs and noise. Set its execution budget for
