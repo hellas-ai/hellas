@@ -34,6 +34,42 @@ pub struct Completed {
     cancel: super::Cancellation,
 }
 
+fn asset_ranges(env: &Environment, plan: &Plan) -> BTreeMap<ContentRef, Vec<(u64, u64)>> {
+    let by_name: BTreeMap<_, _> = env
+        .assets
+        .iter()
+        .map(|asset| (asset.name.as_str(), asset.object))
+        .collect();
+    let mut ranges = BTreeMap::<_, Vec<_>>::new();
+    let mut add = |arg: &Arg| {
+        if let Arg::Asset {
+            name,
+            offset,
+            bytes,
+        } = arg
+        {
+            ranges
+                .entry(by_name[name.as_str()])
+                .or_default()
+                .push((*offset, *bytes));
+        }
+    };
+    for arg in plan.calls.iter().flat_map(|call| &call.args) {
+        add(arg);
+    }
+    if let Some(step) = &plan.step {
+        for arg in &step.args {
+            add(arg.at(0));
+            if step.stop.max_steps > 1
+                && let StepArg::FirstThen { then, .. } = arg
+            {
+                add(then);
+            }
+        }
+    }
+    ranges
+}
+
 /// `emit` publishes each step before its stop rule is evaluated.
 #[allow(clippy::too_many_arguments)]
 pub fn execute(
@@ -70,20 +106,19 @@ pub fn execute(
     let execution = (|| -> Result<Completed> {
         let mut resident = BTreeMap::new();
         let mut objects = BTreeMap::new();
+        for (object, ranges) in asset_ranges(env, plan) {
+            let reader = readers
+                .remove(&object.id())
+                .ok_or("missing verified asset reader")?;
+            objects.insert(
+                object,
+                assets.pin_for_job(reader, object, ranges, &cancel, Some(deadline))?,
+            );
+        }
         for asset in &env.assets {
-            let owner = match objects.get(&asset.object.id()) {
-                Some(owner) => Arc::clone(owner),
-                None => {
-                    let reader = readers
-                        .remove(&asset.object.id())
-                        .ok_or("missing verified asset reader")?;
-                    let owner =
-                        assets.pin_for_job(reader, asset.object, &cancel, Some(deadline))?;
-                    objects.insert(asset.object.id(), owner.clone());
-                    owner
-                }
-            };
-            resident.insert(asset.name.clone(), owner);
+            if let Some(owner) = objects.get(&asset.object) {
+                resident.insert(asset.name.clone(), owner.clone());
+            }
         }
         let mut slots = BTreeMap::new();
         let mut uploads = BTreeMap::new();

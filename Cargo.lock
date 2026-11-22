@@ -3340,6 +3340,7 @@ dependencies = [
  "hellas-rpc",
  "hellas-store",
  "hellas-wire",
+ "hellas-xet",
  "libc",
  "libloading",
  "metacat",
