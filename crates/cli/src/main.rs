@@ -213,14 +213,6 @@ enum Commands {
     Text(commands::transact::TextArgs),
     /// Answer one decision request with a client-rendered d1 job.
     Decide(commands::transact::DecideArgs),
-    /// Fetch a published distilled Flux2 Klein snapshot (4B or 9B) and convert it
-    /// into client metadata and provider assets.
-    ConvertFlux {
-        /// `ORG/NAME@COMMIT`, pinned to a 40-hex commit.
-        checkpoint: commands::convert::Checkpoint,
-        #[arg(short = 'o', long, value_name = "DIR")]
-        output: PathBuf,
-    },
     /// Generate one PNG with a client-rendered Flux job.
     Image(commands::transact::ImageArgs),
     /// Inspect and manage node content with Owner authority.
@@ -393,15 +385,6 @@ async fn async_main() {
             tracer_provider.shutdown();
             if let Err(err) = result {
                 eprintln!("error: {err:#}");
-                std::process::exit(1);
-            }
-            return;
-        }
-        Commands::ConvertFlux { checkpoint, output } => {
-            let result = commands::convert::flux(&checkpoint, &output);
-            tracer_provider.shutdown();
-            if let Err(error) = result {
-                eprintln!("error: {error:#}");
                 std::process::exit(1);
             }
             return;
@@ -623,7 +606,6 @@ async fn async_main() {
         | Commands::ConvertSpeech { .. }
         | Commands::ConvertPhonon { .. }
         | Commands::Model { .. }
-        | Commands::ConvertFlux { .. }
         | Commands::Program { .. } => {
             unreachable!("model commands handled before identity load")
         }

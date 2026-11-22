@@ -1,6 +1,6 @@
 //! Resolve the published checkpoint once for local and Hub-backed model renderers.
-use super::ModelFiles;
-use anyhow::{Context, Result, ensure};
+use super::{ModelFiles, flux};
+use anyhow::{Context, Result, bail, ensure};
 use catena_models::omnivoice;
 use hellas_rpc::{
     ContentRef,
@@ -11,7 +11,7 @@ use hellas_store::{
     hf::{PinnedFile, PinnedRepo},
 };
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::Read,
     path::{Component, Path, PathBuf},
     sync::Arc,
@@ -19,6 +19,7 @@ use std::{
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Kind {
+    Flux,
     OmniVoice,
 }
 
@@ -48,7 +49,9 @@ impl Origin {
         })
     }
     pub(super) fn kind(&self) -> Result<Option<Kind>> {
-        Ok(if self.has("audio_tokenizer/config.json")? {
+        Ok(if self.has("model_index.json")? {
+            Some(Kind::Flux)
+        } else if self.has("audio_tokenizer/config.json")? {
             Some(Kind::OmniVoice)
         } else {
             None
@@ -93,6 +96,7 @@ pub(super) struct Snapshot {
     dir: Arc<tempfile::TempDir>,
     metadata: Vec<PathBuf>,
     weights: BTreeMap<String, Weight>,
+    indexed_names: BTreeMap<String, BTreeSet<String>>,
 }
 
 fn relative(name: &str) -> Result<()> {
@@ -126,18 +130,67 @@ impl Snapshot {
         }
         Ok(())
     }
-
+    fn shards(&mut self, origin: &Origin, key: &str) -> Result<()> {
+        self.add(origin, "", key)?;
+        if !key.ends_with(".index.json") {
+            return Ok(());
+        }
+        #[derive(serde::Deserialize)]
+        struct Index {
+            weight_map: BTreeMap<String, String>,
+        }
+        let index: Index =
+            serde_json::from_reader(std::fs::File::open(self.dir.path().join(key))?)?;
+        ensure!(
+            !index.weight_map.is_empty(),
+            "empty checkpoint shard index {key}"
+        );
+        let directory = key.rsplit_once('/').context("missing shard directory")?.0;
+        let mut shards = BTreeMap::<String, BTreeSet<String>>::new();
+        for (tensor, name) in index.weight_map {
+            ensure!(
+                !name.contains('/') && name.ends_with(".safetensors"),
+                "invalid checkpoint shard {name:?}"
+            );
+            shards
+                .entry(format!("{directory}/{name}"))
+                .or_default()
+                .insert(tensor);
+        }
+        for (key, names) in shards {
+            self.add(origin, "", &key)?;
+            self.indexed_names.insert(key, names);
+        }
+        Ok(())
+    }
     pub(super) fn open(origin: Origin, kind: Kind) -> Result<Self> {
         let mut result = Self {
             dir: Arc::new(tempfile::tempdir()?),
             metadata: vec![],
             weights: BTreeMap::new(),
+            indexed_names: BTreeMap::new(),
         };
         match kind {
             Kind::OmniVoice => {
                 for &key in omnivoice::FILES {
                     result.add(&origin, "", key)?;
                 }
+            }
+            Kind::Flux => {
+                for key in flux::METADATA {
+                    result.add(&origin, "", key)?;
+                }
+                if origin.has("variants.json")? {
+                    result.add(&origin, "", "variants.json")?;
+                }
+                result.shards(&origin, flux::TEXT_INDEX)?;
+                let transformer = if origin.has(flux::TRANSFORMER_INDEX)? {
+                    flux::TRANSFORMER_INDEX
+                } else {
+                    flux::TRANSFORMER
+                };
+                result.shards(&origin, transformer)?;
+                result.add(&origin, "", flux::VAE)?;
             }
         }
         Ok(result)
@@ -216,7 +269,9 @@ impl Snapshot {
                     )
                 })
                 .collect();
-
+            if let Some(expected) = self.indexed_names.get(&key) {
+                ensure!(tensors.keys().eq(expected), "invalid shard index for {key}");
+            }
             files.insert(key, (object, tensors));
         }
         Ok(Native {
@@ -255,6 +310,41 @@ impl Native {
             .get(file)
             .and_then(|(_, ts)| ts.get(tensor))
             .with_context(|| format!("missing tensor {tensor} in {file}"))
+    }
+    pub fn tensor_in(&self, prefix: &str, tensor: &str) -> Result<&Tensor> {
+        let mut hits = self
+            .files
+            .iter()
+            .filter(|(file, _)| file.starts_with(prefix))
+            .filter_map(|(_, (_, ts))| ts.get(tensor));
+        let value = hits
+            .next()
+            .with_context(|| format!("missing {prefix} tensor {tensor}"))?;
+        if hits.next().is_some() {
+            bail!("duplicate {prefix} tensor {tensor}");
+        }
+        Ok(value)
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fixture(dir: &Path, files: Files) -> Self {
+        fn copy(src: &Path, dst: &Path) {
+            for item in std::fs::read_dir(src).unwrap() {
+                let item = item.unwrap();
+                let path = dst.join(item.file_name());
+                if item.file_type().unwrap().is_dir() {
+                    std::fs::create_dir(&path).unwrap();
+                    copy(&item.path(), &path);
+                } else if item.path().extension().is_some_and(|ext| ext == "json") {
+                    std::fs::copy(item.path(), path).unwrap();
+                }
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        copy(dir, root.path());
+        Self {
+            dir: Arc::new(root),
+            files: Arc::new(files),
+        }
     }
 }
 

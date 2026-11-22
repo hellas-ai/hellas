@@ -25,7 +25,6 @@ pub(super) enum Layout {
     Speech,
     SpeechDescriptor,
     Phonon,
-    Flux,
     Native(native::Kind),
 }
 
@@ -75,7 +74,6 @@ pub(super) enum Resolved {
         weights: ContentRef,
     },
     Phonon(PathBuf),
-    Flux(PathBuf),
     Native(native::Kind, Arc<native::Native>),
 }
 
@@ -98,7 +96,9 @@ impl Source {
             let origin = native::Origin::Hub(repo);
             if let Some(kind) = origin.kind()? {
                 ensure!(
-                    selector.as_deref().is_none_or(|s| s == "model.safetensors"),
+                    selector
+                        .as_deref()
+                        .is_none_or(|s| s == "model.safetensors" && kind != native::Kind::Flux),
                     "select the checkpoint root for this model"
                 );
                 return Ok(Self::Checkpoint(kind, origin, name));
@@ -216,10 +216,6 @@ pub(super) fn classify(path: &Path) -> Result<Layout> {
         ensure!(!manifest && !weights, "mixed model layout");
         return Ok(Layout::Phonon);
     }
-    if path.join("model_index.json").try_exists()? {
-        ensure!(!manifest && !weights, "mixed model layout");
-        return Ok(Layout::Flux);
-    }
     let whisper = whisper::METADATA.iter().try_fold(false, |found, name| {
         Ok::<_, std::io::Error>(path.join(name).try_exists()? || found)
     })?;
@@ -270,7 +266,7 @@ impl Layout {
                 }
             }
             Self::Whisper | Self::WhisperDescriptor => ModelKind::Transcription,
-            Self::Flux => ModelKind::Image,
+            Self::Native(native::Kind::Flux) => ModelKind::Image,
             Self::Speech | Self::SpeechDescriptor | Self::Phonon | Self::Native(_) => {
                 ModelKind::Speech
             }
@@ -283,11 +279,9 @@ impl Layout {
         match self {
             Self::Gguf => Some(path.to_owned()),
             Self::Whisper | Self::Speech => Some(path.join(whisper::WEIGHTS_FILE)),
-            Self::WhisperDescriptor
-            | Self::SpeechDescriptor
-            | Self::Phonon
-            | Self::Flux
-            | Self::Native(_) => None,
+            Self::WhisperDescriptor | Self::SpeechDescriptor | Self::Phonon | Self::Native(_) => {
+                None
+            }
         }
     }
     pub(super) fn resolve(self, path: &Path, inspected: Option<ContentRef>) -> Result<Resolved> {
@@ -318,7 +312,6 @@ impl Layout {
                 weights: read_weights(path)?,
             }),
             Self::Phonon => Ok(Resolved::Phonon(path.to_owned())),
-            Self::Flux => Ok(Resolved::Flux(path.to_owned())),
             Self::Native(_) => unreachable!("native source resolved from checkpoints"),
         }
     }
@@ -372,9 +365,7 @@ pub(super) fn describe(path: &Path, output: &Path) -> Result<ContentRef> {
         Layout::WhisperDescriptor | Layout::SpeechDescriptor => {
             bail!("source is already a descriptor")
         }
-        Layout::Phonon | Layout::Flux => {
-            bail!("the package already describes its assets in assets.json")
-        }
+        Layout::Phonon => bail!("the package already describes its assets in assets.json"),
         Layout::Native(_) => {
             bail!("native checkpoints already identify their original assets")
         }

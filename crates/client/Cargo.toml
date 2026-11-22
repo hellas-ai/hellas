@@ -9,6 +9,7 @@ documentation.workspace = true
 
 [features]
 default = []
+test-support = []
 iroh = [
     "dep:hellas-authority",
     "dep:serde_ipld_dagcbor",

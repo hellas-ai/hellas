@@ -55,6 +55,7 @@ zstd = "0.14"
 [dev-dependencies]
 hellas-authority = { workspace = true, features = ["test-support"] }
 hellas-channel = { workspace = true, features = ["test-support"] }
+hellas-client = { workspace = true, features = ["test-support"] }
 hellas-rpc = { workspace = true, features = ["host-control"] }
 hellas-wire = { workspace = true, features = ["unix"] }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }

@@ -135,34 +135,6 @@ pub fn phonon(model: &Checkpoint, names: &[String], output: &Path) -> CliResult<
     Ok(())
 }
 
-pub fn flux(checkpoint: &Checkpoint, output: &Path) -> CliResult<()> {
-    use hellas_client::model::flux;
-    let scratch = scratch(output)?;
-    // A published transformer is one file, or shards named by an index.
-    let transformer = if checkpoint.0.publishes(flux::TRANSFORMER_INDEX)? {
-        flux::TRANSFORMER_INDEX
-    } else {
-        flux::TRANSFORMER
-    };
-    checkpoint.fetch(
-        scratch.path(),
-        flux::CHECKPOINT.into_iter().chain([transformer]),
-    )?;
-    let mut shards = flux::shards(scratch.path(), flux::TEXT_INDEX)?;
-    shards.extend(flux::shards(scratch.path(), transformer)?);
-    checkpoint.fetch(scratch.path(), shards.iter().map(String::as_str))?;
-    for asset in flux::convert_flux(scratch.path(), transformer, output)? {
-        println!(
-            "{}: {} ({} bytes), {}",
-            asset.name,
-            asset.object.id(),
-            asset.object.bytes(),
-            output.join(format!("{}.bin", asset.name)).display()
-        );
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::Checkpoint;

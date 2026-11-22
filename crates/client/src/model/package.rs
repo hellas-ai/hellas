@@ -105,6 +105,14 @@ pub enum ModelResponse {
 }
 
 impl ModelPackage {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn flux_fixture(model: Flux, dialect: super::GpuDialect) -> Self {
+        Self {
+            family: Family::Flux(Arc::new(model)),
+            evaluator: super::evaluator(dialect),
+        }
+    }
+
     /// GGUF metadata used by this package's tokenizer and template.
     pub fn gguf_path(&self) -> Result<&Path> {
         match &self.family {
@@ -197,9 +205,9 @@ impl ModelPackage {
                 descriptor::Resolved::Phonon(path) => {
                     Family::Speech(Arc::new(Speech::open_phonon(path, dialect).await?))
                 }
-                descriptor::Resolved::Flux(path) => Family::Flux(Arc::new({
+                descriptor::Resolved::Native(native::Kind::Flux, path) => Family::Flux(Arc::new({
                     let path = path.clone();
-                    tokio::task::spawn_blocking(move || Flux::open(&path, dialect)).await??
+                    tokio::task::spawn_blocking(move || Flux::open(path, dialect)).await??
                 })),
                 descriptor::Resolved::Whisper { path, weights } => {
                     Family::Whisper(Arc::new(Whisper::open(path, dialect, *weights).await?))
@@ -240,6 +248,7 @@ impl ModelPackage {
         let programs = self.programs()?;
         let mut admission = Admission::compute_only(&programs)?;
         let entries: &[&str] = match &self.family {
+            Family::Flux(_) => &["flux.setup-text", "flux.setup-denoise", "flux.setup-vae"],
             Family::Speech(model) => model.setup_entries(),
             _ => &[],
         };

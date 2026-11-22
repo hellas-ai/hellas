@@ -239,32 +239,20 @@ The result then also carries an `emitted` output with every emitted value.
 
 ## Image jobs
 
-Convert a distilled Flux2 Klein snapshot (4B or 9B) once, pinned to a 40-hex
-commit.
-The converter fetches the published files it reads at that commit:
+Use a pinned Flux2 Klein checkpoint. The client reads the published tensor headers,
+configuration and tokenizer. The provider acquires the original weight files
+and the model's GPU setup prepares the text encoder, denoiser and VAE.
+The default image variant is 512×512 with four steps. A local snapshot can
+include `variants.json` with 1–64 unique width, height and step configurations.
+Keep the same file on the client and provider. `hellas program` prints the
+exact program for each allowed variant.
 
-```sh
-hellas convert-flux black-forest-labs/FLUX.2-klein-4B@COMMIT -o klein
-```
-
-The converter validates the checkpoint and creates three ordinary provider
-assets (`text.bin`, `denoise.bin`, `vae.bin`), plus client metadata and a
-tokenizer. Text norms and VAE weights use F32; other weights use BF16, matching
-catena-models. A provider adds the package with `route add /absolute/path/klein`, or
-uses Jobs pins in its content store; see the
-[content store guide](../crates/store/README.md). The package's default image
-variant is 512×512 with four steps. To select other variants, put an explicit
-list of 1–64 unique `{ "width": 512, "height": 512, "steps": 4 }` entries in
-`klein/variants.json` as a JSON array. Keep it with the package metadata on both
-client and provider. `hellas program klein --backend EVALUATOR` prints one ID
-per variant. Grants derived from a package pin exactly those manifests.
-The client needs the package's JSON files; it does not upload the weights.
 For 512×512 images, the provider must admit a 3 MiB output; allow 2 MiB of
 uploads for the program, token IDs and noise. Set its execution budget for
 the selected hardware and step count.
 
 ```sh
-hellas image --provider ENROLLMENT_ID@NODE_ID --model klein \
+hellas image --provider ENROLLMENT_ID@NODE_ID --model hf://black-forest-labs/FLUX.2-klein-4B@e7b7dc27f91deacad38e78976d1f2b499d76a294 \
   --prompt 'a small red fox' --seed 42 --width 512 --height 512 --steps 4 \
   --backend hellas/catena-dfad87438018-hip --pay 20 -o fox.png
 ```
@@ -275,17 +263,17 @@ One job runs `flux.encode-text`, `flux.denoise` and `flux.decode-image`, passing
 conditioning and latents in slots. Tokenization and seeded ChaCha8 noise are
 client inputs; PNG encoding is client presentation of the signed RGB buffer.
 
-The gateway exposes the same package with `gateway --model klein` and
-`--access`, `--pay` or `--local` as usual:
+Start the gateway with the same pinned checkpoint and use its repository name in the image request.
 
 ```sh
+hellas gateway --model hf://black-forest-labs/FLUX.2-klein-4B@e7b7dc27f91deacad38e78976d1f2b499d76a294 --bearer-file ./gateway.bearer
 curl http://127.0.0.1:8080/v1/images/generations \
-  -H "Authorization: Bearer $(cat ~/.hellas/gateway/bearer)" -H 'Content-Type: application/json' \
-  -d '{"model":"klein","prompt":"a small red fox","seed":42,"size":"512x512","steps":4}'
+  -H "Authorization: Bearer $(cat ./gateway.bearer)" -H 'Content-Type: application/json' \
+  -d '{"model":"FLUX.2-klein-4B","prompt":"a small red fox","seed":42,"size":"512x512","steps":4}'
 ```
 
 The response contains `data[0].b64_json` and signed evidence in `hellas`.
-The model name is the package directory name. Width and height must each be
+A local checkpoint uses the directory name. Width and height must each be
 multiples of 16 from 16 through 512 and steps must be 1–50. Requests must match
 a package variant. Request defaults are 512×512, four steps and seed zero. The API accepts one image (`n: 1`) in `b64_json`
 format; unsupported fields are rejected before work starts.

@@ -1,71 +1,29 @@
 //! Flux2 Klein stages share one program and pass their outputs through slots.
+use super::native::Native;
 use anyhow::{Context, Result, ensure};
-use catena_models::flux::{config, graph, text, transformer, vae};
+use catena_models::{
+    flux::{
+        config, graph,
+        preparation::{Setup, Stage, ordered},
+        text, transformer, vae,
+    },
+    weights::preparation::Binding,
+};
 use hellas_rpc::protocol::invocation::{Artifact, compute::*, output::InvocationOutput};
 use rand_chacha::rand_core::SeedableRng;
 use rand_distr::{Distribution, StandardNormal};
 use serde::Deserialize;
-use std::{
-    collections::BTreeMap,
-    fs::File,
-    io::{BufWriter, Read, Write},
-    path::{Path, PathBuf},
-};
-
-mod weights;
+use std::{fs::File, io::Read, path::Path, sync::Arc};
 
 pub const MAX_DIMENSION: usize = 512;
 pub const MAX_STEPS: usize = 50;
 pub const OUTPUT: &str = "image";
-const ASSETS: [&str; 3] = ["text", "denoise", "vae"];
-pub const TEXT_INDEX: &str = "text_encoder/model.safetensors.index.json";
-/// A published transformer is this one file, or shards named by its index;
-/// [`convert_flux`] takes whichever the snapshot holds.
-pub const TRANSFORMER: &str = "transformer/diffusion_pytorch_model.safetensors";
-pub const TRANSFORMER_INDEX: &str = "transformer/diffusion_pytorch_model.safetensors.index.json";
-const VAE: &str = "vae/diffusion_pytorch_model.safetensors";
-/// The published snapshot files [`convert_flux`] reads, besides the
-/// transformer and the shards the indexes name ([`shards`]).
-pub const CHECKPOINT: [&str; 8] = [
-    METADATA[0],
-    METADATA[1],
-    METADATA[2],
-    METADATA[3],
-    METADATA[4],
-    METADATA[5],
-    TEXT_INDEX,
-    VAE,
-];
-
-/// The shard files a snapshot's weight `source` names, beside it: those of an
-/// index, and none for a single weight file.
-pub fn shards(checkpoint: &Path, source: &str) -> Result<std::collections::BTreeSet<String>> {
-    #[derive(Deserialize)]
-    struct Index {
-        weight_map: BTreeMap<String, String>,
-    }
-    if !source.ends_with(".index.json") {
-        return Ok(Default::default());
-    }
-    let directory = Path::new(source).parent().unwrap_or(Path::new(""));
-    let index: Index = serde_json::from_reader(File::open(checkpoint.join(source))?)?;
-    index
-        .weight_map
-        .into_values()
-        .map(|shard| {
-            ensure!(
-                !shard.is_empty() && !shard.contains(['/', '\\']) && shard != "." && shard != "..",
-                "invalid checkpoint shard {shard:?}"
-            );
-            directory
-                .join(&shard)
-                .into_os_string()
-                .into_string()
-                .map_err(|_| anyhow::anyhow!("invalid checkpoint shard {shard:?}"))
-        })
-        .collect()
-}
-const METADATA: [&str; 6] = [
+pub(super) const TEXT_INDEX: &str = "text_encoder/model.safetensors.index.json";
+pub(super) const TRANSFORMER: &str = "transformer/diffusion_pytorch_model.safetensors";
+pub(super) const TRANSFORMER_INDEX: &str =
+    "transformer/diffusion_pytorch_model.safetensors.index.json";
+pub(super) const VAE: &str = "vae/diffusion_pytorch_model.safetensors";
+pub(super) const METADATA: [&str; 6] = [
     "model_index.json",
     "scheduler/scheduler_config.json",
     "text_encoder/config.json",
@@ -168,6 +126,8 @@ fn dimensions(width: usize, height: usize) -> Result<()> {
     Ok(())
 }
 
+type StageShapes = (Stage, &'static str, Vec<(String, Vec<usize>)>);
+
 struct Config {
     text: catena_models::spec::ModelConfig,
     transformer: config::TransformerConfig,
@@ -186,25 +146,44 @@ impl Config {
             vae,
         })
     }
-    fn tensors(&self) -> Result<[Vec<weights::Tensor>; 3]> {
-        // Weight arguments do not depend on image dimensions or step count.
+    fn tensors(&self) -> Result<[StageShapes; 3]> {
         let denoise = graph::transformer(&self.transformer, 16, 16, 1, false)?;
         let vae = graph::vae(&self.vae, 16, 16, false)?;
         Ok([
-            weights::text(&self.text),
-            weights::ordered(
-                &denoise.weights,
-                transformer::weight_shapes(&self.transformer),
-                false,
-            )?,
-            weights::ordered(&vae.weights, vae::weight_shapes(), true)?,
+            (
+                Stage::Text,
+                "text_encoder/",
+                text::weight_shapes(&self.text),
+            ),
+            (
+                Stage::Denoise,
+                "transformer/",
+                ordered(
+                    &denoise.weights,
+                    transformer::weight_shapes(&self.transformer),
+                )?,
+            ),
+            (
+                Stage::Vae,
+                "vae/",
+                ordered(&vae.weights, vae::weight_shapes())?,
+            ),
         ])
     }
-    fn source(&self, width: usize, height: usize, steps: usize) -> Result<String> {
+    fn source(&self, variant: Variant, setup: &[Setup<Arg>]) -> Result<String> {
+        let Variant {
+            width,
+            height,
+            steps,
+        } = variant;
         let text = text::generated_source(&self.text)?;
         let denoise = graph::transformer(&self.transformer, height, width, steps, false)?;
         let vae = graph::vae(&self.vae, height, width, false)?;
-        bundle_stages([text.as_str(), &denoise.source, &vae.source])
+        bundle_stages(
+            [text.as_str(), &denoise.source, &vae.source]
+                .into_iter()
+                .chain(setup.iter().map(|s| s.source.as_str())),
+        )
     }
 }
 
@@ -228,113 +207,42 @@ fn bundle_stages<'a>(stages: impl IntoIterator<Item = &'a str>) -> Result<String
     Ok(graph::bundle(&raw.to_hexpr_text()))
 }
 
-/// Convert a local distilled Klein snapshot into immutable provider assets
-/// and client metadata. Providers index the three `.bin` files; callers need
-/// only the metadata and tokenizer after conversion.
-pub fn convert_flux(
-    checkpoint: &Path,
-    transformer: &str,
-    destination: &Path,
-) -> Result<Vec<NamedAsset>> {
-    ensure!(!destination.exists(), "destination already exists");
-    let config = Config::read(checkpoint)?;
-    let tensors = config.tensors()?;
-    text::tokenize(checkpoint, "check tokenizer")?;
-    let parent = destination
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let staging = tempfile::Builder::new()
-        .prefix(".flux-")
-        .tempdir_in(parent)?;
-    let mut assets = Vec::new();
-    let sources = [
-        checkpoint.join(TEXT_INDEX),
-        checkpoint.join(transformer),
-        checkpoint.join(VAE),
-    ];
-    for ((name, tensors), source) in ASSETS.into_iter().zip(tensors).zip(sources) {
-        let checkpoint = catena_models::weights::Weights::open(&source)?;
-        let path = staging.path().join(format!("{name}.bin"));
-        let mut file = BufWriter::new(File::create(&path)?);
-        for tensor in tensors {
-            weights::write(&mut file, &checkpoint, &tensor)?;
-        }
-        file.flush()?;
-        file.get_ref().sync_all()?;
-        drop(file);
-        let object = hellas_store::content::file_content(&path)?;
-        assets.push(NamedAsset {
-            name: name.into(),
-            object,
-        });
-    }
-    for name in METADATA {
-        let path = staging.path().join(name);
-        std::fs::create_dir_all(path.parent().unwrap())?;
-        std::fs::copy(checkpoint.join(name), path)?;
-    }
-    std::fs::write(
-        staging.path().join("assets.json"),
-        serde_json::to_vec_pretty(&assets)?,
-    )?;
-    std::fs::rename(staging.path(), destination)?;
-    Ok(assets)
-}
-
 pub(super) struct Flux {
-    directory: PathBuf,
+    source: Arc<Native>,
     config: Config,
-    assets: Vec<NamedAsset>,
-    args: [Vec<Arg>; 3],
+    stages: Vec<Setup<Arg>>,
     variants: Vec<Variant>,
     dialect: super::GpuDialect,
 }
 impl Flux {
-    pub fn open(directory: &Path, dialect: super::GpuDialect) -> Result<Self> {
+    pub fn open(source: Arc<Native>, dialect: super::GpuDialect) -> Result<Self> {
+        let directory = source.dir();
         let config = Config::read(directory)?;
-        let tensors = config.tensors()?;
-        let assets: Vec<NamedAsset> =
-            serde_json::from_reader(File::open(directory.join("assets.json"))?)?;
-        ensure!(
-            assets.len() == ASSETS.len(),
-            "Flux requires three weight assets"
-        );
-        let mut args = [Vec::new(), Vec::new(), Vec::new()];
-        for (i, tensors) in tensors.into_iter().enumerate() {
-            ensure!(assets[i].name == ASSETS[i], "incorrect Flux asset order");
-            let mut offset = 0;
-            for tensor in tensors {
-                let bytes = tensor.bytes();
-                args[i].push(Arg::Asset {
-                    name: ASSETS[i].into(),
-                    offset,
-                    bytes,
-                });
-                offset += bytes;
-            }
-            ensure!(
-                assets[i].object.bytes() == offset,
-                "Flux weight asset has wrong length"
-            );
+        let mut stages = Vec::new();
+        for (stage, prefix, shapes) in config.tensors()? {
+            stages.push(stage.setup(shapes, |name, shape| {
+                let tensor = source.tensor_in(prefix, name)?;
+                ensure!(
+                    tensor.shape == shape,
+                    "{prefix}{name}: expected {shape:?}, got {:?}",
+                    tensor.shape
+                );
+                Ok((tensor.dtype, tensor.arg.clone()))
+            })?);
         }
         text::tokenize(directory, "check tokenizer")?;
+        let variants = Variant::read(directory)?;
         Ok(Self {
-            directory: directory.to_owned(),
+            source,
             config,
-            assets,
-            args,
-            variants: Variant::read(directory)?,
+            stages,
+            variants,
             dialect,
         })
     }
     fn program(&self, variant: Variant) -> Result<String> {
-        let source = super::program::render(
-            &self
-                .config
-                .source(variant.width, variant.height, variant.steps)?,
-            self.dialect,
-        )?;
+        let source =
+            super::program::render(&self.config.source(variant, &self.stages)?, self.dialect)?;
         ensure!(
             source.len() as u64 <= MAX_SOURCE_BYTES,
             "image program exceeds source limit"
@@ -342,7 +250,7 @@ impl Flux {
         Ok(source)
     }
     pub fn assets(&self) -> Vec<NamedAsset> {
-        self.assets.clone()
+        self.source.assets()
     }
 
     pub fn programs(&self, evaluator: &str) -> Result<Vec<ProgramId>> {
@@ -370,7 +278,7 @@ impl Flux {
             variant.height,
             variant.steps
         );
-        let tokens = text::tokenize(&self.directory, request.prompt)?;
+        let tokens = text::tokenize(self.source.dir(), request.prompt)?;
         ensure!(tokens.valid > 0, "empty tokenized prompt");
         ensure!(
             tokens
@@ -384,30 +292,43 @@ impl Flux {
             object: object.into(),
         };
         let slot = |name: &str| Arg::Slot { name: name.into() };
-        let call = |entry: &str, mut args: Vec<Arg>, weights: usize, output: &str| {
-            args.extend(self.args[weights].iter().cloned());
-            Call {
+        let mut calls = Vec::new();
+        let stages = [
+            (
+                "flux.encode-text",
+                vec![input("tokens"), Arg::U64(tokens.valid as u64)],
+                "conditioning",
+            ),
+            (
+                "flux.denoise",
+                vec![input("noise"), slot("conditioning")],
+                "latents",
+            ),
+            ("flux.decode-image", vec![slot("latents")], OUTPUT),
+        ];
+        for ((entry, mut args, output), setup) in stages.into_iter().zip(&self.stages) {
+            let prepared = |i: usize| format!("{}-{i}", setup.entry);
+            if !setup.inputs.is_empty() {
+                calls.push(Call {
+                    entry: setup.entry.into(),
+                    args: setup.inputs.clone(),
+                    bind: (0..setup.inputs.len())
+                        .map(|i| Bind::Name(prepared(i)))
+                        .collect(),
+                });
+            }
+            args.extend(setup.bindings.iter().map(|binding| match binding {
+                Binding::Asset(view) => view.clone(),
+                Binding::Prepared(i) => slot(&prepared(*i)),
+            }));
+            calls.push(Call {
                 entry: entry.into(),
                 args,
                 bind: vec![Bind::Name(output.into())],
-            }
-        };
+            });
+        }
         let plan = Plan {
-            calls: vec![
-                call(
-                    "flux.encode-text",
-                    vec![input("tokens"), Arg::U64(tokens.valid as u64)],
-                    0,
-                    "conditioning",
-                ),
-                call(
-                    "flux.denoise",
-                    vec![input("noise"), slot("conditioning")],
-                    1,
-                    "latents",
-                ),
-                call("flux.decode-image", vec![slot("latents")], 2, OUTPUT),
-            ],
+            calls,
             step: None,
             outputs: vec![Declared {
                 slot: OUTPUT.into(),
@@ -494,5 +415,42 @@ impl Image {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
+pub fn fixture(directory: &Path, dialect: super::GpuDialect) -> Result<super::ModelPackage> {
+    use super::native::Tensor;
+    use hellas_rpc::ContentRef;
+    use std::collections::BTreeMap;
+
+    let mut files = BTreeMap::new();
+    for (_, prefix, shapes) in Config::read(directory)?.tensors()? {
+        let file = format!("{prefix}model.safetensors");
+        let mut tensors = BTreeMap::new();
+        let mut offset = 512;
+        for (name, shape) in shapes {
+            let bytes = shape.iter().product::<usize>() as u64 * 2;
+            let arg = Arg::Asset {
+                name: file.clone(),
+                offset,
+                bytes,
+            };
+            offset += bytes;
+            tensors.insert(
+                name,
+                Tensor {
+                    arg,
+                    shape,
+                    dtype: safetensors::Dtype::BF16,
+                },
+            );
+        }
+        let object = ContentRef::new(ContentRef::for_bytes(file.as_bytes()).id(), offset);
+        files.insert(file, (object, tensors));
+    }
+    let native = Arc::new(Native::fixture(directory, files));
+    Ok(super::ModelPackage::flux_fixture(
+        Flux::open(native, dialect)?,
+        dialect,
+    ))
+}
 #[cfg(test)]
 mod tests;
