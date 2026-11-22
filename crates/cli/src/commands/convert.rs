@@ -200,8 +200,7 @@ mod phonon_tests {
             (["Easton", "../Zoey"], "invalid voice name"),
         ] {
             let names = names.map(String::from);
-            let error = super::phonon(&model, &commit, &commit, &names, &root.path().join("out"))
-                .unwrap_err();
+            let error = super::phonon(&model, &names, &root.path().join("out")).unwrap_err();
             assert!(error.to_string().contains(message), "{error}");
         }
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
