@@ -185,12 +185,6 @@ enum Commands {
     ConvertPhonon {
         /// `ORG/NAME@COMMIT`, pinned to a 40-hex commit.
         checkpoint: commands::convert::Checkpoint,
-        /// The 40-hex commit of the codec repository the checkpoint names.
-        #[arg(long, value_name = "COMMIT")]
-        codec: String,
-        /// The 40-hex commit of the voice catalog repository.
-        #[arg(long, value_name = "COMMIT")]
-        voices: String,
         /// A voice name from the catalog; repeat for more voices.
         #[arg(long = "voice", value_name = "NAME", required = true)]
         voice: Vec<String>,
@@ -457,12 +451,10 @@ async fn async_main() {
         }
         Commands::ConvertPhonon {
             checkpoint,
-            codec,
-            voices,
             voice,
             output,
         } => {
-            let result = commands::convert::phonon(&checkpoint, &codec, &voices, &voice, &output);
+            let result = commands::convert::phonon(&checkpoint, &voice, &output);
             tracer_provider.shutdown();
             if let Err(error) = result {
                 eprintln!("error: {error:#}");

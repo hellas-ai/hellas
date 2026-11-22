@@ -5,7 +5,8 @@ use anyhow::{Context, Result, bail, ensure};
 /// The codec and voice repositories every checkpoint shares, and the
 /// published files a conversion reads.
 pub use catena_models::phonon::{
-    CODEC as CODEC_REPO, CODEC_FILES, MODEL_FILES, VOICE_CATALOG, VOICE_REPO,
+    CODEC as CODEC_REPO, CODEC_FILES, CODEC_REVISION, MODEL_FILES, VOICE_CATALOG, VOICE_REPO,
+    VOICE_REPO_REVISION,
 };
 use catena_models::{
     phonon::{self, Binding, Config, Prompt},

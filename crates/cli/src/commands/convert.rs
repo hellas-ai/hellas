@@ -94,13 +94,7 @@ pub fn speech(checkpoint: &Checkpoint, output: &Path) -> CliResult<()> {
     Ok(())
 }
 
-pub fn phonon(
-    model: &Checkpoint,
-    codec: &str,
-    voices: &str,
-    names: &[String],
-    output: &Path,
-) -> CliResult<()> {
+pub fn phonon(model: &Checkpoint, names: &[String], output: &Path) -> CliResult<()> {
     use hellas_client::model::speech::phonon;
     let mut distinct = std::collections::BTreeSet::new();
     for name in names {
@@ -111,8 +105,9 @@ pub fn phonon(
         );
     }
     let scratch = scratch(output)?;
-    let codec: Checkpoint = format!("{}@{codec}", phonon::CODEC_REPO).parse()?;
-    let catalog: Checkpoint = format!("{}@{voices}", phonon::VOICE_REPO).parse()?;
+    let codec: Checkpoint = format!("{}@{}", phonon::CODEC_REPO, phonon::CODEC_REVISION).parse()?;
+    let catalog: Checkpoint =
+        format!("{}@{}", phonon::VOICE_REPO, phonon::VOICE_REPO_REVISION).parse()?;
     let directory = |name: &str| scratch.path().join(name);
     model.fetch(&directory("model"), phonon::MODEL_FILES)?;
     codec.fetch(&directory("codec"), phonon::CODEC_FILES)?;

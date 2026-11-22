@@ -77,14 +77,13 @@ A Phonon package combines a model checkpoint, the codec it names and one or
 more voices from the voice catalog, each at an immutable 40-hex revision:
 
 ```sh
-hellas convert-phonon MODEL@MODEL_COMMIT --codec CODEC_COMMIT \
-  --voices VOICES_COMMIT --voice Easton --voice Zoey -o ./phonon
+hellas convert-phonon MODEL@MODEL_COMMIT --voice Easton --voice Zoey -o ./phonon
 hellas program ./phonon --backend hellas/catena-dfad87438018-hip
 ```
 
 `MODEL` is the checkpoint's repository, such as the English `phonon-31m-en`
 or a 40M language checkpoint. The codec and voice catalog repositories are
-fixed by the model family, so only their revisions are given. Voice names are
+pinned by the model family. Voice names are
 those of the catalog's `voices.jsonl`, and must be plain file names.
 
 The package contains `weights.bin` (model weights as BF16, codec weights as
