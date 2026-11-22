@@ -172,20 +172,20 @@ pub fn convert(
         &mut |file| {
             let mut written = 0;
             let mut put = |(offset, bytes): (u64, u64), values: &[f32], f32: bool| {
+                let mut encoded = Vec::new();
+                if f32 {
+                    encoded.extend(values.iter().flat_map(|value| value.to_le_bytes()));
+                } else {
+                    bf16(&mut encoded, values)?;
+                }
                 ensure!(
-                    values.len() as u64 * if f32 { 4 } else { 2 } == bytes,
+                    encoded.len() as u64 == bytes,
                     "weight has an unexpected size"
                 );
                 file.write_all(&vec![0; (offset - written) as usize])?;
                 written = offset + bytes;
-                if f32 {
-                    for value in values {
-                        file.write_all(&value.to_le_bytes())?;
-                    }
-                    Ok(())
-                } else {
-                    bf16(file, values)
-                }
+                file.write_all(&encoded)?;
+                Ok(())
             };
             for binding in distinct(&entries) {
                 let values = phonon::materialize(&model_weights, &codec_weights, binding)?;
