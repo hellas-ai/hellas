@@ -330,8 +330,16 @@ impl TargetArgs {
             return Ok(Some(
                 context
                     .local_content
-                    .get_or_try_init(|| {
-                        crate::compute::content(&context.home, &self.native, &self.models)
+                    .get_or_try_init(|| async {
+                        let files =
+                            hellas_client::model::ModelFiles::resolve(self.models.clone()).await?;
+                        crate::compute::content(
+                            &context.home,
+                            &self.native,
+                            &files.local,
+                            &files.hub,
+                        )
+                        .await
                     })
                     .await?
                     .clone(),

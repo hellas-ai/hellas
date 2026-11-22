@@ -1045,6 +1045,7 @@ mod tests {
             &StoreLocation::for_test(root.path()),
             &native,
             std::slice::from_ref(&path),
+            &[],
         )
         .await
         .unwrap();
