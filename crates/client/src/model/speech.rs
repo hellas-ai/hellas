@@ -17,6 +17,7 @@ use std::{
     path::Path,
 };
 
+mod omnivoice;
 pub mod phonon;
 pub use catena_models::tts::Audio;
 
@@ -134,6 +135,7 @@ enum Model {
         views: Vec<(u64, u64)>,
     },
     Phonon(Box<phonon::Phonon>),
+    OmniVoice(Box<omnivoice::OmniVoice>),
 }
 impl Speech {
     pub async fn open(dir: &Path, dialect: super::GpuDialect, object: ContentRef) -> Result<Self> {
@@ -176,6 +178,32 @@ impl Speech {
             model: Model::Phonon(Box::new(model)),
         })
     }
+    pub async fn open_omni(
+        source: super::native::Native,
+        dialect: super::GpuDialect,
+    ) -> Result<Self> {
+        let (model, program, assets) = tokio::task::spawn_blocking(move || -> Result<_> {
+            let (model, bundle) = omnivoice::OmniVoice::open(&source, dialect)?;
+            Ok((
+                model,
+                super::program::render(&bundle, dialect)?,
+                source.assets(),
+            ))
+        })
+        .await??;
+        let (environment, content) = super::program::environment(&program, assets).await?;
+        Ok(Self {
+            environment,
+            content,
+            model: Model::OmniVoice(Box::new(model)),
+        })
+    }
+    pub(super) fn setup_entries(&self) -> &'static [&'static str] {
+        match &self.model {
+            Model::OmniVoice(_) => &["omnivoice.setup"],
+            _ => &[],
+        }
+    }
     pub(super) fn environment(&self) -> &Environment {
         &self.environment
     }
@@ -186,6 +214,9 @@ impl Speech {
         );
         let (tokenizer, views) = match &self.model {
             Model::Mms { tokenizer, views } => (tokenizer, views),
+            Model::OmniVoice(model) => {
+                return model.render_job(&self.environment, &self.content, text, voice, speed);
+            }
             Model::Phonon(model) => {
                 return model.render_job(&self.environment, &self.content, text, voice, speed);
             }
@@ -243,6 +274,7 @@ impl Speech {
         match self.model {
             Model::Mms { .. } => Self::decode_mms(output),
             Model::Phonon(_) => phonon::decode(output),
+            Model::OmniVoice(_) => omnivoice::decode(output),
         }
     }
     fn decode_mms(output: &InvocationOutput) -> Result<Audio> {

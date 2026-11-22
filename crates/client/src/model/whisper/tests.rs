@@ -150,10 +150,10 @@ async fn converted_asset_and_program_are_stable_and_ship_with_every_job() {
         assert_eq!(
             job.environment.sources[0],
             ContentRef::new(
-                "73f3bb55f094376597053c573814bd00599518b8c2703fbd1f72dc2f0e247da3"
+                "787023983694784959a62207793d1a749955c966a2327e7f4124fbb6b90955c7"
                     .parse()
                     .unwrap(),
-                424931,
+                424997,
             ),
         );
         assert!(

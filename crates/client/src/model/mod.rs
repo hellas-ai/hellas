@@ -7,6 +7,8 @@ mod descriptor;
 pub mod flux;
 pub mod gguf;
 #[cfg(feature = "models")]
+mod native;
+#[cfg(feature = "models")]
 mod package;
 #[cfg(feature = "models")]
 mod program;
@@ -58,17 +60,6 @@ pub fn hf_uri(source: &std::path::Path) -> Option<&str> {
     source.to_str().filter(|s| s.starts_with("hf://"))
 }
 
-#[cfg(feature = "models")]
-pub fn pinned_gguf(uri: &str) -> anyhow::Result<hellas_store::hf::PinnedFile> {
-    Ok(hellas_store::hf::PinnedFile::resolve(
-        uri,
-        "gguf",
-        &hellas_store::content::Reservations::ram(
-            hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
-        ),
-    )?)
-}
-
 /// Execution sources prepared before activating a local backend.
 #[cfg(feature = "models")]
 pub struct ModelFiles {
@@ -80,17 +71,19 @@ impl ModelFiles {
     pub async fn resolve(
         models: impl IntoIterator<Item = std::path::PathBuf>,
     ) -> anyhow::Result<Self> {
-        let mut local = Vec::new();
-        let mut hub = Vec::new();
-        for model in models {
-            if let Some(uri) = hf_uri(&model) {
-                let uri = uri.to_owned();
-                hub.push(tokio::task::spawn_blocking(move || pinned_gguf(&uri)).await??);
-            } else {
-                ModelPackage::require_local_weights(&model)?;
-                local.push(model);
+        let paths: Vec<_> = models.into_iter().collect();
+        tokio::task::spawn_blocking(move || {
+            let mut all = Self {
+                local: Vec::new(),
+                hub: Vec::new(),
+            };
+            for path in paths {
+                let files = descriptor::Source::open(&path)?.files()?;
+                all.local.extend(files.local);
+                all.hub.extend(files.hub);
             }
-        }
-        Ok(Self { local, hub })
+            Ok(all)
+        })
+        .await?
     }
 }

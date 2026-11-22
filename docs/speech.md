@@ -2,10 +2,11 @@
 
 ## Synthesize a WAV locally
 
-With a converted package and a GPU build, use the package directory as the model.
+With a GPU build, use the pinned OmniVoice checkpoint or a converted package directory. OmniVoice accepts the default voice and speed 1.
 Choose a voice included in the Phonon package, or use the default MMS voice.
 
 ```sh
+hellas speak --model hf://k2-fsa/OmniVoice@3fc979d1cd72492cd679c5ac2611e0d7ac047ba1 --text 'Hello from Hellas.' -o omni.wav --local
 hellas speak --model ./phonon --text 'Hello from Hellas.' --voice Easton -o phonon.wav --local
 hellas speak --model ./mms --text 'Hello from Hellas.' -o mms.wav --local
 ```

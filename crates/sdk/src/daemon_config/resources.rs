@@ -275,7 +275,7 @@ impl Resource {
                     .ok_or("model evaluator was not prepared")?;
                 (
                     InvocationPolicy {
-                        admissions: vec![Admission::compute_only(&package.programs()?)?],
+                        admissions: package.compute_admissions()?,
                         limits: Limits {
                             max_upload_bytes: 8 << 20,
                             max_output_bytes: 4 << 20,

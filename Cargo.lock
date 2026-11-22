@@ -782,7 +782,7 @@ dependencies = [
 [[package]]
 name = "catena-models"
 version = "0.1.0"
-source = "git+https://github.com/georgewhewell/catena-models.git?rev=5b67a8e013ec53d09fea0251ade4923f66e0b4bd#5b67a8e013ec53d09fea0251ade4923f66e0b4bd"
+source = "git+https://github.com/georgewhewell/catena-models.git?rev=d3bdf7e9e7109652eec183735b60d1176b8f452c#d3bdf7e9e7109652eec183735b60d1176b8f452c"
 dependencies = [
  "anyhow",
  "axum",

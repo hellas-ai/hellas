@@ -2,6 +2,7 @@
 use super::{
     descriptor,
     flux::{Flux, Image, ImageRequest},
+    native,
     qwen3::Qwen3,
     speech::{Audio, Speech},
     whisper::Whisper,
@@ -49,23 +50,11 @@ impl ModelKind {
     }
     /// Gateway and request name, taken from the selected model file.
     pub fn named(path: &Path) -> Result<(Self, String)> {
-        if let Some(uri) = super::hf_uri(path) {
-            let descriptor::Resolved::Gguf { path, .. } = descriptor::remote(uri)? else {
-                unreachable!()
-            };
-            return Ok((
-                descriptor::Layout::Gguf.kind(path.as_ref().as_ref())?,
-                model_name(path.source())?.to_owned(),
-            ));
-        }
-        Ok((
-            descriptor::classify(path)?.kind(path)?,
-            model_name(path)?.to_owned(),
-        ))
+        descriptor::Source::open(path)?.named()
     }
 }
 
-fn model_name(path: &Path) -> Result<&str> {
+pub(super) fn model_name(path: &Path) -> Result<&str> {
     path.file_stem()
         .and_then(|s| s.to_str())
         .context("model needs a UTF-8 name")
@@ -130,6 +119,9 @@ impl ModelPackage {
             _ => bail!("model package is not GGUF"),
         }
     }
+    pub fn is_descriptor(path: &Path) -> Result<bool> {
+        Ok(super::hf_uri(path).is_none() && descriptor::classify(path)?.is_descriptor())
+    }
     /// A local executing backend must have the full model package.
     pub fn require_local_weights(path: &Path) -> Result<()> {
         ensure!(
@@ -181,23 +173,11 @@ impl ModelPackage {
     }
 
     async fn resolve(path: &Path, store: Option<&DiskStore>) -> Result<descriptor::Resolved> {
-        if let Some(uri) = super::hf_uri(path) {
-            let uri = uri.to_owned();
-            return tokio::task::spawn_blocking(move || descriptor::remote(&uri)).await?;
-        }
-        let layout = descriptor::classify(path)?;
-        let inspected = match (store, layout.weights_path(path)) {
-            (Some(store), Some(path)) => Some(
-                *store
-                    .inspect_files(vec![path.clone()])
-                    .await?
-                    .get(&path)
-                    .context("model weights were not inspected")?,
-            ),
-            _ => None,
-        };
-        let path = path.to_owned();
-        tokio::task::spawn_blocking(move || layout.resolve(&path, inspected)).await?
+        let (path, store) = (path.to_owned(), store.cloned());
+        tokio::task::spawn_blocking(move || {
+            descriptor::Source::open(&path)?.resolve(store.as_ref())
+        })
+        .await?
     }
 
     async fn open_resolved(
@@ -208,6 +188,9 @@ impl ModelPackage {
         Ok(Self {
             evaluator: evaluator.into(),
             family: match source {
+                descriptor::Resolved::Native(native::Kind::OmniVoice, source) => Family::Speech(
+                    Arc::new(Speech::open_omni(source.as_ref().clone(), dialect).await?),
+                ),
                 descriptor::Resolved::Speech { path, weights } => {
                     Family::Speech(Arc::new(Speech::open(path, dialect, *weights).await?))
                 }
@@ -251,6 +234,33 @@ impl ModelPackage {
         }])
     }
 
+    /// Admit the exact programs rendered by this model and its known preparation entries.
+    pub fn compute_admissions(&self) -> Result<Vec<hellas_rpc::protocol::invocation::Admission>> {
+        use hellas_rpc::protocol::invocation::{Admission, ComputePrograms};
+        let programs = self.programs()?;
+        let mut admission = Admission::compute_only(&programs)?;
+        let entries: &[&str] = match &self.family {
+            Family::Speech(model) => model.setup_entries(),
+            _ => &[],
+        };
+        if !entries.is_empty()
+            && let Admission::Compute {
+                programs:
+                    ComputePrograms::Only {
+                        pure_setup_entries, ..
+                    },
+                ..
+            } = &mut admission
+        {
+            for p in programs {
+                pure_setup_entries.insert(
+                    p.manifest.to_string(),
+                    entries.iter().map(|e| (*e).to_owned()).collect(),
+                );
+            }
+        }
+        Ok(vec![admission])
+    }
     pub fn kind(&self) -> ModelKind {
         match &self.family {
             Family::Whisper(_) => ModelKind::Transcription,

@@ -10,19 +10,21 @@ pub struct PinnedFile {
     pub object: ContentRef,
 }
 
-impl PinnedFile {
-    /// Select the named file, or the only file with the requested extension.
-    pub fn resolve(
-        uri: &str,
-        extension: &str,
-        pool: &crate::content::Reservations,
-    ) -> Result<Self> {
+/// File metadata at one immutable revision. A single listing covers sharded checkpoints.
+pub struct PinnedRepo {
+    pub repo: Repo,
+    files: Vec<RepoFile>,
+    _charges: Vec<std::sync::Arc<crate::content::reservation::Reservation>>,
+}
+
+impl PinnedRepo {
+    pub fn open(uri: &str, pool: &crate::content::Reservations) -> Result<(Self, Option<String>)> {
         let (id, tail) = uri
             .split_once('@')
             .ok_or_else(|| FetchError::Malformed("expected hf://org/repo@SHA[/file]".into()))?;
         let (revision, selector) = tail
             .split_once('/')
-            .map_or((tail, None), |(rev, file)| (rev, Some(file)));
+            .map_or((tail, None), |(rev, file)| (rev, Some(file.to_owned())));
         if !immutable_sha(revision) {
             return Err(FetchError::Malformed(
                 "model reference requires a 40-hex commit".into(),
@@ -30,7 +32,71 @@ impl PinnedFile {
         }
         let repo = Repo::from_uri(&format!("{id}@{revision}"))?;
         let (files, _charges) = HfCas::new(repo.clone()).files(pool)?;
-        let mut matching = files.into_iter().filter(|file| {
+        Ok((
+            Self {
+                repo,
+                files,
+                _charges,
+            },
+            selector,
+        ))
+    }
+
+    pub fn contains(&self, path: &str) -> bool {
+        self.files.iter().any(|f| f.path == path)
+    }
+
+    fn entry(&self, path: &str) -> Result<&RepoFile> {
+        self.files
+            .iter()
+            .find(|f| f.path == path)
+            .ok_or_else(|| FetchError::Malformed(format!("missing file {path} at pinned revision")))
+    }
+
+    /// A weight file whose verified bytes the provider acquires.
+    pub fn file(&self, path: &str) -> Result<PinnedFile> {
+        let file = self.entry(path)?;
+        let id = file
+            .xet_hash
+            .as_deref()
+            .and_then(|id| id.parse().ok())
+            .ok_or_else(|| {
+                FetchError::Malformed(format!("{path} has no published Xet identity"))
+            })?;
+        Ok(PinnedFile {
+            repo: self.repo.clone(),
+            path: file.path.clone(),
+            object: ContentRef::new(id, file.size),
+        })
+    }
+
+    /// Bounded metadata, including ordinary Git objects without a Xet identity.
+    pub fn metadata(&self, path: &str, limit: u64) -> Result<Vec<u8>> {
+        let size = self.entry(path)?.size;
+        if size > limit {
+            return Err(FetchError::Malformed(format!(
+                "{path} exceeds metadata limit"
+            )));
+        }
+        let mut bytes = Vec::new();
+        HfCas::new(self.repo.clone())
+            .small_file(path)?
+            .take(size + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|source| FetchError::Io {
+                context: path.into(),
+                source,
+            })?;
+        if bytes.len() as u64 != size {
+            return Err(FetchError::Malformed(format!(
+                "incorrect metadata length for {path}"
+            )));
+        }
+        Ok(bytes)
+    }
+
+    pub fn select(&self, extension: &str, selector: Option<&str>) -> Result<PinnedFile> {
+        let mut matching = self.files.iter().filter(|file| {
             std::path::Path::new(&file.path)
                 .extension()
                 .is_some_and(|ext| ext.eq_ignore_ascii_case(extension))
@@ -44,15 +110,18 @@ impl PinnedFile {
                 "multiple matching files; specify the repository path after the commit".into(),
             ));
         }
-        let id = file
-            .xet_hash
-            .and_then(|id| id.parse().ok())
-            .ok_or_else(|| FetchError::Malformed("file has no published Xet identity".into()))?;
-        Ok(Self {
-            repo,
-            path: file.path,
-            object: ContentRef::new(id, file.size),
-        })
+        self.file(&file.path)
+    }
+}
+
+impl PinnedFile {
+    pub fn resolve(
+        uri: &str,
+        extension: &str,
+        pool: &crate::content::Reservations,
+    ) -> Result<Self> {
+        let (repo, selector) = PinnedRepo::open(uri, pool)?;
+        repo.select(extension, selector.as_deref())
     }
 
     pub fn read_range(&self, range: Range<u64>, out: &mut impl std::io::Write) -> Result<()> {
