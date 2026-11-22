@@ -42,21 +42,24 @@ fn metadata(dir: &Path) -> Result<(Config, Generation, tokenizers::Tokenizer)> {
 
 // The public graph lists specify the call ABI; offsets always refer to the
 // once-converted, all-BF16 asset.
-fn tensors(config: &Config) -> Vec<(String, Vec<usize>)> {
+fn tensors(config: &Config) -> Result<Vec<(String, Vec<usize>)>> {
     let shapes: BTreeMap<_, _> = weight_shapes(config).into_iter().collect();
     graph::encoder_names(config)
         .into_iter()
         .chain(graph::cross_names(config))
         .chain(graph::decoder_names(config))
         .map(|name| {
-            let shape = shapes[&name].clone();
-            (name, shape)
+            let shape = shapes
+                .get(&name)
+                .with_context(|| format!("unknown Whisper weight {name}"))?
+                .clone();
+            Ok((name, shape))
         })
         .collect()
 }
 fn views(config: &Config) -> Result<Vec<(u64, u64)>> {
     let mut offset = 0u64;
-    tensors(config)
+    tensors(config)?
         .into_iter()
         .map(|(_, shape)| {
             let bytes = shape
@@ -102,7 +105,7 @@ pub fn convert_whisper(checkpoint: &Path, destination: &Path) -> Result<ContentR
         .tempdir_in(parent)?;
     let path = staging.path().join(WEIGHTS_FILE);
     let mut file = BufWriter::new(File::create(&path)?);
-    for (name, shape) in tensors(&config) {
+    for (name, shape) in tensors(&config)? {
         weights.validate(&name, &shape)?;
         let values = weights.host_f32(&name)?;
         let as_is = weights.tensors[&name].dtype == safetensors::Dtype::BF16;

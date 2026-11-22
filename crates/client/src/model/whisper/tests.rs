@@ -9,6 +9,7 @@ fn checkpoint(dir: &Path) {
     std::fs::write(dir.join("tokenizer.json"), r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"hi":0,"there":1,"[UNK]":2,"eos":3,"sot":4,"en":5,"task":6,"no":7},"unk_token":"[UNK]"}}"#).unwrap();
     let config = Config::read(dir).unwrap();
     let tensors: Vec<_> = tensors(&config)
+        .unwrap()
         .into_iter()
         .enumerate()
         .map(|(i, (name, shape))| {
@@ -98,6 +99,7 @@ async fn converted_asset_and_program_are_stable_and_ship_with_every_job() {
     assert_eq!(object, ContentRef::for_bytes(&bytes));
     let cfg = Config::read(&checkpoint_dir).unwrap();
     let expected: Vec<_> = tensors(&cfg)
+        .unwrap()
         .iter()
         .enumerate()
         .flat_map(|(i, (_, shape))| {
@@ -166,7 +168,10 @@ async fn converted_asset_and_program_are_stable_and_ship_with_every_job() {
         );
         assert!(job.plan.step.is_none());
         assert_eq!(job.plan.calls[0].entry, "whisper.transcribe");
-        assert_eq!(job.plan.calls[0].args.len(), 10 + tensors(&cfg).len());
+        assert_eq!(
+            job.plan.calls[0].args.len(),
+            10 + tensors(&cfg).unwrap().len()
+        );
         assert_eq!(
             job.plan.calls[0].args[1..7],
             [
