@@ -73,6 +73,10 @@ pub struct Resident {
 unsafe impl Send for Resident {}
 unsafe impl Sync for Resident {}
 impl Resident {
+    pub(super) fn object(&self) -> ContentRef {
+        self.object
+    }
+
     pub fn view(&self, offset: u64, bytes: u64) -> Result<MemRef<'_>> {
         if offset
             .checked_add(bytes)
@@ -111,10 +115,87 @@ impl Resident {
     }
 }
 
+/// An immutable sequence of GPU buffers, owned together by one setup result.
+pub(crate) struct PreparedBuffers(pub(super) Vec<MemOwn>);
+// As with Resident, the allocations remain owned by this Arc and only MemRefs
+// are passed to the worker.
+unsafe impl Send for PreparedBuffers {}
+unsafe impl Sync for PreparedBuffers {}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(super) struct SetupKey {
+    pub evaluator: String,
+    pub manifest: hellas_rpc::ContentId,
+    pub entry: String,
+    pub ranges: Vec<(ContentRef, u64, u64)>,
+}
+
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd)]
+enum CacheKey {
+    Asset(ContentRef, Layout),
+    Setup(SetupKey),
+}
+
+enum Allocation {
+    Asset(Arc<Resident>),
+    Setup(Arc<PreparedBuffers>),
+}
+
+impl Allocation {
+    fn available(&self) -> bool {
+        match self {
+            Self::Asset(owner) => Arc::strong_count(owner) == 1,
+            Self::Setup(owner) => Arc::strong_count(owner) == 1,
+        }
+    }
+}
+
+struct Cached {
+    allocation: Allocation,
+    bytes: u64,
+    accessed: u64,
+}
+
 struct State {
-    entries: BTreeMap<(ContentRef, Layout), (Arc<Resident>, u64)>,
+    entries: BTreeMap<CacheKey, Cached>,
     used: u64,
     clock: u64,
+}
+
+impl State {
+    fn get(&mut self, key: &CacheKey) -> Option<&Allocation> {
+        self.clock += 1;
+        let cached = self.entries.get_mut(key)?;
+        cached.accessed = self.clock;
+        Some(&cached.allocation)
+    }
+    fn make_room(&mut self, bytes: u64, capacity: u64) -> Result<()> {
+        if bytes > capacity {
+            return Err("asset exceeds resident capacity".into());
+        }
+        while self.used > capacity - bytes {
+            let victim = self
+                .entries
+                .iter()
+                .filter(|(_, entry)| entry.allocation.available())
+                .min_by_key(|(_, entry)| entry.accessed)
+                .map(|(key, _)| key.clone())
+                .ok_or("resident capacity pinned by running jobs")?;
+            self.used -= self.entries.remove(&victim).unwrap().bytes;
+        }
+        Ok(())
+    }
+    fn insert(&mut self, key: CacheKey, allocation: Allocation, bytes: u64) {
+        self.used += bytes;
+        self.entries.insert(
+            key,
+            Cached {
+                allocation,
+                bytes,
+                accessed: self.clock,
+            },
+        );
+    }
 }
 pub struct Assets {
     state: Mutex<State>,
@@ -153,42 +234,49 @@ impl Assets {
         let mut state = cancel
             .block_on(deadline, self.state.lock())
             .ok_or("asset pin timed out or cancelled")?;
-        state.clock += 1;
-        let clock = state.clock;
         let layout = Layout::new(object, ranges)?;
-        let key = (object, layout);
-        if let Some((resident, used)) = state.entries.get_mut(&key) {
-            *used = clock;
+        let key = CacheKey::Asset(object, layout.clone());
+        if let Some(Allocation::Asset(resident)) = state.get(&key) {
             return Ok(resident.clone());
         }
-        let padded = key.1.bytes;
-        if padded > self.capacity {
-            return Err("asset exceeds resident capacity".into());
-        }
-        while state
-            .used
-            .checked_add(padded)
-            .is_none_or(|n| n > self.capacity)
-        {
-            let victim = state
-                .entries
-                .iter()
-                .filter(|(_, (owner, _))| Arc::strong_count(owner) == 1)
-                .min_by_key(|(_, (_, used))| *used)
-                .map(|(id, _)| id.clone())
-                .ok_or("resident capacity pinned by running jobs")?;
-            let (old, _) = state.entries.remove(&victim).unwrap();
-            state.used -= old.memory.byte_len();
-        }
-        let words = packed_words(reader, object, &key.1)?;
+        let padded = layout.bytes;
+        state.make_room(padded, self.capacity)?;
+        let words = packed_words(reader, object, &layout)?;
         let resident = Arc::new(Resident {
             memory: MemOwn::from_u16_slice(&words, self.dialect)?,
-            layout: key.1.clone(),
+            layout,
             object,
         });
-        state.used += padded;
-        state.entries.insert(key, (resident.clone(), clock));
+        state.insert(key, Allocation::Asset(resident.clone()), padded);
         Ok(resident)
+    }
+
+    pub(super) fn prepare(
+        &self,
+        key: SetupKey,
+        cancel: &super::Cancellation,
+        deadline: Instant,
+        run: impl FnOnce() -> Result<Vec<MemOwn>>,
+    ) -> Result<Arc<PreparedBuffers>> {
+        let mut state = cancel
+            .block_on(Some(deadline), self.state.lock())
+            .ok_or("setup wait timed out or cancelled")?;
+        let key = CacheKey::Setup(key);
+        if let Some(Allocation::Setup(buffers)) = state.get(&key) {
+            return Ok(buffers.clone());
+        }
+        let buffers = run()?;
+        let bytes = buffers
+            .iter()
+            .try_fold(0u64, |total, m| total.checked_add(m.byte_len()))
+            .ok_or("setup buffer sizes exceed address space")?;
+        if bytes == 0 {
+            return Err("setup result must contain weight data".into());
+        }
+        state.make_room(bytes, self.capacity)?;
+        let owner = Arc::new(PreparedBuffers(buffers));
+        state.insert(key, Allocation::Setup(owner.clone()), bytes);
+        Ok(owner)
     }
 }
 

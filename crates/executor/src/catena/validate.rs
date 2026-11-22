@@ -97,12 +97,29 @@ pub fn preflight(
     Ok(())
 }
 
+pub(super) fn shared_setup(entries: &BTreeSet<String>, entry: &str, args: &[&Arg]) -> bool {
+    entries.contains(entry)
+        && !args.is_empty()
+        && args.iter().all(|arg| matches!(arg, Arg::Asset { .. }))
+}
+
 pub fn validate(
     module: &RuntimeModule,
     env: &Environment,
     inputs: &BTreeMap<String, ContentRef>,
     plan: &Plan,
     limits: &Limits,
+) -> Result<(), InvalidPlan> {
+    validate_setup(module, env, inputs, plan, limits, &BTreeSet::new())
+}
+
+pub(super) fn validate_setup(
+    module: &RuntimeModule,
+    env: &Environment,
+    inputs: &BTreeMap<String, ContentRef>,
+    plan: &Plan,
+    limits: &Limits,
+    entries: &BTreeSet<String>,
 ) -> Result<(), InvalidPlan> {
     preflight(env, inputs, plan, limits)?;
     let mut slots = BTreeMap::new();
@@ -116,6 +133,7 @@ pub fn validate(
             &call.args.iter().collect::<Vec<_>>(),
             &call.bind,
             &mut slots,
+            entries,
             None,
         )?;
     }
@@ -130,6 +148,7 @@ pub fn validate(
             &step.args.iter().map(|a| a.at(0)).collect::<Vec<_>>(),
             &step.bind,
             &mut slots,
+            entries,
             Some(0),
         )?;
         let first = slots.clone();
@@ -158,6 +177,7 @@ pub fn validate(
             &step.args.iter().map(|a| a.at(1)).collect::<Vec<_>>(),
             &step.bind,
             &mut slots,
+            entries,
             Some(step.stop.max_steps.saturating_sub(1)),
         )?;
         if first != slots {
@@ -169,7 +189,7 @@ pub fn validate(
             ));
         }
         if !matches!(
-            slots.get(&step.emit),
+            slots.get(&step.emit).map(|slot| slot.0),
             Some(ValueKind::U64 | ValueKind::MemOwn)
         ) {
             return Err(invalid(i, None, "emit U64 or MemOwn[8]", &step.emit));
@@ -180,7 +200,7 @@ pub fn validate(
             OutputKind::Scalar(k) => k,
             OutputKind::Buffer { .. } => ValueKind::MemOwn,
         };
-        if slots.get(&d.slot) != Some(&expected) {
+        if slots.get(&d.slot).map(|slot| slot.0) != Some(expected) {
             return Err(invalid(
                 plan.calls.len(),
                 None,
@@ -201,7 +221,8 @@ fn check_call(
     entry: &str,
     args: &[&Arg],
     bind: &[Bind],
-    slots: &mut BTreeMap<String, ValueKind>,
+    slots: &mut BTreeMap<String, (ValueKind, bool)>,
+    entries: &BTreeSet<String>,
     step: Option<u64>,
 ) -> Result<(), InvalidPlan> {
     let signature: &GeneratedFunction = module
@@ -218,6 +239,18 @@ fn check_call(
             None,
             format!("{} bindings", signature.outputs.len()),
             bind.len(),
+        ));
+    }
+    let shared = shared_setup(entries, entry, args);
+    if shared
+        && (signature.outputs.is_empty()
+            || signature.outputs.iter().any(|k| *k != NativeKind::MemOwn))
+    {
+        return Err(invalid(
+            call,
+            None,
+            "setup returns owned weight buffers",
+            entry,
         ));
     }
     let mut borrowed = BTreeSet::new();
@@ -249,7 +282,15 @@ fn check_call(
                 expected == ValueKind::U64 && step.is_some_and(|i| base.checked_add(i).is_some())
             }
             Arg::Slot { name } => {
-                let found = slots.get(name).copied();
+                let found = slots.get(name).map(|slot| slot.0);
+                if expected == ValueKind::MemOwn && slots.get(name).is_some_and(|slot| slot.1) {
+                    return Err(invalid(
+                        call,
+                        Some(index),
+                        "read-only borrow of a prepared weight",
+                        name,
+                    ));
+                }
                 if expected == ValueKind::MemRef && found == Some(ValueKind::MemOwn) {
                     borrowed.insert(name.clone());
                     true
@@ -280,7 +321,7 @@ fn check_call(
             if name.is_empty() || !bound.insert(name) {
                 return Err(invalid(call, None, "unique nonempty binding", name));
             }
-            slots.insert(name.clone(), kind(*output));
+            slots.insert(name.clone(), (kind(*output), shared));
         }
     }
     Ok(())

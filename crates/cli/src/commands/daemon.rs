@@ -189,8 +189,10 @@ impl ModelContext {
                         programs,
                     } = admission
                     {
-                        if let hellas_rpc::protocol::invocation::ComputePrograms::Only { manifests } =
-                            programs
+                        if let hellas_rpc::protocol::invocation::ComputePrograms::Only {
+                            manifests,
+                            ..
+                        } = programs
                             && !package_programs[evaluator]
                                 .iter()
                                 .all(|program| manifests.contains(&program.manifest))

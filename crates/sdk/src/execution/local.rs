@@ -38,6 +38,7 @@ pub fn policy(
             evaluator: manifest.application().evaluator().into(),
             programs: hellas_rpc::protocol::invocation::ComputePrograms::Only {
                 manifests: vec![manifest.content_id()],
+                pure_setup_entries: Default::default(),
             },
         }],
         limits: Limits {
