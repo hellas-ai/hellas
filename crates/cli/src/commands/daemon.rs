@@ -194,23 +194,13 @@ impl ModelContext {
             .flat_map(|offer| &offer.offer().grant.policies)
         {
             if package.is_some() {
-                use hellas_rpc::protocol::invocation::{Admission, ComputePrograms};
                 for (evaluator, programs) in &package_programs {
-                    if programs.iter().all(|id| {
-                        policy.invocation_policy.admissions.iter().any(
-                            |admission| match admission {
-                                Admission::Compute {
-                                    evaluator: target,
-                                    programs,
-                                } if target == evaluator => match programs {
-                                    ComputePrograms::Any {} => true,
-                                    ComputePrograms::Only { manifests, .. } => {
-                                        manifests.contains(&id.manifest)
-                                    }
-                                },
-                                _ => false,
-                            },
-                        )
+                    if programs.iter().all(|manifest| {
+                        policy
+                            .invocation_policy
+                            .admissions_for(manifest)
+                            .next()
+                            .is_some()
                     }) {
                         matches.push((policy.clone(), Some(evaluator.clone())));
                     }

@@ -10,11 +10,7 @@ pub use process::{Cancellation, isolate_child};
 /// The evaluator id a GPU runtime registers: the programs it compiles. The
 /// executor runs only programs whose evaluator its runtime registered.
 pub fn evaluator(dialect: catena_lang::codegen::GpuDialect) -> String {
-    let name = compile::name(dialect);
-    format!(
-        "{}-{name}",
-        hellas_rpc::protocol::invocation::compute::EVALUATOR
-    )
+    hellas_rpc::protocol::invocation::compute::evaluator(compile::name(dialect))
 }
 /// Resolve an opaque evaluator id registered by this executor build.
 pub fn registered_evaluator(id: &str) -> Result<catena_lang::codegen::GpuDialect, String> {

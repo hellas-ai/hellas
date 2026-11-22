@@ -375,7 +375,11 @@ async fn async_main() {
             .and_then(|packages| packages[&backend].programs())
             .map(|programs| {
                 for program in programs {
-                    println!("{program}");
+                    println!(
+                        "{}/{}",
+                        program.application().evaluator(),
+                        program.content_id()
+                    );
                 }
             });
             tracer_provider.shutdown();

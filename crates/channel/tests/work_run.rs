@@ -230,7 +230,7 @@ impl WorkBackend for CountingBackend {
     ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_channel::work::BackendFault> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         assert_eq!(
-            input.invocation().manifest().unwrap().canonical_bytes(),
+            input.invocation().manifest().canonical_bytes(),
             manifest().canonical_bytes()
         );
         let request = &input.invocation().request;
@@ -513,7 +513,7 @@ async fn a_job_this_process_is_running_is_not_started_again() {
     // the exact canonical values both parties signed the digest of.
     assert_eq!(&input.invocation().request, &invocation_request(1));
     assert_eq!(
-        input.invocation().manifest().unwrap().canonical_bytes(),
+        input.invocation().manifest().canonical_bytes(),
         manifest().canonical_bytes()
     );
 

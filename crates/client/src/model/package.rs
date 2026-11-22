@@ -8,6 +8,7 @@ use super::{
     whisper::Whisper,
 };
 use anyhow::{Context, Result, bail, ensure};
+use hellas_rpc::ProgramManifest;
 use hellas_rpc::protocol::invocation::{
     Artifact,
     compute::{Environment, Plan},
@@ -234,28 +235,20 @@ impl ModelPackage {
         }
     }
     /// The exact programs this package can render for its evaluator.
-    pub fn programs(&self) -> Result<Vec<hellas_rpc::protocol::invocation::compute::ProgramId>> {
+    pub fn programs(&self) -> Result<Vec<ProgramManifest>> {
         let environment = match &self.family {
             Family::Whisper(model) => model.environment(),
             Family::Speech(model) => model.environment(),
             Family::Phonon(voices) => {
                 return voices
                     .values()
-                    .map(|model| {
-                        Ok(hellas_rpc::protocol::invocation::compute::ProgramId {
-                            evaluator: self.evaluator.clone(),
-                            manifest: model.environment().manifest(&self.evaluator)?.content_id(),
-                        })
-                    })
+                    .map(|model| Ok(model.environment().manifest(&self.evaluator)?))
                     .collect();
             }
             Family::Qwen3(model) => model.environment(),
             Family::Flux(model) => return model.programs(&self.evaluator),
         };
-        Ok(vec![hellas_rpc::protocol::invocation::compute::ProgramId {
-            evaluator: self.evaluator.clone(),
-            manifest: environment.manifest(&self.evaluator)?.content_id(),
-        }])
+        Ok(vec![environment.manifest(&self.evaluator)?])
     }
 
     /// Provider policy for exact rendered programs and their known setup contracts.
@@ -263,10 +256,7 @@ impl ModelPackage {
         &self,
         voices: &[String],
     ) -> Result<Vec<hellas_rpc::protocol::invocation::Admission>> {
-        use hellas_rpc::protocol::invocation::{
-            Admission,
-            policy::{ComputePrograms, MAX_COMPUTE_PROGRAMS},
-        };
+        use hellas_rpc::protocol::invocation::{Admission, policy::MAX_COMPUTE_PROGRAMS};
         let mut programs = self.programs()?;
         let entries: &[&str] = match &self.family {
             Family::Whisper(_) => &["whisper.setup"],
@@ -289,26 +279,7 @@ impl ModelPackage {
         };
         programs
             .chunks(MAX_COMPUTE_PROGRAMS)
-            .map(|group| {
-                let mut admission = Admission::compute_only(group)?;
-                if !entries.is_empty()
-                    && let Admission::Compute {
-                        programs:
-                            ComputePrograms::Only {
-                                pure_setup_entries, ..
-                            },
-                        ..
-                    } = &mut admission
-                {
-                    for program in group {
-                        pure_setup_entries.insert(
-                            program.manifest.to_string(),
-                            entries.iter().map(|e| (*e).to_owned()).collect(),
-                        );
-                    }
-                }
-                Ok(admission)
-            })
+            .map(|group| Ok(Admission::compute_only(group, entries)?))
             .collect()
     }
     pub fn kind(&self) -> ModelKind {

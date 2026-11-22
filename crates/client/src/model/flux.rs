@@ -253,16 +253,14 @@ impl Flux {
         self.source.assets()
     }
 
-    pub fn programs(&self, evaluator: &str) -> Result<Vec<ProgramId>> {
+    pub fn programs(&self, evaluator: &str) -> Result<Vec<hellas_rpc::ProgramManifest>> {
         self.variants
             .iter()
             .map(|&variant| {
-                Ok(ProgramId {
-                    evaluator: evaluator.into(),
-                    manifest: super::program::describe(&self.program(variant)?, self.assets())
-                        .manifest(evaluator)?
-                        .content_id(),
-                })
+                Ok(
+                    super::program::describe(&self.program(variant)?, self.assets())
+                        .manifest(evaluator)?,
+                )
             })
             .collect()
     }

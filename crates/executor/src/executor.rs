@@ -375,7 +375,7 @@ impl ExecutorHandle {
                 .map_err(|e| invalid(&e))?;
         let request = hellas_rpc::fetch::verify_input_events(&events).map_err(|e| invalid(&e))?;
         let caller = request.caller_key;
-        let manifest = prepared.manifest().map_err(|e| invalid(&e))?;
+        let manifest = prepared.manifest();
         let bounds = policy.admit(&prepared, &caller).map_err(|e| invalid(&e))?;
         let admissions = policy
             .admissions
@@ -399,7 +399,7 @@ impl ExecutorHandle {
                     admissions: vec![a.clone()],
                     limits,
                 }
-                .classify_manifest(&manifest)?;
+                .classify_manifest(manifest)?;
                 Ok((admission, bounds))
             })
             .collect::<Result<Vec<_>, hellas_rpc::value::CanonicalDecodeError>>()

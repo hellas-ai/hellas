@@ -902,7 +902,6 @@ fn prepared_gpu_buffers_share_the_asset_lru() -> Result<()> {
     let assets = Assets::new(8, GpuDialect::Cuda);
     let object = hellas_rpc::ContentRef::for_bytes(b"abcdefgh");
     let key = |offset: u64| SetupKey {
-        evaluator: "cuda".into(),
         manifest: object.id(),
         entry: "prepare".into(),
         ranges: vec![(object, offset, 2)],

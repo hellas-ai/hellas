@@ -186,25 +186,19 @@ impl InvocationPolicy {
         prepared: &PreparedInvocation,
         caller: &PublicKey,
     ) -> Result<Vec<&'a Admission>, CanonicalDecodeError> {
-        self.validate()?;
         prepared.validate()?;
         if prepared.application_policy.as_bytes() != self.canonical_bytes()?.as_slice() {
             return Err(error(
                 "invocation application policy differs from the owner-approved policy",
             ));
         }
-        let encoded = prepared.canonical_bytes()?;
+        let encoded = prepared.encode_validated()?;
         if encoded.len() > MAX_INVOCATION_BYTES {
             return Err(error("invocation input exceeds its byte bound"));
         }
-        let manifest = prepared.manifest()?;
         let mut admitted = Vec::new();
         let mut last = None;
-        for admission in self
-            .admissions
-            .iter()
-            .filter(|admission| admission.admits_manifest(&manifest))
-        {
+        for admission in self.admissions_for(prepared.manifest()) {
             let facts = AdmissionFacts::for_admission(admission, self.limits)?;
             let result = if encoded.len() > facts.max_encoded_prepared_input as usize {
                 Err(error("invocation input exceeds its admitted bound"))
@@ -219,7 +213,7 @@ impl InvocationPolicy {
                     } => {
                         #[cfg(feature = "fetch")]
                         {
-                            super::fetch::validate_input(
+                            super::fetch::check_request(
                                 prepared,
                                 _admission,
                                 self.limits.max_output_bytes,

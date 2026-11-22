@@ -124,7 +124,6 @@ unsafe impl Sync for PreparedBuffers {}
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(super) struct SetupKey {
-    pub evaluator: String,
     pub manifest: hellas_rpc::ContentId,
     pub entry: String,
     pub ranges: Vec<(ContentRef, u64, u64)>,

@@ -645,7 +645,7 @@ fn upload_messages(
         hellas_rpc::protocol::content::encode_reference(hellas_rpc::ContentRef::for_bytes(&bytes));
     let frames = hellas_channel::test_support::upload_frames(
         &request,
-        input.manifest().unwrap().canonical_bytes(),
+        input.manifest().canonical_bytes(),
         hellas_channel::test_support::channel::program_root(&input),
         &bytes,
         |opening| {
@@ -4563,7 +4563,7 @@ async fn offline_startup_restores_retained_pins_and_output_before_the_global_bar
     let environment = hellas_channel::test_support::channel::program_root(&prepared);
     let closure = hellas_channel::job::content_closure(
         &work_policy(),
-        &prepared.manifest().unwrap(),
+        prepared.manifest(),
         &environment,
         authorization.input_content,
     )

@@ -257,29 +257,13 @@ impl GrantWork {
                     .map_err(status)?
                     .invocation_policy
                     .clone();
-                let manifest = hellas_rpc::ProgramManifest::from_canonical_bytes(&opening.manifest)
-                    .map_err(status)?;
-                let facts = policy.classify_manifest(&manifest).map_err(status)?;
-                if manifest.content_id() != a.environment_commitment
-                    || hellas_rpc::protocol::content::decode_reference(&request.prepared_input)
-                        != Some(a.input_content)
-                    || a.input_content.bytes() > u64::from(facts.max_encoded_prepared_input)
-                {
-                    return Err(status("opening differs from signed invocation"));
-                }
-                let root = match &opening.root {
-                    Some(root) => {
-                        let root = object(root)?;
-                        if root.id() != manifest.root()
-                            || root.bytes() > hellas_channel::content::MAX_PROGRAM_ROOT_BYTES as u64
-                        {
-                            return Err(status("invalid program root reference"));
-                        }
-                        Some(root)
-                    }
-                    None if policy.content_closure(&manifest, &[]).is_ok() => None,
-                    None => return Err(status("missing program root reference")),
-                };
+                let (manifest, _, root) = hellas_channel::job::check_content_opening(
+                    (&a).into(),
+                    &policy,
+                    &opening,
+                    &request.prepared_input,
+                )
+                .map_err(status)?;
                 let first_object = root.unwrap_or(a.input_content);
                 if open.pin.is_some()
                     || object(

@@ -100,7 +100,28 @@ pub struct ProgramManifest {
     root: ContentId,
 }
 
+// The prepared invocation carries the manifest as its strict canonical byte string.
+impl serde::Serialize for ProgramManifest {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(&self.canonical_bytes())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ProgramManifest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let bytes = serde_bytes::ByteBuf::deserialize(deserializer)?;
+        Self::from_canonical_bytes(&bytes).map_err(serde::de::Error::custom)
+    }
+}
+
 impl ProgramManifest {
+    pub(super) fn retained_heap_bytes(&self) -> Option<usize> {
+        self.application
+            .evaluator
+            .capacity()
+            .checked_add(self.application.adaptor.capacity())
+    }
+
     /// Binds an exact application identity to its application-owned root.
     #[must_use]
     pub const fn new(application: Application, root: ContentId) -> Self {

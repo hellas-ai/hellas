@@ -586,10 +586,7 @@ fn application_admission_binds_owner_bytes_caller_and_staging_classification() {
     assert_eq!(admitted.retention, Retention::Ephemeral);
     assert_eq!(admitted.max_spool_bytes, 4 << 20);
     assert_eq!(admitted.max_encoded_result_frame, 1 << 20);
-    assert_eq!(
-        p.classify_manifest(&prepared.manifest().unwrap()).unwrap(),
-        admitted
-    );
+    assert_eq!(p.classify_manifest(prepared.manifest()).unwrap(), admitted);
     assert!(p.admit(&prepared, &runner().public_key()).is_err());
     prepared.application_policy.0.push(0);
     assert!(p.admit(&prepared, &caller()).is_err());
@@ -599,12 +596,12 @@ fn application_admission_binds_owner_bytes_caller_and_staging_classification() {
     assert!(p.admit(&prepared, &caller()).is_err());
 
     let compute = compute_prepared(&p, &step_plan());
-    let facts = p.classify_manifest(&compute.manifest().unwrap()).unwrap();
+    let facts = p.classify_manifest(compute.manifest()).unwrap();
     assert_eq!(facts.capacity_domain, CapacityDomain::Gpu);
     assert_eq!(facts.retention, Retention::Retain);
     let wrong = crate::ProgramManifest::new(
         crate::Application::new(compute::EVALUATOR, "another-adaptor").unwrap(),
-        compute.manifest().unwrap().root(),
+        compute.manifest().root(),
     );
     assert!(p.classify_manifest(&wrong).is_err());
     let mut routes = p.clone();
@@ -625,11 +622,7 @@ fn application_admission_binds_owner_bytes_caller_and_staging_classification() {
         evaluator: crate::protocol::fetch_contract::FETCH_EVALUATOR.into(),
         programs: ComputePrograms::Any {},
     }];
-    assert!(
-        forged
-            .classify_manifest(&prepared.manifest().unwrap())
-            .is_err()
-    );
+    assert!(forged.classify_manifest(prepared.manifest()).is_err());
 }
 
 #[test]
@@ -1563,14 +1556,23 @@ fn setup_declarations_bind_exact_admitted_program_and_evaluator() {
     let manifest = env.manifest(compute::EVALUATOR).unwrap();
     let mut p = policy();
     let id = manifest.content_id();
+    let second = ContentId::from_bytes([1; 32]);
     let entries = BTreeSet::from(["weights.prep".to_owned()]);
     p.admissions = vec![Admission::Compute {
         evaluator: compute::EVALUATOR.into(),
         programs: ComputePrograms::Only {
-            manifests: vec![id],
-            pure_setup_entries: BTreeMap::from([(id.to_string(), entries.clone())]),
+            manifests: vec![id, second],
+            pure_setup_entries: BTreeMap::from([
+                (id, entries.clone()),
+                (second, BTreeSet::from(["second.prep".into()])),
+            ]),
         },
     }];
+    // Existing signed policies encode these two setup-map keys as lowercase text.
+    assert_eq!(
+        p.content_id().unwrap().to_string(),
+        "1123857c338e17f53a8b3e7ba59ec6ee7171f69ddc0523d3738401ab583bb74c"
+    );
     assert_eq!(p.pure_setup_entries(&manifest), entries);
     assert!(
         p.pure_setup_entries(&env.manifest("other").unwrap())

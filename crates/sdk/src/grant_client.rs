@@ -388,9 +388,9 @@ impl PreparedUpload {
     async fn new(input: &PreparedInvocation, content: &(LocalStore, Scope)) -> Result<Self> {
         let bytes = input.canonical_bytes()?;
         let reference = ContentRef::for_bytes(&bytes);
-        let manifest = input.manifest()?;
+        let manifest = input.manifest();
         let policy = InvocationPolicy::from_canonical_bytes(input.application_policy.as_bytes())?;
-        let root = if policy.content_closure(&manifest, &[]).is_ok() {
+        let root = if policy.content_closure(manifest, &[]).is_ok() {
             None
         } else {
             Some(
@@ -401,7 +401,7 @@ impl PreparedUpload {
         };
         let objects = hellas_channel::job::content_closure(
             &policy,
-            &manifest,
+            manifest,
             root.as_deref().unwrap_or_default(),
             reference,
         )?;
@@ -1123,15 +1123,15 @@ impl GrantSession {
         policy
             .invocation_policy
             .admit(input, &self.options.signer.public_key())?;
-        let manifest = input.manifest()?;
+        let manifest = input.manifest();
         if policy
             .invocation_policy
-            .content_closure(&manifest, &[])
+            .content_closure(manifest, &[])
             .is_err()
         {
             let root =
                 hellas_channel::content::root(&content.0, &content.1, manifest.root()).await?;
-            policy.invocation_policy.content_closure(&manifest, &root)?;
+            policy.invocation_policy.content_closure(manifest, &root)?;
         }
         let now = self.now();
         // The provider clock has advanced at least as far as this standing, so

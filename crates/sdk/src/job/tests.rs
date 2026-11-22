@@ -190,8 +190,8 @@ async fn compute_folder_round_trip_binds_environment_plan_and_price() {
     );
     assert_eq!(prepared.input, attested.input);
     assert_eq!(
-        prepared.manifest().unwrap(),
-        environment()
+        prepared.manifest(),
+        &environment()
             .manifest(&hellas_channel::test_support::channel::evaluator())
             .unwrap()
     );

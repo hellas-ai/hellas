@@ -130,7 +130,7 @@ impl InvocationRequest {
 #[serde(deny_unknown_fields)]
 pub struct PreparedInvocation {
     pub request: InvocationRequest,
-    manifest: JsonBytes,
+    manifest: ProgramManifest,
     pub input: InvocationInput,
     pub application_policy: JsonBytes,
 }
@@ -141,8 +141,7 @@ impl PreparedInvocation {
     pub fn retained_heap_bytes(&self) -> Option<usize> {
         let mut bytes = self
             .manifest
-            .0
-            .capacity()
+            .retained_heap_bytes()?
             .checked_add(self.input.parameters.0.capacity())?
             .checked_add(self.application_policy.0.capacity())?
             .checked_add(
@@ -167,7 +166,7 @@ impl PreparedInvocation {
     ) -> Result<Self, CanonicalDecodeError> {
         let prepared = Self {
             request,
-            manifest: JsonBytes(manifest.canonical_bytes()),
+            manifest: manifest.clone(),
             input,
             application_policy: JsonBytes(application_policy),
         };
@@ -175,8 +174,8 @@ impl PreparedInvocation {
         Ok(prepared)
     }
 
-    pub fn manifest(&self) -> Result<ProgramManifest, CanonicalDecodeError> {
-        ProgramManifest::from_canonical_bytes(self.manifest.as_bytes())
+    pub fn manifest(&self) -> &ProgramManifest {
+        &self.manifest
     }
 
     pub fn policy_digest(&self) -> Digest {
@@ -187,7 +186,7 @@ impl PreparedInvocation {
     }
 
     pub fn validate(&self) -> Result<(), CanonicalDecodeError> {
-        if self.manifest()?.content_id() != self.request.execution_environment {
+        if self.manifest.content_id() != self.request.execution_environment {
             return Err(error("invocation manifest does not match the request"));
         }
         if self.input.content_id()? != self.request.input {
@@ -198,6 +197,10 @@ impl PreparedInvocation {
 
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, CanonicalDecodeError> {
         self.validate()?;
+        self.encode_validated()
+    }
+
+    fn encode_validated(&self) -> Result<Vec<u8>, CanonicalDecodeError> {
         encode(&(PREPARED_DOMAIN, self))
     }
 

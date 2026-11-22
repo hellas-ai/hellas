@@ -745,11 +745,9 @@ impl ProviderEndpoint {
         .map_err(|error| Refusal::invalid(error.to_string()))?;
         crate::job::check_paid_input(ready.channel(), &authorization, policy, &bundle)?;
 
-        let manifest = bundle
-            .manifest()
-            .map_err(|error| Refusal::invalid(error.to_string()))?;
+        let manifest = bundle.manifest();
         let (store, scope) = self.close.store.invocation_content(work_id)?;
-        let root = if policy.content_closure(&manifest, &[]).is_ok() {
+        let root = if policy.content_closure(manifest, &[]).is_ok() {
             bytes::Bytes::new()
         } else {
             let hellas_store::content::ScopeKind::Work { closure, .. } = &scope.kind else {
@@ -762,7 +760,7 @@ impl ProviderEndpoint {
             self.close.store.read_content(work_id, root).await?
         };
         let objects =
-            crate::job::content_closure(policy, &manifest, &root, authorization.input_content)?;
+            crate::job::content_closure(policy, manifest, &root, authorization.input_content)?;
         if !store
             .missing_refs(&scope, objects.clone())
             .await
@@ -955,7 +953,7 @@ impl ProviderEndpoint {
         )?;
         let setup = ready
             .invocation_policy()
-            .pure_setup_entries(&bundle.manifest().map_err(PaidWorkError::from)?);
+            .pure_setup_entries(bundle.manifest());
         let admission = RunAdmission::Invoke(Box::new(
             Admitted::new(
                 bundle,
@@ -1776,10 +1774,11 @@ pub async fn run_admitted<B: WorkBackend>(
     admission: WorkAdmission,
     progress: PaidProgress,
 ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
-    let manifest = input.manifest().map_err(BackendFault::caused_by)?;
+    let manifest = input.manifest();
     let facts = policy
-        .classify_manifest(&manifest)
+        .classify_manifest(manifest)
         .map_err(BackendFault::caused_by)?;
+    let setup_entries = policy.pure_setup_entries(manifest);
     let input = Admitted::new(
         input,
         facts.limits,
@@ -1787,7 +1786,7 @@ pub async fn run_admitted<B: WorkBackend>(
         content,
         admission,
     )
-    .with_setup_entries(policy.pure_setup_entries(&manifest));
+    .with_setup_entries(setup_entries);
     execute(backend, input, progress).await
 }
 

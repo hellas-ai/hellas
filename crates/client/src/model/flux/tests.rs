@@ -117,13 +117,15 @@ async fn image_job_bundles_three_stages_and_passes_state_in_slots() {
     assert_eq!(job.environment.assets.len(), 3);
     let programs = package.programs().unwrap();
     assert_eq!(programs.len(), 2);
-    assert_ne!(programs[0].manifest, programs[1].manifest);
-    let manifest = job.environment.manifest(&programs[0].evaluator).unwrap();
-    let admission = hellas_rpc::protocol::invocation::Admission::compute_only(&programs).unwrap();
+    assert_ne!(programs[0], programs[1]);
+    let evaluator = programs[0].application().evaluator();
+    let manifest = job.environment.manifest(evaluator).unwrap();
+    let admission =
+        hellas_rpc::protocol::invocation::Admission::compute_only(&programs, &[]).unwrap();
     assert!(admission.admits_manifest(&manifest));
     let mut unrelated = job.environment.clone();
     unrelated.sources = vec![ContentRef::for_bytes(b"unrelated source")];
-    assert!(!admission.admits_manifest(&unrelated.manifest(&programs[0].evaluator).unwrap()));
+    assert!(!admission.admits_manifest(&unrelated.manifest(evaluator).unwrap()));
 
     for asset in &job.environment.assets {
         assert!(

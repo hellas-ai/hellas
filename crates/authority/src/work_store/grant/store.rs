@@ -634,10 +634,10 @@ pub(super) fn resource_charge(
 ) -> Result<Charge, NodeStoreError> {
     let mut charge = Charge::default();
     charge.set(Meter::Requests, 1);
-    let manifest = input.manifest().map_err(|_| GrantError::Malformed)?;
+    let manifest = input.manifest();
     let fetch = policy
         .invocation_policy
-        .admissions_for(&manifest)
+        .admissions_for(manifest)
         .any(|a| matches!(a, hellas_rpc::protocol::invocation::Admission::Fetch { .. }));
     if fetch {
         let artifact = input.input.artifacts.first().ok_or(GrantError::Malformed)?;

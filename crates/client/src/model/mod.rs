@@ -19,9 +19,9 @@ pub use catena_lang::codegen::GpuDialect;
 /// registered under the evaluator id its programs name.
 #[cfg(feature = "models")]
 fn renderers() -> impl Iterator<Item = (String, GpuDialect)> {
-    let catena = hellas_rpc::protocol::invocation::compute::EVALUATOR;
+    use hellas_rpc::protocol::invocation::compute;
     [(GpuDialect::Hip, "hip"), (GpuDialect::Cuda, "cuda")]
-        .map(|(dialect, name)| (format!("{catena}-{name}"), dialect))
+        .map(|(dialect, name)| (compute::evaluator(name), dialect))
         .into_iter()
 }
 

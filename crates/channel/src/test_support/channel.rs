@@ -266,7 +266,7 @@ pub fn environment() -> compute::Environment {
 }
 /// The evaluator a HIP executor registers, so test jobs run on one.
 pub fn evaluator() -> String {
-    format!("{}-hip", compute::EVALUATOR)
+    compute::evaluator("hip")
 }
 pub fn manifest() -> ProgramManifest {
     environment().manifest(&evaluator()).unwrap()
@@ -417,7 +417,7 @@ pub fn input_uploads(
         hellas_rpc::protocol::content::encode_reference(hellas_rpc::ContentRef::for_bytes(bytes));
     let frames = super::upload_frames(
         &wire,
-        input.manifest().unwrap().canonical_bytes(),
+        input.manifest().canonical_bytes(),
         program_root(&input),
         bytes,
         |opening| {
@@ -499,7 +499,7 @@ pub async fn seed_content(
         InvocationPolicy::from_canonical_bytes(prepared.application_policy.as_bytes()).unwrap();
     let Ok(closure) = crate::job::content_closure(
         &policy,
-        &prepared.manifest().unwrap(),
+        prepared.manifest(),
         &root,
         authorization.input_content,
     ) else {
@@ -521,9 +521,7 @@ pub async fn seed_content(
         return;
     };
     if authorization.retention == hellas_rpc::Retention::Retain {
-        let facts = policy
-            .classify_manifest(&prepared.manifest().unwrap())
-            .unwrap();
+        let facts = policy.classify_manifest(prepared.manifest()).unwrap();
         store
             .reserve_retained(work, facts.max_spool_bytes)
             .await

@@ -91,7 +91,7 @@ impl Slot {
 
 struct SetupCache<'a> {
     assets: &'a Assets,
-    manifest: Option<&'a hellas_rpc::ProgramManifest>,
+    manifest: Option<hellas_rpc::ContentId>,
     entries: &'a BTreeSet<String>,
     cancel: &'a super::Cancellation,
     deadline: Instant,
@@ -107,7 +107,7 @@ pub fn execute(
     plan: &Plan,
     limits: &Limits,
     assets: &Assets,
-    approval: Option<(&hellas_rpc::ProgramManifest, &BTreeSet<String>)>,
+    approval: Option<(hellas_rpc::ContentId, &BTreeSet<String>)>,
     readers: &mut BTreeMap<hellas_rpc::ContentId, VerifiedReader>,
     mut emit: impl FnMut(u64) -> Result<()>,
 ) -> Result<Completed> {
@@ -363,8 +363,7 @@ fn call_once(
             })
             .collect();
         let key = SetupKey {
-            evaluator: manifest.application().evaluator().into(),
-            manifest: manifest.content_id(),
+            manifest,
             entry: entry.to_owned(),
             ranges,
         };
@@ -489,7 +488,7 @@ pub(crate) fn execute_signed_in(
         plan,
         limits,
         assets,
-        Some((&prepared.manifest()?, setup_entries)),
+        Some((request.execution_environment, setup_entries)),
         readers,
         |value| {
             let event = stream.push("emitted", "catena.u64le.v1", offset, &value.to_le_bytes())?;

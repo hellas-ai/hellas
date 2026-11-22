@@ -21,9 +21,35 @@ pub enum ComputePrograms {
     Only {
         manifests: Vec<ContentId>,
         /// Fully initializing, pure weight preparation entries approved by the owner.
-        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-        pure_setup_entries: BTreeMap<String, BTreeSet<String>>,
+        #[serde(
+            default,
+            skip_serializing_if = "BTreeMap::is_empty",
+            with = "setup_entries_by_id"
+        )]
+        pure_setup_entries: BTreeMap<ContentId, BTreeSet<String>>,
     },
+}
+
+// Signed policies use lowercase Xet text for map keys in every encoding, including DAG-CBOR.
+mod setup_entries_by_id {
+    use super::*;
+    use serde::{Deserializer, Serializer, de::IntoDeserializer};
+
+    pub(super) fn serialize<S: Serializer>(
+        map: &BTreeMap<ContentId, BTreeSet<String>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(map.iter().map(|(id, entries)| (id.to_string(), entries)))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<BTreeMap<ContentId, BTreeSet<String>>, D::Error> {
+        BTreeMap::<String, BTreeSet<String>>::deserialize(deserializer)?
+            .into_iter()
+            .map(|(key, entries)| Ok((ContentId::deserialize(key.into_deserializer())?, entries)))
+            .collect()
+    }
 }
 
 impl ComputePrograms {
@@ -39,7 +65,7 @@ impl ComputePrograms {
                 ));
             }
             for (manifest, entries) in pure_setup_entries {
-                if !manifests.iter().any(|id| id.to_string() == *manifest) || entries.is_empty() {
+                if !manifests.contains(manifest) || entries.is_empty() {
                     return Err(error("setup entries must belong to an admitted manifest"));
                 }
                 for entry in entries {
@@ -109,22 +135,31 @@ pub enum Admission {
     },
 }
 impl Admission {
-    /// Admit exactly `programs`, which must share one evaluator.
-    pub fn compute_only(programs: &[compute::ProgramId]) -> Result<Self, CanonicalDecodeError> {
+    /// Admit exact Compute manifests for one evaluator with the owner's pure setup entries.
+    pub fn compute_only(
+        programs: &[ProgramManifest],
+        entries: &[&str],
+    ) -> Result<Self, CanonicalDecodeError> {
         let [first, ..] = programs else {
             return Err(error("compute admission requires a nonempty program list"));
         };
-        if programs
-            .iter()
-            .any(|program| program.evaluator != first.evaluator)
+        let application = first.application();
+        if application.adaptor() != compute::ADAPTOR
+            || programs.iter().any(|p| p.application() != application)
         {
-            return Err(error("admitted programs must share one evaluator"));
+            return Err(error("admitted programs must share one Compute evaluator"));
+        }
+        let manifests: Vec<_> = programs.iter().map(ProgramManifest::content_id).collect();
+        let mut pure_setup_entries = BTreeMap::new();
+        if !entries.is_empty() {
+            let entries: BTreeSet<_> = entries.iter().map(|s| (*s).to_owned()).collect();
+            pure_setup_entries.extend(manifests.iter().map(|&id| (id, entries.clone())));
         }
         Ok(Self::Compute {
-            evaluator: first.evaluator.clone(),
+            evaluator: application.evaluator().into(),
             programs: ComputePrograms::Only {
-                manifests: programs.iter().map(|program| program.manifest).collect(),
-                pure_setup_entries: BTreeMap::new(),
+                manifests,
+                pure_setup_entries,
             },
         })
     }
@@ -231,7 +266,7 @@ impl InvocationPolicy {
                             pure_setup_entries, ..
                         },
                     ..
-                } => pure_setup_entries.get(&manifest.content_id().to_string()),
+                } => pure_setup_entries.get(&manifest.content_id()),
                 _ => None,
             })
             .flatten()
@@ -243,7 +278,7 @@ impl InvocationPolicy {
     /// the first manifest match and silently ignoring the remaining routes.
     pub fn admissions_for<'a>(
         &'a self,
-        manifest: &'a ProgramManifest,
+        manifest: &ProgramManifest,
     ) -> impl Iterator<Item = &'a Admission> {
         self.admissions
             .iter()

@@ -56,9 +56,8 @@ async fn program_is_the_manifest_every_rendered_job_runs() {
         let manifest = job
             .environment
             .manifest(&crate::model::evaluator(crate::model::GpuDialect::Hip))
-            .unwrap()
-            .content_id();
-        assert_eq!(qwen.programs().unwrap()[0].manifest, manifest);
+            .unwrap();
+        assert_eq!(qwen.programs().unwrap()[0], manifest);
     }
     let whisper = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/model/whisper/mini");
     let whisper = ModelPackage::open(
@@ -79,9 +78,8 @@ async fn program_is_the_manifest_every_rendered_job_runs() {
         let manifest = job
             .environment
             .manifest(&crate::model::evaluator(crate::model::GpuDialect::Hip))
-            .unwrap()
-            .content_id();
-        assert_eq!(whisper.programs().unwrap()[0].manifest, manifest);
+            .unwrap();
+        assert_eq!(whisper.programs().unwrap()[0], manifest);
     }
 }
 
