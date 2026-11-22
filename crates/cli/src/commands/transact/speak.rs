@@ -27,9 +27,9 @@ pub async fn speak(mut args: SpeakArgs, context: Context) -> super::super::CliRe
     context
         .model_command(async {
             args.target.models = vec![args.model.clone()];
-            let text = speech_text(args.text, std::io::stdin())?;
             let evaluator = args.target.renderer()?;
             let content = args.target.content(&context).await?;
+            let text = speech_text(args.text, std::io::stdin())?;
             let package =
                 ModelPackage::open_many(&args.model, [evaluator.clone()], content.as_ref())
                     .await?
@@ -92,9 +92,7 @@ mod tests {
     #[test]
     fn speak_reads_stdin_unless_text_is_supplied() {
         let parse = |extra: &[&str]| {
-            let base = [
-                "hellas", "speak", "--model", "model", "--local", "-o", "out.wav",
-            ];
+            let base = ["hellas", "speak", "--model", "model", "-o", "out.wav"];
             let cli =
                 crate::Cli::try_parse_from(base.into_iter().chain(extra.iter().copied())).unwrap();
             let crate::Commands::Speak(args) = cli.command else {
