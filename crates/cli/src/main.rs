@@ -165,13 +165,6 @@ enum Commands {
     Fetch(commands::transact::FetchArgs),
     /// Buy one call of a Catena program using the same job and payment path.
     Run(commands::transact::RunArgs),
-    /// Fetch and convert a pinned MMS English checkpoint.
-    ConvertSpeech {
-        /// `ORG/NAME@COMMIT`, pinned to a 40-hex commit.
-        checkpoint: commands::convert::Checkpoint,
-        #[arg(short = 'o', long, value_name = "DIR")]
-        output: PathBuf,
-    },
     /// Print the program manifests for a local model or pinned hf:// checkpoint.
     Program {
         /// Named voice whose exact speech program the provider admits.
@@ -182,11 +175,6 @@ enum Commands {
         /// The registered renderer (evaluator id) the program is compiled for.
         #[arg(long, value_name = "EVALUATOR")]
         backend: String,
-    },
-    /// Prepare model metadata for rendering jobs on another machine.
-    Model {
-        #[command(subcommand)]
-        command: commands::model::ModelCommand,
     },
     /// Synthesize a WAV with a client-rendered speech job.
     Speak(commands::transact::SpeakArgs),
@@ -397,24 +385,6 @@ async fn async_main() {
             }
             return;
         }
-        Commands::Model { command } => {
-            let result = commands::model::run(command).await;
-            tracer_provider.shutdown();
-            if let Err(error) = result {
-                eprintln!("error: {error:#}");
-                std::process::exit(1);
-            }
-            return;
-        }
-        Commands::ConvertSpeech { checkpoint, output } => {
-            let result = commands::convert::speech(&checkpoint, &output);
-            tracer_provider.shutdown();
-            if let Err(error) = result {
-                eprintln!("error: {error:#}");
-                std::process::exit(1);
-            }
-            return;
-        }
         Commands::Store(args) if args.profile.is_none() => {
             let result = commands::store::run(args, &home, None, passkey).await;
             tracer_provider.shutdown();
@@ -572,7 +542,7 @@ async fn async_main() {
         }
         Commands::Text(args) => async { commands::transact::text(args, job_home()?).await }.await,
         Commands::Image(args) => async { commands::transact::image(args, job_home()?).await }.await,
-        Commands::ConvertSpeech { .. } | Commands::Model { .. } | Commands::Program { .. } => {
+        Commands::Program { .. } => {
             unreachable!("model commands handled before identity load")
         }
         Commands::Trust(args) => commands::trust::run(args),

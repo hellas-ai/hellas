@@ -2,12 +2,12 @@
 
 ## Synthesize a WAV locally
 
-With a GPU build, use a pinned checkpoint for OmniVoice or Phonon, or a local MMS package. Set `PHONON_ORG` to the publisher of the Phonon model.
+With a GPU build, use a pinned checkpoint for MMS English, OmniVoice or Phonon. Set `PHONON_ORG` to the publisher of the Phonon model.
 
 ```sh
 hellas speak --model hf://k2-fsa/OmniVoice@3fc979d1cd72492cd679c5ac2611e0d7ac047ba1 --text 'Hello from Hellas.' -o omni.wav --local
 hellas speak --model "hf://${PHONON_ORG}/phonon-31m-en@8f7a37c94a4c58b04c8287300c53f11d2e208eae" --text 'Hello from Hellas.' --voice Easton -o phonon.wav --local
-hellas speak --model ./mms --text 'Hello from Hellas.' -o mms.wav --local
+hellas speak --model hf://whatever0705/mms-tts-eng-with-discriminator@3975d411eef6e0a05ab701ce981a93dc3a2cfdae --text 'Hello from Hellas.' -o mms.wav --local
 ```
 
 Omit `--text` to read from standard input.
@@ -47,28 +47,15 @@ execution. Both targets return a complete response after verified completion. Ho
 retains its content type and encoding; upstream error statuses and bodies are
 preserved. Signed evidence accompanies successful and failed completions.
 
-## Prepare the MMS package
+## MMS English
 
-Convert a published checkpoint at an immutable 40-hex revision:
+The following revision contains the original MMS English inference tensors and tokenizer. Both clients and providers accept the pinned repository or a local checkpoint directory containing `model.safetensors`, `config.json`, `vocab.json`, `tokenizer_config.json` and `special_tokens_map.json`.
 
 ```sh
-hellas convert-speech facebook/mms-tts-eng@COMMIT -o ./mms
-hellas model describe ./mms -o ./mms-remote
-hellas program ./mms --backend hellas/catena-dfad87438018-hip
+hellas program hf://whatever0705/mms-tts-eng-with-discriminator@3975d411eef6e0a05ab701ce981a93dc3a2cfdae --backend hellas/catena-dfad87438018-hip
 ```
 
-Conversion applies the pinned catena-models weight normalization, transpose and
-BF16 preparation once. The package contains `weights.bf16`, `config.json`,
-`vocab.json`, `tokenizer_config.json` and `special_tokens_map.json`. A descriptor
-replaces the weights with their content reference in `descriptor.json`.
-HIP and CUDA use the existing Catena evaluators; conversion, describing and
-rendering a program do not run synthesis or open a GPU.
-
-The provider indexes the full package's weights. The gateway can render from
-its descriptor. The native model validates the two output artifacts, checks
-status and sample count, and encodes only the valid finite waveform prefix.
-Configure provider Compute admission for the program printed by `hellas program`
-and enough output for the 1,920,000-byte waveform plus 16-byte descriptor.
+The client renders from metadata. The provider verifies the safetensors file and prepares the required weights on its GPU. The speech decoder checks the status and sample count and encodes the valid finite waveform samples. Configure Compute admission for the program printed by `hellas program` and allow 1,920,000 bytes for the waveform plus 16 bytes for its status and sample count.
 
 ## Original speech checkpoints
 
@@ -137,7 +124,7 @@ backends = ["native"]
 model = "mms"
 [routes.target]
 kind = "native"
-package = "/srv/models/mms-remote"
+package = "hf://whatever0705/mms-tts-eng-with-discriminator@3975d411eef6e0a05ab701ce981a93dc3a2cfdae"
 ```
 
 For Phonon set `package` to its pinned Hub URI and add

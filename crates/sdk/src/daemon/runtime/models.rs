@@ -38,13 +38,10 @@ impl Runtime {
                 let files = if hellas_client::model::hf_uri(&path).is_some() {
                     Files::new()
                 } else {
-                    let paths = if ModelPackage::is_descriptor(&path)? {
-                        vec![path.clone()]
-                    } else {
+                    let paths =
                         hellas_client::model::ModelFiles::for_voices([path.clone()], &voices)
                             .await?
-                            .local
-                    };
+                            .local;
                     self.options.content.inspect_files(paths).await?
                 };
                 let cached = cache.entry(path.clone()).or_insert_with(|| Cached {

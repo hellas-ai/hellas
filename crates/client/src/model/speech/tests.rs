@@ -3,112 +3,44 @@ use crate::model::{GpuDialect, ModelKind, ModelPackage, ModelRequest};
 use hellas_rpc::protocol::invocation::output::Outcome;
 use std::io::Cursor;
 
-fn fixture(dir: &Path) {
-    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/model/speech/fixture");
-    for name in METADATA {
-        std::fs::copy(source.join(name), dir.join(name)).unwrap();
-    }
-}
-
 #[tokio::test]
-async fn converted_mms_and_descriptor_render_the_same_portable_synthesis_job() {
-    let root = tempfile::tempdir().unwrap();
-    let checkpoint = root.path().join("checkpoint");
-    std::fs::create_dir(&checkpoint).unwrap();
-    fixture(&checkpoint);
-    let mut tensors = std::collections::BTreeMap::new();
-    for (name, binding) in tts::bindings() {
-        if binding.normalized {
-            let prefix = name.strip_suffix(".weight").unwrap();
-            tensors.insert(
-                format!("{prefix}.weight_v"),
-                (
-                    binding.shape.clone(),
-                    vec![1f32; binding.shape.iter().product()],
-                ),
-            );
-            tensors.insert(
-                format!("{prefix}.weight_g"),
-                (vec![binding.shape[0], 1, 1], vec![1f32; binding.shape[0]]),
-            );
-        } else {
-            tensors.insert(
-                name,
-                (
-                    binding.shape.clone(),
-                    vec![0f32; binding.shape.iter().product()],
-                ),
-            );
-        }
-    }
-    let bytes: Vec<_> = tensors
-        .iter()
-        .map(|(name, (shape, values))| {
-            (
-                name,
-                shape,
-                values
-                    .iter()
-                    .flat_map(|x| x.to_le_bytes())
-                    .collect::<Vec<_>>(),
-            )
-        })
-        .collect();
-    let tensor_views = bytes.iter().map(|(name, shape, data)| {
-        (
-            name.as_str(),
-            safetensors::tensor::TensorView::new(safetensors::Dtype::F32, (*shape).clone(), data)
-                .unwrap(),
-        )
-    });
-    safetensors::tensor::serialize_to_file(
-        tensor_views,
-        None,
-        &checkpoint.join("model.safetensors"),
-    )
-    .unwrap();
-    drop(bytes);
-    drop(tensors);
-    let full = root.path().join("mms");
-    let object = convert_speech(&checkpoint, &full).unwrap();
-    let desc = root.path().join("descriptor");
-    assert_eq!(ModelPackage::describe(&full, &desc).await.unwrap(), object);
-    assert!(!desc.join(WEIGHTS_FILE).exists());
-    assert_eq!(ModelKind::of(&full).unwrap(), ModelKind::Speech);
-    assert_eq!(ModelKind::of(&desc).unwrap(), ModelKind::Speech);
-    assert!(ModelPackage::require_local_weights(&desc).is_err());
+async fn original_mms_ranges_prepare_once_for_different_utterances() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    write_test_checkpoint(root.path())?;
+    assert_eq!(ModelKind::of(root.path())?, ModelKind::Speech);
+    let object = hellas_store::content::file_content(&root.path().join("model.safetensors"))?;
     for dialect in [GpuDialect::Hip, GpuDialect::Cuda] {
-        let evaluator = crate::model::evaluator(dialect);
-        let a = ModelPackage::open(&full, &evaluator).await.unwrap();
-        let b = ModelPackage::open(&desc, &evaluator).await.unwrap();
-        assert_eq!(a.programs().unwrap(), b.programs().unwrap());
-        let request = ModelRequest::Speech {
-            text: "Hello",
-            voice: "default",
+        let model = ModelPackage::open(root.path(), &crate::model::evaluator(dialect)).await?;
+        let request = |text, voice| ModelRequest::Speech {
+            text,
+            voice,
             speed: 1.,
         };
-        let other = ModelRequest::Speech {
-            text: "Hello",
-            voice: "other",
-            speed: 1.,
+        assert!(model.render_job(&request("Hello", "other")).await.is_err());
+        let job = model.render_job(&request("Hello", "default")).await?;
+        let other = model.render_job(&request("Goodbye", "default")).await?;
+        assert_eq!(job.environment.assets.len(), 1);
+        assert_eq!(job.environment.assets[0].name, "model.safetensors");
+        assert_eq!(job.environment.assets[0].object, object);
+        let [setup, synth] = job.plan.calls.as_slice() else {
+            panic!("expected setup then synthesis")
         };
-        assert!(a.render_job(&other).await.is_err());
-        let a = a.render_job(&request).await.unwrap();
-        let b = b.render_job(&request).await.unwrap();
-        assert_eq!(a.plan, b.plan);
-        assert_eq!(a.inputs, b.inputs);
-        assert_eq!(a.environment, b.environment);
-        assert_eq!(a.plan.calls[0].entry, "tts.synthesize");
-        assert_eq!(a.plan.calls[0].args.len(), 7 + tts::bindings().len());
-        assert_eq!(a.environment.assets[0].object, object);
+        assert_eq!(setup.entry, tts::preparation::SETUP_ENTRY);
+        assert_eq!(setup, &other.plan.calls[0]);
+        assert_ne!(job.inputs, other.inputs);
+        assert_eq!(setup.bind.len(), tts::bindings().len());
+        assert_eq!(setup.args.len(), 492);
+        assert!(setup.args.iter().all(|arg| matches!(arg, Arg::Asset { name, offset, bytes }
+            if name == "model.safetensors" && *offset > 8 && *bytes > 0 && offset + bytes <= object.bytes())));
+        assert_eq!(synth.entry, "tts.synthesize");
+        assert_eq!(synth.args.len(), 7 + setup.bind.len());
+        assert!(
+            synth.args[7..]
+                .iter()
+                .all(|arg| matches!(arg, Arg::Slot { .. }))
+        );
     }
-    std::fs::write(desc.join("config.json"), []).unwrap();
-    assert!(
-        ModelPackage::require_local_weights(&desc)
-            .unwrap_err()
-            .to_string()
-            .contains("local execution requires the full model weights")
-    );
+    Ok(())
 }
 
 fn output(samples: &[f32], count: u64, status: u64) -> InvocationOutput {

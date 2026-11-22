@@ -107,10 +107,10 @@ The same packages work with the job commands. On your GPU:
 hellas transcribe --model hf://unsloth/whisper-tiny@34457cb234c8624f23ac716000773b367000df6e --audio speech.wav --local
 ```
 
-Or use a friend's access bundle and their GPU evaluator:
+For remote transcription, ask the provider to share its `whisper-tiny` resource. Use that access bundle and the provider's GPU evaluator.
 
 ```sh
-hellas transcribe --model hf://unsloth/whisper-tiny@34457cb234c8624f23ac716000773b367000df6e --audio speech.wav --access friend.access \
+hellas transcribe --model hf://unsloth/whisper-tiny@34457cb234c8624f23ac716000773b367000df6e --audio speech.wav --access whisper.access \
   --backend hellas/catena-dfad87438018-hip
 ```
 

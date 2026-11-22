@@ -2,8 +2,6 @@
 #[cfg(feature = "models")]
 pub mod decision;
 #[cfg(feature = "models")]
-mod descriptor;
-#[cfg(feature = "models")]
 pub mod flux;
 pub mod gguf;
 #[cfg(feature = "models")]
@@ -12,6 +10,8 @@ mod native;
 mod package;
 #[cfg(feature = "models")]
 mod program;
+#[cfg(feature = "models")]
+mod source;
 #[cfg(feature = "models")]
 pub use catena_lang::codegen::GpuDialect;
 
@@ -85,7 +85,7 @@ impl ModelFiles {
                 hub: Vec::new(),
             };
             for path in paths {
-                let files = descriptor::Source::open(&path)?.files(&voices)?;
+                let files = source::Source::open(&path)?.files(&voices)?;
                 all.local.extend(files.local);
                 all.hub.extend(files.hub);
             }

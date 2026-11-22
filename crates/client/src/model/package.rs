@@ -1,9 +1,9 @@
 //! Model families render the same opaque program-and-bytes Compute contract.
 use super::{
-    descriptor,
     flux::{Flux, Image, ImageRequest},
     native,
     qwen3::Qwen3,
+    source,
     speech::{Audio, Speech},
     whisper::Whisper,
 };
@@ -41,7 +41,7 @@ pub enum ModelKind {
     Transcription,
     /// A local or pinned Flux checkpoint.
     Image,
-    /// A speech checkpoint or an MMS English package or descriptor.
+    /// A local or pinned speech checkpoint.
     Speech,
 }
 
@@ -51,7 +51,7 @@ impl ModelKind {
     }
     /// Gateway and request name, taken from the selected model file.
     pub fn named(path: &Path) -> Result<(Self, String)> {
-        descriptor::Source::open(path)?.named()
+        source::Source::open(path)?.named()
     }
 }
 
@@ -128,26 +128,6 @@ impl ModelPackage {
             _ => bail!("model package is not GGUF"),
         }
     }
-    pub fn is_descriptor(path: &Path) -> Result<bool> {
-        Ok(super::hf_uri(path).is_none() && descriptor::classify(path)?.is_descriptor())
-    }
-
-    /// A local executing backend must have the full model package.
-    pub fn require_local_weights(path: &Path) -> Result<()> {
-        ensure!(
-            super::hf_uri(path).is_some() || !descriptor::classify(path)?.is_descriptor(),
-            "local execution requires the full model weights, not a descriptor"
-        );
-        Ok(())
-    }
-
-    /// Create a new metadata-only package directory from a converted MMS package.
-    pub async fn describe(path: &Path, output: &Path) -> Result<hellas_rpc::ContentRef> {
-        let (path, output) = (path.to_owned(), output.to_owned());
-        tokio::task::spawn_blocking(move || descriptor::describe(&path, &output)).await?
-    }
-
-    /// Render programs for a local model or immutable Hub source using `evaluator`.
     pub async fn open(path: &Path, evaluator: &str) -> Result<Self> {
         let dialect = super::renderer(evaluator)?;
         let source = Self::resolve(path, &[], None).await?;
@@ -194,26 +174,23 @@ impl ModelPackage {
         path: &Path,
         voices: &[String],
         store: Option<&DiskStore>,
-    ) -> Result<descriptor::Resolved> {
+    ) -> Result<source::Resolved> {
         let (path, voices, store) = (path.to_owned(), voices.to_vec(), store.cloned());
         tokio::task::spawn_blocking(move || {
-            descriptor::Source::open(&path)?.resolve(&voices, store.as_ref())
+            source::Source::open(&path)?.resolve(&voices, store.as_ref())
         })
         .await?
     }
 
     async fn open_resolved(
-        source: &descriptor::Resolved,
+        source: &source::Resolved,
         evaluator: &str,
         dialect: super::GpuDialect,
     ) -> Result<Self> {
         Ok(Self {
             evaluator: evaluator.into(),
             family: match source {
-                descriptor::Resolved::Speech { path, weights } => {
-                    Family::Speech(Arc::new(Speech::open(path, dialect, *weights).await?))
-                }
-                descriptor::Resolved::Native(native::Kind::Phonon, source) => {
+                source::Resolved::Native(native::Kind::Phonon, source) => {
                     let mut models = std::collections::BTreeMap::new();
                     for (name, file) in &source.voices {
                         let mut one = source.as_ref().clone();
@@ -227,30 +204,24 @@ impl ModelPackage {
                     }
                     Family::Phonon(models)
                 }
-                descriptor::Resolved::Native(native::Kind::OmniVoice, source) => {
-                    Family::Speech(Arc::new(
-                        Speech::open_native(
-                            source.as_ref().clone(),
-                            native::Kind::OmniVoice,
-                            dialect,
-                        )
-                        .await?,
-                    ))
-                }
-                descriptor::Resolved::Native(native::Kind::Flux, source) => {
-                    Family::Flux(Arc::new({
-                        let source = source.clone();
-                        tokio::task::spawn_blocking(move || Flux::open(source, dialect)).await??
-                    }))
-                }
-                descriptor::Resolved::Native(native::Kind::Whisper, source) => {
+                source::Resolved::Native(
+                    kind @ (native::Kind::OmniVoice | native::Kind::Mms),
+                    source,
+                ) => Family::Speech(Arc::new(
+                    Speech::open_native(source.as_ref().clone(), *kind, dialect).await?,
+                )),
+                source::Resolved::Native(native::Kind::Flux, source) => Family::Flux(Arc::new({
+                    let source = source.clone();
+                    tokio::task::spawn_blocking(move || Flux::open(source, dialect)).await??
+                })),
+                source::Resolved::Native(native::Kind::Whisper, source) => {
                     Family::Whisper(Arc::new(Whisper::open(source.clone(), dialect).await?))
                 }
-                descriptor::Resolved::Gguf {
+                source::Resolved::Gguf(source::Gguf {
                     path,
                     header,
                     weights,
-                } => Family::Qwen3(Arc::new(
+                }) => Family::Qwen3(Arc::new(
                     Qwen3::open(path.clone(), dialect, *weights, header.clone()).await?,
                 )),
             },

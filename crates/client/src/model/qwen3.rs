@@ -26,7 +26,7 @@ const WEIGHTS: &str = "weights";
 const LOGITS: &str = "logits";
 
 pub(super) struct Qwen3 {
-    pub(super) path: Arc<super::descriptor::GgufPath>,
+    pub(super) path: Arc<super::source::GgufPath>,
     config: ModelConfig,
     environment: Environment,
     content: (LocalStore, Scope),
@@ -75,7 +75,7 @@ pub(super) fn metadata(
 
 impl Qwen3 {
     pub async fn open(
-        path: Arc<super::descriptor::GgufPath>,
+        path: Arc<super::source::GgufPath>,
         dialect: super::GpuDialect,
         object: hellas_rpc::ContentRef,
         header: Arc<gguf::Header>,

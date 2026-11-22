@@ -102,33 +102,25 @@ impl hellas_gateway::WorkExecutionBackend for SpeechBackend {
     > {
         use hellas_rpc::protocol::invocation::{
             Artifact,
-            compute::Arg,
+            compute::{Arg, Bind},
             output::{InvocationOutput, Outcome},
         };
         assert_eq!(backend, "mms");
-        assert_eq!(job.plan.calls.len(), 1);
-        let call = &job.plan.calls[0];
+        assert_eq!(job.plan.calls.len(), 2);
+        assert_eq!(job.plan.calls[0].entry, "tts.prepare-weights");
+        let call = &job.plan.calls[1];
         assert_eq!(call.entry, "tts.synthesize");
         assert_eq!(call.args[1], Arg::U64(11)); // hello with interleaved blanks
         let fail = call.args[6] == Arg::F32Bits(2f32.to_bits());
         assert!(fail || call.args[6] == Arg::F32Bits(1f32.to_bits()));
-        assert_eq!(job.environment.assets[0].object.bytes(), 56_546_102);
+        assert_eq!(job.environment.assets[0].name, "model.safetensors");
         assert_eq!(job.inputs[0].name, "tokens");
-        let mut offset = 0;
-        for arg in &call.args[7..] {
-            let Arg::Asset {
-                name,
-                offset: start,
-                bytes,
-            } = arg
-            else {
-                panic!("MMS weight argument")
-            };
-            assert_eq!(name, "weights");
-            assert_eq!(*start, offset);
-            offset += bytes;
+        let prepared = &job.plan.calls[0].bind;
+        assert_eq!(prepared.len(), call.args.len() - 7);
+        for (binding, weight) in prepared.iter().zip(&call.args[7..]) {
+            assert!(matches!((binding, weight),
+                (Bind::Name(output), Arg::Slot { name }) if output == name));
         }
-        assert_eq!(offset, 56_546_102);
         self.native_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(Box::pin(async_stream::stream! {
@@ -162,27 +154,8 @@ impl hellas_gateway::WorkExecutionBackend for SpeechBackend {
 }
 
 fn native_route(root: &std::path::Path) -> Route {
-    let package = root.join("mms-descriptor");
-    std::fs::create_dir(&package).unwrap();
-    let fixture =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../client/src/model/speech/fixture");
-    for name in [
-        "config.json",
-        "vocab.json",
-        "tokenizer_config.json",
-        "special_tokens_map.json",
-    ] {
-        std::fs::copy(fixture.join(name), package.join(name)).unwrap();
-    }
-    let object = hellas_rpc::ContentRef::new(
-        ContentId::hash(b"MMS evaluator fixture weights"),
-        56_546_102,
-    );
-    std::fs::write(
-        package.join("descriptor.json"),
-        serde_json::to_vec(&serde_json::json!({"weights":object})).unwrap(),
-    )
-    .unwrap();
+    let package = root.join("mms");
+    hellas_client::model::speech::write_test_checkpoint(&package).unwrap();
     Route {
         backends: vec!["mms".into()],
         presentation: Presentation::Speech {

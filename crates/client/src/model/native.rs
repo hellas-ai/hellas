@@ -19,6 +19,7 @@ use std::{
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Kind {
+    Mms,
     Whisper,
     Flux,
     OmniVoice,
@@ -66,6 +67,7 @@ impl Origin {
                 .model_type
                 .as_deref()
             {
+                Some("vits") => Some(Kind::Mms),
                 Some("whisper") => Some(Kind::Whisper),
                 _ => None,
             }
@@ -189,6 +191,11 @@ impl Snapshot {
             voices: BTreeMap::new(),
         };
         match kind {
+            Kind::Mms => {
+                for &key in &super::speech::CHECKPOINT {
+                    result.add(&origin, "", key)?;
+                }
+            }
             Kind::Whisper => {
                 for &key in &super::whisper::CHECKPOINT {
                     result.add(&origin, "", key)?;

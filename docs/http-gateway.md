@@ -15,7 +15,7 @@ hellas gateway \
 ```
 
 The gateway serves local or pinned GGUF text and decision models, original
-Whisper, OmniVoice, Flux and Phonon checkpoints, and converted MMS packages and descriptors. It discovers the modality and API paths from the model.
+Whisper, MMS, OmniVoice, Flux and Phonon checkpoints. It discovers the modality and API paths from the model.
 Append `@CONTACT` to a model path or pinned URI to use a remote Compute grant. A Fetch
 grant uses `NAME@CONTACT`, checked against the models in its signed offer.
 Import contacts and access with `hellas pair … --name CONTACT`. For an App
@@ -41,7 +41,7 @@ hellas gateway --model hf://unsloth/whisper-tiny@34457cb234c8624f23ac716000773b3
 hellas program hf://MisterCD/whisper-small@98533e05a8a8d670fa562f13392b78841424f44f --backend hellas/catena-dfad87438018-cuda
 ```
 
-An MMS package can also supply a metadata-only descriptor for remote speech. See [speech](speech.md).
+For MMS English and other speech checkpoints, see [speech](speech.md).
 
 ## Upstreams and HTTP access
 
@@ -107,7 +107,7 @@ behavior; it does not journal routing configuration.
 The TOML schema is the SDK's daemon document (`listeners`, `backends`, `routes`,
 `resources`, `machine`, `budgets`, `limits`, `execution`), plus `models`,
 `upstreams` and optional `paid_policy`. Models and upstreams are resolved into
-that document with the same logic as route/backend edits. Use a pinned Hub URI or a local model path. MMS also accepts a converted package or its descriptor. Multiple local model routes share a serialized executor for each
+that document with the same logic as route/backend edits. Use a pinned Hub URI or a local model path. Multiple local model routes share a serialized executor for each
 evaluator, rather than running GPU jobs concurrently.
 
 `execution.queue_capacity`, `execution.session_programs` and
@@ -144,7 +144,7 @@ paired profile for edits:
 ```sh
 hellas backend add upstream https://api.example.com/v1 --key-file "$HOME/api.key"
 hellas route add gpt-5@upstream
-hellas route add /srv/models/qwen3.gguf
+hellas route add hf://ggml-org/Qwen3-0.6B-GGUF@afe8ad3577aa22500b3cd1c880f153b3b0e1cae8/Qwen3-0.6B-BF16.gguf
 hellas route listen 127.0.0.1:8081
 hellas routes
 hellas route rm gpt-5@upstream
