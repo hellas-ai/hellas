@@ -174,8 +174,6 @@ impl Config {
         let transformer: config::TransformerConfig =
             config::read(dir.join("transformer/config.json"))?;
         let vae: config::VaeConfig = config::read(dir.join("vae/config.json"))?;
-        transformer.validate()?;
-        vae.validate()?;
         Ok(Self {
             text: text.qwen()?,
             transformer,

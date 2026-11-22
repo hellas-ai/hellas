@@ -1,30 +1,30 @@
 event: response.created
-data: {"response":{"created_at":1700000000,"id":"resp-fixture","model":"fixture","object":"response","output":[],"status":"queued"},"sequence_number":0,"type":"response.created"}
+data: {"response":{"id":"resp-fixture","object":"response","created_at":1700000000,"status":"queued","model":"fixture","output":[]},"type":"response.created","sequence_number":0}
 
 event: response.in_progress
-data: {"response":{"created_at":1700000000,"id":"resp-fixture","model":"fixture","object":"response","output":[],"status":"in_progress"},"sequence_number":1,"type":"response.in_progress"}
+data: {"response":{"id":"resp-fixture","object":"response","created_at":1700000000,"status":"in_progress","model":"fixture","output":[]},"type":"response.in_progress","sequence_number":1}
 
 event: response.output_item.added
-data: {"item":{"annotations":[],"content":[],"id":"msg-fixture","role":"assistant","status":"in_progress","type":"message"},"output_index":0,"sequence_number":2,"type":"response.output_item.added"}
+data: {"output_index":0,"item":{"id":"msg-fixture","type":"message","status":"in_progress","role":"assistant","content":[],"annotations":[]},"type":"response.output_item.added","sequence_number":2}
 
 event: response.content_part.added
-data: {"content_index":0,"item_id":"msg-fixture","output_index":0,"part":{"annotations":[],"text":"","type":"output_text"},"sequence_number":3,"type":"response.content_part.added"}
+data: {"item_id":"msg-fixture","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]},"type":"response.content_part.added","sequence_number":3}
 
 event: response.output_text.delta
-data: {"content_index":0,"delta":"Hello ","item_id":"msg-fixture","output_index":0,"sequence_number":4,"type":"response.output_text.delta"}
+data: {"item_id":"msg-fixture","output_index":0,"content_index":0,"delta":"Hello ","type":"response.output_text.delta","sequence_number":4}
 
 event: response.output_text.delta
-data: {"content_index":0,"delta":"κόσμε\n","item_id":"msg-fixture","output_index":0,"sequence_number":5,"type":"response.output_text.delta"}
+data: {"item_id":"msg-fixture","output_index":0,"content_index":0,"delta":"κόσμε\n","type":"response.output_text.delta","sequence_number":5}
 
 event: response.output_text.done
-data: {"content_index":0,"item_id":"msg-fixture","output_index":0,"sequence_number":6,"text":"Hello κόσμε\n","type":"response.output_text.done"}
+data: {"item_id":"msg-fixture","output_index":0,"content_index":0,"text":"Hello κόσμε\n","type":"response.output_text.done","sequence_number":6}
 
 event: response.content_part.done
-data: {"content_index":0,"item_id":"msg-fixture","output_index":0,"part":{"annotations":[],"text":"Hello κόσμε\n","type":"output_text"},"sequence_number":7,"type":"response.content_part.done"}
+data: {"item_id":"msg-fixture","output_index":0,"content_index":0,"part":{"type":"output_text","text":"Hello κόσμε\n","annotations":[]},"type":"response.content_part.done","sequence_number":7}
 
 event: response.output_item.done
-data: {"item":{"annotations":[],"content":[{"annotations":[],"text":"Hello κόσμε\n","type":"output_text"}],"id":"msg-fixture","role":"assistant","status":"completed","type":"message"},"output_index":0,"sequence_number":8,"type":"response.output_item.done"}
+data: {"output_index":0,"item":{"id":"msg-fixture","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"Hello κόσμε\n","annotations":[]}],"annotations":[]},"type":"response.output_item.done","sequence_number":8}
 
 event: response.completed
-data: {"response":{"created_at":1700000000,"id":"resp-fixture","model":"fixture","object":"response","output":[{"annotations":[],"content":[{"annotations":[],"text":"Hello κόσμε\n","type":"output_text"}],"id":"msg-fixture","role":"assistant","status":"completed","type":"message"}],"status":"completed","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}},"sequence_number":9,"type":"response.completed"}
+data: {"response":{"id":"resp-fixture","object":"response","created_at":1700000000,"status":"completed","model":"fixture","output":[{"id":"msg-fixture","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"Hello κόσμε\n","annotations":[]}],"annotations":[]}],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}},"type":"response.completed","sequence_number":9}
 

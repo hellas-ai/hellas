@@ -1,6 +1,8 @@
 # Fetch SSE fixtures
 
 Recorded from the gateway at H1 head `dbb6bd3d`, before changing `WorkBackend`.
+JSON object keys keep insertion order: catena-models enables serde_json's
+`preserve_order`, which applies to every gateway build.
 The tests exercise the production Fetch request adapter and SSE response body
 with deterministic upstream semantic events. They pin rendering metadata to
 `resp-fixture`, `msg-fixture`, and Unix time `1700000000`; no bytes are normalized
