@@ -439,6 +439,11 @@ cannot be replayed from those journals.
 
 ## Tracked native execution
 
+Compute job and attempt digests include the evaluator. Saved folders from earlier
+versions reopen using the evaluator in `job.toml`. Their pre-change paid and grant
+attempts use older digests. Running one of those jobs again uses a fresh default
+attempt and can incur another charge or consume grant allowance.
+
 The SDK's `execution` module provides `ExecutionAttempt` and a borrowed
 `ExecutionSession` for paid or granted work without an HTTP listener. Open an
 attempt at a caller-owned private path with the original `JobInput` and exact

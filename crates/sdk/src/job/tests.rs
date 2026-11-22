@@ -213,6 +213,35 @@ async fn compute_folder_round_trip_binds_environment_plan_and_price() {
 }
 
 #[tokio::test]
+async fn saved_jobs_and_attempts_distinguish_compute_evaluators() {
+    use hellas_channel::test_support::channel::{environment, plan, program_content};
+    let job = async |evaluator: &str| {
+        Job::compute(
+            20,
+            evaluator.into(),
+            environment(),
+            plan(),
+            vec![],
+            program_content().await,
+        )
+        .await
+        .unwrap()
+    };
+    let hip = job("test/hip").await;
+    let cuda = job("test/cuda").await;
+    let folder = tempfile::tempdir().unwrap();
+    hip.save(folder.path()).await.unwrap();
+    assert!(cuda.save(folder.path()).await.is_err());
+    let saved = Job::load(folder.path()).await.unwrap();
+    assert_eq!(saved.digest(), hip.digest());
+    assert_ne!(saved.digest(), cuda.digest());
+    assert_ne!(
+        saved.input().tracking_digest(),
+        cuda.input().tracking_digest()
+    );
+}
+
+#[tokio::test]
 async fn compute_folder_preserves_provider_held_assets_without_uploading_them() {
     use compute::{Environment, NamedAsset};
     let content = MemoryStore::new(Reservations::ram(
