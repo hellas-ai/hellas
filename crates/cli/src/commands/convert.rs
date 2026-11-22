@@ -102,6 +102,14 @@ pub fn phonon(
     output: &Path,
 ) -> CliResult<()> {
     use hellas_client::model::speech::phonon;
+    let mut distinct = std::collections::BTreeSet::new();
+    for name in names {
+        phonon::validate_voice(name)?;
+        ensure!(
+            distinct.insert(name.to_lowercase()),
+            "voice {name:?} is named twice"
+        );
+    }
     let scratch = scratch(output)?;
     let codec: Checkpoint = format!("{}@{codec}", phonon::CODEC_REPO).parse()?;
     let catalog: Checkpoint = format!("{}@{voices}", phonon::VOICE_REPO).parse()?;
@@ -182,6 +190,23 @@ mod tests {
 mod phonon_tests {
     use hellas_client::model::{GpuDialect, ModelKind, ModelPackage, ModelRequest, evaluator};
     use std::path::PathBuf;
+
+    #[test]
+    fn repeated_or_unsafe_voices_are_refused_before_any_download() {
+        let commit = "ab".repeat(20);
+        let model = format!("org/model@{commit}").parse().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        for (names, message) in [
+            (["Easton", "easton"], "named twice"),
+            (["Easton", "../Zoey"], "invalid voice name"),
+        ] {
+            let names = names.map(String::from);
+            let error = super::phonon(&model, &commit, &commit, &names, &root.path().join("out"))
+                .unwrap_err();
+            assert!(error.to_string().contains(message), "{error}");
+        }
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
 
     /// Converts the published snapshots and checks every rendered call against
     /// the signatures of the compiled program.

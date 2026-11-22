@@ -1,5 +1,5 @@
 use super::*;
-use crate::model::{GpuDialect, ModelKind, ModelPackage, ModelRequest, ModelResponse};
+use crate::model::{GpuDialect, ModelKind, ModelPackage, ModelRequest};
 use hellas_rpc::protocol::invocation::output::Outcome;
 use std::io::Cursor;
 
@@ -153,5 +153,4 @@ fn output_descriptor_is_checked_and_only_valid_samples_enter_wav() {
         .artifacts
         .push(Artifact::new("extra", "catena.bytes.v1", vec![]));
     assert!(Speech::decode_mms(&extra).is_err());
-    let _response = ModelResponse::Speech(audio);
 }

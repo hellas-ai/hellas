@@ -29,10 +29,8 @@ const CODEC: &str = "codec";
 const VOICES: &str = "voices";
 /// A converted package holds the model's processor configuration here.
 pub(in crate::model) const MARKER: &str = "model/processor_config.json";
-const VOICE_WIDTH: u64 = 512;
-/// Samples per generated frame, and the F32 scratch `phonon.synthesize` takes.
-const FRAME_SAMPLES: u64 = 1920;
-const SCRATCH_BYTES: u64 = 2048 * 4;
+/// Bytes per frame of a converted BF16 voice.
+const VOICE_FRAME_BYTES: u64 = phonon::VOICE_CHANNELS as u64 * 2;
 /// Sampling is seeded; the speech API has no seed, so every request uses this.
 const SEED: u64 = 0;
 
@@ -70,22 +68,10 @@ fn voice_asset(name: &str) -> String {
 
 /// The frames of a converted voice, which must leave room for text.
 fn voice_frames(bytes: u64) -> Result<u64> {
-    let frames = bytes / (VOICE_WIDTH * 2);
-    ensure!(
-        frames > 0 && bytes == frames * VOICE_WIDTH * 2 && frames < phonon::CONTEXT as u64,
-        "invalid voice length"
-    );
-    // The text budget `phonon.setup` returns.
-    ensure!(
-        ((phonon::CONTEXT as u64 - 1 - frames) * 6).max(150) - 150 >= 31,
-        "voice leaves no room for text"
-    );
+    let frames = bytes / VOICE_FRAME_BYTES;
+    ensure!(bytes == frames * VOICE_FRAME_BYTES, "invalid voice length");
+    phonon::text_limit(usize::try_from(frames)?)?;
     Ok(frames)
-}
-
-fn bytes(binding: &Binding) -> u64 {
-    let elements = binding.names.len() as u64 * binding.shape.iter().product::<usize>() as u64;
-    elements * if binding.codec { 4 } else { 2 }
 }
 
 /// Byte ranges of the weight asset: each distinct binding once, in entry
@@ -97,7 +83,7 @@ struct Views {
     bytes: u64,
 }
 const LATENTS: [&str; 2] = [phonon::LATENT_STD, phonon::LATENT_MEAN];
-const LATENT_BYTES: u64 = 32 * 2;
+const LATENT_BYTES: u64 = phonon::LATENT as u64 * 2;
 
 fn entries(config: &Config) -> Result<[Vec<Binding>; 2]> {
     Ok([
@@ -122,7 +108,7 @@ fn views(entries: &[Vec<Binding>; 2]) -> Views {
         (offset, bytes)
     };
     let bindings = distinct(entries)
-        .map(|binding| (binding.names.clone(), place(bytes(binding))))
+        .map(|binding| (binding.names.clone(), place(binding.bytes() as u64)))
         .collect();
     let latents = [place(LATENT_BYTES), place(LATENT_BYTES)];
     Views {
@@ -329,7 +315,7 @@ impl Phonon {
             Arg::Asset {
                 name: voice_asset(voice),
                 offset: 0,
-                bytes: frames * VOICE_WIDTH * 2,
+                bytes: frames * VOICE_FRAME_BYTES,
             },
             Arg::U64(frames),
         ];
@@ -351,7 +337,7 @@ impl Phonon {
                 format!("waveform-{i:02}"),
                 format!("result-{i:02}"),
             );
-            let tokens = prompt.ids.len() as u64;
+            let tokens = prompt.ids.len();
             let [std, mean] = self.views.latents.map(|(offset, bytes)| Arg::Asset {
                 name: WEIGHTS.into(),
                 offset,
@@ -366,12 +352,12 @@ impl Phonon {
                 slot("cond"),
                 slot("time"),
                 Arg::Zeroed {
-                    bytes: SCRATCH_BYTES,
+                    bytes: phonon::SCRATCH as u64 * 4,
                 },
                 std,
                 mean,
                 Arg::U64(frames),
-                Arg::U64(tokens),
+                Arg::U64(tokens as u64),
                 Arg::U64(prompt.words as u64),
                 Arg::U64(SEED),
                 Arg::U64(i as u64),
@@ -395,7 +381,7 @@ impl Phonon {
                 Declared {
                     slot: waveform,
                     kind: OutputKind::Buffer {
-                        max_bytes: ((tokens + 6) * 25).div_ceil(6) * FRAME_SAMPLES * 4,
+                        max_bytes: phonon::waveform_samples(tokens) as u64 * 4,
                     },
                 },
             ]);
@@ -433,13 +419,14 @@ pub(super) fn decode(output: &InvocationOutput) -> Result<Audio> {
         bail!("expected a waveform and result per utterance");
     }
     for i in 0..utterances {
-        let result: Vec<u64> = artifact(format!("result-{i:02}"))?
-            .as_chunks::<8>()
-            .0
+        let (result, []) = artifact(format!("result-{i:02}"))?.as_chunks::<8>() else {
+            bail!("invalid speech result descriptor");
+        };
+        let result: Vec<u64> = result
             .iter()
             .map(|bytes| u64::from_le_bytes(*bytes))
             .collect();
-        let waveform = floats_f32(artifact(format!("waveform-{i:02}"))?);
+        let waveform = floats_f32(artifact(format!("waveform-{i:02}"))?)?;
         if i > 0 {
             samples.resize(samples.len() + phonon::PAUSE_SAMPLES, 0.);
         }

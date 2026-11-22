@@ -28,7 +28,7 @@ fn voice_names_and_catalog_files_cannot_leave_their_directory() {
 #[test]
 fn voices_must_be_whole_frames_that_leave_room_for_text() {
     assert_eq!(voice_frames(250 * 1024).unwrap(), 250);
-    for bytes in [0, 1023, 1025, 8192 * 1024, 8170 * 1024] {
+    for bytes in [0, 1023, 1025, 8192 * 1024, 8161 * 1024] {
         assert!(voice_frames(bytes).is_err(), "{bytes}");
     }
 }
@@ -73,6 +73,17 @@ fn utterances_are_joined_by_pauses_and_statuses_are_checked() {
         output(&[(&[f32::NAN], 1, 0)]),
     ] {
         assert!(decode(&invalid).is_err());
+    }
+    for (artifact, extra) in [(0, 8), (1, 1)] {
+        let mut ragged = output(&[(&[0.5], 1, 0)]);
+        let mut bytes = ragged.artifacts[artifact].bytes.as_bytes().to_vec();
+        bytes.resize(bytes.len() + extra, 0);
+        ragged.artifacts[artifact] = Artifact::new(
+            ragged.artifacts[artifact].name.clone(),
+            "catena.bytes.v1",
+            bytes,
+        );
+        assert!(decode(&ragged).is_err(), "{artifact}");
     }
     let mut missing = output(&[(&[0.5], 1, 0), (&[0.5], 1, 0)]);
     missing.artifacts.remove(2);

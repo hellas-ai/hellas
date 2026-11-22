@@ -273,7 +273,7 @@ impl Speech {
             "invalid speech sample count"
         );
         let waveform = artifact(WAVEFORM, tts::MAX_SAMPLES * 4)?;
-        let samples = floats_f32(&waveform[..count * 4]);
+        let samples = floats_f32(&waveform[..count * 4])?;
         ensure!(
             samples.iter().all(|x| x.is_finite()),
             "nonfinite speech waveform"
@@ -284,14 +284,11 @@ impl Speech {
         })
     }
 }
-fn floats_f32(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .copied()
-        .map(f32::from_le_bytes)
-        .collect()
+fn floats_f32(bytes: &[u8]) -> Result<Vec<f32>> {
+    let (floats, []) = bytes.as_chunks::<4>() else {
+        anyhow::bail!("waveform is not whole F32 samples");
+    };
+    Ok(floats.iter().copied().map(f32::from_le_bytes).collect())
 }
 
 #[cfg(test)]
