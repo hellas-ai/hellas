@@ -37,7 +37,7 @@ fn request(body: serde_json::Value) -> http_fetch::HttpFetchRequest {
         method: "POST".into(),
         headers: vec![],
         body_base64: STANDARD.encode(serde_json::to_vec(&body).unwrap()),
-        tls: r.tls,
+        tls: Some(r.tls),
         max_response_bytes: r.max_response_bytes,
     }
 }
@@ -88,7 +88,7 @@ fn signed_template_is_exact_and_only_client_repairs_generation() {
         match field {
             0 => altered.url = "https://elsewhere.lan/v1/chat/completions".into(),
             1 => altered.method = "GET".into(),
-            2 => altered.tls.roots = http_fetch::HttpTrustRoots::WebPki,
+            2 => altered.tls.as_mut().unwrap().roots = http_fetch::HttpTrustRoots::WebPki,
             _ => altered
                 .headers
                 .push(("authorization".into(), "caller-key".into())),

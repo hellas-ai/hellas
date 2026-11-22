@@ -1,4 +1,4 @@
-//! A generic HTTPS driver. The URL and TLS contract are in the signed input;
+//! A generic HTTP driver. The URL and TLS contract are in the signed input;
 //! provider credentials are origin-scoped and held in memory.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -39,6 +39,7 @@ const IDLE: Duration = Duration::from_secs(90);
 #[derive(Clone, Debug, Default)]
 pub struct HttpEgressPolicy {
     pub allowed_hosts: Vec<String>,
+    pub plain_http_hosts: Vec<String>,
     pub allow_private_addresses: bool,
 }
 
@@ -84,7 +85,7 @@ impl HttpFetchProvider {
         if policy.allow_private_addresses && policy.allowed_hosts.is_empty() {
             return Err(fault("private egress requires an explicit host allowlist"));
         }
-        for host in &policy.allowed_hosts {
+        for host in policy.allowed_hosts.iter().chain(&policy.plain_http_hosts) {
             let parsed = Url::parse(&format!("https://{host}/"))
                 .map_err(|_| fault("invalid egress host"))?;
             if parsed.host_str() != Some(host)
@@ -184,7 +185,11 @@ impl HttpFetchProvider {
         // A caller-controlled CA could impersonate the allowed origin and
         // steal its credential. Only the operator selects this trust boundary;
         // additional caller pins can narrow it, never replace its roots.
-        if request.tls.roots != credential.trust_roots {
+        let tls = request
+            .tls
+            .as_ref()
+            .ok_or_else(|| fault("credentials require HTTPS"))?;
+        if tls.roots != credential.trust_roots {
             return Err(fault("credential trust roots mismatch"));
         }
         if request
@@ -201,8 +206,8 @@ impl HttpFetchProvider {
         &self,
         prepared: PreparedFetchRequest,
     ) -> Result<FetchProviderResponse, FetchProviderError> {
-        let request = HttpFetchRequest::decode(prepared.body.as_bytes())
-            .map_err(|_| fault("invalid HTTPS request"))?;
+        let request =
+            HttpFetchRequest::decode(prepared.body.as_bytes()).map_err(|error| fault(error.0))?;
         let url = request
             .parsed_url()
             .map_err(|_| fault("invalid HTTPS URL"))?;
@@ -215,6 +220,15 @@ impl HttpFetchProvider {
                 .any(|allowed| allowed == host)
         {
             return Err(fault("HTTPS host is outside the egress policy"));
+        }
+        if url.scheme() == "http"
+            && !self
+                .policy
+                .plain_http_hosts
+                .iter()
+                .any(|allowed| allowed == host)
+        {
+            return Err(fault("HTTP host is outside the plaintext egress policy"));
         }
         let credential = self.credential(&request, &url)?;
         let port = url

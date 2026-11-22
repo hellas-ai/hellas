@@ -3,7 +3,12 @@ use super::{fault, tls};
 use hellas_executor::FetchProviderError;
 use hellas_rpc::http_fetch::{HttpFetchRequest, HttpTls};
 use reqwest::{Client, Url};
-use std::{collections::VecDeque, net::SocketAddr, sync::Mutex, time::Duration};
+use std::{
+    collections::VecDeque,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 const MAX_CLIENTS: usize = 32;
 
@@ -11,7 +16,7 @@ const MAX_CLIENTS: usize = 32;
 struct Key {
     origin: String,
     addresses: Vec<SocketAddr>,
-    tls: HttpTls,
+    tls: Option<HttpTls>,
 }
 
 #[derive(Debug, Default)]
@@ -52,7 +57,17 @@ impl Clients {
             .pool_idle_timeout(Duration::from_secs(90))
             .pool_max_idle_per_host(4)
             .resolve_to_addrs(url.host_str().expect("validated HTTPS URL"), &key.addresses)
-            .tls_backend_preconfigured(tls::config(&key.tls).map_err(fault)?)
+            .https_only(key.tls.is_some())
+            .tls_backend_preconfigured(match &key.tls {
+                Some(settings) => tls::config(settings).map_err(fault)?,
+                None => rustls::ClientConfig::builder_with_provider(Arc::new(
+                    rustls::crypto::ring::default_provider(),
+                ))
+                .with_safe_default_protocol_versions()
+                .map_err(|_| fault("TLS versions unavailable"))?
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth(),
+            })
             .build()
             .map_err(|_| fault("HTTPS client initialization failed"))?;
         let mut entries = self.0.lock().unwrap();

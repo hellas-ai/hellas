@@ -12,6 +12,8 @@ pub struct HttpProviderConfig {
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
     #[serde(default)]
+    pub plain_http_hosts: Vec<String>,
+    #[serde(default)]
     pub allow_private_addresses: bool,
     #[serde(default)]
     pub credentials: Vec<HttpCredentialConfig>,
@@ -313,6 +315,7 @@ impl HttpProviderConfig {
         let provider = HttpFetchProvider::new(
             HttpEgressPolicy {
                 allowed_hosts: self.allowed_hosts,
+                plain_http_hosts: self.plain_http_hosts,
                 allow_private_addresses: self.allow_private_addresses,
             },
             credentials,

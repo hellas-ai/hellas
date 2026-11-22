@@ -798,19 +798,25 @@ impl FetchArgs {
                     .collect::<super::CliResult<_>>()?,
             }
         };
-        let request = HttpFetchRequest {
+        let mut request = HttpFetchRequest {
             url: self.url.clone(),
             method: self.method.clone(),
             headers,
             body_base64: STANDARD.encode(body),
-            tls: HttpTls {
-                roots,
-                spki_sha256: self.spki_sha256.clone(),
-            },
+            tls: None,
             max_response_bytes: self
                 .max_response_bytes
                 .unwrap_or(hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES),
         };
+        if request.parsed_url()?.scheme() == "https"
+            || !self.tls_roots.is_empty()
+            || !self.spki_sha256.is_empty()
+        {
+            request.tls = Some(HttpTls {
+                roots,
+                spki_sha256: self.spki_sha256.clone(),
+            });
+        }
         request.validate()?;
         Ok(request)
     }

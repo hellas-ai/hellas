@@ -687,3 +687,15 @@ fn multiple_policy_offers_require_and_honor_explicit_resource_selection() {
         policies[0].resource
     );
 }
+
+#[test]
+fn fetch_selects_transport_from_the_parsed_scheme_and_rejects_plaintext_tls_flags() {
+    for url in ["http://example.test/path", "HTTP://example.test/path"] {
+        let mut args = fetch_args(&[]);
+        args.url = url.into();
+        assert!(args.request().unwrap().tls.is_none());
+        args.spki_sha256 = vec!["00".repeat(32)];
+        assert!(args.request().is_err());
+    }
+    assert!(fetch_args(&[]).request().unwrap().tls.is_some());
+}

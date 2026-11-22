@@ -65,10 +65,10 @@ impl Document {
                                 path: crate::gateway_work::http_route_path(upstream_path).into(),
                                 method: "POST".into(),
                                 url: format!("{origin}{upstream_path}"),
-                                tls: HttpTls {
+                                tls: Some(HttpTls {
                                     roots: api.trust_roots.clone(),
                                     spki_sha256: vec![],
-                                },
+                                }),
                                 headers: vec![],
                                 max_response_bytes: hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES,
                                 models: Some(vec![model.into()]),
@@ -150,6 +150,7 @@ impl Upstream {
         let base = parsed.path().trim_end_matches('/');
         let base = base.strip_suffix("/v1").unwrap_or(base);
         Ok(Self::Http {
+            plain_http_hosts: vec![],
             allowed_hosts: vec![parsed.host_str().ok_or("upstream has no host")?.into()],
             allow_private_addresses: false,
             credentials: vec![Credential {
