@@ -1,133 +1,21 @@
 //! Whisper preprocessing and model bytes stay on the caller's side of Compute.
-use super::package::ComputeJob;
+use super::{native::Native, package::ComputeJob};
 use anyhow::{Context, Result, bail, ensure};
 use catena_models::{
-    weights::{Weights, f32_to_bf16},
-    whisper::{Config, Generation, audio, graph, weight_shapes},
+    weights::preparation::Binding,
+    whisper::{Config, Generation, audio, setup},
 };
-use hellas_rpc::{
-    ContentRef,
-    protocol::invocation::{Artifact, compute::*, output::InvocationOutput},
-};
+use hellas_rpc::protocol::invocation::{Artifact, compute::*, output::InvocationOutput};
 use hellas_store::content::{LocalStore, Scope};
-use std::{
-    collections::BTreeMap,
-    fs::File,
-    io::{BufWriter, Write},
-    path::Path,
-};
+use std::sync::Arc;
 
-pub const WEIGHTS_FILE: &str = "weights.bf16";
+pub const CHECKPOINT: [&str; 4] = [
+    "config.json",
+    "generation_config.json",
+    "tokenizer.json",
+    "model.safetensors",
+];
 pub const OUTPUT: &str = "transcription";
-pub(super) const MAX_METADATA_BYTES: usize = 64 << 20;
-pub(super) const METADATA: [&str; 3] = ["config.json", "generation_config.json", "tokenizer.json"];
-/// The published checkpoint files [`convert_whisper`] reads.
-pub const CHECKPOINT: [&str; 4] = [METADATA[0], METADATA[1], METADATA[2], "model.safetensors"];
-
-fn metadata(dir: &Path) -> Result<(Config, Generation, tokenizers::Tokenizer)> {
-    let read =
-        |name| hellas_private::read_bounded_regular_file(&dir.join(name), MAX_METADATA_BYTES);
-    let config: Config = serde_json::from_slice(&read(METADATA[0])?)?;
-    config.validate()?;
-    let generation: Generation = serde_json::from_slice(&read(METADATA[1])?)?;
-    generation.validate(&config)?;
-    let tokenizer =
-        tokenizers::Tokenizer::from_bytes(read(METADATA[2])?).map_err(anyhow::Error::msg)?;
-    ensure!(
-        tokenizer.get_vocab_size(true) == config.vocab_size,
-        "tokenizer vocabulary does not match model"
-    );
-    Ok((config, generation, tokenizer))
-}
-
-// The public graph lists specify the call ABI; offsets always refer to the
-// once-converted, all-BF16 asset.
-fn tensors(config: &Config) -> Result<Vec<(String, Vec<usize>)>> {
-    let shapes: BTreeMap<_, _> = weight_shapes(config).into_iter().collect();
-    graph::encoder_names(config)
-        .into_iter()
-        .chain(graph::cross_names(config))
-        .chain(graph::decoder_names(config))
-        .map(|name| {
-            let shape = shapes
-                .get(&name)
-                .with_context(|| format!("unknown Whisper weight {name}"))?
-                .clone();
-            Ok((name, shape))
-        })
-        .collect()
-}
-fn views(config: &Config) -> Result<Vec<(u64, u64)>> {
-    let mut offset = 0u64;
-    tensors(config)?
-        .into_iter()
-        .map(|(_, shape)| {
-            let bytes = shape
-                .into_iter()
-                .try_fold(2u64, |n, dim| n.checked_mul(dim as u64))
-                .context("weight size overflow")?;
-            let start = offset;
-            offset = offset
-                .checked_add(bytes)
-                .context("weight offset overflow")?;
-            Ok((start, bytes))
-        })
-        .collect()
-}
-
-pub(super) fn validate_metadata(dir: &Path, object: ContentRef) -> Result<()> {
-    let (config, _, _) = metadata(dir)?;
-    validate_weight_length(&views(&config)?, object)
-}
-
-fn validate_weight_length(views: &[(u64, u64)], object: ContentRef) -> Result<()> {
-    let (offset, bytes) = views.last().context("model has no weights")?;
-    ensure!(
-        object.bytes() == offset + bytes,
-        "derived weight file has wrong length"
-    );
-    Ok(())
-}
-
-/// Convert a published local checkpoint into a client package directory. The
-/// derived weight file is an ordinary content-addressed provider asset.
-pub fn convert_whisper(checkpoint: &Path, destination: &Path) -> Result<ContentRef> {
-    ensure!(!destination.exists(), "destination already exists");
-    let (config, _, _) = metadata(checkpoint)?;
-    let weights = Weights::open(&checkpoint.join("model.safetensors"))?;
-    catena_models::whisper::validate_weights(&weights, &config)?;
-    let parent = destination
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let staging = tempfile::Builder::new()
-        .prefix(".whisper-")
-        .tempdir_in(parent)?;
-    let path = staging.path().join(WEIGHTS_FILE);
-    let mut file = BufWriter::new(File::create(&path)?);
-    for (name, shape) in tensors(&config)? {
-        weights.validate(&name, &shape)?;
-        let values = weights.host_f32(&name)?;
-        let as_is = weights.tensors[&name].dtype == safetensors::Dtype::BF16;
-        for value in values {
-            let bits = if as_is {
-                (value.to_bits() >> 16) as u16
-            } else {
-                f32_to_bf16(value)
-            };
-            file.write_all(&bits.to_le_bytes())?;
-        }
-    }
-    file.flush()?;
-    file.get_ref().sync_all()?;
-    drop(file);
-    for name in METADATA {
-        std::fs::copy(checkpoint.join(name), staging.path().join(name))?;
-    }
-    let object = hellas_store::content::file_content(&path)?;
-    std::fs::rename(staging.path(), destination)?;
-    Ok(object)
-}
 
 pub(super) struct Whisper {
     config: Config,
@@ -135,7 +23,8 @@ pub(super) struct Whisper {
     tokenizer: tokenizers::Tokenizer,
     environment: Environment,
     content: (LocalStore, Scope),
-    views: Vec<(u64, u64)>,
+    setup: Option<Call>,
+    weights: Vec<Arg>,
 }
 #[derive(Debug, serde::Serialize)]
 pub struct Transcription {
@@ -145,32 +34,59 @@ pub struct Transcription {
     pub truncated: bool,
 }
 impl Whisper {
-    pub async fn open(dir: &Path, dialect: super::GpuDialect, object: ContentRef) -> Result<Self> {
-        let dir = dir.to_owned();
-        let (config, generation, tokenizer, views, object, source) =
+    pub async fn open(source: Arc<Native>, dialect: super::GpuDialect) -> Result<Self> {
+        let (config, generation, tokenizer, setup, weights, bundle, assets) =
             tokio::task::spawn_blocking(move || -> Result<_> {
-                let (config, generation, tokenizer) = metadata(&dir)?;
-                let views = views(&config)?;
-                validate_weight_length(&views, object)?;
-                let source = super::program::render(&graph::bundle(&config, false)?, dialect)?;
-                Ok((config, generation, tokenizer, views, object, source))
+                let dir = source.dir();
+                let config = Config::read(dir)?;
+                let generation = Generation::read(dir, &config)?;
+                let tokenizer = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json"))
+                    .map_err(anyhow::Error::msg)?;
+                ensure!(
+                    tokenizer.get_vocab_size(true) == config.vocab_size,
+                    "tokenizer vocabulary does not match model"
+                );
+                let program = setup::program(&config, false, |name, shape| {
+                    let tensor = source.tensor("model.safetensors", name)?;
+                    ensure!(tensor.shape == shape, "unexpected Whisper shape for {name}");
+                    Ok((tensor.arg.clone(), tensor.dtype))
+                })?;
+                let slot = |index| format!("weight-{index}");
+                let setup = (!program.inputs.is_empty()).then(|| Call {
+                    entry: setup::ENTRY.into(),
+                    bind: (0..program.inputs.len())
+                        .map(|i| Bind::Name(slot(i)))
+                        .collect(),
+                    args: program.inputs,
+                });
+                let weights = program
+                    .weights
+                    .into_iter()
+                    .map(|w| match w {
+                        Binding::Asset(arg) => arg,
+                        Binding::Prepared(i) => Arg::Slot { name: slot(i) },
+                    })
+                    .collect();
+                Ok((
+                    config,
+                    generation,
+                    tokenizer,
+                    setup,
+                    weights,
+                    super::program::render(&program.source, dialect)?,
+                    source.assets(),
+                ))
             })
             .await??;
-        let (environment, content) = super::program::environment(
-            &source,
-            vec![NamedAsset {
-                name: "weights".into(),
-                object,
-            }],
-        )
-        .await?;
+        let (environment, content) = super::program::environment(&bundle, assets).await?;
         Ok(Self {
             config,
             generation,
             tokenizer,
             environment,
             content,
-            views,
+            setup,
+            weights,
         })
     }
     pub(super) fn environment(&self) -> &Environment {
@@ -226,21 +142,19 @@ impl Whisper {
             input("text-mask"),
             input("begin-mask"),
         ];
-        args.extend(self.views.iter().map(|&(offset, bytes)| Arg::Asset {
-            name: "weights".into(),
-            offset,
-            bytes,
-        }));
+        args.extend_from_slice(&self.weights);
+        let mut calls = Vec::from_iter(self.setup.iter().cloned());
+        calls.push(Call {
+            entry: "whisper.transcribe".into(),
+            args,
+            bind: vec![Bind::Name(OUTPUT.into())],
+        });
         Ok(ComputeJob {
             environment: self.environment.clone(),
             content: self.content.clone(),
             inputs,
             plan: Plan {
-                calls: vec![Call {
-                    entry: "whisper.transcribe".into(),
-                    args,
-                    bind: vec![Bind::Name(OUTPUT.into())],
-                }],
+                calls,
                 step: None,
                 outputs: vec![Declared {
                     slot: OUTPUT.into(),

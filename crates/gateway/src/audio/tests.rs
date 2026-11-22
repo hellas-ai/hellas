@@ -37,7 +37,8 @@ impl WorkExecutionBackend for Fake {
     ) -> Result<WorkOutputStream<ComputeEvent>, WorkGatewayError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.started.notify_one();
-        assert_eq!(job.plan.calls[0].entry, "whisper.transcribe");
+        assert_eq!(job.plan.calls[0].entry, "whisper.setup");
+        assert_eq!(job.plan.calls[1].entry, "whisper.transcribe");
         assert!(job.plan.step.is_none());
         assert_eq!(
             job.inputs

@@ -17,11 +17,9 @@ This installs the portable client. GPU machines run the `ghcr.io/hellas-ai/hella
 or `:cuda` image, or the [NixOS module](docs/nix.md).
 
 A pinned Hub reference lets the client read the model metadata and the provider
-acquire the matching weights. This walkthrough uses a published Qwen GGUF and
-a converted Whisper tiny package. Prepare Whisper and a sample recording:
+acquire the matching weights. This walkthrough uses a published Qwen GGUF and the original Whisper tiny weights. Download the sample recording.
 
 ```sh
-hellas convert-whisper openai/whisper-tiny@169d4a4341b33bc18d8881c4b69c2e104e1cc0af -o whisper-tiny
 curl -fLo speech.wav https://raw.githubusercontent.com/ggml-org/whisper.cpp/b0a11594aec50892a02cd8d129eee2dfe93a8bb8/samples/jfk.wav
 ```
 
@@ -30,7 +28,7 @@ curl -fLo speech.wav https://raw.githubusercontent.com/ggml-org/whisper.cpp/b0a1
 On a GPU machine, one command serves both models. Hellas prints each model, API path and backend at startup.
 
 ```sh
-hellas gateway --model hf://ggml-org/Qwen3-0.6B-GGUF@afe8ad3577aa22500b3cd1c880f153b3b0e1cae8/Qwen3-0.6B-BF16.gguf --model ./whisper-tiny --wrap claude
+hellas gateway --model hf://ggml-org/Qwen3-0.6B-GGUF@afe8ad3577aa22500b3cd1c880f153b3b0e1cae8/Qwen3-0.6B-BF16.gguf --model hf://unsloth/whisper-tiny@34457cb234c8624f23ac716000773b367000df6e --wrap claude
 ```
 
 `--wrap` gives the child its OpenAI and Anthropic URLs and a private bearer,
@@ -69,7 +67,7 @@ the models it will serve:
 
 ```sh
 hellas pair "$INVITE" --name mine
-hellas route add "$PWD/whisper-tiny"
+hellas route add hf://unsloth/whisper-tiny@34457cb234c8624f23ac716000773b367000df6e
 hellas route add hf://ggml-org/Qwen3-0.6B-GGUF@afe8ad3577aa22500b3cd1c880f153b3b0e1cae8/Qwen3-0.6B-BF16.gguf
 hellas routes
 ```
@@ -89,7 +87,7 @@ hellas share --to "$FRIEND_CONTACT" --resource Qwen3-0.6B-BF16 --limit requests:
 ```
 
 Your friend imports it under a contact name and renders requests from their
-pinned model reference or a [metadata-only descriptor](docs/http-gateway.md#model-packages-and-descriptors):
+[pinned model reference](docs/http-gateway.md#model-sources).
 
 ```sh
 hellas pair friend.access --name alice
@@ -106,13 +104,13 @@ programs you trust. See [node administration](docs/admin.md).
 The same packages work with the job commands. On your GPU:
 
 ```sh
-hellas transcribe --model whisper-tiny --audio speech.wav --local
+hellas transcribe --model hf://unsloth/whisper-tiny@34457cb234c8624f23ac716000773b367000df6e --audio speech.wav --local
 ```
 
 Or use a friend's access bundle and their GPU evaluator:
 
 ```sh
-hellas transcribe --model whisper-tiny --audio speech.wav --access friend.access \
+hellas transcribe --model hf://unsloth/whisper-tiny@34457cb234c8624f23ac716000773b367000df6e --audio speech.wav --access friend.access \
   --backend hellas/catena-dfad87438018-hip
 ```
 
@@ -120,7 +118,7 @@ A paid job uses devnet coins and checks the quoted price before signing:
 
 ```sh
 hellas faucet
-hellas transcribe --model whisper-tiny --audio speech.wav --pay 20 \
+hellas transcribe --model hf://unsloth/whisper-tiny@34457cb234c8624f23ac716000773b367000df6e --audio speech.wav --pay 20 \
   --provider "$DEVNET_PROVIDER" --backend hellas/catena-dfad87438018-hip
 ```
 

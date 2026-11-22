@@ -179,7 +179,7 @@ impl Speech {
                     let (m, s) = omnivoice::OmniVoice::open(&source, dialect)?;
                     (Model::OmniVoice(Box::new(m)), s)
                 }
-                super::native::Kind::Flux => unreachable!(),
+                super::native::Kind::Flux | super::native::Kind::Whisper => unreachable!(),
             };
             Ok((
                 model,

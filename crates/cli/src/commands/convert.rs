@@ -65,20 +65,6 @@ fn scratch(output: &Path) -> CliResult<tempfile::TempDir> {
         })
 }
 
-pub fn whisper(checkpoint: &Checkpoint, output: &Path) -> CliResult<()> {
-    let scratch = scratch(output)?;
-    checkpoint.fetch(scratch.path(), hellas_client::model::whisper::CHECKPOINT)?;
-    let object = hellas_client::model::whisper::convert_whisper(scratch.path(), output)?;
-    println!(
-        "weights: {} ({} bytes), {}",
-        object.id(),
-        object.bytes(),
-        output
-            .join(hellas_client::model::whisper::WEIGHTS_FILE)
-            .display()
-    );
-    Ok(())
-}
 pub fn speech(checkpoint: &Checkpoint, output: &Path) -> CliResult<()> {
     let scratch = scratch(output)?;
     checkpoint.fetch(scratch.path(), hellas_client::model::speech::CHECKPOINT)?;

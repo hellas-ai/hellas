@@ -34,7 +34,7 @@ from its local checkpoint or pinned Hub source; `run` and `transact --job` read 
 through `--content PATH` or `--content-config`. `--timeout` bounds it like any other job.
 
 ```sh
-hellas transcribe --model ./whisper-tiny --audio speech.wav --local
+hellas transcribe --model hf://unsloth/whisper-tiny@34457cb234c8624f23ac716000773b367000df6e --audio speech.wav --local
 hellas text --model hf://ggml-org/Qwen3-0.6B-GGUF@afe8ad3577aa22500b3cd1c880f153b3b0e1cae8/Qwen3-0.6B-BF16.gguf --prompt 'Why is the sky blue?' --local
 ```
 

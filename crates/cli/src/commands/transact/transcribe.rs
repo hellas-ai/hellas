@@ -5,8 +5,8 @@ use hellas_client::model::{ModelPackage, ModelRequest, ModelResponse, wav};
 pub struct TranscribeArgs {
     #[command(flatten)]
     client: ClientArgs,
-    /// Converted Whisper package or descriptor directory.
-    #[arg(long, value_name = "DIR")]
+    /// Original Whisper checkpoint directory or pinned Hub reference.
+    #[arg(long, value_name = "MODEL")]
     model: PathBuf,
     #[arg(long, value_name = "WAV")]
     audio: PathBuf,

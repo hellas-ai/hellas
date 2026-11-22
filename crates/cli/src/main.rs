@@ -165,14 +165,6 @@ enum Commands {
     Fetch(commands::transact::FetchArgs),
     /// Buy one call of a Catena program using the same job and payment path.
     Run(commands::transact::RunArgs),
-    /// Fetch a published Whisper checkpoint and convert it into a model
-    /// package, e.g. `openai/whisper-tiny@COMMIT`.
-    ConvertWhisper {
-        /// `ORG/NAME@COMMIT`, pinned to a 40-hex commit.
-        checkpoint: commands::convert::Checkpoint,
-        #[arg(short = 'o', long, value_name = "DIR")]
-        output: PathBuf,
-    },
     /// Fetch and convert a pinned MMS English checkpoint.
     ConvertSpeech {
         /// `ORG/NAME@COMMIT`, pinned to a 40-hex commit.
@@ -414,15 +406,6 @@ async fn async_main() {
             }
             return;
         }
-        Commands::ConvertWhisper { checkpoint, output } => {
-            let result = commands::convert::whisper(&checkpoint, &output);
-            tracer_provider.shutdown();
-            if let Err(error) = result {
-                eprintln!("error: {error:#}");
-                std::process::exit(1);
-            }
-            return;
-        }
         Commands::ConvertSpeech { checkpoint, output } => {
             let result = commands::convert::speech(&checkpoint, &output);
             tracer_provider.shutdown();
@@ -589,10 +572,7 @@ async fn async_main() {
         }
         Commands::Text(args) => async { commands::transact::text(args, job_home()?).await }.await,
         Commands::Image(args) => async { commands::transact::image(args, job_home()?).await }.await,
-        Commands::ConvertWhisper { .. }
-        | Commands::ConvertSpeech { .. }
-        | Commands::Model { .. }
-        | Commands::Program { .. } => {
+        Commands::ConvertSpeech { .. } | Commands::Model { .. } | Commands::Program { .. } => {
             unreachable!("model commands handled before identity load")
         }
         Commands::Trust(args) => commands::trust::run(args),

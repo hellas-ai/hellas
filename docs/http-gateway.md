@@ -7,7 +7,7 @@ grants and API upstreams can appear together:
 ```sh
 hellas gateway \
   --model hf://ggml-org/Qwen3-0.6B-GGUF@afe8ad3577aa22500b3cd1c880f153b3b0e1cae8/Qwen3-0.6B-BF16.gguf \
-  --model ./whisper-tiny \
+  --model hf://unsloth/whisper-tiny@34457cb234c8624f23ac716000773b367000df6e \
   --model hf://black-forest-labs/FLUX.2-klein-4B@e7b7dc27f91deacad38e78976d1f2b499d76a294 \
   --model hf://ggml-org/Qwen3-0.6B-GGUF@afe8ad3577aa22500b3cd1c880f153b3b0e1cae8/Qwen3-0.6B-BF16.gguf@alice \
   --upstream openrouter=https://openrouter.ai/api,key-file="$HOME/or.key" \
@@ -15,8 +15,7 @@ hellas gateway \
 ```
 
 The gateway serves local or pinned GGUF text and decision models, original
-OmniVoice, Flux and Phonon checkpoints, and converted Whisper or MMS packages
-and descriptors. It discovers the modality and API paths from the model.
+Whisper, OmniVoice, Flux and Phonon checkpoints, and converted MMS packages and descriptors. It discovers the modality and API paths from the model.
 Append `@CONTACT` to a model path or pinned URI to use a remote Compute grant. A Fetch
 grant uses `NAME@CONTACT`, checked against the models in its signed offer.
 Import contacts and access with `hellas pair … --name CONTACT`. For an App
@@ -25,7 +24,7 @@ Attest provider, independently approve its pins under the same contact name:
 --expected-revision 0 --reason REASON` (use `~/.hellas/trust` for the default
 home). The bundle cannot approve or replace those pins.
 
-## Model packages and descriptors
+## Model sources
 
 For a GGUF, give the gateway a pinned Hub reference. Append the contact name to run on a grant provider:
 
@@ -35,12 +34,14 @@ hellas gateway --model hf://LiquidAI/LFM3-1.7B-GGUF@cd0c74c575b5c416f3011b5b4c29
 
 The gateway reads the GGUF header for the tokenizer, template and tensor ranges. The provider acquires and verifies the weight file. Local GGUF paths also work.
 
-A converted Whisper or MMS package can supply a metadata-only descriptor for remote execution. It contains the tokenizer and model configuration and a `descriptor.json` naming the verified weights.
+Whisper clients read the tokenizer, generation settings and safetensors header. The provider verifies the original weight file and prepares the selected tensors on its GPU. You can also select a local directory containing the original checkpoint files.
 
 ```sh
-hellas model describe ./whisper-tiny -o ./whisper-remote
-hellas gateway --model ./whisper-remote@alice
+hellas gateway --model hf://unsloth/whisper-tiny@34457cb234c8624f23ac716000773b367000df6e@alice
+hellas program hf://MisterCD/whisper-small@98533e05a8a8d670fa562f13392b78841424f44f --backend hellas/catena-dfad87438018-cuda
 ```
+
+An MMS package can also supply a metadata-only descriptor for remote speech. See [speech](speech.md).
 
 ## Upstreams and HTTP access
 
@@ -81,7 +82,7 @@ client. The bearer changes on restart.
 For repeatable startup, both forms accept `--config PATH`:
 
 ```toml
-models = ["/srv/models/qwen3.gguf", "/srv/models/whisper-tiny", "gpt-5@api"]
+models = ["/srv/models/qwen3.gguf", "hf://unsloth/whisper-tiny@34457cb234c8624f23ac716000773b367000df6e", "gpt-5@api"]
 
 [upstreams.api]
 url = "https://api.example.com/v1"
@@ -106,9 +107,7 @@ behavior; it does not journal routing configuration.
 The TOML schema is the SDK's daemon document (`listeners`, `backends`, `routes`,
 `resources`, `machine`, `budgets`, `limits`, `execution`), plus `models`,
 `upstreams` and optional `paid_policy`. Models and upstreams are resolved into
-that document with the same logic as route/backend edits. Paths name prepared
-local packages or descriptors; conversion and acquisition remain separate
-commands. Multiple local model routes share a serialized executor for each
+that document with the same logic as route/backend edits. Use a pinned Hub URI or a local model path. MMS also accepts a converted package or its descriptor. Multiple local model routes share a serialized executor for each
 evaluator, rather than running GPU jobs concurrently.
 
 `execution.queue_capacity`, `execution.session_programs` and

@@ -19,6 +19,7 @@ use std::{
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Kind {
+    Whisper,
     Flux,
     OmniVoice,
     Phonon,
@@ -56,6 +57,18 @@ impl Origin {
             Some(Kind::OmniVoice)
         } else if self.has(phonon::TOKENIZER)? || self.has("model/processor_config.json")? {
             Some(Kind::Phonon)
+        } else if self.has("model.safetensors")? && self.has("config.json")? {
+            #[derive(serde::Deserialize)]
+            struct Config {
+                model_type: Option<String>,
+            }
+            match serde_json::from_slice::<Config>(&self.metadata("config.json")?)?
+                .model_type
+                .as_deref()
+            {
+                Some("whisper") => Some(Kind::Whisper),
+                _ => None,
+            }
         } else {
             None
         })
@@ -176,6 +189,11 @@ impl Snapshot {
             voices: BTreeMap::new(),
         };
         match kind {
+            Kind::Whisper => {
+                for &key in &super::whisper::CHECKPOINT {
+                    result.add(&origin, "", key)?;
+                }
+            }
             Kind::OmniVoice => {
                 for &key in omnivoice::FILES {
                     result.add(&origin, "", key)?;

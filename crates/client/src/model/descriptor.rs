@@ -1,5 +1,5 @@
 //! A model's native metadata and the identity of its separately held weights.
-use super::{ModelKind, gguf, native, qwen3, speech, whisper};
+use super::{ModelKind, gguf, native, qwen3, speech};
 use anyhow::{Context, Result, bail, ensure};
 use hellas_rpc::ContentRef;
 use serde::{Deserialize, Serialize};
@@ -20,8 +20,6 @@ struct Descriptor {
 #[derive(Clone, Copy)]
 pub(super) enum Layout {
     Gguf,
-    Whisper,
-    WhisperDescriptor,
     Speech,
     SpeechDescriptor,
     Native(native::Kind),
@@ -62,10 +60,6 @@ pub(super) enum Resolved {
     Gguf {
         path: Arc<GgufPath>,
         header: Arc<gguf::Header>,
-        weights: ContentRef,
-    },
-    Whisper {
-        path: PathBuf,
         weights: ContentRef,
     },
     Speech {
@@ -208,7 +202,7 @@ pub(super) fn classify(path: &Path) -> Result<Layout> {
         "model package is not a regular file or directory"
     );
     let manifest = path.join(MANIFEST).try_exists()?;
-    let weights = path.join(whisper::WEIGHTS_FILE).try_exists()?;
+    let weights = path.join(speech::WEIGHTS_FILE).try_exists()?;
     if let Some(kind) = native::Origin::Local(path.to_owned()).kind()? {
         ensure!(
             !manifest && !weights,
@@ -216,9 +210,6 @@ pub(super) fn classify(path: &Path) -> Result<Layout> {
         );
         return Ok(Layout::Native(kind));
     }
-    let whisper = whisper::METADATA.iter().try_fold(false, |found, name| {
-        Ok::<_, std::io::Error>(path.join(name).try_exists()? || found)
-    })?;
     let speech = speech::METADATA[1..]
         .iter()
         .try_fold(false, |found, name| {
@@ -244,15 +235,7 @@ pub(super) fn classify(path: &Path) -> Result<Layout> {
             Layout::Speech
         });
     }
-    if manifest {
-        ensure!(whisper, "descriptor.json requires GGUF or Whisper metadata");
-        return Ok(Layout::WhisperDescriptor);
-    }
-    ensure!(
-        whisper && weights,
-        "Whisper package requires metadata and weights.bf16"
-    );
-    Ok(Layout::Whisper)
+    bail!("unrecognized model checkpoint")
 }
 
 impl Layout {
@@ -265,19 +248,19 @@ impl Layout {
                     ModelKind::Text
                 }
             }
-            Self::Whisper | Self::WhisperDescriptor => ModelKind::Transcription,
+            Self::Native(native::Kind::Whisper) => ModelKind::Transcription,
             Self::Native(native::Kind::Flux) => ModelKind::Image,
             Self::Speech | Self::SpeechDescriptor | Self::Native(_) => ModelKind::Speech,
         })
     }
     pub(super) fn is_descriptor(self) -> bool {
-        matches!(self, Self::WhisperDescriptor | Self::SpeechDescriptor)
+        matches!(self, Self::SpeechDescriptor)
     }
     pub(super) fn weights_path(self, path: &Path) -> Option<PathBuf> {
         match self {
             Self::Gguf => Some(path.to_owned()),
-            Self::Whisper | Self::Speech => Some(path.join(whisper::WEIGHTS_FILE)),
-            Self::WhisperDescriptor | Self::SpeechDescriptor | Self::Native(_) => None,
+            Self::Speech => Some(path.join(speech::WEIGHTS_FILE)),
+            Self::SpeechDescriptor | Self::Native(_) => None,
         }
     }
     pub(super) fn resolve(self, path: &Path, inspected: Option<ContentRef>) -> Result<Resolved> {
@@ -290,14 +273,6 @@ impl Layout {
                     path,
                 )?)?),
                 weights: weights(path)?,
-            }),
-            Self::Whisper => Ok(Resolved::Whisper {
-                path: path.to_owned(),
-                weights: weights(&path.join(whisper::WEIGHTS_FILE))?,
-            }),
-            Self::WhisperDescriptor => Ok(Resolved::Whisper {
-                path: path.to_owned(),
-                weights: read_weights(path)?,
             }),
             Self::Speech => Ok(Resolved::Speech {
                 path: path.to_owned(),
@@ -327,20 +302,6 @@ pub(super) fn describe(path: &Path, output: &Path) -> Result<ContentRef> {
     ensure!(!output.try_exists()?, "destination already exists");
     match classify(path)? {
         Layout::Gguf => bail!("use a pinned hf:// reference or the local GGUF file"),
-        Layout::Whisper => write_descriptor(
-            &path.join(whisper::WEIGHTS_FILE),
-            output,
-            |staging, object| {
-                for name in whisper::METADATA {
-                    let bytes = hellas_private::read_bounded_regular_file(
-                        &path.join(name),
-                        whisper::MAX_METADATA_BYTES,
-                    )?;
-                    std::fs::write(staging.join(name), bytes)?;
-                }
-                whisper::validate_metadata(staging, object)
-            },
-        ),
         Layout::Speech => write_descriptor(
             &path.join(speech::WEIGHTS_FILE),
             output,
@@ -357,7 +318,7 @@ pub(super) fn describe(path: &Path, output: &Path) -> Result<ContentRef> {
                 speech::validate_metadata(staging, object)
             },
         ),
-        Layout::WhisperDescriptor | Layout::SpeechDescriptor => {
+        Layout::SpeechDescriptor => {
             bail!("source is already a descriptor")
         }
         Layout::Native(_) => {

@@ -394,7 +394,7 @@ ID before distributing it or retrying issuance.
 The receiving device runs jobs with it directly:
 
 ```sh
-hellas transcribe --model whisper-tiny --audio speech.wav --access me.access \
+hellas transcribe --model hf://unsloth/whisper-tiny@34457cb234c8624f23ac716000773b367000df6e --audio speech.wav --access me.access \
   --backend hellas/catena-dfad87438018-hip
 ```
 

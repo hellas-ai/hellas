@@ -37,7 +37,7 @@ pub enum ModelKind {
     Text,
     /// A local or pinned Hub d1 GGUF.
     Decision,
-    /// A converted Whisper package or descriptor directory.
+    /// A local or pinned Whisper checkpoint.
     Transcription,
     /// A local or pinned Flux checkpoint.
     Image,
@@ -141,7 +141,7 @@ impl ModelPackage {
         Ok(())
     }
 
-    /// Create a new metadata-only package directory from a converted Whisper or MMS package.
+    /// Create a new metadata-only package directory from a converted MMS package.
     pub async fn describe(path: &Path, output: &Path) -> Result<hellas_rpc::ContentRef> {
         let (path, output) = (path.to_owned(), output.to_owned());
         tokio::task::spawn_blocking(move || descriptor::describe(&path, &output)).await?
@@ -243,8 +243,8 @@ impl ModelPackage {
                         tokio::task::spawn_blocking(move || Flux::open(source, dialect)).await??
                     }))
                 }
-                descriptor::Resolved::Whisper { path, weights } => {
-                    Family::Whisper(Arc::new(Whisper::open(path, dialect, *weights).await?))
+                descriptor::Resolved::Native(native::Kind::Whisper, source) => {
+                    Family::Whisper(Arc::new(Whisper::open(source.clone(), dialect).await?))
                 }
                 descriptor::Resolved::Gguf {
                     path,
@@ -298,6 +298,7 @@ impl ModelPackage {
         };
         let mut programs = self.programs()?;
         let entries: &[&str] = match &self.family {
+            Family::Whisper(_) => &["whisper.setup"],
             Family::Flux(_) => &["flux.setup-text", "flux.setup-denoise", "flux.setup-vae"],
             Family::Phonon(models) => {
                 let selected = native::selected_voices(voices);
