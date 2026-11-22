@@ -281,7 +281,7 @@ impl Fixture {
             method: "POST".into(),
             headers: vec![],
             body_base64: STANDARD.encode(serde_json::to_vec(&body).unwrap()),
-            tls: template.tls.clone(),
+            tls: Some(template.tls.clone()),
             max_response_bytes: template.max_response_bytes,
         };
         WorkFetchRequest {
@@ -393,7 +393,7 @@ async fn resource_repair_precedes_client_signing() {
     };
     let route = &targets["test"].route;
     assert_eq!(route.max_response_bytes, 4096);
-    assert_eq!(route.tls, fixture.template.tls);
+    assert_eq!(route.tls, Some(fixture.template.tls.clone()));
     fixture.result(None).await.unwrap();
     assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 1);
     fixture.shutdown().await;
@@ -1101,7 +1101,7 @@ async fn the_command_executor_runs_a_grant_once_and_replays_it() {
         method: "POST".into(),
         headers: vec![],
         body_base64: STANDARD.encode(br#"{"messages":[],"max_tokens":6}"#),
-        tls: template.tls.clone(),
+        tls: Some(template.tls.clone()),
         max_response_bytes: template.max_response_bytes,
     };
     let input = WorkRequest::Fetch(WorkFetchRequest {

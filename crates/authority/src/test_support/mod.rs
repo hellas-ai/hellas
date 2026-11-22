@@ -315,7 +315,7 @@ pub fn proposal_for(
             method: "POST".into(),
             headers: vec![],
             body_base64: "eyJtYXhfdG9rZW5zIjo4fQ==".into(),
-            tls: resource.tls.clone(),
+            tls: Some(resource.tls.clone()),
             max_response_bytes: resource.max_response_bytes,
         })
         .unwrap()

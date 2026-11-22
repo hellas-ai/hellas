@@ -148,7 +148,7 @@ impl HttpsResource {
             method: self.methods[0].clone(),
             headers: vec![],
             body_base64: String::new(),
-            tls: self.tls.clone(),
+            tls: Some(self.tls.clone()),
             max_response_bytes: self.max_response_bytes,
         };
         sample.validate()?;
@@ -171,7 +171,7 @@ impl HttpsResource {
         {
             return Err(TemplateError::PathMethod);
         }
-        if request.tls != self.tls {
+        if request.tls.as_ref() != Some(&self.tls) {
             return Err(TemplateError::Tls);
         }
         if request

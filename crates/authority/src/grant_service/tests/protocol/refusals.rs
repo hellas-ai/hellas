@@ -88,14 +88,14 @@ impl Case {
                     method: "POST".into(),
                     headers: vec![],
                     body_base64: "eyJtYXhfdG9rZW5zIjo4fQ==".into(),
-                    tls: resource.tls,
+                    tls: Some(resource.tls),
                     max_response_bytes: 4096,
                 };
                 match self {
                     Self::Origin => http.url = "https://other.test/v1/chat/completions".into(),
                     Self::Path => http.url = "https://glm.test/v1/other".into(),
                     Self::TlsRoots => {
-                        http.tls.roots = HttpTrustRoots::Certificates {
+                        http.tls.as_mut().unwrap().roots = HttpTrustRoots::Certificates {
                             der_base64: vec!["AQ==".into()],
                         }
                     }

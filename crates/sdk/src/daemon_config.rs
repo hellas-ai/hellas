@@ -135,6 +135,8 @@ pub enum Upstream {
     Http {
         allowed_hosts: Vec<String>,
         #[serde(default)]
+        plain_http_hosts: Vec<String>,
+        #[serde(default)]
         allow_private_addresses: bool,
         #[serde(default)]
         credentials: Vec<Credential>,

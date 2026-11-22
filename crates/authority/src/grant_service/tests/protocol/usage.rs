@@ -162,7 +162,7 @@ async fn metered_https_health_requests_do_not_quarantine_generation() {
                 method: "GET".into(),
                 headers: vec![],
                 body_base64: String::new(),
-                tls: https.tls.clone(),
+                tls: Some(https.tls.clone()),
                 max_response_bytes: https.max_response_bytes,
             };
             let contract = hellas_rpc::FetchContract::http().unwrap();

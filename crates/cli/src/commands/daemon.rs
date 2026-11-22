@@ -82,7 +82,7 @@ pub struct ModelContext {
 impl ModelContext {
     pub fn new(
         home: &Path,
-        identity: &crate::identity::LocalIdentity,
+        identity: &hellas_sdk::identity::LocalIdentity,
         owner: Option<&dyn Authenticator>,
     ) -> Result<Self> {
         Ok(Self {
@@ -543,13 +543,13 @@ where
 
 async fn options(
     home: StoreLocation,
-    identity: &crate::identity::LocalIdentity,
+    identity: &hellas_sdk::identity::LocalIdentity,
     owner: Option<&hellas_kernel::SoftPasskey>,
     profile: &hellas_chain::genesis::ChainProfile,
     node: hellas_authority::node::NodeCoordinator,
     endpoint: Option<iroh::Endpoint>,
 ) -> Result<hellas_sdk::daemon::Options> {
-    let settlement = crate::identity::settlement_signer(identity)?;
+    let settlement = hellas_sdk::identity::settlement_signer(identity)?;
     let content = hellas_store::content::DiskStore::open(
         home.child("content"),
         vec![],
@@ -582,7 +582,7 @@ async fn options(
 pub async fn gateway(
     args: GatewayArgs,
     home: &StoreLocation,
-    identity: &crate::identity::LocalIdentity,
+    identity: &hellas_sdk::identity::LocalIdentity,
     owner: Option<&hellas_kernel::SoftPasskey>,
     chain: &hellas_chain::genesis::ChainProfile,
     #[cfg(feature = "otel")] metrics: Option<(std::net::SocketAddr, crate::metrics::MetricsBundle)>,
@@ -695,7 +695,7 @@ pub async fn gateway(
 
 pub async fn serve(
     home: &StoreLocation,
-    identity: &crate::identity::LocalIdentity,
+    identity: &hellas_sdk::identity::LocalIdentity,
     owner: Option<&hellas_kernel::SoftPasskey>,
     chain: &hellas_chain::genesis::ChainProfile,
     port: Option<u16>,

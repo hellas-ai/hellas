@@ -112,7 +112,7 @@ impl HostedSpeech {
         let request = HttpFetchRequest {
             url,
             method: "POST".into(),
-            tls: self.tls.clone(),
+            tls: Some(self.tls.clone()),
             max_response_bytes: self.max_response_bytes,
             headers: vec![("content-type".into(), "application/json".into())],
             body_base64: STANDARD.encode(body),

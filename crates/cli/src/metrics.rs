@@ -26,7 +26,7 @@ pub async fn spawn_metrics_server(
     let app = axum::Router::new()
         .route("/metrics", axum::routing::get(scrape))
         .with_state(Arc::new(bundle));
-    info!("prometheus metrics server listening on http://{addr}/metrics");
+    tracing::info!("prometheus metrics server listening on http://{addr}/metrics");
     tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, app).await {
             eprintln!("warning: metrics server failed: {err}");

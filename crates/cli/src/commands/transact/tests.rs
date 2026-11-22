@@ -1,5 +1,6 @@
 use super::*;
 use clap::Parser as _;
+use hellas_auth::ProducerSigningKey;
 use hellas_private::Durability::Crash;
 use hellas_private::StoreLocation;
 
@@ -32,7 +33,7 @@ fn grant_execution_requires_explicit_access_and_refuses_paid_options() {
 #[tokio::test]
 async fn an_expired_command_closes_the_endpoint_it_bound() {
     let root = tempfile::tempdir().unwrap();
-    let identity = crate::identity::load_or_create(&root.path().join("identity")).unwrap();
+    let identity = hellas_sdk::identity::load_or_create(&root.path().join("identity")).unwrap();
     let chain = hellas_chain::genesis::ChainProfile::known(hellas_chain::genesis::Chain::Devnet);
     let owner = hellas_kernel::SoftPasskey::from_secret_scalar([7; 32]).unwrap();
     let context = Context::new(
@@ -61,7 +62,7 @@ async fn an_expired_command_closes_the_endpoint_it_bound() {
 async fn paid_deadline_options_reach_the_signed_job_configuration() {
     let root = tempfile::tempdir().unwrap();
     let identity_path = root.path().join("identity");
-    let identity = crate::identity::load_or_create(&identity_path).unwrap();
+    let identity = hellas_sdk::identity::load_or_create(&identity_path).unwrap();
     let owner = hellas_kernel::SoftPasskey::from_secret_scalar([7; 32]).unwrap();
     let location = StoreLocation::for_test(root.path());
     let context = Context::new(
@@ -685,4 +686,16 @@ fn multiple_policy_offers_require_and_honor_explicit_resource_selection() {
         select_policy(&policies[..1], None).unwrap().resource,
         policies[0].resource
     );
+}
+
+#[test]
+fn fetch_selects_transport_from_the_parsed_scheme_and_rejects_plaintext_tls_flags() {
+    for url in ["http://example.test/path", "HTTP://example.test/path"] {
+        let mut args = fetch_args(&[]);
+        args.url = url.into();
+        assert!(args.request().unwrap().tls.is_none());
+        args.spki_sha256 = vec!["00".repeat(32)];
+        assert!(args.request().is_err());
+    }
+    assert!(fetch_args(&[]).request().unwrap().tls.is_some());
 }

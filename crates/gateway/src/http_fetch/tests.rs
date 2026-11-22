@@ -4,6 +4,32 @@ use crate::WorkExecutionBackend;
 use hellas_rpc::provenance::ExecutionProvenance;
 use std::time::Duration;
 
+#[test]
+fn route_tls_is_resolved_at_validation() {
+    let route = |url| {
+        serde_json::from_value::<HttpRoute>(serde_json::json!({
+            "path": "/v1/responses", "method": "POST", "url": url,
+        }))
+        .unwrap()
+    };
+    let https = route("https://example.com/v1/responses");
+    assert!(https.tls.is_none());
+    let https = https.validate().unwrap();
+    assert_eq!(https.tls, Some(public_tls()));
+    assert_eq!(
+        https.request(Bytes::new(), &HeaderMap::new()).unwrap().tls,
+        https.tls
+    );
+    let mut http = route("http://example.com/v1/responses").validate().unwrap();
+    assert!(http.tls.is_none());
+    http.request(Bytes::new(), &HeaderMap::new())
+        .unwrap()
+        .validate()
+        .unwrap();
+    http.tls = Some(public_tls());
+    assert!(http.validate().is_err());
+}
+
 #[tokio::test]
 async fn http_uses_the_paid_backend_and_waits_for_its_payment_completion() {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -130,7 +156,7 @@ fn forward_only_protocol_headers_and_keep_retry_and_quota_metadata() {
         path: "/v1/messages".into(),
         method: "POST".into(),
         url: "https://api.example.com/v1/messages".into(),
-        tls: public_tls(),
+        tls: Some(public_tls()),
         headers: vec![("anthropic-version".into(), "2023-06-01".into())],
         models: None,
     };
@@ -188,7 +214,7 @@ fn credentials_and_hop_headers_cannot_be_configured_as_static_headers() {
             path: "/v1/messages".into(),
             method: "POST".into(),
             url: "https://example.com/v1/messages".into(),
-            tls: public_tls(),
+            tls: Some(public_tls()),
             headers: vec![(name.into(), "secret".into())],
             models: None,
         };
@@ -668,7 +694,7 @@ fn http(path: &str, models: Option<Vec<String>>) -> crate::Route {
                             path: path.into(),
                             method: "POST".into(),
                             url: format!("https://example.com{path}"),
-                            tls: public_tls(),
+                            tls: Some(public_tls()),
                             headers: vec![],
                             max_response_bytes: hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES,
                             models: models.clone(),

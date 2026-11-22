@@ -172,6 +172,7 @@ impl OfferHost {
                         service: "http".into(),
                         method: "request".into(),
                         upstream: Upstream::Http {
+                            plain_http_hosts: vec![],
                             allowed_hosts: vec!["localhost".into()],
                             allow_private_addresses: true,
                             credentials: vec![Credential {
@@ -1138,12 +1139,12 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
         method: "POST".into(),
         headers: vec![("content-type".into(), "application/json".into())],
         body_base64: STANDARD.encode(br#"{"model":"m","messages":[],"max_tokens":8}"#),
-        tls: hellas_rpc::http_fetch::HttpTls {
+        tls: Some(hellas_rpc::http_fetch::HttpTls {
             roots: hellas_rpc::http_fetch::HttpTrustRoots::Certificates {
                 der_base64: vec![host.https.root_der.clone()],
             },
             spki_sha256: vec![],
-        },
+        }),
         max_response_bytes: 65536,
     };
     let job = hellas_sdk::job::Job::fetch(

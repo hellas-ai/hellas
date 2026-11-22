@@ -799,7 +799,7 @@ fn policy_http_routes(
                     path: http_route_path(path).into(),
                     method: verb.clone(),
                     url: format!("{}{}", template.origin, path),
-                    tls: template.tls.clone(),
+                    tls: Some(template.tls.clone()),
                     headers: vec![],
                     max_response_bytes: template.max_response_bytes,
                     models: template
@@ -1825,3 +1825,6 @@ mod output_tests {
         assert!(response.next().await.is_none());
     }
 }
+
+#[cfg(test)]
+mod http_tests;

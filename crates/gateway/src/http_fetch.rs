@@ -59,9 +59,12 @@ enum HttpOpenError {
 }
 
 pub(super) fn router(
-    targets: BTreeMap<String, crate::HttpTarget>,
+    mut targets: BTreeMap<String, crate::HttpTarget>,
     paid: Arc<crate::route::RouteExecution>,
 ) -> crate::GatewayResult<Router> {
+    for target in targets.values_mut() {
+        target.route = target.route.validate()?;
+    }
     let first = &targets
         .values()
         .next()
@@ -69,7 +72,6 @@ pub(super) fn router(
         .route;
     let path = first.path.clone();
     for target in targets.values() {
-        target.route.validate()?;
         if target.route.path != first.path
             || target.route.method != first.method
             || target.route.models != first.models

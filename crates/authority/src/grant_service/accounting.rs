@@ -301,10 +301,10 @@ mod tests {
             method: "POST".into(),
             headers: vec![],
             body_base64: String::new(),
-            tls: hellas_rpc::http_fetch::HttpTls {
+            tls: Some(hellas_rpc::http_fetch::HttpTls {
                 roots: hellas_rpc::http_fetch::HttpTrustRoots::WebPki,
                 spki_sha256: vec![],
-            },
+            }),
             max_response_bytes: 1,
         };
         let events = hellas_rpc::fetch::build_input_events_with_retention(
