@@ -4,14 +4,8 @@
 use super::{ModelPackage, ModelRequest, ModelResponse};
 use anyhow::{Result, bail};
 pub use catena_models::systemone::InvalidRequest;
-use catena_models::systemone::{Decisions, Prepared, Request};
+use catena_models::systemone::{Prepared, Request};
 use serde_json::Value;
-use std::path::Path;
-
-/// The request format and readout embedded in a decision model's GGUF.
-pub struct Decision {
-    decisions: Decisions,
-}
 
 /// One validated request with a prompt per question.
 pub struct DecisionRequest {
@@ -32,17 +26,11 @@ impl DecisionRequest {
     }
 }
 
-impl Decision {
-    /// Local file I/O only: a decision GGUF or its descriptor directory.
-    pub fn open(path: &Path) -> Result<Self> {
-        Ok(Self {
-            decisions: Decisions::read(&ModelPackage::gguf_path(path)?, usize::MAX)?,
-        })
-    }
-
-    /// Parse and expand a request body. Failures caused by the body are
-    /// [`InvalidRequest`]s.
-    pub fn prepare(&self, body: Value) -> Result<DecisionRequest> {
+impl ModelPackage {
+    /// Parse and expand a decision request body with the format embedded in
+    /// the model. Failures caused by the body are [`InvalidRequest`]s.
+    pub fn decision_request(&self, body: Value) -> Result<DecisionRequest> {
+        let decisions = self.decisions()?;
         let request = Request::parse(body)?;
         if request.has_images() {
             return Err(InvalidRequest(
@@ -50,7 +38,7 @@ impl Decision {
             )
             .into());
         }
-        let prepared = self.decisions.prepare(&request)?;
+        let prepared = decisions.prepare(&request)?;
         let prompts = prepared.iter().map(|p| p.tokens.clone()).collect();
         Ok(DecisionRequest {
             request,
@@ -59,8 +47,9 @@ impl Decision {
         })
     }
 
-    /// The response envelope for the logits a decision job returned.
-    pub fn respond(
+    /// The response envelope, under the name `model`, for the logits a
+    /// decision job returned.
+    pub fn decision_response(
         &self,
         model: &str,
         request: &DecisionRequest,
@@ -69,7 +58,7 @@ impl Decision {
         let ModelResponse::Logits(logits) = response else {
             bail!("expected decision logits");
         };
-        self.decisions
+        self.decisions()?
             .respond(model, &request.request, &request.prepared, &logits)
     }
 }

@@ -1,7 +1,7 @@
 //! `hellas decide`: one decision request, expanded here into a prompt per
 //! question and run as a Compute job.
 use super::*;
-use hellas_client::model::{ModelPackage, decision::Decision};
+use hellas_client::model::ModelPackage;
 use std::io::Read;
 
 const MAX_REQUEST_BYTES: usize = 1 << 20;
@@ -49,29 +49,25 @@ pub async fn decide(mut args: DecideArgs, context: Context) -> super::super::Cli
                 )?
             };
             let body = serde_json::from_slice(&body).context("request is not JSON")?;
-            let model = args.model.clone();
-            let (decision, request) = tokio::task::spawn_blocking(move || {
-                let decision = Decision::open(&model)?;
-                let request = decision.prepare(body)?;
-                anyhow::Ok((decision, request))
-            })
-            .await??;
             let package =
                 ModelPackage::open_many(&args.model, [evaluator.clone()], content.as_ref())
                     .await?
                     .remove(&evaluator)
                     .context("model evaluator is not prepared")?;
+            let preparing = package.clone();
+            let request =
+                tokio::task::spawn_blocking(move || preparing.decision_request(body)).await??;
+            // The model's name is its file's, as on a gateway route.
+            let name = args
+                .model
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .context("model needs a UTF-8 name")?;
+            ensure!(
+                request.model().is_none_or(|model| model == name),
+                "request names another model than {name}"
+            );
             let rendered = package.render_job(&request.job()).await?;
-            // The envelope names the model as the request does, else by its file.
-            let name = match request.model() {
-                Some(name) => name.to_owned(),
-                None => args
-                    .model
-                    .file_stem()
-                    .and_then(|name| name.to_str())
-                    .context("model needs a UTF-8 name")?
-                    .to_owned(),
-            };
             let target = args.target;
             run_quoted(
                 &args.client,
@@ -82,8 +78,11 @@ pub async fn decide(mut args: DecideArgs, context: Context) -> super::super::Cli
                 async |price| compute_job(price, evaluator, rendered).await,
                 |_| args.output.clone(),
                 |_, completed, _| {
-                    let response =
-                        decision.respond(&name, &request, package.decode(&completed.output)?)?;
+                    let response = package.decision_response(
+                        name,
+                        &request,
+                        package.decode(&completed.output)?,
+                    )?;
                     println!("{response}");
                     std::io::stdout().lock().flush()?;
                     Ok(())
@@ -107,9 +106,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let request = Decision::open(&path)
-            .unwrap()
-            .prepare(serde_json::json!({
+        let request = package
+            .decision_request(serde_json::json!({
                 "state": "charged twice",
                 "questions": {
                     "refund": {"type": "noul", "instructions": "refund?"},

@@ -1,7 +1,6 @@
 //! A model's native metadata and the identity of its separately held weights.
 use super::{ModelKind, gguf, qwen3, speech, whisper};
 use anyhow::{Result, bail, ensure};
-use catena_models::checkpoint::read_gguf_model_config;
 use hellas_rpc::ContentRef;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -121,8 +120,7 @@ impl Layout {
     pub(super) fn kind(self, path: &Path) -> Result<ModelKind> {
         Ok(match self {
             Self::Gguf | Self::GgufDescriptor => {
-                let config = read_gguf_model_config(&self.gguf_path(path)?)?;
-                if qwen3::is_decision(&config) {
+                if qwen3::is_decision(&self.gguf_path(path)?)? {
                     ModelKind::Decision
                 } else {
                     ModelKind::Text

@@ -199,6 +199,12 @@ impl ModelPackage {
             },
         })
     }
+    pub(super) fn decisions(&self) -> Result<&catena_models::systemone::Decisions> {
+        match &self.family {
+            Family::Qwen3(model) => model.decisions(),
+            _ => bail!("model does not answer decisions"),
+        }
+    }
     /// The exact programs this package can render for its evaluator.
     pub fn programs(&self) -> Result<Vec<hellas_rpc::protocol::invocation::compute::ProgramId>> {
         let environment = match &self.family {

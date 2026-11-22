@@ -9,6 +9,7 @@ use hellas_rpc::{
     },
 };
 use serde_json::json;
+use std::path::Path;
 
 fn fixture(name: &str) -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -39,8 +40,7 @@ async fn decisions_prefill_each_question_and_read_its_logits() {
         .await
         .unwrap();
     assert_eq!(package.kind(), ModelKind::Decision);
-    let decision = Decision::open(&path).unwrap();
-    let request = decision.prepare(body()).unwrap();
+    let request = package.decision_request(body()).unwrap();
     assert_eq!(request.model(), None);
 
     let job = package.render_job(&request.job()).await.unwrap();
@@ -97,8 +97,8 @@ async fn decisions_prefill_each_question_and_read_its_logits() {
             .unwrap(),
         ),
     };
-    let response = decision
-        .respond("mini", &request, package.decode(&output).unwrap())
+    let response = package
+        .decision_response("mini", &request, package.decode(&output).unwrap())
         .unwrap();
     assert_eq!(response["model"], "mini");
     let tokens: usize = request.prompts.iter().map(Vec::len).sum();
@@ -114,15 +114,17 @@ async fn decisions_prefill_each_question_and_read_its_logits() {
     let mut short = output;
     short.artifacts.pop();
     assert!(
-        decision
-            .respond("mini", &request, package.decode(&short).unwrap())
+        package
+            .decision_response("mini", &request, package.decode(&short).unwrap())
             .is_err()
     );
 }
 
 #[tokio::test]
 async fn decisions_reject_images_and_text_models() {
-    let decision = Decision::open(&fixture("mini-d1")).unwrap();
+    let decision = ModelPackage::open(&fixture("mini-d1"), &evaluator(GpuDialect::Hip))
+        .await
+        .unwrap();
     let mut png = Vec::new();
     {
         let mut encoder = png::Encoder::new(&mut png, 1, 1);
@@ -141,19 +143,21 @@ async fn decisions_reject_images_and_text_models() {
     for key in ["images", "files"] {
         let mut body = body();
         body[key] = json!([image]);
-        let error = decision.prepare(body).err().expect("images are rejected");
+        let error = decision
+            .decision_request(body)
+            .err()
+            .expect("images are rejected");
         assert!(error.is::<InvalidRequest>());
         assert!(error.to_string().contains("text only"), "{error}");
     }
     let error = decision
-        .prepare(json!({"questions": {}}))
+        .decision_request(json!({"questions": {}}))
         .err()
         .expect("a request needs state");
     assert!(error.is::<InvalidRequest>());
 
     let text = fixture("mini-qwen3.gguf");
     assert_eq!(ModelKind::of(&text).unwrap(), ModelKind::Text);
-    assert!(Decision::open(&text).is_err());
     let package = ModelPackage::open(&text, &evaluator(GpuDialect::Hip))
         .await
         .unwrap();
@@ -165,4 +169,5 @@ async fn decisions_reject_images_and_text_models() {
         .err()
         .expect("a text model answers no decisions");
     assert!(error.to_string().contains("does not answer decisions"));
+    assert!(package.decision_request(body()).is_err());
 }

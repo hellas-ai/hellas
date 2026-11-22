@@ -118,7 +118,7 @@ pub async fn with_models(
                             .await?,
                     )),
                     hellas_client::model::ModelKind::Decision => {
-                        crate::decision::router(model.clone(), package.clone(), execution).await?
+                        crate::decision::router(model.clone(), execution)?
                     }
                     hellas_client::model::ModelKind::Transcription => {
                         crate::audio::router(*max_tokens as usize, execution)?

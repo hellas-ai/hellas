@@ -338,7 +338,8 @@ admit two bytes of output per vocabulary entry for each question (256 kB per
 question for d1) and uploads for the program and token IDs.
 
 Requests are text only: `images` and `files` are rejected before work starts.
-`model` is optional for `decide`, which otherwise names the model by its file.
+The response names the model by its file name without the extension, as a
+gateway route does; a request's optional `model` must match it.
 
 The gateway exposes the same model with `gateway --model d1.gguf` and
 `--access`, `--pay` or `--local` as usual. `POST /v1/systemone` takes the same

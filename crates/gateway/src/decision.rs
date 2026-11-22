@@ -11,33 +11,30 @@ use axum::{
     response::Response,
     routing::post,
 };
-use hellas_client::model::{
-    ModelKind,
-    decision::{Decision, InvalidRequest},
-};
-use std::{path::PathBuf, sync::Arc};
+use hellas_client::model::{ModelKind, ModelPackage, decision::InvalidRequest};
+use std::sync::Arc;
 
 pub(super) const PATH: &str = "/v1/systemone";
 pub(super) const MAX_REQUEST_BYTES: usize = 1 << 20;
 struct DecisionState {
     name: String,
-    decision: Decision,
+    /// Every renderer's package reads the same request format from the model.
+    package: Arc<ModelPackage>,
     work: Arc<RouteExecution>,
 }
-pub(super) async fn router(
-    model_name: String,
-    package: PathBuf,
-    work: Arc<RouteExecution>,
-) -> GatewayResult<Router> {
+pub(super) fn router(model_name: String, work: Arc<RouteExecution>) -> GatewayResult<Router> {
     work.require_kind(ModelKind::Decision)?;
-    let decision = tokio::task::spawn_blocking(move || Decision::open(&package))
-        .await?
-        .map_err(|error| GatewayError::Presentation(error.into()))?;
+    let package = work
+        .packages
+        .values()
+        .next()
+        .ok_or_else(|| GatewayError::Presentation("decision route needs a renderer".into()))?
+        .clone();
     Ok(Router::new()
         .route(PATH, post(handle))
         .with_state(Arc::new(DecisionState {
             name: model_name,
-            decision,
+            package,
             work,
         })))
 }
@@ -54,7 +51,9 @@ async fn handle(
         );
     }
     let prepare = state.clone();
-    let request = match tokio::task::spawn_blocking(move || prepare.decision.prepare(body)).await {
+    let request = match tokio::task::spawn_blocking(move || prepare.package.decision_request(body))
+        .await
+    {
         Ok(Ok(request)) => Arc::new(request),
         Ok(Err(error)) if error.is::<InvalidRequest>() => {
             return json_error(StatusCode::BAD_REQUEST, error.to_string());
@@ -70,8 +69,8 @@ async fn handle(
         move |output| {
             let (state, request) = respond;
             state
-                .decision
-                .respond(&state.name, &request, output)
+                .package
+                .decision_response(&state.name, &request, output)
                 .map(Reply::Json)
                 .map_err(pipeline::invalid_output)
         },

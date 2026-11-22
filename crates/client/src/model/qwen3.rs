@@ -13,6 +13,7 @@ use catena_models::{
     catena::InferenceOptions,
     checkpoint::read_gguf_model_config,
     spec::{ModelArchitecture, ModelConfig, WeightDtype, weight_specs},
+    systemone::{Decisions, Metadata},
 };
 use hellas_rpc::protocol::invocation::{
     Artifact, MAX_ARTIFACTS, compute::*, output::InvocationOutput,
@@ -30,6 +31,14 @@ pub(super) struct Qwen3 {
     content: (LocalStore, Scope),
     views: Vec<(u64, u64)>,
     states: Vec<String>,
+    /// The request format and readout of a decision model.
+    decisions: Option<Decisions>,
+}
+
+/// A decision model carries its request format in the GGUF and generates no
+/// text.
+pub(super) fn is_decision(path: &Path) -> Result<bool> {
+    Ok(Metadata::read(path)?.is_some())
 }
 
 pub(super) fn metadata(
@@ -71,9 +80,12 @@ impl Qwen3 {
         header: Arc<gguf::Header>,
     ) -> Result<Self> {
         let path = path.to_owned();
-        let (config, views, object, source, states) =
+        let (config, views, object, source, states, decisions) =
             tokio::task::spawn_blocking(move || -> Result<_> {
                 let (config, views) = metadata(&path, &header)?;
+                let decisions = is_decision(&path)?
+                    .then(|| Decisions::read(&path, usize::MAX))
+                    .transpose()?;
                 // Qwen3.5 and LFM3 prefill with matrix cores; Qwen3 uses SIMT kernels.
                 let wmma = matches!(
                     config.architecture,
@@ -94,7 +106,7 @@ impl Qwen3 {
                     anyhow::bail!("model init must declare a tuple of state outputs");
                 };
                 let states = (0..outputs.len()).map(|i| format!("s{i}")).collect();
-                Ok((config, views, object, source, states))
+                Ok((config, views, object, source, states, decisions))
             })
             .await??;
         let (environment, content) = super::program::environment(
@@ -111,15 +123,20 @@ impl Qwen3 {
             content,
             views,
             states,
+            decisions,
         })
     }
 
     pub(super) fn environment(&self) -> &Environment {
         &self.environment
     }
-    /// Bidirectional models answer decisions and do not generate text.
     pub(super) fn is_decision(&self) -> bool {
-        is_decision(&self.config)
+        self.decisions.is_some()
+    }
+    pub(super) fn decisions(&self) -> Result<&Decisions> {
+        self.decisions
+            .as_ref()
+            .context("model does not answer decisions")
     }
     fn weights(&self) -> impl Iterator<Item = Arg> {
         self.views.iter().map(|&(offset, bytes)| Arg::Asset {
@@ -133,7 +150,7 @@ impl Qwen3 {
     }
     /// One full prefill per prompt, each returning its final-position logits.
     pub fn render_decisions(&self, prompts: &[Vec<u64>]) -> Result<ComputeJob> {
-        ensure!(self.is_decision(), "model does not answer decisions");
+        self.decisions()?;
         ensure!(
             (1..=MAX_ARTIFACTS).contains(&prompts.len()),
             "a decision job answers 1 to {MAX_ARTIFACTS} questions"
@@ -304,13 +321,6 @@ impl Qwen3 {
             content: self.content.clone(),
         })
     }
-}
-
-pub(super) fn is_decision(config: &ModelConfig) -> bool {
-    config
-        .lfm3
-        .as_ref()
-        .is_some_and(|lfm3| !lfm3.causal_attention)
 }
 
 fn tokens(name: &str, ids: &[u64]) -> Artifact {
