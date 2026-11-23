@@ -164,6 +164,7 @@ impl WorkBackend for HostCompute {
                 &prepared,
                 &limits,
                 &Assets::new(0, dialect),
+                &Default::default(),
                 &mut readers,
                 &key,
                 |_| Ok(()),

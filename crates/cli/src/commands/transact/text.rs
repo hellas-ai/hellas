@@ -8,8 +8,8 @@ use hellas_presentation::{ChatMessage, TextPresentation};
 pub struct TextArgs {
     #[command(flatten)]
     client: ClientArgs,
-    /// Qwen GGUF or descriptor; the provider holds the matching weights.
-    #[arg(long, value_name = "PATH")]
+    /// Local or pinned Hub GGUF; the provider holds the matching weights.
+    #[arg(long, value_name = "MODEL")]
     model: PathBuf,
     #[arg(long)]
     prompt: String,
@@ -66,11 +66,14 @@ async fn prepare(
     TextPresentation,
     hellas_client::model::ComputeJob,
 )> {
-    let model = args.model.clone();
-    let presentation = tokio::task::spawn_blocking(move || {
-        TextPresentation::from_gguf(&ModelPackage::gguf_path(&model)?)
-    })
-    .await??;
+    let package = ModelPackage::open_many(&args.model, [evaluator.to_owned()], content)
+        .await?
+        .remove(evaluator)
+        .context("model evaluator is not prepared")?;
+    let metadata = package.clone();
+    let presentation =
+        tokio::task::spawn_blocking(move || TextPresentation::from_gguf(metadata.gguf_path()?))
+            .await??;
     let messages: Vec<_> = args
         .system
         .iter()
@@ -87,10 +90,6 @@ async fn prepare(
         .into_iter()
         .map(u64::from)
         .collect();
-    let package = ModelPackage::open_many(&args.model, [evaluator.to_owned()], content)
-        .await?
-        .remove(evaluator)
-        .context("model evaluator is not prepared")?;
     let rendered = package
         .render_job(&ModelRequest::Text {
             prompt_ids: &prompt,

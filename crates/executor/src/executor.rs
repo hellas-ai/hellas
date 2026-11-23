@@ -196,6 +196,8 @@ impl ExecutorHandle {
                     .map_err(|_| AdmissionError::Closed.into())
             })
             .await?;
+        #[cfg(feature = "compute")]
+        let setup_entries = input.pure_setup_entries().clone();
         let (prepared, limits, content, admission) = input.into_parts_and_admission();
         if prepared.request.runner_public_key != self.inner.config.producer_key.public_key() {
             return Err(BackendFault::caused_by(ExecutorError::PolicyDenied(
@@ -306,6 +308,7 @@ impl ExecutorHandle {
                                 &prepared,
                                 &limits,
                                 &executor.assets,
+                                &setup_entries,
                                 &mut readers,
                                 &executor.config.producer_key,
                                 |event| {
@@ -372,7 +375,7 @@ impl ExecutorHandle {
                 .map_err(|e| invalid(&e))?;
         let request = hellas_rpc::fetch::verify_input_events(&events).map_err(|e| invalid(&e))?;
         let caller = request.caller_key;
-        let manifest = prepared.manifest().map_err(|e| invalid(&e))?;
+        let manifest = prepared.manifest();
         let bounds = policy.admit(&prepared, &caller).map_err(|e| invalid(&e))?;
         let admissions = policy
             .admissions
@@ -396,7 +399,7 @@ impl ExecutorHandle {
                     admissions: vec![a.clone()],
                     limits,
                 }
-                .classify_manifest(&manifest)?;
+                .classify_manifest(manifest)?;
                 Ok((admission, bounds))
             })
             .collect::<Result<Vec<_>, hellas_rpc::value::CanonicalDecodeError>>()

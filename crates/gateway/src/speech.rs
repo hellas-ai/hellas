@@ -23,6 +23,8 @@ use std::{path::PathBuf, sync::Arc};
 pub enum SpeechTarget {
     Native {
         package: PathBuf,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        voices: Vec<String>,
     },
     Hosted {
         service: String,
@@ -78,12 +80,16 @@ async fn handle(
     Extension(request): Extension<SpeechRequest>,
 ) -> Response {
     let operation = match &state.target {
-        SpeechTarget::Native { .. } => {
+        SpeechTarget::Native { voices, .. } => {
+            if !hellas_client::model::voice_allowed(voices, &request.voice) {
+                return pipeline::rejected(format!("unknown voice {:?}", request.voice));
+            }
             if let Err(error) = request.native() {
                 return pipeline::rejected(error.message);
             }
             Operation::Compute(ModelRequest::Speech {
                 text: &request.input,
+                voice: &request.voice,
                 speed: request.speed,
             })
         }
@@ -120,7 +126,7 @@ async fn handle(
                 axum::http::header::CONTENT_TYPE,
                 axum::http::HeaderValue::from_static("audio/wav"),
             )]),
-            bytes: audio.wav().map_err(pipeline::invalid_output)?,
+            bytes: audio.wav_bytes().map_err(pipeline::invalid_output)?,
         }))
     })
     .await

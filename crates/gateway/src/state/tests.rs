@@ -11,7 +11,6 @@ fn text_model() -> std::path::PathBuf {
 
 async fn open(work: Arc<dyn WorkExecutionBackend>) -> TextState {
     TextState::open(
-        text_model(),
         128,
         crate::test_support::execution(
             work,

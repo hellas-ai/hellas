@@ -745,11 +745,9 @@ impl ProviderEndpoint {
         .map_err(|error| Refusal::invalid(error.to_string()))?;
         crate::job::check_paid_input(ready.channel(), &authorization, policy, &bundle)?;
 
-        let manifest = bundle
-            .manifest()
-            .map_err(|error| Refusal::invalid(error.to_string()))?;
+        let manifest = bundle.manifest();
         let (store, scope) = self.close.store.invocation_content(work_id)?;
-        let root = if policy.content_closure(&manifest, &[]).is_ok() {
+        let root = if policy.content_closure(manifest, &[]).is_ok() {
             bytes::Bytes::new()
         } else {
             let hellas_store::content::ScopeKind::Work { closure, .. } = &scope.kind else {
@@ -762,7 +760,7 @@ impl ProviderEndpoint {
             self.close.store.read_content(work_id, root).await?
         };
         let objects =
-            crate::job::content_closure(policy, &manifest, &root, authorization.input_content)?;
+            crate::job::content_closure(policy, manifest, &root, authorization.input_content)?;
         if !store
             .missing_refs(&scope, objects.clone())
             .await
@@ -953,15 +951,21 @@ impl ProviderEndpoint {
             ready.invocation_policy(),
             &bundle,
         )?;
-        let admission = RunAdmission::Invoke(Box::new(Admitted::new(
-            bundle,
-            facts.limits,
-            facts.capacity_domain,
-            self.close.store.invocation_content(work_id)?,
-            WorkAdmission::payment(hellas_auth::PublicKey::Secp256k1(
-                ready.channel().client_key().to_bytes(),
-            )),
-        )));
+        let setup = ready
+            .invocation_policy()
+            .pure_setup_entries(bundle.manifest());
+        let admission = RunAdmission::Invoke(Box::new(
+            Admitted::new(
+                bundle,
+                facts.limits,
+                facts.capacity_domain,
+                self.close.store.invocation_content(work_id)?,
+                WorkAdmission::payment(hellas_auth::PublicKey::Secp256k1(
+                    ready.channel().client_key().to_bytes(),
+                )),
+            )
+            .with_setup_entries(setup),
+        ));
 
         self.close
             .store
@@ -1770,16 +1774,19 @@ pub async fn run_admitted<B: WorkBackend>(
     admission: WorkAdmission,
     progress: PaidProgress,
 ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
+    let manifest = input.manifest();
     let facts = policy
-        .classify_manifest(&input.manifest().map_err(BackendFault::caused_by)?)
+        .classify_manifest(manifest)
         .map_err(BackendFault::caused_by)?;
+    let setup_entries = policy.pure_setup_entries(manifest);
     let input = Admitted::new(
         input,
         facts.limits,
         facts.capacity_domain,
         content,
         admission,
-    );
+    )
+    .with_setup_entries(setup_entries);
     execute(backend, input, progress).await
 }
 
@@ -1952,15 +1959,7 @@ where
         }
     };
     let input = if let Some(permit) = permit {
-        let domain = input.capacity_domain();
-        let (input, limits, content, _) = input.into_parts_and_admission();
-        Admitted::new(
-            input,
-            limits,
-            domain,
-            content,
-            WorkAdmission::reserved(permit),
-        )
+        input.with_admission(WorkAdmission::reserved(permit))
     } else {
         input
     };

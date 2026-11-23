@@ -36,7 +36,8 @@ pub(crate) struct GpuArgs {
 pub(crate) async fn content(
     home: &hellas_private::StoreLocation,
     native: &LocalArgs,
-    models: &[PathBuf],
+    local: &[PathBuf],
+    hub: &[hellas_store::hf::PinnedFile],
 ) -> CliResult<hellas_store::content::DiskStore> {
     let mut configuration =
         crate::content_configuration::ContentConfiguration::load(native.content_config.clone())?
@@ -44,7 +45,7 @@ pub(crate) async fn content(
     let paths = native
         .content
         .iter()
-        .chain(models)
+        .chain(local)
         .map(std::path::absolute)
         .collect::<std::io::Result<Vec<_>>>()?;
     let mut initial = configuration.config().clone();
@@ -62,6 +63,9 @@ pub(crate) async fn content(
         content.finish_recovery().await?;
         configuration.add_content(&content, paths).await?;
         configuration.apply(&content).await?;
+        for file in hub {
+            file.acquire(&content).await?;
+        }
         Ok(())
     }
     .await;
@@ -96,6 +100,7 @@ mod tests {
             &hellas_private::StoreLocation::for_test(root.path()),
             &native,
             &[weights],
+            &[],
         )
         .await;
         match result {

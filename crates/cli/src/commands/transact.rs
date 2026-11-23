@@ -28,6 +28,10 @@ mod image;
 pub use image::{ImageArgs, image};
 mod text;
 pub use text::{TextArgs, text};
+mod speak;
+pub use speak::{SpeakArgs, speak};
+mod decide;
+pub use decide::{DecideArgs, decide};
 #[cfg(test)]
 mod tests;
 
@@ -172,6 +176,8 @@ pub(super) struct TargetArgs {
     /// from; local execution reads the jobs' weights from them.
     #[arg(skip)]
     pub(super) models: Vec<PathBuf>,
+    #[arg(skip)]
+    pub(super) voices: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -323,14 +329,22 @@ impl TargetArgs {
     ) -> super::CliResult<Option<hellas_store::content::DiskStore>> {
         #[cfg(feature = "compute")]
         if self.local {
-            for path in &self.models {
-                hellas_client::model::ModelPackage::require_local_weights(path)?;
-            }
             return Ok(Some(
                 context
                     .local_content
-                    .get_or_try_init(|| {
-                        crate::compute::content(&context.home, &self.native, &self.models)
+                    .get_or_try_init(|| async {
+                        let files = hellas_client::model::ModelFiles::for_voices(
+                            self.models.clone(),
+                            &self.voices,
+                        )
+                        .await?;
+                        crate::compute::content(
+                            &context.home,
+                            &self.native,
+                            &files.local,
+                            &files.hub,
+                        )
+                        .await
                     })
                     .await?
                     .clone(),

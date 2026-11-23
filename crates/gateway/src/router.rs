@@ -45,11 +45,25 @@ pub async fn router(
     }
     let mut models = Models::new();
     for (path, evaluators) in evaluators {
+        let mut voices = BTreeSet::new();
+        for route in &routes {
+            if route.model_package().is_some_and(|(_, p)| p == &path) {
+                if route.model_voices().is_empty() {
+                    voices.insert("default".to_string());
+                }
+                voices.extend(route.model_voices().iter().cloned());
+            }
+        }
         models.insert(
             path.clone(),
-            Ok(ModelPackage::open_many(&path, evaluators, None)
-                .await
-                .map_err(|error| crate::GatewayError::Presentation(error.into()))?),
+            Ok(ModelPackage::open_many_with_voices(
+                &path,
+                evaluators,
+                None,
+                &voices.into_iter().collect::<Vec<_>>(),
+            )
+            .await
+            .map_err(|error| crate::GatewayError::Presentation(error.into()))?),
         );
     }
     let (router, errors) = with_models(routes, work, jobs, memory, &models).await?;
@@ -109,14 +123,16 @@ pub async fn with_models(
             Ok(match &route.presentation {
                 Presentation::Model {
                     model,
-                    package,
+                    package: _,
                     max_tokens,
                     modality,
                 } => match modality {
                     hellas_client::model::ModelKind::Text => crate::state::router(Arc::new(
-                        crate::state::TextState::open(package.clone(), *max_tokens, execution)
-                            .await?,
+                        crate::state::TextState::open(*max_tokens, execution).await?,
                     )),
+                    hellas_client::model::ModelKind::Decision => {
+                        crate::decision::router(model.clone(), execution)?
+                    }
                     hellas_client::model::ModelKind::Transcription => {
                         crate::audio::router(*max_tokens as usize, execution)?
                     }
@@ -292,6 +308,8 @@ pub(crate) fn request_limit(path: &str) -> usize {
         crate::audio::MAX_REQUEST_BYTES
     } else if path == crate::image::PATH {
         crate::image::MAX_REQUEST_BYTES
+    } else if path == crate::decision::PATH {
+        crate::decision::MAX_REQUEST_BYTES
     } else {
         hellas_rpc::fetch::MAX_FETCH_REQUEST_BODY_BYTES
     }

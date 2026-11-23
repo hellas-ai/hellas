@@ -65,11 +65,15 @@ let
     ++ lib.concatMap (
       backend: lib.optionals ((backend.kind or "") == "local") (backend.content or [ ])
     ) (lib.attrValues (settings.backends or { }))
-    ++ lib.concatMap (route: lib.optional ((route.kind or "") == "model") route.package) (
-      settings.routes or [ ]
-    )
     ++ lib.concatMap (
-      resource: lib.optional ((resource.kind.kind or "") == "model") resource.kind.package
+      route:
+      lib.optional ((route.kind or "") == "model" && !(lib.hasPrefix "hf://" route.package)) route.package
+    ) (settings.routes or [ ])
+    ++ lib.concatMap (
+      resource:
+      lib.optional (
+        (resource.kind.kind or "") == "model" && !(lib.hasPrefix "hf://" resource.kind.package)
+      ) resource.kind.package
     ) (settings.resources or [ ]);
   settingPaths =
     settings:
@@ -92,7 +96,11 @@ let
     hellas.catenaPlatform pkgs
     && (
       gateway.configFile != null
-      || lib.any (model: !(lib.hasInfix "@" model)) (gateway.settings.models or [ ])
+      || lib.any (
+        model:
+        !(lib.hasInfix "@" model)
+        || builtins.match "hf://[^@]+@[[:xdigit:]]{40}(/.*[.][gG][gG][uU][fF])?" model != null
+      ) (gateway.settings.models or [ ])
       || lib.any (backend: (backend.kind or "") == "local") (
         lib.attrValues (gateway.settings.backends or { })
       )

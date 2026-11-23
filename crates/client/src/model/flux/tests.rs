@@ -1,9 +1,10 @@
 use super::*;
-use crate::model::{ModelPackage, ModelRequest, ModelResponse};
+use crate::model::{GpuDialect, ModelRequest, ModelResponse};
 use hellas_rpc::ContentRef;
 use hellas_rpc::{JsonBytes, protocol::invocation::output::Outcome};
+use std::path::PathBuf;
 
-fn fixture() -> PathBuf {
+fn directory() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src/model/flux/fixture")
 }
 fn request() -> ImageRequest<'static> {
@@ -100,12 +101,7 @@ async fn seeded_noise_matches_the_upstream_reference() {
 
 #[tokio::test]
 async fn image_job_bundles_three_stages_and_passes_state_in_slots() {
-    let package = ModelPackage::open(
-        &fixture(),
-        &crate::model::evaluator(crate::model::GpuDialect::Hip),
-    )
-    .await
-    .unwrap();
+    let package = fixture(&directory(), GpuDialect::Hip).unwrap();
     let request = request();
     let job = package
         .render_job(&ModelRequest::Image(request))
@@ -121,13 +117,15 @@ async fn image_job_bundles_three_stages_and_passes_state_in_slots() {
     assert_eq!(job.environment.assets.len(), 3);
     let programs = package.programs().unwrap();
     assert_eq!(programs.len(), 2);
-    assert_ne!(programs[0].manifest, programs[1].manifest);
-    let manifest = job.environment.manifest(&programs[0].evaluator).unwrap();
-    let admission = hellas_rpc::protocol::invocation::Admission::compute_only(&programs).unwrap();
+    assert_ne!(programs[0], programs[1]);
+    let evaluator = programs[0].application().evaluator();
+    let manifest = job.environment.manifest(evaluator).unwrap();
+    let admission =
+        hellas_rpc::protocol::invocation::Admission::compute_only(&programs, &[]).unwrap();
     assert!(admission.admits_manifest(&manifest));
     let mut unrelated = job.environment.clone();
     unrelated.sources = vec![ContentRef::for_bytes(b"unrelated source")];
-    assert!(!admission.admits_manifest(&unrelated.manifest(&programs[0].evaluator).unwrap()));
+    assert!(!admission.admits_manifest(&unrelated.manifest(evaluator).unwrap()));
 
     for asset in &job.environment.assets {
         assert!(
@@ -143,15 +141,42 @@ async fn image_job_bundles_three_stages_and_passes_state_in_slots() {
     }
     assert!(job.plan.step.is_none());
     let calls = &job.plan.calls;
-    assert_eq!(calls.len(), 3);
     assert_eq!(
         calls.iter().map(|c| c.entry.as_str()).collect::<Vec<_>>(),
-        ["flux.encode-text", "flux.denoise", "flux.decode-image"]
+        [
+            "flux.setup-text",
+            "flux.encode-text",
+            "flux.denoise",
+            "flux.setup-vae",
+            "flux.decode-image"
+        ]
     );
-    assert_eq!(
-        calls.iter().map(|c| c.args.len()).collect::<Vec<_>>(),
-        [300, 171, 143]
+    for (setup, count) in [(&calls[0], 108), (&calls[3], 142)] {
+        assert_eq!(setup.args.len(), count);
+        assert_eq!(setup.bind.len(), count);
+        assert!(
+            setup
+                .args
+                .iter()
+                .all(|a| matches!(a, Arg::Asset{offset,..} if *offset >= 512))
+        );
+    }
+    assert!(
+        matches!(&calls[1].args[2], Arg::Asset { name, .. } if name.starts_with("text_encoder/"))
     );
+    assert!(matches!(&calls[1].args[3], Arg::Slot { name } if name == "flux.setup-text-0"));
+    assert!(
+        calls[2].args[2..]
+            .iter()
+            .all(|a| matches!(a, Arg::Asset{name,..} if name.starts_with("transformer/")))
+    );
+    assert!(
+        calls[4].args[1..]
+            .iter()
+            .all(|a| matches!(a, Arg::Slot{name} if name.starts_with("flux.setup-vae-")))
+    );
+    let calls = [&calls[1], &calls[2], &calls[4]];
+    assert_eq!(calls.map(|c| c.args.len()), [300, 171, 143]);
     assert_eq!(calls[0].bind, [Bind::Name("conditioning".into())]);
     assert_eq!(
         calls[1].args[1],
@@ -176,7 +201,7 @@ async fn image_job_bundles_three_stages_and_passes_state_in_slots() {
             }
         }]
     );
-    let tokens = text::tokenize(&fixture(), request.prompt).unwrap();
+    let tokens = text::tokenize(&directory(), request.prompt).unwrap();
     assert_eq!(
         job.inputs[1].bytes.as_bytes(),
         tokens
@@ -203,12 +228,7 @@ async fn image_job_bundles_three_stages_and_passes_state_in_slots() {
 
 #[tokio::test]
 async fn image_bounds_are_checked_before_rendering_or_allocating_noise() {
-    let model = ModelPackage::open(
-        &fixture(),
-        &crate::model::evaluator(crate::model::GpuDialect::Hip),
-    )
-    .await
-    .unwrap();
+    let model = fixture(&directory(), GpuDialect::Hip).unwrap();
     for (width, height, steps) in [
         (0, 16, 1),
         (15, 16, 1),
@@ -254,13 +274,13 @@ async fn image_bounds_are_checked_before_rendering_or_allocating_noise() {
 
 #[tokio::test]
 async fn tokenizer_ids_outside_the_model_vocabulary_are_refused() {
-    let directory = tempfile::tempdir().unwrap();
-    for name in METADATA.into_iter().chain(["assets.json", VARIANTS_FILE]) {
-        let target = directory.path().join(name);
+    let temp = tempfile::tempdir().unwrap();
+    for name in METADATA.into_iter().chain([VARIANTS_FILE]) {
+        let target = temp.path().join(name);
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
-        std::fs::copy(fixture().join(name), target).unwrap();
+        std::fs::copy(directory().join(name), target).unwrap();
     }
-    let path = directory.path().join("tokenizer/tokenizer.json");
+    let path = temp.path().join("tokenizer/tokenizer.json");
     let mut tokenizer: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     let text = format!(
@@ -270,17 +290,10 @@ async fn tokenizer_ids_outside_the_model_vocabulary_are_refused() {
     tokenizer["model"]["vocab"][text] = serde_json::json!(151936);
     std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
     assert_eq!(
-        text::tokenize(directory.path(), request().prompt)
-            .unwrap()
-            .ids[0],
+        text::tokenize(temp.path(), request().prompt).unwrap().ids[0],
         151936
     );
-    let package = ModelPackage::open(
-        directory.path(),
-        &crate::model::evaluator(crate::model::GpuDialect::Hip),
-    )
-    .await
-    .unwrap();
+    let package = fixture(temp.path(), GpuDialect::Hip).unwrap();
     let error = package
         .render_job(&ModelRequest::Image(request()))
         .await
@@ -290,93 +303,8 @@ async fn tokenizer_ids_outside_the_model_vocabulary_are_refused() {
 }
 
 #[tokio::test]
-async fn converted_weights_match_upstream_storage_and_reject_invalid_tensors() {
-    use safetensors::{Dtype, tensor::TensorView};
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("model.safetensors");
-    let f32_bits = [0x3f800000u32, 0x3f808000, 0x3f818000, 0x7f800001];
-    let f32_bytes: Vec<_> = f32_bits.into_iter().flat_map(u32::to_le_bytes).collect();
-    let bf16_bits = [0u16, 0x8000, 0x7f81, 0xffff];
-    let bf16_bytes: Vec<_> = bf16_bits.into_iter().flat_map(u16::to_le_bytes).collect();
-    safetensors::serialize_to_file(
-        [
-            (
-                "float",
-                TensorView::new(Dtype::F32, vec![4], &f32_bytes).unwrap(),
-            ),
-            (
-                "bf16",
-                TensorView::new(Dtype::BF16, vec![4], &bf16_bytes).unwrap(),
-            ),
-            (
-                "half",
-                TensorView::new(Dtype::F16, vec![4], &bf16_bytes).unwrap(),
-            ),
-        ],
-        None,
-        &path,
-    )
-    .unwrap();
-    let checkpoint = catena_models::weights::Weights::open(&path).unwrap();
-    for (name, f32, expected) in [
-        ("float", true, f32_bytes),
-        (
-            "float",
-            false,
-            [0x3f80u16, 0x3f80, 0x3f82, 0x7fc0]
-                .into_iter()
-                .flat_map(u16::to_le_bytes)
-                .collect(),
-        ),
-        ("bf16", false, bf16_bytes),
-        (
-            "bf16",
-            true,
-            bf16_bits
-                .into_iter()
-                .flat_map(|v| ((v as u32) << 16).to_le_bytes())
-                .collect(),
-        ),
-    ] {
-        let mut bytes = Vec::new();
-        weights::write(
-            &mut bytes,
-            &checkpoint,
-            &weights::Tensor {
-                name: name.into(),
-                shape: vec![4],
-                f32,
-            },
-        )
-        .unwrap();
-        assert_eq!(bytes, expected, "{name} storage f32={f32}");
-    }
-    for (name, shape) in [("float", vec![2]), ("half", vec![4])] {
-        let mut bytes = Vec::new();
-        assert!(
-            weights::write(
-                &mut bytes,
-                &checkpoint,
-                &weights::Tensor {
-                    name: name.into(),
-                    shape,
-                    f32: false
-                }
-            )
-            .is_err()
-        );
-        assert!(bytes.is_empty());
-    }
-}
-
-#[tokio::test]
 async fn image_output_is_checked_and_png_quantization_matches_upstream() {
-    let model = ModelPackage::open(
-        &fixture(),
-        &crate::model::evaluator(crate::model::GpuDialect::Hip),
-    )
-    .await
-    .unwrap();
+    let model = fixture(&directory(), GpuDialect::Hip).unwrap();
     let mut values = vec![0f32; 16 * 16 * 3];
     values[..6].copy_from_slice(&[-1., 0.5 / 255., 1.5 / 255., 0.5, 1., 2.]);
     let output = |values: &[f32]| InvocationOutput {
@@ -415,31 +343,4 @@ async fn image_output_is_checked_and_png_quantization_matches_upstream() {
     invalid.outcome =
         Outcome::Failed(hellas_rpc::protocol::invocation::output::FailureReason::Execution);
     assert!(model.decode(&invalid).is_err());
-}
-
-#[test]
-fn the_snapshot_files_include_every_text_encoder_shard_its_index_names() {
-    let directory = tempfile::tempdir().unwrap();
-    let index = directory.path().join(SOURCES[0]);
-    std::fs::create_dir_all(index.parent().unwrap()).unwrap();
-    std::fs::write(
-        &index,
-        r#"{"metadata":{},"weight_map":{"a":"model-1.safetensors","b":"model-2.safetensors","c":"model-1.safetensors"}}"#,
-    )
-    .unwrap();
-    assert_eq!(
-        text_shards(directory.path())
-            .unwrap()
-            .into_iter()
-            .collect::<Vec<_>>(),
-        [
-            "text_encoder/model-1.safetensors",
-            "text_encoder/model-2.safetensors"
-        ]
-    );
-    assert!(CHECKPOINT.contains(&SOURCES[0]));
-    for shard in ["../escape", "a/b", ""] {
-        std::fs::write(&index, format!(r#"{{"weight_map":{{"a":{shard:?}}}}}"#)).unwrap();
-        assert!(text_shards(directory.path()).is_err(), "{shard}");
-    }
 }

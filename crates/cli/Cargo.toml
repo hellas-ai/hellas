@@ -117,6 +117,7 @@ hellas-authority = { workspace = true, features = ["test-support"] }
 hellas-chain = { workspace = true, features = ["client", "test-support"] }
 hellas-channel = { workspace = true, features = ["test-support"] }
 # Tests check rendered Catena programs against the compiler.
+hellas-client = { workspace = true, features = ["test-support"] }
 hellas-executor = { workspace = true, features = ["compute"] }
 hellas-genesis = { workspace = true, features = ["test-support"] }
 hellas-providers = { workspace = true, features = ["test-support"] }

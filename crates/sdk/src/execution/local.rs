@@ -34,12 +34,10 @@ pub fn policy(
     };
     let manifest = environment.manifest(evaluator)?;
     Ok(InvocationPolicy {
-        admissions: vec![hellas_rpc::protocol::invocation::Admission::Compute {
-            evaluator: manifest.application().evaluator().into(),
-            programs: hellas_rpc::protocol::invocation::ComputePrograms::Only {
-                manifests: vec![manifest.content_id()],
-            },
-        }],
+        admissions: vec![hellas_rpc::protocol::invocation::Admission::compute_only(
+            &[manifest],
+            &[],
+        )?],
         limits: Limits {
             max_upload_bytes: MAX_INVOCATION_BYTES as u64,
             max_output_bytes: MAX_INVOCATION_BYTES as u64,

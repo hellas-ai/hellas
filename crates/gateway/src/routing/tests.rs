@@ -408,15 +408,12 @@ async fn compute_is_rendered_for_each_selected_evaluator() {
     }
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../client/src/model/package/mini-qwen3.gguf");
-    let root = tempfile::tempdir().unwrap();
-    let descriptor = root.path().join("descriptor");
-    ModelPackage::describe(&path, &descriptor).await.unwrap();
     let route = Route {
         backends: vec!["hip".into(), "cuda".into()],
         presentation: Presentation::Model {
             modality: hellas_client::model::ModelKind::Text,
             model: "tiny".into(),
-            package: descriptor,
+            package: path.clone(),
             max_tokens: 1,
         },
     };

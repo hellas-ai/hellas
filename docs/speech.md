@@ -1,8 +1,23 @@
-# Speech on one gateway
+# Speech
+
+## Synthesize a WAV locally
+
+With a GPU build, use a pinned checkpoint for MMS English, OmniVoice or Phonon. Set `PHONON_ORG` to the publisher of the Phonon model.
+
+```sh
+hellas speak --model hf://k2-fsa/OmniVoice@3fc979d1cd72492cd679c5ac2611e0d7ac047ba1 --text 'Hello from Hellas.' -o omni.wav --local
+hellas speak --model "hf://${PHONON_ORG}/phonon-31m-en@8f7a37c94a4c58b04c8287300c53f11d2e208eae" --text 'Hello from Hellas.' --voice Easton -o phonon.wav --local
+hellas speak --model hf://whatever0705/mms-tts-eng-with-discriminator@3975d411eef6e0a05ab701ce981a93dc3a2cfdae --text 'Hello from Hellas.' -o mms.wav --local
+```
+
+Omit `--text` to read from standard input.
+
+## Speech on one gateway
 
 `POST /v1/audio/speech` accepts JSON and returns audio bytes. The request's
-`model` selects either a hosted audio interface through Fetch or an MMS
-English package through Compute. Both use the existing listener and its bearer.
+`model` selects either a hosted audio interface through Fetch or a native
+model through Compute (MMS English, OmniVoice or Phonon). All use the existing listener
+and its bearer.
 
 ```sh
 curl -H "Authorization: Bearer $(cat "$HOME/gateway.bearer")" \
@@ -13,7 +28,7 @@ curl -H "Authorization: Bearer $(cat "$HOME/gateway.bearer")" \
 
 Change only `model` to `mms` to use the native route in the example below.
 The hosted service must support the requested voice and configured format;
-its voice identifiers remain its own. MMS has one voice, named `default`.
+its voice identifiers remain its own. MMS has one voice, named `default`. Phonon serves the configured catalog voices. Its default is Easton. OmniVoice supports the default voice and speed 1.
 
 MMS accepts `response_format: "wav"` and finite `speed` between 0.25 and 4
 (default 1). The result is mono 16 kHz, signed 16-bit PCM WAV. Text uses the
@@ -21,34 +36,44 @@ pinned MMS English tokenizer and must fit its 512-token limit after blank
 insertion. Invalid durations or audio longer than the model's 30-second
 capacity fail explicitly. Hosted speech accepts only the configured `wav`
 and/or `mp3` mappings and speed 1. Omitting `response_format` selects `mp3`,
-which therefore requires a hosted mp3 mapping; MMS callers must request wav.
+which therefore requires a hosted mp3 mapping; native callers must request wav.
+
+Phonon accepts `response_format: "wav"` and speed 1. The result is mono 24 kHz,
+signed 16-bit PCM WAV. Text longer than 50 tokens is split at sentence, clause
+or word boundaries into at most 32 utterances, joined by 120 ms pauses. Sampling
+uses a fixed seed, so the same request renders the same job.
 Unknown fields, unsupported settings and query parameters receive 400 before
 execution. Both targets return a complete response after verified completion. Hosted audio
 retains its content type and encoding; upstream error statuses and bodies are
 preserved. Signed evidence accompanies successful and failed completions.
 
-## Prepare the MMS package
+## MMS English
 
-Convert a published checkpoint at an immutable 40-hex revision:
+The following revision contains the original MMS English inference tensors and tokenizer. Both clients and providers accept the pinned repository or a local checkpoint directory containing `model.safetensors`, `config.json`, `vocab.json`, `tokenizer_config.json` and `special_tokens_map.json`.
 
 ```sh
-hellas convert-speech facebook/mms-tts-eng@COMMIT -o ./mms
-hellas model describe ./mms -o ./mms-remote
-hellas program ./mms --backend hellas/catena-dfad87438018-hip
+hellas program hf://whatever0705/mms-tts-eng-with-discriminator@3975d411eef6e0a05ab701ce981a93dc3a2cfdae --backend hellas/catena-dfad87438018-hip
 ```
 
-Conversion applies the pinned catena-models weight normalization, transpose and
-BF16 preparation once. The package contains `weights.bf16`, `config.json`,
-`vocab.json`, `tokenizer_config.json` and `special_tokens_map.json`. A descriptor
-replaces the weights with their content reference in `descriptor.json`.
-HIP and CUDA use the existing Catena evaluators; conversion, describing and
-rendering a program do not run synthesis or open a GPU.
+The client renders from metadata. The provider verifies the safetensors file and prepares the required weights on its GPU. The speech decoder checks the status and sample count and encodes the valid finite waveform samples. Configure Compute admission for the program printed by `hellas program` and allow 1,920,000 bytes for the waveform plus 16 bytes for its status and sample count.
 
-The provider indexes the full package's weights. The gateway can render from
-its descriptor. The native model validates the two output artifacts, checks
-status and sample count, and encodes only the valid finite waveform prefix.
-Configure provider Compute admission for the program printed by `hellas program`
-and enough output for the 1,920,000-byte waveform plus 16-byte descriptor.
+## Original speech checkpoints
+
+OmniVoice keeps its model weights and audio tokenizer in one repository.
+Phonon uses the model revision you select and fixed revisions for its codec
+and voice catalog. The client reads the catalog and tensor headers. The provider
+acquires the original model, codec and selected voice files. Each Phonon voice
+has its own signed program.
+
+```sh
+hellas program "hf://${PHONON_ORG}/phonon-31m-en@8f7a37c94a4c58b04c8287300c53f11d2e208eae" --voice Easton --backend hellas/catena-dfad87438018-hip
+```
+
+A local OmniVoice snapshot has the same files as its Hub repository. An offline
+Phonon directory contains the original `model/`, `codec/` and `voices/`
+snapshots, including `voices/voices.jsonl` and the voice files named by the
+catalog. A standalone local Phonon model directory uses the pinned Hub
+dependencies.
 
 ## Gateway configuration
 
@@ -99,12 +124,12 @@ backends = ["native"]
 model = "mms"
 [routes.target]
 kind = "native"
-package = "/srv/models/mms-remote"
+package = "hf://whatever0705/mms-tts-eng-with-discriminator@3975d411eef6e0a05ab701ce981a93dc3a2cfdae"
 ```
 
-Each model alias has one speech target in the existing route table. Both target
-kinds share request parsing, response delivery and provenance. Generic HTTP
-passthrough has no speech configuration.
+For Phonon set `package` to its pinned Hub URI and add
+`voices = ["Easton", "Zoey"]` to the native target. Use the same list on the
+provider's model resource. Omitting the list serves Easton.
 
 The adaptor maps `input` to upstream `text`, uses the configured upstream
 `model_id`, encodes `voice` as one path segment, and puts the mapped format in

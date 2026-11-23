@@ -1,28 +1,28 @@
 //! Model families render the same opaque program-and-bytes Compute contract.
 use super::{
-    descriptor,
     flux::{Flux, Image, ImageRequest},
+    native,
     qwen3::Qwen3,
-    speech::{Speech, SpeechAudio},
+    source,
+    speech::{Audio, Speech},
     whisper::Whisper,
 };
 use anyhow::{Context, Result, bail, ensure};
+use hellas_rpc::ProgramManifest;
 use hellas_rpc::protocol::invocation::{
     Artifact,
     compute::{Environment, Plan},
     output::InvocationOutput,
 };
 use hellas_store::content::{DiskStore, LocalStore, Scope};
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{path::Path, sync::Arc};
 
 enum Family {
     Qwen3(Arc<Qwen3>),
     Whisper(Arc<Whisper>),
     Flux(Arc<Flux>),
     Speech(Arc<Speech>),
+    Phonon(std::collections::BTreeMap<String, Arc<Speech>>),
 }
 
 pub struct ModelPackage {
@@ -34,26 +34,39 @@ pub struct ModelPackage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelKind {
-    /// A Qwen GGUF file or descriptor directory.
+    /// A local or pinned Hub text GGUF.
     Text,
-    /// A converted Whisper package or descriptor directory.
+    /// A local or pinned Hub d1 GGUF.
+    Decision,
+    /// A local or pinned Whisper checkpoint.
     Transcription,
-    /// A converted Flux package directory.
+    /// A local or pinned Flux checkpoint.
     Image,
-    /// A converted MMS English package or descriptor.
+    /// A local or pinned speech checkpoint.
     Speech,
 }
 
 impl ModelKind {
     pub fn of(path: &Path) -> Result<Self> {
-        Ok(descriptor::classify(path)?.kind())
+        Ok(Self::named(path)?.0)
     }
+    /// Gateway and request name, taken from the selected model file.
+    pub fn named(path: &Path) -> Result<(Self, String)> {
+        source::Source::open(path)?.named()
+    }
+}
+
+pub(super) fn model_name(path: &Path) -> Result<&str> {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .context("model needs a UTF-8 name")
 }
 
 #[derive(Clone, Copy)]
 pub enum ModelRequest<'a> {
     Speech {
         text: &'a str,
+        voice: &'a str,
         speed: f32,
     },
     Image(ImageRequest<'a>),
@@ -61,6 +74,10 @@ pub enum ModelRequest<'a> {
         prompt_ids: &'a [u64],
         max_new: u64,
         stops: &'a [u64],
+    },
+    /// One complete prompt per question; see [`super::decision`].
+    Decision {
+        prompts: &'a [Vec<u64>],
     },
     Transcription {
         samples: &'a [f32],
@@ -82,37 +99,39 @@ pub struct ComputeJob {
 #[derive(Debug)]
 pub enum ModelResponse {
     Tokens(Vec<u32>),
+    /// Final-position vocabulary logits of each decision prompt.
+    Logits(Vec<Vec<f32>>),
     Transcription(super::whisper::Transcription),
     Image(Image),
-    Speech(SpeechAudio),
+    Speech(Audio),
 }
 
 impl ModelPackage {
-    /// Native GGUF metadata, whether held in a full file or a descriptor directory.
-    pub fn gguf_path(path: &Path) -> Result<PathBuf> {
-        descriptor::classify(path)?.gguf_path(path)
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn flux_fixture(model: Flux, dialect: super::GpuDialect) -> Self {
+        Self {
+            family: Family::Flux(Arc::new(model)),
+            evaluator: super::evaluator(dialect),
+        }
     }
 
-    /// A local executing backend must have the full model package.
-    pub fn require_local_weights(path: &Path) -> Result<()> {
-        ensure!(
-            !descriptor::classify(path)?.is_descriptor(),
-            "local execution requires the full model weights, not a descriptor"
-        );
-        Ok(())
+    /// GGUF metadata used by this package's tokenizer and template.
+    pub fn gguf_path(&self) -> Result<&Path> {
+        match &self.family {
+            Family::Qwen3(model) => Ok(model.path.as_ref().as_ref()),
+            _ => bail!("model package is not GGUF"),
+        }
     }
 
-    /// Create a new metadata-only package directory from a full Qwen, Whisper or MMS package.
-    pub async fn describe(path: &Path, output: &Path) -> Result<hellas_rpc::ContentRef> {
-        let (path, output) = (path.to_owned(), output.to_owned());
-        tokio::task::spawn_blocking(move || descriptor::describe(&path, &output)).await?
+    pub fn gguf_name(&self) -> Result<&str> {
+        match &self.family {
+            Family::Qwen3(model) => model_name(model.path.source()),
+            _ => bail!("model package is not GGUF"),
+        }
     }
-
-    /// A Qwen GGUF, converted Whisper, MMS or Flux package, or model descriptor,
-    /// rendering programs with the renderer registered under `evaluator`.
     pub async fn open(path: &Path, evaluator: &str) -> Result<Self> {
         let dialect = super::renderer(evaluator)?;
-        let source = Self::resolve(path, None).await?;
+        let source = Self::resolve(path, &[], None).await?;
         Self::open_resolved(&source, evaluator, dialect).await
     }
 
@@ -122,6 +141,15 @@ impl ModelPackage {
         path: &Path,
         evaluators: impl IntoIterator<Item = String>,
         store: Option<&DiskStore>,
+    ) -> Result<std::collections::BTreeMap<String, Arc<Self>>> {
+        Self::open_many_with_voices(path, evaluators, store, &[]).await
+    }
+
+    pub async fn open_many_with_voices(
+        path: &Path,
+        evaluators: impl IntoIterator<Item = String>,
+        store: Option<&DiskStore>,
+        voices: &[String],
     ) -> Result<std::collections::BTreeMap<String, Arc<Self>>> {
         let evaluators: std::collections::BTreeSet<_> = evaluators.into_iter().collect();
         let evaluators = evaluators
@@ -134,7 +162,7 @@ impl ModelPackage {
         if evaluators.is_empty() {
             return Ok(Default::default());
         }
-        let source = Self::resolve(path, store).await?;
+        let source = Self::resolve(path, voices, store).await?;
         let mut packages = std::collections::BTreeMap::new();
         for (evaluator, dialect) in evaluators {
             let package = Self::open_resolved(&source, &evaluator, dialect).await?;
@@ -143,68 +171,122 @@ impl ModelPackage {
         Ok(packages)
     }
 
-    async fn resolve(path: &Path, store: Option<&DiskStore>) -> Result<descriptor::Resolved> {
-        let layout = descriptor::classify(path)?;
-        let inspected = match (store, layout.weights_path(path)) {
-            (Some(store), Some(path)) => Some(
-                *store
-                    .inspect_files(vec![path.clone()])
-                    .await?
-                    .get(&path)
-                    .context("model weights were not inspected")?,
-            ),
-            _ => None,
-        };
-        let path = path.to_owned();
-        tokio::task::spawn_blocking(move || layout.resolve(&path, inspected)).await?
+    async fn resolve(
+        path: &Path,
+        voices: &[String],
+        store: Option<&DiskStore>,
+    ) -> Result<source::Resolved> {
+        let (path, voices, store) = (path.to_owned(), voices.to_vec(), store.cloned());
+        tokio::task::spawn_blocking(move || {
+            source::Source::open(&path)?.resolve(&voices, store.as_ref())
+        })
+        .await?
     }
 
     async fn open_resolved(
-        source: &descriptor::Resolved,
+        source: &source::Resolved,
         evaluator: &str,
         dialect: super::GpuDialect,
     ) -> Result<Self> {
         Ok(Self {
             evaluator: evaluator.into(),
             family: match source {
-                descriptor::Resolved::Speech { path, weights } => {
-                    Family::Speech(Arc::new(Speech::open(path, dialect, *weights).await?))
+                source::Resolved::Native(native::Kind::Phonon, source) => {
+                    let mut models = std::collections::BTreeMap::new();
+                    for (name, file) in &source.voices {
+                        let mut one = source.as_ref().clone();
+                        one.voices = [(name.clone(), file.clone())].into_iter().collect();
+                        models.insert(
+                            name.clone(),
+                            Arc::new(
+                                Speech::open_native(one, native::Kind::Phonon, dialect).await?,
+                            ),
+                        );
+                    }
+                    Family::Phonon(models)
                 }
-                descriptor::Resolved::Flux(path) => Family::Flux(Arc::new({
-                    let path = path.clone();
-                    tokio::task::spawn_blocking(move || Flux::open(&path, dialect)).await??
+                source::Resolved::Native(
+                    kind @ (native::Kind::OmniVoice | native::Kind::Mms),
+                    source,
+                ) => Family::Speech(Arc::new(
+                    Speech::open_native(source.as_ref().clone(), *kind, dialect).await?,
+                )),
+                source::Resolved::Native(native::Kind::Flux, source) => Family::Flux(Arc::new({
+                    let source = source.clone();
+                    tokio::task::spawn_blocking(move || Flux::open(source, dialect)).await??
                 })),
-                descriptor::Resolved::Whisper { path, weights } => {
-                    Family::Whisper(Arc::new(Whisper::open(path, dialect, *weights).await?))
+                source::Resolved::Native(native::Kind::Whisper, source) => {
+                    Family::Whisper(Arc::new(Whisper::open(source.clone(), dialect).await?))
                 }
-                descriptor::Resolved::Gguf {
+                source::Resolved::Gguf(source::Gguf {
                     path,
                     header,
                     weights,
-                } => Family::Qwen3(Arc::new(
-                    Qwen3::open(path, dialect, *weights, header.clone()).await?,
+                }) => Family::Qwen3(Arc::new(
+                    Qwen3::open(path.clone(), dialect, *weights, header.clone()).await?,
                 )),
             },
         })
     }
+    pub(super) fn decisions(&self) -> Result<&catena_models::systemone::Decisions> {
+        match &self.family {
+            Family::Qwen3(model) => model.decisions(),
+            _ => bail!("model does not answer decisions"),
+        }
+    }
     /// The exact programs this package can render for its evaluator.
-    pub fn programs(&self) -> Result<Vec<hellas_rpc::protocol::invocation::compute::ProgramId>> {
+    pub fn programs(&self) -> Result<Vec<ProgramManifest>> {
         let environment = match &self.family {
             Family::Whisper(model) => model.environment(),
             Family::Speech(model) => model.environment(),
+            Family::Phonon(voices) => {
+                return voices
+                    .values()
+                    .map(|model| Ok(model.environment().manifest(&self.evaluator)?))
+                    .collect();
+            }
             Family::Qwen3(model) => model.environment(),
             Family::Flux(model) => return model.programs(&self.evaluator),
         };
-        Ok(vec![hellas_rpc::protocol::invocation::compute::ProgramId {
-            evaluator: self.evaluator.clone(),
-            manifest: environment.manifest(&self.evaluator)?.content_id(),
-        }])
+        Ok(vec![environment.manifest(&self.evaluator)?])
     }
 
+    /// Provider policy for exact rendered programs and their known setup contracts.
+    pub fn compute_admissions(
+        &self,
+        voices: &[String],
+    ) -> Result<Vec<hellas_rpc::protocol::invocation::Admission>> {
+        use hellas_rpc::protocol::invocation::{Admission, policy::MAX_COMPUTE_PROGRAMS};
+        let mut programs = self.programs()?;
+        let entries: &[&str] = match &self.family {
+            Family::Whisper(_) => &["whisper.setup"],
+            Family::Flux(_) => &["flux.setup-text", "flux.setup-denoise", "flux.setup-vae"],
+            Family::Phonon(models) => {
+                let selected = native::selected_voices(voices);
+                ensure!(
+                    selected.iter().all(|v| models.contains_key(v)),
+                    "model resource requests an unconfigured voice"
+                );
+                programs = programs
+                    .into_iter()
+                    .zip(models.keys())
+                    .filter_map(|(p, v)| selected.contains(v).then_some(p))
+                    .collect();
+                &["phonon.prepare-weights", "phonon.prepare-voice"]
+            }
+            Family::Speech(model) => model.setup_entries(),
+            _ => &[],
+        };
+        programs
+            .chunks(MAX_COMPUTE_PROGRAMS)
+            .map(|group| Ok(Admission::compute_only(group, entries)?))
+            .collect()
+    }
     pub fn kind(&self) -> ModelKind {
-        match self.family {
+        match &self.family {
             Family::Whisper(_) => ModelKind::Transcription,
-            Family::Speech(_) => ModelKind::Speech,
+            Family::Speech(_) | Family::Phonon(_) => ModelKind::Speech,
+            Family::Qwen3(model) if model.is_decision() => ModelKind::Decision,
             Family::Qwen3(_) => ModelKind::Text,
             Family::Flux(_) => ModelKind::Image,
         }
@@ -213,21 +295,39 @@ impl ModelPackage {
     pub fn transcription_capacity(&self) -> Option<usize> {
         match &self.family {
             Family::Whisper(model) => Some(model.transcription_capacity()),
-            Family::Qwen3(_) | Family::Flux(_) | Family::Speech(_) => None,
+            Family::Qwen3(_) | Family::Flux(_) | Family::Speech(_) | Family::Phonon(_) => None,
         }
     }
     pub async fn render_job(&self, request: &ModelRequest<'_>) -> Result<ComputeJob> {
         match (&self.family, request) {
-            (Family::Speech(model), ModelRequest::Speech { text, speed }) => {
-                let (model, text, speed) = (model.clone(), text.to_string(), *speed);
-                tokio::task::spawn_blocking(move || model.render_job(&text, speed)).await?
+            (
+                family @ (Family::Speech(_) | Family::Phonon(_)),
+                ModelRequest::Speech { text, voice, speed },
+            ) => {
+                let mut voice = voice.to_string();
+                let model = match family {
+                    Family::Phonon(models) => {
+                        if voice == "default" {
+                            voice = catena_models::phonon::DEFAULT_VOICE.into();
+                        }
+                        models
+                            .get(&voice)
+                            .with_context(|| format!("unknown voice {voice:?}"))?
+                    }
+                    Family::Speech(model) => model,
+                    _ => unreachable!(),
+                }
+                .clone();
+                let (text, speed) = (text.to_string(), *speed);
+                tokio::task::spawn_blocking(move || model.render_job(&text, &voice, speed)).await?
             }
             (Family::Flux(model), ModelRequest::Image(request)) => {
                 let model = model.clone();
                 let prompt = request.prompt.to_owned();
                 let (seed, width, height, steps) =
                     (request.seed, request.width, request.height, request.steps);
-                let (job, source) = tokio::task::spawn_blocking(move || {
+                let assets = model.assets();
+                let (plan, inputs, source) = tokio::task::spawn_blocking(move || {
                     model.render_job(&ImageRequest {
                         prompt: &prompt,
                         seed,
@@ -237,13 +337,13 @@ impl ModelPackage {
                     })
                 })
                 .await??;
-                hellas_channel::content::upload_object(&job.content.0, source.as_bytes()).await?;
-                hellas_channel::content::upload_object(
-                    &job.content.0,
-                    &job.environment.canonical_bytes()?,
-                )
-                .await?;
-                Ok(job)
+                let (environment, content) = super::program::environment(&source, assets).await?;
+                Ok(ComputeJob {
+                    environment,
+                    plan,
+                    inputs,
+                    content,
+                })
             }
             (
                 Family::Qwen3(model),
@@ -257,6 +357,10 @@ impl ModelPackage {
                 let (prompt, max_new, stops) = (prompt_ids.to_vec(), *max_new, stops.to_vec());
                 tokio::task::spawn_blocking(move || model.render_job(&prompt, max_new, &stops))
                     .await?
+            }
+            (Family::Qwen3(model), ModelRequest::Decision { prompts }) => {
+                let (model, prompts) = (model.clone(), prompts.to_vec());
+                tokio::task::spawn_blocking(move || model.render_decisions(&prompts)).await?
             }
             (
                 Family::Whisper(model),
@@ -287,9 +391,13 @@ impl ModelPackage {
             output.outcome
         );
         match &self.family {
-            Family::Speech(_) => Ok(ModelResponse::Speech(Speech::decode(output)?)),
+            Family::Speech(model) => Ok(ModelResponse::Speech(model.decode(output)?)),
+            Family::Phonon(_) => Ok(ModelResponse::Speech(Speech::decode_phonon(output)?)),
             Family::Flux(_) => Ok(ModelResponse::Image(Image::decode(output)?)),
             Family::Whisper(model) => Ok(ModelResponse::Transcription(model.decode(output)?)),
+            Family::Qwen3(model) if model.is_decision() => {
+                Ok(ModelResponse::Logits(model.decode_logits(output)?))
+            }
             Family::Qwen3(_) => {
                 let artifact = output
                     .artifacts

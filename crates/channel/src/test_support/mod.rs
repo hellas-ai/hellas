@@ -248,7 +248,7 @@ pub fn grant_upload_requests(
     ));
     let frames = upload_frames(
         &wire,
-        input.manifest().unwrap().canonical_bytes(),
+        input.manifest().canonical_bytes(),
         channel::program_root(&input),
         &request.prepared_input,
         |opening| {

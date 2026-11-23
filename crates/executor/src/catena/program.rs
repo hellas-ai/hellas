@@ -28,10 +28,10 @@ impl BoundProgram {
         BTreeMap<ContentId, VerifiedReader>,
     )> {
         prepared.validate()?;
+        let manifest = prepared.manifest();
         if prepared.request.retain != (content.0.retention() == hellas_rpc::Retention::Retain) {
             return Err("compute content retention differs from the signed request".into());
         }
-        let manifest = prepared.manifest()?;
         if manifest.application().evaluator() != evaluator
             || manifest.application().adaptor() != ADAPTOR
         {
@@ -57,7 +57,7 @@ impl BoundProgram {
             hellas_channel::content::root(&content.0, &content.1, manifest.root()).await?
         };
         let environment = Environment::from_canonical_bytes(&root)?;
-        if environment.manifest(evaluator)?.content_id() != manifest.content_id() {
+        if ContentId::hash(&root) != manifest.root() {
             return Err("compute environment identity mismatch".into());
         }
         let plan = Plan::from_canonical_bytes(prepared.input.parameters.as_bytes())?;
@@ -99,7 +99,6 @@ impl BoundProgram {
         cancel: &super::Cancellation,
         dialect: GpuDialect,
     ) -> Result<Self> {
-        let manifest = prepared.manifest()?;
         let plan = Plan::from_canonical_bytes(prepared.input.parameters.as_bytes())?;
         let inputs = prepared
             .input
@@ -112,7 +111,7 @@ impl BoundProgram {
         Ok(Self {
             environment,
             module,
-            manifest: manifest.content_id(),
+            manifest: prepared.manifest().content_id(),
         })
     }
     pub fn module(&self) -> &RuntimeModule {
@@ -126,7 +125,7 @@ impl BoundProgram {
         prepared: &PreparedInvocation,
     ) -> Result<(Plan, BTreeMap<String, Vec<u8>>)> {
         prepared.validate()?;
-        if prepared.manifest()?.content_id() != self.manifest {
+        if prepared.request.execution_environment != self.manifest {
             return Err("prepared environment differs from compiled program".into());
         }
         let plan = Plan::from_canonical_bytes(prepared.input.parameters.as_bytes())?;

@@ -135,11 +135,12 @@ impl JobInput {
                 serde_bytes::Bytes::new(request),
             )),
             Self::Compute {
+                evaluator,
                 environment,
                 plan,
                 inputs,
                 ..
-            } => hellas_rpc::canonical_dag_cbor(&("compute", environment, plan, inputs)),
+            } => hellas_rpc::canonical_dag_cbor(&("compute", evaluator, environment, plan, inputs)),
         }
         .expect("job input contains only canonical strings, integers and bytes");
         hash_tuple("hellas.work.attempt.input.v1", &[&bytes])
@@ -421,6 +422,7 @@ impl Job {
                 serde_bytes::Bytes::new(request),
             )),
             JobInput::Compute {
+                evaluator,
                 environment,
                 plan,
                 inputs,
@@ -429,6 +431,7 @@ impl Job {
                 FORMAT,
                 self.price,
                 "compute",
+                evaluator,
                 environment,
                 plan,
                 inputs,

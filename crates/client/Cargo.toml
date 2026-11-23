@@ -9,6 +9,7 @@ documentation.workspace = true
 
 [features]
 default = []
+test-support = []
 iroh = [
     "dep:hellas-authority",
     "dep:serde_ipld_dagcbor",
@@ -86,7 +87,7 @@ serde_ipld_dagcbor = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
 thiserror.workspace = true
-tokenizers = { version = "0.23", default-features = false, features = [
+tokenizers = { version = "0.22", default-features = false, features = [
     "onig",
 ], optional = true }
 tokio = { workspace = true, optional = true }

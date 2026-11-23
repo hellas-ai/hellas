@@ -5,8 +5,8 @@ use hellas_client::model::{ModelPackage, ModelRequest, ModelResponse, flux::Imag
 pub struct ImageArgs {
     #[command(flatten)]
     client: ClientArgs,
-    /// Converted Flux2 Klein package directory.
-    #[arg(long, value_name = "DIR")]
+    /// Original Flux2 Klein checkpoint directory or pinned hf:// model.
+    #[arg(long, value_name = "MODEL")]
     model: PathBuf,
     #[arg(long)]
     prompt: String,
@@ -78,21 +78,18 @@ mod tests {
     async fn image_cli_prepares_a_saved_job_with_provider_held_weights() {
         let model = Path::new(env!("CARGO_MANIFEST_DIR")).join("../client/src/model/flux/fixture");
         let root = tempfile::tempdir().unwrap();
-        let rendered = ModelPackage::open(
-            &model,
-            &hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip),
-        )
-        .await
-        .unwrap()
-        .render_job(&ModelRequest::Image(ImageRequest {
-            prompt: "a red fox",
-            seed: 42,
-            width: 16,
-            height: 16,
-            steps: 1,
-        }))
-        .await
-        .unwrap();
+        let rendered =
+            hellas_client::model::flux::fixture(&model, hellas_client::model::GpuDialect::Hip)
+                .unwrap()
+                .render_job(&ModelRequest::Image(ImageRequest {
+                    prompt: "a red fox",
+                    seed: 42,
+                    width: 16,
+                    height: 16,
+                    steps: 1,
+                }))
+                .await
+                .unwrap();
         let job = Job::compute(
             20,
             hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip),
@@ -116,7 +113,7 @@ mod tests {
         else {
             panic!()
         };
-        assert_eq!(plan.calls.len(), 3);
+        assert_eq!(plan.calls.len(), 5);
         assert_eq!(environment.sources.len(), 1);
         assert!(
             content

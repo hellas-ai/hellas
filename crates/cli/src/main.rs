@@ -165,47 +165,25 @@ enum Commands {
     Fetch(commands::transact::FetchArgs),
     /// Buy one call of a Catena program using the same job and payment path.
     Run(commands::transact::RunArgs),
-    /// Fetch a published Whisper checkpoint and convert it into a model
-    /// package, e.g. `openai/whisper-tiny@COMMIT`.
-    ConvertWhisper {
-        /// `ORG/NAME@COMMIT`, pinned to a 40-hex commit.
-        checkpoint: commands::convert::Checkpoint,
-        #[arg(short = 'o', long, value_name = "DIR")]
-        output: PathBuf,
-    },
-    /// Fetch and convert a pinned MMS English checkpoint.
-    ConvertSpeech {
-        /// `ORG/NAME@COMMIT`, pinned to a 40-hex commit.
-        checkpoint: commands::convert::Checkpoint,
-        #[arg(short = 'o', long, value_name = "DIR")]
-        output: PathBuf,
-    },
-    /// Print the program manifest a model's jobs run, which `serve
-    /// --program` admits: a Qwen GGUF, converted Whisper/MMS package, or descriptor.
+    /// Print the program manifests for a local model or pinned hf:// checkpoint.
     Program {
-        #[arg(value_name = "PATH")]
+        /// Named voice whose exact speech program the provider admits.
+        #[arg(long)]
+        voice: Vec<String>,
+        #[arg(value_name = "MODEL")]
         model: PathBuf,
         /// The registered renderer (evaluator id) the program is compiled for.
         #[arg(long, value_name = "EVALUATOR")]
         backend: String,
     },
-    /// Prepare model metadata for rendering jobs on another machine.
-    Model {
-        #[command(subcommand)]
-        command: commands::model::ModelCommand,
-    },
+    /// Synthesize a WAV with a client-rendered speech job.
+    Speak(commands::transact::SpeakArgs),
     /// Transcribe one WAV with a client-rendered Whisper job.
     Transcribe(commands::transact::TranscribeArgs),
     /// Answer one prompt with a client-rendered Qwen text job.
     Text(commands::transact::TextArgs),
-    /// Fetch a published distilled Flux2 Klein 4B snapshot and convert it
-    /// into client metadata and provider assets.
-    ConvertFlux {
-        /// `ORG/NAME@COMMIT`, pinned to a 40-hex commit.
-        checkpoint: commands::convert::Checkpoint,
-        #[arg(short = 'o', long, value_name = "DIR")]
-        output: PathBuf,
-    },
+    /// Answer one decision request with a client-rendered d1 job.
+    Decide(commands::transact::DecideArgs),
     /// Generate one PNG with a client-rendered Flux job.
     Image(commands::transact::ImageArgs),
     /// Inspect and manage node content with Owner authority.
@@ -382,51 +360,28 @@ async fn async_main() {
             }
             return;
         }
-        Commands::ConvertFlux { checkpoint, output } => {
-            let result = commands::convert::flux(&checkpoint, &output);
-            tracer_provider.shutdown();
-            if let Err(error) = result {
-                eprintln!("error: {error:#}");
-                std::process::exit(1);
-            }
-            return;
-        }
-        Commands::Program { model, backend } => {
-            let result = hellas_client::model::ModelPackage::open(&model, &backend)
-                .await
-                .and_then(|package| package.programs())
-                .map(|programs| {
-                    for program in programs {
-                        println!("{program}");
-                    }
-                });
-            tracer_provider.shutdown();
-            if let Err(error) = result {
-                eprintln!("error: {error:#}");
-                std::process::exit(1);
-            }
-            return;
-        }
-        Commands::Model { command } => {
-            let result = commands::model::run(command).await;
-            tracer_provider.shutdown();
-            if let Err(error) = result {
-                eprintln!("error: {error:#}");
-                std::process::exit(1);
-            }
-            return;
-        }
-        Commands::ConvertWhisper { checkpoint, output } => {
-            let result = commands::convert::whisper(&checkpoint, &output);
-            tracer_provider.shutdown();
-            if let Err(error) = result {
-                eprintln!("error: {error:#}");
-                std::process::exit(1);
-            }
-            return;
-        }
-        Commands::ConvertSpeech { checkpoint, output } => {
-            let result = commands::convert::speech(&checkpoint, &output);
+        Commands::Program {
+            model,
+            backend,
+            voice,
+        } => {
+            let result = hellas_client::model::ModelPackage::open_many_with_voices(
+                &model,
+                [backend.clone()],
+                None,
+                &voice,
+            )
+            .await
+            .and_then(|packages| packages[&backend].programs())
+            .map(|programs| {
+                for program in programs {
+                    println!(
+                        "{}/{}",
+                        program.application().evaluator(),
+                        program.content_id()
+                    );
+                }
+            });
             tracer_provider.shutdown();
             if let Err(error) = result {
                 eprintln!("error: {error:#}");
@@ -582,16 +537,16 @@ async fn async_main() {
         Commands::Run(args) => {
             async { commands::transact::run_program(args, job_home()?).await }.await
         }
+        Commands::Speak(args) => async { commands::transact::speak(args, job_home()?).await }.await,
         Commands::Transcribe(args) => {
             async { commands::transact::transcribe(args, job_home()?).await }.await
         }
+        Commands::Decide(args) => {
+            async { commands::transact::decide(args, job_home()?).await }.await
+        }
         Commands::Text(args) => async { commands::transact::text(args, job_home()?).await }.await,
         Commands::Image(args) => async { commands::transact::image(args, job_home()?).await }.await,
-        Commands::ConvertWhisper { .. }
-        | Commands::ConvertSpeech { .. }
-        | Commands::Model { .. }
-        | Commands::ConvertFlux { .. }
-        | Commands::Program { .. } => {
+        Commands::Program { .. } => {
             unreachable!("model commands handled before identity load")
         }
         Commands::Trust(args) => commands::trust::run(args),

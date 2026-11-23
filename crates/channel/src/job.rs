@@ -8,7 +8,9 @@ use crate::model::work::{
 use hellas_auth::{Digest, PublicKey};
 use hellas_kernel::{Key, NetworkId};
 use hellas_rpc::protocol::invocation::{AdmissionFacts, InvocationPolicy, PreparedInvocation};
-use hellas_rpc::{ContentId, ContentRef, OutputEventEnvelope, RequestCommitment, Retention};
+use hellas_rpc::{
+    ContentId, ContentRef, OutputEventEnvelope, ProgramManifest, RequestCommitment, Retention,
+};
 
 const POLICY: &[u8] = b"hellas.work.invocation-policy.v1";
 const INPUT: &[u8] = b"hellas.work.prepared-input.v1";
@@ -300,7 +302,7 @@ mod tests;
 /// The exact neutral object set named by this manifest and prepared-input reference.
 pub fn content_closure(
     policy: &InvocationPolicy,
-    manifest: &hellas_rpc::ProgramManifest,
+    manifest: &ProgramManifest,
     program_root: &[u8],
     prepared: ContentRef,
 ) -> Result<Vec<ContentRef>, PaidWorkError> {
@@ -323,6 +325,45 @@ pub fn content_closure(
         .into_iter()
         .map(|(id, bytes)| ContentRef::new(id, bytes))
         .collect())
+}
+
+/// Verify the content opening against an authenticated paid or grant proposal.
+pub fn check_content_opening(
+    binding: JobInputBinding,
+    policy: &InvocationPolicy,
+    opening: &hellas_rpc::pb::content::WorkOpening,
+    prepared_input: &[u8],
+) -> Result<(ProgramManifest, AdmissionFacts, Option<ContentRef>), PaidWorkError> {
+    let manifest = ProgramManifest::from_canonical_bytes(&opening.manifest)?;
+    if manifest.content_id() != binding.environment_commitment
+        || hellas_rpc::protocol::content::decode_reference(prepared_input)
+            != Some(binding.input_content)
+    {
+        return Err(PaidWorkError::Mismatch {
+            field: "signed content opening",
+        });
+    }
+    let facts = policy.classify_manifest(&manifest)?;
+    if binding.input_content.bytes() > u64::from(facts.max_encoded_prepared_input) {
+        return Err(PaidWorkError::Mismatch {
+            field: "prepared input length",
+        });
+    }
+    let root = match &opening.root {
+        Some(root)
+            if root.id.as_slice() == manifest.root().as_bytes()
+                && root.bytes <= crate::content::MAX_PROGRAM_ROOT_BYTES as u64 =>
+        {
+            Some(ContentRef::new(manifest.root(), root.bytes))
+        }
+        None if policy.content_closure(&manifest, &[]).is_ok() => None,
+        _ => {
+            return Err(PaidWorkError::Mismatch {
+                field: "signed program root",
+            });
+        }
+    };
+    Ok((manifest, facts, root))
 }
 
 /// The one upload signature binds the complete routed opening and root length to

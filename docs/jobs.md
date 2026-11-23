@@ -18,7 +18,7 @@ selects one when it has several. Reusing the same access file and job returns
 its retained result without executing again. An unresolved attempt reports its
 recorded status instead of submitting new work. A new attempt path (`--attempt
 FILE`) is an explicit request to execute again and consume the allowance.
-`run`, `image`, `transcribe`, `text` and `fetch` accept `--access FILE` as the
+`run`, `image`, `transcribe`, `speak`, `decide`, `text` and `fetch` accept `--access FILE` as the
 alternative to `--pay`; they save a zero-price job and use this same route.
 Grant channel journals and attempts live under `<home>/grants`; paid execution
 lives under `<home>/chains/<full consensus digest>/`.
@@ -30,16 +30,15 @@ With the compute-enabled package (`cli-cuda`, `cli-hip`, the NixOS module or the
 the portable release has no local compute), every Compute command also accepts
 `--local`: the job runs on this machine's executor under your own limits, with
 no chain, channel, grant or attempt record. A helper serves the model's weights
-from its `--model` file or directory; `run` and `transact --job` read assets
+from its local checkpoint or pinned Hub source; `run` and `transact --job` read assets
 through `--content PATH` or `--content-config`. `--timeout` bounds it like any other job.
 
 ```sh
-hellas transcribe --model ./whisper-tiny --audio speech.wav --local
-hellas text --model ./qwen3.gguf --prompt 'Why is the sky blue?' --local
+hellas transcribe --model hf://unsloth/whisper-tiny@34457cb234c8624f23ac716000773b367000df6e --audio speech.wav --local
+hellas text --model hf://ggml-org/Qwen3-0.6B-GGUF@afe8ad3577aa22500b3cd1c880f153b3b0e1cae8/Qwen3-0.6B-BF16.gguf --prompt 'Why is the sky blue?' --local
 ```
 
-The [Nix one-liners](nix.md#local-gpu-one-liners) include pinned preparation
-and execution commands for text, transcription, MMS speech, Flux images and
+The [Nix one-liners](nix.md#local-gpu-one-liners) include pinned commands for text, transcription, MMS speech, Flux images and
 one gateway serving them together. The same `cli-cuda` or `cli-hip` output
 runs every modality; no development shell is needed.
 
@@ -49,15 +48,24 @@ registers (such as `hellas/catena-dfad87438018-hip`), before they ask for a
 quote; the provider refuses a program for an evaluator it did not register.
 `--local` renders for this machine's GPU runtime.
 
-`hellas text --model FILE.gguf --prompt TEXT [--system TEXT] [--max-tokens N]`
+`hellas text --model MODEL --prompt TEXT [--system TEXT] [--max-tokens N]`
 renders one chat turn with the GGUF's tokenizer and embedded Jinja chat template,
 runs it as a Compute job
 and prints the decoded reply.
 
-For remote jobs, `text`, `transcribe` and `program` also accept a
-[model descriptor](http-gateway.md#model-packages-and-descriptors), produced by
-`hellas model describe PATH -o DIR`. It retains rendering metadata and the
-weights' content reference; the executing provider holds the real weights.
+A pinned Hub GGUF works with `text`, `decide`, `program` and the gateway. Give the 40-hex revision and the file path when the repository holds multiple GGUFs.
+
+```sh
+hellas text --model hf://LiquidAI/LFM3-1.7B-GGUF@cd0c74c575b5c416f3011b5b4c298077f26ca8c2/LFM3-1.7B-BF16.gguf --prompt 'What is the capital of France?' --local
+```
+
+For remote jobs the client reads only the header. The provider can pre-acquire the file, or configure its content allow-list with the same repository, revision, file path, content ID and size. For example:
+
+```sh
+hellas store acquire hf://LiquidAI/LFM3-1.7B-GGUF@cd0c74c575b5c416f3011b5b4c298077f26ca8c2 --path LFM3-1.7B-BF16.gguf --expect a4896de517cae418383c2fd9954bc5ac33d8112b810c7895fb3feb70dca622dc --bytes 3466626336 --pin models/lfm3 --policy jobs
+```
+
+The provider checks the published Xet hash against the canonical content ID. It rejects files published with legacy Xet chunking. With `--local`, the local executor acquires the weights into its own content store.
 
 `hellas transact --job DIR` executes a caller-owned job folder for any
 application. `hellas run` (one call of a Catena program) and `hellas fetch`
@@ -235,34 +243,26 @@ The result then also carries an `emitted` output with every emitted value.
 
 ## Image jobs
 
-Convert the distilled Flux2 Klein 4B snapshot once, pinned to a 40-hex commit.
-The converter fetches the published files it reads at that commit:
+Use a pinned Flux2 Klein checkpoint. The client reads the published tensor headers,
+configuration and tokenizer. The provider acquires the original weight files
+and the model's GPU setup prepares the text encoder, denoiser and VAE.
+The default image variant is 512×512 with four steps. A local snapshot can
+include `variants.json` with 1–64 unique width, height and step configurations.
+Keep the same file on the client and provider. `hellas program` prints the
+exact program for each allowed variant.
 
 ```sh
-nix run github:hellas-ai/hellas#cli-cuda -- convert-flux black-forest-labs/FLUX.2-klein-4B@e7b7dc27f91deacad38e78976d1f2b499d76a294 -o ./klein
-nix run github:hellas-ai/hellas#cli-cuda -- image --model ./klein --prompt 'a small red fox' --seed 42 --width 512 --height 512 --steps 4 --local -o fox.png
+nix run github:hellas-ai/hellas#cli-cuda -- image --model hf://black-forest-labs/FLUX.2-klein-4B@e7b7dc27f91deacad38e78976d1f2b499d76a294 --prompt 'a small red fox' --seed 42 --width 512 --height 512 --steps 4 --local -o fox.png
 ```
 
 Use `cli-hip` for AMD. Both outputs include the Compute CLI and runtime compiler.
 
-The converter validates the checkpoint and creates three ordinary provider
-assets (`text.bin`, `denoise.bin`, `vae.bin`), plus client metadata and a
-tokenizer. Text norms and VAE weights use F32; other weights use BF16, matching
-catena-models. A provider adds the package with `route add /absolute/path/klein`, or
-uses Jobs pins in its content store; see the
-[content store guide](../crates/store/README.md). The package's default image
-variant is 512×512 with four steps. To select other variants, put an explicit
-list of 1–64 unique `{ "width": 512, "height": 512, "steps": 4 }` entries in
-`klein/variants.json` as a JSON array. Keep it with the package metadata on both
-client and provider. `hellas program klein --backend EVALUATOR` prints one ID
-per variant. Grants derived from a package pin exactly those manifests.
-The client needs the package's JSON files; it does not upload the weights.
 For 512×512 images, the provider must admit a 3 MiB output; allow 2 MiB of
 uploads for the program, token IDs and noise. Set its execution budget for
 the selected hardware and step count.
 
 ```sh
-hellas image --provider ENROLLMENT_ID@NODE_ID --model klein \
+hellas image --provider ENROLLMENT_ID@NODE_ID --model hf://black-forest-labs/FLUX.2-klein-4B@e7b7dc27f91deacad38e78976d1f2b499d76a294 \
   --prompt 'a small red fox' --seed 42 --width 512 --height 512 --steps 4 \
   --backend hellas/catena-dfad87438018-hip --pay 20 -o fox.png
 ```
@@ -273,22 +273,96 @@ One job runs `flux.encode-text`, `flux.denoise` and `flux.decode-image`, passing
 conditioning and latents in slots. Tokenization and seeded ChaCha8 noise are
 client inputs; PNG encoding is client presentation of the signed RGB buffer.
 
-The gateway exposes the same package locally with `gateway --model klein`.
-For a remote contact, use `gateway --model klein@CONTACT`; see the
-[HTTP gateway guide](http-gateway.md). Local paths select local execution
-automatically, without a `--local` gateway flag:
+Start the gateway with the same pinned checkpoint and use its repository name in the image request.
 
 ```sh
+hellas gateway --model hf://black-forest-labs/FLUX.2-klein-4B@e7b7dc27f91deacad38e78976d1f2b499d76a294 --bearer-file ./gateway.bearer
 curl http://127.0.0.1:8080/v1/images/generations \
-  -H "Authorization: Bearer $(cat ~/.hellas/gateway/bearer)" -H 'Content-Type: application/json' \
-  -d '{"model":"klein","prompt":"a small red fox","seed":42,"size":"512x512","steps":4}'
+  -H "Authorization: Bearer $(cat ./gateway.bearer)" -H 'Content-Type: application/json' \
+  -d '{"model":"FLUX.2-klein-4B","prompt":"a small red fox","seed":42,"size":"512x512","steps":4}'
 ```
 
 The response contains `data[0].b64_json` and signed evidence in `hellas`.
-The model name is the package directory name. Width and height must each be
+A local checkpoint uses the directory name. Width and height must each be
 multiples of 16 from 16 through 512 and steps must be 1–50. Requests must match
 a package variant. Request defaults are 512×512, four steps and seed zero. The API accepts one image (`n: 1`) in `b64_json`
 format; unsupported fields are rejected before work starts.
+
+## Decision jobs
+
+Ask a d1 model a yes-or-no question on the local GPU:
+
+```sh
+echo '{"state":"I was charged twice.","questions":{"billing":{"type":"noul","instructions":"Is this about billing?"}}}' | hellas decide --model hf://LiquidAI/d1-2B-GGUF@4a181094d1b6addfaa3a0956f78e7ab2aa406a0c/d1-2B-BF16.gguf --local
+```
+
+A d1 decision model answers questions about a state without generating text.
+Its BF16 GGUF supplies the weights and request metadata. A
+provider adds the GGUF with `route add`, as for a text model.
+
+The request names a `state` (a string or any JSON value) and one or more
+`questions`, each of type `noul` (yes or no), `choice` or `score`:
+
+```json
+{
+  "state": "I was charged twice this month, please refund one of them.",
+  "questions": {
+    "refund": {"type": "noul", "instructions": "Is the customer asking for a refund?"},
+    "team": {
+      "type": "choice",
+      "instructions": "Which team should handle this?",
+      "criteria": {"billing": "Charges, refunds, invoices", "technical": "App or site faults"}
+    },
+    "urgency": {
+      "type": "score",
+      "instructions": "How urgent is this?",
+      "criteria": ["Can wait", "Today", "Blocking the customer now"]
+    }
+  }
+}
+```
+
+```sh
+hellas decide --provider ENROLLMENT_ID@NODE_ID --model hf://LiquidAI/d1-2B-GGUF@4a181094d1b6addfaa3a0956f78e7ab2aa406a0c/d1-2B-BF16.gguf \
+  --request request.json --backend hellas/catena-dfad87438018-hip --pay 20
+```
+
+`decide` reads the request from `--request FILE`, or from standard input by
+default, and prints the response JSON:
+
+```json
+{
+  "model": "d1-2B-BF16",
+  "answers": {
+    "refund": {"type": "noul", "noul": 0.97},
+    "team": {"type": "choice", "choice": "billing", "confidence": 0.99, "probabilities": {"billing": 0.99, "technical": 0.01}},
+    "urgency": {"type": "score", "score": 1.0, "confidence": 0.6, "probabilities": {"0": 0.1, "1": 0.6, "2": 0.3}, "legend": {"0": "Can wait", "1": "Today", "2": "Blocking the customer now"}}
+  },
+  "usage": {"input_tokens": 212, "output_tokens": 0}
+}
+```
+
+The client expands each question into one complete prompt, using the request
+format stored in the GGUF. One job then runs `qwen3.init` and `qwen3` once per
+question and returns each prompt's final vocabulary logits; the client reads
+the answers from them. A job answers at most 64 questions. The provider must
+admit two bytes of output per vocabulary entry for each question (256 kB per
+question for d1) and uploads for the program and token IDs.
+
+Requests are text only: `images` and `files` are rejected before work starts.
+The response names the model by its file name without the extension, as a
+gateway route does; a request's optional `model` must match it.
+
+The gateway exposes the same model with `gateway --model d1.gguf` and
+`--access`, `--pay` or `--local` as usual. `POST /v1/systemone` takes the same
+body, with `model` set to the package's file name without its extension, and
+returns the same response with signed evidence in `hellas`:
+
+```sh
+curl http://127.0.0.1:8080/v1/systemone \
+  -H "Authorization: Bearer $(cat ~/.hellas/gateway/bearer)" -H 'Content-Type: application/json' \
+  -d "$(jq '.model = "d1"' request.json)"
+```
 
 ## Fetch jobs
 
@@ -374,6 +448,11 @@ files retain the caller's result. A paid Fetch result lost with the process
 cannot be replayed from those journals.
 
 ## Tracked native execution
+
+Compute job and attempt digests include the evaluator. Saved folders from earlier
+versions reopen using the evaluator in `job.toml`. Their pre-change paid and grant
+attempts use older digests. Running one of those jobs again uses a fresh default
+attempt and can incur another charge or consume grant allowance.
 
 The SDK's `execution` module provides `ExecutionAttempt` and a borrowed
 `ExecutionSession` for paid or granted work without an HTTP listener. Open an

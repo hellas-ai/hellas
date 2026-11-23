@@ -7,6 +7,7 @@ use hellas_store::content::{LocalStore, Scope};
 
 pub struct Admitted<I = PreparedInvocation, A = WorkAdmission> {
     input: I,
+    pure_setup_entries: std::collections::BTreeSet<String>,
     limits: Limits,
     domain: CapacityDomain,
     content: (LocalStore, Scope),
@@ -36,11 +37,25 @@ impl<I> Admitted<I> {
     ) -> Self {
         Self {
             input,
+            pure_setup_entries: Default::default(),
             limits,
             domain,
             content,
             admission,
         }
+    }
+
+    pub fn with_admission(mut self, admission: WorkAdmission) -> Self {
+        self.admission = admission;
+        self
+    }
+
+    pub(crate) fn with_setup_entries(
+        mut self,
+        entries: std::collections::BTreeSet<String>,
+    ) -> Self {
+        self.pure_setup_entries = entries;
+        self
     }
 
     pub async fn reserve(
@@ -50,6 +65,7 @@ impl<I> Admitted<I> {
         let admission = self.admission.reserve(self.domain, payment).await?;
         Ok(Admitted {
             input: self.input,
+            pure_setup_entries: self.pure_setup_entries,
             limits: self.limits,
             domain: self.domain,
             content: self.content,
@@ -59,6 +75,9 @@ impl<I> Admitted<I> {
 }
 
 impl<I, A> Admitted<I, A> {
+    pub fn pure_setup_entries(&self) -> &std::collections::BTreeSet<String> {
+        &self.pure_setup_entries
+    }
     pub const fn admission(&self) -> &A {
         &self.admission
     }

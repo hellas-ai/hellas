@@ -297,15 +297,25 @@ pub fn validate_input(
     max_output_bytes: u64,
     caller: &hellas_auth::PublicKey,
 ) -> Result<crate::fetch::FetchInput, CanonicalDecodeError> {
-    use crate::{FetchEgress, FetchSchema};
-    prepared.validate()?;
     admission.validate()?;
     if prepared.canonical_bytes()?.len() > admission.limits.max_encoded_prepared_input as usize {
         return Err(error("Fetch prepared input exceeds limit"));
     }
+    check_request(prepared, admission, max_output_bytes, caller)
+}
+
+/// The caller has validated the invocation, the admission and its size bound.
+#[cfg(feature = "fetch")]
+pub(super) fn check_request(
+    prepared: &super::PreparedInvocation,
+    admission: &FetchAdmission,
+    max_output_bytes: u64,
+    caller: &hellas_auth::PublicKey,
+) -> Result<crate::fetch::FetchInput, CanonicalDecodeError> {
+    use crate::{FetchEgress, FetchSchema};
     let parameters = Parameters::from_canonical_bytes(prepared.input.parameters.as_bytes())?;
     if parameters.contract != admission.contract
-        || parameters.contract.manifest() != prepared.manifest()?
+        || parameters.contract.manifest_id() != prepared.request.execution_environment
     {
         return Err(error("Fetch contract does not match the admitted manifest"));
     }

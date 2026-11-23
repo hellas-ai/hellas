@@ -6,16 +6,17 @@ grants and API upstreams can appear together:
 
 ```sh
 hellas gateway \
-  --model ./qwen3.gguf --model ./whisper-tiny --model ./flux \
-  --model ./qwen3.gguf@alice \
+  --model hf://ggml-org/Qwen3-0.6B-GGUF@afe8ad3577aa22500b3cd1c880f153b3b0e1cae8/Qwen3-0.6B-BF16.gguf \
+  --model hf://unsloth/whisper-tiny@34457cb234c8624f23ac716000773b367000df6e \
+  --model hf://black-forest-labs/FLUX.2-klein-4B@e7b7dc27f91deacad38e78976d1f2b499d76a294 \
+  --model hf://ggml-org/Qwen3-0.6B-GGUF@afe8ad3577aa22500b3cd1c880f153b3b0e1cae8/Qwen3-0.6B-BF16.gguf@alice \
   --upstream openrouter=https://openrouter.ai/api,key-file="$HOME/or.key" \
   --model gpt-5@openrouter
 ```
 
-A local path accepts Qwen GGUF, converted Whisper, MMS speech or Flux directories, and
-Qwen, Whisper or MMS descriptor directories. The package determines the modality
-and API paths. Remote Compute uses `PATH@CONTACT`: the gateway needs that
-local package to render the invocation for the contact's evaluator. A Fetch
+The gateway serves local or pinned GGUF text and decision models, original
+Whisper, MMS, OmniVoice, Flux and Phonon checkpoints. It discovers the modality and API paths from the model.
+Append `@CONTACT` to a model path or pinned URI to use a remote Compute grant. A Fetch
 grant uses `NAME@CONTACT`, checked against the models in its signed offer.
 Import contacts and access with `hellas pair … --name CONTACT`. For an App
 Attest provider, independently approve its pins under the same contact name:
@@ -23,42 +24,24 @@ Attest provider, independently approve its pins under the same contact name:
 --expected-revision 0 --reason REASON` (use `~/.hellas/trust` for the default
 home). The bundle cannot approve or replace those pins.
 
-## Model packages and descriptors
+## Model sources
 
-Remote Compute needs the model's rendering metadata and the weights' content
-reference. Produce a descriptor once from a full package:
+For a GGUF, give the gateway a pinned Hub reference. Append the contact name to run on a grant provider:
 
 ```sh
-hellas model describe ./qwen3.gguf -o ./qwen3
-hellas model describe ./whisper-tiny -o ./whisper-remote
-hellas gateway --model ./qwen3@alice --model ./whisper-remote@alice
+hellas gateway --model hf://LiquidAI/LFM3-1.7B-GGUF@cd0c74c575b5c416f3011b5b4c298077f26ca8c2/LFM3-1.7B-BF16.gguf@alice
 ```
 
-The output is a new directory with `descriptor.json`, a JSON object with one
-`weights` field containing the original asset's `ContentRef` (`id` and `bytes`).
-A Qwen descriptor also contains `header.gguf`: exactly the GGUF header,
-metadata, tensor table and alignment padding, ending before tensor data. A
-Whisper descriptor contains `config.json`, `generation_config.json` and
-`tokenizer.json`; its config determines the converted tensor layout. There are
-no weights in either descriptor. Flux already names its assets in `assets.json`
-and needs no descriptor conversion.
+The gateway reads the GGUF header for the tokenizer, template and tensor ranges. The provider acquires and verifies the weight file. Local GGUF paths also work.
 
-`ModelPackage::open`, `hellas program`, `text` and `transcribe` accept these
-directories just as they accept full packages. Descriptors preserve the native
-tokenizer metadata and produce the same program, environment and call-plan
-bytes for the same request and evaluator. The path's file stem is the gateway's model name: `qwen3.remote` is served as
-`qwen3`.
+Whisper clients read the tokenizer, generation settings and safetensors header. The provider verifies the original weight file and prepares the selected tensors on its GPU. You can also select a local directory containing the original checkpoint files.
 
-Describing a package hashes its weights once. A gateway opening a full package
-shares that hash across offer matching, evaluators and content indexing. Opening
-a descriptor reads only its metadata. Keep model packages immutable while loaded.
+```sh
+hellas gateway --model hf://unsloth/whisper-tiny@34457cb234c8624f23ac716000773b367000df6e@alice
+hellas program hf://MisterCD/whisper-small@98533e05a8a8d670fa562f13392b78841424f44f --backend hellas/catena-dfad87438018-cuda
+```
 
-A descriptor is for rendering remote jobs. A local executing backend requires
-the full package; the provider's content store verifies actual weight bytes
-against the job's content reference. A descriptor cannot supply or substitute
-for those bytes. Hand-edited descriptors are trusted renderer input: an incorrect
-weights reference or metadata can produce a job that the provider refuses or
-executes with meaningless results.
+For MMS English and other speech checkpoints, see [speech](speech.md).
 
 ## Upstreams and HTTP access
 
@@ -73,18 +56,18 @@ Every request requires a scoped `gateway.invoke` bearer. The foreground
 command prints its bearer to the terminal, or passes it directly to a child:
 
 ```sh
-hellas gateway --model ./qwen3.gguf --wrap claude
+hellas gateway --model hf://ggml-org/Qwen3-0.6B-GGUF@afe8ad3577aa22500b3cd1c880f153b3b0e1cae8/Qwen3-0.6B-BF16.gguf --wrap claude
 ```
 
 `--wrap` supplies OpenAI and Anthropic URLs and tokens, and drains accepted
 work when the child exits. For headless clients, use `--bearer-file PATH`:
 
 ```sh
-hellas gateway --model ./qwen3.gguf --bearer-file "$HOME/gateway.bearer"
+hellas gateway --model hf://ggml-org/Qwen3-0.6B-GGUF@afe8ad3577aa22500b3cd1c880f153b3b0e1cae8/Qwen3-0.6B-BF16.gguf --bearer-file "$HOME/gateway.bearer"
 # In another shell:
 curl -H "Authorization: Bearer $(cat "$HOME/gateway.bearer")" \
   -H "Content-Type: application/json" \
-  -d '{"model":"qwen3","messages":[{"role":"user","content":"Hello"}]}' \
+  -d '{"model":"Qwen3-0.6B-BF16","messages":[{"role":"user","content":"Hello"}]}' \
   http://127.0.0.1:8080/v1/chat/completions
 ```
 
@@ -99,7 +82,7 @@ client. The bearer changes on restart.
 For repeatable startup, both forms accept `--config PATH`:
 
 ```toml
-models = ["/srv/models/qwen3.gguf", "/srv/models/whisper-tiny", "gpt-5@api"]
+models = ["/srv/models/qwen3.gguf", "hf://unsloth/whisper-tiny@34457cb234c8624f23ac716000773b367000df6e", "gpt-5@api"]
 
 [upstreams.api]
 url = "https://api.example.com/v1"
@@ -124,9 +107,7 @@ behavior; it does not journal routing configuration.
 The TOML schema is the SDK's daemon document (`listeners`, `backends`, `routes`,
 `resources`, `machine`, `budgets`, `limits`, `execution`), plus `models`,
 `upstreams` and optional `paid_policy`. Models and upstreams are resolved into
-that document with the same logic as route/backend edits. Paths name prepared
-local packages or descriptors; conversion and acquisition remain separate
-commands. Multiple local model routes share a serialized executor for each
+that document with the same logic as route/backend edits. Use a pinned Hub URI or a local model path. Multiple local model routes share a serialized executor for each
 evaluator, rather than running GPU jobs concurrently.
 
 `execution.queue_capacity`, `execution.session_programs` and
@@ -163,7 +144,7 @@ paired profile for edits:
 ```sh
 hellas backend add upstream https://api.example.com/v1 --key-file "$HOME/api.key"
 hellas route add gpt-5@upstream
-hellas route add /srv/models/qwen3.gguf
+hellas route add hf://ggml-org/Qwen3-0.6B-GGUF@afe8ad3577aa22500b3cd1c880f153b3b0e1cae8/Qwen3-0.6B-BF16.gguf
 hellas route listen 127.0.0.1:8081
 hellas routes
 hellas route rm gpt-5@upstream

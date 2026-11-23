@@ -7,7 +7,9 @@ use hellas_auth::authority::{NodeKey, PrincipalId};
 use hellas_store::content::DiskStore;
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 mod models;
-pub(super) use models::Files;
+#[cfg(feature = "compute")]
+use models::Files;
+pub(super) use models::ModelIndex;
 
 pub struct Options {
     pub discovery: bool,

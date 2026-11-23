@@ -6,13 +6,11 @@ use std::path::Path;
 pub mod admin;
 pub mod chain;
 pub mod contributions;
-pub mod convert;
 pub mod faucet;
 
 mod bootstrap;
 pub mod daemon;
 pub mod identity;
-pub mod model;
 pub mod monitor;
 mod owner;
 pub mod rpc;

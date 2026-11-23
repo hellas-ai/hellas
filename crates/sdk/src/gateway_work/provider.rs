@@ -147,15 +147,7 @@ impl WorkBackend for IrohBackend {
                 .await?
                 .cancellable(job.cancellation());
             let permit = permit.retaining(reserved(inner, job, slot));
-            let domain = input.capacity_domain();
-            let (prepared, limits, content, _) = input.into_parts_and_admission();
-            Admitted::new(
-                prepared,
-                limits,
-                domain,
-                content,
-                WorkAdmission::reserved(permit),
-            )
+            input.with_admission(WorkAdmission::reserved(permit))
         };
         let selected = input.admission().backend().ok_or(AdmissionError::Closed)?;
         (selected.execute)(input, progress).await

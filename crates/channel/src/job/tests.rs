@@ -59,6 +59,35 @@ fn every_invocation_binding_is_checked_for_both_funding_forms() {
         (&granted_input, JobInputBinding::from(&granted)),
     ] {
         assert!(check_input(&context, &binding, &policy, input).is_ok());
+        let prepared = hellas_rpc::protocol::content::encode_reference(binding.input_content);
+        let root = ContentRef::for_bytes(&fixture::program_root(input));
+        let mut opening = hellas_rpc::pb::content::WorkOpening {
+            manifest: input.manifest().canonical_bytes(),
+            root: Some(hellas_rpc::pb::content::ContentRef {
+                id: root.id().as_bytes().to_vec(),
+                bytes: root.bytes(),
+            }),
+            ..Default::default()
+        };
+        let check = |opening: &_, prepared: &[u8]| {
+            check_content_opening(binding, &policy, opening, prepared)
+        };
+        assert_eq!(check(&opening, &prepared).unwrap().2, Some(root));
+        assert!(check(&opening, &[]).is_err());
+        let mut wrong_manifest = opening.clone();
+        wrong_manifest.manifest = hellas_rpc::ProgramManifest::new(
+            input.manifest().application().clone(),
+            ContentId::hash(b"other root"),
+        )
+        .canonical_bytes();
+        assert!(check(&wrong_manifest, &prepared).is_err());
+        opening.root.as_mut().unwrap().bytes = crate::content::MAX_PROGRAM_ROOT_BYTES as u64 + 1;
+        assert!(check(&opening, &prepared).is_err());
+        opening.root.as_mut().unwrap().bytes = root.bytes();
+        opening.root.as_mut().unwrap().id[0] ^= 1;
+        assert!(check(&opening, &prepared).is_err());
+        opening.root = None;
+        assert!(check(&opening, &prepared).is_err());
         let changes: &[fn(&mut JobInputBinding)] = &[
             |a| a.work_policy_digest = Digest::hash(b"another policy"),
             |a| {
@@ -287,7 +316,7 @@ fn every_prepared_invocation_and_policy_field_is_bound_for_paid_and_grant_inputs
             },
             |p| p.application_policy.0.push(0),
             |p| {
-                let old = p.manifest().unwrap();
+                let old = p.manifest();
                 let manifest = hellas_rpc::ProgramManifest::new(
                     old.application().clone(),
                     ContentId::hash(b"another root"),
@@ -302,7 +331,7 @@ fn every_prepared_invocation_and_policy_field_is_bound_for_paid_and_grant_inputs
                 .unwrap();
             },
             |p| {
-                let old = p.manifest().unwrap();
+                let old = p.manifest();
                 let manifest = hellas_rpc::ProgramManifest::new(
                     hellas_rpc::Application::new("other/evaluator", old.application().adaptor())
                         .unwrap(),

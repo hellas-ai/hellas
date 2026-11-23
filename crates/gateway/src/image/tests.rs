@@ -39,7 +39,7 @@ impl WorkExecutionBackend for Fake {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.started.notify_one();
         assert_eq!(job.environment.sources.len(), 1);
-        assert_eq!(job.plan.calls.len(), 3);
+        assert_eq!(job.plan.calls.len(), 5);
         assert_eq!(job.inputs.len(), 2);
         let OutputKind::Buffer { max_bytes } = job.plan.outputs[0].kind else {
             panic!()
@@ -95,21 +95,34 @@ impl WorkExecutionBackend for Fake {
     }
 }
 async fn app(work: Arc<Fake>) -> Router {
-    crate::router::router(
+    use hellas_client::model::{GpuDialect, evaluator, flux};
+    let directory =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../client/src/model/flux/fixture");
+    let models = [(
+        directory.clone(),
+        Ok([(
+            evaluator(GpuDialect::Hip),
+            Arc::new(flux::fixture(&directory, GpuDialect::Hip).unwrap()),
+        )]
+        .into()),
+    )]
+    .into();
+    let (router, errors) = crate::router::with_models(
         vec![crate::test_support::route(crate::Presentation::Model {
             modality: hellas_client::model::ModelKind::Image,
             model: "klein".into(),
-            package: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../client/src/model/flux/fixture"),
+            package: directory,
             max_tokens: 128,
         })],
         work,
         Arc::new(crate::jobs::Jobs::default()),
         Default::default(),
+        &models,
     )
     .await
-    .unwrap()
-    .layer(crate::provenance_layer::ProvenanceLayer)
+    .unwrap();
+    assert!(errors.is_empty());
+    router.layer(crate::provenance_layer::ProvenanceLayer)
 }
 fn request(body: serde_json::Value) -> axum::extract::Request {
     axum::extract::Request::post("/v1/images/generations")

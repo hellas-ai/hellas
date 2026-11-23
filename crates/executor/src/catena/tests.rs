@@ -248,6 +248,7 @@ fn counter_and_first_then_resolve_by_step_index() {
         &plan,
         &limits(),
         &Assets::new(0, catena_lang::codegen::GpuDialect::Hip),
+        None,
         &mut BTreeMap::new(),
         |v| {
             observed.push(v);
@@ -291,6 +292,7 @@ fn invalid_plan_never_loads_or_calls_a_device() {
                 &plan,
                 &limit,
                 &Assets::new(0, catena_lang::codegen::GpuDialect::Hip),
+                None,
                 &mut BTreeMap::new(),
                 |_| Ok(())
             )
@@ -502,6 +504,7 @@ fn hip_unseen_program_and_kill_respawn() {
             plan,
             &limits,
             &Assets::new(0, dialect),
+            None,
             &mut BTreeMap::new(),
             |_| Ok(()),
         )
@@ -821,4 +824,124 @@ async fn an_executor_refuses_an_unregistered_evaluator() {
             .await
             .contains("unsupported compute evaluator")
     );
+}
+
+#[test]
+fn only_approved_asset_only_setup_results_are_read_only() {
+    use std::collections::BTreeSet;
+    let f = |name: &str, input| GeneratedFunction {
+        source_name: name.into(),
+        symbol: name.into(),
+        inputs: vec![input],
+        outputs: vec![K::MemOwn],
+    };
+    let module = RuntimeModule::new(
+        GpuDialect::Cuda,
+        "",
+        [
+            f("prep", K::MemRef),
+            f("scalar", K::U64),
+            f("consume", K::MemOwn),
+            f("borrow", K::MemRef),
+        ],
+    );
+    let object = hellas_rpc::ContentRef::for_bytes(b"weight");
+    let env = Environment {
+        sources: vec![],
+        assets: vec![NamedAsset {
+            name: "w".into(),
+            object,
+        }],
+    };
+    let asset = Arg::Asset {
+        name: "w".into(),
+        offset: 0,
+        bytes: object.bytes(),
+    };
+    let call = |entry: &str, arg: Arg| Call {
+        entry: entry.into(),
+        args: vec![arg],
+        bind: vec![Bind::Name("result".into())],
+    };
+    let slot = Arg::Slot {
+        name: "result".into(),
+    };
+    let mut plan = Plan {
+        calls: vec![call("prep", asset.clone()), call("consume", slot.clone())],
+        step: None,
+        outputs: vec![],
+    };
+    let entries = BTreeSet::from(["prep".to_owned(), "scalar".to_owned()]);
+    let check = |p: &Plan, e: &BTreeSet<String>| {
+        validate::validate_setup(&module, &env, &BTreeMap::new(), p, &limits(), e)
+    };
+    assert!(
+        check(&plan, &entries)
+            .unwrap_err()
+            .to_string()
+            .contains("read-only")
+    );
+    assert!(check(&plan, &Default::default()).is_ok());
+    plan.calls[1] = call("borrow", slot.clone());
+    assert!(check(&plan, &entries).is_ok());
+    plan.calls[0] = call("scalar", Arg::U64(4));
+    plan.calls[1] = call("consume", slot);
+    assert!(check(&plan, &entries).is_ok());
+}
+
+#[test]
+#[ignore = "requires CUDA device"]
+fn prepared_gpu_buffers_share_the_asset_lru() -> Result<()> {
+    use super::assets::SetupKey;
+    use catena_lang::runtime::MemOwn;
+    use std::{
+        cell::Cell,
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+    let assets = Assets::new(8, GpuDialect::Cuda);
+    let object = hellas_rpc::ContentRef::for_bytes(b"abcdefgh");
+    let key = |offset: u64| SetupKey {
+        manifest: object.id(),
+        entry: "prepare".into(),
+        ranges: vec![(object, offset, 2)],
+    };
+    let runs = Cell::new(0);
+    let cancel = super::Cancellation::default();
+    let prepare = |offset| {
+        assets.prepare(
+            key(offset),
+            &cancel,
+            Instant::now() + Duration::from_secs(30),
+            || {
+                runs.set(runs.get() + 1);
+                Ok(vec![MemOwn::from_u16_slice(
+                    &[0x1122, 0x3344],
+                    GpuDialect::Cuda,
+                )?])
+            },
+        )
+    };
+    let first = prepare(0)?;
+    let hit = prepare(0)?;
+    assert!(Arc::ptr_eq(&first, &hit));
+    assert_eq!(runs.get(), 1);
+    let second = prepare(2)?;
+    drop(second);
+    drop(hit);
+    drop(first);
+    // Touch 0 again before admitting range 4 to evict range 2.
+    drop(prepare(0)?);
+    drop(prepare(4)?);
+    drop(prepare(2)?);
+    assert_eq!(runs.get(), 4);
+    let reader = hellas_store::content::VerifiedReader::Memory(std::io::Cursor::new(
+        b"abcdefgh".to_vec().into(),
+    ));
+    let asset = assets.pin(reader, object)?;
+    assert!(prepare(0).is_err());
+    drop(asset);
+    let fresh = prepare(0)?;
+    assert_eq!(fresh.0[0].try_to_u16_vec()?, [0x1122, 0x3344]);
+    Ok(())
 }

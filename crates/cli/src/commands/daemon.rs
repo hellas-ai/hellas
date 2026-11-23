@@ -15,11 +15,14 @@ mod config;
 #[derive(clap::Args)]
 pub struct GatewayArgs {
     /// TOML routing and listener configuration.
-    #[arg(long, conflicts_with_all = ["models", "upstreams", "bind"])]
+    #[arg(long, conflicts_with_all = ["models", "upstreams", "bind","voices"])]
     pub config: Option<PathBuf>,
-    /// Qwen GGUF, Whisper/Flux package or descriptor; PATH@CONTACT or NAME@UPSTREAM.
+    /// Model path or pinned hf:// checkpoint, PATH@CONTACT, or NAME@UPSTREAM.
     #[arg(long = "model", required_unless_present = "config")]
     pub models: Vec<String>,
+    /// Named voices to serve with a native Phonon model (repeatable).
+    #[arg(long = "voice")]
+    pub voices: Vec<String>,
     /// NAME=HTTPS_API_URL,key-file=PATH (an OpenAI-compatible service).
     #[arg(long = "upstream")]
     pub upstreams: Vec<String>,
@@ -74,6 +77,7 @@ pub enum Edit {
 }
 
 pub struct ModelContext {
+    voices: Vec<String>,
     pub home: PathBuf,
     pub principal: Option<PrincipalId>,
     pub holder: NodeKey,
@@ -86,6 +90,7 @@ impl ModelContext {
         owner: Option<&dyn Authenticator>,
     ) -> Result<Self> {
         Ok(Self {
+            voices: vec![],
             home: home.into(),
             content: None,
             holder: NodeKey::from_public_key(identity.node_key.public_key())?,
@@ -104,13 +109,19 @@ impl ModelContext {
         path: &Path,
         evaluators: impl IntoIterator<Item = String>,
     ) -> Result<std::collections::BTreeMap<String, Arc<hellas_client::model::ModelPackage>>> {
-        hellas_client::model::ModelPackage::open_many(path, evaluators, self.content.as_ref()).await
+        hellas_client::model::ModelPackage::open_many_with_voices(
+            path,
+            evaluators,
+            self.content.as_ref(),
+            &self.voices,
+        )
+        .await
     }
 
     async fn add(&self, document: &mut Document, model: &str) -> Result<()> {
-        let Some((name, destination)) = model.rsplit_once('@') else {
-            let path =
-                std::fs::canonicalize(model).with_context(|| format!("model package {model}"))?;
+        let (name, destination) = split_model(model);
+        let Some(destination) = destination else {
+            let path = model_path(name)?.with_context(|| format!("model package {model}"))?;
             document
                 .backends
                 .entry("local".into())
@@ -122,7 +133,7 @@ impl ModelContext {
                     },
                 });
             document
-                .add_route(package_route(path, "local")?)
+                .add_route(package_route(path, "local", &self.voices).await?)
                 .map_err(anyhow::Error::from_boxed)?;
             return Ok(());
         };
@@ -155,10 +166,7 @@ impl ModelContext {
                 store: self.home.join("trust"),
                 policy: destination.into(),
             });
-        let package = Path::new(name)
-            .exists()
-            .then(|| std::fs::canonicalize(name))
-            .transpose()?;
+        let package = model_path(name)?;
         let packages = if let Some(path) = &package {
             let evaluators = bundle
                 .offers
@@ -177,7 +185,7 @@ impl ModelContext {
         };
         let package_programs = packages
             .iter()
-            .map(|(evaluator, package)| Ok((evaluator, package.programs()?)))
+            .map(|(evaluator, package)| Ok((evaluator.clone(), package.programs()?)))
             .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
         let mut matches = vec![];
         for policy in bundle
@@ -186,20 +194,14 @@ impl ModelContext {
             .flat_map(|offer| &offer.offer().grant.policies)
         {
             if package.is_some() {
-                for admission in &policy.invocation_policy.admissions {
-                    if let hellas_rpc::protocol::invocation::Admission::Compute {
-                        evaluator,
-                        programs,
-                    } = admission
-                    {
-                        if let hellas_rpc::protocol::invocation::ComputePrograms::Only { manifests } =
-                            programs
-                            && !package_programs[evaluator]
-                                .iter()
-                                .all(|program| manifests.contains(&program.manifest))
-                        {
-                            continue;
-                        }
+                for (evaluator, programs) in &package_programs {
+                    if programs.iter().all(|manifest| {
+                        policy
+                            .invocation_policy
+                            .admissions_for(manifest)
+                            .next()
+                            .is_some()
+                    }) {
                         matches.push((policy.clone(), Some(evaluator.clone())));
                     }
                 }
@@ -237,7 +239,7 @@ impl ModelContext {
         );
         if let Some(package) = package {
             document
-                .add_route(package_route(package, &id)?)
+                .add_route(package_route(package, &id, &self.voices).await?)
                 .map_err(anyhow::Error::from_boxed)?;
         } else {
             for mut route in hellas_sdk::grant_routes(&policy, &id).map_err(anyhow::Error::from)? {
@@ -308,18 +310,45 @@ fn grant_backend(
     id
 }
 
-fn package_route(package: PathBuf, backend: &str) -> Result<Route> {
-    let model = package
-        .file_stem()
-        .and_then(|name| name.to_str())
-        .context("model package needs a UTF-8 name")?
-        .to_owned();
+fn split_model(value: &str) -> (&str, Option<&str>) {
+    let Some((source, contact)) = value.rsplit_once('@') else {
+        return (value, None);
+    };
+    if value.starts_with("hf://")
+        && (!source.contains('@')
+            || (value.to_ascii_lowercase().ends_with(".gguf")
+                && !source.to_ascii_lowercase().ends_with(".gguf")))
+    {
+        (value, None)
+    } else {
+        (source, Some(contact))
+    }
+}
+
+fn model_path(source: &str) -> Result<Option<PathBuf>> {
+    if source.starts_with("hf://") {
+        return Ok(Some(source.into()));
+    }
+    Ok(Path::new(source)
+        .exists()
+        .then(|| std::fs::canonicalize(source))
+        .transpose()?)
+}
+
+async fn package_route(package: PathBuf, backend: &str, voices: &[String]) -> Result<Route> {
+    let input = package.clone();
+    let (modality, model) =
+        tokio::task::spawn_blocking(move || hellas_client::model::ModelKind::named(&input))
+            .await??;
     Ok(Route {
         backends: vec![backend.into()],
-        presentation: match hellas_client::model::ModelKind::of(&package)? {
+        presentation: match modality {
             hellas_client::model::ModelKind::Speech => Presentation::Speech {
                 model,
-                target: hellas_gateway::SpeechTarget::Native { package },
+                target: hellas_gateway::SpeechTarget::Native {
+                    package,
+                    voices: voices.to_vec(),
+                },
             },
             modality => Presentation::Model {
                 modality,
@@ -394,19 +423,14 @@ pub async fn apply(document: &mut Document, edit: Edit, context: &ModelContext) 
                 .insert("api".into(), Listener::http(bind));
         }
         Edit::Route(RouteCommand::Rm { model }) => {
-            let (name, destination) = model
-                .rsplit_once('@')
-                .map_or((model.as_str(), None), |(a, b)| (a, Some(b)));
-            let package = Path::new(name)
-                .exists()
-                .then(|| std::fs::canonicalize(name))
-                .transpose()?;
+            let (name, destination) = split_model(&model);
+            let package = model_path(name)?;
             let mut removed = false;
             for route in &mut document.routes {
                 let matches = match &route.presentation {
                     Presentation::Model { package: path, .. }
                     | Presentation::Speech {
-                        target: hellas_gateway::SpeechTarget::Native { package: path },
+                        target: hellas_gateway::SpeechTarget::Native { package: path, .. },
                         ..
                     } => package.as_ref() == Some(path),
                     _ => route
@@ -456,6 +480,7 @@ pub fn print(view: &hellas_sdk::daemon::View) {
         let modality = match &route.presentation {
             Presentation::Model { modality, .. } => match modality {
                 hellas_client::model::ModelKind::Text => "text",
+                hellas_client::model::ModelKind::Decision => "decision",
                 hellas_client::model::ModelKind::Transcription => "audio",
                 hellas_client::model::ModelKind::Speech => "speech",
                 hellas_client::model::ModelKind::Image => "image",
@@ -625,6 +650,7 @@ pub async fn gateway(
         identity,
         owner.map(|owner| owner as &dyn Authenticator),
     )?;
+    context.voices = args.voices;
     hellas_private::create_dir_all_durable(home)?;
     let temporary = tempfile::Builder::new()
         .prefix(".gateway-")
@@ -890,6 +916,7 @@ mod tests {
 
     pub(super) fn model_context(home: &Path) -> ModelContext {
         ModelContext {
+            voices: vec![],
             home: home.into(),
             principal: None,
             content: None,
@@ -1028,6 +1055,7 @@ mod tests {
             &StoreLocation::for_test(root.path()),
             &native,
             std::slice::from_ref(&path),
+            &[],
         )
         .await
         .unwrap();

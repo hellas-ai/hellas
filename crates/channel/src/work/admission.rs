@@ -17,7 +17,7 @@ impl BackendKey {
     pub fn of(
         input: &hellas_rpc::protocol::invocation::PreparedInvocation,
     ) -> Result<Self, BackendFault> {
-        let manifest = input.manifest().map_err(BackendFault::caused_by)?;
+        let manifest = input.manifest();
         if manifest.application().adaptor() == hellas_rpc::protocol::invocation::compute::ADAPTOR {
             return Ok(Self::Compute(manifest.application().evaluator().into()));
         }

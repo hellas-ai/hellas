@@ -68,9 +68,13 @@ and all desired arguments:
 ["serve", "--port", "31145", "--home", "/var/lib/hellas/.hellas"]
 ```
 
-Put converted packages on the persistent volume. Pair the invite, then use
-`hellas route add /var/lib/hellas/models/PACKAGE` from an editing CLI that can
-read that path. Routes create bounded resources; allowances and contacts stay
+Pair the invite and add a pinned model from the editing CLI. The provider acquires and verifies the original weights. A local checkpoint directory on the persistent volume also works when the editing CLI can read it.
+
+```sh
+hellas route add hf://unsloth/whisper-tiny@34457cb234c8624f23ac716000773b367000df6e
+```
+
+Routes create bounded resources; allowances and contacts stay
 on the existing `share` and `pair` commands. A template does not download models
 or create allowances. See [sharing](../README.md#2-share-your-gpu).
 The state filesystem must preserve private files owned by the daemon user

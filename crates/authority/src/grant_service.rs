@@ -512,12 +512,10 @@ impl GrantService {
                     &input,
                 )
                 .map_err(|_| refused(GrantRefusalCode::Malformed))?;
-                let manifest = input
-                    .manifest()
-                    .map_err(|_| refused(GrantRefusalCode::Malformed))?;
+                let manifest = input.manifest();
                 let root = if policy
                     .invocation_policy
-                    .content_closure(&manifest, &[])
+                    .content_closure(manifest, &[])
                     .is_ok()
                 {
                     bytes::Bytes::new()
@@ -528,7 +526,7 @@ impl GrantService {
                 };
                 let objects = hellas_channel::job::content_closure(
                     &policy.invocation_policy,
-                    &manifest,
+                    manifest,
                     &root,
                     a.input_content,
                 )

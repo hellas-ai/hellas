@@ -144,14 +144,14 @@ impl ClientEndpoint {
         }
         let (policy, facts) =
             crate::job::job_facts(self.state().channel(), authorization, prepared)?;
-        let manifest = prepared.manifest().map_err(PaidWorkError::from)?;
-        let root = if policy.content_closure(&manifest, &[]).is_ok() {
+        let manifest = prepared.manifest();
+        let root = if policy.content_closure(manifest, &[]).is_ok() {
             bytes::Bytes::new()
         } else {
             crate::content::root(&source.0, &source.1, manifest.root()).await?
         };
         let closure =
-            crate::job::content_closure(&policy, &manifest, &root, authorization.input_content)?;
+            crate::job::content_closure(&policy, manifest, &root, authorization.input_content)?;
         let mut share = vec![authorization.input_content];
         let mut readers = Vec::new();
         for reference in closure {
@@ -231,19 +231,19 @@ where
         )
     };
     let source = retained.as_ref().unwrap_or(source);
-    let manifest = prepared.manifest().map_err(PaidWorkError::from)?;
+    let manifest = prepared.manifest();
     let policy = hellas_rpc::protocol::invocation::InvocationPolicy::from_canonical_bytes(
         prepared.application_policy.as_bytes(),
     )
     .map_err(PaidWorkError::from)?;
-    let root = if policy.content_closure(&manifest, &[]).is_ok() {
+    let root = if policy.content_closure(manifest, &[]).is_ok() {
         None
     } else {
         Some(crate::content::root(&source.0, &source.1, manifest.root()).await?)
     };
     let closure = crate::job::content_closure(
         &policy,
-        &manifest,
+        manifest,
         root.as_deref().unwrap_or_default(),
         authorization.input_content,
     )?;
@@ -564,40 +564,22 @@ impl WorkService {
                 ) {
                     return Err(status(Error::Denied));
                 }
-                let manifest = hellas_rpc::ProgramManifest::from_canonical_bytes(&opening.manifest)
-                    .map_err(status)?;
-                if manifest.content_id() != authorization.environment_commitment
-                    || decode_reference(&request.prepared_input)
-                        != Some(authorization.input_content)
-                {
-                    return Err(status(Error::Denied));
-                }
                 let policy = endpoint
                     .ready
                     .as_ref()
                     .ok_or_else(|| status(Error::Denied))?
                     .invocation_policy()
                     .clone();
-                let facts = policy.classify_manifest(&manifest).map_err(status)?;
-                if facts.retention != authorization.retention
-                    || authorization.input_content.bytes()
-                        > u64::from(facts.max_encoded_prepared_input)
-                {
+                let (manifest, facts, root) = crate::job::check_content_opening(
+                    (&authorization).into(),
+                    &policy,
+                    &opening,
+                    &request.prepared_input,
+                )
+                .map_err(status)?;
+                if facts.retention != authorization.retention {
                     return Err(status(Error::Denied));
                 }
-                let root = match &opening.root {
-                    Some(root) => {
-                        let root = object(root)?;
-                        if root.id() != manifest.root()
-                            || root.bytes() > crate::content::MAX_PROGRAM_ROOT_BYTES as u64
-                        {
-                            return Err(status(Error::Invalid("signed program root")));
-                        }
-                        Some(root)
-                    }
-                    None if policy.content_closure(&manifest, &[]).is_ok() => None,
-                    None => return Err(status(Error::Invalid("missing signed root reference"))),
-                };
                 let first_object = root.unwrap_or(authorization.input_content);
                 if open.pin.is_some()
                     || object(open.object.as_ref().ok_or_else(|| status(Error::Denied))?)?

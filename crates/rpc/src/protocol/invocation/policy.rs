@@ -1,6 +1,6 @@
 //! Owner-approved application admission and common per-job bounds.
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::{bound, compute, domain_is, encode, error, fetch::FetchAdmission};
 use crate::protocol::value::{CanonicalDecodeError, decode_canonical_dag_cbor};
@@ -18,16 +18,59 @@ pub const MAX_COMPUTE_PROGRAMS: usize = 64;
 #[serde(tag = "mode", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ComputePrograms {
     Any {},
-    Only { manifests: Vec<ContentId> },
+    Only {
+        manifests: Vec<ContentId>,
+        /// Fully initializing, pure weight preparation entries approved by the owner.
+        #[serde(
+            default,
+            skip_serializing_if = "BTreeMap::is_empty",
+            with = "setup_entries_by_id"
+        )]
+        pure_setup_entries: BTreeMap<ContentId, BTreeSet<String>>,
+    },
+}
+
+// Signed policies use lowercase Xet text for map keys in every encoding, including DAG-CBOR.
+mod setup_entries_by_id {
+    use super::*;
+    use serde::{Deserializer, Serializer, de::IntoDeserializer};
+
+    pub(super) fn serialize<S: Serializer>(
+        map: &BTreeMap<ContentId, BTreeSet<String>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(map.iter().map(|(id, entries)| (id.to_string(), entries)))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<BTreeMap<ContentId, BTreeSet<String>>, D::Error> {
+        BTreeMap::<String, BTreeSet<String>>::deserialize(deserializer)?
+            .into_iter()
+            .map(|(key, entries)| Ok((ContentId::deserialize(key.into_deserializer())?, entries)))
+            .collect()
+    }
 }
 
 impl ComputePrograms {
     pub fn validate(&self) -> Result<(), CanonicalDecodeError> {
-        if let Self::Only { manifests } = self {
+        if let Self::Only {
+            manifests,
+            pure_setup_entries,
+        } = self
+        {
             if manifests.is_empty() || manifests.len() > MAX_COMPUTE_PROGRAMS {
                 return Err(error(
                     "compute admission requires a bounded, nonempty manifest list",
                 ));
+            }
+            for (manifest, entries) in pure_setup_entries {
+                if !manifests.contains(manifest) || entries.is_empty() {
+                    return Err(error("setup entries must belong to an admitted manifest"));
+                }
+                for entry in entries {
+                    super::label(entry)?;
+                }
             }
             if manifests.iter().collect::<BTreeSet<_>>().len() != manifests.len() {
                 return Err(error("duplicate compute manifest"));
@@ -38,7 +81,7 @@ impl ComputePrograms {
     fn admits(&self, manifest: &ProgramManifest) -> bool {
         match self {
             Self::Any {} => true,
-            Self::Only { manifests } => manifests.contains(&manifest.content_id()),
+            Self::Only { manifests, .. } => manifests.contains(&manifest.content_id()),
         }
     }
 }
@@ -92,21 +135,31 @@ pub enum Admission {
     },
 }
 impl Admission {
-    /// Admit exactly `programs`, which must share one evaluator.
-    pub fn compute_only(programs: &[compute::ProgramId]) -> Result<Self, CanonicalDecodeError> {
+    /// Admit exact Compute manifests for one evaluator with the owner's pure setup entries.
+    pub fn compute_only(
+        programs: &[ProgramManifest],
+        entries: &[&str],
+    ) -> Result<Self, CanonicalDecodeError> {
         let [first, ..] = programs else {
             return Err(error("compute admission requires a nonempty program list"));
         };
-        if programs
-            .iter()
-            .any(|program| program.evaluator != first.evaluator)
+        let application = first.application();
+        if application.adaptor() != compute::ADAPTOR
+            || programs.iter().any(|p| p.application() != application)
         {
-            return Err(error("admitted programs must share one evaluator"));
+            return Err(error("admitted programs must share one Compute evaluator"));
+        }
+        let manifests: Vec<_> = programs.iter().map(ProgramManifest::content_id).collect();
+        let mut pure_setup_entries = BTreeMap::new();
+        if !entries.is_empty() {
+            let entries: BTreeSet<_> = entries.iter().map(|s| (*s).to_owned()).collect();
+            pure_setup_entries.extend(manifests.iter().map(|&id| (id, entries.clone())));
         }
         Ok(Self::Compute {
-            evaluator: first.evaluator.clone(),
+            evaluator: application.evaluator().into(),
             programs: ComputePrograms::Only {
-                manifests: programs.iter().map(|program| program.manifest).collect(),
+                manifests,
+                pure_setup_entries,
             },
         })
     }
@@ -203,12 +256,29 @@ impl InvocationPolicy {
     pub fn content_id(&self) -> Result<ContentId, CanonicalDecodeError> {
         Ok(ContentId::hash(&self.canonical_bytes()?))
     }
+    /// Compute the cache permission from this owner's exact program admissions.
+    pub fn pure_setup_entries(&self, manifest: &ProgramManifest) -> BTreeSet<String> {
+        self.admissions_for(manifest)
+            .filter_map(|admission| match admission {
+                Admission::Compute {
+                    programs:
+                        ComputePrograms::Only {
+                            pure_setup_entries, ..
+                        },
+                    ..
+                } => pure_setup_entries.get(&manifest.content_id()),
+                _ => None,
+            })
+            .flatten()
+            .cloned()
+            .collect()
+    }
     /// More than one route can admit the same Fetch manifest. Callers check the
     /// application's input against a matching admission rather than choosing
     /// the first manifest match and silently ignoring the remaining routes.
     pub fn admissions_for<'a>(
         &'a self,
-        manifest: &'a ProgramManifest,
+        manifest: &ProgramManifest,
     ) -> impl Iterator<Item = &'a Admission> {
         self.admissions
             .iter()
