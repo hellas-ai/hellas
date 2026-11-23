@@ -245,6 +245,7 @@ pub async fn listener_router(
     app: axum::Router,
     node: hellas_authority::node::NodeCoordinator,
     archive: ArchiveOptions,
+    require_auth: bool,
 ) -> GatewayResult<axum::Router> {
     let policy = archive::Policy::new(archive);
     let app =
@@ -257,7 +258,7 @@ pub async fn listener_router(
     let app = app.layer(axum::middleware::from_fn(
         hellas_rpc::telemetry::http::trace_request,
     ));
-    Ok(app.layer(access::BearerLayer::new(node)))
+    Ok(app.layer(access::BearerLayer::new(node, require_auth)))
 }
 
 /// A refusal or failure in the OpenAI error shape.

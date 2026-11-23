@@ -105,6 +105,7 @@ async fn both_listeners_keep_admitted_backends_when_fetch_configuration_changes(
             Listener::Http {
                 bind: "127.0.0.1:0".parse().unwrap(),
                 zdr: true,
+                require_auth: true,
             },
         );
         document.routes.push(hellas_gateway::Route {
@@ -209,6 +210,7 @@ async fn both_listeners_keep_admitted_backends_when_fetch_configuration_changes(
             Listener::Http {
                 bind: "127.0.0.1:0".parse().unwrap(),
                 zdr: true,
+                require_auth: true,
             },
         );
         document.routes = provider.watch().0.document.routes;

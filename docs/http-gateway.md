@@ -52,8 +52,13 @@ The same model selection is available in a TOML service configuration; there
 are no per-modality flags.
 
 The default HTTP address is `127.0.0.1:8080`; `--bind ADDRESS:PORT` changes it.
-Every request requires a scoped `gateway.invoke` bearer. The foreground
-command prints its bearer to the terminal, or passes it directly to a child:
+On a loopback address the foreground gateway admits local callers without a
+bearer, provided the request names a loopback `Host` and no foreign `Origin`
+(refusing DNS rebinding and cross-site pages). Any local process can then use
+the gateway and what it can spend. `--require-auth`, or any non-loopback
+`--bind`, makes every request present a
+scoped `gateway.invoke` bearer. The foreground command prints its bearer to the
+terminal, or passes it directly to a child:
 
 ```sh
 hellas gateway --model hf://ggml-org/Qwen3-0.6B-GGUF@afe8ad3577aa22500b3cd1c880f153b3b0e1cae8/Qwen3-0.6B-BF16.gguf --wrap claude
@@ -72,8 +77,8 @@ curl -H "Authorization: Bearer $(cat "$HOME/gateway.bearer")" \
 ```
 
 The parent directory must exist. The file is replaced atomically with mode
-0600 on each start. Without a wrapper, bearer file or controlling terminal,
-startup fails. The NixOS gateway unit writes `/run/hellas-gateway/bearer` inside
+0600 on each start. When a bearer is required and there is no wrapper, bearer
+file or controlling terminal, startup fails. The NixOS gateway unit writes `/run/hellas-gateway/bearer` inside
 its private runtime directory; an administrator can read it for an authorized
 client. The bearer changes on restart.
 
@@ -92,6 +97,7 @@ key_file = "/run/secrets/api.key"
 kind = "http"
 bind = "127.0.0.1:8080"
 zdr = true # default; set false explicitly to retain request/response data
+require_auth = true # default; false is allowed only on a loopback bind
 ```
 
 ```sh

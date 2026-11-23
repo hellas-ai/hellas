@@ -630,7 +630,10 @@ impl Core {
                 }
             };
             listeners.insert(id.clone(), bound);
-            let Listener::Http { zdr, .. } = listener else {
+            let Listener::Http {
+                zdr, require_auth, ..
+            } = listener
+            else {
                 continue;
             };
             routers.insert(
@@ -642,6 +645,7 @@ impl Core {
                         directory: self.runtime.options.home.join("gateway-archive"),
                         zdr: *zdr,
                     },
+                    *require_auth,
                 )
                 .await?,
             );

@@ -157,6 +157,7 @@ async fn configure_commits_and_publishes_after_the_control_connection_closes() {
             Listener::Http {
                 bind: "127.0.0.1:0".parse().unwrap(),
                 zdr: true,
+                require_auth: true,
             },
         );
         let mut events = core.watch().1;
@@ -282,6 +283,7 @@ async fn removing_a_backend_preserves_its_accepted_request_and_routes_the_next_o
             Listener::Http {
                 bind: "127.0.0.1:0".parse().unwrap(),
                 zdr: true,
+                require_auth: true,
             },
         );
         let template = chat_resource("https://private.fixture", 6);
@@ -639,6 +641,7 @@ async fn rejected_profile(authorized: bool) {
         Listener::Http {
             bind: "127.0.0.1:0".parse().unwrap(),
             zdr: false,
+            require_auth: true,
         },
     );
     let mut candidate = request(&document, 0);
@@ -677,6 +680,7 @@ async fn retired_listener_drain_does_not_block_configure_or_close_admission() {
             Listener::Http {
                 bind: "127.0.0.1:0".parse().unwrap(),
                 zdr: true,
+                require_auth: true,
             },
         );
         assert_eq!(
@@ -738,6 +742,7 @@ async fn unrelated_configure_keeps_the_local_backend_instance() {
             Listener::Http {
                 bind: "127.0.0.1:0".parse().unwrap(),
                 zdr: true,
+                require_auth: true,
             },
         );
         assert_eq!(
@@ -1040,6 +1045,7 @@ async fn occupied_saved_listener_keeps_control_available_for_repair() {
         Listener::Http {
             bind: occupied.local_addr().unwrap(),
             zdr: true,
+            require_auth: true,
         },
     );
     let (echo, secrets) = document.redacted();
