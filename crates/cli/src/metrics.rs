@@ -1,7 +1,6 @@
 use prometheus::TextEncoder;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tracing::info;
 
 /// The OpenTelemetry pull registry and optional node endpoint.
 #[derive(Default)]

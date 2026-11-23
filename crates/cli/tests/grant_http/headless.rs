@@ -99,7 +99,14 @@ async fn headless_gateway_hands_its_bearer_to_an_authenticated_client() {
     );
     process.stop().await;
 
-    let mut command = cli.command(&["gateway", "--upstream", &upstream, "--model", "model@api"]);
+    let mut command = cli.command(&[
+        "gateway",
+        "--require-auth",
+        "--upstream",
+        &upstream,
+        "--model",
+        "model@api",
+    ]);
     unsafe {
         command.pre_exec(|| {
             if libc::setsid() == -1 {
