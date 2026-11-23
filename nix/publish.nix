@@ -21,11 +21,15 @@ pkgs.writeShellApplication {
     repository=''${HELLAS_GITHUB_REPOSITORY:-hellas-ai/hellas}
     dry_run=0
     revision=""
+    lane=""
+    verify_cache=0
     while [ $# -gt 0 ]; do
       case "$1" in
         --dry-run) dry_run=1 ;;
-        --revision) revision=$2; shift ;;
-        *) echo "usage: hellas-publish [--dry-run] [--revision SHA]" >&2; exit 2 ;;
+        --verify-cache) verify_cache=1 ;;
+        --revision) revision=''${2:?missing revision}; shift ;;
+        --lane) lane=''${2:?missing lane}; shift ;;
+        *) echo "usage: hellas-publish [--dry-run] [--revision SHA] [--lane LANE] [--verify-cache]" >&2; exit 2 ;;
       esac
       shift
     done
@@ -33,11 +37,75 @@ pkgs.writeShellApplication {
     if [ -n "$revision" ] && ! [[ "$revision" =~ ^[0-9a-f]{40}$ ]]; then
       echo "invalid revision" >&2; exit 2
     fi
+    api() { curl -fsS -H 'Accept: application/json' "$hydra$1"; }
+
+    if [ "$verify_cache" = 1 ]; then
+      case "$lane" in
+        nix-thin) package=default; output_name=thin ;;
+        l1) package="cli-validator"; output_name=l1 ;;
+        cuda|hip) package="cli-$lane"; output_name=$package ;;
+        *) echo "--verify-cache requires a native package lane" >&2; exit 2 ;;
+      esac
+    fi
+
+    if [ -n "$lane" ]; then
+      if [ "$dry_run" != 1 ]; then
+        echo "lane verification requires --dry-run" >&2
+        exit 2
+      fi
+      case "$lane" in
+        nix-thin) component=cli; systems=(x86_64-linux aarch64-linux aarch64-darwin) ;;
+        standalone) component=cli; systems=(x86_64-linux aarch64-darwin) ;;
+        network|wasm) component=cli; systems=(x86_64-linux) ;;
+        cuda|hip) component=gpu; systems=(x86_64-linux) ;;
+        l1) component=consensus; systems=(x86_64-linux) ;;
+        *) echo "unknown release lane: $lane" >&2; exit 2 ;;
+      esac
+      gates=$(printf '%s\n' "''${systems[@]}" | jq -R --arg lane "$lane" '. + ".promotionGates." + $lane' | jq -s .)
+      evaluations=$(api "/jobset/hellas/hellas-$component/evals")
+      while read -r candidate id; do
+        builds=$(api "/eval/$id/builds")
+        if jq -e --argjson gates "$gates" '
+          . as $builds
+          | all($gates[]; . as $gate | any($builds[];
+              .job == $gate and .finished == 1 and .buildstatus == 0))
+        ' <<< "$builds" > /dev/null; then
+          printf '%s revision %s (Hydra eval %s)\n' "$lane" "$candidate" "$id"
+          if [ "$verify_cache" = 1 ]; then
+            fresh=$(mktemp -d)
+            trap 'rm -rf "$fresh"' EXIT
+            store_uri="local?root=$fresh"
+            for system in "''${systems[@]}"; do
+              output=$(jq -er --arg job "$system.promotionOutputs.$output_name" '
+                first(.[] | select(.job == $job and .finished == 1 and .buildstatus == 0))
+                | .buildoutputs.out.path
+              ' <<< "$builds")
+              exact=$(nix eval --accept-flake-config --raw "github:$repository/$candidate#packages.$system.$package.outPath")
+              if [ "$output" != "$exact" ]; then
+                echo "$system Hydra output differs from the exact flake package" >&2
+                exit 1
+              fi
+              nix copy --from "$cache" --to "$store_uri" --option builders "" --option max-jobs 0 \
+                --option require-sigs true --option trusted-public-keys "$cache_key" "$output"
+              nix store verify --store "$store_uri" --recursive --sigs-needed 1 \
+                --option trusted-public-keys "$cache_key" "$output"
+            done
+          fi
+          exit 0
+        fi
+      done < <(jq -r --arg revision "$revision" '
+        .evals[]
+        | select(.jobsetevalinputs.hellasSrc.revision | type == "string" and test("^[0-9a-f]{40}$"))
+        | select($revision == "" or .jobsetevalinputs.hellasSrc.revision == $revision)
+        | "\(.jobsetevalinputs.hellasSrc.revision) \(.id)"
+      ' <<< "$evaluations")
+      echo "no eligible $lane revision''${revision:+ for $revision} among recent evaluations" >&2
+      exit 1
+    fi
+
     if [ -n "''${GHCR_TOKEN:-}" ]; then
       skopeo login "''${registry%%/*}" --username "''${GHCR_USER:?}" --password-stdin <<< "$GHCR_TOKEN"
     fi
-
-    api() { curl -fsS -H 'Accept: application/json' "$hydra$1"; }
     run() {
       if [ "$dry_run" = 1 ]; then echo "dry run: $*"; else "$@"; fi
     }

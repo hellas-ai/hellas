@@ -15,6 +15,12 @@ def mock(command, args):
     if command == "curl":
         print((root / args[-1].removeprefix("https://fixture/").replace("/", "_")).read_text())
     elif command == "nix":
+        if args[0] == "eval":
+            print(os.environ["EXACT_OUTPUT"])
+            return 0
+        if args[:2] == ["store", "verify"]:
+            assert args[args.index("--sigs-needed") + 1] == "1", args
+            return 0
         assert args[0] == "copy", args
         if os.environ.get("REJECT_CACHE") == "1":
             return 1
@@ -101,6 +107,57 @@ def test(publisher):
     os.environ["REJECT_CACHE"] = "1"
     run(False)
     print("Publisher uses signed CLI manifest metadata and rejects mismatches before publication")
+
+    newer = "b" * 40
+    write("jobset_hellas_hellas-gpu_evals", {
+        "evals": [
+            {"id": 3, "jobsetevalinputs": {"hellasSrc": {"revision": newer}}},
+            {"id": 2, "jobsetevalinputs": {"hellasSrc": {"revision": revision}}},
+        ],
+    })
+    cuda_output = root / "cuda"
+    write("eval_3_builds", [
+        job("x86_64-linux.promotionGates.cuda"),
+        job("x86_64-linux.promotionOutputs.cli-cuda", cuda_output),
+        {**job("x86_64-linux.promotionGates.hip"), "finished": 0, "buildstatus": None},
+    ])
+    write("eval_2_builds", [job("x86_64-linux.promotionGates.hip")])
+
+    def verify_lane(lane, *arguments):
+        (root / "calls").write_text("")
+        result = subprocess.run(
+            [publisher, "--dry-run", "--lane", lane, *arguments], text=True, capture_output=True
+        )
+        calls = [json.loads(line) for line in (root / "calls").read_text().splitlines()]
+        assert all(call[0] == "curl" and "hellas-cli" not in call[-1] for call in calls), calls
+        return result
+
+    for lane, expected, eid in (("cuda", newer, 3), ("hip", revision, 2)):
+        result = verify_lane(lane)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == f"{lane} revision {expected} (Hydra eval {eid})"
+    result = verify_lane("hip", "--revision", newer)
+    assert result.returncode == 1 and "no eligible hip revision" in result.stderr, result
+
+    args = [publisher, "--dry-run", "--lane", "cuda", "--verify-cache"]
+    os.environ.pop("REJECT_CACHE")
+    os.environ["EXACT_OUTPUT"] = str(cuda_output)
+    (root / "calls").write_text("")
+    result = subprocess.run(args, text=True, capture_output=True)
+    assert result.returncode == 0, result.stderr
+    calls = [json.loads(line) for line in (root / "calls").read_text().splitlines()]
+    copy = next(call for call in calls if call[:2] == ["nix", "copy"])
+    assert copy[copy.index("--to") + 1].startswith("local?root=")
+    assert ["--option", "builders", ""] == copy[copy.index("builders") - 1:copy.index("builders") + 2]
+    assert any(call[:3] == ["nix", "store", "verify"] for call in calls)
+    os.environ["EXACT_OUTPUT"] = str(root / "hip")
+    (root / "calls").write_text("")
+    result = subprocess.run(args, text=True, capture_output=True)
+    assert result.returncode == 1 and "differs from the exact flake package" in result.stderr, result
+    assert not any(
+        json.loads(line)[:2] == ["nix", "copy"] for line in (root / "calls").read_text().splitlines()
+    )
+
 
 
 if sys.argv[1] == "mock":
