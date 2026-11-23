@@ -26,11 +26,19 @@ impl Config {
         models: Vec<String>,
         upstreams: Vec<String>,
         bind: Option<std::net::SocketAddr>,
+        require_auth: bool,
     ) -> Result<Self> {
         let mut document = Document::default();
+        let bind = bind.unwrap_or_else(|| "127.0.0.1:8080".parse().unwrap());
         document.listeners.insert(
             "api".into(),
-            Listener::http(bind.unwrap_or_else(|| "127.0.0.1:8080".parse().unwrap())),
+            Listener::Http {
+                bind,
+                zdr: true,
+                // A loopback-only ad hoc gateway admits local callers without
+                // a bearer; any other bind always requires one.
+                require_auth: require_auth || !bind.ip().is_loopback(),
+            },
         );
         let mut named = std::collections::BTreeMap::new();
         for upstream in upstreams {
@@ -126,6 +134,7 @@ mod tests {
             vec!["model@remote".into(), "second@remote".into()],
             vec![shorthand],
             None,
+            true,
         )
         .unwrap()
         .resolve(&context)

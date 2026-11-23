@@ -46,6 +46,9 @@ pub struct Limits {
 const fn default_http_zdr() -> bool {
     true
 }
+const fn default_http_require_auth() -> bool {
+    true
+}
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -54,6 +57,11 @@ pub enum Listener {
         bind: SocketAddr,
         #[serde(default = "default_http_zdr")]
         zdr: bool,
+        /// Require a gateway bearer on every request. `false` is accepted only
+        /// for a loopback bind, and then admits bearer-less requests whose Host
+        /// is loopback and that carry no cross-origin browser `Origin`.
+        #[serde(default = "default_http_require_auth")]
+        require_auth: bool,
     },
     Iroh {
         port: u16,
@@ -67,6 +75,7 @@ impl Listener {
         Self::Http {
             bind,
             zdr: default_http_zdr(),
+            require_auth: default_http_require_auth(),
         }
     }
 }
@@ -290,6 +299,11 @@ impl Document {
                     }
                 }
             }
+        }
+        if self.listeners.values().any(|listener| {
+            matches!(listener, Listener::Http { bind, require_auth: false, .. } if !bind.ip().is_loopback())
+        }) {
+            return Err("an HTTP listener without authentication must bind a loopback address");
         }
         for listener in self.listeners.values() {
             if let Listener::Iroh { backends, .. } = listener {

@@ -33,9 +33,11 @@ hellas gateway --model hf://ggml-org/Qwen3-0.6B-GGUF@afe8ad3577aa22500b3cd1c880f
 
 `--wrap` gives the child its OpenAI and Anthropic URLs and a private bearer,
 then drains the gateway when the child exits. Without `--wrap`, the gateway
-runs in the foreground and prints its URL and bearer to the terminal. For
-headless use, `--bearer-file PATH` writes the bearer atomically with mode 0600;
-without a wrapper, file or terminal, startup fails. Routing configuration is
+runs in the foreground on `127.0.0.1:8080` and admits local callers without a
+bearer; browser cross-site and DNS-rebinding requests are refused. Add
+`--require-auth` (implied by any non-loopback `--bind`) to require a bearer,
+which is printed to the terminal or, with `--bearer-file PATH`, written
+atomically with mode 0600. Routing configuration is
 not saved, and each start creates a new bearer. Repeatable service deployments
 use the shared [`--config` TOML](docs/http-gateway.md#shared-toml-configuration)
 with `gateway` or `serve`; [NixOS settings](docs/nix.md) generate the same file.

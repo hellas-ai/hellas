@@ -555,6 +555,7 @@ async fn controlled_gateway(
             Listener::Http {
                 bind: "127.0.0.1:0".parse().unwrap(),
                 zdr: true,
+                require_auth: true,
             },
         )]
         .into(),

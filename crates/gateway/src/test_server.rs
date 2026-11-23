@@ -35,7 +35,7 @@ pub async fn serve(
     routes: Vec<Route>,
 ) -> GatewayResult<Server> {
     let router = crate::router::router(routes, work.clone(), jobs, Default::default()).await?;
-    let router = crate::listener_router(router, node, archive).await?;
+    let router = crate::listener_router(router, node, archive, true).await?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let (stop, stopped) = tokio::sync::watch::channel(false);

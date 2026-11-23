@@ -102,7 +102,7 @@ fn router(access: GatewayAccess) -> Router {
                 "reached"
             }),
         )
-        .layer(BearerLayer::new(access.node()))
+        .layer(BearerLayer::new(access.node(), true))
 }
 async fn status(router: &Router, token: Option<&str>) -> StatusCode {
     let mut request = Request::builder().uri("/invoke");
@@ -363,4 +363,61 @@ async fn refusals_take_the_error_shape_of_their_path() {
             expected
         );
     }
+}
+#[tokio::test]
+async fn open_listeners_admit_only_loopback_requests_without_a_bearer() {
+    let fixture = Fixture::new().await;
+    let bearer = format!("Bearer {}", fixture.access.bearer());
+    let open = Router::new()
+        .route("/invoke", get(|| async { "reached" }))
+        .layer(BearerLayer::new(fixture.access.node(), false));
+    for (host, extra, expected) in [
+        ("127.0.0.1:8080", None, StatusCode::OK),
+        ("localhost", None, StatusCode::OK),
+        ("[::1]:8080", None, StatusCode::OK),
+        (
+            "127.0.0.1",
+            Some((header::ORIGIN, "http://localhost:3000")),
+            StatusCode::OK,
+        ),
+        (
+            "127.0.0.1",
+            Some((header::AUTHORIZATION, bearer.as_str())),
+            StatusCode::OK,
+        ),
+        // DNS rebinding, cross-site pages and bad bearers are still refused.
+        ("evil.example", None, StatusCode::FORBIDDEN),
+        ("localhost.evil.example", None, StatusCode::FORBIDDEN),
+        (
+            "127.0.0.1",
+            Some((header::ORIGIN, "https://evil.example")),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "127.0.0.1",
+            Some((header::ORIGIN, "null")),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "127.0.0.1",
+            Some((header::AUTHORIZATION, "Bearer nope")),
+            StatusCode::UNAUTHORIZED,
+        ),
+    ] {
+        let mut request = Request::builder().uri("/invoke").header(header::HOST, host);
+        if let Some((name, value)) = extra.clone() {
+            request = request.header(name, value);
+        }
+        let response = open
+            .clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{host} {extra:?}");
+    }
+    // The default listener still requires a bearer from loopback.
+    assert_eq!(
+        status(&router(fixture.access), None).await,
+        StatusCode::UNAUTHORIZED
+    );
 }

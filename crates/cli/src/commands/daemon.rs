@@ -33,6 +33,10 @@ pub struct GatewayArgs {
     /// Write the gateway bearer atomically to this private file (mode 0600).
     #[arg(long)]
     pub bearer_file: Option<PathBuf>,
+    /// Require the bearer even on a loopback bind. A non-loopback bind always
+    /// requires it; `--config` listeners set `require_auth` themselves.
+    #[arg(long, conflicts_with = "config")]
+    pub require_auth: bool,
     #[arg(last = true, allow_hyphen_values = true, requires = "wrap")]
     pub wrap_args: Vec<String>,
 }
@@ -613,7 +617,7 @@ pub async fn gateway(
 ) -> Result<()> {
     let configured = match args.config {
         Some(path) => config::Config::load(&path)?,
-        None => config::Config::gateway(args.models, args.upstreams, args.bind)?,
+        None => config::Config::gateway(args.models, args.upstreams, args.bind, args.require_auth)?,
     };
     ensure!(
         configured.paid_policy.is_none(),
@@ -629,12 +633,12 @@ pub async fn gateway(
         .iter()
         .next()
         .context("missing HTTP listener")?;
-    ensure!(
-        matches!(kind, Listener::Http { .. }),
-        "gateway requires an HTTP listener"
-    );
+    let Listener::Http { require_auth, .. } = *kind else {
+        anyhow::bail!("gateway requires an HTTP listener")
+    };
     let listener = listener.clone();
-    let mut tty = if args.wrap.is_none() && args.bearer_file.is_none() {
+    // Without authentication there is no secret that must reach the operator.
+    let mut tty = if require_auth && args.wrap.is_none() && args.bearer_file.is_none() {
         let terminal = if cfg!(windows) { "CONOUT$" } else { "/dev/tty" };
         Some(
             std::fs::OpenOptions::new()
@@ -685,7 +689,14 @@ pub async fn gateway(
             if let Some(path) = args.bearer_file {
                 hellas_private::write_atomically(&path, ".bearer", access.bearer().as_bytes())?;
             }
+            // The address goes to stderr once; the bearer goes only to the
+            // controlling terminal, never to a redirected stderr or log.
             eprintln!("Gateway: http://{address}");
+            if !require_auth {
+                eprintln!(
+                    "Authorization: not required for loopback callers (--require-auth to enable)"
+                );
+            }
             if let Some(command) = args.wrap {
                 let mut child = crate::wrap::spawn(
                     &command,
@@ -699,13 +710,12 @@ pub async fn gateway(
                     status = child.wait() => ensure!(status?.success(), "wrapped command failed"),
                 }
             } else {
-                use std::io::Write;
+                use std::io::{IsTerminal, Write};
                 if let Some(tty) = &mut tty {
-                    writeln!(
-                        tty,
-                        "Gateway: http://{address}\nAuthorization: Bearer {}",
-                        access.bearer()
-                    )?;
+                    if !std::io::stderr().is_terminal() {
+                        writeln!(tty, "Gateway: http://{address}")?;
+                    }
+                    writeln!(tty, "Authorization: Bearer {}", access.bearer())?;
                 }
                 tokio::select! {
                     result = shutdown_signal()? => result?,

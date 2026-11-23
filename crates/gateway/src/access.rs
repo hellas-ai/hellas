@@ -98,13 +98,58 @@ impl fmt::Debug for GatewayAccess {
     }
 }
 
+/// Whether a bearer-less request may be admitted on a listener that does not
+/// require authentication. The listener itself is bound to loopback (checked
+/// by configuration), so the peer is local. The Host must also name a loopback
+/// address, which defeats DNS rebinding, and any browser `Origin` must be
+/// loopback too, which defeats cross-site requests from web pages.
+fn loopback_request<B>(request: &Request<B>) -> bool {
+    let headers = request.headers();
+    let mut hosts = headers.get_all(header::HOST).iter();
+    let host = match (request.uri().authority(), hosts.next(), hosts.next()) {
+        (Some(authority), _, _) => Some(authority.host().to_owned()),
+        (None, Some(host), None) => host
+            .to_str()
+            .ok()
+            .and_then(|host| host.parse::<axum::http::uri::Authority>().ok())
+            .map(|authority| authority.host().to_owned()),
+        _ => None,
+    };
+    let mut origins = headers.get_all(header::ORIGIN).iter();
+    let origin = match (origins.next(), origins.next()) {
+        (None, _) => true,
+        (Some(origin), None) => origin
+            .to_str()
+            .ok()
+            .and_then(|origin| origin.parse::<axum::http::Uri>().ok())
+            .is_some_and(|origin| {
+                matches!(origin.scheme_str(), Some("http" | "https"))
+                    && origin.host().is_some_and(loopback_host)
+            }),
+        _ => false,
+    };
+    host.as_deref().is_some_and(loopback_host) && origin
+}
+
+fn loopback_host(host: &str) -> bool {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
 #[derive(Clone)]
 pub(crate) struct BearerLayer {
     node: NodeCoordinator,
+    require_auth: bool,
 }
 impl BearerLayer {
-    pub(crate) fn new(node: NodeCoordinator) -> Self {
-        Self { node }
+    pub(crate) fn new(node: NodeCoordinator, require_auth: bool) -> Self {
+        Self { node, require_auth }
     }
 }
 impl<S> Layer<S> for BearerLayer {
@@ -113,6 +158,7 @@ impl<S> Layer<S> for BearerLayer {
         BearerService {
             inner,
             node: self.node.clone(),
+            require_auth: self.require_auth,
         }
     }
 }
@@ -120,6 +166,7 @@ impl<S> Layer<S> for BearerLayer {
 pub(crate) struct BearerService<S> {
     inner: S,
     node: NodeCoordinator,
+    require_auth: bool,
 }
 impl<S, B> Service<Request<B>> for BearerService<S>
 where
@@ -135,9 +182,23 @@ where
     }
     fn call(&mut self, mut request: Request<B>) -> Self::Future {
         let node = self.node.clone();
+        let require_auth = self.require_auth;
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
         Box::pin(async move {
+            // Without a bearer, an open loopback listener admits the request as
+            // a local caller. A presented bearer is always checked.
+            if !require_auth && !request.headers().contains_key(header::AUTHORIZATION) {
+                if !loopback_request(&request) {
+                    return Ok(crate::path_error(
+                        request.uri().path(),
+                        StatusCode::FORBIDDEN,
+                        "requests without a gateway credential must use a loopback Host and no cross-origin Origin",
+                    ));
+                }
+                request.extensions_mut().insert(crate::jobs::Origin::Local);
+                return inner.call(request).await;
+            }
             let Some(origin) = authorizes(&node, request.headers()).await else {
                 return Ok(unauthorized(request.uri().path()));
             };
