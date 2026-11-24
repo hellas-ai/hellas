@@ -39,6 +39,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use archive::ArchiveOptions;
+pub use hellas_adaptors::PaymentRequired;
 pub use hellas_rpc::compute_event::ComputeEvent;
 pub use http_fetch::{HttpRoute, RoutingError};
 
@@ -60,6 +61,8 @@ pub enum WorkGatewayError {
     Denied(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("resource allowance exhausted: {0}")]
     Quota(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error(transparent)]
+    PaymentRequired(#[from] PaymentRequired),
     #[error("Work backend does not support this application")]
     Unsupported,
     #[error(transparent)]
@@ -83,6 +86,7 @@ impl From<WorkGatewayError> for BackendError {
             }
             WorkGatewayError::Denied(_) => BackendError::Denied(message),
             WorkGatewayError::Quota(_) => BackendError::Quota(message),
+            WorkGatewayError::PaymentRequired(reason) => reason.into(),
             WorkGatewayError::Busy(_) => BackendError::Busy(message),
             WorkGatewayError::Timeout(_) => BackendError::Timeout(message),
             WorkGatewayError::Unreachable(_) | WorkGatewayError::Execution(_) => {
@@ -98,6 +102,7 @@ pub(crate) fn backend_status(error: &BackendError) -> StatusCode {
         BackendError::Rejected(_) => StatusCode::BAD_REQUEST,
         BackendError::Denied(_) => StatusCode::FORBIDDEN,
         BackendError::Quota(_) => StatusCode::TOO_MANY_REQUESTS,
+        BackendError::PaymentRequired(_) => StatusCode::PAYMENT_REQUIRED,
         BackendError::Busy(_) => StatusCode::SERVICE_UNAVAILABLE,
         BackendError::Conflict(_) => StatusCode::CONFLICT,
         BackendError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
@@ -318,7 +323,24 @@ fn now_unix() -> i64 {
 
 fn work_error(error: WorkGatewayError) -> Response {
     let error: BackendError = error.into();
-    json_error(backend_status(&error), error.to_string())
+    payment_header(
+        json_error(backend_status(&error), error.to_string()),
+        &error,
+    )
+}
+
+fn payment_header(mut response: Response, error: &BackendError) -> Response {
+    if let BackendError::PaymentRequired(reason) = error {
+        let code = match reason {
+            PaymentRequired::ChannelCapacity => "channel_capacity_exhausted",
+            PaymentRequired::BuyerFunds => "insufficient_buyer_funds",
+        };
+        response.headers_mut().insert(
+            "x-hellas-payment-required",
+            axum::http::HeaderValue::from_static(code),
+        );
+    }
+    response
 }
 
 #[cfg(test)]

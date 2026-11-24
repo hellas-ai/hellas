@@ -395,8 +395,18 @@ mod tests {
     }
 }
 
+#[derive(Clone, Copy, Debug, Error)]
+pub enum PaymentRequired {
+    #[error("paid channel has insufficient available capacity for this job")]
+    ChannelCapacity,
+    #[error("buyer has insufficient available funds to open a paid channel")]
+    BuyerFunds,
+}
+
 #[derive(Debug, Error)]
 pub enum BackendError {
+    #[error(transparent)]
+    PaymentRequired(#[from] PaymentRequired),
     #[error("backend rejected request: {0}")]
     Rejected(String),
     #[error("backend access denied: {0}")]

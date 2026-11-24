@@ -195,6 +195,7 @@ where
 {
     use futures::StreamExt;
     let mut last = WorkGatewayError::Busy(crate::WorkGatewayBusy);
+    let mut payment_required = None;
     while let Some(id) = selection.next() {
         let started = async {
             let (target, mut stream) = attempt(id.clone(), selection.job.clone()).await?;
@@ -212,9 +213,18 @@ where
                 selection.accept(&id);
                 return Ok(stream);
             }
-            Err(WorkGatewayError::PreProposal(error)) => last = *error,
+            Err(WorkGatewayError::PreProposal(error)) => match *error {
+                WorkGatewayError::PaymentRequired(reason) => {
+                    payment_required.get_or_insert((id, reason));
+                }
+                error => last = error,
+            },
             Err(error) => return Err(error),
         }
+    }
+    if let Some((backend, reason)) = payment_required {
+        selection.backend = Some(backend);
+        return Err(reason.into());
     }
     Err(last)
 }

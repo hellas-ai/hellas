@@ -178,7 +178,10 @@ fn adaptor_error<A: WireAdaptor>(adaptor: &A, surface: &str, error: AdaptorError
 
 fn backend_error<A: WireAdaptor>(adaptor: &A, surface: &str, error: BackendError) -> Response {
     let status = super::backend_status(&error);
-    error_response(adaptor, status, format!("{surface}: {error}"))
+    super::payment_header(
+        error_response(adaptor, status, format!("{surface}: {error}")),
+        &error,
+    )
 }
 
 fn error_response<A: WireAdaptor>(adaptor: &A, status: StatusCode, message: String) -> Response {
