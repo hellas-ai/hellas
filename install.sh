@@ -7,7 +7,13 @@ case "$(uname -s)-$(uname -m)" in
   *) echo 'Unsupported platform' >&2; exit 1 ;;
 esac
 archive="hellas-$platform-portable.tar.gz"
-base=https://github.com/hellas-ai/hellas/releases/latest/download
+# The release build replaces this value so both assets come from the same tag.
+release_tag=
+if [ -n "$release_tag" ]; then
+  base="https://github.com/hellas-ai/hellas/releases/download/$release_tag"
+else
+  base=https://github.com/hellas-ai/hellas/releases/latest/download
+fi
 directory=${HELLAS_INSTALL_DIR:-"$HOME/.local/bin"}
 temporary=$(mktemp -d)
 trap 'rm -rf "$temporary"' EXIT
