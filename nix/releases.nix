@@ -91,7 +91,9 @@ let
         // lib.optionalAttrs x86 {
           installer = pkgs.runCommand "hellas-installer-${revision}" { } ''
             mkdir -p "$out"
-            cp ${../install.sh} "$out/install.sh"
+            substitute ${../install.sh} "$out/install.sh" \
+              --replace-fail 'release_tag=' 'release_tag=v${nativePackages.cli.version}-${builtins.substring 0 12 revision}'
+            chmod +x "$out/install.sh"
             cd "$out"
             sha256sum install.sh > SHA256SUMS
           '';
