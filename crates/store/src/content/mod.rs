@@ -107,6 +107,8 @@ pub enum Error {
     Locked,
     #[error("invalid content: {0}")]
     Invalid(&'static str),
+    #[error("remote content operation failed ({0:?})")]
+    Remote(hellas_wire::WireCode),
     #[error("content access denied")]
     Denied,
     #[error("this store is owned by a node with paid work; run the command against the daemon")]

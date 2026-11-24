@@ -194,7 +194,8 @@ pub(crate) fn error(status: hellas_wire::WireStatus) -> Error {
         WireCode::InvalidArgument if status.message() == crate::hf::LEGACY_CHUNKING => {
             Error::Invalid(crate::hf::LEGACY_CHUNKING)
         }
-        _ => Error::Invalid("remote content operation failed"),
+        WireCode::InvalidArgument => Error::Invalid("remote content operation failed"),
+        code => Error::Remote(code),
     }
 }
 
