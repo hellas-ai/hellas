@@ -147,6 +147,9 @@ async fn handle(
                 BackendError::Rejected(_) => "request exceeds or mismatches the granted resource",
                 BackendError::Denied(_) => "grant access refused",
                 BackendError::Quota(_) => "resource allowance exhausted",
+                BackendError::PaymentRequired(_) => {
+                    "paid channel capacity or buyer funds exhausted"
+                }
                 BackendError::Busy(_) => "Work Fetch is busy; retry later",
                 BackendError::Conflict(_) => "conflicting request",
                 BackendError::Timeout(_) => "authenticated Fetch timed out",
@@ -163,7 +166,7 @@ async fn handle(
             let status = super::backend_status(&error);
             observed.status(status.as_u16());
             return attributed(
-                json_error(status, message),
+                super::payment_header(json_error(status, message), &error),
                 selected.backend.as_deref().unwrap_or(""),
             );
         }

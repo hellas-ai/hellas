@@ -755,7 +755,10 @@ fn http(path: &str, models: Option<Vec<String>>) -> crate::Route {
 #[tokio::test]
 async fn failover_uses_each_backends_own_destination_without_caller_credentials() {
     use tower::ServiceExt;
-    struct Targets(std::sync::Mutex<Vec<String>>);
+    struct Targets {
+        calls: std::sync::Mutex<Vec<String>>,
+        allow_second: bool,
+    }
     impl crate::WorkExecutionBackend for Targets {
         fn backends(&self) -> Vec<crate::BackendInfo> {
             ["first", "second"]
@@ -776,7 +779,7 @@ async fn failover_uses_each_backends_own_destination_without_caller_credentials(
             job: Arc<crate::jobs::Job>,
             request: WorkFetchRequest,
         ) -> Result<crate::WorkFetchStream, crate::WorkGatewayError> {
-            self.0.lock().unwrap().push(id.into());
+            self.calls.lock().unwrap().push(id.into());
             assert_eq!(request.service, id);
             let upstream: hellas_rpc::http_fetch::HttpFetchRequest =
                 serde_json::from_slice(&request.body).unwrap();
@@ -791,6 +794,11 @@ async fn failover_uses_each_backends_own_destination_without_caller_credentials(
                     .any(|(name, _)| name == "authorization")
             );
             if id == "first" {
+                return Err(crate::WorkGatewayError::PreProposal(Box::new(
+                    crate::PaymentRequired::ChannelCapacity.into(),
+                )));
+            }
+            if !self.allow_second {
                 return Err(crate::WorkGatewayError::PreProposal(Box::new(
                     crate::WorkGatewayBusy.into(),
                 )));
@@ -813,27 +821,55 @@ async fn failover_uses_each_backends_own_destination_without_caller_credentials(
         targets.insert(id.into(), target);
     }
     route.backends = vec!["first".into(), "second".into()];
-    let work = Arc::new(Targets(Default::default()));
-    let app = crate::router::router(
-        vec![route],
-        work.clone(),
-        Arc::new(crate::jobs::Jobs::default()),
-        Default::default(),
-    )
-    .await
-    .unwrap();
-    let response = app
-        .oneshot(
-            axum::http::Request::post("/v1/responses?stream=true")
-                .header("authorization", "Bearer client-only")
-                .body(Body::from(r#"{"model":"m"}"#))
-                .unwrap(),
+    for allow_second in [true, false] {
+        let work = Arc::new(Targets {
+            calls: Default::default(),
+            allow_second,
+        });
+        let app = crate::router::router(
+            vec![route.clone()],
+            work.clone(),
+            Arc::new(crate::jobs::Jobs::default()),
+            Default::default(),
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    axum::body::to_bytes(response.into_body(), 4096)
-        .await
-        .unwrap();
-    assert_eq!(*work.0.lock().unwrap(), ["first", "second"]);
+        let response = app
+            .oneshot(
+                axum::http::Request::post("/v1/responses?stream=true")
+                    .header("authorization", "Bearer client-only")
+                    .body(Body::from(r#"{"model":"m"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        if allow_second {
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(!response.headers().contains_key("x-hellas-payment-required"));
+        } else {
+            assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+            assert_eq!(
+                response.headers()["x-hellas-payment-required"],
+                "channel_capacity_exhausted"
+            );
+            assert_eq!(
+                response.extensions().get::<BackendName>().unwrap().0,
+                "first"
+            );
+        }
+        axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(*work.calls.lock().unwrap(), ["first", "second"]);
+    }
+}
+
+#[test]
+fn work_refusal_reports_insufficient_buyer_funds() {
+    let response = crate::work_error(crate::PaymentRequired::BuyerFunds.into());
+    assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+    assert_eq!(
+        response.headers()["x-hellas-payment-required"],
+        "insufficient_buyer_funds"
+    );
 }
