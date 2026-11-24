@@ -123,6 +123,14 @@ impl Config {
 mod tests {
     use super::*;
 
+    #[test]
+    fn paid_speech_backend_requires_capacity() {
+        let entry = "[backends.speech]\nkind = 'paid'\nprovider = 'ENROLLMENT_ID@NODE_ID'\nmax_price = 20\n";
+        assert!(Config::parse(entry).is_err());
+        let config = Config::parse(&format!("{entry}max_in_flight = 1")).unwrap();
+        assert_eq!(config.document.backends["speech"].max_in_flight.get(), 1);
+    }
+
     #[tokio::test]
     async fn compilation_preserves_selection_and_matches_foreground_defaults() {
         let root = tempfile::tempdir().unwrap();
