@@ -94,11 +94,13 @@ bind = "127.0.0.1:8080"
 
 [backends.hosted]
 kind = "paid"
+max_in_flight = 1
 provider = "ENROLLMENT_ID@NODE_ID"
 max_price = 20
 
 [backends.native]
 kind = "paid"
+max_in_flight = 1
 provider = "NATIVE_ENROLLMENT_ID@NATIVE_NODE_ID"
 max_price = 20
 evaluator = "hellas/catena-dfad87438018-hip"
@@ -159,6 +161,7 @@ The seller's Fetch backend uses the same service/method as the hosted target:
 ```toml
 [backends.audio]
 kind = "fetch"
+max_in_flight = 1
 service = "audio"
 method = "speech"
 [backends.audio.upstream]

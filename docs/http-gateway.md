@@ -218,6 +218,11 @@ model receives 404; malformed or unsupported routing input receives 400. These
 checks precede upstream execution. Model-less, empty-body auxiliary requests use
 an eligible backend; account-specific quota endpoints are not aggregated.
 
+`hellas routes` reads the existing Watch snapshot without contacting a
+provider. `Up` means the backend is present, has available slots and has no
+recorded health error. Individual requests can still encounter scope,
+admission or execution errors.
+
 ### Hosted transcription
 
 Use an HTTP Fetch target with `path = "/v1/audio/transcriptions"`,
