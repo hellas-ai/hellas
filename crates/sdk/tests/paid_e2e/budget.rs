@@ -1,8 +1,14 @@
 use super::*;
+use hellas_channel::work::{DeliverError, EndpointError, PaymentError, WorkRefusal};
 use hellas_sdk::paid_client::{
     FundingApproval, PaidClientError, SessionFundingOptions, SessionOpenMode,
 };
+use hellas_sdk::transact::{TransactError, TransactionOptions, transact};
 use std::{collections::BTreeMap, sync::Mutex};
+
+fn stale_provider_observation(refusal: WorkRefusal, reason: &str) -> bool {
+    refusal == WorkRefusal::NotReady && reason == EndpointError::ObservationStale.to_string()
+}
 
 /// Each purchase reopens the retained channel with no fresh funding allowance.
 /// The one funding allocation is also the entire lifetime budget.
@@ -104,19 +110,72 @@ fn consecutive_jobs_reuse_bounded_funding_and_closing_channels_never_refund_it()
                     *bond.get_or_insert(session.descriptor().bond_edge()),
                     session.descriptor().bond_edge()
                 );
-                let result = tokio::time::timeout(
-                    Duration::from_secs(30),
-                    hellas_sdk::transact::transact(
-                        &mut session,
-                        &job,
-                        &producer,
-                        hellas_sdk::transact::TransactionOptions::default(),
-                    ),
-                )
+                let mut finalized = case.provider_node.finalized();
+                let credited = tokio::time::timeout(Duration::from_secs(30), async {
+                    let mut payment = None;
+                    loop {
+                        finalized.borrow_and_update();
+                        if let Some(credited) = payment {
+                            // The certificate is already durable. Ask the session to
+                            // resend it without proposing another purchase.
+                            match session.run(None, &job.content(), false, None).await {
+                                Ok(None) => break credited,
+                                Err(PaidClientError::Payment(PaymentError::Refused {
+                                    refusal,
+                                    reason,
+                                })) if stale_provider_observation(refusal, &reason) => {}
+                                Ok(Some(_)) => {
+                                    panic!("payment recovery executed new work for job {n}")
+                                }
+                                Err(error) => panic!("recovering payment for job {n}: {error:?}"),
+                            }
+                        } else {
+                            match transact(
+                                &mut session,
+                                &job,
+                                &producer,
+                                TransactionOptions::default(),
+                            )
+                            .await
+                            {
+                                Ok(result) => break result.credited_cumulative,
+                                Err(TransactError::Client(PaidClientError::Deliver(
+                                    DeliverError::Refused { refusal, reason },
+                                ))) if stale_provider_observation(refusal, &reason) => {
+                                    // Delivery failed before payment. transact resumes
+                                    // the matching accepted job from the journal.
+                                    session
+                                        .with_state(|state| {
+                                            assert_eq!(
+                                                state.ledger().credited_cumulative(),
+                                                PRICE * n
+                                            );
+                                            assert_eq!(state.jobs().len(), 1);
+                                        })
+                                        .await
+                                        .unwrap();
+                                }
+                                Err(TransactError::Client(PaidClientError::Payment(
+                                    PaymentError::Refused { refusal, reason },
+                                ))) if stale_provider_observation(refusal, &reason) => {
+                                    payment = Some(
+                                        session
+                                            .with_state(|state| {
+                                                state.ledger().credited_cumulative()
+                                            })
+                                            .await
+                                            .unwrap(),
+                                    );
+                                }
+                                Err(error) => panic!("executing job {n}: {error:?}"),
+                            }
+                        }
+                        finalized.changed().await.expect("provider remains running");
+                    }
+                })
                 .await
-                .expect("consecutive retained job completes")
-                .unwrap_or_else(|error| panic!("executing job {n}: {error}"));
-                assert_eq!(result.credited_cumulative, PRICE * (n + 1));
+                .unwrap_or_else(|_| panic!("consecutive retained job {n} timed out"));
+                assert_eq!(credited, PRICE * (n + 1));
                 assert_eq!(
                     budget.0.lock().unwrap().allocations,
                     BTreeMap::from([([7; 16], CLIENT_FUNDING)])
@@ -126,6 +185,7 @@ fn consecutive_jobs_reuse_bounded_funding_and_closing_channels_never_refund_it()
                 session
                     .with_state(|state| {
                         assert_eq!(state.jobs().len(), 0);
+                        assert_eq!(state.proposal_nonce_high_water(), n + 1);
                         assert_eq!(
                             state.ledger().credited_cumulative() + PRICE
                                 > state.settlement().capacity(),
