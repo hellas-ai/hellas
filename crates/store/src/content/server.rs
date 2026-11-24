@@ -120,6 +120,7 @@ fn status(error: Error) -> WireStatus {
         Error::Capacity => (WireCode::ResourceExhausted, "content reservation exhausted"),
         Error::Invalid(message) => (WireCode::InvalidArgument, message),
         Error::Io(_) => (WireCode::Internal, "content IO failed"),
+        Error::Remote(code) => (code, "remote content operation failed"),
     };
     WireStatus::new(code, message)
 }
@@ -477,5 +478,21 @@ mod waiter_tests {
             "terminal response retained the queued Core effect"
         );
         drop(response);
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    #[test]
+    fn remote_transport_status_survives_forwarding_without_peer_details() {
+        for code in [WireCode::Unavailable, WireCode::DeadlineExceeded] {
+            let error = w::error(WireStatus::new(code, "peer-specific details"));
+            assert!(matches!(error, Error::Remote(actual) if actual == code));
+            let forwarded = status(error);
+            assert_eq!(forwarded.code(), code);
+            assert_eq!(forwarded.message(), "remote content operation failed");
+        }
     }
 }
