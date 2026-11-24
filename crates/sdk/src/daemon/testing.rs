@@ -29,6 +29,15 @@ impl Daemon {
     pub fn administration(&self) -> Option<hellas_authority::grant_service::WorkAdministration> {
         self.core.administration()
     }
+    /// Waits for the provider's paid observer to confirm a fresh read at this height or later.
+    pub async fn wait_paid_ready(&self, channel: hellas_auth::Digest, height: u64) {
+        let paid = {
+            let paid = self.core.runtime.paid.lock().await;
+            assert_eq!(paid.len(), 1, "fixture has one paid chain");
+            paid.values().next().unwrap().clone()
+        };
+        paid.wait_ready(channel, height).await;
+    }
     pub async fn shutdown(self) -> Result<()> {
         let result = self.core.shutdown().await;
         self.core.runtime.options.content.close().await;
