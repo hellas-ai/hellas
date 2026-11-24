@@ -2,6 +2,11 @@ name: CI
 
 on:
   workflow_dispatch:
+    inputs:
+      workspace_regressions:
+        description: Run the serial consensus workspace regression check
+        type: boolean
+        default: false
   schedule:
     - cron: '17 3 * * *'
   pull_request:
@@ -68,13 +73,15 @@ jobs:
 
   workspace-regressions:
     name: Workspace regressions
-    if: github.event_name == 'schedule'
+    if: github.event_name == 'schedule' || inputs.workspace_regressions
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: master
+          ref: ${{ github.event_name == 'schedule' && 'master' || github.ref }}
       - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
       - name: Workspace regressions
-        run: nix run --accept-flake-config .#check-regressions
+        run: >-
+          nix build --accept-flake-config --print-build-logs --no-link
+          .#releaseJobs.consensus.x86_64-linux.checks.regressions

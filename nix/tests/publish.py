@@ -123,13 +123,15 @@ def test(publisher):
     ])
     write("eval_2_builds", [job("x86_64-linux.promotionGates.hip")])
 
-    def verify_lane(lane, *arguments):
+    def verify_lane(lane, *arguments, component="gpu"):
         (root / "calls").write_text("")
         result = subprocess.run(
             [publisher, "--dry-run", "--lane", lane, *arguments], text=True, capture_output=True
         )
         calls = [json.loads(line) for line in (root / "calls").read_text().splitlines()]
-        assert all(call[0] == "curl" and "hellas-cli" not in call[-1] for call in calls), calls
+        assert all(call[0] == "curl" for call in calls), calls
+        jobset_calls = [call[-1] for call in calls if "/jobset/" in call[-1]]
+        assert jobset_calls == [f"https://fixture/jobset/hellas/hellas-{component}/evals"], calls
         return result
 
     for lane, expected, eid in (("cuda", newer, 3), ("hip", revision, 2)):
@@ -138,6 +140,44 @@ def test(publisher):
         assert result.stdout.strip() == f"{lane} revision {expected} (Hydra eval {eid})"
     result = verify_lane("hip", "--revision", newer)
     assert result.returncode == 1 and "no eligible hip revision" in result.stderr, result
+
+    write("jobset_hellas_hellas-cli_evals", {
+        "evals": [
+            {"id": 4, "jobsetevalinputs": {"hellasSrc": {"revision": newer}}},
+            {"id": 1, "jobsetevalinputs": {"hellasSrc": {"revision": revision}}},
+        ],
+    })
+    thin_systems = ("x86_64-linux", "aarch64-linux", "aarch64-darwin")
+    standalone_systems = ("x86_64-linux", "aarch64-darwin")
+
+    def gates(lane, systems):
+        return [job(f"{system}.promotionGates.{lane}") for system in systems]
+
+    # The newest SHA has standalone on both required builders and lacks the
+    # native ARM Linux gate. Thin must fall back without blocking standalone.
+    write("eval_4_builds", gates("nix-thin", standalone_systems) + gates("standalone", standalone_systems))
+    write("eval_1_builds", gates("nix-thin", thin_systems) + gates("standalone", ("x86_64-linux",)))
+    for lane, expected, eid in (("nix-thin", revision, 1), ("standalone", newer, 4)):
+        result = verify_lane(lane, component="cli")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == f"{lane} revision {expected} (Hydra eval {eid})"
+    for lane, missing in (("nix-thin", newer), ("standalone", revision)):
+        result = verify_lane(lane, "--revision", missing, component="cli")
+        assert result.returncode == 1 and f"no eligible {lane} revision" in result.stderr, result
+
+    write("jobset_hellas_hellas-consensus_evals", {
+        "evals": [
+            {"id": 6, "jobsetevalinputs": {"hellasSrc": {"revision": newer}}},
+            {"id": 5, "jobsetevalinputs": {"hellasSrc": {"revision": revision}}},
+        ],
+    })
+    write("eval_6_builds", [{**job("x86_64-linux.promotionGates.l1"), "buildstatus": 1}])
+    write("eval_5_builds", gates("l1", ("x86_64-linux",)))
+    result = verify_lane("l1", component="consensus")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == f"l1 revision {revision} (Hydra eval 5)"
+    result = verify_lane("l1", "--revision", newer, component="consensus")
+    assert result.returncode == 1 and "no eligible l1 revision" in result.stderr, result
 
     args = [publisher, "--dry-run", "--lane", "cuda", "--verify-cache"]
     os.environ.pop("REJECT_CACHE")
