@@ -479,7 +479,7 @@ pub async fn apply(document: &mut Document, edit: Edit, context: &ModelContext) 
 }
 
 pub fn print(view: &hellas_sdk::daemon::View) {
-    println!("MODEL\tMODALITY\tAPI PATH\tBACKEND\tSTATE\tJOBS\tERROR");
+    println!("MODEL\tMODALITY\tAPI PATH\tBACKEND\tSTATE\tJOBS\tPROVIDER\tSCOPE\tMAX PRICE");
     for route in &view.document.routes {
         let modality = match &route.presentation {
             Presentation::Model { modality, .. } => match modality {
@@ -492,21 +492,64 @@ pub fn print(view: &hellas_sdk::daemon::View) {
             Presentation::Speech { .. } => "speech",
             _ => "text",
         };
-        for (path, _, model) in route.keys() {
+        for (path, method, model) in route.keys() {
+            let modality = if path == "/v1/audio/transcriptions" && method == "POST" {
+                "audio"
+            } else {
+                modality
+            };
             for id in &route.backends {
                 let backend = view.backends.iter().find(|backend| backend.id == *id);
+                let state = match backend {
+                    None => "Unknown",
+                    Some(backend) if backend.down || backend.error.is_some() => "Down",
+                    Some(backend) if backend.in_flight >= backend.max_in_flight => "Busy",
+                    Some(_) => "Up",
+                };
+                let jobs = backend.map_or("-".into(), |backend| {
+                    format!("{}/{}", backend.in_flight, backend.max_in_flight)
+                });
+                let kind = view.document.backends.get(id).map(|backend| &backend.kind);
+                let (provider, max_price) = match kind {
+                    Some(BackendKind::Paid {
+                        provider,
+                        max_price,
+                        ..
+                    }) => (
+                        provider
+                            .parse::<hellas_client::ProviderAddress>()
+                            .ok()
+                            .map(|id| id.to_string()),
+                        Some(max_price.to_string()),
+                    ),
+                    _ => (None, None),
+                };
+                let scope = match &route.presentation {
+                    Presentation::Responses {
+                        service, method, ..
+                    }
+                    | Presentation::Speech {
+                        target:
+                            hellas_gateway::SpeechTarget::Hosted {
+                                service, method, ..
+                            },
+                        ..
+                    } => Some(format!("{service}/{method}")),
+                    Presentation::Http { targets } => targets
+                        .get(id)
+                        .map(|target| format!("{}/{}", target.service, target.method)),
+                    _ => None,
+                };
+                let resource = match kind {
+                    Some(BackendKind::Grant { resource, .. }) => resource.map(|id| id.to_string()),
+                    _ => None,
+                };
                 println!(
-                    "{}\t{modality}\t{path}\t{id}\t{}\t{}\t{}",
+                    "{}\t{modality}\t{method} {path}\t{id}\t{state}\t{jobs}\t{}\t{}\t{}",
                     model.as_deref().unwrap_or("*"),
-                    if backend.is_some_and(|backend| backend.down) {
-                        "Down"
-                    } else {
-                        "Up"
-                    },
-                    backend.map_or(0, |backend| backend.in_flight),
-                    backend
-                        .and_then(|backend| backend.error.as_deref())
-                        .unwrap_or("")
+                    provider.as_deref().unwrap_or("-"),
+                    resource.or(scope).as_deref().unwrap_or("compute"),
+                    max_price.as_deref().unwrap_or("-"),
                 );
             }
         }

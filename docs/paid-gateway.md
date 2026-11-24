@@ -258,6 +258,11 @@ journal for recovery, as does abrupt process termination.
 All HTTP requests require a scoped gateway bearer. See [HTTP authority](admin.md#http-gateway-authority)
 and the [HTTP gateway guide](http-gateway.md) for stateless and persistent services.
 
+When every candidate fails before proposal, a buyer funding or channel
+capacity refusal returns HTTP 402. The `X-Hellas-Payment-Required` header
+reports `insufficient_buyer_funds` or `channel_capacity_exhausted`. A proposed
+job stays with its original backend for completion and recovery.
+
 ## Request traces
 
 Build with the opt-in `otel` feature and set `OTEL_EXPORTER_OTLP_ENDPOINT`

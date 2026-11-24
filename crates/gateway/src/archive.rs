@@ -99,16 +99,8 @@ pub(crate) async fn record(
         // Multipart audio is not JSON and its route has a larger WAV bound.
         // Identity bytes need no decompression; compressed bodies retain the
         // shared decompression limit and still pass through the normal parser.
-        let multipart_audio = parts.uri.path() == super::audio::PATH
-            && parts
-                .headers
-                .get(axum::http::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .is_some_and(|v| {
-                    v.split(';')
-                        .next()
-                        .is_some_and(|v| v.trim().eq_ignore_ascii_case("multipart/form-data"))
-                });
+        let multipart_audio =
+            parts.uri.path() == super::audio::PATH && super::audio::is_multipart(&parts.headers);
         let encodings = parts.headers.get_all(axum::http::header::CONTENT_ENCODING);
         let mut encodings = encodings.iter();
         let identity = match (encodings.next(), encodings.next()) {

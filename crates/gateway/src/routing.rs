@@ -246,6 +246,12 @@ impl Routing {
         fields.extend(parts.iter().map(|s| s.as_bytes()));
         ContentId::from_bytes(*hellas_auth::hash_tuple(domain, &fields).as_bytes())
     }
+    pub(super) fn has_named_route(&self, path: &str, method: &str) -> bool {
+        self.keys
+            .keys()
+            .any(|(p, m, model)| p == path && m == method && model.is_some())
+    }
+
     pub fn select(
         self: &Arc<Self>,
         path: &str,
@@ -254,10 +260,7 @@ impl Routing {
         connection: Option<&crate::ConnectionId>,
         job: Arc<crate::jobs::Job>,
     ) -> Result<(usize, Selection), Unavailable> {
-        let named = self
-            .keys
-            .keys()
-            .any(|(p, m, model)| p == path && m == method && model.is_some());
+        let named = self.has_named_route(path, method);
         if named && hints.model.is_none() {
             return Err(Unavailable::new(
                 StatusCode::BAD_REQUEST,

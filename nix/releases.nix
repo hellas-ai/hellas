@@ -63,6 +63,74 @@ let
       sha256sum *.tar.gz > SHA256SUMS
       echo "file binary-dist $out/hellas-${backend}-${revision}.tar.gz" > nix-support/hydra-build-products
     '';
+  thinChecks = [
+    "cli"
+    "cloud"
+    "client-work"
+    "http-fetch"
+    "rpc-work"
+    "sdk-paid-work"
+  ];
+  # Promotion gates share the existing jobsets and exact source revision. Keep
+  # archive and image dependencies out of the native package gates.
+  promotion = {
+    cli = {
+      nix-thin = {
+        checks = thinChecks;
+        outputs = {
+          thin = nativePackages.cli;
+        };
+      };
+    }
+    // lib.optionalAttrs (x86 || darwin) {
+      standalone = {
+        checks = thinChecks;
+        artifacts =
+          if darwin then
+            [ "portable-aarch64" ]
+          else
+            [
+              "portable-x86_64"
+              "portable-aarch64"
+              "installer"
+            ];
+      };
+    }
+    // lib.optionalAttrs x86 {
+      wasm = {
+        checks = [
+          "wasm-rpc"
+          "wasm-chain"
+          "wasm-xet"
+        ];
+        artifacts = [ "wasm" ];
+      };
+      network = {
+        checks = thinChecks;
+        artifacts = [ "network-image" ];
+      };
+    };
+    gpu = lib.genAttrs [ "cuda" "hip" ] (backend: {
+      checks = [
+        "executor"
+        "client-work"
+        "http-fetch"
+        "rpc-work"
+        "sdk-paid-work"
+      ];
+      artifacts = [ "${backend}-image" ];
+      outputs = {
+        "cli-${backend}" = linuxOutputs.packages."cli-${backend}";
+      };
+    });
+    consensus.l1 = {
+      includeTests = true;
+      artifacts = [ "validator" ];
+      outputs = {
+        l1 = nativePackages.cli-validator;
+      };
+    };
+  };
   specifications = {
     cli = {
       dependencies =
@@ -142,8 +210,8 @@ let
         "kernel-model-run"
         "kernel-model-verify"
         "kernel-fixture-freshness"
-      ]
-      ++ lib.optionals x86 [ "regressions" ];
+        "regressions"
+      ];
       artifacts = {
         validator = archive "consensus-${system}" nativePackages.cli-validator;
       };
@@ -167,9 +235,27 @@ let
           ++ spec.checks
         ) (name: buildChecks.${name});
       tests = lib.genAttrs spec.vms (name: linuxOutputs.nixosTests.${name});
+      promotionLanes = promotion.${component};
+      promotionOutputs = lib.mergeAttrsList (
+        map (lane: lane.outputs or { }) (lib.attrValues promotionLanes)
+      );
+      promotionGates = lib.mapAttrs (
+        laneName: lane:
+        pkgs.releaseTools.aggregate {
+          name = "hellas-${laneName}-${system}-tested";
+          constituents =
+            map (name: buildChecks.${name}) (lane.checks or spec.checks)
+            ++ map (name: spec.artifacts.${name}) (lane.artifacts or [ ])
+            ++ lib.attrValues (lane.outputs or { })
+            ++ lib.optionals (lane.includeTests or false) (lib.attrValues tests);
+        }
+      ) promotionLanes;
       required = pkgs.releaseTools.aggregate {
         name = "hellas-${component}-${system}-tested";
-        constituents = lib.attrValues checks ++ lib.attrValues spec.artifacts ++ lib.attrValues tests;
+        constituents =
+          lib.attrValues (if component == "consensus" then removeAttrs checks [ "unit" ] else checks)
+          ++ lib.attrValues spec.artifacts
+          ++ lib.attrValues tests;
       };
       manifest = pkgs.writeText "hellas-${component}-release.json" (
         builtins.toJSON {
@@ -180,7 +266,13 @@ let
       );
     in
     {
-      inherit checks tests required;
+      inherit
+        checks
+        tests
+        required
+        promotionGates
+        promotionOutputs
+        ;
       # Named jobs keep compiled dependencies rooted when Hydra collects build inputs.
       inherit (spec) artifacts dependencies;
       release = pkgs.runCommand "hellas-${component}-${system}-release" { } ''

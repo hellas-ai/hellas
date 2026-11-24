@@ -9,8 +9,8 @@ use futures::{future::BoxFuture, stream::BoxStream};
 use hellas_authority::model::grant::records::GrantPolicy;
 use hellas_authority::model::grant::resource::HttpsResource;
 use hellas_gateway::{
-    ComputeEvent, WorkEvent, WorkExecutionBackend, WorkFetchRequest, WorkGatewayBusy,
-    WorkGatewayError, WorkOutputStream, WorkShutdownError,
+    ComputeEvent, PaymentRequired, WorkEvent, WorkExecutionBackend, WorkFetchRequest,
+    WorkGatewayBusy, WorkGatewayError, WorkOutputStream, WorkShutdownError,
 };
 use hellas_rpc::http_fetch::HttpFetchRequest;
 use hellas_rpc::output::OutputEvent;
@@ -1101,9 +1101,9 @@ impl Backend {
                 if backend_failed(&error) {
                     self.health(Some(error.to_string()));
                 }
-                Err(WorkGatewayError::PreProposal(Box::new(gateway_error(
-                    *error,
-                ))))
+                Err(WorkGatewayError::PreProposal(Box::new(
+                    pre_proposal_gateway_error(*error),
+                )))
             }
             Err(AttemptError::Committed(error)) => {
                 if backend_failed(&error)
@@ -1448,6 +1448,78 @@ fn execution(e: impl std::error::Error + Send + Sync + 'static) -> WorkGatewayEr
 }
 fn rejected(e: impl std::error::Error + Send + Sync + 'static) -> WorkGatewayError {
     WorkGatewayError::Rejected(Box::new(e))
+}
+
+fn pre_proposal_gateway_error(error: ExecutionError) -> WorkGatewayError {
+    use crate::client_owner::ClientOwnerError;
+    use crate::coin_owner::CoinOwnerError;
+    use crate::paid_client::PaidClientError;
+    use crate::transact::TransactError;
+    use hellas_channel::work::ProposeError;
+    use hellas_channel::work_store::{ChannelStateError, WorkStoreError};
+
+    let paid_error = match &error {
+        ExecutionError::Paid(paid) | ExecutionError::Transaction(TransactError::Client(paid)) => {
+            paid
+        }
+        _ => return gateway_error(error),
+    };
+    match paid_error {
+        PaidClientError::Propose(ProposeError::Store(WorkStoreError::Channel(
+            ChannelStateError::OverCredit {
+                ledger: "capacity", ..
+            },
+        ))) => PaymentRequired::ChannelCapacity.into(),
+        PaidClientError::Owner(ClientOwnerError::Plan(CoinOwnerError::Insufficient { .. })) => {
+            PaymentRequired::BuyerFunds.into()
+        }
+        _ => gateway_error(error),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn only_funding_exhaustion_is_payment_required_before_proposal() {
+    use crate::client_owner::ClientOwnerError;
+    use crate::coin_owner::CoinOwnerError;
+    use crate::paid_client::PaidClientError;
+    use crate::transact::TransactError;
+    use hellas_channel::work::ProposeError;
+    use hellas_channel::work_store::{ChannelStateError, WorkStoreError};
+
+    let over_credit = |ledger| {
+        ExecutionError::Transaction(TransactError::Client(PaidClientError::Propose(
+            ProposeError::Store(WorkStoreError::Channel(ChannelStateError::OverCredit {
+                ledger,
+                used: 200,
+                reserved: 0,
+                price: 20,
+                limit: 200,
+            })),
+        )))
+    };
+    assert!(matches!(
+        pre_proposal_gateway_error(over_credit("capacity")),
+        WorkGatewayError::PaymentRequired(PaymentRequired::ChannelCapacity)
+    ));
+    assert!(matches!(
+        gateway_error(over_credit("capacity")),
+        WorkGatewayError::Execution(_)
+    ));
+    assert!(matches!(
+        pre_proposal_gateway_error(over_credit("compute")),
+        WorkGatewayError::Execution(_)
+    ));
+    let funding_error = ExecutionError::Paid(PaidClientError::Owner(ClientOwnerError::Plan(
+        CoinOwnerError::Insufficient {
+            required: 200,
+            available: 0,
+        },
+    )));
+    assert!(matches!(
+        pre_proposal_gateway_error(funding_error),
+        WorkGatewayError::PaymentRequired(PaymentRequired::BuyerFunds)
+    ));
 }
 
 /// What every presentation reports for a failed run.

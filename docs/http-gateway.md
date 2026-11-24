@@ -218,6 +218,20 @@ model receives 404; malformed or unsupported routing input receives 400. These
 checks precede upstream execution. Model-less, empty-body auxiliary requests use
 an eligible backend; account-specific quota endpoints are not aggregated.
 
+`hellas routes` reads the existing Watch snapshot without contacting a
+provider. `Up` means the backend is present, has available slots and has no
+recorded health error. Individual requests can still encounter scope,
+admission or execution errors.
+
+### Hosted transcription
+
+Use an HTTP Fetch target with `path = "/v1/audio/transcriptions"`,
+`method = "POST"` and `models = ["hosted-transcription"]`. Point its URL
+at a provider that accepts OpenAI multipart transcription requests. The form's
+`model` selects the route, so a native Whisper alias and a hosted alias can
+share the endpoint. The Fetch target sends the original multipart body within
+the Fetch byte limit. Keep provider credentials at the executing backend.
+
 ## Payloads and cancellation
 
 HTTP listeners default to ZDR: request and response payloads are not archived.
