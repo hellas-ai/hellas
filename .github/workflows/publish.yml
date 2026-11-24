@@ -9,6 +9,23 @@ on:
       revision:
         description: "Exact commit to publish (default: newest green revision)"
         required: false
+      lane:
+        description: Verify an independent lane without publishing
+        type: choice
+        options:
+          - legacy
+          - nix-thin
+          - standalone
+          - network
+          - wasm
+          - cuda
+          - hip
+          - l1
+        default: legacy
+      verify_cache:
+        description: Verify exact native package closures in a fresh Nix store
+        type: boolean
+        default: false
       dry_run:
         description: Resolve and verify without publishing
         type: boolean
@@ -23,10 +40,11 @@ concurrency:
 
 jobs:
   publish:
+    if: inputs.lane == '' || inputs.lane == 'legacy'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
         with:
           extra_nix_config: |
@@ -43,4 +61,24 @@ jobs:
           args=()
           if [ -n "$REVISION" ]; then args+=(--revision "$REVISION"); fi
           if [ "$DRY_RUN" = true ]; then args+=(--dry-run); fi
+          nix run --accept-flake-config .#publish -- "${args[@]}"
+
+  verify-lane:
+    if: inputs.lane != '' && inputs.lane != 'legacy'
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
+      - name: Resolve the eligible revision
+        env:
+          LANE: ${{ inputs.lane }}
+          REVISION: ${{ inputs.revision }}
+          VERIFY_CACHE: ${{ inputs.verify_cache }}
+        run: |
+          args=(--dry-run --lane "$LANE")
+          if [ "$VERIFY_CACHE" = true ]; then args+=(--verify-cache); fi
+          if [ -n "$REVISION" ]; then args+=(--revision "$REVISION"); fi
           nix run --accept-flake-config .#publish -- "${args[@]}"
