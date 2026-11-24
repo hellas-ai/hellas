@@ -8,7 +8,7 @@ use axum::{
     Extension, Router,
     body::{Body, Bytes},
     extract::{FromRequest, Multipart, Request, State},
-    http::{StatusCode, request::Parts},
+    http::{HeaderMap, StatusCode, header, request::Parts},
     response::{IntoResponse, Response},
     routing::post,
 };
@@ -17,6 +17,14 @@ use hellas_client::model::{ModelRequest, ModelResponse, wav};
 use std::sync::Arc;
 pub(super) const PATH: &str = "/v1/audio/transcriptions";
 pub(super) const MAX_REQUEST_BYTES: usize = wav::MAX_WAV_BYTES + (64 << 10);
+
+pub(super) fn is_multipart(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("multipart/form-data"))
+}
 
 struct AudioState {
     max_tokens: usize,

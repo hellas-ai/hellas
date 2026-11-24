@@ -680,6 +680,52 @@ async fn duplicate_session_header_never_discards_an_unknown_continuation() {
     assert_eq!(work.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
 
+#[tokio::test]
+async fn named_http_transcription_routes_by_multipart_model() {
+    use tower::ServiceExt;
+
+    let work = Arc::new(ContinuationBackend { calls: 0.into() });
+    let app = crate::router::router(
+        vec![http(crate::audio::PATH, Some(vec!["hosted".into()]))],
+        work.clone(),
+        Arc::new(crate::jobs::Jobs::default()),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    for (model, status) in [
+        ("hosted", StatusCode::OK),
+        ("unknown", StatusCode::NOT_FOUND),
+    ] {
+        let body = format!(
+            "--a\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{model}\r\n\
+             --a\r\nContent-Disposition: form-data; name=\"file\"; filename=\"sample.wav\"\r\n\r\naudio\r\n--a--\r\n"
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post(crate::audio::PATH)
+                    .header("content-type", "multipart/form-data; boundary=a")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+    }
+    let response = app
+        .oneshot(
+            Request::post(crate::audio::PATH)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"hosted"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(work.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
 fn http(path: &str, models: Option<Vec<String>>) -> crate::Route {
     crate::test_support::route(crate::Presentation::Http {
         targets: ["test"]

@@ -258,10 +258,13 @@ async fn dispatch(
             );
         }
     };
-    let hints = match decoders
-        .get(path.as_str())
-        .filter(|_| parts.method == axum::http::Method::POST)
-    {
+    let decoder = decoders.get(path.as_str()).copied().or_else(|| {
+        (path == crate::audio::PATH
+            && crate::audio::is_multipart(&parts.headers)
+            && routing.has_named_route(&path, parts.method.as_str()))
+        .then_some(crate::audio::decode as crate::pipeline::Decode)
+    });
+    let hints = match decoder.filter(|_| parts.method == axum::http::Method::POST) {
         Some(decode) => match decode(&mut parts, &body).await {
             Ok(hints) => hints,
             Err(response) => return *response,
