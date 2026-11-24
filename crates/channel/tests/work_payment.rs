@@ -23,8 +23,8 @@ use hellas_channel::model::work::{
 };
 use hellas_channel::test_support::channel::{CURSOR, PRICE, client, deadlines, provider, store_at};
 use hellas_channel::work::{
-    ClientEndpoint, PaymentError, ProviderEndpoint, RunError, WorkRefusal, WorkService,
-    admit_payment,
+    ClientEndpoint, EndpointError, MAX_CERTIFIED_AGE, PaymentError, ProviderEndpoint, RunError,
+    WorkRefusal, WorkService, admit_payment,
 };
 use hellas_channel::work_store::{JobPhase, JobState, Role};
 use hellas_kernel::{
@@ -34,7 +34,7 @@ use hellas_rpc::pb::work::{
     AdmitCertificateRequest, AdmitCertificateResponse, WorkPaid, WorkRefusalCode,
     admit_certificate_response::Outcome as AdmitOutcome,
 };
-use hellas_rpc::services::work::WorkClientImpl;
+use hellas_rpc::services::work::{WorkClientImpl, WorkHandler};
 
 mod support;
 
@@ -109,6 +109,18 @@ fn refusal_of(response: &AdmitCertificateResponse) -> WorkRefusalCode {
         },
         other => panic!("expected a refusal, got {other:?}"),
     }
+}
+
+// Poll the handler itself so tests can distinguish waiting for observation
+// from waiting for transport dispatch.
+async fn credit(
+    service: &WorkService,
+    request: AdmitCertificateRequest,
+) -> AdmitCertificateResponse {
+    hellas_rpc::call::with_trailer(service.admit_certificate(request, Default::default()))
+        .await
+        .unwrap()
+        .response
 }
 
 fn signature_over(signer: &Secp256k1Signer, hash: hellas_kernel::PayloadHash) -> Vec<u8> {
@@ -707,7 +719,7 @@ async fn payment_waits_for_observation_before_signing_but_not_for_retransmission
 
 #[tokio::test]
 async fn stale_observation_blocks_new_money_but_preserves_retransmission() {
-    use hellas_channel::work::{ClientChannel as _, ClientService, EndpointError};
+    use hellas_channel::work::{ClientChannel as _, ClientService};
     let fixture = checked_job().await;
     let mut client = ClientService::new(fixture.client);
     let id = fixture.id;
@@ -735,12 +747,26 @@ async fn stale_observation_blocks_new_money_but_preserves_retransmission() {
     );
 
     fixture.service.require_observer().await.unwrap();
-    let refused = admit_response(&fixture.service, request.clone()).await;
-    assert_eq!(refusal_of(&refused), WorkRefusalCode::NotReady);
+    let mut paying = Box::pin(credit(&fixture.service, request.clone()));
+    let mut duplicate = Box::pin(credit(&fixture.service, request.clone()));
+    let mut forged_request = request.clone();
+    forged_request.binding_signature = request.certificate_signature.clone();
+    let mut forged = Box::pin(credit(&fixture.service, forged_request));
+    assert!(futures::poll!(&mut paying).is_pending());
+    assert!(futures::poll!(&mut duplicate).is_pending());
+    assert!(futures::poll!(&mut forged).is_pending());
     assert_nothing_credited(&fixture.service, "observer has not initialized").await;
     fixture.service.observe_ready(fixture.ready).await.unwrap();
-    let accepted = admit_response(&fixture.service, request.clone()).await;
-    assert!(matches!(accepted.outcome, Some(AdmitOutcome::Paid(_))));
+    assert_eq!(refusal_of(&forged.await), WorkRefusalCode::Invalid);
+    assert_nothing_credited(&fixture.service, "forged payment after a fresh observation").await;
+    let (accepted, replayed) = tokio::join!(paying, duplicate);
+    assert_eq!(
+        accepted.outcome,
+        Some(AdmitOutcome::Paid(WorkPaid {
+            credited_cumulative: PRICE
+        }))
+    );
+    assert_eq!(replayed, accepted);
     fixture.service.suspend().await.unwrap();
     assert_eq!(admit_response(&fixture.service, request).await, accepted);
     assert_eq!(
@@ -751,6 +777,80 @@ async fn stale_observation_blocks_new_money_but_preserves_retransmission() {
             .unwrap(),
         PRICE
     );
+}
+
+#[tokio::test]
+async fn provider_payment_is_revalidated_after_finalized_expiry() {
+    use hellas_channel::test_support::channel::{descriptor, observe_service, ready_of};
+
+    let mut fixture = checked_job().await;
+    let request = fixture.client.pay(fixture.id).await.unwrap();
+    fixture.service.require_observer().await.unwrap();
+    let mut paying = Box::pin(credit(&fixture.service, request));
+    assert!(futures::poll!(&mut paying).is_pending());
+
+    let expired_at = deadlines().payment + 1;
+    observe_service(
+        &fixture.service,
+        expired_at,
+        hellas_kernel::PendingSlot::Absent,
+    )
+    .await;
+    fixture
+        .service
+        .observe_ready(ready_of(&descriptor(), expired_at))
+        .await
+        .unwrap();
+    assert_eq!(refusal_of(&paying.await), WorkRefusalCode::Conflict);
+    fixture
+        .service
+        .with_state(|state| {
+            assert_eq!(state.ledger().credited_cumulative(), 0);
+            assert_eq!(state.max_executable_certificate(), 0);
+            assert_eq!(state.jobs().len(), 0);
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn stale_provider_payment_wait_has_one_deadline() {
+    let mut fixture = checked_job().await;
+    let request = fixture.client.pay(fixture.id).await.unwrap();
+    fixture.service.require_observer().await.unwrap();
+    tokio::time::pause();
+    let mut paying = Box::pin(credit(&fixture.service, request));
+    assert!(futures::poll!(&mut paying).is_pending());
+    tokio::time::advance(MAX_CERTIFIED_AGE / 2).await;
+    fixture.service.suspend().await.unwrap();
+    assert!(futures::poll!(&mut paying).is_pending());
+    tokio::time::advance(MAX_CERTIFIED_AGE / 2).await;
+    let response = tokio::time::timeout(std::time::Duration::from_millis(10), paying)
+        .await
+        .expect("observer notifications must not reset the payment wait deadline");
+    assert_eq!(refusal_of(&response), WorkRefusalCode::NotReady);
+    assert_nothing_credited(&fixture.service, "observation wait expired").await;
+}
+
+#[tokio::test]
+async fn pending_provider_payment_wakes_on_shutdown() {
+    for quiesce in [false, true] {
+        let mut fixture = checked_job().await;
+        let request = fixture.client.pay(fixture.id).await.unwrap();
+        fixture.service.require_observer().await.unwrap();
+        let mut paying = Box::pin(credit(&fixture.service, request));
+        assert!(futures::poll!(&mut paying).is_pending());
+        if quiesce {
+            fixture.service.quiesce().await.unwrap();
+        } else {
+            fixture.service.stop().await.unwrap();
+        }
+        let std::task::Poll::Ready(response) = futures::poll!(&mut paying) else {
+            panic!("shutdown must wake a payment waiting for the observer");
+        };
+        assert_eq!(refusal_of(&response), WorkRefusalCode::NotReady);
+        assert_nothing_credited(&fixture.service, "provider shutdown").await;
+    }
 }
 
 #[tokio::test]
