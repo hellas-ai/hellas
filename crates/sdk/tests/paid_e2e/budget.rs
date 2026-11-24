@@ -89,7 +89,9 @@ fn consecutive_jobs_reuse_bounded_funding_and_closing_channels_never_refund_it()
                         approval: Some(budget.clone()),
                     },
                 );
-                // Only the first opening needs to seal a funding transaction.
+                // Only the first opening funds a channel. Reconnecting to it
+                // needs no blocks: sealing on a wall-clock timer here would
+                // age the bond according to the CI runner's network speed.
                 let opened = if n == 0 {
                     sealing_while(&mut case.devnet, Duration::from_millis(100), open).await
                 } else {
@@ -102,19 +104,6 @@ fn consecutive_jobs_reuse_bounded_funding_and_closing_channels_never_refund_it()
                     *bond.get_or_insert(session.descriptor().bond_edge()),
                     session.descriptor().bond_edge()
                 );
-                // Opening the client session does not refresh the provider's
-                // observation. Wait for the provider to confirm a heartbeat block.
-                tokio::time::timeout(
-                    HANG_GUARD,
-                    case.provider.wait_paid_ready(
-                        session.descriptor().channel().id(),
-                        case.devnet.height() + 1,
-                    ),
-                )
-                .await
-                .unwrap_or_else(|_| {
-                    panic!("provider did not observe finalized progress for job {n}")
-                });
                 let result = tokio::time::timeout(
                     Duration::from_secs(30),
                     hellas_sdk::transact::transact(

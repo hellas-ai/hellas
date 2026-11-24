@@ -31,11 +31,6 @@ pub(super) struct Paid {
     watcher: Mutex<Option<WorkWatcher>>,
 }
 impl Paid {
-    #[cfg(any(test, feature = "integration-tests"))]
-    pub(super) async fn wait_ready(&self, channel: hellas_auth::Digest, height: u64) {
-        self.work.wait_ready(channel, height).await;
-    }
-
     pub async fn shutdown(&self) -> Result<()> {
         self.work.stop_pending();
         let watcher = self.watcher.lock().unwrap().take();
