@@ -115,7 +115,7 @@ fn consecutive_jobs_reuse_bounded_funding_and_closing_channels_never_refund_it()
                 )
                 .await
                 .expect("consecutive retained job completes")
-                .unwrap_or_else(|error| panic!("executing job {n}: {error}"));
+                .unwrap_or_else(|error| panic!("executing job {n}: {error:?}"));
                 assert_eq!(result.credited_cumulative, PRICE * (n + 1));
                 assert_eq!(
                     budget.0.lock().unwrap().allocations,

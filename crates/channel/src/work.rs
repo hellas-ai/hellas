@@ -2827,10 +2827,36 @@ impl WorkService {
     /// which is after its record is committed. Nothing on this path can
     /// acknowledge a payment the disk does not hold.
     async fn credit(&self, request: &AdmitCertificateRequest) -> AdmitCertificateResponse {
-        let outcome = match self.endpoint().await {
-            Ok(mut endpoint) => endpoint.admit(request).await.map_err(Refusal::from),
-            Err(error) => Err(Refusal::new(endpoint_refusal(error), error.to_string())),
-        };
+        let deadline = tokio::time::Instant::now() + MAX_CERTIFIED_AGE;
+        let outcome = loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let mut endpoint = match self.endpoint().await {
+                Ok(endpoint) => endpoint,
+                Err(error) => break Err(PaymentError::from(error)),
+            };
+            let result = endpoint.admit(request).await;
+            // Only this typed refusal precedes any payment write. Retry the same
+            // request against the updated journal after releasing its lock.
+            if !matches!(
+                result,
+                Err(PaymentError::Endpoint(EndpointError::ObservationStale))
+            ) || !endpoint.accepting
+                || endpoint.state().is_closing()
+            {
+                break result;
+            }
+            drop(endpoint);
+            // Bound observation waits across all notifications. A journal append
+            // that has already started is outside this timeout.
+            if tokio::time::Instant::now() >= deadline
+                || tokio::time::timeout_at(deadline, changed).await.is_err()
+            {
+                break result;
+            }
+        }
+        .map_err(Refusal::from);
         AdmitCertificateResponse {
             outcome: Some(match outcome {
                 Ok(credited_cumulative) => AdmitOutcome::Paid(WorkPaid {
