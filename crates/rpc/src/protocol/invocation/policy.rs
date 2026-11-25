@@ -11,78 +11,134 @@ pub const MAX_POLICY_BYTES: usize = 64 * 1024;
 pub const MAX_ADMISSIONS: usize = 64;
 pub const MAX_COMPUTE_PROGRAMS: usize = 64;
 
-/// Explicit owner choice between general Compute and exact program manifests.
-/// A manifest commits the rendered sources and asset identities, while request
-/// inputs and plans remain variable within the invocation limits.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "mode", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum ComputePrograms {
-    Any {},
-    Only {
-        manifests: Vec<ContentId>,
-        /// Fully initializing, pure weight preparation entries approved by the owner.
-        #[serde(
-            default,
-            skip_serializing_if = "BTreeMap::is_empty",
-            with = "setup_entries_by_id"
-        )]
-        pure_setup_entries: BTreeMap<ContentId, BTreeSet<String>>,
-    },
-}
+/// A Hub model repository, with neither revision nor path.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct HubRepo(String);
 
-// Signed policies use lowercase Xet text for map keys in every encoding, including DAG-CBOR.
-mod setup_entries_by_id {
-    use super::*;
-    use serde::{Deserializer, Serializer, de::IntoDeserializer};
-
-    pub(super) fn serialize<S: Serializer>(
-        map: &BTreeMap<ContentId, BTreeSet<String>>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        serializer.collect_map(map.iter().map(|(id, entries)| (id.to_string(), entries)))
-    }
-
-    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<BTreeMap<ContentId, BTreeSet<String>>, D::Error> {
-        BTreeMap::<String, BTreeSet<String>>::deserialize(deserializer)?
-            .into_iter()
-            .map(|(key, entries)| Ok((ContentId::deserialize(key.into_deserializer())?, entries)))
-            .collect()
-    }
-}
-
-impl ComputePrograms {
-    pub fn validate(&self) -> Result<(), CanonicalDecodeError> {
-        if let Self::Only {
-            manifests,
-            pure_setup_entries,
-        } = self
+impl TryFrom<String> for HubRepo {
+    type Error = CanonicalDecodeError;
+    fn try_from(id: String) -> Result<Self, Self::Error> {
+        let valid = |part: &str| {
+            !matches!(part, "" | "." | "..")
+                && part
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
+        };
+        if id.len() > 256
+            || !id
+                .split_once('/')
+                .is_some_and(|(org, repo)| valid(org) && valid(repo))
         {
-            if manifests.is_empty() || manifests.len() > MAX_COMPUTE_PROGRAMS {
-                return Err(error(
-                    "compute admission requires a bounded, nonempty manifest list",
-                ));
-            }
-            for (manifest, entries) in pure_setup_entries {
-                if !manifests.contains(manifest) || entries.is_empty() {
-                    return Err(error("setup entries must belong to an admitted manifest"));
-                }
-                for entry in entries {
-                    super::label(entry)?;
-                }
-            }
-            if manifests.iter().collect::<BTreeSet<_>>().len() != manifests.len() {
-                return Err(error("duplicate compute manifest"));
-            }
+            return Err(error("invalid Hub repository name"));
+        }
+        Ok(Self(id))
+    }
+}
+impl From<HubRepo> for String {
+    fn from(repo: HubRepo) -> String {
+        repo.0
+    }
+}
+impl HubRepo {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// One entry per distinct model asset. Missing origins are explicitly unproven.
+pub struct ModelOrigins {
+    model: ContentId,
+    assets: Vec<BTreeSet<HubRepo>>,
+}
+impl ModelOrigins {
+    pub fn new(
+        model: &compute::Model,
+        files: &BTreeMap<crate::ContentRef, BTreeSet<HubRepo>>,
+    ) -> Result<Self, CanonicalDecodeError> {
+        Ok(Self {
+            model: model.content_id()?,
+            assets: model
+                .assets
+                .iter()
+                .map(|asset| files.get(&asset.object).cloned().unwrap_or_default())
+                .collect(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Match {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluator: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program: Option<ContentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ContentId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repos: Vec<HubRepo>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub pure_setup_entries: BTreeSet<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    Accept,
+    Reject,
+    NeedsOrigins,
+}
+
+impl Match {
+    pub fn evaluate(&self, manifest: &ProgramManifest, origins: Option<&ModelOrigins>) -> Decision {
+        if manifest.application().adaptor() != compute::ADAPTOR
+            || manifest.model().is_none()
+            || self
+                .evaluator
+                .as_ref()
+                .is_some_and(|e| e != manifest.application().evaluator())
+            || self.program.is_some_and(|p| p != manifest.content_id())
+            || self.model.is_some_and(|m| Some(m) != manifest.model())
+        {
+            return Decision::Reject;
+        }
+        if self.repos.is_empty() {
+            return Decision::Accept;
+        }
+        let Some(origins) = origins else {
+            return Decision::NeedsOrigins;
+        };
+        if Some(origins.model) == manifest.model()
+            && !origins.assets.is_empty()
+            && origins
+                .assets
+                .iter()
+                .all(|repos| self.repos.iter().any(|repo| repos.contains(repo)))
+        {
+            Decision::Accept
+        } else {
+            Decision::Reject
+        }
+    }
+    fn validate(&self) -> Result<(), CanonicalDecodeError> {
+        if let Some(evaluator) = &self.evaluator {
+            Application::new(evaluator.clone(), compute::ADAPTOR)
+                .map_err(|e| error(e.to_string()))?;
+        }
+        if self.repos.len() > MAX_COMPUTE_PROGRAMS || self.repos.windows(2).any(|w| w[0] >= w[1]) {
+            return Err(error(
+                "match repositories must be bounded, unique and sorted",
+            ));
+        }
+        if self.model.is_none() && self.program.is_none() && !self.pure_setup_entries.is_empty() {
+            return Err(error(
+                "setup cache permission requires an exact program or model",
+            ));
+        }
+        for entry in &self.pure_setup_entries {
+            super::label(entry)?;
         }
         Ok(())
-    }
-    fn admits(&self, manifest: &ProgramManifest) -> bool {
-        match self {
-            Self::Any {} => true,
-            Self::Only { manifests, .. } => manifests.contains(&manifest.content_id()),
-        }
     }
 }
 
@@ -126,13 +182,8 @@ pub enum CapacityDomain {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Admission {
-    Compute {
-        evaluator: String,
-        programs: ComputePrograms,
-    },
-    Fetch {
-        admission: FetchAdmission,
-    },
+    Compute { rules: Vec<Match> },
+    Fetch { admission: FetchAdmission },
 }
 impl Admission {
     /// Admit exact Compute manifests for one evaluator with the owner's pure setup entries.
@@ -149,19 +200,27 @@ impl Admission {
         {
             return Err(error("admitted programs must share one Compute evaluator"));
         }
-        let manifests: Vec<_> = programs.iter().map(ProgramManifest::content_id).collect();
-        let mut pure_setup_entries = BTreeMap::new();
-        if !entries.is_empty() {
-            let entries: BTreeSet<_> = entries.iter().map(|s| (*s).to_owned()).collect();
-            pure_setup_entries.extend(manifests.iter().map(|&id| (id, entries.clone())));
-        }
+        let entries: BTreeSet<_> = entries.iter().map(|s| (*s).to_owned()).collect();
         Ok(Self::Compute {
-            evaluator: application.evaluator().into(),
-            programs: ComputePrograms::Only {
-                manifests,
-                pure_setup_entries,
-            },
+            rules: programs
+                .iter()
+                .map(|manifest| Match {
+                    evaluator: Some(application.evaluator().into()),
+                    program: Some(manifest.content_id()),
+                    pure_setup_entries: entries.clone(),
+                    ..Default::default()
+                })
+                .collect(),
         })
+    }
+
+    pub fn evaluator(evaluator: String) -> Self {
+        Self::Compute {
+            rules: vec![Match {
+                evaluator: Some(evaluator),
+                ..Default::default()
+            }],
+        }
     }
     pub const fn capacity_domain(&self) -> CapacityDomain {
         match self {
@@ -177,28 +236,39 @@ impl Admission {
             Self::Fetch { .. } => Retention::Ephemeral,
         }
     }
-    pub fn admits_manifest(&self, manifest: &ProgramManifest) -> bool {
+    pub fn evaluate(&self, manifest: &ProgramManifest, origins: Option<&ModelOrigins>) -> Decision {
         match self {
-            Self::Compute {
-                evaluator,
-                programs,
-            } => {
-                manifest.application().evaluator() == evaluator
-                    && manifest.application().adaptor() == compute::ADAPTOR
-                    && programs.admits(manifest)
+            Self::Compute { rules } => {
+                let mut decision = Decision::Reject;
+                for rule in rules {
+                    match rule.evaluate(manifest, origins) {
+                        Decision::Accept => return Decision::Accept,
+                        Decision::NeedsOrigins => decision = Decision::NeedsOrigins,
+                        Decision::Reject => {}
+                    }
+                }
+                decision
             }
-            Self::Fetch { admission } => manifest == &admission.contract.manifest(),
+            Self::Fetch { admission } if manifest == &admission.contract.manifest() => {
+                Decision::Accept
+            }
+            Self::Fetch { .. } => Decision::Reject,
         }
     }
     pub fn validate(&self) -> Result<(), CanonicalDecodeError> {
         match self {
-            Self::Compute {
-                evaluator,
-                programs,
-            } => {
-                Application::new(evaluator.clone(), compute::ADAPTOR)
-                    .map_err(|e| error(e.to_string()))?;
-                programs.validate()
+            Self::Compute { rules } => {
+                if rules.is_empty() || rules.len() > MAX_COMPUTE_PROGRAMS {
+                    return Err(error("require a bounded nonempty list of Compute rules"));
+                }
+                let mut seen = BTreeSet::new();
+                for rule in rules {
+                    rule.validate()?;
+                    if !seen.insert(encode(rule)?) {
+                        return Err(error("duplicate Compute rule"));
+                    }
+                }
+                Ok(())
             }
             Self::Fetch { admission } => admission.validate(),
         }
@@ -212,17 +282,19 @@ pub struct InvocationPolicy {
     pub limits: Limits,
 }
 impl InvocationPolicy {
-    /// Whether this policy admits Compute programs nobody configured.
+    /// All Compute rules in this policy, in their signed order.
+    pub fn compute_rules(&self) -> impl Iterator<Item = &Match> {
+        self.admissions
+            .iter()
+            .flat_map(|admission| match admission {
+                Admission::Compute { rules } => rules.as_slice(),
+                Admission::Fetch { .. } => &[],
+            })
+    }
+
+    /// Whether this policy permits arbitrary source programs for a matching model.
     pub fn admits_any_program(&self) -> bool {
-        self.admissions.iter().any(|admission| {
-            matches!(
-                admission,
-                Admission::Compute {
-                    programs: ComputePrograms::Any {},
-                    ..
-                }
-            )
-        })
+        self.compute_rules().any(|rule| rule.program.is_none())
     }
     pub fn validate(&self) -> Result<(), CanonicalDecodeError> {
         self.limits.validate()?;
@@ -256,32 +328,40 @@ impl InvocationPolicy {
     pub fn content_id(&self) -> Result<ContentId, CanonicalDecodeError> {
         Ok(ContentId::hash(&self.canonical_bytes()?))
     }
-    /// Compute the cache permission from this owner's exact program admissions.
-    pub fn pure_setup_entries(&self, manifest: &ProgramManifest) -> BTreeSet<String> {
-        self.admissions_for(manifest)
-            .filter_map(|admission| match admission {
-                Admission::Compute {
-                    programs:
-                        ComputePrograms::Only {
-                            pure_setup_entries, ..
-                        },
-                    ..
-                } => pure_setup_entries.get(&manifest.content_id()),
-                _ => None,
-            })
-            .flatten()
-            .cloned()
+    /// Whether any otherwise matching rule requires verified asset provenance.
+    pub fn needs_model_origins(&self, manifest: &ProgramManifest) -> bool {
+        self.compute_rules()
+            .any(|rule| rule.evaluate(manifest, None) == Decision::NeedsOrigins)
+    }
+    pub fn pure_setup_entries(
+        &self,
+        manifest: &ProgramManifest,
+        origins: Option<&ModelOrigins>,
+    ) -> BTreeSet<String> {
+        self.compute_rules()
+            .filter(|r| r.evaluate(manifest, origins) == Decision::Accept)
+            .flat_map(|r| r.pure_setup_entries.iter().cloned())
             .collect()
+    }
+
+    pub fn admits_manifest(
+        &self,
+        manifest: &ProgramManifest,
+        origins: Option<&ModelOrigins>,
+    ) -> bool {
+        self.admissions
+            .iter()
+            .any(|a| a.evaluate(manifest, origins) == Decision::Accept)
     }
     /// More than one route can admit the same Fetch manifest. Callers check the
     /// application's input against a matching admission rather than choosing
     /// the first manifest match and silently ignoring the remaining routes.
-    pub fn admissions_for<'a>(
+    pub fn candidates_for<'a>(
         &'a self,
         manifest: &ProgramManifest,
     ) -> impl Iterator<Item = &'a Admission> {
         self.admissions
             .iter()
-            .filter(move |a| a.admits_manifest(manifest))
+            .filter(move |a| a.evaluate(manifest, None) != Decision::Reject)
     }
 }

@@ -113,6 +113,7 @@ fn https_offer() -> Offer {
     let client_principal = principal(2).0;
     let route = FetchRoutePolicy::sealed_route("http", "request").unwrap();
     let policy = GrantPolicy {
+        backend_evaluator: None,
         config_change: Default::default(),
         resource: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test resource")),
         account: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),
@@ -283,6 +284,37 @@ fn contact_proof_offer_signature_and_actor_channel_binding_are_not_advisory() {
             provider.content_id(),
             client_principal
         )
+    );
+}
+
+#[test]
+fn available_renderer_is_signed_independently_of_a_model_only_rule() {
+    use hellas_rpc::protocol::invocation::{Admission, Match};
+    let mut offer = https_offer();
+    let policy = &mut offer.grant.policies[0];
+    assert!(
+        serde_json::to_value(&*policy)
+            .unwrap()
+            .get("backend_evaluator")
+            .is_none()
+    );
+    policy.backend_evaluator = Some("provider-cuda".into());
+    assert!(policy.validate().is_err());
+    policy.https = None;
+    let rule = Match {
+        model: Some(ContentId::hash(b"model")),
+        ..Default::default()
+    };
+    policy.invocation_policy.admissions = vec![Admission::Compute {
+        rules: vec![rule.clone()],
+    }];
+    let signed = SignedOffer::sign(offer, &principal(1).1).unwrap();
+    let decoded = SignedOffer::decode(&signed.encode().unwrap(), UnixMillis(1000)).unwrap();
+    let policy = &decoded.offer().grant.policies[0];
+    assert_eq!(policy.render_evaluators(), ["provider-cuda"].into());
+    assert_eq!(
+        policy.invocation_policy.admissions,
+        [Admission::Compute { rules: vec![rule] }]
     );
 }
 

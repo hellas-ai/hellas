@@ -13,6 +13,54 @@ pub const MAX_PROGRAM_ROOT_BYTES: usize = 1 << 20;
 pub const MAX_CONTENT_BYTES: usize = crate::work_store::journal::MAX_ACTIVE_JOURNAL_BYTES as usize;
 pub const DEFAULT_MAX_STAGING_BYTES: u64 = MAX_CONTENT_BYTES as u64;
 
+/// Finish conditional Compute rules with the provider's own acquisition history.
+/// Opening a scoped staging carrier only admits the signed root and input until this succeeds.
+pub async fn match_program(
+    store: &LocalStore,
+    scope: &Scope,
+    policy: &hellas_rpc::protocol::invocation::InvocationPolicy,
+    manifest: &hellas_rpc::ProgramManifest,
+    opened_root: Option<&[u8]>,
+) -> Result<std::collections::BTreeSet<String>, Error> {
+    use hellas_rpc::protocol::invocation::{HubRepo, ModelOrigins, compute::Environment};
+    let origins = if policy.needs_model_origins(manifest) {
+        let loaded;
+        let bytes = match opened_root {
+            Some(bytes) => bytes,
+            None => {
+                loaded = root(store, scope, manifest.root()).await?;
+                &loaded
+            }
+        };
+        if ContentId::hash(bytes) != manifest.root() {
+            return Err(Error::Denied);
+        }
+        let model = Environment::from_canonical_bytes(bytes)
+            .map_err(|_| Error::Invalid("compute root"))?
+            .model;
+        let mut files = std::collections::BTreeMap::new();
+        for asset in &model.assets {
+            if let std::collections::btree_map::Entry::Vacant(entry) = files.entry(asset.object) {
+                let origins = store
+                    .verified_hub_files(asset.object)
+                    .await?
+                    .into_iter()
+                    .map(|(repo, _, _)| {
+                        HubRepo::try_from(repo).map_err(|_| Error::Invalid("stored Hub repo"))
+                    })
+                    .collect::<Result<_, _>>()?;
+                entry.insert(origins);
+            }
+        }
+        Some(ModelOrigins::new(&model, &files).map_err(|_| Error::Denied)?)
+    } else {
+        None
+    };
+    if !policy.admits_manifest(manifest, origins.as_ref()) {
+        return Err(Error::Denied);
+    }
+    Ok(policy.pure_setup_entries(manifest, origins.as_ref()))
+}
 pub async fn read(
     store: &LocalStore,
     scope: &Scope,

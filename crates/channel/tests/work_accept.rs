@@ -836,10 +836,8 @@ async fn a_retained_proposal_survives_restart_expiry_and_policy_change() {
     drop(endpoint); // The provider response was lost before journaling.
 
     let mut policy = work_policy();
-    policy.admissions[0] = hellas_rpc::protocol::invocation::Admission::Compute {
-        evaluator: "other/evaluator".into(),
-        programs: hellas_rpc::protocol::invocation::ComputePrograms::Any {},
-    };
+    policy.admissions[0] =
+        hellas_rpc::protocol::invocation::Admission::evaluator("other/evaluator".into());
     let changed = ready_with_descriptor(descriptor_with_policy(policy));
     let reopened = at_height(
         store(root.path(), Role::Client).await,

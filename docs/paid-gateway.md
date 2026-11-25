@@ -34,13 +34,22 @@ owner/passkey checks and idempotent comparison. The expected revision is checked
 before equality: a stale request fails; equal terms at the current revision
 retain their revision and salt.
 
-The policy's `invocation_policy` names the evaluator shown by `hellas routes`.
-Change the example's HIP evaluator if the provider uses another runtime. Its
-`programs: {"mode":"any"}` allows arbitrary programs for that evaluator;
-restrict it to `{"mode":"only","manifests":["CONTENT_ID"]}` to allow only
-specific program manifests. Those programs run with the provider process's
-filesystem and device access. The example sells Compute only; Fetch requires
-an explicit Fetch admission in the same policy.
+The example admits Compute programs for the evaluator shown by `hellas routes`.
+Each Compute admission contains a nonempty `rules` array. A single rule must
+match all its specified fields. Omit a field to leave it unconstrained.
+
+| Rule field | What the provider checks |
+|---|---|
+| `evaluator` | The exact interpreter named by the manifest. |
+| `program` | The content ID of the exact executable manifest. |
+| `model` | The ID of the model committed by that manifest and its opened environment. |
+| `repos` | Every model asset was verified at an immutable revision of a repo in this sorted list of Hub names. Git-stored metadata qualifies by hashing the downloaded file. |
+
+For example, `{"model":"MODEL_ID"}` admits variants of that model. A rule can
+name multiple repositories for a model assembled from different checkpoints.
+An evaluator-only rule also admits arbitrary programs on that evaluator.
+Only a rule pinning a program or model can declare `pure_setup_entries`.
+Fetch has its own admission in the same policy.
 
 `payment_policy` sets price and block margins; `channel_policy` limits credit;
 `offers` bounds automatic funding. At price 20 and 10 jobs per channel, capacity

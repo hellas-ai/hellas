@@ -573,8 +573,7 @@ async fn cached_program_still_opens_current_pin_policy(warm_gpu: bool) {
     use hellas_rpc::{
         Assurance, ContentRef, JsonBytes,
         protocol::invocation::{
-            Admission, ComputePrograms, InvocationInput, InvocationPolicy, InvocationRequest,
-            PreparedInvocation,
+            Admission, InvocationInput, InvocationPolicy, InvocationRequest, PreparedInvocation,
         },
     };
     use hellas_store::content::{
@@ -626,10 +625,7 @@ async fn cached_program_still_opens_current_pin_policy(warm_gpu: bool) {
     let mut limits = limits();
     limits.max_upload_bytes = hellas_channel::content::DEFAULT_MAX_STAGING_BYTES;
     let policy = InvocationPolicy {
-        admissions: vec![Admission::Compute {
-            evaluator: super::evaluator(GpuDialect::Hip),
-            programs: ComputePrograms::Any {},
-        }],
+        admissions: vec![Admission::evaluator(super::evaluator(GpuDialect::Hip))],
         limits,
     };
     let input = InvocationInput {
@@ -767,8 +763,7 @@ async fn an_executor_refuses_an_unregistered_evaluator() {
     use hellas_rpc::{
         Assurance, ContentRef, JsonBytes, Retention,
         protocol::invocation::{
-            Admission, ComputePrograms, InvocationInput, InvocationPolicy, InvocationRequest,
-            PreparedInvocation,
+            Admission, InvocationInput, InvocationPolicy, InvocationRequest, PreparedInvocation,
         },
     };
     use hellas_store::content::{LocalStore, MemoryStore, Reservations, Scope};
@@ -788,10 +783,7 @@ async fn an_executor_refuses_an_unregistered_evaluator() {
             artifacts: vec![],
         };
         let policy = InvocationPolicy {
-            admissions: vec![Admission::Compute {
-                evaluator: evaluator.into(),
-                programs: ComputePrograms::Any {},
-            }],
+            admissions: vec![Admission::evaluator(evaluator.into())],
             limits: limits(),
         };
         let prepared = PreparedInvocation::new(

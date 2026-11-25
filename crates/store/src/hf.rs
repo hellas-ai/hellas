@@ -477,6 +477,16 @@ fn authenticated_get(
     url: &str,
     bearer: Option<&str>,
 ) -> ureq::RequestBuilder<ureq::typestate::WithoutBody> {
+    #[cfg(feature = "test-support")]
+    if url::Url::parse(url)
+        .is_ok_and(|url| url.scheme() == "http" && url.host_str() == Some("127.0.0.1"))
+    {
+        let loopback: ureq::Agent = ureq::Agent::config_builder()
+            .max_redirects(0)
+            .build()
+            .into();
+        return loopback.get(url);
+    }
     authenticated(http().get(url), url, bearer)
 }
 /// The bearer goes only to HF origins.
@@ -500,6 +510,37 @@ pub(crate) struct RepoFile {
     pub xet_hash: Option<String>,
     #[serde(default)]
     pub lfs: Option<serde_json::Value>,
+}
+impl RepoFile {
+    pub(crate) fn advertised(&self) -> Result<Option<hellas_rpc::ContentRef>> {
+        self.xet_hash
+            .as_ref()
+            .map(|hash| {
+                hash.parse()
+                    .map(|id| hellas_rpc::ContentRef::new(id, self.size))
+                    .map_err(|_| {
+                        FetchError::Malformed(format!(
+                            "invalid published Xet identity for {}",
+                            self.path
+                        ))
+                    })
+            })
+            .transpose()
+    }
+
+    pub(crate) fn lfs_sha256(&self) -> Result<Option<[u8; 32]>> {
+        self.lfs
+            .as_ref()
+            .map(|lfs| {
+                let oid = lfs
+                    .get("oid")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| FetchError::Malformed("Hub LFS object id".into()))?;
+                hellas_auth::hex::parse(oid)
+                    .map_err(|_| FetchError::Malformed("Hub LFS SHA-256".into()))
+            })
+            .transpose()
+    }
 }
 impl Repo {
     pub fn from_uri(uri: &str) -> Result<Self> {

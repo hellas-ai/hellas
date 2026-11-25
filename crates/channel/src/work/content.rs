@@ -683,15 +683,16 @@ impl WorkService {
             while let Some(reply) = replies.next().await {
                 let reply = reply?;
                 if !widened && reply.complete {
-                    let (closure, local, bound) = {
+                    let (closure, local, bound, opened_root) = {
                         let endpoint = host.endpoint().await.map_err(status)?;
                         endpoint.check_upload_authority(&authorization).map_err(status)?;
                         let root_bytes = match root { Some(root) => endpoint.close.store.read_content(id, root).await.map_err(status)?, None => bytes::Bytes::new() };
                         let closure = crate::job::content_closure(&policy, &manifest, &root_bytes, authorization.input_content).map_err(status)?;
                         let (local, _) = endpoint.close.store.invocation_content(id).map_err(status)?;
                         let bound = current_scope(&shared)?;
-                        (closure,local,bound)
+                        (closure,local,bound,root_bytes)
                     };
+                    crate::content::match_program(&local, &bound, &policy, &manifest, Some(&opened_root)).await.map_err(status)?;
                     local.acquire_missing(&bound,closure.clone()).await.map_err(status)?;
                     let mut endpoint = host.endpoint().await.map_err(status)?;
                     endpoint.check_upload_authority(&authorization).map_err(status)?;

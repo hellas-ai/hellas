@@ -36,6 +36,18 @@ impl RemoteSession {
             finished: false,
         })
     }
+    async fn progress(&mut self, missing: &'static str) -> Result<pb::UploadResponse> {
+        let call = self.call.as_mut().ok_or(Error::Missing)?;
+        if let Some(response) = call.next().await {
+            return response.map_err(w::error);
+        }
+        self.call
+            .take()
+            .ok_or(Error::Missing)?
+            .finish()
+            .map_err(w::error)?;
+        Err(Error::Invalid(missing))
+    }
     async fn finish_object(&mut self) -> Result<()> {
         if !self.work {
             self.close().await?;
@@ -76,11 +88,7 @@ impl RemoteSession {
         })
         .await
         .map_err(w::error)?;
-        let progress = call
-            .next()
-            .await
-            .ok_or(Error::Invalid("missing upload progress"))?
-            .map_err(w::error)?;
+        let progress = self.progress("missing upload progress").await?;
         if progress.next_chunk != 0 || progress.complete != verified {
             return Err(Error::Invalid("upload declaration progress"));
         }
@@ -96,11 +104,7 @@ impl RemoteSession {
         })
         .await
         .map_err(w::error)?;
-        let progress = call
-            .next()
-            .await
-            .ok_or(Error::Invalid("missing upload progress"))?
-            .map_err(w::error)?;
+        let progress = self.progress("missing upload progress").await?;
         if progress.next_chunk != next as u64 || progress.complete != complete {
             return Err(Error::Invalid("upload payload progress"));
         }
@@ -389,11 +393,7 @@ where
             })
             .await
             .map_err(w::error)?;
-        let progress = active
-            .next()
-            .await
-            .ok_or(Error::Invalid("missing upload answer"))?
-            .map_err(w::error)?;
+        let progress = remote.progress("missing upload answer").await?;
         if !progress.missing {
             if !progress.complete {
                 return Err(Error::Invalid("invalid missing answer"));

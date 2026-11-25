@@ -524,6 +524,15 @@ impl GrantService {
                         .await
                         .map_err(|_| refused(GrantRefusalCode::Malformed))?
                 };
+                hellas_channel::content::match_program(
+                    &local,
+                    &scope,
+                    &policy.invocation_policy,
+                    manifest,
+                    Some(&root),
+                )
+                .await
+                .map_err(|_| refused(GrantRefusalCode::Malformed))?;
                 let objects = hellas_channel::job::content_closure(
                     &policy.invocation_policy,
                     manifest,

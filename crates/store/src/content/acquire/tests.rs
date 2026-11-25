@@ -223,44 +223,7 @@ pub(crate) fn framed(bytes: &[u8]) -> Vec<u8> {
     frame.extend_from_slice(bytes);
     frame
 }
-pub(crate) fn hub(
-    responses: impl FnOnce(&str) -> Vec<(String, u16, Vec<u8>)>,
-) -> (String, std::thread::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
-    let responses = responses(&base);
-    let serving = std::thread::spawn(move || {
-        for (expected, status, body) in responses {
-            let (mut socket, _) = listener.accept().unwrap();
-            let mut input = std::io::BufReader::new(socket.try_clone().unwrap());
-            let mut first = String::new();
-            input.read_line(&mut first).unwrap();
-            assert!(
-                first.starts_with(&format!("GET {expected} ")),
-                "unexpected Hub request path"
-            );
-            loop {
-                let mut line = String::new();
-                input.read_line(&mut line).unwrap();
-                if line == "\r\n" || line.is_empty() {
-                    break;
-                }
-                assert!(
-                    !line.to_ascii_lowercase().starts_with("authorization:"),
-                    "a non-HF origin received a credential"
-                );
-            }
-            write!(
-                socket,
-                "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            )
-            .unwrap();
-            socket.write_all(&body).unwrap();
-        }
-    });
-    (base, serving)
-}
+pub(crate) use crate::content::testing::hub;
 fn repo(kind: crate::hf::RepoKind) -> crate::hf::Repo {
     crate::hf::Repo {
         kind,
@@ -387,7 +350,7 @@ async fn resolve_tree_fetches_git_files_but_not_weights_and_missing_weights_stay
     });
     let cas = crate::hf::HfCas::new(repo(crate::hf::RepoKind::Model)).with_hub(base);
     let pool = Reservations::ram(16 << 20);
-    let (stages, root) = hf_stages(&cas, &Core::new(pool.clone()), None, None, false).unwrap();
+    let (stages, root, _) = hf_stages(&cas, &Core::new(pool.clone()), None, None, false).unwrap();
     serving.join().unwrap();
     assert!(!stages.contains_key(&weight.id()));
     let store = MemoryStore::new(pool.clone());
@@ -570,4 +533,105 @@ async fn disk_resolve_obeys_recovery_and_reclaims_before_retrying_the_same_commi
             .exists()
     );
     store.close().await;
+}
+
+#[tokio::test]
+async fn hub_provenance_requires_a_verified_file_at_an_immutable_revision() {
+    let sha = "a".repeat(40);
+    let config = ContentRef::for_bytes(b"{}");
+    let (base, serving) = hub(|_| {
+        vec![
+            (
+                format!("/api/models/org/repo/tree/{sha}?recursive=true"),
+                200,
+                serde_json::json!([{"type":"file","path":"config.json","size":2}])
+                    .to_string()
+                    .into_bytes(),
+            ),
+            (
+                format!("/org/repo/resolve/{sha}/config.json"),
+                200,
+                b"{}".to_vec(),
+            ),
+        ]
+    });
+    let mut store = MemoryStore::new(Reservations::ram(16 << 20));
+    store.core.hf_hub = Some(base);
+    let local = LocalStore::Memory(store.clone());
+    assert!(local.verified_hub_files(config).await.unwrap().is_empty());
+    store
+        .acquire(
+            &Scope::Owner,
+            Source::HfXet {
+                repo: repo(crate::hf::RepoKind::Model),
+                commit: sha.clone(),
+                path: Some("config.json".into()),
+            },
+            Some(config),
+            pin("config"),
+        )
+        .await
+        .unwrap();
+    serving.join().unwrap();
+    assert_eq!(
+        local.verified_hub_files(config).await.unwrap(),
+        vec![("org/repo".into(), sha, "config.json".into())]
+    );
+    assert!(
+        local
+            .verified_hub_files(ContentRef::for_bytes(b"another"))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn lfs_without_xet_id_requires_matching_sha_and_canonical_content() {
+    let revision = "a".repeat(40);
+    let object = ContentRef::for_bytes(b"weights");
+    let oid = "9a129038d9a00aed0cf6a7ea059ca50a813449061ab87848cf1a13eafdf33b2c".to_owned();
+    for (advertised, expected, accepted) in [
+        (oid.clone(), object, true),
+        ("0".repeat(64), object, false),
+        (oid, ContentRef::for_bytes(b"another"), false),
+    ] {
+        let listing = serde_json::json!([{"type":"file", "path":"weights.bin", "size":7,
+            "lfs":{"oid":advertised,"size":7}}]);
+        let (base, serving) = hub(|_| {
+            vec![
+                (
+                    format!("/api/models/org/repo/tree/{revision}?recursive=true"),
+                    200,
+                    listing.to_string().into_bytes(),
+                ),
+                (
+                    format!("/org/repo/resolve/{revision}/weights.bin"),
+                    200,
+                    b"weights".to_vec(),
+                ),
+            ]
+        });
+        let mut store = MemoryStore::new(Reservations::ram(16 << 20));
+        store.core.hf_hub = Some(base);
+        let result = store
+            .acquire(
+                &Scope::Owner,
+                Source::HfXet {
+                    repo: repo(crate::hf::RepoKind::Model),
+                    commit: revision.clone(),
+                    path: Some("weights.bin".into()),
+                },
+                Some(expected),
+                pin("weights"),
+            )
+            .await;
+        serving.join().unwrap();
+        assert_eq!(result.is_ok(), accepted);
+        let proofs = LocalStore::Memory(store)
+            .verified_hub_files(object)
+            .await
+            .unwrap();
+        assert_eq!(!proofs.is_empty(), accepted);
+    }
 }

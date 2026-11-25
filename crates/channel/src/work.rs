@@ -743,7 +743,7 @@ impl ProviderEndpoint {
             crate::content::MAX_CONTENT_BYTES,
         )
         .map_err(|error| Refusal::invalid(error.to_string()))?;
-        crate::job::check_paid_input(ready.channel(), &authorization, policy, &bundle)?;
+        let facts = crate::job::check_paid_input(ready.channel(), &authorization, policy, &bundle)?;
 
         let manifest = bundle.manifest();
         let (store, scope) = self.close.store.invocation_content(work_id)?;
@@ -759,6 +759,9 @@ impl ProviderEndpoint {
                 .ok_or_else(|| content_refusal(hellas_store::content::Error::Missing))?;
             self.close.store.read_content(work_id, root).await?
         };
+        crate::content::match_program(&store, &scope, policy, manifest, Some(&root))
+            .await
+            .map_err(content_refusal)?;
         let objects =
             crate::job::content_closure(policy, manifest, &root, authorization.input_content)?;
         if !store
@@ -782,8 +785,6 @@ impl ProviderEndpoint {
             .transpose()
             .map_err(|error| Refusal::new(WorkRefusal::Declined, error.to_string()))?;
         if authorization.retention == hellas_rpc::Retention::Retain {
-            let facts =
-                crate::job::check_paid_input(ready.channel(), &authorization, policy, &bundle)?;
             self.close
                 .store
                 .reserve_retained(work_id, facts.max_spool_bytes)
@@ -951,15 +952,22 @@ impl ProviderEndpoint {
             ready.invocation_policy(),
             &bundle,
         )?;
-        let setup = ready
-            .invocation_policy()
-            .pure_setup_entries(bundle.manifest());
+        let content = self.close.store.invocation_content(work_id)?;
+        let setup = crate::content::match_program(
+            &content.0,
+            &content.1,
+            ready.invocation_policy(),
+            bundle.manifest(),
+            None,
+        )
+        .await
+        .map_err(|e| RunError::Backend(BackendFault::caused_by(e)))?;
         let admission = RunAdmission::Invoke(Box::new(
             Admitted::new(
                 bundle,
                 facts.limits,
                 facts.capacity_domain,
-                self.close.store.invocation_content(work_id)?,
+                content,
                 WorkAdmission::payment(hellas_auth::PublicKey::Secp256k1(
                     ready.channel().client_key().to_bytes(),
                 )),
@@ -1778,7 +1786,10 @@ pub async fn run_admitted<B: WorkBackend>(
     let facts = policy
         .classify_manifest(manifest)
         .map_err(BackendFault::caused_by)?;
-    let setup_entries = policy.pure_setup_entries(manifest);
+    let setup_entries =
+        crate::content::match_program(&content.0, &content.1, policy, manifest, None)
+            .await
+            .map_err(BackendFault::caused_by)?;
     let input = Admitted::new(
         input,
         facts.limits,

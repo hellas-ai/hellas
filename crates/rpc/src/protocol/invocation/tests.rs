@@ -19,10 +19,7 @@ fn fetch_admission() -> FetchAdmission {
 fn policy() -> InvocationPolicy {
     InvocationPolicy {
         admissions: vec![
-            Admission::Compute {
-                evaluator: compute::EVALUATOR.into(),
-                programs: ComputePrograms::Any {},
-            },
+            Admission::evaluator(compute::EVALUATOR.into()),
             Admission::Fetch {
                 admission: fetch_admission(),
             },
@@ -52,12 +49,7 @@ fn every_policy_term_changes_the_committed_identity() {
         |p| p.limits.max_steps += 1,
         |p| p.limits.execution_timeout_ms += 1,
         |p| p.admissions.remove(0).validate().unwrap(),
-        |p| {
-            p.admissions[0] = Admission::Compute {
-                evaluator: "another/evaluator-1".into(),
-                programs: ComputePrograms::Any {},
-            }
-        },
+        |p| p.admissions[0] = Admission::evaluator("another/evaluator-1".into()),
         |p| fetch_mut(p).route = FetchRoutePolicy::open_fetch(true, vec!["example.com".into()]),
         |p| fetch_mut(p).route = FetchRoutePolicy::open_fetch(false, vec!["example.net".into()]),
         |p| fetch_mut(p).route = FetchRoutePolicy::sealed_route("http", "fetch").unwrap(),
@@ -167,7 +159,7 @@ fn policy_is_bounded_canonical_and_has_no_compile_budget() {
     let bytes = p.canonical_bytes().unwrap();
     assert_eq!(
         p.content_id().unwrap().to_string(),
-        "9de3a4e03988e29d402e54ba54d6bac631f4c7884c0b9a6076a996bc1e2fc405"
+        "a3f0c74bbb8f2c635f10284740fa8c4cf2fbaa13a5c47400d7a035d515a1f7b9"
     );
     assert_eq!(InvocationPolicy::from_canonical_bytes(&bytes).unwrap(), p);
     let mut trailing = bytes.clone();
@@ -613,15 +605,14 @@ fn application_admission_binds_owner_bytes_caller_and_staging_classification() {
     routes.validate().unwrap();
     assert_eq!(
         routes
-            .admissions_for(&FetchContract::http().unwrap().manifest())
+            .candidates_for(&FetchContract::http().unwrap().manifest())
             .count(),
         2
     );
     let mut forged = p;
-    forged.admissions = vec![Admission::Compute {
-        evaluator: crate::protocol::fetch_contract::FETCH_EVALUATOR.into(),
-        programs: ComputePrograms::Any {},
-    }];
+    forged.admissions = vec![Admission::evaluator(
+        crate::protocol::fetch_contract::FETCH_EVALUATOR.into(),
+    )];
     assert!(forged.classify_manifest(prepared.manifest()).is_err());
 }
 
@@ -640,11 +631,11 @@ fn compute_program_selection_binds_sources_and_weights_before_admission() {
         .unwrap();
     let mut restricted = policy();
     restricted.admissions[0] = Admission::Compute {
-        evaluator: compute::EVALUATOR.into(),
-        programs: ComputePrograms::Only {
-            manifests: vec![manifest.content_id()],
-            pure_setup_entries: Default::default(),
-        },
+        rules: vec![Match {
+            evaluator: Some(compute::EVALUATOR.into()),
+            program: Some(manifest.content_id()),
+            ..Default::default()
+        }],
     };
     assert_ne!(
         restricted.content_id().unwrap(),
@@ -657,7 +648,7 @@ fn compute_program_selection_binds_sources_and_weights_before_admission() {
     );
     let json = serde_json::to_value(&restricted).unwrap();
     assert_eq!(
-        json["admissions"][0]["programs"]["manifests"][0],
+        json["admissions"][0]["rules"][0]["program"],
         manifest.content_id().to_string()
     );
     assert_eq!(
@@ -738,22 +729,20 @@ fn compute_program_selection_is_explicit_and_bounded() {
             .collect(),
     ] {
         p.admissions[0] = Admission::Compute {
-            evaluator: compute::EVALUATOR.into(),
-            programs: ComputePrograms::Only {
-                manifests,
-                pure_setup_entries: Default::default(),
-            },
+            rules: manifests
+                .into_iter()
+                .map(|id| Match {
+                    program: Some(id),
+                    ..Default::default()
+                })
+                .collect(),
         };
         assert!(p.canonical_bytes().is_err());
     }
-    let mut value = serde_json::to_value(policy()).unwrap();
-    value["admissions"][0]
-        .as_object_mut()
-        .unwrap()
-        .remove("programs");
-    assert!(serde_json::from_value::<InvocationPolicy>(value).is_err());
-    assert!(serde_json::from_str::<ComputePrograms>(r#"{"mode":"any","manifests":[]}"#).is_err());
-    assert!(serde_json::from_str::<ComputePrograms>(r#"{"mode":"only"}"#).is_err());
+    assert!(
+        serde_json::from_str::<Admission>(r#"{"kind":"compute","programs":{"mode":"any"}}"#)
+            .is_err()
+    );
     // Old policy bytes are never silently interpreted as unrestricted compute.
     assert!(
         InvocationPolicy::from_canonical_bytes(
@@ -1245,9 +1234,10 @@ fn compute_event_cap_refuses_excessive_fragmentation_within_the_raw_byte_allowan
 }
 
 fn closure_manifest(root: &[u8]) -> crate::ProgramManifest {
-    crate::ProgramManifest::new(
+    crate::ProgramManifest::with_model(
         crate::Application::new(compute::EVALUATOR, compute::ADAPTOR).unwrap(),
         crate::ContentId::hash(root),
+        compute::Model::default().content_id().unwrap(),
     )
 }
 
@@ -1554,46 +1544,66 @@ fn http_bounds_cover_raw_audio_headers_framing_and_retained_envelopes() {
 
 #[test]
 fn setup_declarations_bind_exact_admitted_program_and_evaluator() {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeSet;
     let env = compute::Environment {
         sources: vec![],
         model: Default::default(),
     };
     let manifest = env.manifest(compute::EVALUATOR).unwrap();
     let mut p = policy();
-    let id = manifest.content_id();
-    let second = ContentId::from_bytes([1; 32]);
+    p.admissions =
+        vec![Admission::compute_only(std::slice::from_ref(&manifest), &["weights.prep"]).unwrap()];
     let entries = BTreeSet::from(["weights.prep".to_owned()]);
-    p.admissions = vec![Admission::Compute {
-        evaluator: compute::EVALUATOR.into(),
-        programs: ComputePrograms::Only {
-            manifests: vec![id, second],
-            pure_setup_entries: BTreeMap::from([
-                (id, entries.clone()),
-                (second, BTreeSet::from(["second.prep".into()])),
-            ]),
-        },
-    }];
-    // Existing signed policies encode these two setup-map keys as lowercase text.
-    assert_eq!(
-        p.content_id().unwrap().to_string(),
-        "64b383e9249b32a01fd6e7cf3d4d66068f3f24852ba936b59ef13a5a2b1e6f18"
-    );
-    assert_eq!(p.pure_setup_entries(&manifest), entries);
+    assert_eq!(p.pure_setup_entries(&manifest, None), entries);
     assert!(
-        p.pure_setup_entries(&env.manifest("other").unwrap())
+        p.pure_setup_entries(&env.manifest("other").unwrap(), None)
             .is_empty()
     );
     let bytes = p.canonical_bytes().unwrap();
     assert_eq!(InvocationPolicy::from_canonical_bytes(&bytes).unwrap(), p);
-    if let Admission::Compute {
-        programs: ComputePrograms::Only { manifests, .. },
-        ..
-    } = &mut p.admissions[0]
-    {
-        manifests[0] = ContentId::hash(b"other");
-    }
+    let Admission::Compute { rules } = &mut p.admissions[0] else {
+        unreachable!()
+    };
+    rules[0].program = None;
     assert!(p.validate().is_err());
+}
+
+#[test]
+fn repo_match_requires_every_asset_to_have_a_verified_origin_in_the_set() {
+    use std::collections::{BTreeMap, BTreeSet};
+    let object = crate::ContentRef::for_bytes(b"weights");
+    let config = crate::ContentRef::for_bytes(b"git metadata");
+    let env = compute::Environment {
+        sources: vec![],
+        model: compute::Model::new(vec![
+            compute::NamedAsset {
+                name: "weights".into(),
+                object,
+            },
+            compute::NamedAsset {
+                name: "config.json".into(),
+                object: config,
+            },
+        ])
+        .unwrap(),
+    };
+    let manifest = env.manifest(compute::EVALUATOR).unwrap();
+    let one = HubRepo::try_from("org/model".to_owned()).unwrap();
+    let two = HubRepo::try_from("org/voices".to_owned()).unwrap();
+    let mut rule = Match {
+        repos: vec![one.clone(), two.clone()],
+        ..Default::default()
+    };
+    assert!(rule.evaluate(&manifest, None) == Decision::NeedsOrigins);
+    let mut files = BTreeMap::from([(object, BTreeSet::from([one.clone()]))]);
+    let partial = ModelOrigins::new(&env.model, &files).unwrap();
+    assert!(rule.evaluate(&manifest, Some(&partial)) == Decision::Reject);
+    files.insert(config, BTreeSet::from([two.clone()]));
+    let complete = ModelOrigins::new(&env.model, &files).unwrap();
+    assert!(rule.evaluate(&manifest, Some(&complete)) == Decision::Accept);
+    rule.repos = vec![one];
+    assert!(rule.evaluate(&manifest, Some(&complete)) == Decision::Reject);
+    assert!(HubRepo::try_from("org/*".to_owned()).is_err());
 }
 
 #[test]

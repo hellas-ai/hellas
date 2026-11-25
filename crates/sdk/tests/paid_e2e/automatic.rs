@@ -1659,10 +1659,9 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
     assert_eq!(files(&config.chain.provider().join("channels")), 0);
     let mut policy = paid_policy();
     policy.invocation_policy = InvocationPolicy {
-        admissions: vec![Admission::Compute {
-            evaluator: hellas_channel::test_support::channel::evaluator(),
-            programs: hellas_rpc::protocol::invocation::ComputePrograms::Any {},
-        }],
+        admissions: vec![Admission::evaluator(
+            hellas_channel::test_support::channel::evaluator(),
+        )],
         limits: Limits {
             max_upload_bytes: 1 << 20,
             max_output_bytes: 4096,

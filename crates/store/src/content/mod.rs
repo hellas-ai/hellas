@@ -13,6 +13,8 @@ mod remote;
 pub(crate) mod reservation;
 mod server;
 mod storage;
+#[cfg(any(test, feature = "test-support"))]
+pub mod testing;
 pub(crate) mod tree;
 mod upload;
 mod wire;

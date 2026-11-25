@@ -114,6 +114,9 @@ pub struct GrantPolicy {
     pub name: String,
     #[serde(default)]
     pub config_change: ConfigChange,
+    /// The provider's registered render target for this resource.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_evaluator: Option<String>,
     #[serde(with = "policy_bytes")]
     pub invocation_policy: InvocationPolicy,
     pub https: Option<super::resource::HttpsResource>,
@@ -121,6 +124,16 @@ pub struct GrantPolicy {
     pub pricing: super::pricing::Pricing,
 }
 impl GrantPolicy {
+    pub fn render_evaluators(&self) -> std::collections::BTreeSet<&str> {
+        if let Some(evaluator) = self.backend_evaluator.as_deref() {
+            return [evaluator].into();
+        }
+        self.invocation_policy
+            .compute_rules()
+            .filter_map(|rule| rule.evaluator.as_deref())
+            .collect()
+    }
+
     pub(crate) fn changed(&self, previous: Option<&Self>) -> Result<Option<Self>, GrantError> {
         let mut next = self.clone();
         if let Some(old) = previous {
@@ -144,6 +157,18 @@ impl GrantPolicy {
         self.invocation_policy
             .validate()
             .map_err(|_| GrantError::Malformed)?;
+        if let Some(evaluator) = &self.backend_evaluator {
+            hellas_rpc::Application::new(
+                evaluator.clone(),
+                hellas_rpc::protocol::invocation::compute::ADAPTOR,
+            )
+            .map_err(|_| GrantError::Malformed)?;
+            if !self.invocation_policy.admissions.iter().any(|admission| matches!(admission,
+                Admission::Compute { rules } if rules.iter().any(|r| r.evaluator.as_ref().is_none_or(|e| e == evaluator))
+            )) {
+                return Err(GrantError::Malformed);
+            }
+        }
         self.pricing.validate().map_err(|_| GrantError::Limits)?;
         if self
             .pricing

@@ -594,6 +594,15 @@ pub async fn store_at(
     height: u64,
 ) -> ChannelStore {
     let content = content_store(root).await;
+    store_at_with_content(root, ready, role, height, content).await
+}
+pub async fn store_at_with_content(
+    root: &std::path::Path,
+    ready: &ReadyChannel,
+    role: Role,
+    height: u64,
+    content: hellas_store::content::DiskStore,
+) -> ChannelStore {
     let location = StoreLocation::for_test(root);
     let mut store = match ChannelStore::open(
         &location,
@@ -616,10 +625,7 @@ pub async fn store_at(
 
 pub fn work_policy() -> InvocationPolicy {
     InvocationPolicy {
-        admissions: vec![Admission::Compute {
-            evaluator: evaluator(),
-            programs: hellas_rpc::protocol::invocation::ComputePrograms::Any {},
-        }],
+        admissions: vec![Admission::evaluator(evaluator())],
         limits: Limits {
             max_upload_bytes: 1 << 20,
             max_output_bytes: 1 << 20,
@@ -1194,4 +1200,67 @@ pub async fn program_content() -> (
     .await
     .unwrap();
     (LocalStore::Memory(store), Scope::Owner)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ExtraAsset {
+    None,
+    Local,
+    HubOnly,
+}
+pub const EXTRA_BYTES: &[u8] = b"local-only variant";
+/// Two independently acquired files and optionally an asset with no receipt.
+pub async fn repo_model(
+    store: &hellas_store::content::DiskStore,
+    extra: ExtraAsset,
+) -> compute::Environment {
+    use hellas_store::content::testing::acquire_git_file;
+    let mut assets = vec![
+        compute::NamedAsset {
+            name: "config.json".into(),
+            object: acquire_git_file(store, "org/base", "config.json", br#"{"width":3}"#).await,
+        },
+        compute::NamedAsset {
+            name: "voices.json".into(),
+            object: acquire_git_file(store, "org/voices", "voices.json", br#"["Easton"]"#).await,
+        },
+    ];
+    if extra != ExtraAsset::None {
+        use hellas_store::content::{PinName, PinPolicy, PinTarget, Scope};
+        let object = hellas_rpc::ContentRef::for_bytes(EXTRA_BYTES);
+        if extra == ExtraAsset::Local {
+            crate::content::upload_bytes(
+                store,
+                &Scope::Owner,
+                EXTRA_BYTES,
+                Some(PinTarget {
+                    name: PinName::new("models/local-variant".into()).unwrap(),
+                    policy: PinPolicy::Jobs,
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        assets.push(compute::NamedAsset {
+            name: "variant".into(),
+            object,
+        });
+    }
+    compute::Environment {
+        sources: vec![],
+        model: compute::Model::new(assets).unwrap(),
+    }
+}
+pub fn repo_policy() -> InvocationPolicy {
+    let mut policy = work_policy();
+    policy.admissions = vec![Admission::Compute {
+        rules: vec![hellas_rpc::protocol::invocation::Match {
+            repos: vec![
+                "org/base".to_owned().try_into().unwrap(),
+                "org/voices".to_owned().try_into().unwrap(),
+            ],
+            ..Default::default()
+        }],
+    }];
+    policy
 }

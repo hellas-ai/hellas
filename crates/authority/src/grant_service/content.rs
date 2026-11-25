@@ -353,7 +353,7 @@ impl GrantWork {
             while let Some(reply) = replies.next().await {
                 let reply = reply?;
                 if !widened && reply.complete {
-                    let (closure,local,bound) = {
+                    let (closure, local, bound, opened_root) = {
                         let store = work.service.node.writer().await.map_err(status)?;
                         work.access.authorize(&store, authorization.grant_id, work.service.node.observed_time(&store)).map_err(status)?;
                         let job = work.service.pending_content(authorization.channel_id, id.id).map_err(|_| status("content scope ended"))?;
@@ -362,8 +362,9 @@ impl GrantWork {
                         let bytes = match root { Some(root) => hellas_channel::content::read(&local, job.scope(), root, hellas_channel::content::MAX_PROGRAM_ROOT_BYTES as u64).await.map_err(status)?, None => bytes::Bytes::new() };
                         let closure = hellas_channel::job::content_closure(&policy, &manifest, &bytes, authorization.input_content).map_err(status)?;
                         let bound = current_scope(&shared)?;
-                        (closure,local,bound)
+                        (closure,local,bound,bytes)
                     };
+                    hellas_channel::content::match_program(&local, &bound, &policy, &manifest, Some(&opened_root)).await.map_err(status)?;
                     local.acquire_missing(&bound,closure.clone()).await.map_err(status)?;
                     let mut store = work.service.node.writer().await.map_err(status)?;
                     work.access.authorize(&store, authorization.grant_id, work.service.node.observed_time(&store)).map_err(status)?;

@@ -25,7 +25,6 @@ enum Family {
 }
 
 pub struct ModelPackage {
-    hub_files: Arc<[hellas_store::hf::PinnedFile]>,
     family: Family,
     evaluator: String,
 }
@@ -110,7 +109,6 @@ impl ModelPackage {
     #[cfg(any(test, feature = "test-support"))]
     pub(super) fn flux_fixture(model: Flux, dialect: super::GpuDialect) -> Self {
         Self {
-            hub_files: Arc::default(),
             family: Family::Flux(Arc::new(model)),
             evaluator: super::evaluator(dialect),
         }
@@ -183,10 +181,6 @@ impl ModelPackage {
     ) -> Result<Self> {
         Ok(Self {
             evaluator: evaluator.into(),
-            hub_files: match source {
-                source::Resolved::Native(_, native) => native.hub_files.clone(),
-                source::Resolved::Gguf(gguf) => gguf.hub.iter().cloned().collect(),
-            },
             family: match source {
                 source::Resolved::Native(
                     kind @ (native::Kind::OmniVoice | native::Kind::Mms | native::Kind::Phonon),
@@ -217,10 +211,6 @@ impl ModelPackage {
             Family::Qwen3(model) => model.decisions(),
             _ => bail!("model does not answer decisions"),
         }
-    }
-    /// Files identified at their original Hub revision while acquiring this package.
-    pub fn hub_files(&self) -> &[hellas_store::hf::PinnedFile] {
-        &self.hub_files
     }
     /// The canonical assets shared by all programs this package renders.
     pub fn model(&self) -> &hellas_rpc::protocol::invocation::compute::Model {

@@ -371,10 +371,7 @@ fn every_prepared_invocation_and_policy_field_is_bound_for_paid_and_grant_inputs
             policies.push(serde_json::from_value::<InvocationPolicy>(value).unwrap());
         }
         let mut other = policy.clone();
-        other.admissions = vec![Admission::Compute {
-            evaluator: "other/evaluator".into(),
-            programs: hellas_rpc::protocol::invocation::ComputePrograms::Any {},
-        }];
+        other.admissions = vec![Admission::evaluator("other/evaluator".into())];
         policies.push(other);
         for changed in policies {
             assert_ne!(

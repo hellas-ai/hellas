@@ -8,7 +8,7 @@ use hellas_authority::model::grant::{
     responses::ResponsesResource,
 };
 use hellas_gateway::Presentation;
-use hellas_rpc::protocol::invocation::{Admission, InvocationPolicy, Limits};
+use hellas_rpc::protocol::invocation::{Admission, InvocationPolicy, Limits, Match};
 
 /// Operator terms for a named resource. Core derives the executable policy and
 /// the authority journal assigns its revision at commit.
@@ -30,9 +30,18 @@ pub struct Resource {
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ResourceKind {
-    Model { package: PathBuf },
-    Https { https: HttpsResource },
-    Responses { responses: ResponsesResource },
+    Model {
+        package: PathBuf,
+        /// When omitted, derive the exact programs and setup entries from the package.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rules: Option<Vec<Match>>,
+    },
+    Https {
+        https: HttpsResource,
+    },
+    Responses {
+        responses: ResponsesResource,
+    },
 }
 fn account_backed(https: &HttpsResource, credentials: &[Credential]) -> bool {
     credentials.iter().any(|credential| {
@@ -144,6 +153,7 @@ impl Document {
                                 id.clone(),
                                 ResourceKind::Model {
                                     package: package.clone(),
+                                    rules: None,
                                 },
                             );
                             resource.rates = Some(vec![]);
@@ -259,83 +269,91 @@ impl Resource {
         models: &hellas_gateway::router::Models,
         model_route: bool,
     ) -> Result<GrantPolicy, crate::daemon::Error> {
-        let (invocation_policy, https, responses) = match (&self.kind, &backend.kind) {
-            (ResourceKind::Model { package }, BackendKind::Local { .. }) => {
-                let evaluator = backends
-                    .iter()
-                    .find(|b| b.id == self.backend)
-                    .and_then(|b| b.evaluator.as_deref())
-                    .ok_or("local backend has no evaluator")?;
-                let package = models
-                    .get(package)
-                    .ok_or("model was not prepared")?
-                    .as_ref()
-                    .map_err(|error| error.clone())?
-                    .get(evaluator)
-                    .ok_or("model evaluator was not prepared")?;
-                (
-                    InvocationPolicy {
-                        admissions: package.compute_admissions()?,
-                        limits: Limits {
-                            max_upload_bytes: 8 << 20,
-                            max_output_bytes: 4 << 20,
-                            max_steps: 4096,
-                            execution_timeout_ms: self.max_job_millis.get(),
+        let (invocation_policy, backend_evaluator, https, responses) =
+            match (&self.kind, &backend.kind) {
+                (ResourceKind::Model { package, rules }, BackendKind::Local { .. }) => {
+                    let evaluator = backends
+                        .iter()
+                        .find(|b| b.id == self.backend)
+                        .and_then(|b| b.evaluator.as_deref())
+                        .ok_or("local backend has no evaluator")?;
+                    let package = models
+                        .get(package)
+                        .ok_or("model was not prepared")?
+                        .as_ref()
+                        .map_err(|error| error.clone())?
+                        .get(evaluator)
+                        .ok_or("model evaluator was not prepared")?;
+                    (
+                        InvocationPolicy {
+                            admissions: match rules {
+                                Some(rules) => vec![Admission::Compute {
+                                    rules: rules.clone(),
+                                }],
+                                None => package.compute_admissions()?,
+                            },
+                            limits: Limits {
+                                max_upload_bytes: 8 << 20,
+                                max_output_bytes: 4 << 20,
+                                max_steps: 4096,
+                                execution_timeout_ms: self.max_job_millis.get(),
+                            },
                         },
-                    },
-                    None,
-                    None,
-                )
-            }
-            (kind, BackendKind::Fetch { upstream, .. }) => {
-                let (https, responses) = match (kind, upstream) {
-                    (ResourceKind::Https { https }, Upstream::Http { credentials, .. }) => {
-                        if https.account_backed != account_backed(https, credentials) {
-                            return Err(
-                                "HTTPS account_backed disagrees with backend credential scopes"
-                                    .into(),
-                            );
-                        }
-                        (Some(https.clone()), None)
-                    }
-                    (ResourceKind::Responses { responses }, Upstream::OpenaiResponses { .. }) => {
-                        (None, Some(responses.clone()))
-                    }
-                    _ => return Err("resource and backend protocols disagree".into()),
-                };
-                let mut policy = backend.fetch_policy()?;
-                if !model_route {
-                    policy.limits = Limits {
-                        max_upload_bytes: 128 << 10,
-                        max_output_bytes: if responses.is_some() {
-                            1 << 20
-                        } else {
-                            4 << 20
-                        },
-                        max_steps: 1,
-                        execution_timeout_ms: self.max_job_millis.get(),
-                    };
-                    for admission in &mut policy.admissions {
-                        if let Admission::Fetch { admission } = admission {
-                            admission.limits =
-                                hellas_rpc::protocol::invocation::fetch::FetchLimits {
-                                    max_request_body_bytes: 64 << 10,
-                                    max_output_events: 4096,
-                                    max_spool_bytes: if responses.is_some() {
-                                        4 << 20
-                                    } else {
-                                        8 << 20
-                                    },
-                                    max_encoded_result_frame: 4 << 20,
-                                    max_encoded_prepared_input: 128 << 10,
-                                };
-                        }
-                    }
+                        Some(evaluator.to_owned()),
+                        None,
+                        None,
+                    )
                 }
-                (policy, https, responses)
-            }
-            _ => return Err("resource and backend protocols disagree".into()),
-        };
+                (kind, BackendKind::Fetch { upstream, .. }) => {
+                    let (https, responses) = match (kind, upstream) {
+                        (ResourceKind::Https { https }, Upstream::Http { credentials, .. }) => {
+                            if https.account_backed != account_backed(https, credentials) {
+                                return Err(
+                                    "HTTPS account_backed disagrees with backend credential scopes"
+                                        .into(),
+                                );
+                            }
+                            (Some(https.clone()), None)
+                        }
+                        (
+                            ResourceKind::Responses { responses },
+                            Upstream::OpenaiResponses { .. },
+                        ) => (None, Some(responses.clone())),
+                        _ => return Err("resource and backend protocols disagree".into()),
+                    };
+                    let mut policy = backend.fetch_policy()?;
+                    if !model_route {
+                        policy.limits = Limits {
+                            max_upload_bytes: 128 << 10,
+                            max_output_bytes: if responses.is_some() {
+                                1 << 20
+                            } else {
+                                4 << 20
+                            },
+                            max_steps: 1,
+                            execution_timeout_ms: self.max_job_millis.get(),
+                        };
+                        for admission in &mut policy.admissions {
+                            if let Admission::Fetch { admission } = admission {
+                                admission.limits =
+                                    hellas_rpc::protocol::invocation::fetch::FetchLimits {
+                                        max_request_body_bytes: 64 << 10,
+                                        max_output_events: 4096,
+                                        max_spool_bytes: if responses.is_some() {
+                                            4 << 20
+                                        } else {
+                                            8 << 20
+                                        },
+                                        max_encoded_result_frame: 4 << 20,
+                                        max_encoded_prepared_input: 128 << 10,
+                                    };
+                            }
+                        }
+                    }
+                    (policy, None, https, responses)
+                }
+                _ => return Err("resource and backend protocols disagree".into()),
+            };
         Ok(GrantPolicy {
             resource: self.resource,
             account: self.account,
@@ -343,6 +361,7 @@ impl Resource {
             name: self.name.clone(),
             config_change: self.config_change,
             invocation_policy,
+            backend_evaluator,
             https,
             responses,
             pricing: Pricing {

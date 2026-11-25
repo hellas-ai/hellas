@@ -18,7 +18,9 @@ pub use admission::{AdmissionFacts, VerifiedOutput};
 pub mod compute;
 pub mod fetch;
 pub mod policy;
-pub use policy::{Admission, CapacityDomain, ComputePrograms, InvocationPolicy, Limits};
+pub use policy::{
+    Admission, CapacityDomain, Decision, HubRepo, InvocationPolicy, Limits, Match, ModelOrigins,
+};
 pub mod output;
 
 const REQUEST_DOMAIN: &str = "hellas.invocation.request.v1";

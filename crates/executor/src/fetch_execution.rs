@@ -583,10 +583,9 @@ mod tests {
 
         // Retained content lost after admission still yields an authenticated failure.
         let compute_policy = InvocationPolicy {
-            admissions: vec![Admission::Compute {
-                evaluator: hellas_channel::test_support::channel::evaluator(),
-                programs: hellas_rpc::protocol::invocation::ComputePrograms::Any {},
-            }],
+            admissions: vec![Admission::evaluator(
+                hellas_channel::test_support::channel::evaluator(),
+            )],
             limits,
         };
         let mut compute = hellas_channel::test_support::channel::bundle(1);

@@ -38,7 +38,8 @@ pub(crate) fn validate_resources(
         for admission in &resource.invocation_policy.admissions {
             let available = backends.iter().any(|(inner, _evaluator_name)| match (admission, &inner.state) {
                     #[cfg(feature = "compute")]
-                    (Admission::Compute { evaluator, .. }, BackendState::Local { .. }) => *_evaluator_name == Some(evaluator.as_str()),
+                    (Admission::Compute { rules }, BackendState::Local { .. }) => _evaluator_name.is_some_and(|e| resource.backend_evaluator.as_deref().is_none_or(|advertised| advertised == e) &&
+                        rules.iter().any(|r| r.evaluator.as_deref().is_none_or(|wanted| wanted == e))),
                     (Admission::Fetch { admission }, BackendState::Fetch { policy, .. }) =>
                         matches!(admission.route, FetchRoutePolicy::SealedRoute { .. }) && policy.admissions.iter().any(|offered| {
                             matches!(offered, Admission::Fetch { admission: offered } if offered.route == admission.route && offered.contract == admission.contract)

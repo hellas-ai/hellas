@@ -120,6 +120,34 @@ async fn failed_acknowledgements_and_trailers_never_report_complete_and_allow_cl
     }
 }
 #[tokio::test]
+async fn a_denial_trailer_in_place_of_any_upload_acknowledgement_reaches_the_client() {
+    for frame in 1..=3 {
+        let fixture = Fixture::new(BTreeMap::new(), Mode::DenyOnUploadFrame(frame));
+        let store = remote(fixture);
+        let bytes = b"root";
+        let object = ContentRef::for_bytes(bytes);
+        let scope = Scope::work(
+            JobId {
+                channel: Digest::ZERO,
+                id: Digest::ZERO,
+            },
+            vec![object],
+            0,
+        );
+        let result = async {
+            let mut upload = store.upload(&scope, object, None).await?;
+            upload.declare(&hellas_xet::chunk(bytes), true).await?;
+            upload.accept_chunk(bytes).await
+        }
+        .await;
+        assert!(
+            matches!(result, Err(Error::Denied)),
+            "frame {frame}: {result:?}"
+        );
+        assert!(upload(&store, bytes).await);
+    }
+}
+#[tokio::test]
 async fn concurrent_objects_are_refused_and_cancellation_owns_the_stream() {
     let fixture = Fixture::new(BTreeMap::new(), Mode::HoldFirstDeclaration);
     let store = remote(fixture.clone());

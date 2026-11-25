@@ -292,7 +292,7 @@ async fn model_and_operator_inputs_keep_their_terms_in_one_configuration() {
         900_000
     );
     assert!(
-        matches!(&compute.invocation_policy.admissions[..], [Admission::Compute { evaluator: actual, .. }] if actual == &evaluator)
+        matches!(&compute.invocation_policy.admissions[..], [Admission::Compute { rules }] if rules.iter().all(|r| r.evaluator.as_ref() == Some(&evaluator)))
     );
     let mut explicit = Resource::new(
         "models".into(),
@@ -524,5 +524,45 @@ async fn segment_templates_are_validated_and_require_account_backing_for_covered
     assert_eq!(
         document.validate().unwrap_err(),
         "overlapping HTTP credential scopes"
+    );
+}
+
+#[tokio::test]
+async fn explicit_model_rules_preserve_their_shape_and_advertise_the_backend_renderer() {
+    use hellas_rpc::protocol::invocation::{Admission, Match};
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../client/src/model/package/mini-qwen3.gguf");
+    let evaluator = hellas_client::model::evaluator(hellas_client::model::GpuDialect::Cuda);
+    let package = hellas_client::model::ModelPackage::open(&path, &evaluator)
+        .await
+        .unwrap();
+    let rules = vec![
+        Match {
+            model: Some(package.model().content_id().unwrap()),
+            ..Default::default()
+        },
+        Match {
+            repos: vec!["org/repo".to_string().try_into().unwrap()],
+            ..Default::default()
+        },
+    ];
+    let resource: ResourceKind = serde_json::from_value(serde_json::json!({
+        "kind": "model", "package": path, "rules": rules,
+    }))
+    .unwrap();
+    let mut document = Document::default();
+    document.backends.insert("gpu".into(), local(&evaluator));
+    document
+        .resources
+        .push(Resource::new("test".into(), "gpu".into(), resource));
+    let configuration = document
+        .configuration_for_test(&[info("gpu", &evaluator)])
+        .await
+        .unwrap();
+    let policy = configuration.resource("test").unwrap();
+    assert_eq!(policy.render_evaluators(), [evaluator.as_str()].into());
+    assert_eq!(
+        policy.invocation_policy.admissions,
+        [Admission::Compute { rules }]
     );
 }

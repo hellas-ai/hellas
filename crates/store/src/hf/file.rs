@@ -8,6 +8,7 @@ pub struct PinnedFile {
     pub repo: Repo,
     pub path: String,
     pub object: ContentRef,
+    downloaded: Option<std::sync::Arc<tempfile::NamedTempFile>>,
 }
 
 /// File metadata at one immutable revision. A single listing covers sharded checkpoints.
@@ -55,24 +56,13 @@ impl PinnedRepo {
 
     /// A weight file whose verified bytes the provider acquires.
     pub fn file(&self, path: &str) -> Result<PinnedFile> {
-        let file = self.entry(path)?;
-        let id = file
-            .xet_hash
-            .as_deref()
-            .and_then(|id| id.parse().ok())
-            .ok_or_else(|| {
-                FetchError::Malformed(format!("{path} has no published Xet identity"))
-            })?;
-        Ok(PinnedFile {
-            repo: self.repo.clone(),
-            path: file.path.clone(),
-            object: ContentRef::new(id, file.size),
-        })
+        PinnedFile::from_entry(&HfCas::new(self.repo.clone()), self.entry(path)?)
     }
 
     /// Bounded metadata, including ordinary Git objects without a Xet identity.
     pub fn metadata(&self, path: &str, limit: u64) -> Result<Vec<u8>> {
-        let size = self.entry(path)?.size;
+        let file = self.entry(path)?;
+        let size = file.size;
         if size > limit {
             return Err(FetchError::Malformed(format!(
                 "{path} exceeds metadata limit"
@@ -90,6 +80,18 @@ impl PinnedRepo {
         if bytes.len() as u64 != size {
             return Err(FetchError::Malformed(format!(
                 "incorrect metadata length for {path}"
+            )));
+        }
+        use sha2::Digest as _;
+        if file
+            .advertised()?
+            .is_some_and(|expected| ContentRef::for_bytes(&bytes) != expected)
+            || file
+                .lfs_sha256()?
+                .is_some_and(|expected| <[u8; 32]>::from(sha2::Sha256::digest(&bytes)) != expected)
+        {
+            return Err(FetchError::Malformed(format!(
+                "incorrect metadata digest for {path}"
             )));
         }
         Ok(bytes)
@@ -115,6 +117,55 @@ impl PinnedRepo {
 }
 
 impl PinnedFile {
+    pub fn new(repo: Repo, path: String, object: ContentRef) -> Self {
+        Self {
+            repo,
+            path,
+            object,
+            downloaded: None,
+        }
+    }
+
+    fn from_entry(cas: &HfCas, file: &RepoFile) -> Result<Self> {
+        if let Some(object) = file.advertised()? {
+            return Ok(Self::new(cas.repo.clone(), file.path.clone(), object));
+        }
+        use sha2::Digest as _;
+        use std::io::Write as _;
+        let io_error = |source| FetchError::Io {
+            context: file.path.clone(),
+            source,
+        };
+        let expected = file.lfs_sha256()?;
+        let mut sha = expected.map(|_| sha2::Sha256::new());
+        let mut saved = tempfile::NamedTempFile::new().map_err(io_error)?;
+        let mut input = cas.small_file(&file.path)?;
+        let indexed = crate::index_stream(&mut input, file.size, |bytes| {
+            if let Some(digest) = &mut sha {
+                digest.update(bytes);
+            }
+            saved.write_all(bytes)
+        })
+        .map_err(io_error)?
+        .ok_or_else(|| FetchError::Malformed(format!("incorrect file length for {}", file.path)))?;
+        if let Some((digest, hash)) = sha.zip(expected)
+            && <[u8; 32]>::from(digest.finalize()) != hash
+        {
+            return Err(FetchError::Malformed(format!(
+                "incorrect LFS SHA-256 for {}",
+                file.path
+            )));
+        }
+        Ok(Self {
+            repo: cas.repo.clone(),
+            path: file.path.clone(),
+            object: ContentRef::new(
+                hellas_rpc::ContentId::from_bytes(indexed.id.into_bytes()),
+                indexed.len,
+            ),
+            downloaded: Some(std::sync::Arc::new(saved)),
+        })
+    }
     pub fn resolve(
         uri: &str,
         extension: &str,
@@ -127,6 +178,22 @@ impl PinnedFile {
     pub fn read_range(&self, range: Range<u64>, out: &mut impl std::io::Write) -> Result<()> {
         if range.is_empty() || range.end > self.object.bytes() {
             return Err(FetchError::Malformed("invalid Hub file range".into()));
+        }
+        if let Some(saved) = &self.downloaded {
+            use std::io::{Seek as _, SeekFrom};
+            return (|| {
+                let mut input = saved.reopen()?;
+                input.seek(SeekFrom::Start(range.start))?;
+                let len = range.end - range.start;
+                if std::io::copy(&mut input.take(len), out)? != len {
+                    return Err(std::io::ErrorKind::UnexpectedEof.into());
+                }
+                Ok(())
+            })()
+            .map_err(|source| FetchError::Io {
+                context: self.path.clone(),
+                source,
+            });
         }
         let mut url =
             HfCas::new(self.repo.clone()).hub_url(false, &["resolve", &self.repo.revision])?;
@@ -185,11 +252,20 @@ impl PinnedFile {
             ContentStore, PinName, PinPolicy, PinTarget, Scope, Source, Target, owner_pin,
         };
         let name = PinName::new(format!("models/{}", self.object.id()))?;
-        if owner_pin(store, &name).await?.is_some_and(|value| {
-            value.target == Target::Object(self.object)
-                && value.policy == PinPolicy::Jobs
-                && value.expires.is_none()
-        }) {
+        if store
+            .core
+            .hub_files(self.object)
+            .await?
+            .iter()
+            .any(|(repo, commit, path)| {
+                repo == &self.repo.id && commit == &self.repo.revision && path == &self.path
+            })
+            && owner_pin(store, &name).await?.is_some_and(|value| {
+                value.target == Target::Object(self.object)
+                    && value.policy == PinPolicy::Jobs
+                    && value.expires.is_none()
+            })
+        {
             return Ok(());
         }
         store
@@ -208,5 +284,64 @@ impl PinnedFile {
             )
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::content::testing::hub;
+    #[test]
+    fn pinned_git_weights_use_verified_download_for_header_ranges() {
+        let metadata = br#"{"tensor":{"dtype":"U8","shape":[4],"data_offsets":[0,4]}}"#;
+        let header_size = metadata.len().next_multiple_of(8);
+        let mut bytes = (header_size as u64).to_le_bytes().to_vec();
+        bytes.extend(metadata);
+        bytes.resize(8 + header_size, b' ');
+        bytes.extend([1, 2, 3, 4]);
+        let path = "shard.safetensors";
+        let sha = "a".repeat(40);
+        let repo = Repo::from_uri(&format!("hf://org/model@{sha}")).unwrap();
+        let oid = "60ef6645a381c2305e5bd66b09ae8a7e82374faaa89c756bf5c54e043e4d05d5";
+        for lfs in [
+            None,
+            Some(serde_json::json!({"oid":oid})),
+            Some(serde_json::json!({"oid":"0".repeat(64)})),
+        ] {
+            let valid = lfs.as_ref().is_none_or(|lfs| lfs["oid"] == oid);
+            let (url, serving) = hub(|_| {
+                vec![(
+                    format!("/org/model/resolve/{sha}/{path}"),
+                    200,
+                    bytes.to_vec(),
+                )]
+            });
+            let cas = HfCas::new(repo.clone()).with_hub(url);
+            let entry = RepoFile {
+                path: path.into(),
+                size: bytes.len() as u64,
+                xet_hash: None,
+                lfs,
+            };
+            let got = PinnedFile::from_entry(&cas, &entry);
+            serving.join().unwrap();
+            if valid {
+                let got = got.unwrap();
+                assert_eq!(got.object, ContentRef::for_bytes(&bytes));
+                let mut header = Vec::new();
+                got.read_range(8..8 + header_size as u64, &mut header)
+                    .unwrap();
+                assert_eq!(&header[..metadata.len()], metadata);
+            } else {
+                assert!(got.is_err());
+            }
+        }
+        let entry = RepoFile {
+            path: path.into(),
+            size: bytes.len() as u64,
+            xet_hash: Some("malformed".into()),
+            lfs: None,
+        };
+        assert!(PinnedFile::from_entry(&HfCas::new(repo), &entry).is_err());
     }
 }

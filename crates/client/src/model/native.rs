@@ -170,11 +170,8 @@ impl Snapshot {
             self.metadata.insert(name.clone(), object);
             std::fs::write(path, &bytes)?;
             if let Origin::Hub(repo) = origin {
-                self.hub_metadata.push(PinnedFile {
-                    repo: repo.repo.clone(),
-                    path: key.to_string(),
-                    object,
-                });
+                self.hub_metadata
+                    .push(PinnedFile::new(repo.repo.clone(), key.to_owned(), object));
             }
             if let Origin::Local(root) = origin {
                 self.local_metadata.push(root.join(key));
@@ -339,7 +336,6 @@ impl Snapshot {
             }
             _ => BTreeMap::new(),
         };
-        let mut hub_files = self.hub_metadata;
         let mut files = BTreeMap::new();
         let mut voice_files = BTreeMap::new();
         for (key, weight) in self.weights {
@@ -348,10 +344,7 @@ impl Snapshot {
                     Some(object) => *object,
                     None => hellas_store::content::file_content(path)?,
                 },
-                Weight::Hub(file) => {
-                    hub_files.push(file.clone());
-                    file.object
-                }
+                Weight::Hub(file) => file.object,
                 Weight::Peer(_, object) => *object,
             };
             let tensors = if key.starts_with("voices/") {
@@ -373,7 +366,6 @@ impl Snapshot {
             );
         }
         Ok(Native {
-            hub_files: hub_files.into(),
             model,
             dir: self.dir,
             files: Arc::new(files),
@@ -443,7 +435,6 @@ pub(crate) struct Tensor {
 type Files = BTreeMap<String, (ContentRef, BTreeMap<String, Tensor>)>;
 #[derive(Clone)]
 pub(crate) struct Native {
-    pub hub_files: Arc<[PinnedFile]>,
     pub model: Model,
     dir: Arc<tempfile::TempDir>,
     files: Arc<Files>,
@@ -565,7 +556,6 @@ impl Native {
         let mut metadata = BTreeMap::new();
         copy(dir, root.path(), root.path(), &mut metadata);
         Self {
-            hub_files: Arc::default(),
             model: Self::model_from_files(&files, &metadata).unwrap(),
             dir: Arc::new(root),
             files: Arc::new(files),

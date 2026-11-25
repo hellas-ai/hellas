@@ -36,7 +36,6 @@ pub(super) struct Gguf {
     pub path: Arc<GgufPath>,
     pub header: Arc<gguf::Header>,
     pub weights: ContentRef,
-    pub hub: Option<PinnedFile>,
 }
 
 impl Gguf {
@@ -52,15 +51,12 @@ impl Gguf {
             path: Arc::new(GgufPath::Header(output, name.to_owned())),
             header: Arc::new(header),
             weights: object,
-            hub: None,
         })
     }
     fn hub(file: &PinnedFile) -> Result<Self> {
-        let mut gguf = Self::remote(Path::new(&file.path), file.object, |range, bytes| {
+        Self::remote(Path::new(&file.path), file.object, |range, bytes| {
             file.read_range(range, bytes).map_err(std::io::Error::other)
-        })?;
-        gguf.hub = Some(file.clone());
-        Ok(gguf)
+        })
     }
 
     fn peer(peer: &PeerModel) -> Result<Self> {
@@ -225,7 +221,6 @@ impl Source {
                     path: Arc::new(GgufPath::Local(path)),
                     header: Arc::new(header),
                     weights,
-                    hub: None,
                 })
             }
             Self::Checkpoint(kind, origin, _) => Resolved::Native(

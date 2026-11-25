@@ -147,13 +147,19 @@ pub(crate) async fn memory(
                 super::tree::validate_path(path, false)?;
             }
             let core = store.clone();
-            let (stages, root) = tokio::task::spawn_blocking(move || {
+            let repo_id = repo.id.clone();
+            let model_repo = repo.kind == crate::hf::RepoKind::Model;
+            let (stages, root, files) = tokio::task::spawn_blocking(move || {
                 let cas = core.hf(repo);
                 hf_stages(&cas, &core, path.as_deref(), expect, true)
             })
             .await
             .map_err(|_| Error::Invalid("HF worker failed"))??;
-            publish(store, scope, stages, root, pin, requester).await
+            let acquisition = publish(store, scope, stages, root, pin, requester).await?;
+            if model_repo {
+                store.record_hub_files(&repo_id, &commit, files).await?;
+            }
+            Ok(acquisition)
         }
     }
 }
@@ -290,22 +296,11 @@ fn hf_file(
     stages: &BTreeMap<ContentId, Staged>,
     expect: Option<ContentRef>,
 ) -> Result<Staged> {
-    let advertised = file
-        .xet_hash
-        .as_ref()
-        .map(|hash| {
-            hash.parse::<ContentId>()
-                .map(|id| ContentRef::new(id, file.size))
-                .map_err(|_| Error::Invalid("Hub Xet hash"))
-        })
-        .transpose()?;
+    let advertised = file.advertised().map_err(hf_error)?;
     if expect.is_some_and(|expect| {
         advertised.is_some_and(|advertised| expect != advertised) || expect.bytes() != file.size
     }) {
         return Err(Error::Invalid("HF expected reference"));
-    }
-    if advertised.is_none() && file.lfs.is_some() {
-        return Err(Error::Invalid("legacy LFS has no canonical Xet identity"));
     }
     let charge = stage_charge(core, stages, file.size)?;
     let mut bytes = Buffer::new(core, file.size, charge)?;
@@ -313,21 +308,27 @@ fn hf_file(
         cas.write_xet(advertised.id().digest(), file.size, &mut bytes, &core.pool)
             .map_err(hf_error)?;
     } else {
+        let sha256 = file.lfs_sha256().map_err(hf_error)?;
         bytes.fill(
             cas.small_file(&file.path).map_err(hf_error)?,
-            None,
+            sha256,
             &core.pool,
         )?;
     }
     finish(bytes, expect.or(advertised))
 }
+type HfStages = (
+    BTreeMap<ContentId, Staged>,
+    Target,
+    BTreeMap<String, ContentRef>,
+);
 fn hf_stages(
     cas: &crate::hf::HfCas,
     core: &Core,
     path: Option<&str>,
     expect: Option<ContentRef>,
     weights: bool,
-) -> Result<(BTreeMap<ContentId, Staged>, Target)> {
+) -> Result<HfStages> {
     let (files, _metadata) = cas.files(&core.pool).map_err(hf_error)?;
     let mut stages = BTreeMap::new();
     if let Some(path) = path {
@@ -338,7 +339,11 @@ fn hf_stages(
         let stage = hf_file(cas, file, core, &stages, expect)?;
         let root = Target::Object(stage.object);
         stages.insert(stage.object.id(), stage);
-        return Ok((stages, root));
+        return Ok((
+            stages,
+            root,
+            BTreeMap::from([(path.to_owned(), root.object())]),
+        ));
     }
     let mut leaves = BTreeMap::new();
     for file in &files {
@@ -358,7 +363,7 @@ fn hf_stages(
             return Err(Error::Invalid("duplicate Hub file"));
         }
     }
-    let root = trees(leaves, core, &mut stages)?;
+    let root = trees(leaves.clone(), core, &mut stages)?;
     if expect.is_some_and(|expect| expect != root) {
         return Err(Error::Invalid("HF tree expectation"));
     }
@@ -377,7 +382,7 @@ fn hf_stages(
             }
         }
     }
-    Ok((stages, Target::Tree(root)))
+    Ok((stages, Target::Tree(root), leaves))
 }
 fn trees(
     leaves: BTreeMap<String, ContentRef>,
@@ -462,7 +467,7 @@ impl Core {
         let core = self.clone();
         let id = repo.id.clone();
         let sha = repo.revision.clone();
-        let (stages, root) = tokio::task::spawn_blocking(move || {
+        let (stages, root, _) = tokio::task::spawn_blocking(move || {
             hf_stages(&core.hf(repo), &core, None, None, false)
         })
         .await

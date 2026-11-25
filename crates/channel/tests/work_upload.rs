@@ -985,3 +985,72 @@ async fn paid_upload_termination_cancels_a_blocked_ack_and_releases_its_ram() {
         .unwrap();
     }
 }
+
+#[tokio::test]
+async fn paid_repo_admission_checks_all_assets_before_acceptance() {
+    for extra in [ExtraAsset::None, ExtraAsset::Local, ExtraAsset::HubOnly] {
+        let directory = tempfile::tempdir().unwrap();
+        let ready = ready_of(&descriptor_with(repo_policy()), CURSOR);
+        let root_dir = directory.path().join("provider");
+        let mut node = content_store(&root_dir).await;
+        let probe = hellas_store::content::testing::AvailableHubFile::new(
+            &mut node,
+            "org/base",
+            "variant.json",
+            EXTRA_BYTES,
+        );
+        let journal =
+            store_at_with_content(&root_dir, &ready, Role::Provider, CURSOR, node.clone()).await;
+        let service =
+            WorkService::new(ProviderEndpoint::new(ready.clone(), journal, provider()).unwrap());
+        let env = repo_model(&node, extra).await;
+        let root = env.canonical_bytes().unwrap();
+        let manifest = env.manifest(&evaluator()).unwrap();
+        let mut input = bundle(1);
+        input.request.execution_environment = manifest.content_id();
+        input = PreparedInvocation::new(
+            input.request,
+            &manifest,
+            input.input,
+            repo_policy().canonical_bytes().unwrap(),
+        )
+        .unwrap();
+        let buyer = LocalStore::Memory(MemoryStore::new(Reservations::ram(16 << 20)));
+        hellas_channel::content::upload_object(&buyer, &root)
+            .await
+            .unwrap();
+        let (_, mut request, bytes) = proposal(
+            &directory.path().join("client"),
+            &ready,
+            input,
+            &(buyer, Scope::Owner),
+        )
+        .await;
+        request.prepared_input =
+            hellas_rpc::protocol::content::encode_reference(ContentRef::for_bytes(&bytes));
+        let frames = frames(&request, manifest.canonical_bytes(), root, &bytes);
+        let connection = Cancellation::new();
+        let opened = upload(&service, frames, &connection).await;
+        if extra != ExtraAsset::None {
+            assert!(opened.is_err());
+            assert!(matches!(
+                service.accept(&request, None).await.outcome,
+                Some(accept_work_response::Outcome::Refused(_))
+            ));
+            assert!(service.accepted_work_ids().await.unwrap().is_empty());
+        } else {
+            opened.unwrap();
+            assert!(matches!(
+                service.accept(&request, None).await.outcome,
+                Some(accept_work_response::Outcome::Accepted(_))
+            ));
+            let ids = service.accepted_work_ids().await.unwrap();
+            assert_eq!(ids.len(), 1);
+            run_to_result(&service, &ready, ids[0]).await;
+        }
+        connection.cancel();
+        claims_released(&service).await;
+        probe.assert_unused().await;
+        shutdown(service, node).await;
+    }
+}

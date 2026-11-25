@@ -308,18 +308,29 @@ impl Runtime {
                     &holder,
                 )?;
                 let trust = self.trust(trust, counters.clone())?;
-                (
-                    crate::home::access_target(
-                        bundle,
-                        *resource,
-                        None,
-                        trust,
-                        self.options.signer.clone(),
-                        &self.options.home,
-                        self.consumer_endpoint().await?,
-                    )?,
-                    evaluator.clone(),
-                )
+                let backend = crate::home::access_target(
+                    bundle,
+                    *resource,
+                    None,
+                    trust,
+                    self.options.signer.clone(),
+                    &self.options.home,
+                    self.consumer_endpoint().await?,
+                )?;
+                let advertised = match &backend.state {
+                    BackendState::Grant(grant) => grant.policy.backend_evaluator.as_ref(),
+                    _ => None,
+                };
+                if let (Some(configured), Some(advertised)) = (evaluator, advertised)
+                    && configured != advertised
+                {
+                    return Err(
+                        "grant backend evaluator differs from the provider's advertised evaluator"
+                            .into(),
+                    );
+                }
+                let evaluator = evaluator.as_ref().or(advertised).cloned();
+                (backend, evaluator)
             }
             BackendKind::Paid {
                 addresses,

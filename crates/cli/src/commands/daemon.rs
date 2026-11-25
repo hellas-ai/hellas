@@ -170,13 +170,8 @@ impl ModelContext {
                 .offers
                 .iter()
                 .flat_map(|offer| &offer.offer().grant.policies)
-                .flat_map(|policy| &policy.invocation_policy.admissions)
-                .filter_map(|admission| match admission {
-                    hellas_rpc::protocol::invocation::Admission::Compute { evaluator, .. } => {
-                        Some(evaluator.clone())
-                    }
-                    _ => None,
-                });
+                .flat_map(|policy| policy.render_evaluators())
+                .map(str::to_owned);
             self.open_many(path, evaluators).await?
         } else {
             Default::default()
@@ -192,15 +187,17 @@ impl ModelContext {
             .flat_map(|offer| &offer.offer().grant.policies)
         {
             if package.is_some() {
-                for (evaluator, programs) in &package_programs {
-                    if programs.iter().all(|manifest| {
-                        policy
-                            .invocation_policy
-                            .admissions_for(manifest)
-                            .next()
-                            .is_some()
+                for evaluator in policy.render_evaluators() {
+                    let Some(programs) = package_programs.get(evaluator) else {
+                        continue;
+                    };
+                    if programs.iter().any(|manifest| {
+                        policy.invocation_policy.admissions.iter().any(|admission| {
+                            admission.evaluate(manifest, None)
+                                != hellas_rpc::protocol::invocation::Decision::Reject
+                        })
                     }) {
-                        matches.push((policy.clone(), Some(evaluator.clone())));
+                        matches.push((policy.clone(), Some(evaluator.to_owned())));
                     }
                 }
             } else if policy

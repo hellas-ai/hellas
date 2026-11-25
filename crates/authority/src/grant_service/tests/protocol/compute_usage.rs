@@ -3,8 +3,22 @@ use crate::test_support::{compute::Compute, ids};
 use hellas_channel::test_support::actors::*;
 
 async fn compute_node(path: &std::path::Path, oversized: bool) -> (TestNode, Proposal) {
+    compute_node_with_policy(
+        path,
+        oversized,
+        hellas_channel::test_support::channel::work_policy(),
+    )
+    .await
+}
+
+async fn compute_node_with_policy(
+    path: &std::path::Path,
+    oversized: bool,
+    policy: hellas_rpc::protocol::invocation::InvocationPolicy,
+) -> (TestNode, Proposal) {
     let compute = Compute;
     let mut allowance = compute.allowance(ids::ALLOWANCE, FRIEND);
+    allowance.definition.policies[0].invocation_policy = policy;
     if oversized {
         allowance.definition.policies[0]
             .invocation_policy
@@ -157,27 +171,7 @@ async fn unseen_grant_program_closure_reaches_only_the_ram_backend_and_never_fil
     let manifest = environment
         .manifest(&hellas_channel::test_support::channel::evaluator())
         .unwrap();
-    let mut invocation_request = proposal.input.request.clone();
-    invocation_request.execution_environment = manifest.content_id();
-    proposal.input = hellas_rpc::protocol::invocation::PreparedInvocation::new(
-        invocation_request,
-        &manifest,
-        proposal.input.input.clone(),
-        proposal.input.application_policy.0.clone(),
-    )
-    .unwrap();
-    proposal.authorization.environment_commitment = manifest.content_id();
-    proposal.authorization.input_content =
-        ContentRef::for_bytes(&proposal.input.canonical_bytes().unwrap());
-    proposal.authorization.prepared_input_digest =
-        hellas_channel::job::bound_prepared_input_digest(
-            network(),
-            proposal.authorization.channel_id.0,
-            &proposal.input,
-        )
-        .unwrap();
-    proposal.authorization.request_commitment = proposal.input.request.commitment().unwrap();
-    proposal.signature = FRIEND.node_key().sign_digest(proposal.work()).unwrap();
+    bind_manifest(&mut proposal, &manifest);
     let prepared = proposal.input.canonical_bytes().unwrap();
     let objects = vec![source, asset, root.clone(), prepared];
     let expected = objects.clone();
@@ -314,4 +308,105 @@ async fn unseen_grant_program_closure_reaches_only_the_ram_backend_and_never_fil
     assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
     assert_eq!(world.used(BudgetNode::Machine, Meter::Requests).await, 1);
     no_closure_payloads_on_disk(directory.path(), &objects);
+}
+
+fn bind_manifest(proposal: &mut Proposal, manifest: &hellas_rpc::ProgramManifest) {
+    let mut invocation_request = proposal.input.request.clone();
+    invocation_request.execution_environment = manifest.content_id();
+    proposal.input = hellas_rpc::protocol::invocation::PreparedInvocation::new(
+        invocation_request,
+        manifest,
+        proposal.input.input.clone(),
+        proposal.input.application_policy.0.clone(),
+    )
+    .unwrap();
+    proposal.authorization.environment_commitment = manifest.content_id();
+    proposal.authorization.input_content =
+        ContentRef::for_bytes(&proposal.input.canonical_bytes().unwrap());
+    proposal.authorization.prepared_input_digest =
+        hellas_channel::job::bound_prepared_input_digest(
+            network(),
+            proposal.authorization.channel_id.0,
+            &proposal.input,
+        )
+        .unwrap();
+    proposal.authorization.request_commitment = proposal.input.request.commitment().unwrap();
+    proposal.signature = FRIEND.node_key().sign_digest(proposal.work()).unwrap();
+}
+
+#[tokio::test]
+async fn grant_repo_admission_checks_all_assets_before_reserving() {
+    use hellas_channel::test_support::channel::{
+        EXTRA_BYTES, ExtraAsset, evaluator, repo_model, repo_policy,
+    };
+    use hellas_rpc::pb::content as pb;
+    for extra in [ExtraAsset::None, ExtraAsset::Local, ExtraAsset::HubOnly] {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut node, mut proposal) =
+            compute_node_with_policy(directory.path(), false, repo_policy()).await;
+        let probe = hellas_store::content::testing::AvailableHubFile::new(
+            &mut node.content,
+            "org/base",
+            "variant.json",
+            EXTRA_BYTES,
+        );
+        let env = repo_model(&node.content, extra).await;
+        let manifest = env.manifest(&evaluator()).unwrap();
+        bind_manifest(&mut proposal, &manifest);
+        let backend = Backend {
+            finish: hellas_channel::test_support::backend::Completion::Immediate,
+            signer: Arc::new(PROVIDER.node_key()),
+            ..Default::default()
+        };
+        let world = node.serve(backend.clone());
+        let work = world.work(FRIEND, ids::FRIEND_GRANT).await;
+        let before = world.snapshot().await;
+        let rows = world.service.node().writer().await.unwrap().journal_len();
+        let mut request = proposal.request();
+        request.prepared_input =
+            hellas_rpc::protocol::content::encode_reference(proposal.authorization.input_content);
+        let frames = hellas_channel::test_support::upload_frames(
+            &request,
+            manifest.canonical_bytes(),
+            env.canonical_bytes().unwrap(),
+            &proposal.input.canonical_bytes().unwrap(),
+            |opening| {
+                FRIEND
+                    .node_key()
+                    .sign_digest(hellas_channel::job::opening_digest(opening, &[7; 32]))
+                    .unwrap()
+                    .bytes()
+                    .to_vec()
+            },
+        );
+        let (connection, stream) = (
+            hellas_channel::work::admission::Cancellation::new(),
+            futures::stream::iter(frames.into_iter().map(Ok::<pb::UploadRequest, _>)),
+        );
+        let opened = hellas_channel::test_support::drive_upload(
+            work.upload_stream(Box::pin(stream), context(), connection.clone())
+                .await,
+        )
+        .await;
+        assert_eq!(opened.is_ok(), extra == ExtraAsset::None, "{opened:?}");
+        assert_eq!(world.snapshot().await, before);
+        assert_eq!(
+            world.service.node().writer().await.unwrap().journal_len(),
+            rows
+        );
+        if extra != ExtraAsset::None {
+            assert!(matches!(
+                work.accept(&request).await.outcome,
+                Some(hellas_rpc::pb::work::accept_work_response::Outcome::Refused(_))
+            ));
+            assert_eq!(world.used(BudgetNode::Machine, Meter::Requests).await, 0);
+            assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        } else {
+            assert_eq!(accepted_id(work.accept(&request).await), proposal.work());
+            within(world.service.drain()).await.unwrap();
+            assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        }
+        probe.assert_unused().await;
+        connection.cancel();
+    }
 }

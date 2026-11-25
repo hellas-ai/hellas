@@ -127,10 +127,15 @@ async fn image_job_bundles_three_stages_and_passes_state_in_slots() {
     let manifest = job.environment.manifest(evaluator).unwrap();
     let admission =
         hellas_rpc::protocol::invocation::Admission::compute_only(&programs, &[]).unwrap();
-    assert!(admission.admits_manifest(&manifest));
+    assert!(
+        admission.evaluate(&manifest, None) == hellas_rpc::protocol::invocation::Decision::Accept
+    );
     let mut unrelated = job.environment.clone();
     unrelated.sources = vec![ContentRef::for_bytes(b"unrelated source")];
-    assert!(!admission.admits_manifest(&unrelated.manifest(evaluator).unwrap()));
+    assert!(
+        admission.evaluate(&unrelated.manifest(evaluator).unwrap(), None)
+            == hellas_rpc::protocol::invocation::Decision::Reject
+    );
 
     for asset in &job.environment.model.assets {
         let bytes = hellas_channel::content::read(

@@ -111,7 +111,7 @@ impl InvocationPolicy {
     ) -> Result<Vec<ContentRef>, CanonicalDecodeError> {
         self.classify_manifest(manifest)?;
         if self
-            .admissions_for(manifest)
+            .candidates_for(manifest)
             .any(|admission| matches!(admission, Admission::Fetch { .. }))
         {
             if !program_root.is_empty() {
@@ -164,7 +164,7 @@ impl InvocationPolicy {
         manifest: &ProgramManifest,
     ) -> Result<AdmissionFacts, CanonicalDecodeError> {
         self.validate()?;
-        self.facts(self.admissions_for(manifest))
+        self.facts(self.candidates_for(manifest))
     }
     fn facts<'a>(
         &self,
@@ -198,7 +198,7 @@ impl InvocationPolicy {
         }
         let mut admitted = Vec::new();
         let mut last = None;
-        for admission in self.admissions_for(prepared.manifest()) {
+        for admission in self.candidates_for(prepared.manifest()) {
             let facts = AdmissionFacts::for_admission(admission, self.limits)?;
             let result = if encoded.len() > facts.max_encoded_prepared_input as usize {
                 Err(error("invocation input exceeds its admitted bound"))

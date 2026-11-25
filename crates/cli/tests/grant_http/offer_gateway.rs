@@ -888,10 +888,9 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
     let mut policy = http_invocation_policy();
     policy
         .admissions
-        .push(hellas_rpc::protocol::invocation::Admission::Compute {
-            evaluator: hellas_channel::test_support::channel::evaluator(),
-            programs: hellas_rpc::protocol::invocation::ComputePrograms::Any {},
-        });
+        .push(hellas_rpc::protocol::invocation::Admission::evaluator(
+            hellas_channel::test_support::channel::evaluator(),
+        ));
     let mut host = OfferHost::start_with_policy(None, None, None, policy).await;
     let root_path = host.root().to_path_buf();
     let root = root_path.as_path();

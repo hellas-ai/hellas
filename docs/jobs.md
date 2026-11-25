@@ -59,11 +59,18 @@ A pinned Hub GGUF works with `text`, `decide`, `program` and the gateway. Give t
 hellas text --model hf://LiquidAI/LFM3-1.7B-GGUF@cd0c74c575b5c416f3011b5b4c298077f26ca8c2/LFM3-1.7B-BF16.gguf --prompt 'What is the capital of France?' --local
 ```
 
-For remote jobs the client reads only the header. The provider can pre-acquire the file, or configure its content allow-list with the same repository, revision, file path, content ID and size. For example:
+With a published Xet ID, the remote buyer reads only the header. For a Git or LFS weight file without a published Xet ID, the buyer streams the pinned file once to compute its canonical content ID and reads headers from that download. The provider can pre-acquire the file, or configure its content allow-list with the same repository, revision, file path, content ID and size. For example:
 
 ```sh
 hellas store acquire hf://LiquidAI/LFM3-1.7B-GGUF@cd0c74c575b5c416f3011b5b4c298077f26ca8c2 --path LFM3-1.7B-BF16.gguf --expect a4896de517cae418383c2fd9954bc5ac33d8112b810c7895fb3feb70dca622dc --bytes 3466626336 --pin models/lfm3 --policy jobs
 ```
+
+A grant or paid policy constrained to Hub repositories requires a provider acquisition
+receipt for every model asset, including tokenizer, configuration, and voice files.
+Activate the exact Hub checkpoint or acquire the selected files before serving that
+policy. The buyer can use local files, a Hub revision, or a model ID. Admission checks
+the provider's durable receipts by content ID and size and works with the Hub offline.
+An on-miss allow-list can fetch approved missing content after the policy check.
 
 The provider checks the published Xet hash against the canonical content ID. It rejects files published with legacy Xet chunking. With `--local`, the local executor acquires the weights into its own content store.
 

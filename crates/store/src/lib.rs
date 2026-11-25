@@ -47,6 +47,14 @@ thread_local! {
 /// being read; importantly, a writer that grows forever cannot extend this
 /// loop forever.
 fn hash_exact_length(reader: &mut impl io::Read, expected_len: u64) -> io::Result<Option<Indexed>> {
+    index_stream(reader, expected_len, |_| Ok(()))
+}
+
+fn index_stream(
+    reader: &mut impl io::Read,
+    expected_len: u64,
+    mut observe: impl FnMut(&[u8]) -> io::Result<()>,
+) -> io::Result<Option<Indexed>> {
     #[cfg(test)]
     HASH_CALLS.with(|calls| calls.set(calls.get() + 1));
     let mut hasher = XetFileHasher::new();
@@ -61,6 +69,7 @@ fn hash_exact_length(reader: &mut impl io::Read, expected_len: u64) -> io::Resul
         }
         remaining -= read as u64;
         hasher.update(&buffer[..read]);
+        observe(&buffer[..read])?;
     }
 
     let mut sentinel = [0_u8; 1];
