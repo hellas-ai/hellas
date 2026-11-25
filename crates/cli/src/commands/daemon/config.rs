@@ -207,7 +207,7 @@ mod tests {
     async fn compilation_preserves_selection_and_matches_foreground_defaults() {
         let root = tempfile::tempdir().unwrap();
         let key = root.path().join("key");
-        std::fs::write(&key, "runtime-secret").unwrap();
+        hellas_private::write_secret_file(&key, ".key", b"runtime-secret").unwrap();
         let context = super::super::tests::model_context(root.path());
         let shorthand = format!("remote=https://example.com/v1,key-file={}", key.display());
         let flags = Config::gateway(

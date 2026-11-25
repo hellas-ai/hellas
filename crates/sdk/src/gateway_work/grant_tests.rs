@@ -956,9 +956,9 @@ async fn remote_jobs_end_before_the_session_that_delivers_them() {
         panic!("one finished job")
     };
     let a = terminal.outcome.authorization;
-    // Signed 30 s before its acceptance deadline; one 5 s idle period is kept
-    // for the terminal state before the 15 min session ends.
-    let span = a.terminal_deadline_ms.0 - (a.acceptance_deadline_ms.0 - 30_000);
+    // The five-second control timeout bounds admission, and one further
+    // control timeout is kept for delivery before the session ends.
+    let span = a.terminal_deadline_ms.0 - (a.acceptance_deadline_ms.0 - 5_000);
     let carried = hellas_auth::authority::MAX_SESSION_LIFETIME_MS - 5_000;
     assert!(
         span <= carried && span > carried - 1_000,

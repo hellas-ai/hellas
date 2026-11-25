@@ -1195,7 +1195,11 @@ impl GrantSession {
             input_content: prepared.reference,
             prepared_input_digest,
             proposal_nonce: self.store.next_nonce()?,
-            acceptance_deadline_ms: UnixMillis(now.0 + (span / 2).min(30_000)),
+            // Allow admission (including verified asset staging) as long as the
+            // control request itself can wait, leaving time for execution.
+            acceptance_deadline_ms: UnixMillis(
+                now.0 + (span / 2).min(u64::try_from(grace.as_millis()).unwrap_or(u64::MAX)),
+            ),
             request_commitment,
             environment_commitment: input.request.execution_environment,
             terminal_deadline_ms: UnixMillis(terminal),

@@ -164,6 +164,26 @@ pub fn is_private(file: &File) -> io::Result<bool> {
     imp::is_private(file)
 }
 
+/// Check the opened descriptor before handling key or credential bytes.
+pub fn require_secret_file(file: &File, destination: &Path) -> io::Result<()> {
+    if is_private(file)? {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "{} must be a private file owned by this user (0600 on Unix); use a separate secrets path on storage that enforces permissions (serve --secrets-dir DIR)",
+            destination.display()
+        ),
+    ))
+}
+
+pub fn read_secret_file(path: &Path, maximum: usize) -> io::Result<zeroize::Zeroizing<Vec<u8>>> {
+    let file = open_regular_file(path)?;
+    require_secret_file(&file, path)?;
+    regular::read_zeroizing_bounded(file, maximum)
+}
+
 /// Makes an existing directory private to this user: mode 0700 on Unix; on
 /// Windows an owner-only, protected DACL that files and directories created
 /// inside it inherit.
@@ -265,11 +285,20 @@ pub fn write_atomically(path: &Path, suffix: &str, bytes: &[u8]) -> io::Result<(
     Durability::Power.write_atomically(path, suffix, bytes)
 }
 
+/// Verify permissions on the empty temporary file before writing a secret.
+pub fn write_secret_file(path: &Path, suffix: &str, bytes: &[u8]) -> io::Result<()> {
+    Durability::Power.replace(path, suffix, bytes, true)
+}
+
 impl Durability {
     pub fn write_atomically(self, path: &Path, suffix: &str, bytes: &[u8]) -> io::Result<()> {
+        self.replace(path, suffix, bytes, false)
+    }
+
+    fn replace(self, path: &Path, suffix: &str, bytes: &[u8], secret: bool) -> io::Result<()> {
         let parent = path
             .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
+            .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
         let name = path.file_name().ok_or_else(|| {
             io::Error::new(
@@ -279,6 +308,9 @@ impl Durability {
         })?;
         let mut temporary =
             private_tempfile(parent, &format!(".{}.", name.to_string_lossy()), suffix)?;
+        if secret {
+            require_secret_file(temporary.as_file(), path)?;
+        }
         temporary.write_all(bytes)?;
         self.sync_file(temporary.as_file())?;
         // Close first, keeping the TempPath as the guard that removes the file if

@@ -66,7 +66,7 @@ RunPod's template `cmd` replaces the default command, so include the subcommand
 and all desired arguments:
 
 ```json
-["serve", "--port", "31145", "--home", "/var/lib/hellas/.hellas"]
+["serve", "--port", "31145", "--home", "/var/lib/hellas/.hellas", "--secrets-dir", "/var/lib/hellas-secrets"]
 ```
 
 For an RTX 5090, the [RunPod v2 template](examples/runpod-rtx5090-template.json)
@@ -86,13 +86,21 @@ hellas route add hf://unsloth/whisper-tiny@34457cb234c8624f23ac716000773b367000d
 Routes create bounded resources; allowances and contacts stay
 on the existing `share` and `pair` commands. A template does not download models
 or create allowances. See [sharing](../README.md#2-share-your-gpu).
-The state filesystem must preserve private files owned by the daemon user
-(mode `0600` on Unix). If startup reports `file must be private`, inspect the
-reported path's owner and permissions on the actual mounted filesystem; do not
-relax the check or advertise the worker as ready. RunPod's volume disk can be
-[network-backed](https://github.com/runpod/runpod-plugins-official/blob/main/plugins/runpod/skills/runpod-usage/reference/storage.md),
-so verify its semantics rather than assuming it behaves like the container disk.
-Keep the identity and journal together on persistent storage across restarts.
+The template keeps model assets and content pins in `/var/lib/hellas/.hellas/content`
+on the persistent volume. `--secrets-dir` places the device identity, credentials,
+authority journal (which can contain upstream credentials), and local control
+socket together on the container disk. Without this option, both locations use
+the existing home layout. Use the secrets directory as `--home` for local
+administration of a split worker.
+
+Some network volumes ignore `chmod`. Hellas checks the actual permissions before
+writing or reading a key or credential; an ordinary lock file only needs to
+support exclusive locking.
+
+A pod rebuild loses the container disk and its key. Re-pair using the new invite,
+reapply the provider configuration, and issue fresh grants. The retained model
+files are available when the same persistent storage is attached. Settle channels
+and retain any required authority records before rebuilding.
 
 Keep the owner's principal key on the client. An unowned worker's invite expires
 15 minutes after startup; obtain it promptly through the authenticated console.

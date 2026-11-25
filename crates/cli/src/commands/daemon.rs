@@ -15,6 +15,18 @@ use std::{
 mod config;
 
 #[derive(clap::Args)]
+pub struct ServeArgs {
+    /// Keep keys and identity-bound authority state in DIR. Models stay under --home/content.
+    #[arg(long, value_name = "DIR")]
+    pub secrets_dir: Option<PathBuf>,
+    /// Reconcile a TOML daemon configuration and optional owner-approved paid terms.
+    #[arg(long = "config", conflicts_with = "port")]
+    config_file: Option<PathBuf>,
+    #[arg(long)]
+    port: Option<u16>,
+}
+
+#[derive(clap::Args)]
 pub struct GatewayArgs {
     /// TOML routing and listener configuration.
     #[arg(long, conflicts_with_all = ["models", "upstreams", "bind","voices"])]
@@ -402,8 +414,8 @@ fn key(path: &Path) -> Result<String> {
     } else {
         path.to_owned()
     };
-    let value = String::from_utf8(hellas_private::read_bounded_regular_file(&path, 16 * 1024)?)?;
-    let value = value.trim();
+    let value = hellas_private::read_secret_file(&path, 16 * 1024)?;
+    let value = std::str::from_utf8(&value)?.trim();
     ensure!(
         !value.is_empty() && !value.contains(['\r', '\n']),
         "key file must contain one nonempty line"
@@ -633,6 +645,7 @@ where
 
 async fn options(
     home: StoreLocation,
+    content_dir: StoreLocation,
     identity: &hellas_sdk::identity::LocalIdentity,
     owner: Option<&hellas_kernel::SoftPasskey>,
     profile: &hellas_chain::genesis::ChainProfile,
@@ -641,7 +654,7 @@ async fn options(
 ) -> Result<hellas_sdk::daemon::Options> {
     let settlement = hellas_sdk::identity::settlement_signer(identity)?;
     let content = hellas_store::content::DiskStore::open(
-        home.child("content"),
+        content_dir,
         vec![],
         hellas_store::content::IndexMode::Resume,
         None,
@@ -726,7 +739,16 @@ pub async fn gateway(
     let (node, access) =
         super::admin::gateway_authority(&home.child(temporary.path()), identity, &ephemeral)
             .await?;
-    let options = options(home.clone(), identity, owner, chain, node.clone(), None).await?;
+    let options = options(
+        home.clone(),
+        home.child("content"),
+        identity,
+        owner,
+        chain,
+        node.clone(),
+        None,
+    )
+    .await?;
     context.content = Some(options.content.clone());
     run_daemon(
         options,
@@ -745,7 +767,7 @@ pub async fn gateway(
                 .get(&listener)
                 .context("gateway HTTP listener is unavailable")?;
             if let Some(path) = args.bearer_file {
-                hellas_private::write_atomically(&path, ".bearer", access.bearer().as_bytes())?;
+                hellas_private::write_secret_file(&path, ".bearer", access.bearer().as_bytes())?;
             }
             // The address goes to stderr once; the bearer goes only to the
             // controlling terminal, never to a redirected stderr or log.
@@ -791,10 +813,13 @@ pub async fn serve(
     identity: &hellas_sdk::identity::LocalIdentity,
     owner: Option<&hellas_kernel::SoftPasskey>,
     chain: &hellas_chain::genesis::ChainProfile,
-    port: Option<u16>,
-    config_file: Option<PathBuf>,
+    args: ServeArgs,
+    content_dir: StoreLocation,
     #[cfg(feature = "otel")] metrics: Option<(std::net::SocketAddr, crate::metrics::MetricsBundle)>,
 ) -> Result<()> {
+    let ServeArgs {
+        port, config_file, ..
+    } = args;
     let declarative = config_file.is_some();
     let desired = if let Some(path) = config_file {
         let state = config::Config::load(&path)?;
@@ -833,7 +858,16 @@ pub async fn serve(
         store,
         Arc::new(|| hellas_auth::authority::UnixMillis::now().unwrap_or_default()),
     );
-    let mut options = options(home.clone(), identity, owner, chain, node, endpoint).await?;
+    let mut options = options(
+        home.clone(),
+        content_dir,
+        identity,
+        owner,
+        chain,
+        node,
+        endpoint,
+    )
+    .await?;
     options.remote_control = hellas_sdk::node_control::RemoteControlAdmission::credential_gated();
     run_daemon(
         options,
@@ -1351,7 +1385,7 @@ mod tests {
     async fn upstream_edits_share_one_document_with_bounded_resources_and_write_only_keys() {
         let directory = tempfile::tempdir().unwrap();
         let key_file = directory.path().join("key");
-        std::fs::write(&key_file, "test-secret\n").unwrap();
+        hellas_private::write_secret_file(&key_file, ".key", b"test-secret\n").unwrap();
         let context = model_context(directory.path());
         let mut document = Document::default();
         document.listeners.insert(

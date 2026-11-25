@@ -113,11 +113,8 @@ enum Commands {
     Admin(commands::admin::AdminArgs),
     /// Run the stateful daemon, with live edits or declarative desired state.
     Serve {
-        /// Reconcile a TOML daemon configuration and optional owner-approved paid terms.
-        #[arg(long = "config", conflicts_with = "port")]
-        config_file: Option<std::path::PathBuf>,
-        #[arg(long)]
-        port: Option<u16>,
+        #[command(flatten)]
+        args: commands::daemon::ServeArgs,
         #[cfg(feature = "otel")]
         #[arg(long)]
         metrics_port: Option<u16>,
@@ -330,6 +327,13 @@ async fn dispatch(
     if let Commands::Trust(args) = cli.command {
         return commands::trust::run(args);
     }
+    let content_dir = home.child("content");
+    let home = match &cli.command {
+        Commands::Serve { args, .. } if let Some(dir) = &args.secrets_dir => {
+            StoreLocation::from_home(&std::path::absolute(dir)?, home.durability())
+        }
+        _ => home,
+    };
     let owner = cli.owner.load(&home).and_then(|owner| match owner {
         None if acts_for_principal(&cli.command) => {
             hellas_sdk::identity::principal(&home).map(Some)
@@ -428,16 +432,14 @@ async fn dispatch(
             commands::store::run(args, &home, Some(&local_identity), passkey).await
         }
 
-        Commands::Serve {
-            port, config_file, ..
-        } => {
+        Commands::Serve { args, .. } => {
             commands::daemon::serve(
                 &home,
                 &local_identity,
                 owner.as_ref(),
                 &selected_chain,
-                port,
-                config_file,
+                args,
+                content_dir,
                 #[cfg(feature = "otel")]
                 metrics,
             )

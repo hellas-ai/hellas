@@ -87,7 +87,7 @@ fn prepare_tls(home: &StoreLocation) -> Result<()> {
     hellas_private::create_dir_all_durable(&root)?;
     let tls = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
     hellas_private::write_atomically(&root.child("control.cert.der"), ".writing", tls.cert.der())?;
-    hellas_private::write_atomically(
+    hellas_private::write_secret_file(
         &root.child("control.key.der"),
         ".writing",
         &tls.signing_key.serialize_der(),
@@ -114,8 +114,8 @@ impl Startup {
             );
             return Ok(None);
         }
-        let bytes = hellas_private::read_private_bounded(
-            hellas_private::open_regular_file(&home.join("provider/startup.json"))?,
+        let bytes = hellas_private::read_bounded_regular_file(
+            &home.join("provider/startup.json"),
             64 * 1024,
         )?;
         serde_json::from_slice(&bytes).context("incompatible or invalid local startup metadata; no automatic migration/reset is supported")

@@ -1102,3 +1102,19 @@ async fn previous_home_format_is_rejected_before_journal_replay_or_rotation() {
         assert_eq!(std::fs::read(marker_path).unwrap(), previous);
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn public_startup_lock_still_excludes_other_writers() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = tempfile::tempdir().unwrap();
+    let authority = StoreLocation::for_test(root.path()).child("authority");
+    let path = root.path().join(".authority.startup.lock");
+    std::fs::write(&path, []).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+    let held = StartupLock::acquire(&authority).unwrap();
+    assert!(StartupLock::acquire(&authority).is_err());
+    drop(held);
+    assert!(StartupLock::acquire(&authority).is_ok());
+}

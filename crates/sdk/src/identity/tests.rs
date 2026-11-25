@@ -51,7 +51,7 @@ fn creates_and_reloads_one_identity() {
 fn rejects_old_key_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("identity");
-    fs::write(&path, [0; 32]).unwrap();
+    hellas_private::write_secret_file(&path, ".key", &[0; 32]).unwrap();
     assert!(
         load_existing(&path)
             .err()
@@ -65,7 +65,7 @@ fn rejects_old_key_file() {
 fn rejects_v2_json_identity() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("identity");
-    fs::write(&path, br#"{"version":2}"#).unwrap();
+    hellas_private::write_secret_file(&path, ".key", br#"{"version":2}"#).unwrap();
     assert!(
         load_existing(&path)
             .err()
@@ -145,4 +145,27 @@ fn concurrent_creation_converges() {
         .map(|handle| handle.join().unwrap())
         .collect();
     assert!(keys.iter().all(|key| key == &keys[0]));
+}
+
+#[cfg(unix)]
+#[test]
+fn refuses_readable_device_and_principal_keys_with_storage_guidance() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let device = dir.path().join("identity");
+    load_or_create(&device).unwrap();
+    principal(dir.path()).unwrap();
+    for path in [&device, &dir.path().join(PRINCIPAL_KEY)] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+        let error = if path == &device {
+            load_or_create(path).err().unwrap()
+        } else {
+            principal(dir.path()).err().unwrap()
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(path.to_str().unwrap()) && message.contains("--secrets-dir"),
+            "{message}"
+        );
+    }
 }

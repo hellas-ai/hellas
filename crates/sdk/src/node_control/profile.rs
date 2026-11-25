@@ -52,16 +52,14 @@ impl ClientProfile {
     pub fn remote_node(
         path: &Path,
     ) -> io::Result<Option<(iroh::EndpointId, Vec<std::net::SocketAddr>)>> {
-        let profile: ProfileFile = serde_json::from_slice(&read_private(path)?)
-            .map_err(|_| invalid("invalid control profile"))?;
+        let profile = read_profile(path)?;
         Ok(profile
             .remote_node
             .map(|node| (node, profile.remote_addresses)))
     }
 
     pub fn load(path: &Path) -> io::Result<Self> {
-        let profile: ProfileFile = serde_json::from_slice(&read_private(path)?)
-            .map_err(|_| invalid("invalid control profile"))?;
+        let profile = read_profile(path)?;
         Self::from_file(path, profile)
     }
 
@@ -78,14 +76,21 @@ impl ClientProfile {
     }
 }
 
+fn read_profile(path: &Path) -> io::Result<ProfileFile> {
+    serde_json::from_slice(&hellas_private::read_bounded_regular_file(
+        path,
+        MAX_FILE as usize,
+    )?)
+    .map_err(|_| invalid("invalid control profile"))
+}
+
 /// Retain the independently trusted pairing target beside its new credential.
 pub fn pin_remote(
     path: &Path,
     node: iroh::EndpointId,
     addresses: &[std::net::SocketAddr],
 ) -> io::Result<()> {
-    let mut profile: ProfileFile = serde_json::from_slice(&read_private(path)?)
-        .map_err(|_| invalid("invalid control profile"))?;
+    let mut profile = read_profile(path)?;
     if profile.local.is_some() || profile.remote_node.is_some_and(|existing| existing != node) {
         return Err(invalid("profile already pins a different server"));
     }
@@ -100,8 +105,10 @@ pub fn pin_remote(
 
 impl LocalTrust {
     fn load(self, parent: &Path) -> io::Result<(Arc<ClientConfig>, ServerName<'static>)> {
-        let certificate =
-            CertificateDer::from(read_private(&parent.join(self.certificate))?.to_vec());
+        let certificate = CertificateDer::from(hellas_private::read_bounded_regular_file(
+            &parent.join(self.certificate),
+            MAX_FILE as usize,
+        )?);
         local_trust(certificate, self.server_name)
     }
 }
@@ -130,7 +137,10 @@ pub fn local_trust(
 
 /// Load a provisioned DER certificate and PKCS#8 key from private files.
 pub fn server_identity(certificate: &Path, key: &Path) -> io::Result<Arc<ServerConfig>> {
-    let certificate = CertificateDer::from(read_private(certificate)?.to_vec());
+    let certificate = CertificateDer::from(hellas_private::read_bounded_regular_file(
+        certificate,
+        MAX_FILE as usize,
+    )?);
     let mut key = read_private(key)?;
     server_tls(
         certificate,
@@ -155,8 +165,7 @@ pub fn server_tls(
 }
 
 fn read_private(path: &Path) -> io::Result<Zeroizing<Vec<u8>>> {
-    hellas_private::open_regular_file(path)
-        .and_then(|file| hellas_private::read_private_bounded(file, MAX_FILE as usize))
+    hellas_private::read_secret_file(path, MAX_FILE as usize)
         .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))
 }
 
@@ -192,7 +201,7 @@ fn credential_bytes(credential: &CredentialSecret) -> Zeroizing<Vec<u8>> {
 
 /// Replace the operator-selected canonical credential after an explicit rebind.
 pub fn replace_credential(path: &Path, credential: &CredentialSecret) -> io::Result<()> {
-    hellas_private::write_atomically(path, ".credential", &credential_bytes(credential))
+    hellas_private::write_secret_file(path, ".credential", &credential_bytes(credential))
 }
 
 /// Write profile metadata referring to the one canonical credential file.
@@ -223,14 +232,12 @@ pub fn write_local(
 
 /// Durably publish secret-bearing bytes through a private temporary file
 /// beside `path`. An existing file is never replaced.
-pub fn publish_private(
-    mut file: tempfile::NamedTempFile,
-    path: &Path,
-    bytes: &[u8],
-) -> io::Result<()> {
-    if !hellas_private::is_private(file.as_file())? {
-        return Err(invalid("secret output must be private"));
-    }
+pub fn publish_private(file: tempfile::NamedTempFile, path: &Path, bytes: &[u8]) -> io::Result<()> {
+    hellas_private::require_secret_file(file.as_file(), path)?;
+    publish_new(file, path, bytes)
+}
+
+fn publish_new(mut file: tempfile::NamedTempFile, path: &Path, bytes: &[u8]) -> io::Result<()> {
     file.write_all(bytes)?;
     file.as_file().sync_all()?;
     file.persist_noclobber(path).map_err(|e| e.error)?;
@@ -265,7 +272,7 @@ pub fn install_remote(
     })
     .map_err(io::Error::other)?;
     let path = directory.join("profile.json");
-    publish_private(temporary()?, &path, &profile)?;
+    publish_new(temporary()?, &path, &profile)?;
     Ok(path)
 }
 
@@ -284,6 +291,25 @@ fn invalid(message: &'static str) -> io::Error {
 #[cfg(test)]
 mod pin_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_bytes_never_reach_an_insecure_staging_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let staging = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
+        let observed = staging.as_file().try_clone().unwrap();
+        observed
+            .set_permissions(std::fs::Permissions::from_mode(0o666))
+            .unwrap();
+        let destination = directory.path().join("credential");
+        let error = publish_private(staging, &destination, b"secret").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains(destination.to_str().unwrap()));
+        assert!(error.to_string().contains("--secrets-dir"));
+        assert_eq!(observed.metadata().unwrap().len(), 0);
+        assert!(!destination.exists());
+    }
 
     #[test]
     fn pairing_pin_is_retained_and_cannot_be_silently_replaced() {

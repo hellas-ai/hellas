@@ -9,7 +9,6 @@ use hellas_rpc::{
 };
 use hellas_rpc::{PlatformEnrollment, ProviderEnrollmentBundle};
 use iroh::SecretKey;
-use std::fs;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -51,7 +50,7 @@ impl PlatformRoot {
 }
 
 pub fn load_or_create(path: &Path) -> anyhow::Result<LocalIdentity> {
-    match fs::read(path) {
+    match hellas_private::read_secret_file(path, 64 * 1024) {
         Ok(bytes) => decode(path, &bytes),
         Err(error) if error.kind() == ErrorKind::NotFound => create(path),
         Err(error) => {
@@ -70,7 +69,7 @@ pub fn settlement_signer(
 }
 
 pub fn load_existing(path: &Path) -> anyhow::Result<LocalIdentity> {
-    let bytes = fs::read(path)
+    let bytes = hellas_private::read_secret_file(path, 64 * 1024)
         .with_context(|| format!("failed to read identity file {}", path.display()))?;
     decode(path, &bytes)
 }
@@ -286,6 +285,7 @@ fn persist(path: &Path, stored: &StoredIdentity) -> anyhow::Result<bool> {
         .with_context(|| format!("failed to create identity directory {}", dir.display()))?;
     let mut temp = hellas_private::private_tempfile(dir, ".identity-", ".tmp")
         .with_context(|| format!("failed to create temporary identity in {}", dir.display()))?;
+    hellas_private::require_secret_file(temp.as_file(), path)?;
     temp.write_all(&stored.canonical_bytes())?;
     temp.flush()?;
     temp.as_file().sync_all()?;
@@ -318,6 +318,7 @@ pub fn principal(home: &Path) -> anyhow::Result<SoftPasskey> {
             }
         };
         let mut file = hellas_private::private_tempfile(home, ".principal-", ".new")?;
+        hellas_private::require_secret_file(file.as_file(), &path)?;
         file.write_all(&secret)?;
         file.as_file().sync_all()?;
         // A concurrent first use created it; both use the one that won.
@@ -333,19 +334,20 @@ pub fn load_principal(path: &Path) -> anyhow::Result<SoftPasskey> {
         .map_err(|_| anyhow::anyhow!("P-256 key file contains an invalid secret scalar"))
 }
 pub fn read_scalar(path: &Path) -> anyhow::Result<[u8; 32]> {
-    let bytes =
-        fs::read(path).with_context(|| format!("failed to read key file {}", path.display()))?;
+    let bytes = hellas_private::read_secret_file(path, 64 * 1024)
+        .with_context(|| format!("failed to read key file {}", path.display()))?;
     let trimmed = bytes.trim_ascii();
-    let material = if trimmed.len() == 2 * 32 && trimmed.iter().all(u8::is_ascii_hexdigit) {
-        hex::decode(trimmed).with_context(|| format!("invalid hex key file {}", path.display()))?
-    } else {
-        bytes
-    };
-    let actual = material.len();
-    material.try_into().map_err(|_| {
+    if trimmed.len() == 64 && trimmed.iter().all(u8::is_ascii_hexdigit) {
+        let mut key = [0; 32];
+        hex::decode_to_slice(trimmed, &mut key)
+            .with_context(|| format!("invalid hex key file {}", path.display()))?;
+        return Ok(key);
+    }
+    bytes.as_slice().try_into().map_err(|_| {
         anyhow::anyhow!(
-            "key file {} must contain 32 raw bytes or 64 hex digits, got {actual} bytes",
-            path.display()
+            "key file {} must contain 32 raw bytes or 64 hex digits, got {} bytes",
+            path.display(),
+            bytes.len()
         )
     })
 }

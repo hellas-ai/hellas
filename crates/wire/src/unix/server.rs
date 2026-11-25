@@ -72,7 +72,7 @@ impl LocalControlServer {
             .custom_flags(libc::O_NOFOLLOW)
             .open(PathBuf::from(lock_name))?;
         let lock_meta = lock.metadata()?;
-        if !lock_meta.is_file() || lock_meta.uid() != uid || lock_meta.mode() & 0o077 != 0 {
+        if !lock_meta.is_file() || lock_meta.uid() != uid {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "invalid control socket lock",
