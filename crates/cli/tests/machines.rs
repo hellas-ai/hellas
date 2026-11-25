@@ -21,9 +21,16 @@ async fn exercise(from_environment: bool) {
         serde_json::from_str(include_str!("../../../docs/machine-provider.json")).unwrap();
     let image = format!("registry/hellas@sha256:{}", "a".repeat(64));
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let base = format!("http://{}/v1", listener.local_addr().unwrap());
+    let base = format!("http://{}/v2", listener.local_addr().unwrap());
     let configuration = &mut documented["config"];
-    if !from_environment {
+    let cloud = if from_environment {
+        "COMMUNITY"
+    } else {
+        "SECURE"
+    };
+    if from_environment {
+        configuration["cloud"] = json!(cloud);
+    } else {
         configuration["base_url"] = json!(base);
     }
     let template = configuration["template"].as_str().unwrap().to_owned();
@@ -44,14 +51,13 @@ async fn exercise(from_environment: bool) {
             "name": "fixture",
             "image": image,
             "accelerator": "test accelerator",
-            "accelerator_count": 1,
-            "interruptible": false
+            "accelerator_count": 1
         })
         .to_string(),
     )
     .unwrap();
     let server = std::thread::spawn(move || {
-        let pod = json!({"id":"machine1","name":"fixture","desiredStatus":"RUNNING", "image":image,"templateId":template,"env":{"secret":"must-not-appear"}});
+        let pod = json!({"id":"machine1","name":"fixture","status":"RUNNING", "image":image,"template":null,"cloud":cloud,"gpu":{"id":"test accelerator","count":1},"disk":20,"mounts":{"persistent":{"path":"/var/lib/hellas","size":10}},"env":{"secret":"must-not-appear"}});
         for step in 0..5 {
             let (mut stream, _) = listener.accept().unwrap();
             stream
@@ -81,42 +87,36 @@ async fn exercise(from_environment: bool) {
             stream.read_exact(&mut body).unwrap();
             let response = match step {
                 0 => {
-                    assert!(headers.starts_with(&format!("GET /v1/templates/{template} ")));
+                    assert!(headers.starts_with(&format!("GET /v2/templates/{template} ")));
                     json!({
                         "id": template,
-                        "imageName": image,
-                        "volumeMountPath": "/var/lib/hellas",
-                        "containerDiskInGb": 20,
-                        "volumeInGb": 10
+                        "image": image, "serverless":false,
+                        "disk":20,"mounts":pod["mounts"]
                     })
                 }
                 1 => {
-                    assert!(headers.starts_with("POST /v1/pods "));
+                    assert!(headers.starts_with("POST /v2/pods "));
                     let body: Value = serde_json::from_slice(&body).unwrap();
                     assert_eq!(
                         body,
                         json!({
                             "name": "fixture",
                             "templateId": template,
-                            "computeType": "GPU",
-                            "cloudType": "SECURE",
-                            "gpuTypeIds": ["test accelerator"],
-                            "gpuCount": 1,
-                            "interruptible": false
+                            "cloud":cloud,"gpu":{"id":"test accelerator","count":1}
                         })
                     );
                     json!({"id": "machine1"})
                 }
                 2 => {
-                    assert!(headers.starts_with("GET /v1/pods/machine1 "));
+                    assert!(headers.starts_with("GET /v2/pods/machine1 "));
                     pod.clone()
                 }
                 3 => {
-                    assert!(headers.starts_with("GET /v1/pods "));
-                    json!([pod])
+                    assert!(headers.starts_with("GET /v2/pods "));
+                    json!({"pods":[pod],"pagination":{"hasNextPage":false}})
                 }
                 _ => {
-                    assert!(headers.starts_with("DELETE /v1/pods/machine1 "));
+                    assert!(headers.starts_with("DELETE /v2/pods/machine1 "));
                     Value::Null
                 }
             }

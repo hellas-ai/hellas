@@ -9,8 +9,9 @@ The provider selector and provider-specific configuration are illustrated in
 The RunPod template must use the same digest-pinned image requested by the
 machine spec, mount persistent data at `/var/lib/hellas`, and provide nonzero
 container and volume disks. Templates are provider configuration; the generic
-machine spec contains only `name`, `image`, `accelerator`, `accelerator_count`
-and `interruptible`.
+machine spec contains only `name`, `image`, `accelerator` and
+`accelerator_count`; RunPod v2 allocates on-demand pods. The default hosting tier is
+`SECURE`. Set `config.cloud` to `COMMUNITY` to request that tier explicitly.
 
 The credential-source file uses the shared HTTP credential source format, for
 example `{"secret_file":"/private/accounts/provider.json","secret_field":"token"}`.
@@ -61,12 +62,20 @@ Updating a tag or template does not upgrade an already running Pod. Review the
 new release's state compatibility before replacing a persistent worker.
 
 Preserve the image's Docker entrypoint, including CUDA driver-library setup.
-RunPod's `dockerStartCmd` replaces the default command, so include the subcommand
+RunPod's template `cmd` replaces the default command, so include the subcommand
 and all desired arguments:
 
 ```json
 ["serve", "--port", "31145", "--home", "/var/lib/hellas/.hellas"]
 ```
+
+For an RTX 5090, the [RunPod v2 template](examples/runpod-rtx5090-template.json)
+also sets `NVCC_APPEND_FLAGS=--generate-code=arch=compute_120,code=sm_120`
+and a fresh `CATENA_GPU_CACHE_DIR`. Replace its image placeholder with the
+published CUDA manifest digest. The RTX 5090 loads the native SM 120 kernel
+even when the host driver cannot compile the image toolkit’s newer PTX.
+Choose the appropriate compute capability for other GPUs. Change the native
+cache directory when changing compiler targets so cached binaries are rebuilt.
 
 Pair the invite and add a pinned model from the editing CLI. The provider acquires and verifies the original weights. A local checkpoint directory on the persistent volume also works when the editing CLI can read it.
 
@@ -98,8 +107,7 @@ write a machine spec (replace the digest and accelerator with your selection):
   "name": "hellas-demo",
   "image": "ghcr.io/hellas-ai/hellas@sha256:CUDA_MANIFEST_DIGEST",
   "accelerator": "NVIDIA L4",
-  "accelerator_count": 1,
-  "interruptible": false
+  "accelerator_count": 1
 }
 ```
 
@@ -138,7 +146,7 @@ native limit is 2,560 bytes. Oversize values fail rather than being split or
 written elsewhere. Linux stores base64 internally to preserve arbitrary bytes
 with Secret Service implementations that accept only UTF-8.
 
-The RunPod API endpoint defaults to `https://rest.runpod.io/v1`. Set
+The RunPod API endpoint defaults to `https://api.runpod.io/v2`. Set
 `config.base_url` in the provider configuration or `RUNPOD_BASE_URL` in the
 process environment to use another HTTP(S) endpoint, including its API path
 prefix. An explicit configuration value takes precedence over the environment.

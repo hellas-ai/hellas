@@ -11,11 +11,22 @@ pub(crate) fn open(credential: HttpSecretConfig, config: Config) -> Result<Box<d
     Ok(Box::new(RunPod::new(credential, config)?))
 }
 
+/// RunPod's hosting tier for on-demand allocation.
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum Cloud {
+    #[default]
+    Secure,
+    Community,
+}
+
 /// RunPod settings; the generic machine request contains no template metadata.
 #[derive(Clone, Debug, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub template: Option<String>,
+    #[serde(default)]
+    pub cloud: Cloud,
     /// API endpoint; overrides RUNPOD_BASE_URL when specified.
     pub base_url: Option<String>,
 }
@@ -35,7 +46,7 @@ impl Config {
             .base_url
             .as_deref()
             .or(environment.as_deref())
-            .unwrap_or("https://rest.runpod.io/v1");
+            .unwrap_or("https://api.runpod.io/v2");
         let url = reqwest::Url::parse(base).map_err(|_| Error::Invalid("RunPod base URL"))?;
         if !matches!(url.scheme(), "http" | "https")
             || url.host_str().is_none()
@@ -77,7 +88,6 @@ impl RunPod {
     }
 
     async fn request(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {
-        let allocation = method == Method::POST && path == "/pods";
         let token = self
             .credential
             .resolve()
@@ -93,28 +103,7 @@ impl RunPod {
         // Never retry allocation: a lost response can hide a billable machine.
         let mut response = request.send().await.map_err(Error::Request)?;
         if !response.status().is_success() {
-            let status = response.status();
-            // RunPod reports exhausted capacity as HTTP 500. Recognize only its
-            // exact public message; arbitrary error bodies can contain secrets.
-            if allocation && status == reqwest::StatusCode::INTERNAL_SERVER_ERROR {
-                let mut bytes = Vec::new();
-                while let Some(chunk) = response.chunk().await.map_err(Error::Request)? {
-                    if bytes.len().saturating_add(chunk.len()) > 4096 {
-                        return Err(Error::HttpStatus(status));
-                    }
-                    bytes.extend_from_slice(&chunk);
-                }
-                if serde_json::from_slice::<Value>(&bytes)
-                    .ok()
-                    .is_some_and(|body| {
-                        body["error"].as_str()
-                            == Some("create pod: There are no instances currently available")
-                    })
-                {
-                    return Err(Error::CapacityUnavailable);
-                }
-            }
-            return Err(Error::HttpStatus(status));
+            return Err(Error::HttpStatus(response.status()));
         }
         let mut bytes = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(Error::Request)? {
@@ -144,7 +133,7 @@ impl Provider for RunPod {
             .request(Method::GET, &format!("/templates/{template_id}"), None)
             .await?;
         validate_template(request, template_id, &template)?;
-        // Preserve template attribution and its persistent storage settings.
+        // The API expands the template into the pod configuration.
         // No transport secret, owner, bootstrap token, or environment is supplied.
         let created = self
             .request(
@@ -152,9 +141,8 @@ impl Provider for RunPod {
                 "/pods",
                 Some(json!({
                     "name": request.name, "templateId": template_id,
-                    "computeType": "GPU", "cloudType": "SECURE",
-                    "gpuTypeIds": [request.accelerator], "gpuCount": request.accelerator_count,
-                    "interruptible": request.interruptible
+                    "cloud": self.config.cloud,
+                    "gpu": {"id": request.accelerator, "count": request.accelerator_count}
                 })),
             )
             .await
@@ -179,12 +167,18 @@ impl Provider for RunPod {
                 reason: "could not read allocated machine",
             })?;
         if live["id"].as_str() != Some(&id)
-            || live["templateId"].as_str() != Some(template_id)
-            || image(&live) != Some(&request.image)
+            || live["name"] != request.name
+            || live["cloud"] != json!(self.config.cloud)
+            || live["gpu"]["id"] != request.accelerator
+            || live["gpu"]["count"] != request.accelerator_count
+            || ["image", "disk", "cmd", "entrypoint", "ports"]
+                .iter()
+                .any(|&key| live[key] != template[key])
+            || live["mounts"]["persistent"] != template["mounts"]["persistent"]
         {
             return Err(Error::Allocated {
                 id,
-                reason: "template attribution or pinned image changed",
+                reason: "allocated hardware or effective template settings changed",
             });
         }
         machine(&live).map_err(|_| Error::Allocated {
@@ -194,13 +188,23 @@ impl Provider for RunPod {
     }
 
     async fn list(&self) -> Result<Vec<Machine>> {
-        let value = self.request(Method::GET, "/pods", None).await?;
-        value
-            .as_array()
-            .ok_or(Error::Response)?
-            .iter()
-            .map(machine)
-            .collect()
+        let mut machines = Vec::new();
+        let mut path = String::from("/pods");
+        loop {
+            let page = self.request(Method::GET, &path, None).await?;
+            for pod in page["pods"].as_array().ok_or(Error::Response)? {
+                machines.push(machine(pod)?);
+            }
+            let pagination = &page["pagination"];
+            if !pagination["hasNextPage"].as_bool().ok_or(Error::Response)? {
+                return Ok(machines);
+            }
+            let cursor = field(pagination, "nextCursor")?;
+            let mut url =
+                reqwest::Url::parse(&self.base).map_err(|_| Error::Invalid("RunPod base URL"))?;
+            url.query_pairs_mut().append_pair("cursor", cursor);
+            path = format!("/pods?{}", url.query().ok_or(Error::Response)?);
+        }
     }
 
     async fn destroy(&self, id: &str) -> Result<()> {
@@ -218,21 +222,23 @@ fn field<'a>(value: &'a Value, name: &str) -> Result<&'a str> {
         .ok_or(Error::Response)
 }
 
-fn image(value: &Value) -> Option<&str> {
-    value["image"]
-        .as_str()
-        .or_else(|| value["imageName"].as_str())
-}
-
 fn machine(value: &Value) -> Result<Machine> {
     let id = field(value, "id")?;
     validate_id(id)?;
     Ok(Machine {
         id: id.into(),
         name: field(value, "name")?.into(),
-        status: field(value, "desiredStatus")?.into(),
-        image: image(value).ok_or(Error::Response)?.into(),
-        public_ip: value["publicIp"].as_str().map(str::to_owned),
+        status: field(value, "status")?.into(),
+        image: field(value, "image")?.into(),
+        public_ip: value["runtime"]["ports"]
+            .as_array()
+            .and_then(|ports| {
+                ports
+                    .iter()
+                    .filter(|port| port["public"].is_u64())
+                    .find_map(|port| port["ip"].as_str())
+            })
+            .map(str::to_owned),
         console_url: Some("https://console.runpod.io/pods".into()),
     })
 }
@@ -240,7 +246,9 @@ fn machine(value: &Value) -> Result<Machine> {
 fn validate_id(id: &str) -> Result<()> {
     if id.is_empty()
         || id.len() > 128
-        || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
     {
         return Err(Error::Invalid("resource ID"));
     }
@@ -273,13 +281,13 @@ fn validate_request(request: &CreateMachine) -> Result<()> {
 
 fn validate_template(request: &CreateMachine, template_id: &str, template: &Value) -> Result<()> {
     if template["id"].as_str() != Some(template_id)
-        || template["imageName"].as_str() != Some(&request.image)
-        || template["isServerless"] == true
-        || template["volumeMountPath"] != "/var/lib/hellas"
-        || !template["containerDiskInGb"]
+        || template["image"].as_str() != Some(&request.image)
+        || template["serverless"] != false
+        || template["mounts"]["persistent"]["path"] != "/var/lib/hellas"
+        || !template["disk"].as_u64().is_some_and(|v| v > 0)
+        || !template["mounts"]["persistent"]["size"]
             .as_u64()
             .is_some_and(|v| v > 0)
-        || !template["volumeInGb"].as_u64().is_some_and(|v| v > 0)
     {
         return Err(Error::Invalid(
             "template must retain the pinned image and persistent Hellas data volume",
@@ -300,25 +308,25 @@ mod tests {
             image: format!("registry/hellas@sha256:{}", "a".repeat(64)),
             accelerator: "NVIDIA L4".into(),
             accelerator_count: 1,
-            interruptible: false,
         }
     }
 
     fn template() -> Value {
-        json!({"id":"template", "imageName":spec().image, "isServerless":false,
-            "volumeMountPath":"/var/lib/hellas", "containerDiskInGb":20, "volumeInGb":5})
+        json!({"id":"template", "image":spec().image, "serverless":false,
+            "mounts":{"persistent":{"path":"/var/lib/hellas","size":5}}, "disk":20})
     }
 
     fn pod() -> Value {
-        json!({"id":"pod1", "name":"worker", "desiredStatus":"RUNNING",
-            "image":spec().image, "templateId":"template", "publicIp":"192.0.2.1",
+        json!({"id":"pod1", "name":"worker", "status":"RUNNING","cloud":"SECURE","gpu":{"id":"NVIDIA L4","count":1},
+            "image":spec().image, "template":null, "disk":20,"mounts":template()["mounts"],
             "env":{"SECRET":"never-project-this"}})
     }
 
     fn config() -> Config {
         Config {
             template: Some("template".into()),
-            base_url: Some("https://rest.runpod.io/v1".into()),
+            base_url: Some("https://api.runpod.io/v2".into()),
+            ..Config::default()
         }
     }
 
@@ -412,7 +420,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
-            for step in 0..5 {
+            for step in 0..6 {
                 let (mut socket, _) = listener.accept().unwrap();
                 let (headers, body) = receive(&mut socket);
                 assert!(headers.to_lowercase().contains(if step < 3 {
@@ -429,7 +437,7 @@ mod tests {
                         assert!(headers.starts_with("POST /pods "));
                         assert_eq!(
                             body,
-                            json!({"name":"worker","templateId":"template","computeType":"GPU", "cloudType":"SECURE", "gpuTypeIds":["NVIDIA L4"],"gpuCount":1,"interruptible":false})
+                            json!({"name":"worker","templateId":"template","cloud":"SECURE", "gpu":{"id":"NVIDIA L4","count":1}})
                         );
                         json!({"id":"pod1"})
                     }
@@ -439,7 +447,11 @@ mod tests {
                     }
                     3 => {
                         assert!(headers.starts_with("GET /pods "));
-                        json!([pod()])
+                        json!({"pods":[], "pagination":{"hasNextPage":true, "nextCursor":"a+b/c"}})
+                    }
+                    4 => {
+                        assert!(headers.starts_with("GET /pods?cursor=a%2Bb%2Fc "));
+                        json!({"pods":[pod()], "pagination":{"hasNextPage":false}})
                     }
                     _ => {
                         assert!(headers.starts_with("DELETE /pods/pod1 "));
@@ -474,11 +486,17 @@ mod tests {
     fn template_image_storage_and_identifiers_are_enforced_before_allocation() {
         for (field, value) in [
             ("id", json!("different")),
-            ("imageName", json!("registry/image:latest")),
-            ("volumeMountPath", json!("/workspace")),
-            ("volumeInGb", json!(0)),
-            ("containerDiskInGb", json!(0)),
-            ("isServerless", json!(true)),
+            ("image", json!("registry/image:latest")),
+            (
+                "mounts",
+                json!({"persistent":{"path":"/workspace","size":2}}),
+            ),
+            (
+                "mounts",
+                json!({"persistent":{"path":"/var/lib/hellas","size":0}}),
+            ),
+            ("disk", json!(0)),
+            ("serverless", json!(true)),
         ] {
             let mut invalid = template();
             invalid[field] = value;
@@ -508,7 +526,7 @@ mod tests {
                     1 => json!({"id":"pod1"}),
                     _ => {
                         let mut value = pod();
-                        value["templateId"] = json!("changed");
+                        value["mounts"]["persistent"]["path"] = json!("/changed");
                         value
                     }
                 };
@@ -530,43 +548,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exhausted_capacity_is_actionable_without_exposing_other_error_bodies() {
+    async fn bad_request_retains_reconciliation_advice_without_exposing_provider_detail() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("credential.json");
         hellas_private::write_atomically(&path, ".tmp", br#"{"token":"key"}"#).unwrap();
-        for (body, capacity) in [
-            (json!({"error":"create pod: There are no instances currently available", "status":500, "detail":"private-detail"}).to_string(), true),
-            (json!({"error":"private-detail"}).to_string(), false),
-            ("private-detail".repeat(400), false),
-        ] {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let address = listener.local_addr().unwrap();
-            let server = std::thread::spawn(move || {
-                let (mut socket, _) = listener.accept().unwrap();
-                let (headers, _) = receive(&mut socket);
-                assert!(headers.starts_with("GET /templates/template "));
-                respond(&mut socket, "200 OK", &template().to_string());
-                let (mut socket, _) = listener.accept().unwrap();
-                let (headers, _) = receive(&mut socket);
-                assert!(headers.starts_with("POST /pods "));
-                respond(&mut socket, "500 Internal Server Error", &body);
-            });
-            let provider = RunPod::new(source(&path), Config {
+        let body = r#"{"detail":"private-detail"}"#;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let (headers, _) = receive(&mut socket);
+            assert!(headers.starts_with("GET /templates/template "));
+            respond(&mut socket, "200 OK", &template().to_string());
+            let (mut socket, _) = listener.accept().unwrap();
+            let (headers, _) = receive(&mut socket);
+            assert!(headers.starts_with("POST /pods "));
+            respond(&mut socket, "400 Bad Request", body);
+        });
+        let provider = RunPod::new(
+            source(&path),
+            Config {
                 base_url: Some(format!("http://{address}")),
                 ..config()
-            }).unwrap();
-            let error = provider.create(&spec()).await.unwrap_err();
-            assert!(!error.to_string().contains("private-detail"));
-            let Error::CreationUnconfirmed { name, source } = error else {
-                panic!("allocation failure must retain reconciliation advice")
-            };
-            assert_eq!(name, "worker");
-            assert_eq!(matches!(*source, Error::CapacityUnavailable), capacity);
-            if !capacity {
-                assert!(matches!(*source, Error::HttpStatus(reqwest::StatusCode::INTERNAL_SERVER_ERROR)));
-            }
-            server.join().unwrap();
-        }
+            },
+        )
+        .unwrap();
+        let error = provider.create(&spec()).await.unwrap_err();
+        assert!(!error.to_string().contains("private-detail"));
+        let Error::CreationUnconfirmed { name, source } = error else {
+            panic!("allocation failure must retain reconciliation advice")
+        };
+        assert_eq!(name, "worker");
+        assert!(matches!(
+            *source,
+            Error::HttpStatus(reqwest::StatusCode::BAD_REQUEST)
+        ));
+        server.join().unwrap();
     }
 
     #[tokio::test]

@@ -136,6 +136,12 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1")]
         metrics_addr: std::net::IpAddr,
     },
+    /// Replace a paired node's daemon configuration from a TOML file.
+    Configure {
+        #[command(flatten)]
+        control: commands::daemon::ControlArgs,
+        config: PathBuf,
+    },
     Backend {
         #[command(flatten)]
         control: commands::daemon::ControlArgs,
@@ -446,6 +452,16 @@ async fn dispatch(
                 &selected_chain,
                 #[cfg(feature = "otel")]
                 metrics,
+            )
+            .await
+        }
+        Commands::Configure { control, config } => {
+            commands::admin::daemon(
+                control,
+                Some(commands::daemon::Edit::Configure(config)),
+                &local_identity,
+                passkey,
+                &home,
             )
             .await
         }

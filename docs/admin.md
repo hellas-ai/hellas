@@ -189,6 +189,12 @@ declare `pure_setup_entries` when it pins a program or model. The signed
 resource advertises its registered evaluator so a client can render a program
 for a grant whose rules leave that field open.
 
+An owner can replace the paired node's daemon configuration with
+`hellas configure --profile PROFILE daemon.toml`. Supply the complete document,
+including the work listener. The command uses the same TOML as `serve --config`
+and submits it against the observed daemon revision. Set paid policy through
+`admin work`, which requires its own authority.
+
 Each Fetch admission in a resource's `invocation_policy` carries a required
 `contract` descriptor. The descriptor selects a compiled request/result
 schema and commits the adapter, driver and egress terms. For example, the current

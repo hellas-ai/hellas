@@ -78,6 +78,7 @@ pub enum RouteCommand {
 }
 
 pub enum Edit {
+    Configure(PathBuf),
     Backend(BackendCommand),
     Route(RouteCommand),
 }
@@ -419,6 +420,14 @@ fn expand_upstream(document: &mut Document, name: &str, url: &str, key_file: &Pa
 
 pub async fn apply(document: &mut Document, edit: Edit, context: &ModelContext) -> Result<()> {
     match edit {
+        Edit::Configure(path) => {
+            let config = config::Config::load(&path)?;
+            ensure!(
+                config.paid_policy.is_none(),
+                "set paid policy with admin work"
+            );
+            *document = config.resolve(context).await?.0;
+        }
         Edit::Backend(BackendCommand::Add {
             name,
             url,
@@ -954,6 +963,28 @@ mod tests {
             )
             .unwrap(),
         }
+    }
+
+    #[tokio::test]
+    async fn configuring_from_toml_replaces_the_previous_document() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("daemon.toml");
+        std::fs::write(
+            &path,
+            "[listeners.api]\nkind = 'http'\nbind = '127.0.0.1:8888'\n",
+        )?;
+        let mut document = Document::default();
+        document
+            .listeners
+            .insert("previous".into(), Listener::http("127.0.0.1:8889".parse()?));
+        apply(
+            &mut document,
+            Edit::Configure(path),
+            &model_context(root.path()),
+        )
+        .await?;
+        assert_eq!(document.listeners.keys().collect::<Vec<_>>(), ["api"]);
+        Ok(())
     }
 
     #[test]
