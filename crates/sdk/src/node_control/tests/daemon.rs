@@ -730,7 +730,7 @@ async fn unrelated_configure_keeps_the_local_backend_instance() {
         let f = fixture().await;
         let document: Document = serde_json::from_value(serde_json::json!({
             "listeners": {}, "routes": [],
-            "backends": {"local": {"kind": "local", "evaluator": hellas_executor::catena::evaluator(hellas_executor::GpuDialect::Hip), "max_in_flight": 2}}
+            "backends": {"local": {"kind": "local", "evaluator": hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip, "gfx1151"), "max_in_flight": 2}}
         }))
         .unwrap();
         let core = Core::open(options(&f), document.clone()).await.unwrap();
@@ -844,7 +844,8 @@ async fn resources_require_a_backend_allowed_by_the_iroh_listener() {
 #[tokio::test]
 async fn local_backends_register_by_evaluator_id() {
     let f = fixture().await;
-    let evaluator = hellas_executor::catena::evaluator(hellas_executor::GpuDialect::Hip);
+    let evaluator =
+        hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip, "gfx1151");
     let document: Document = serde_json::from_value(serde_json::json!({
         "listeners": {},
         "backends": {"local": {"kind": "local", "evaluator": evaluator, "max_in_flight": 2}}
@@ -862,7 +863,7 @@ async fn local_backends_register_by_evaluator_id() {
 fn model_document(path: std::path::PathBuf) -> Document {
     serde_json::from_value(serde_json::json!({
         "listeners": {"api": {"kind": "http", "bind": "127.0.0.1:0", "zdr": true}},
-        "backends": {"local": {"kind": "local", "evaluator": hellas_executor::catena::evaluator(hellas_executor::GpuDialect::Hip), "max_in_flight": 2}},
+        "backends": {"local": {"kind": "local", "evaluator": hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip, "gfx1151"), "max_in_flight": 2}},
         "routes": [{"backends": ["local"], "kind": "model", "model": "tiny", "package": path, "modality": "text", "max_tokens": 1}]
     })).unwrap()
 }

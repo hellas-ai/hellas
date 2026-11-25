@@ -55,21 +55,22 @@ mod tests {
     async fn image_cli_prepares_a_saved_job_with_provider_held_weights() {
         let model = Path::new(env!("CARGO_MANIFEST_DIR")).join("../client/src/model/flux/fixture");
         let root = tempfile::tempdir().unwrap();
-        let rendered =
-            hellas_client::model::flux::fixture(&model, hellas_client::model::GpuDialect::Hip)
-                .unwrap()
-                .render_job(&ModelRequest::Image(ImageRequest {
-                    prompt: "a red fox",
-                    seed: 42,
-                    width: 16,
-                    height: 16,
-                    steps: 1,
-                }))
-                .await
-                .unwrap();
+        let evaluator =
+            hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip, "gfx1151");
+        let rendered = hellas_client::model::flux::fixture(&model, &evaluator)
+            .unwrap()
+            .render_job(&ModelRequest::Image(ImageRequest {
+                prompt: "a red fox",
+                seed: 42,
+                width: 16,
+                height: 16,
+                steps: 1,
+            }))
+            .await
+            .unwrap();
         let job = Job::compute(
             20,
-            hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip),
+            evaluator,
             rendered.environment,
             rendered.plan,
             rendered.inputs,

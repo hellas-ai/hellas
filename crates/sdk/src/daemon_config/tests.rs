@@ -136,10 +136,6 @@ fn iroh_duplicate_keys_use_resolved_evaluator_ids() {
     document
         .validate_resolved(&[info("first", "opaque/one"), info("second", "opaque/two")])
         .unwrap();
-    assert_eq!(
-        document.validate_resolved(&[]),
-        Err("local backend has no registered evaluator")
-    );
 }
 
 #[test]
@@ -295,7 +291,8 @@ async fn model_and_operator_inputs_keep_their_terms_in_one_configuration() {
             backends: vec!["models".into(), "operator".into(), "gpu".into()],
         },
     );
-    let evaluator = hellas_client::model::evaluator(hellas_client::model::GpuDialect::Cuda);
+    let evaluator =
+        hellas_client::model::evaluator(hellas_client::model::GpuDialect::Cuda, "sm_120");
     let configuration = document
         .configuration_for_test(&[info("gpu", &evaluator)])
         .await
@@ -566,7 +563,8 @@ async fn explicit_model_rules_preserve_their_shape_and_advertise_the_backend_ren
     use hellas_rpc::protocol::invocation::{Admission, Match};
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../client/src/model/package/mini-qwen3.gguf");
-    let evaluator = hellas_client::model::evaluator(hellas_client::model::GpuDialect::Cuda);
+    let evaluator =
+        hellas_client::model::evaluator(hellas_client::model::GpuDialect::Cuda, "sm_120");
     let package = hellas_client::model::ModelPackage::open(&path, &evaluator)
         .await
         .unwrap();

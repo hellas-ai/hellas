@@ -1153,8 +1153,9 @@ mod tests {
         let mut context = model_context(root.path());
         context.content = Some(store.clone());
         let before = read_bytes();
-        let hip = hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip);
-        let cuda = hellas_client::model::evaluator(hellas_client::model::GpuDialect::Cuda);
+        let hip = hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip, "gfx1151");
+        let cuda =
+            hellas_client::model::evaluator(hellas_client::model::GpuDialect::Cuda, "sm_120");
         let packages = ModelSpec::from(path.clone())
             .open_many([hip.clone(), hip, cuda], context.content.as_ref())
             .await
@@ -1196,7 +1197,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let evaluator = hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip);
+        let evaluator =
+            hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip, "gfx1151");
         let packages = ModelSpec::from(path)
             .open_many([evaluator.clone()], Some(&store))
             .await
@@ -1295,19 +1297,9 @@ mod tests {
         assert!(document.routes.is_empty());
     }
 
-    #[cfg(feature = "compute")]
     #[test]
-    fn local_commands_accept_registered_evaluator_ids() {
+    fn the_command_line_is_well_formed() {
         use clap::CommandFactory;
-        let evaluator = hellas_executor::catena::evaluator(hellas_executor::GpuDialect::Hip);
-        let command = clap::Command::new("test");
-        use clap::Args;
-        let matches = crate::compute::GpuArgs::augment_args(command).try_get_matches_from([
-            "test",
-            "--evaluator",
-            &evaluator,
-        ]);
-        assert!(matches.is_ok(), "{matches:?}");
         crate::Cli::command().debug_assert();
     }
 

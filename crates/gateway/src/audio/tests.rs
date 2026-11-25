@@ -26,6 +26,7 @@ impl WorkExecutionBackend for Fake {
         crate::test_support::backend({
             Some(hellas_client::model::evaluator(
                 hellas_client::model::GpuDialect::Hip,
+                "gfx1151",
             ))
         })
     }

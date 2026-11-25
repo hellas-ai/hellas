@@ -43,6 +43,7 @@ async fn authenticated_prefixes_arrive_before_the_paid_terminal() {
             crate::test_support::backend({
                 Some(hellas_client::model::evaluator(
                     hellas_client::model::GpuDialect::Hip,
+                    "gfx1151",
                 ))
             })
         }
@@ -137,6 +138,7 @@ async fn paid_capacity_is_a_retryable_error() {
             crate::test_support::backend({
                 Some(hellas_client::model::evaluator(
                     hellas_client::model::GpuDialect::Hip,
+                    "gfx1151",
                 ))
             })
         }
@@ -186,6 +188,7 @@ impl WorkExecutionBackend for Accepting {
         crate::test_support::backend({
             Some(hellas_client::model::evaluator(
                 hellas_client::model::GpuDialect::Hip,
+                "gfx1151",
             ))
         })
     }
@@ -372,6 +375,7 @@ impl WorkExecutionBackend for Capturing {
         crate::test_support::backend({
             Some(hellas_client::model::evaluator(
                 hellas_client::model::GpuDialect::Hip,
+                "gfx1151",
             ))
         })
     }

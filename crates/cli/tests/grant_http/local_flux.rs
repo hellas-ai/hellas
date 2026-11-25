@@ -75,7 +75,7 @@ async fn local_gateway_flux_matches_reference_image_without_a_chain() {
     };
     let package = hellas_client::model::ModelPackage::open(
         &model,
-        &hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip),
+        &hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip, "gfx1151"),
     )
     .await
     .unwrap();

@@ -257,7 +257,7 @@ async fn model_job_restart_inner(provider_held: bool) {
 
     let package = ModelPackage::open(
         &fixture,
-        &hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip),
+        &hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip, "gfx1151"),
     )
     .await
     .expect("the miniature Qwen model opens");

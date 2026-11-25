@@ -1,7 +1,7 @@
 use catena_lang::{codegen::GpuDialect, runtime::MemOwn};
 use libloading::Library;
 use std::{
-    ffi::{c_int, c_void},
+    ffi::{CStr, c_int, c_void},
     path::PathBuf,
     sync::OnceLock,
 };
@@ -40,6 +40,61 @@ fn runtime(dialect: GpuDialect) -> Result<&'static Library> {
         }
     }
     Err(format!("cannot load {dialect:?} runtime").into())
+}
+
+/// The architecture of the runtime's current device, as its compiler names
+/// it: `sm_120` or `gfx1151`.
+pub fn architecture(dialect: GpuDialect) -> Result<String> {
+    type Status = c_int;
+    let lib = runtime(dialect)?;
+    let check = |status: Status| match status {
+        0 => Ok(()),
+        status => Err(format!("GPU device query failed with status {status}")),
+    };
+    let get_device: &[u8] = match dialect {
+        GpuDialect::Hip => b"hipGetDevice\0",
+        GpuDialect::Cuda => b"cudaGetDevice\0",
+    };
+    let get_device = unsafe { lib.get::<unsafe extern "C" fn(*mut c_int) -> Status>(get_device)? };
+    let mut device = 0;
+    check(unsafe { get_device(&mut device) })?;
+    match dialect {
+        GpuDialect::Cuda => {
+            let attribute = unsafe {
+                lib.get::<unsafe extern "C" fn(*mut c_int, c_int, c_int) -> Status>(
+                    b"cudaDeviceGetAttribute\0",
+                )?
+            };
+            // cudaDevAttrComputeCapabilityMajor and cudaDevAttrComputeCapabilityMinor.
+            let (mut major, mut minor) = (0, 0);
+            check(unsafe { attribute(&mut major, 75, device) })?;
+            check(unsafe { attribute(&mut minor, 76, device) })?;
+            Ok(format!("sm_{major}{minor}"))
+        }
+        GpuDialect::Hip => {
+            // The ABI-frozen hipDeviceProp_tR0600: 1472 bytes, `gcnArchName` at 1160.
+            #[repr(C, align(8))]
+            struct Properties {
+                _head: [u8; 1160],
+                arch: [u8; 256],
+                _tail: [u8; 56],
+            }
+            let properties = unsafe {
+                lib.get::<unsafe extern "C" fn(*mut Properties, c_int) -> Status>(
+                    b"hipGetDevicePropertiesR0600\0",
+                )?
+            };
+            let mut device_properties = Properties {
+                _head: [0; 1160],
+                arch: [0; 256],
+                _tail: [0; 56],
+            };
+            check(unsafe { properties(&mut device_properties, device) })?;
+            // `gfx90a:sramecc+:xnack-` names the target, then its features.
+            let name = CStr::from_bytes_until_nul(&device_properties.arch)?.to_str()?;
+            Ok(name.split(':').next().unwrap_or_default().to_owned())
+        }
+    }
 }
 
 /// Upstream exposes typed reads only; declared byte buffers can have odd lengths.

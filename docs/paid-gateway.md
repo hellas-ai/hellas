@@ -84,7 +84,7 @@ and [NixOS settings](nix.md).
 ```sh
 hellas faucet
 hellas transcribe --model hf://unsloth/whisper-tiny@34457cb234c8624f23ac716000773b367000df6e --audio speech.wav --pay 20 --provider ENROLLMENT_ID@NODE_ID \
-  --backend hellas/catena-dfad87438018-hip
+  --backend hellas/catena-dfad87438018-hip-gfx1151
 hellas transact --settle --provider ENROLLMENT_ID@NODE_ID
 ```
 

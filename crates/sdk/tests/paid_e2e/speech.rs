@@ -75,6 +75,7 @@ impl hellas_gateway::WorkExecutionBackend for SpeechBackend {
             instance: 1,
             evaluator: Some(hellas_client::model::evaluator(
                 hellas_client::model::GpuDialect::Hip,
+                "gfx1151",
             )),
             max_in_flight: 1,
             in_flight: 0,

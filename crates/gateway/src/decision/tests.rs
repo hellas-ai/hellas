@@ -20,6 +20,7 @@ impl WorkExecutionBackend for Fake {
     fn backends(&self) -> Vec<crate::BackendInfo> {
         crate::test_support::backend(Some(hellas_client::model::evaluator(
             hellas_client::model::GpuDialect::Hip,
+            "gfx1151",
         )))
     }
     fn run(

@@ -21,15 +21,28 @@ pub(crate) struct LocalArgs {
 #[cfg(feature = "compute")]
 #[derive(Args, Debug)]
 pub(crate) struct GpuArgs {
-    /// Registered local evaluator id; omitted selects the native executor.
-    #[arg(long = "evaluator", value_parser = hellas_executor::catena::registered_evaluator)]
-    pub(crate) evaluator: Option<hellas_executor::GpuDialect>,
+    /// Evaluator id a local GPU runtime registers; omitted selects the native
+    /// runtime.
+    #[arg(long = "evaluator")]
+    pub(crate) evaluator: Option<String>,
     /// Maximum programs retained in a GPU worker session.
     #[arg(long = "gpu-session-programs", default_value_t = hellas_executor::DEFAULT_GPU_SESSION_PROGRAMS, value_parser = crate::parsers::parse_positive_usize)]
     pub(crate) gpu_session_programs: usize,
     /// Maximum static asset bytes retained across GPU jobs.
     #[arg(long = "gpu-session-asset-bytes", default_value_t = hellas_executor::DEFAULT_GPU_SESSION_ASSET_BYTES, value_parser = crate::parsers::parse_positive_u64)]
     pub(crate) gpu_session_asset_bytes: u64,
+}
+
+#[cfg(feature = "compute")]
+impl GpuArgs {
+    pub(crate) fn config(&self) -> CliResult<hellas_executor::GpuConfig> {
+        Ok(hellas_executor::GpuConfig {
+            gpu: hellas_executor::catena::Gpu::select(self.evaluator.as_deref())
+                .map_err(anyhow::Error::msg)?,
+            session_programs: self.gpu_session_programs,
+            session_asset_bytes: self.gpu_session_asset_bytes,
+        })
+    }
 }
 
 #[cfg(feature = "compute")]

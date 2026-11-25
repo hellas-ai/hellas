@@ -59,7 +59,7 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../client/src/model/whisper/mini");
         let package = ModelPackage::open(
             &path,
-            &hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip),
+            &hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip, "gfx1151"),
         )
         .await
         .unwrap();

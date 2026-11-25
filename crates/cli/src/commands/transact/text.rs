@@ -82,7 +82,8 @@ mod tests {
         let model = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../client/src/model/package/mini-qwen3.gguf");
         let model = model.display().to_string();
-        let evaluator = hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip);
+        let evaluator =
+            hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip, "gfx1151");
         let parse = |system: &[&str]| {
             let mut argv = vec![
                 "hellas",

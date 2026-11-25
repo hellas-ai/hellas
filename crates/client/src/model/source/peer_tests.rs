@@ -54,7 +54,7 @@ async fn catalog_visibility_and_verified_header_select_the_same_program_as_local
             });
         }
     });
-    let evaluator = evaluator(GpuDialect::Hip);
+    let evaluator = evaluator(GpuDialect::Hip, "gfx1151");
     assert!(ModelPackage::open(&uri, &evaluator).await.is_err());
     let name = model_pin(id).unwrap();
     let jobs = owner_pin(&store, &name).await.unwrap().unwrap();

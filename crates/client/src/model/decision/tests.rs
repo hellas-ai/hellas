@@ -36,7 +36,7 @@ fn body() -> Value {
 async fn decisions_prefill_each_question_and_read_its_logits() {
     let path = fixture("mini-d1.gguf");
     assert_eq!(ModelKind::of(&path).unwrap(), ModelKind::Decision);
-    let package = ModelPackage::open(&path, &evaluator(GpuDialect::Hip))
+    let package = ModelPackage::open(&path, &evaluator(GpuDialect::Hip, "gfx1151"))
         .await
         .unwrap();
     assert_eq!(package.kind(), ModelKind::Decision);
@@ -122,9 +122,12 @@ async fn decisions_prefill_each_question_and_read_its_logits() {
 
 #[tokio::test]
 async fn decisions_reject_images_and_text_models() {
-    let decision = ModelPackage::open(&fixture("mini-d1.gguf"), &evaluator(GpuDialect::Hip))
-        .await
-        .unwrap();
+    let decision = ModelPackage::open(
+        &fixture("mini-d1.gguf"),
+        &evaluator(GpuDialect::Hip, "gfx1151"),
+    )
+    .await
+    .unwrap();
     let mut png = Vec::new();
     {
         let mut encoder = png::Encoder::new(&mut png, 1, 1);
@@ -158,7 +161,7 @@ async fn decisions_reject_images_and_text_models() {
 
     let text = fixture("mini-qwen3.gguf");
     assert_eq!(ModelKind::of(&text).unwrap(), ModelKind::Text);
-    let package = ModelPackage::open(&text, &evaluator(GpuDialect::Hip))
+    let package = ModelPackage::open(&text, &evaluator(GpuDialect::Hip, "gfx1151"))
         .await
         .unwrap();
     let error = package

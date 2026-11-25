@@ -617,15 +617,13 @@ async fn cached_program_still_opens_current_pin_policy(warm_gpu: bool) {
         }])
         .unwrap(),
     };
-    let manifest = environment
-        .manifest(&super::evaluator(GpuDialect::Hip))
-        .unwrap();
+    let manifest = environment.manifest(&hip_evaluator("gfx1151")).unwrap();
     let root_bytes = environment.canonical_bytes().unwrap();
     let root_object = ContentRef::for_bytes(&root_bytes);
     let mut limits = limits();
     limits.max_upload_bytes = hellas_channel::content::DEFAULT_MAX_STAGING_BYTES;
     let policy = InvocationPolicy {
-        admissions: vec![Admission::evaluator(super::evaluator(GpuDialect::Hip))],
+        admissions: vec![Admission::evaluator(hip_evaluator("gfx1151"))],
         limits,
     };
     let input = InvocationInput {
@@ -672,14 +670,10 @@ async fn cached_program_still_opens_current_pin_policy(warm_gpu: bool) {
         .await
         .unwrap();
     let content = (LocalStore::Job(job.clone()), job.scope().clone());
-    let (environment, sources, mut readers) = super::program::BoundProgram::open(
-        &content,
-        &prepared,
-        &limits,
-        &super::evaluator(GpuDialect::Hip),
-    )
-    .await
-    .unwrap();
+    let (environment, sources, mut readers) =
+        super::program::BoundProgram::open(&content, &prepared, &limits, &hip_evaluator("gfx1151"))
+            .await
+            .unwrap();
     let compiling = prepared.clone();
     let module = tokio::task::spawn_blocking(move || {
         super::program::BoundProgram::compile_cancellable(
@@ -725,15 +719,11 @@ async fn cached_program_still_opens_current_pin_policy(warm_gpu: bool) {
     )
     .await
     .unwrap();
-    let failure = super::program::BoundProgram::open(
-        &content,
-        &prepared,
-        &limits,
-        &super::evaluator(GpuDialect::Hip),
-    )
-    .await
-    .err()
-    .unwrap();
+    let failure =
+        super::program::BoundProgram::open(&content, &prepared, &limits, &hip_evaluator("gfx1151"))
+            .await
+            .err()
+            .unwrap();
     assert!(
         failure.to_string().contains("missing compute asset"),
         "{failure}"
@@ -775,7 +765,7 @@ async fn an_executor_refuses_an_unregistered_evaluator() {
         LocalStore::Memory(MemoryStore::new(Reservations::ram(1 << 20))),
         Scope::Owner,
     );
-    let registered = super::evaluator(GpuDialect::Hip);
+    let registered = hip_evaluator("gfx1151");
     let open = async |evaluator: &str| {
         let manifest = environment.manifest(evaluator).unwrap();
         let input = InvocationInput {
@@ -806,11 +796,13 @@ async fn an_executor_refuses_an_unregistered_evaluator() {
             .unwrap()
             .to_string()
     };
-    assert!(
-        open("hellas/unregistered")
-            .await
-            .contains("unsupported compute evaluator")
-    );
+    for unregistered in ["hellas/unregistered", &hip_evaluator("gfx1100")] {
+        assert!(
+            open(unregistered)
+                .await
+                .contains("unsupported compute evaluator")
+        );
+    }
     // The same program for the registered evaluator passes the check and only
     // then misses its root in this empty store.
     assert!(
@@ -939,4 +931,12 @@ fn prepared_gpu_buffers_share_the_asset_lru() -> Result<()> {
     let fresh = prepare(0)?;
     assert_eq!(fresh.0[0].try_to_u16_vec()?, [0x1122, 0x3344]);
     Ok(())
+}
+
+fn hip_evaluator(arch: &str) -> String {
+    super::Gpu {
+        dialect: GpuDialect::Hip,
+        arch: arch.into(),
+    }
+    .evaluator()
 }

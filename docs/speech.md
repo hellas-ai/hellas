@@ -52,7 +52,7 @@ preserved. Signed evidence accompanies successful and failed completions.
 The following revision contains the original MMS English inference tensors and tokenizer. Both clients and providers accept the pinned repository or a local checkpoint directory containing `model.safetensors`, `config.json`, `vocab.json`, `tokenizer_config.json` and `special_tokens_map.json`.
 
 ```sh
-hellas program hf://whatever0705/mms-tts-eng-with-discriminator@3975d411eef6e0a05ab701ce981a93dc3a2cfdae --backend hellas/catena-dfad87438018-hip
+hellas program hf://whatever0705/mms-tts-eng-with-discriminator@3975d411eef6e0a05ab701ce981a93dc3a2cfdae --backend hellas/catena-dfad87438018-hip-gfx1151
 ```
 
 The client renders from metadata. The provider verifies the safetensors file and prepares the required weights on its GPU. The speech decoder checks the status and sample count and encodes the valid finite waveform samples. Configure Compute admission for the program printed by `hellas program` and allow 1,920,000 bytes for the waveform plus 16 bytes for its status and sample count.
@@ -71,7 +71,7 @@ All voices share one program per evaluator. For a speech request, the client
 reads the selected voice’s tensor header and puts its byte range in the plan.
 
 ```sh
-hellas program "hf://${PHONON_ORG}/phonon-31m-en@8f7a37c94a4c58b04c8287300c53f11d2e208eae" --backend hellas/catena-dfad87438018-hip
+hellas program "hf://${PHONON_ORG}/phonon-31m-en@8f7a37c94a4c58b04c8287300c53f11d2e208eae" --backend hellas/catena-dfad87438018-hip-gfx1151
 ```
 
 A local OmniVoice snapshot has the same files as its Hub repository. An offline
@@ -114,7 +114,7 @@ kind = "paid"
 max_in_flight = 1
 provider = "NATIVE_ENROLLMENT_ID@NATIVE_NODE_ID"
 max_price = 20
-evaluator = "hellas/catena-dfad87438018-hip"
+evaluator = "hellas/catena-dfad87438018-hip-gfx1151"
 
 [[routes]]
 kind = "speech"

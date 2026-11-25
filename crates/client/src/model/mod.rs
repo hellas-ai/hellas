@@ -19,31 +19,29 @@ mod source;
 #[cfg(feature = "models")]
 pub use catena_lang::codegen::GpuDialect;
 
-/// Program renderers: catena-models' program assembly for each GPU target,
-/// registered under the evaluator id its programs name.
+/// Program renderers: catena-models' program assembly for each GPU runtime,
+/// registered under the runtime's evaluators, one per device architecture.
 #[cfg(feature = "models")]
-fn renderers() -> impl Iterator<Item = (String, GpuDialect)> {
-    use hellas_rpc::protocol::invocation::compute;
-    [(GpuDialect::Hip, "hip"), (GpuDialect::Cuda, "cuda")]
-        .map(|(dialect, name)| (compute::evaluator(name), dialect))
-        .into_iter()
-}
+const RENDERERS: [(GpuDialect, &str); 2] = [(GpuDialect::Hip, "hip"), (GpuDialect::Cuda, "cuda")];
 
-/// The evaluator id of programs rendered for `dialect`.
+/// The evaluator id of programs rendered for `dialect` on a device `arch`.
 #[cfg(feature = "models")]
-pub fn evaluator(dialect: GpuDialect) -> String {
-    renderers()
-        .find(|(_, d)| *d == dialect)
-        .map(|(id, _)| id)
-        .expect("every dialect renders")
+pub fn evaluator(dialect: GpuDialect, arch: &str) -> String {
+    let (_, runtime) = RENDERERS
+        .into_iter()
+        .find(|(d, _)| *d == dialect)
+        .expect("every dialect renders");
+    hellas_rpc::protocol::invocation::compute::evaluator(runtime, arch)
 }
 
 /// The renderer registered under `evaluator`.
 #[cfg(feature = "models")]
 fn renderer(evaluator: &str) -> anyhow::Result<GpuDialect> {
-    renderers()
-        .find(|(id, _)| id == evaluator)
-        .map(|(_, dialect)| dialect)
+    use hellas_rpc::protocol::invocation::compute;
+    RENDERERS
+        .into_iter()
+        .find(|(_, runtime)| compute::architecture(evaluator, runtime).is_some())
+        .map(|(dialect, _)| dialect)
         .ok_or_else(|| anyhow::anyhow!("no program renderer for evaluator {evaluator}"))
 }
 #[cfg(feature = "models")]

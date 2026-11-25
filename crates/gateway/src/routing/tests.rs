@@ -111,7 +111,7 @@ async fn discovery_lists_models_from_native_and_fetch_routes_once() {
         },
     };
     let packages = ModelSpec::from(path.as_path())
-        .open_many([evaluator(GpuDialect::Hip)], None)
+        .open_many([evaluator(GpuDialect::Hip, "gfx1151")], None)
         .await
         .unwrap();
     let models = [(path.into(), Ok(packages))].into();
@@ -367,16 +367,18 @@ async fn pinned_pre_proposal_failure_is_not_retried_on_another_backend() {
 #[tokio::test]
 async fn compute_is_rendered_for_each_selected_evaluator() {
     use hellas_client::model::{ComputeJob, GpuDialect, ModelPackage, ModelRequest, evaluator};
+    const RENDERED: [(GpuDialect, &str); 2] =
+        [(GpuDialect::Hip, "gfx1151"), (GpuDialect::Cuda, "sm_120")];
     struct Renderers {
         calls: Mutex<Vec<(String, ComputeJob)>>,
     }
     impl WorkExecutionBackend for Renderers {
         fn backends(&self) -> Vec<BackendInfo> {
-            [("hip", GpuDialect::Hip), ("cuda", GpuDialect::Cuda)]
-                .map(|(id, dialect)| BackendInfo {
+            [("hip", RENDERED[0]), ("cuda", RENDERED[1])]
+                .map(|(id, (dialect, arch))| BackendInfo {
                     instance: 1,
                     id: id.into(),
-                    evaluator: Some(evaluator(dialect)),
+                    evaluator: Some(evaluator(dialect, arch)),
                     max_in_flight: 2,
                     in_flight: 0,
                     down: false,
@@ -445,8 +447,8 @@ async fn compute_is_rendered_for_each_selected_evaluator() {
         calls.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
         ["hip", "cuda"]
     );
-    for ((_, actual), dialect) in calls.into_iter().zip([GpuDialect::Hip, GpuDialect::Cuda]) {
-        let package = ModelPackage::open(&path, &evaluator(dialect))
+    for ((_, actual), (dialect, arch)) in calls.into_iter().zip(RENDERED) {
+        let package = ModelPackage::open(&path, &evaluator(dialect, arch))
             .await
             .unwrap();
         let expected = package.render_job(&request).await.unwrap();

@@ -52,8 +52,10 @@ runs every modality; no development shell is needed.
 
 A Compute job names the evaluator its program is rendered for. Remote Compute
 commands render for `--backend EVALUATOR`, the id the provider's GPU runtime
-registers (such as `hellas/catena-dfad87438018-hip`), before they ask for a
+registers (such as `hellas/catena-dfad87438018-hip-gfx1151`), before they ask for a
 quote; the provider refuses a program for an evaluator it did not register.
+The id names the architecture of the device the runtime opened, because the
+same program rounds differently on different architectures.
 `--local` renders for this machine's GPU runtime.
 
 `hellas text --model MODEL --prompt TEXT [--system TEXT] [--max-tokens N]`
@@ -119,7 +121,7 @@ Signing keys and funding/channel recovery journals remain durable.
 ```sh
 hellas faucet
 hellas run --provider ENROLLMENT_ID@NODE_ID --source counter.hex --entry advance \
-  --arg u64:2 --arg u64:3 --returns u64 --backend hellas/catena-dfad87438018-hip \
+  --arg u64:2 --arg u64:3 --returns u64 --backend hellas/catena-dfad87438018-hip-gfx1151 \
   --pay 20 --save-job ./add
 hellas transact --job ./add --provider ENROLLMENT_ID@NODE_ID@127.0.0.1:9000 -o ./result
 hellas fetch https://example.com/data --provider ENROLLMENT_ID@NODE_ID --pay 20 \
@@ -167,7 +169,7 @@ intentionally have different trust boundaries:
 
 | Application | Root and trusted computation | Outside that guarantee |
 | --- | --- | --- |
-| `hellas/catena-dfad87438018-<runtime>` (the id a GPU runtime registers, such as `-hip`), `compute-0.0.1` | The GPU runtime the program is compiled for, exact Catena Hex sources, named content-addressed assets, inputs, the call plan (calls, optional step loop and stop rule) and declared outputs | Where sources and weights come from, tokenizer, chat template, text decoding, and API presentation |
+| `hellas/catena-dfad87438018-<runtime>-<arch>` (the id a GPU runtime registers for the device it opened, such as `-hip-gfx1151` or `-cuda-sm_120`), `compute-0.0.1` | The GPU runtime and device architecture the program is compiled for, exact Catena Hex sources, named content-addressed assets, inputs, the call plan (calls, optional step loop and stop rule) and declared outputs | Where sources and weights come from, tokenizer, chat template, text decoding, and API presentation |
 | `hellas/fetch-0.0.2`, the contract's adaptor (`http-0.0.1`, `codex-responses-0.0.2` or `openai-responses-0.0.3`) | A strict stateless Responses field set; typed reconstruction of provider-shaped JSON; `stream=true` and upstream `store=false`; the exact official Codex or OpenAI HTTPS endpoint; no redirects; and SSE response projection | The truth, correctness, and availability of the adversarial upstream service; provider route label; credentials/auth-file location; and access policy |
 
 Fetch's purpose is to attest the exact transformation around a
@@ -223,7 +225,7 @@ are part of the job's content identity.
 format = "hellas.job.v1"
 
 [application]
-evaluator = "hellas/catena-dfad87438018-hip"
+evaluator = "hellas/catena-dfad87438018-hip-gfx1151"
 adaptor = "compute-0.0.1"
 
 [payment]
@@ -303,7 +305,7 @@ the selected hardware and step count.
 ```sh
 hellas image --provider ENROLLMENT_ID@NODE_ID --model hf://black-forest-labs/FLUX.2-klein-4B@e7b7dc27f91deacad38e78976d1f2b499d76a294 \
   --prompt 'a small red fox' --seed 42 --width 512 --height 512 --steps 4 \
-  --backend hellas/catena-dfad87438018-hip --pay 20 -o fox.png
+  --backend hellas/catena-dfad87438018-hip-gfx1151 --pay 20 -o fox.png
 ```
 
 `image` saves the job before purchase, writes the PNG to `-o` (default
@@ -363,7 +365,7 @@ The request names a `state` (a string or any JSON value) and one or more
 
 ```sh
 hellas decide --provider ENROLLMENT_ID@NODE_ID --model hf://LiquidAI/d1-2B-GGUF@4a181094d1b6addfaa3a0956f78e7ab2aa406a0c/d1-2B-BF16.gguf \
-  --request request.json --backend hellas/catena-dfad87438018-hip --pay 20
+  --request request.json --backend hellas/catena-dfad87438018-hip-gfx1151 --pay 20
 ```
 
 `decide` reads the request from `--request FILE`, or from standard input by
@@ -488,10 +490,7 @@ cannot be replayed from those journals.
 
 ## Tracked native execution
 
-Compute job and attempt digests include the evaluator. Saved folders from earlier
-versions reopen using the evaluator in `job.toml`. Their pre-change paid and grant
-attempts use older digests. Running one of those jobs again uses a fresh default
-attempt and can incur another charge or consume grant allowance.
+Compute job and attempt digests include the evaluator.
 
 The SDK's `execution` module provides `ExecutionAttempt` and a borrowed
 `ExecutionSession` for paid or granted work without an HTTP listener. Open an

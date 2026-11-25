@@ -27,17 +27,17 @@ pub const DEFAULT_GPU_SESSION_PROGRAMS: usize = 8;
 #[cfg(feature = "compute")]
 pub const DEFAULT_GPU_SESSION_ASSET_BYTES: u64 = 128 * 1024 * 1024 * 1024;
 #[cfg(feature = "compute")]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct GpuConfig {
-    pub backend: crate::GpuDialect,
+    pub gpu: catena::Gpu,
     pub session_programs: usize,
     pub session_asset_bytes: u64,
 }
 #[cfg(feature = "compute")]
-impl Default for GpuConfig {
-    fn default() -> Self {
+impl GpuConfig {
+    pub fn new(gpu: catena::Gpu) -> Self {
         Self {
-            backend: crate::GpuDialect::Hip,
+            gpu,
             session_programs: DEFAULT_GPU_SESSION_PROGRAMS,
             session_asset_bytes: DEFAULT_GPU_SESSION_ASSET_BYTES,
         }
@@ -52,8 +52,9 @@ pub struct ExecutorSpawnConfig {
     pub fetch_routes: FetchRouteRegistry,
     pub fetch_max_in_flight: usize,
     pub fetch_queue_capacity: usize,
+    /// The GPU this executor runs Compute on; without one, Fetch only.
     #[cfg(feature = "compute")]
-    pub gpu_config: GpuConfig,
+    pub gpu_config: Option<GpuConfig>,
 }
 impl ExecutorSpawnConfig {
     pub fn capacity_total(active: usize, queued: usize) -> Result<usize, ExecutorError> {
@@ -73,7 +74,7 @@ impl ExecutorSpawnConfig {
             fetch_max_in_flight: hellas_rpc::DEFAULT_FETCH_MAX_IN_FLIGHT,
             fetch_queue_capacity: hellas_rpc::DEFAULT_FETCH_QUEUE_CAPACITY,
             #[cfg(feature = "compute")]
-            gpu_config: GpuConfig::default(),
+            gpu_config: None,
         }
     }
     /// Whether this build executes Compute; without it, Fetch only.
@@ -89,8 +90,13 @@ pub struct Executor {
     fetch_active: Arc<Semaphore>,
     gpu_active: Arc<Semaphore>,
     #[cfg(feature = "compute")]
+    compute: Option<Arc<Compute>>,
+}
+#[cfg(feature = "compute")]
+struct Compute {
+    dialect: crate::GpuDialect,
+    evaluator: String,
     pool: catena::pool::Pool,
-    #[cfg(feature = "compute")]
     assets: catena::assets::Assets,
 }
 #[derive(Clone)]
@@ -116,8 +122,16 @@ impl Executor {
             Ok(Arc::new(Semaphore::new(total)))
         };
         #[cfg(feature = "compute")]
-        let pool = catena::pool::Pool::new(1, config.gpu_config.session_programs)
-            .map_err(|e| ExecutorError::Execution(e.to_string()))?;
+        let compute = match &config.gpu_config {
+            Some(gpu) => Some(Arc::new(Compute {
+                evaluator: gpu.gpu.evaluator(),
+                pool: catena::pool::Pool::new(1, gpu.session_programs)
+                    .map_err(|e| ExecutorError::Execution(e.to_string()))?,
+                assets: catena::assets::Assets::new(gpu.session_asset_bytes, gpu.gpu.dialect),
+                dialect: gpu.gpu.dialect,
+            })),
+            None => None,
+        };
         Ok(ExecutorHandle {
             inner: Arc::new(Self {
                 fetch_capacity: capacity(config.fetch_max_in_flight, config.fetch_queue_capacity)?,
@@ -126,12 +140,7 @@ impl Executor {
                 fetch_active: Arc::new(Semaphore::new(config.fetch_max_in_flight)),
                 gpu_active: Arc::new(Semaphore::new(1)),
                 #[cfg(feature = "compute")]
-                pool,
-                #[cfg(feature = "compute")]
-                assets: catena::assets::Assets::new(
-                    config.gpu_config.session_asset_bytes,
-                    config.gpu_config.backend,
-                ),
+                compute,
                 config,
             }),
         })
@@ -154,7 +163,13 @@ impl ExecutorHandle {
         match domain {
             CapacityDomain::Fetch => Ok(self.inner.fetch_capacity.clone()),
             #[cfg(feature = "compute")]
-            CapacityDomain::Gpu if self.inner.pool.available() => {
+            CapacityDomain::Gpu
+                if self
+                    .inner
+                    .compute
+                    .as_ref()
+                    .is_some_and(|compute| compute.pool.available()) =>
+            {
                 Ok(self.inner.gpu_capacity.clone())
             }
             _ => Err(AdmissionError::Unsupported(domain).into()),
@@ -227,6 +242,9 @@ impl ExecutorHandle {
             CapacityDomain::Gpu => Err(AdmissionError::Unsupported(domain).into()),
             #[cfg(feature = "compute")]
             CapacityDomain::Gpu => {
+                let Some(compute) = self.inner.compute.clone() else {
+                    return Err(AdmissionError::Unsupported(domain).into());
+                };
                 let cancel = catena::Cancellation::default();
                 let _cancel_on_drop = cancel.drop_guard();
                 let executor = self.inner.clone();
@@ -239,7 +257,7 @@ impl ExecutorHandle {
                                 &content,
                                 &prepared,
                                 &limits,
-                                &catena::evaluator(executor.config.gpu_config.backend),
+                                &compute.evaluator,
                             )
                             .await
                             .map_err(|error| error.to_string())
@@ -270,9 +288,9 @@ impl ExecutorHandle {
                                     &limits,
                                     &std::env::current_exe()?,
                                     &control,
-                                    executor.config.gpu_config.backend,
+                                    compute.dialect,
                                 )?;
-                                let worker = executor.pool.lease_cancellable(
+                                let worker = compute.pool.lease_cancellable(
                                     program.module(),
                                     Duration::from_millis(limits.execution_timeout_ms),
                                     control.clone(),
@@ -307,7 +325,7 @@ impl ExecutorHandle {
                                 &program,
                                 &prepared,
                                 &limits,
-                                &executor.assets,
+                                &compute.assets,
                                 &setup_entries,
                                 &mut readers,
                                 &executor.config.producer_key,
@@ -631,6 +649,10 @@ mod content_tests {
         let key = Arc::new(ProducerSigningKey::generate());
         let mut config = ExecutorSpawnConfig::new(key.clone(), FetchRouteRegistry::new());
         config.queue_capacity = 0;
+        config.gpu_config = Some(GpuConfig::new(catena::Gpu {
+            dialect: crate::GpuDialect::Hip,
+            arch: "gfx1151".into(),
+        }));
         let executor = Executor::spawn_configured(config).await.unwrap();
         let mut prepared = fixture::bundle(1);
         prepared.request.runner_public_key = key.public_key();

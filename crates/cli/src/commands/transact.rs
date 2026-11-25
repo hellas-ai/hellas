@@ -511,23 +511,15 @@ impl TargetArgs {
         Ok(None)
     }
 
-    /// The evaluator id jobs for this target are rendered for.
-    fn evaluator(&self) -> Option<String> {
+    /// The evaluator a rendered job names: the local GPU's, or the one remote
+    /// work must select.
+    fn renderer(&self) -> super::CliResult<String> {
         #[cfg(feature = "compute")]
         if self.local {
-            return Some(hellas_executor::catena::evaluator(
-                self.native
-                    .gpu
-                    .evaluator
-                    .unwrap_or_else(hellas_executor::catena::default_gpu),
-            ));
+            return Ok(self.native.gpu.config()?.gpu.evaluator());
         }
-        self.backend.clone()
-    }
-
-    /// The evaluator a rendered job names, which remote work must select.
-    fn renderer(&self) -> super::CliResult<String> {
-        self.evaluator()
+        self.backend
+            .clone()
             .context("remote jobs name their renderer with --backend EVALUATOR")
     }
 
@@ -550,15 +542,7 @@ impl TargetArgs {
                 backend: context
                     .target(TargetSpec::Local {
                         content,
-                        gpu: hellas_executor::GpuConfig {
-                            backend: self
-                                .native
-                                .gpu
-                                .evaluator
-                                .unwrap_or_else(hellas_executor::catena::default_gpu),
-                            session_programs: self.native.gpu.gpu_session_programs,
-                            session_asset_bytes: self.native.gpu.gpu_session_asset_bytes,
-                        },
+                        gpu: self.native.gpu.config()?,
                         timeout: client.timeout.unwrap_or(Duration::from_secs(86_400)),
                     })
                     .await?,

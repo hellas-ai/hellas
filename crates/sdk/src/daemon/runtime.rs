@@ -61,21 +61,9 @@ impl PreparedBackend {
     }
     pub fn unavailable(configured: &crate::daemon_config::Backend, reason: String) -> Self {
         let evaluator = match &configured.kind {
-            BackendKind::Local { evaluator, .. } => {
-                #[cfg(feature = "compute")]
-                {
-                    Some(evaluator.clone().unwrap_or_else(|| {
-                        hellas_executor::catena::evaluator(hellas_executor::catena::default_gpu())
-                    }))
-                }
-                #[cfg(not(feature = "compute"))]
-                {
-                    evaluator.clone()
-                }
-            }
-            BackendKind::Grant { evaluator, .. } | BackendKind::Paid { evaluator, .. } => {
-                evaluator.clone()
-            }
+            BackendKind::Local { evaluator, .. }
+            | BackendKind::Grant { evaluator, .. }
+            | BackendKind::Paid { evaluator, .. } => evaluator.clone(),
             BackendKind::Fetch { .. } => None,
         };
         Self::ready(BackendEntry {
@@ -381,22 +369,15 @@ impl Runtime {
                 }
                 #[cfg(feature = "compute")]
                 {
-                    let dialect = evaluator
-                        .as_deref()
-                        .map(hellas_executor::catena::registered_evaluator)
-                        .transpose()?
-                        .unwrap_or_else(hellas_executor::catena::default_gpu);
-                    let evaluator = hellas_executor::catena::evaluator(dialect);
+                    let gpu = hellas_executor::catena::Gpu::select(evaluator.as_deref())?;
+                    let evaluator = gpu.evaluator();
                     let mut executors = self.executors.lock().await;
                     let backend = if let Some(backend) = executors.get(&evaluator) {
                         backend.clone()
                     } else {
                         let backend = crate::execution::local::spawn(
                             self.options.signer.clone(),
-                            hellas_executor::GpuConfig {
-                                backend: dialect,
-                                ..Default::default()
-                            },
+                            hellas_executor::GpuConfig::new(gpu),
                             execution,
                         )
                         .await?;

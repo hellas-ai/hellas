@@ -4,11 +4,21 @@ use serde::{Deserialize, Serialize};
 use crate::ContentRef;
 
 /// The locked Catena compiler. A GPU runtime that compiles its programs
-/// registers an evaluator id that extends it with the runtime's name.
+/// registers an evaluator id that extends it with the runtime's name and the
+/// architecture of the device it opened: results differ across architectures.
 pub const EVALUATOR: &str = "hellas/catena-dfad87438018";
-/// Exact evaluator registered by the renderer and executor for a Catena runtime.
-pub fn evaluator(runtime: &str) -> String {
-    format!("{EVALUATOR}-{runtime}")
+/// Exact evaluator registered by a Catena runtime on a device architecture.
+pub fn evaluator(runtime: &str, arch: &str) -> String {
+    format!("{EVALUATOR}-{runtime}-{arch}")
+}
+/// The device architecture of an evaluator that `runtime` registers.
+pub fn architecture<'a>(evaluator: &'a str, runtime: &str) -> Option<&'a str> {
+    evaluator
+        .strip_prefix(EVALUATOR)?
+        .strip_prefix('-')?
+        .strip_prefix(runtime)?
+        .strip_prefix('-')
+        .filter(|arch| !arch.is_empty())
 }
 
 pub const MAX_ENVIRONMENT_BYTES: usize = 1 << 20;

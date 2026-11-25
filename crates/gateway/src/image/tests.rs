@@ -27,6 +27,7 @@ impl WorkExecutionBackend for Fake {
         crate::test_support::backend({
             Some(hellas_client::model::evaluator(
                 hellas_client::model::GpuDialect::Hip,
+                "gfx1151",
             ))
         })
     }
@@ -98,11 +99,12 @@ async fn app(work: Arc<Fake>) -> Router {
     use hellas_client::model::{GpuDialect, evaluator, flux};
     let directory =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../client/src/model/flux/fixture");
+    let evaluator = evaluator(GpuDialect::Hip, "gfx1151");
     let models = [(
         directory.clone().into(),
         Ok([(
-            evaluator(GpuDialect::Hip),
-            Arc::new(flux::fixture(&directory, GpuDialect::Hip).unwrap()),
+            evaluator.clone(),
+            Arc::new(flux::fixture(&directory, &evaluator).unwrap()),
         )]
         .into()),
     )]

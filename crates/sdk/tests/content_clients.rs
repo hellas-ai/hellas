@@ -313,7 +313,7 @@ async fn job_constructor_checks_root_and_streaming_folder_round_trip_keeps_ident
 async fn authenticated_catalog_can_render_only_its_granted_pin() {
     use hellas_client::model::{GpuDialect, ModelPackage, evaluator, publish_model};
     use hellas_store::content::{ContentStore, PinName, PinPolicy, PinValue, owner_pin};
-    let eval = evaluator(GpuDialect::Hip);
+    let eval = evaluator(GpuDialect::Hip, "gfx1151");
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../client/src/model/package/mini-qwen3.gguf");
     let local = ModelPackage::open(&path, &eval).await.unwrap();

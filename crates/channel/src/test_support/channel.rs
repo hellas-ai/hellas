@@ -266,7 +266,7 @@ pub fn environment() -> compute::Environment {
 }
 /// The evaluator a HIP executor registers, so test jobs run on one.
 pub fn evaluator() -> String {
-    compute::evaluator("hip")
+    compute::evaluator("hip", "gfx1151")
 }
 pub fn manifest() -> ProgramManifest {
     environment().manifest(&evaluator()).unwrap()

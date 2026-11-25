@@ -123,7 +123,7 @@ impl WorkBackend for HostCompute {
             &content,
             &prepared,
             &limits,
-            &hellas_executor::catena::evaluator(hellas_executor::GpuDialect::Hip),
+            &hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip, "gfx1151"),
         )
         .await
         .map_err(|error| error.to_string());

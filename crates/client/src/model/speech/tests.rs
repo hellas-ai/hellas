@@ -9,8 +9,9 @@ async fn original_mms_ranges_prepare_once_for_different_utterances() -> Result<(
     write_test_checkpoint(root.path())?;
     assert_eq!(ModelKind::of(root.path())?, ModelKind::Speech);
     let object = hellas_store::content::file_content(&root.path().join("model.safetensors"))?;
-    for dialect in [GpuDialect::Hip, GpuDialect::Cuda] {
-        let model = ModelPackage::open(root.path(), &crate::model::evaluator(dialect)).await?;
+    for (dialect, arch) in [(GpuDialect::Hip, "gfx1151"), (GpuDialect::Cuda, "sm_120")] {
+        let model =
+            ModelPackage::open(root.path(), &crate::model::evaluator(dialect, arch)).await?;
         let request = |text, voice| ModelRequest::Speech {
             text,
             voice,

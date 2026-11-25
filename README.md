@@ -113,7 +113,7 @@ For remote transcription, ask the provider to share its `whisper-tiny` resource.
 
 ```sh
 hellas transcribe --model hf://unsloth/whisper-tiny@34457cb234c8624f23ac716000773b367000df6e --audio speech.wav --access whisper.access \
-  --backend hellas/catena-dfad87438018-hip
+  --backend hellas/catena-dfad87438018-hip-gfx1151
 ```
 
 A paid job uses devnet coins and checks the quoted price before signing:
@@ -121,10 +121,10 @@ A paid job uses devnet coins and checks the quoted price before signing:
 ```sh
 hellas faucet
 hellas transcribe --model hf://unsloth/whisper-tiny@34457cb234c8624f23ac716000773b367000df6e --audio speech.wav --pay 20 \
-  --provider "$DEVNET_PROVIDER" --backend hellas/catena-dfad87438018-hip
+  --provider "$DEVNET_PROVIDER" --backend hellas/catena-dfad87438018-hip-gfx1151
 ```
 
-`--local` is available in GPU builds. NVIDIA providers use the CUDA evaluator.
+`--local` is available in GPU builds. A provider's evaluator names its GPU runtime and architecture, such as `-cuda-sm_120` for an RTX 5090.
 See [jobs](docs/jobs.md) for text, image, decision, Fetch and prepared-program commands.
 
 ## More

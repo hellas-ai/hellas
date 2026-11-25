@@ -17,7 +17,7 @@ async fn jobs_bind_original_ranges_and_only_cast_float_weights() {
     let object = ContentRef::for_bytes(&bytes);
     let package = ModelPackage::open(
         path,
-        &crate::model::evaluator(crate::model::GpuDialect::Hip),
+        &crate::model::evaluator(crate::model::GpuDialect::Hip, "gfx1151"),
     )
     .await
     .unwrap();
@@ -114,7 +114,7 @@ async fn jobs_bind_original_ranges_and_only_cast_float_weights() {
 async fn decode_validates_the_result_header_and_decodes_client_side() {
     let model = ModelPackage::open(
         fixture(),
-        &crate::model::evaluator(crate::model::GpuDialect::Hip),
+        &crate::model::evaluator(crate::model::GpuDialect::Hip, "gfx1151"),
     )
     .await
     .unwrap();
@@ -182,7 +182,7 @@ async fn changing_tokenizer_bytes_changes_model_and_manifest() {
     let tokenizer = directory.path().join("tokenizer.json");
     let bytes = std::fs::read(&tokenizer).unwrap();
     std::fs::write(tokenizer, [bytes.as_slice(), b"\n"].concat()).unwrap();
-    let evaluator = crate::model::evaluator(crate::model::GpuDialect::Hip);
+    let evaluator = crate::model::evaluator(crate::model::GpuDialect::Hip, "gfx1151");
     let before = ModelPackage::open(original, &evaluator).await.unwrap();
     let after = ModelPackage::open(directory.path(), &evaluator)
         .await

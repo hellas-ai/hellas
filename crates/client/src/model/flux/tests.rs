@@ -1,5 +1,5 @@
 use super::*;
-use crate::model::{GpuDialect, ModelRequest, ModelResponse};
+use crate::model::{GpuDialect, ModelRequest, ModelResponse, evaluator};
 use hellas_rpc::ContentRef;
 use hellas_rpc::{JsonBytes, protocol::invocation::output::Outcome};
 use std::path::PathBuf;
@@ -101,7 +101,7 @@ async fn seeded_noise_matches_the_upstream_reference() {
 
 #[tokio::test]
 async fn image_job_bundles_three_stages_and_passes_state_in_slots() {
-    let package = fixture(&directory(), GpuDialect::Hip).unwrap();
+    let package = fixture(&directory(), &evaluator(GpuDialect::Hip, "gfx1151")).unwrap();
     let request = request();
     let job = package
         .render_job(&ModelRequest::Image(request))
@@ -243,7 +243,7 @@ async fn image_job_bundles_three_stages_and_passes_state_in_slots() {
 
 #[tokio::test]
 async fn image_bounds_are_checked_before_rendering_or_allocating_noise() {
-    let model = fixture(&directory(), GpuDialect::Hip).unwrap();
+    let model = fixture(&directory(), &evaluator(GpuDialect::Hip, "gfx1151")).unwrap();
     for (width, height, steps) in [
         (0, 16, 1),
         (15, 16, 1),
@@ -308,7 +308,7 @@ async fn tokenizer_ids_outside_the_model_vocabulary_are_refused() {
         text::tokenize(temp.path(), request().prompt).unwrap().ids[0],
         151936
     );
-    let package = fixture(temp.path(), GpuDialect::Hip).unwrap();
+    let package = fixture(temp.path(), &evaluator(GpuDialect::Hip, "gfx1151")).unwrap();
     let error = package
         .render_job(&ModelRequest::Image(request()))
         .await
@@ -319,7 +319,7 @@ async fn tokenizer_ids_outside_the_model_vocabulary_are_refused() {
 
 #[tokio::test]
 async fn image_output_is_checked_and_png_quantization_matches_upstream() {
-    let model = fixture(&directory(), GpuDialect::Hip).unwrap();
+    let model = fixture(&directory(), &evaluator(GpuDialect::Hip, "gfx1151")).unwrap();
     let mut values = vec![0f32; 16 * 16 * 3];
     values[..6].copy_from_slice(&[-1., 0.5 / 255., 1.5 / 255., 0.5, 1., 2.]);
     let output = |values: &[f32]| InvocationOutput {

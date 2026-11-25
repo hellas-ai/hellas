@@ -26,7 +26,7 @@ fn fixture() -> std::path::PathBuf {
 async fn canonical_qwen3_job_bytes_are_stable() {
     let package = ModelPackage::open(
         &fixture(),
-        &crate::model::evaluator(crate::model::GpuDialect::Hip),
+        &crate::model::evaluator(crate::model::GpuDialect::Hip, "gfx1151"),
     )
     .await
     .unwrap();
@@ -47,7 +47,7 @@ async fn canonical_qwen3_job_bytes_are_stable() {
 async fn program_is_the_manifest_every_rendered_job_runs() {
     let qwen = ModelPackage::open(
         &fixture(),
-        &crate::model::evaluator(crate::model::GpuDialect::Hip),
+        &crate::model::evaluator(crate::model::GpuDialect::Hip, "gfx1151"),
     )
     .await
     .unwrap();
@@ -55,14 +55,17 @@ async fn program_is_the_manifest_every_rendered_job_runs() {
         let job = qwen.text_job(prompt, max_new, &[0]).await.unwrap();
         let manifest = job
             .environment
-            .manifest(&crate::model::evaluator(crate::model::GpuDialect::Hip))
+            .manifest(&crate::model::evaluator(
+                crate::model::GpuDialect::Hip,
+                "gfx1151",
+            ))
             .unwrap();
         assert_eq!(qwen.programs().unwrap()[0], manifest);
     }
     let whisper = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/model/whisper/mini");
     let whisper = ModelPackage::open(
         &whisper,
-        &crate::model::evaluator(crate::model::GpuDialect::Hip),
+        &crate::model::evaluator(crate::model::GpuDialect::Hip, "gfx1151"),
     )
     .await
     .unwrap();
@@ -77,7 +80,10 @@ async fn program_is_the_manifest_every_rendered_job_runs() {
             .unwrap();
         let manifest = job
             .environment
-            .manifest(&crate::model::evaluator(crate::model::GpuDialect::Hip))
+            .manifest(&crate::model::evaluator(
+                crate::model::GpuDialect::Hip,
+                "gfx1151",
+            ))
             .unwrap();
         assert_eq!(whisper.programs().unwrap()[0], manifest);
     }
@@ -87,7 +93,7 @@ async fn program_is_the_manifest_every_rendered_job_runs() {
 async fn tiny_gguf_renders_the_complete_qwen3_step_job() {
     let package = ModelPackage::open(
         &fixture(),
-        &crate::model::evaluator(crate::model::GpuDialect::Hip),
+        &crate::model::evaluator(crate::model::GpuDialect::Hip, "gfx1151"),
     )
     .await
     .unwrap();
@@ -220,7 +226,7 @@ async fn tiny_gguf_renders_the_complete_qwen3_step_job() {
 async fn empty_oversized_and_out_of_vocabulary_requests_are_refused() {
     let package = ModelPackage::open(
         &fixture(),
-        &crate::model::evaluator(crate::model::GpuDialect::Hip),
+        &crate::model::evaluator(crate::model::GpuDialect::Hip, "gfx1151"),
     )
     .await
     .unwrap();

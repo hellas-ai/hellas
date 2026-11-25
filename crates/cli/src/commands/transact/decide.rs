@@ -67,7 +67,7 @@ mod tests {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../client/src/model/package/mini-d1.gguf");
         let package = ModelPackage::open(
             &path,
-            &hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip),
+            &hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip, "gfx1151"),
         )
         .await
         .unwrap();

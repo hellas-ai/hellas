@@ -37,21 +37,7 @@ impl OfferHost {
         metrics_address: Option<String>,
         client_identity: Option<&Path>,
     ) -> Self {
-        Self::start_with_policy(
-            metrics_endpoint,
-            metrics_address,
-            client_identity,
-            http_invocation_policy(),
-        )
-        .await
-    }
-    async fn start_with_policy(
-        metrics_endpoint: Option<String>,
-        metrics_address: Option<String>,
-        client_identity: Option<&Path>,
-        invocation_policy: hellas_rpc::protocol::invocation::InvocationPolicy,
-    ) -> Self {
-        let any_program = invocation_policy.admits_any_program();
+        let invocation_policy = http_invocation_policy();
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         hellas_private::restrict_directory(root).unwrap();
@@ -145,7 +131,7 @@ impl OfferHost {
                 "accounting":"openai-chat","max_output_tokens":8,"max_response_bytes":65536,
                 "model_policy":[{"path":"/v1/chat/completions","models":["m"]}]}
         })).unwrap();
-        let mut document = Document {
+        let document = Document {
             listeners: [
                 (
                     "work".into(),
@@ -221,23 +207,6 @@ impl OfferHost {
             )],
             ..Default::default()
         };
-        if any_program {
-            document.backends.insert(
-                "local".into(),
-                Backend {
-                    max_in_flight: std::num::NonZeroUsize::MIN,
-                    kind: BackendKind::Local {
-                        evaluator: None,
-                        content: vec![],
-                    },
-                },
-            );
-            let Listener::Iroh { backends, .. } = document.listeners.get_mut("work").unwrap()
-            else {
-                unreachable!()
-            };
-            backends.push("local".into());
-        }
         let (echo, secrets) = document.redacted();
         coordinator
             .configure(
@@ -885,13 +854,7 @@ async fn a_restricted_administrator_can_share_and_renew() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_access_bundle_shares_allowances_with_one_contact_device() {
     use hellas_auth::authority as auth;
-    let mut policy = http_invocation_policy();
-    policy
-        .admissions
-        .push(hellas_rpc::protocol::invocation::Admission::evaluator(
-            hellas_channel::test_support::channel::evaluator(),
-        ));
-    let mut host = OfferHost::start_with_policy(None, None, None, policy).await;
+    let host = OfferHost::start().await;
     let root_path = host.root().to_path_buf();
     let root = root_path.as_path();
     let authority = hellas_sdk::node_control::profile::ClientProfile::load(&host.provider_profile)
@@ -1261,56 +1224,5 @@ async fn an_access_bundle_shares_allowances_with_one_contact_device() {
     next_args[at + 1] = string(&next_attempt);
     host.client.run(&next_args).await;
     assert_eq!(host.https.calls.load(Ordering::SeqCst), 3);
-    // The run helper saves a zero-price job and uses the same grant path.
-    // A signed compilation failure remains a failed command on replay.
-    let invalid_source = root.join("invalid.hex");
-    std::fs::write(&invalid_source, b"invalid Hex source").unwrap();
-    let invalid_dir = root.join("invalid-compute-job");
-    let failed_result = root.join("failed-compute-result");
-    let evaluator = hellas_channel::test_support::channel::evaluator();
-    let failed_args = [
-        "run",
-        "--source",
-        string(&invalid_source),
-        "--entry",
-        "main",
-        "--returns",
-        "u64",
-        "--access",
-        string(&bundle),
-        "--backend",
-        &evaluator,
-        "--save-job",
-        string(&invalid_dir),
-        "--output",
-        string(&failed_result),
-    ];
-    for _ in 0..2 {
-        let failed = host.client.output(&failed_args).await;
-        assert!(
-            !failed.status.success(),
-            "a failed computation returned success"
-        );
-        assert!(
-            String::from_utf8_lossy(&failed.stderr).contains("Compilation"),
-            "{}",
-            String::from_utf8_lossy(&failed.stderr)
-        );
-        assert!(!String::from_utf8_lossy(&failed.stdout).contains("completed"));
-    }
-    assert_eq!(
-        hellas_sdk::job::Job::load(&invalid_dir)
-            .await
-            .unwrap()
-            .price(),
-        0
-    );
-    let retained = std::fs::read(failed_result.join("result.json")).unwrap();
-    let mut replay_command = host.client.command(&failed_args);
-    let retained_path = failed_result.join("result.json");
-    host.node.stop().await;
-    let replay = replay_command.output().await.unwrap();
-    assert!(!replay.status.success());
-    assert!(String::from_utf8_lossy(&replay.stderr).contains("Compilation"));
-    assert_eq!(std::fs::read(retained_path).unwrap(), retained);
+    host.stop().await;
 }

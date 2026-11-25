@@ -108,10 +108,10 @@ pub enum ModelResponse {
 
 impl ModelPackage {
     #[cfg(any(test, feature = "test-support"))]
-    pub(super) fn flux_fixture(model: Flux, dialect: super::GpuDialect) -> Self {
+    pub(super) fn flux_fixture(model: Flux, evaluator: &str) -> Self {
         Self {
             family: Family::Flux(Arc::new(model)),
-            evaluator: super::evaluator(dialect),
+            evaluator: evaluator.into(),
         }
     }
 
