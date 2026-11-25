@@ -49,11 +49,7 @@ async fn untrusted_scopes_cannot_acquire_and_invalid_sources_never_reserve() {
         store
             .acquire(
                 &Scope::Owner,
-                Source::HfXet {
-                    repo,
-                    commit: "a".repeat(40),
-                    path: None
-                },
+                Source::HfXet { repo, path: None },
                 None,
                 pin()
             )

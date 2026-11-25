@@ -7,53 +7,34 @@ use hellas_presentation::{ChatMessage, TextPresentation};
 #[derive(Debug, Args)]
 pub struct TextArgs {
     #[command(flatten)]
-    client: ClientArgs,
-    /// Local or pinned Hub GGUF; the provider holds the matching weights.
-    #[arg(long, value_name = "MODEL")]
-    model: PathBuf,
+    placement: ModelArgs,
     #[arg(long)]
     prompt: String,
     #[arg(long)]
     system: Option<String>,
     #[arg(long, default_value_t = 256, value_parser = clap::value_parser!(u64).range(1..))]
     max_tokens: u64,
-    /// Pay the provider named by --provider its quoted price per job, at most MAX.
-    #[arg(long, value_name = "MAX", requires = "provider", conflicts_with = "access", value_parser = clap::value_parser!(u64).range(1..))]
-    pay: Option<u64>,
-    #[command(flatten)]
-    target: TargetArgs,
     #[arg(short = 'o', long, value_name = "DIR")]
     output: Option<PathBuf>,
 }
 
-pub async fn text(mut args: TextArgs, context: Context) -> super::super::CliResult<()> {
-    context
-        .model_command(async {
-            let (evaluator, package) = args
-                .target
-                .open_model(&args.client, &context, &mut args.model)
-                .await?;
-            let (presentation, rendered) = prepare(&args, &package).await?;
-            let target = args.target;
-            run_quoted(
-                &args.client,
-                target,
-                &context,
-                args.pay,
-                None,
-                async |price| compute_job(price, evaluator, rendered).await,
-                |_| args.output.clone(),
-                |_, completed, _| {
-                    let ModelResponse::Tokens(tokens) = package.decode(&completed.output)? else {
-                        bail!("expected generated tokens");
-                    };
-                    println!("{}", presentation.decode(&tokens)?);
-                    std::io::stdout().lock().flush()?;
-                    Ok(())
-                },
-            )
-            .await
-        })
+pub async fn text(mut args: TextArgs, context: &Context) -> super::super::CliResult<()> {
+    let package = args.placement.open(context, None).await?;
+    let (presentation, rendered) = prepare(&args, &package).await?;
+    args.placement
+        .run(
+            context,
+            &package,
+            rendered,
+            |_| args.output.clone(),
+            |response| {
+                let ModelResponse::Tokens(tokens) = response else {
+                    bail!("expected generated tokens");
+                };
+                println!("{}", presentation.decode(&tokens)?);
+                Ok(())
+            },
+        )
         .await
 }
 
@@ -118,15 +99,18 @@ mod tests {
                 &evaluator,
             ];
             argv.extend(system);
-            let crate::Commands::Text(args) = crate::Cli::try_parse_from(argv).unwrap().command
+            let crate::Commands::Job(crate::commands::transact::JobCommand::Text(args)) =
+                crate::Cli::try_parse_from(argv).unwrap().command
             else {
                 panic!("text");
             };
             args
         };
         let render = async |args: TextArgs| {
-            let package =
-                Arc::new(ModelPackage::open(&args.model, &args.target.renderer()?).await?);
+            let package = Arc::new(
+                ModelPackage::open(&args.placement.model, &args.placement.target.renderer()?)
+                    .await?,
+            );
             prepare(&args, &package).await
         };
         let (presentation, job) = render(parse(&[])).await.unwrap();

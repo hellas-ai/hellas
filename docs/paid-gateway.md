@@ -35,7 +35,7 @@ before equality: a stale request fails; equal terms at the current revision
 retain their revision and salt.
 
 The example admits Compute programs for the evaluator shown by `hellas routes`.
-Each Compute admission contains a nonempty `rules` array. A single rule must
+Each `{"kind":"compute", ...}` admission is one rule. A single rule must
 match all its specified fields. Omit a field to leave it unconstrained.
 
 | Rule field | What the provider checks |
@@ -45,7 +45,7 @@ match all its specified fields. Omit a field to leave it unconstrained.
 | `model` | The ID of the model committed by that manifest and its opened environment. |
 | `repos` | Every model asset was verified at an immutable revision of a repo in this sorted list of Hub names. Git-stored metadata qualifies by hashing the downloaded file. |
 
-For example, `{"model":"MODEL_ID"}` admits variants of that model. A rule can
+For example, `{"kind":"compute","model":"MODEL_ID"}` admits variants of that model. A rule can
 name multiple repositories for a model assembled from different checkpoints.
 An evaluator-only rule also admits arbitrary programs on that evaluator.
 Only a rule pinning a program or model can declare `pure_setup_entries`.

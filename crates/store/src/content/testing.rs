@@ -5,6 +5,7 @@ use std::{
     io::{BufRead, Write},
     net::TcpListener,
 };
+#[cfg(test)]
 pub(crate) fn hub(
     responses: impl FnOnce(&str) -> Vec<(String, u16, Vec<u8>)>,
 ) -> (String, std::thread::JoinHandle<()>) {
@@ -59,83 +60,70 @@ pub async fn acquire_git_file(
     path: &str,
     bytes: &[u8],
 ) -> ContentRef {
-    let sha = "a".repeat(40);
-    let (url, server) = hub(|_| routes(repo, path, &sha, bytes));
-    let mut receiving = store.clone();
-    receiving.core.hf_hub = Some(url);
-    let object = ContentRef::for_bytes(bytes);
-    receiving
-        .acquire(
-            &Scope::Owner,
-            Source::HfXet {
-                repo: crate::hf::Repo::from_uri(&format!("hf://{repo}@{sha}")).unwrap(),
-                commit: sha,
-                path: Some(path.into()),
-            },
-            Some(object),
-            PinTarget {
-                name: PinName::new(format!("models/{}", object.id())).unwrap(),
-                policy: PinPolicy::Jobs,
-            },
-        )
+    AvailableHubFile::serve(&mut store.clone(), repo, path, bytes)
+        .acquire()
         .await
-        .unwrap();
-    server.join().unwrap();
-    object
-}
-
-#[cfg(feature = "test-support")]
-fn routes(repo: &str, path: &str, sha: &str, bytes: &[u8]) -> Vec<(String, u16, Vec<u8>)> {
-    vec![
-        (
-            format!("/api/models/{repo}/tree/{sha}?recursive=true"),
-            200,
-            serde_json::json!([{"type":"file","path":path,"size":bytes.len()}])
-                .to_string()
-                .into_bytes(),
-        ),
-        (format!("/{repo}/resolve/{sha}/{path}"), 200, bytes.to_vec()),
-    ]
 }
 
 #[cfg(feature = "test-support")]
 pub struct AvailableHubFile {
     calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     server: std::thread::JoinHandle<()>,
-    cas: crate::hf::HfCas,
-    path: String,
-    object: ContentRef,
+    store: DiskStore,
+    file: crate::hf::PinnedFile,
 }
+
 #[cfg(feature = "test-support")]
 impl AvailableHubFile {
-    /// Provide a live, allow-listed Hub source without acquiring its file.
-    pub fn new(store: &mut DiskStore, repo: &str, path: &str, bytes: &[u8]) -> Self {
+    fn serve(store: &mut DiskStore, repo: &str, path: &str, bytes: &[u8]) -> Self {
         let sha = "a".repeat(40);
         let calls = std::sync::Arc::default();
         let (url, server) = counted_hub(
-            |_| routes(repo, path, &sha, bytes),
+            |_| {
+                vec![
+                    (
+                        format!("/api/models/{repo}/tree/{sha}?recursive=true"),
+                        200,
+                        serde_json::to_vec(
+                            &serde_json::json!([{"type":"file","path":path,"size":bytes.len()}]),
+                        )
+                        .unwrap(),
+                    ),
+                    (format!("/{repo}/resolve/{sha}/{path}"), 200, bytes.to_vec()),
+                ]
+            },
             std::sync::Arc::clone(&calls),
         );
-        let repo = crate::hf::Repo::from_uri(&format!("hf://{repo}@{sha}")).unwrap();
-        let object = ContentRef::for_bytes(bytes);
-        let source = Source::HfXet {
-            repo: repo.clone(),
-            commit: sha,
-            path: Some(path.into()),
-        };
-        store
-            .set_on_miss(std::sync::Arc::new(AllowList(
-                [(object.id(), (object.bytes(), source))].into(),
-            )))
-            .unwrap();
-        store.core.hf_hub = Some(url.clone());
+        store.core.hf_hub = Some(url);
+        let file = crate::hf::PinnedFile::new(
+            crate::hf::Repo::from_uri(&format!("hf://{repo}@{sha}")).unwrap(),
+            path.into(),
+            ContentRef::for_bytes(bytes),
+        );
         Self {
             calls,
             server,
-            cas: crate::hf::HfCas::new(repo).with_hub(url),
-            path: path.into(),
-            object,
+            store: store.clone(),
+            file,
         }
+    }
+
+    async fn acquire(self) -> ContentRef {
+        self.file.acquire(&self.store).await.unwrap();
+        self.server.join().unwrap();
+        self.file.object
+    }
+
+    /// Provide a live, allow-listed Hub source without acquiring its file.
+    pub fn new(store: &mut DiskStore, repo: &str, path: &str, bytes: &[u8]) -> Self {
+        let served = Self::serve(store, repo, path, bytes);
+        let object = served.file.object;
+        store
+            .set_on_miss(std::sync::Arc::new(AllowList(
+                [(object.id(), (object.bytes(), served.file.source()))].into(),
+            )))
+            .unwrap();
+        served
     }
     /// Check no provider requests occurred, then read the fixture to prove that it was available.
     pub async fn assert_unused(self) {
@@ -145,21 +133,6 @@ impl AvailableHubFile {
             0,
             "admission contacted the Hub"
         );
-        tokio::task::spawn_blocking(move || {
-            use std::io::Read;
-            let (listing, _charges) = self.cas.files(&Reservations::ram(16 << 20)).unwrap();
-            assert_eq!(listing[0].path, self.path);
-            let mut bytes = Vec::new();
-            self.cas
-                .small_file(&self.path)
-                .unwrap()
-                .read_to_end(&mut bytes)
-                .unwrap();
-            assert_eq!(ContentRef::for_bytes(&bytes), self.object);
-            self.server.join().unwrap();
-            assert_eq!(self.calls.load(Ordering::SeqCst), 2);
-        })
-        .await
-        .unwrap();
+        self.acquire().await;
     }
 }

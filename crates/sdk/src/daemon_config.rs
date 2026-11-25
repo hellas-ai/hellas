@@ -345,10 +345,7 @@ impl Document {
             for id in backends {
                 let key = match &self.backends[id].kind {
                     BackendKind::Local { .. } => {
-                        let evaluator = resolved
-                            .iter()
-                            .find(|backend| backend.id == *id)
-                            .and_then(|backend| backend.evaluator.as_deref())
+                        let evaluator = hellas_gateway::BackendInfo::evaluator_for(resolved, id)
                             .ok_or("local backend has no registered evaluator")?;
                         ("compute", evaluator, "")
                     }

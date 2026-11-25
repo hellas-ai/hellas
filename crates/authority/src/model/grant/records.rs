@@ -163,9 +163,11 @@ impl GrantPolicy {
                 hellas_rpc::protocol::invocation::compute::ADAPTOR,
             )
             .map_err(|_| GrantError::Malformed)?;
-            if !self.invocation_policy.admissions.iter().any(|admission| matches!(admission,
-                Admission::Compute { rules } if rules.iter().any(|r| r.evaluator.as_ref().is_none_or(|e| e == evaluator))
-            )) {
+            if !self
+                .invocation_policy
+                .compute_rules()
+                .any(|r| r.evaluator.as_ref().is_none_or(|e| e == evaluator))
+            {
                 return Err(GrantError::Malformed);
             }
         }
@@ -257,7 +259,7 @@ impl GrantDef {
                 return Err(GrantError::Malformed);
             }
             let account_backed = policy.invocation_policy.admissions.iter().any(|a| match a {
-                Admission::Compute { .. } => false,
+                Admission::Compute(_) => false,
                 Admission::Fetch { admission } => {
                     admission.contract.schema() == hellas_rpc::FetchSchema::StatelessResponsesV1
                         || policy.https.as_ref().is_none_or(|r| r.account_backed)

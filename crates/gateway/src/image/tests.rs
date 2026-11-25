@@ -99,7 +99,7 @@ async fn app(work: Arc<Fake>) -> Router {
     let directory =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../client/src/model/flux/fixture");
     let models = [(
-        directory.clone(),
+        directory.clone().into(),
         Ok([(
             evaluator(GpuDialect::Hip),
             Arc::new(flux::fixture(&directory, GpuDialect::Hip).unwrap()),
@@ -111,7 +111,7 @@ async fn app(work: Arc<Fake>) -> Router {
         vec![crate::test_support::route(crate::Presentation::Model {
             modality: hellas_client::model::ModelKind::Image,
             model: "klein".into(),
-            package: directory,
+            package: directory.into(),
             max_tokens: 128,
         })],
         work,

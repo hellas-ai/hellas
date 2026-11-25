@@ -4,10 +4,7 @@ use hellas_client::model::{ModelRequest, ModelResponse, flux::ImageRequest};
 #[derive(Debug, Args)]
 pub struct ImageArgs {
     #[command(flatten)]
-    client: ClientArgs,
-    /// Original Flux2 Klein checkpoint directory or pinned hf:// model.
-    #[arg(long, value_name = "MODEL")]
-    model: PathBuf,
+    placement: ModelArgs,
     #[arg(long)]
     prompt: String,
     #[arg(long, default_value_t = 0)]
@@ -18,52 +15,36 @@ pub struct ImageArgs {
     height: usize,
     #[arg(long, default_value_t = 4)]
     steps: usize,
-    /// Pay the provider named by --provider its quoted price per job, at most MAX.
-    #[arg(long, value_name = "MAX", requires = "provider", conflicts_with = "access", value_parser = clap::value_parser!(u64).range(1..))]
-    pay: Option<u64>,
-    #[command(flatten)]
-    target: TargetArgs,
     #[arg(short = 'o', long, default_value = "image.png", value_name = "PNG")]
     output: PathBuf,
 }
 
-pub async fn image(mut args: ImageArgs, context: Context) -> super::super::CliResult<()> {
-    context
-        .model_command(async {
-            let request = ImageRequest {
-                prompt: &args.prompt,
-                seed: args.seed,
-                width: args.width,
-                height: args.height,
-                steps: args.steps,
-            };
-            request.validate()?;
-            let (evaluator, package) = args
-                .target
-                .open_model(&args.client, &context, &mut args.model)
-                .await?;
-            let rendered = package.render_job(&ModelRequest::Image(request)).await?;
-            let target = args.target;
-            run_quoted(
-                &args.client,
-                target,
-                &context,
-                args.pay,
-                None,
-                async |price| compute_job(price, evaluator, rendered).await,
-                |directory| Some(directory.join("result")),
-                |_, completed, _| {
-                    let ModelResponse::Image(image) = package.decode(&completed.output)? else {
-                        bail!("expected image");
-                    };
-                    std::fs::write(&args.output, image.png(args.width, args.height)?)?;
-                    println!("{}", args.output.display());
-                    std::io::stdout().lock().flush()?;
-                    Ok(())
-                },
-            )
-            .await
-        })
+pub async fn image(mut args: ImageArgs, context: &Context) -> super::super::CliResult<()> {
+    let request = ImageRequest {
+        prompt: &args.prompt,
+        seed: args.seed,
+        width: args.width,
+        height: args.height,
+        steps: args.steps,
+    };
+    request.validate()?;
+    let package = args.placement.open(context, None).await?;
+    let rendered = package.render_job(&ModelRequest::Image(request)).await?;
+    args.placement
+        .run(
+            context,
+            &package,
+            rendered,
+            |directory| Some(directory.join("result")),
+            |response| {
+                let ModelResponse::Image(image) = response else {
+                    bail!("expected image");
+                };
+                std::fs::write(&args.output, image.png(args.width, args.height)?)?;
+                println!("{}", args.output.display());
+                Ok(())
+            },
+        )
         .await
 }
 

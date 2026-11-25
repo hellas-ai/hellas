@@ -32,6 +32,15 @@ pub struct Indexed {
     pub len: u64,
 }
 
+impl Indexed {
+    pub(crate) fn object(&self) -> hellas_rpc::ContentRef {
+        hellas_rpc::ContentRef::new(
+            hellas_rpc::ContentId::from_bytes(self.id.into_bytes()),
+            self.len,
+        )
+    }
+}
+
 /// Bound for a hung wait, not a performance requirement: CI runs many suites at
 /// once on shared machines, and the property never depends on how fast that is.
 #[cfg(test)]
@@ -47,16 +56,19 @@ thread_local! {
 /// being read; importantly, a writer that grows forever cannot extend this
 /// loop forever.
 fn hash_exact_length(reader: &mut impl io::Read, expected_len: u64) -> io::Result<Option<Indexed>> {
-    index_stream(reader, expected_len, |_| Ok(()))
+    index_stream(reader, expected_len, None, |_| Ok(()))
 }
 
 fn index_stream(
     reader: &mut impl io::Read,
     expected_len: u64,
+    expected_sha256: Option<[u8; 32]>,
     mut observe: impl FnMut(&[u8]) -> io::Result<()>,
 ) -> io::Result<Option<Indexed>> {
     #[cfg(test)]
     HASH_CALLS.with(|calls| calls.set(calls.get() + 1));
+    use sha2::Digest as _;
+    let mut sha256 = expected_sha256.map(|_| sha2::Sha256::new());
     let mut hasher = XetFileHasher::new();
     let mut buffer = vec![0_u8; STREAM_BUFFER];
     let mut remaining = expected_len;
@@ -68,12 +80,20 @@ fn index_stream(
             return Ok(None);
         }
         remaining -= read as u64;
-        hasher.update(&buffer[..read]);
-        observe(&buffer[..read])?;
+        let chunk = &buffer[..read];
+        hasher.update(chunk);
+        if let Some(hash) = &mut sha256 {
+            hash.update(chunk);
+        }
+        observe(chunk)?;
     }
 
     let mut sentinel = [0_u8; 1];
-    if reader.read(&mut sentinel)? != 0 {
+    if reader.read(&mut sentinel)? != 0
+        || expected_sha256
+            .zip(sha256)
+            .is_some_and(|(expected, hash)| hash.finalize().as_slice() != expected)
+    {
         return Ok(None);
     }
 

@@ -1,5 +1,9 @@
 //! Resolve the published checkpoint once for local and Hub-backed model renderers.
-use super::{ModelFiles, flux, source::PeerModel};
+mod companion;
+use super::{
+    ModelFiles, ModelSpec, flux,
+    source::{File, PeerModel, RemoteFile},
+};
 use anyhow::{Context, Result, bail, ensure};
 use catena_models::{omnivoice, phonon};
 use hellas_rpc::{
@@ -7,7 +11,7 @@ use hellas_rpc::{
     protocol::invocation::compute::{Arg, Model, NamedAsset},
 };
 use hellas_store::{
-    content::{ContentStore, DiskStore, LocalStore, Scope},
+    content::{DiskStore, LocalStore, Scope},
     hf::{PinnedFile, PinnedRepo},
 };
 use std::{
@@ -37,14 +41,17 @@ impl Origin {
         Ok(match self {
             Self::Local(dir) => dir.join(key).try_exists()?,
             Self::Hub(repo) => repo.contains(key),
-            Self::Peer(peer) => peer.model.assets.iter().any(|asset| asset.name == key),
+            Self::Peer(peer) => peer.object(key).is_ok(),
         })
     }
-    fn file(&self, key: &str) -> Result<Weight> {
+    fn file(&self, key: &str, metadata: Option<ContentRef>) -> Result<File> {
         Ok(match self {
-            Self::Local(dir) => Weight::Local(dir.join(key)),
-            Self::Hub(repo) => Weight::Hub(repo.file(key)?),
-            Self::Peer(peer) => Weight::Peer(peer.clone(), peer.object(key)?),
+            Self::Local(dir) => File::Local(dir.join(key)),
+            Self::Hub(repo) => File::Remote(RemoteFile::Hub(match metadata {
+                Some(object) => PinnedFile::new(repo.repo.clone(), key.into(), object),
+                None => repo.file(key)?,
+            })),
+            Self::Peer(peer) => File::Remote(RemoteFile::Peer(peer.clone(), peer.object(key)?)),
         })
     }
     fn metadata(&self, key: &str) -> Result<Vec<u8>> {
@@ -58,7 +65,7 @@ impl Origin {
                     object.bytes() <= MAX as u64,
                     "checkpoint metadata exceeds limit: {key}"
                 );
-                let bytes = peer.read(key, 0..object.bytes())?;
+                let bytes = peer.read(object, 0..object.bytes())?;
                 ensure!(
                     ContentRef::for_bytes(&bytes) == object,
                     "metadata identity mismatch: {key}"
@@ -101,36 +108,34 @@ pub(super) fn hub(uri: &str) -> Result<(PinnedRepo, Option<String>)> {
     )?)
 }
 
-enum Weight {
-    Local(PathBuf),
-    Hub(PinnedFile),
-    Peer(PeerModel, ContentRef),
+struct RangeReader<'a> {
+    file: &'a RemoteFile,
+    position: u64,
 }
-
-struct RangeReader<F> {
-    file_bytes: u64,
-    offset: u64,
-    read: F,
-}
-impl<F: FnMut(std::ops::Range<u64>, &mut [u8]) -> Result<()>> Read for RangeReader<F> {
+impl Read for RangeReader<'_> {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-        let count = (out.len() as u64).min(self.file_bytes - self.offset);
+        let count = out.len().min(
+            (self.file.object().bytes() - self.position)
+                .try_into()
+                .unwrap_or(usize::MAX),
+        );
         if count != 0 {
-            (self.read)(self.offset..self.offset + count, &mut out[..count as usize])
+            let end = self.position + count as u64;
+            self.file
+                .read_range(self.position..end, &mut &mut out[..count])
                 .map_err(std::io::Error::other)?;
-            self.offset += count;
+            self.position = end;
         }
-        Ok(count as usize)
+        Ok(count)
     }
 }
 
 pub(super) struct Snapshot {
-    dir: Arc<tempfile::TempDir>,
-    local_metadata: Vec<PathBuf>,
-    hub_metadata: Vec<PinnedFile>,
-    metadata: BTreeMap<String, ContentRef>,
+    dir: tempfile::TempDir,
+    pub(super) originals: ModelFiles,
+    assets: Vec<NamedAsset>,
     expected: Option<Arc<Model>>,
-    weights: BTreeMap<String, Weight>,
+    weights: BTreeMap<String, File>,
     indexed_names: BTreeMap<String, BTreeSet<String>>,
     voices: BTreeMap<String, String>,
 }
@@ -152,30 +157,33 @@ pub(super) fn relative(name: &str) -> Result<()> {
 
 impl Snapshot {
     fn add(&mut self, origin: &Origin, prefix: &str, key: &str) -> Result<()> {
+        self.add_from(origin, &format!("{prefix}{key}"), key)
+    }
+    fn add_from(&mut self, origin: &Origin, name: &str, key: &str) -> Result<()> {
+        relative(name)?;
         relative(key)?;
-        let name = format!("{prefix}{key}");
         let key = if matches!(origin, Origin::Peer(_)) {
-            name.as_str()
+            name
         } else {
             key
         };
         if key.ends_with(".safetensors") {
-            let weight = origin.file(key)?;
-            self.weights.insert(name, weight);
+            let weight = origin.file(key, None)?;
+            weight.register(&mut self.originals);
+            self.weights.insert(name.to_owned(), weight);
         } else {
-            let path = self.dir.path().join(&name);
+            let path = self.dir.path().join(name);
             std::fs::create_dir_all(path.parent().unwrap())?;
             let bytes = origin.metadata(key)?;
             let object = ContentRef::for_bytes(&bytes);
-            self.metadata.insert(name.clone(), object);
+            self.assets.push(NamedAsset {
+                name: name.to_owned(),
+                object,
+            });
             std::fs::write(path, &bytes)?;
-            if let Origin::Hub(repo) = origin {
-                self.hub_metadata
-                    .push(PinnedFile::new(repo.repo.clone(), key.to_owned(), object));
-            }
-            if let Origin::Local(root) = origin {
-                self.local_metadata.push(root.join(key));
-            }
+            origin
+                .file(key, Some(object))?
+                .register(&mut self.originals);
         }
         Ok(())
     }
@@ -212,12 +220,11 @@ impl Snapshot {
         }
         Ok(())
     }
-    pub(super) fn open(origin: Origin, kind: Kind) -> Result<Self> {
+    pub(super) fn open(origin: Origin, kind: Kind, companions: Option<&ModelSpec>) -> Result<Self> {
         let mut result = Self {
-            dir: Arc::new(tempfile::tempdir()?),
-            metadata: BTreeMap::new(),
-            local_metadata: vec![],
-            hub_metadata: vec![],
+            dir: tempfile::tempdir()?,
+            assets: Vec::new(),
+            originals: ModelFiles::default(),
             expected: match &origin {
                 Origin::Peer(peer) => Some(peer.model.clone()),
                 _ => None,
@@ -226,26 +233,18 @@ impl Snapshot {
             indexed_names: BTreeMap::new(),
             voices: BTreeMap::new(),
         };
+        let fixed: &[&str] = match kind {
+            Kind::Mms => &super::speech::CHECKPOINT,
+            Kind::Whisper => &super::whisper::CHECKPOINT,
+            Kind::OmniVoice => omnivoice::FILES,
+            Kind::Flux => &flux::METADATA,
+            Kind::Phonon => &[],
+        };
+        for key in fixed {
+            result.add(&origin, "", key)?;
+        }
         match kind {
-            Kind::Mms => {
-                for &key in &super::speech::CHECKPOINT {
-                    result.add(&origin, "", key)?;
-                }
-            }
-            Kind::Whisper => {
-                for &key in &super::whisper::CHECKPOINT {
-                    result.add(&origin, "", key)?;
-                }
-            }
-            Kind::OmniVoice => {
-                for &key in omnivoice::FILES {
-                    result.add(&origin, "", key)?;
-                }
-            }
             Kind::Flux => {
-                for key in flux::METADATA {
-                    result.add(&origin, "", key)?;
-                }
                 if origin.has("variants.json")? {
                     result.add(&origin, "", "variants.json")?;
                 }
@@ -259,106 +258,57 @@ impl Snapshot {
                 result.add(&origin, "", flux::VAE)?;
             }
             Kind::Phonon => {
-                let (model, codec, catalog) = match origin {
-                    Origin::Local(root)
-                        if root.join("model/processor_config.json").try_exists()? =>
-                    {
-                        (
-                            Origin::Local(root.join("model")),
-                            Origin::Local(root.join("codec")),
-                            Origin::Local(root.join("voices")),
-                        )
-                    }
-                    Origin::Peer(peer) => (
-                        Origin::Peer(peer.clone()),
-                        Origin::Peer(peer.clone()),
-                        Origin::Peer(peer),
-                    ),
-                    model => {
-                        let dep = |id, revision| {
-                            Ok::<_, anyhow::Error>(Origin::Hub(
-                                hub(&format!("hf://{id}@{revision}"))?.0,
-                            ))
-                        };
-                        (
-                            model,
-                            dep(phonon::CODEC, phonon::CODEC_REVISION)?,
-                            dep(phonon::VOICE_REPO, phonon::VOICE_REPO_REVISION)?,
-                        )
-                    }
-                };
+                let (model, codec, catalog) = companion::resolve(origin, companions)?;
                 for key in phonon::MODEL_FILES {
                     result.add(&model, "model/", key)?;
                 }
                 for key in phonon::CODEC_FILES {
-                    result.add(&codec, "codec/", key)?;
+                    codec.add(&mut result, "codec/", key)?;
                 }
-                result.add(&catalog, "voices/", phonon::VOICE_CATALOG)?;
+                catalog.add(&mut result, "voices/", phonon::VOICE_CATALOG)?;
                 let listing = std::fs::read_to_string(
                     result.dir.path().join("voices").join(phonon::VOICE_CATALOG),
                 )?;
                 for (name, key) in super::speech::phonon::catalog(&listing)? {
                     let asset = format!("voices/{key}");
                     if !result.weights.contains_key(&asset) {
-                        result.add(&catalog, "voices/", &key)?;
+                        catalog.add(&mut result, "voices/", &key)?;
                     }
                     result.voices.insert(name, asset);
                 }
             }
+            _ => {}
         }
         Ok(result)
     }
 
-    pub(super) fn files(&self) -> ModelFiles {
-        let mut local = self.local_metadata.clone();
-        let mut hub = self.hub_metadata.clone();
-        for file in self.weights.values() {
-            match file {
-                Weight::Local(path) => local.push(path.clone()),
-                Weight::Hub(file) => hub.push(file.clone()),
-                Weight::Peer(_, _) => {}
-            }
-        }
-        ModelFiles { local, hub }
-    }
-    pub(super) fn resolve(self, store: Option<&DiskStore>) -> Result<Native> {
-        let paths = self
-            .weights
-            .values()
-            .filter_map(|w| match w {
-                Weight::Local(path) => Some(path.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
+    pub(super) fn resolve(mut self, store: Option<&DiskStore>) -> Result<Native> {
+        let paths = self.weights.values().filter_map(|file| match file {
+            File::Local(path) => Some(path.clone()),
+            _ => None,
+        });
         let inspected = match store {
-            Some(store) if !paths.is_empty() => {
-                tokio::runtime::Handle::current().block_on(store.inspect_files(paths))?
+            Some(store) => {
+                tokio::runtime::Handle::current().block_on(store.inspect_files(paths.collect()))?
             }
-            _ => BTreeMap::new(),
+            None => BTreeMap::new(),
         };
         let mut files = BTreeMap::new();
         let mut voice_files = BTreeMap::new();
         for (key, weight) in self.weights {
-            let object = match &weight {
-                Weight::Local(path) => match inspected.get(path) {
-                    Some(object) => *object,
-                    None => hellas_store::content::file_content(path)?,
-                },
-                Weight::Hub(file) => file.object,
-                Weight::Peer(_, object) => *object,
-            };
-            let tensors = if key.starts_with("voices/") {
-                voice_files.insert(key.clone(), weight);
-                BTreeMap::new()
+            let object = weight.object(&inspected)?;
+            if key.starts_with("voices/") {
+                voice_files.insert(key.clone(), (weight, object));
             } else {
-                weight.tensors(&key, object)?
-            };
-            if let Some(expected) = self.indexed_names.get(&key) {
-                ensure!(tensors.keys().eq(expected), "invalid shard index for {key}");
+                let tensors = weight.tensors(&key, object)?;
+                if let Some(expected) = self.indexed_names.get(&key) {
+                    ensure!(tensors.keys().eq(expected), "invalid shard index for {key}");
+                }
+                files.insert(key.clone(), tensors);
             }
-            files.insert(key, (object, tensors));
+            self.assets.push(NamedAsset { name: key, object });
         }
-        let model = Native::model_from_files(&files, &self.metadata)?;
+        let model = Model::new(self.assets)?;
         if let Some(expected) = self.expected {
             ensure!(
                 model == *expected,
@@ -368,43 +318,21 @@ impl Snapshot {
         Ok(Native {
             model,
             dir: self.dir,
-            files: Arc::new(files),
+            files,
             voices: self.voices,
-            voice_files: Arc::new(voice_files),
+            voice_files,
         })
     }
 }
 
-impl Weight {
+impl File {
     fn tensors(&self, key: &str, object: ContentRef) -> Result<BTreeMap<String, Tensor>> {
         let file_bytes = object.bytes();
-        let (base, metadata) = match self {
-            Self::Local(path) => catena_models::weights::read_safetensors_header(
-                hellas_private::open_regular_file(path)?,
-                file_bytes,
-            )?,
-            Self::Hub(file) => catena_models::weights::read_safetensors_header(
-                RangeReader {
-                    file_bytes,
-                    offset: 0,
-                    read: |range, out: &mut [u8]| Ok(file.read_range(range, &mut &mut *out)?),
-                },
-                file_bytes,
-            )?,
-            Self::Peer(peer, _) => catena_models::weights::read_safetensors_header(
-                RangeReader {
-                    file_bytes,
-                    offset: 0,
-                    read: |range, out: &mut [u8]| {
-                        let bytes = peer.read(key, range)?;
-                        ensure!(bytes.len() == out.len(), "incomplete header range");
-                        out.copy_from_slice(&bytes);
-                        Ok(())
-                    },
-                },
-                file_bytes,
-            )?,
+        let reader: Box<dyn Read + '_> = match self {
+            Self::Local(path) => Box::new(hellas_private::open_regular_file(path)?),
+            Self::Remote(file) => Box::new(RangeReader { file, position: 0 }),
         };
+        let (base, metadata) = catena_models::weights::read_safetensors_header(reader, file_bytes)?;
         Ok(metadata
             .tensors()
             .into_iter()
@@ -432,32 +360,27 @@ pub(crate) struct Tensor {
     pub dtype: safetensors::Dtype,
     pub shape: Vec<usize>,
 }
-type Files = BTreeMap<String, (ContentRef, BTreeMap<String, Tensor>)>;
-#[derive(Clone)]
+type Tensors = BTreeMap<String, Tensor>;
 pub(crate) struct Native {
     pub model: Model,
-    dir: Arc<tempfile::TempDir>,
-    files: Arc<Files>,
+    dir: tempfile::TempDir,
+    files: BTreeMap<String, Tensors>,
     voices: BTreeMap<String, String>,
-    voice_files: Arc<BTreeMap<String, Weight>>,
+    voice_files: BTreeMap<String, (File, ContentRef)>,
 }
 impl Native {
     pub fn dir(&self) -> &Path {
         self.dir.path()
     }
-    fn model_from_files(files: &Files, metadata: &BTreeMap<String, ContentRef>) -> Result<Model> {
-        let assets = files
-            .iter()
-            .map(|(name, (object, _))| (name, object))
-            .chain(metadata.iter())
-            .map(|(name, object)| NamedAsset {
-                name: name.clone(),
-                object: *object,
-            })
-            .collect();
-        Ok(Model::new(assets)?)
-    }
-    async fn stage_metadata(&self, store: &impl ContentStore) -> Result<()> {
+    pub async fn environment(
+        &self,
+        source: &str,
+    ) -> Result<(
+        hellas_rpc::protocol::invocation::compute::Environment,
+        (LocalStore, Scope),
+    )> {
+        let (environment, content) =
+            super::program::environment(source, self.model.clone()).await?;
         for NamedAsset { name, object } in self
             .model
             .assets
@@ -469,20 +392,8 @@ impl Native {
                 ContentRef::for_bytes(&bytes) == *object,
                 "checkpoint metadata changed: {name}"
             );
-            hellas_channel::content::upload_object(store, &bytes).await?;
+            hellas_channel::content::upload_object(&content.0, &bytes).await?;
         }
-        Ok(())
-    }
-    pub async fn environment(
-        &self,
-        source: &str,
-    ) -> Result<(
-        hellas_rpc::protocol::invocation::compute::Environment,
-        (LocalStore, Scope),
-    )> {
-        let (environment, content) =
-            super::program::environment(source, self.model.clone()).await?;
-        self.stage_metadata(&content.0).await?;
         Ok((environment, content))
     }
     pub fn voice(&self, name: &str) -> Result<Tensor> {
@@ -490,15 +401,11 @@ impl Native {
             .voices
             .get(name)
             .with_context(|| format!("unknown Phonon voice {name:?}"))?;
-        let weight = self
+        let (weight, object) = self
             .voice_files
             .get(key)
             .context("missing catalog voice file")?;
-        let (object, _) = self
-            .files
-            .get(key)
-            .context("missing catalog weight reference")?;
-        if let Weight::Local(path) = weight {
+        if let File::Local(path) = weight {
             ensure!(
                 hellas_store::content::file_content(path)? == *object,
                 "catalog voice changed: {key}"
@@ -512,7 +419,7 @@ impl Native {
     pub fn tensor(&self, file: &str, tensor: &str) -> Result<&Tensor> {
         self.files
             .get(file)
-            .and_then(|(_, ts)| ts.get(tensor))
+            .and_then(|ts| ts.get(tensor))
             .with_context(|| format!("missing tensor {tensor} in {file}"))
     }
     pub fn tensor_in(&self, prefix: &str, tensor: &str) -> Result<&Tensor> {
@@ -520,7 +427,7 @@ impl Native {
             .files
             .iter()
             .filter(|(file, _)| file.starts_with(prefix))
-            .filter_map(|(_, (_, ts))| ts.get(tensor));
+            .filter_map(|(_, ts)| ts.get(tensor));
         let value = hits
             .next()
             .with_context(|| format!("missing {prefix} tensor {tensor}"))?;
@@ -530,7 +437,7 @@ impl Native {
         Ok(value)
     }
     #[cfg(any(test, feature = "test-support"))]
-    pub fn fixture(dir: &Path, files: Files) -> Self {
+    pub fn fixture(dir: &Path, files: BTreeMap<String, (ContentRef, Tensors)>) -> Self {
         fn copy(src: &Path, dst: &Path, root: &Path, metadata: &mut BTreeMap<String, ContentRef>) {
             for item in std::fs::read_dir(src).unwrap() {
                 let item = item.unwrap();
@@ -555,10 +462,21 @@ impl Native {
         let root = tempfile::tempdir().unwrap();
         let mut metadata = BTreeMap::new();
         copy(dir, root.path(), root.path(), &mut metadata);
+        let files = files
+            .into_iter()
+            .map(|(name, (object, tensors))| {
+                metadata.insert(name.clone(), object);
+                (name, tensors)
+            })
+            .collect();
+        let assets = metadata
+            .into_iter()
+            .map(|(name, object)| NamedAsset { name, object })
+            .collect();
         Self {
-            model: Self::model_from_files(&files, &metadata).unwrap(),
-            dir: Arc::new(root),
-            files: Arc::new(files),
+            model: Model::new(assets).unwrap(),
+            dir: root,
+            files,
             voices: Default::default(),
             voice_files: Default::default(),
         }
@@ -593,8 +511,12 @@ mod tests {
         for name in ["model.safetensors", "audio_tokenizer/model.safetensors"] {
             std::os::unix::fs::symlink(&object_path, snapshot.join(name))?;
         }
-        let parsed = Snapshot::open(Origin::Local(snapshot.clone()), Kind::OmniVoice)?;
-        let files = parsed.files();
+        let parsed = Snapshot::open(
+            Origin::Local(snapshot.clone()),
+            Kind::OmniVoice,
+            Default::default(),
+        )?;
+        let files = &parsed.originals;
         assert!(files.hub.is_empty());
         assert!(
             files

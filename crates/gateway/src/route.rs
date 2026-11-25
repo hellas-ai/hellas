@@ -1,8 +1,8 @@
 //! HTTP route declarations and execution on the selected backend.
 use crate::{WorkExecutionBackend, WorkFetchRequest, WorkGatewayError, WorkOutputStream};
-use hellas_client::model::{ModelKind, ModelPackage, ModelRequest};
+use hellas_client::model::{ModelKind, ModelPackage, ModelRequest, ModelSpec};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc};
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Route {
@@ -16,7 +16,7 @@ pub struct Route {
 pub enum Presentation {
     Model {
         model: String,
-        package: PathBuf,
+        package: ModelSpec,
         modality: ModelKind,
         #[serde(default = "default_tokens")]
         max_tokens: u32,
@@ -51,7 +51,7 @@ fn default_tokens() -> u32 {
 
 impl Route {
     /// Packages needed by model presentations, including native speech.
-    pub fn model_package(&self) -> Option<(&str, &PathBuf)> {
+    pub fn model_package(&self) -> Option<(&str, &ModelSpec)> {
         match &self.presentation {
             Presentation::Model { model, package, .. }
             | Presentation::Speech {
@@ -135,16 +135,12 @@ impl RouteExecution {
     ) -> Result<(Arc<ModelPackage>, WorkOutputStream<crate::ComputeEvent>), WorkGatewayError> {
         let request = &request;
         execute(selection, |id, job| async move {
-            let evaluator = self
-                .work
-                .backends()
-                .into_iter()
-                .find(|b| b.id == id)
-                .and_then(|b| b.evaluator)
+            let backends = self.work.backends();
+            let evaluator = crate::BackendInfo::evaluator_for(&backends, &id)
                 .ok_or(WorkGatewayError::Unsupported)?;
             let package = self
                 .packages
-                .get(&evaluator)
+                .get(evaluator)
                 .ok_or(WorkGatewayError::Unsupported)?;
             let steps = if needs_step_bound {
                 self.work.max_steps(&id).await?

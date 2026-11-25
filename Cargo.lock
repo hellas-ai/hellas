@@ -3659,6 +3659,7 @@ dependencies = [
  "iroh",
  "libc",
  "lz4_flex 0.14.2",
+ "percent-encoding",
  "prost",
  "rcgen",
  "rustls",

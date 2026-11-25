@@ -13,53 +13,144 @@ pub const MAX_PROGRAM_ROOT_BYTES: usize = 1 << 20;
 pub const MAX_CONTENT_BYTES: usize = crate::work_store::journal::MAX_ACTIVE_JOURNAL_BYTES as usize;
 pub const DEFAULT_MAX_STAGING_BYTES: u64 = MAX_CONTENT_BYTES as u64;
 
-/// Finish conditional Compute rules with the provider's own acquisition history.
-/// Opening a scoped staging carrier only admits the signed root and input until this succeeds.
-pub async fn match_program(
+/// The paid router and both funding services open the first frame exactly once.
+pub struct WorkUpload {
+    request: hellas_rpc::pb::work::AcceptWorkRequest,
+    opening: hellas_rpc::pb::content::WorkOpening,
+    exporter: [u8; 32],
+    requests: hellas_store::content::UploadRequests,
+}
+impl WorkUpload {
+    pub fn request(&self) -> &hellas_rpc::pb::work::AcceptWorkRequest {
+        &self.request
+    }
+    pub fn into_parts(
+        self,
+    ) -> (
+        hellas_rpc::pb::content::WorkOpening,
+        hellas_rpc::pb::work::AcceptWorkRequest,
+        [u8; 32],
+        hellas_store::content::UploadRequests,
+    ) {
+        (self.opening, self.request, self.exporter, self.requests)
+    }
+    pub async fn read(
+        mut requests: hellas_store::content::UploadRequests,
+        context: &hellas_wire::TransportContext,
+    ) -> Result<Self, hellas_wire::WireStatus> {
+        use futures::StreamExt;
+        use hellas_rpc::pb::content::upload_request::Part;
+        use prost::Message;
+        let denied = || {
+            hellas_wire::WireStatus::new(
+                hellas_wire::WireCode::PermissionDenied,
+                "invalid Work content opening",
+            )
+        };
+        let mut first = requests.next().await.ok_or_else(denied)??;
+        let Some(Part::Open(open)) = &mut first.part else {
+            return Err(denied());
+        };
+        let opening = open.work.take().ok_or_else(denied)?;
+        let request =
+            hellas_rpc::pb::work::AcceptWorkRequest::decode(opening.signed_opening.as_slice())
+                .map_err(|_| denied())?;
+        let first_object = open.object.as_ref().ok_or_else(denied)?;
+        // Funding authentication subsequently checks these exact root/input commitments.
+        let matches = match &opening.root {
+            Some(root) => first_object == root,
+            None => hellas_rpc::protocol::content::decode_reference(&request.prepared_input)
+                .is_some_and(|input| {
+                    first_object.bytes == input.bytes()
+                        && first_object.id.as_slice() == input.id().as_bytes()
+                }),
+        };
+        if open.pin.is_some() || !matches {
+            return Err(denied());
+        }
+        Ok(Self {
+            request,
+            opening,
+            exporter: context.open_exporter.ok_or_else(denied)?,
+            requests: futures::stream::once(async move { Ok(first) })
+                .chain(requests)
+                .boxed(),
+        })
+    }
+}
+/// The bound scope checks funding, cancellation and this reservation before each store effect.
+pub async fn stage_work(
+    service: &hellas_store::content::ContentService<LocalStore>,
+    policy: &hellas_rpc::protocol::invocation::InvocationPolicy,
+    manifest: &hellas_rpc::ProgramManifest,
+    input: ContentRef,
+) -> Result<Vec<ContentRef>, hellas_wire::WireStatus> {
+    let bound = service.scope()?;
+    let (closure, _) = admit_content(&service.store, &bound, policy, manifest, Some(input))
+        .await
+        .map_err(upload_status)?;
+    service
+        .store
+        .acquire_missing(&bound, closure.clone())
+        .await
+        .map_err(upload_status)?;
+    Ok(closure)
+}
+
+pub fn upload_status(error: impl std::fmt::Display) -> hellas_wire::WireStatus {
+    hellas_wire::WireStatus::new(hellas_wire::WireCode::PermissionDenied, error.to_string())
+}
+
+/// Check the provider's current policy and verified acquisition receipts. Staging and
+/// acceptance also open the complete object closure; execution asks for setup permissions.
+pub async fn admit_content(
     store: &LocalStore,
     scope: &Scope,
     policy: &hellas_rpc::protocol::invocation::InvocationPolicy,
     manifest: &hellas_rpc::ProgramManifest,
-    opened_root: Option<&[u8]>,
-) -> Result<std::collections::BTreeSet<String>, Error> {
-    use hellas_rpc::protocol::invocation::{HubRepo, ModelOrigins, compute::Environment};
-    let origins = if policy.needs_model_origins(manifest) {
-        let loaded;
-        let bytes = match opened_root {
-            Some(bytes) => bytes,
-            None => {
-                loaded = root(store, scope, manifest.root()).await?;
-                &loaded
-            }
+    prepared: Option<ContentRef>,
+) -> Result<(Vec<ContentRef>, std::collections::BTreeSet<String>), Error> {
+    use std::collections::BTreeSet;
+    let needs_receipts = policy
+        .compute_rules()
+        .any(|rule| !rule.repos.is_empty() && rule.matches(manifest, None));
+    let mut receipts = vec![];
+    let mut closure = vec![];
+    if prepared.is_some() || needs_receipts {
+        let bytes = if manifest.model().is_some() {
+            root(store, scope, manifest.root()).await?
+        } else {
+            bytes::Bytes::new()
         };
-        if ContentId::hash(bytes) != manifest.root() {
-            return Err(Error::Denied);
-        }
-        let model = Environment::from_canonical_bytes(bytes)
-            .map_err(|_| Error::Invalid("compute root"))?
-            .model;
-        let mut files = std::collections::BTreeMap::new();
-        for asset in &model.assets {
-            if let std::collections::btree_map::Entry::Vacant(entry) = files.entry(asset.object) {
-                let origins = store
-                    .verified_hub_files(asset.object)
-                    .await?
-                    .into_iter()
-                    .map(|(repo, _, _)| {
-                        HubRepo::try_from(repo).map_err(|_| Error::Invalid("stored Hub repo"))
-                    })
-                    .collect::<Result<_, _>>()?;
-                entry.insert(origins);
+        let (objects, model) = policy
+            .content_closure(manifest, &bytes, prepared)
+            .map_err(|_| Error::Invalid("invalid program content closure"))?;
+        closure = objects;
+        if needs_receipts {
+            let model = model.ok_or(Error::Denied)?;
+            for object in model
+                .assets
+                .into_iter()
+                .map(|asset| asset.object)
+                .collect::<BTreeSet<_>>()
+            {
+                receipts.push(
+                    store
+                        .verified_hub_files(object)
+                        .await?
+                        .into_iter()
+                        .map(|(repo, _, _)| repo)
+                        .collect(),
+                );
             }
         }
-        Some(ModelOrigins::new(&model, &files).map_err(|_| Error::Denied)?)
-    } else {
-        None
-    };
-    if !policy.admits_manifest(manifest, origins.as_ref()) {
-        return Err(Error::Denied);
     }
-    Ok(policy.pure_setup_entries(manifest, origins.as_ref()))
+    Ok((
+        closure,
+        policy
+            .admitted_setup(manifest, &receipts)
+            .ok_or(Error::Denied)?,
+    ))
 }
 pub async fn read(
     store: &LocalStore,
@@ -74,15 +165,27 @@ pub async fn read(
         .open_verified(scope, object, None)
         .await?
         .ok_or(Error::Missing)?;
-    read_reader(reader, object, &store.ram_pool()).await
+    reader.read_all(object, &store.ram_pool()).await
 }
 
-pub(crate) async fn read_reader(
-    reader: hellas_store::content::VerifiedReader,
+/// Host-side work staging may read this reservation's as-yet-unpublished disk objects.
+pub(crate) async fn read_staged(
+    store: &LocalStore,
+    scope: &Scope,
     object: ContentRef,
-    pool: &hellas_store::content::Reservations,
+    maximum: u64,
 ) -> Result<bytes::Bytes, Error> {
-    reader.read_all(object, pool).await
+    let LocalStore::Disk(node) = store else {
+        return read(store, scope, object, maximum).await;
+    };
+    if object.bytes() > maximum {
+        return Err(Error::Invalid("application content byte limit"));
+    }
+    node.open_staged(scope, object)
+        .await?
+        .ok_or(Error::Missing)?
+        .read_all(object, &store.ram_pool())
+        .await
 }
 
 pub fn object_pin(object: ContentRef) -> Result<PinTarget, Error> {
@@ -93,21 +196,21 @@ pub fn object_pin(object: ContentRef) -> Result<PinTarget, Error> {
 }
 
 pub async fn root(store: &LocalStore, scope: &Scope, id: ContentId) -> Result<bytes::Bytes, Error> {
-    let object = if let ScopeKind::Work { closure, .. } = &scope.kind {
-        *closure
+    if let ScopeKind::Work { closure, .. } = &scope.kind {
+        let object = *closure
             .iter()
             .find(|object| object.id() == id)
-            .ok_or(Error::Missing)?
-    } else {
-        let at =
-            hellas_store::content::Path::new(PinName::new(format!("object/{id}"))?, String::new())?;
-        store
-            .stat(scope, &at)
-            .await?
-            .ok_or(Error::Missing)?
-            .target
-            .object()
-    };
+            .ok_or(Error::Missing)?;
+        return read_staged(store, scope, object, MAX_PROGRAM_ROOT_BYTES as u64).await;
+    }
+    let at =
+        hellas_store::content::Path::new(PinName::new(format!("object/{id}"))?, String::new())?;
+    let object = store
+        .stat(scope, &at)
+        .await?
+        .ok_or(Error::Missing)?
+        .target
+        .object();
     read(store, scope, object, MAX_PROGRAM_ROOT_BYTES as u64).await
 }
 

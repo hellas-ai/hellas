@@ -289,22 +289,29 @@ pub fn invocation_request(nonce: u8) -> InvocationRequest {
     bundle(nonce).request
 }
 pub fn bundle(nonce: u8) -> PreparedInvocation {
+    bundle_for(&manifest(), &work_policy(), nonce)
+}
+pub fn bundle_for(
+    manifest: &ProgramManifest,
+    policy: &InvocationPolicy,
+    nonce: u8,
+) -> PreparedInvocation {
     let input = InvocationInput {
         artifacts: vec![],
         parameters: JsonBytes(plan().canonical_bytes().unwrap()),
     };
     PreparedInvocation::new(
         InvocationRequest {
-            execution_environment: manifest().content_id(),
+            execution_environment: manifest.content_id(),
             input: input.content_id().unwrap(),
             runner_public_key: PublicKey::Secp256k1(provider().party_key().to_bytes()),
             nonce: [nonce; 32],
             assurance: Assurance::ProducerSigned,
             retain: true,
         },
-        &manifest(),
+        manifest,
         input,
-        work_policy().canonical_bytes().unwrap(),
+        policy.canonical_bytes().unwrap(),
     )
     .unwrap()
 }
@@ -1253,14 +1260,11 @@ pub async fn repo_model(
 }
 pub fn repo_policy() -> InvocationPolicy {
     let mut policy = work_policy();
-    policy.admissions = vec![Admission::Compute {
-        rules: vec![hellas_rpc::protocol::invocation::Match {
-            repos: vec![
-                "org/base".to_owned().try_into().unwrap(),
-                "org/voices".to_owned().try_into().unwrap(),
-            ],
+    policy.admissions = vec![Admission::Compute(
+        hellas_rpc::protocol::invocation::Match {
+            repos: vec!["org/base".into(), "org/voices".into()],
             ..Default::default()
-        }],
-    }];
+        },
+    )];
     policy
 }

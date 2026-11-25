@@ -90,7 +90,7 @@ impl Qwen3 {
         let metadata_path = path.clone();
         let (config, views, object, source, states, decisions) =
             tokio::task::spawn_blocking(move || -> Result<_> {
-                let path = metadata_path.as_ref().as_ref();
+                let path = metadata_path.metadata();
                 let (config, views) = metadata(path, &header)?;
                 let decisions = is_decision(path)?
                     .then(|| Decisions::read(path, usize::MAX))

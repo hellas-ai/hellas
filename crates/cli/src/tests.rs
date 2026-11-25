@@ -58,7 +58,10 @@ fn image_cli_and_gateway_surfaces_are_available() {
         "512",
     ])
     .unwrap();
-    assert!(matches!(image.command, Commands::Image(_)));
+    assert!(matches!(
+        image.command,
+        Commands::Job(crate::commands::transact::JobCommand::Image(_))
+    ));
 }
 
 #[cfg(unix)]

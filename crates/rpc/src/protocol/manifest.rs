@@ -89,11 +89,8 @@ pub enum ApplicationError {
 
 /// One application-owned, content-addressed execution environment.
 ///
-/// The application defines the meaning of `root`. For example, Catena causal
-/// LM roots exclude tokenizers, chat templates, decoding, and other
-/// presentation policy. An attested Fetch application instead includes its
-/// exact request structuring and response destructuring because those steps are
-/// trusted computation.
+/// Compute binds the environment root and complete model ID. Fetch binds the
+/// request and response contract in its application root.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProgramManifest {
     application: Application,
@@ -125,20 +122,11 @@ impl ProgramManifest {
 
     /// Binds an exact application identity to its application-owned root.
     #[must_use]
-    pub const fn new(application: Application, root: ContentId) -> Self {
+    pub const fn new(application: Application, root: ContentId, model: Option<ContentId>) -> Self {
         Self {
             application,
             root,
-            model: None,
-        }
-    }
-
-    /// Bind a model identity alongside the exact executable root.
-    pub const fn with_model(application: Application, root: ContentId, model: ContentId) -> Self {
-        Self {
-            application,
-            root,
-            model: Some(model),
+            model,
         }
     }
 
@@ -209,17 +197,7 @@ impl ProgramManifest {
 
         let application = Application::new(evaluator, adaptor)
             .map_err(|error| CanonicalDecodeError::new(error.to_string()))?;
-        let manifest = Self {
-            application,
-            root,
-            model,
-        };
-        if manifest.canonical_bytes() != bytes {
-            return Err(CanonicalDecodeError::new(
-                "program manifest is not in canonical DAG-CBOR form",
-            ));
-        }
-        Ok(manifest)
+        Ok(Self::new(application, root, model))
     }
 
     /// Returns the Xet content identifier of the canonical manifest bytes.

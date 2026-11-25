@@ -119,7 +119,8 @@ fn options(name: &str) -> crate::Route {
         modality: hellas_client::model::ModelKind::Transcription,
         model: name.into(),
         package: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../client/src/model/whisper/mini"),
+            .join("../client/src/model/whisper/mini")
+            .into(),
         max_tokens: 4,
     })
 }

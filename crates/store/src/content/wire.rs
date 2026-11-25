@@ -174,10 +174,10 @@ pub(crate) fn source(source: Source) -> pb::Source {
                 sha256: sha256.map(|hash| hash.to_vec()),
                 bytes,
             }),
-            Source::HfXet { repo, commit, path } => Kind::HfXet(pb::HfXet {
+            Source::HfXet { repo, path } => Kind::HfXet(pb::HfXet {
                 repo: repo.id,
                 dataset: repo.kind == crate::hf::RepoKind::Dataset,
-                commit,
+                commit: repo.revision,
                 path,
             }),
         }),
@@ -232,14 +232,13 @@ pub(crate) fn source_from(source: pb::Source) -> Result<Source> {
         Kind::HfXet(source) => Source::HfXet {
             repo: crate::hf::Repo {
                 id: source.repo,
-                revision: source.commit.clone(),
+                revision: source.commit,
                 kind: if source.dataset {
                     crate::hf::RepoKind::Dataset
                 } else {
                     crate::hf::RepoKind::Model
                 },
             },
-            commit: source.commit,
             path: source.path,
         },
     })

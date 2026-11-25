@@ -1,5 +1,6 @@
 use super::*;
 use hellas_auth::Signature;
+use std::fs;
 
 #[test]
 fn creates_and_reloads_one_identity() {

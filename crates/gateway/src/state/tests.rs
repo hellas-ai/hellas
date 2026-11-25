@@ -17,7 +17,7 @@ async fn open(work: Arc<dyn WorkExecutionBackend>) -> TextState {
             crate::Presentation::Model {
                 modality: hellas_client::model::ModelKind::Text,
                 model: "mini-qwen3".into(),
-                package: text_model(),
+                package: text_model().into(),
                 max_tokens: 128,
             },
         )
@@ -724,7 +724,7 @@ async fn test_router(
         vec![crate::test_support::route(crate::Presentation::Model {
             modality: hellas_client::model::ModelKind::Text,
             model: name.into(),
-            package,
+            package: package.into(),
             max_tokens: 128,
         })],
         work,

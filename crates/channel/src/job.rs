@@ -306,25 +306,9 @@ pub fn content_closure(
     program_root: &[u8],
     prepared: ContentRef,
 ) -> Result<Vec<ContentRef>, PaidWorkError> {
-    let mut objects = std::collections::BTreeMap::new();
-    for object in policy
-        .content_closure(manifest, program_root)?
-        .into_iter()
-        .chain([prepared])
-    {
-        if objects
-            .insert(object.id(), object.bytes())
-            .is_some_and(|bytes| bytes != object.bytes())
-        {
-            return Err(PaidWorkError::Mismatch {
-                field: "content closure length",
-            });
-        }
-    }
-    Ok(objects
-        .into_iter()
-        .map(|(id, bytes)| ContentRef::new(id, bytes))
-        .collect())
+    Ok(policy
+        .content_closure(manifest, program_root, Some(prepared))?
+        .0)
 }
 
 /// Verify the content opening against an authenticated paid or grant proposal.
@@ -349,14 +333,14 @@ pub fn check_content_opening(
             field: "prepared input length",
         });
     }
-    let root = match &opening.root {
-        Some(root)
+    let root = match (&opening.root, manifest.model()) {
+        (Some(root), Some(_))
             if root.id.as_slice() == manifest.root().as_bytes()
                 && root.bytes <= crate::content::MAX_PROGRAM_ROOT_BYTES as u64 =>
         {
             Some(ContentRef::new(manifest.root(), root.bytes))
         }
-        None if policy.content_closure(&manifest, &[]).is_ok() => None,
+        (None, None) => None,
         _ => {
             return Err(PaidWorkError::Mismatch {
                 field: "signed program root",

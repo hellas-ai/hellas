@@ -61,7 +61,6 @@ async fn acquire_response(response: Response) {
             &Scope::Owner,
             Source::HfXet {
                 repo: repo(crate::hf::RepoKind::Model),
-                commit: "a".repeat(40),
                 path: Some("model.safetensors".into()),
             },
             Some(object),

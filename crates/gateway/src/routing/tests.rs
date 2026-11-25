@@ -97,7 +97,7 @@ fn order_of(mut selection: Selection) -> Vec<String> {
 #[tokio::test]
 async fn discovery_lists_models_from_native_and_fetch_routes_once() {
     use axum::{body::Body, http::Request};
-    use hellas_client::model::{GpuDialect, ModelPackage, evaluator};
+    use hellas_client::model::{GpuDialect, ModelSpec, evaluator};
     use tower::ServiceExt;
     let path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../client/src/model/whisper/mini");
@@ -105,15 +105,16 @@ async fn discovery_lists_models_from_native_and_fetch_routes_once() {
         backends: vec!["a".into()],
         presentation: Presentation::Model {
             model: "speech".into(),
-            package: path.clone(),
+            package: path.clone().into(),
             modality: hellas_client::model::ModelKind::Transcription,
             max_tokens: 1,
         },
     };
-    let packages = ModelPackage::open_many(&path, [evaluator(GpuDialect::Hip)], None)
+    let packages = ModelSpec::from(path.as_path())
+        .open_many([evaluator(GpuDialect::Hip)], None)
         .await
         .unwrap();
-    let models = [(path, Ok(packages))].into();
+    let models = [(path.into(), Ok(packages))].into();
     let (router, errors) = crate::router::with_models(
         vec![
             native,
@@ -413,7 +414,7 @@ async fn compute_is_rendered_for_each_selected_evaluator() {
         presentation: Presentation::Model {
             modality: hellas_client::model::ModelKind::Text,
             model: "tiny".into(),
-            package: path.clone(),
+            package: path.clone().into(),
             max_tokens: 1,
         },
     };

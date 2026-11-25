@@ -2,30 +2,16 @@ use super::*;
 use crate::test_support::{compute::Compute, ids};
 use hellas_channel::test_support::actors::*;
 
-async fn compute_node(path: &std::path::Path, oversized: bool) -> (TestNode, Proposal) {
-    compute_node_with_policy(
-        path,
-        oversized,
-        hellas_channel::test_support::channel::work_policy(),
-    )
-    .await
-}
+use hellas_channel::test_support::channel::{manifest, work_policy};
 
-async fn compute_node_with_policy(
+async fn compute_node(
     path: &std::path::Path,
-    oversized: bool,
     policy: hellas_rpc::protocol::invocation::InvocationPolicy,
-) -> (TestNode, Proposal) {
+) -> TestNode {
     let compute = Compute;
     let mut allowance = compute.allowance(ids::ALLOWANCE, FRIEND);
     allowance.definition.policies[0].invocation_policy = policy;
-    if oversized {
-        allowance.definition.policies[0]
-            .invocation_policy
-            .limits
-            .max_output_bytes = 64 << 20;
-    }
-    let node = Node::bootstrap(path)
+    Node::bootstrap(path)
         .with_capacity(Capacity::new(4))
         .with_allowance(allowance)
         .with_grant(
@@ -39,15 +25,14 @@ async fn compute_node_with_policy(
                 .build(),
         )
         .build()
-        .await;
-    let proposal = compute.proposal(&node, FRIEND, ids::ALLOWANCE, 1);
-    (node, proposal)
+        .await
 }
 
 #[tokio::test]
 async fn small_compute_grant_runs_and_settles_one_request_without_tokens_or_device_time() {
     let directory = tempfile::tempdir().unwrap();
-    let (node, proposal) = compute_node(directory.path(), false).await;
+    let node = compute_node(directory.path(), work_policy()).await;
+    let proposal = Compute.proposal(&node, FRIEND, ids::ALLOWANCE, 1, &manifest());
     let private_input = proposal.input.canonical_bytes().unwrap();
     let backend = Backend {
         signer: Arc::new(PROVIDER.node_key()),
@@ -107,7 +92,10 @@ async fn small_compute_grant_runs_and_settles_one_request_without_tokens_or_devi
 #[tokio::test]
 async fn oversized_compute_grant_is_refused_before_reserving_capacity_or_journaling_acceptance() {
     let directory = tempfile::tempdir().unwrap();
-    let (node, proposal) = compute_node(directory.path(), true).await;
+    let mut policy = work_policy();
+    policy.limits.max_output_bytes = 64 << 20;
+    let node = compute_node(directory.path(), policy).await;
+    let proposal = Compute.proposal(&node, FRIEND, ids::ALLOWANCE, 1, &manifest());
     let backend = Backend {
         signer: Arc::new(PROVIDER.node_key()),
         ..Backend::default()
@@ -156,7 +144,7 @@ async fn unseen_grant_program_closure_reaches_only_the_ram_backend_and_never_fil
     use hellas_rpc::protocol::invocation::compute::{Environment, NamedAsset};
     use hellas_store::content::{ContentStore as _, Cursor, Scope};
     let directory = tempfile::tempdir().unwrap();
-    let (node, mut proposal) = compute_node(directory.path(), false).await;
+    let node = compute_node(directory.path(), work_policy()).await;
     let source = b"grant-private-program-source-7321".to_vec();
     let asset = b"grant-private-asset-body-9362".to_vec();
     let environment = Environment {
@@ -171,7 +159,7 @@ async fn unseen_grant_program_closure_reaches_only_the_ram_backend_and_never_fil
     let manifest = environment
         .manifest(&hellas_channel::test_support::channel::evaluator())
         .unwrap();
-    bind_manifest(&mut proposal, &manifest);
+    let proposal = Compute.proposal(&node, FRIEND, ids::ALLOWANCE, 1, &manifest);
     let prepared = proposal.input.canonical_bytes().unwrap();
     let objects = vec![source, asset, root.clone(), prepared];
     let expected = objects.clone();
@@ -310,30 +298,6 @@ async fn unseen_grant_program_closure_reaches_only_the_ram_backend_and_never_fil
     no_closure_payloads_on_disk(directory.path(), &objects);
 }
 
-fn bind_manifest(proposal: &mut Proposal, manifest: &hellas_rpc::ProgramManifest) {
-    let mut invocation_request = proposal.input.request.clone();
-    invocation_request.execution_environment = manifest.content_id();
-    proposal.input = hellas_rpc::protocol::invocation::PreparedInvocation::new(
-        invocation_request,
-        manifest,
-        proposal.input.input.clone(),
-        proposal.input.application_policy.0.clone(),
-    )
-    .unwrap();
-    proposal.authorization.environment_commitment = manifest.content_id();
-    proposal.authorization.input_content =
-        ContentRef::for_bytes(&proposal.input.canonical_bytes().unwrap());
-    proposal.authorization.prepared_input_digest =
-        hellas_channel::job::bound_prepared_input_digest(
-            network(),
-            proposal.authorization.channel_id.0,
-            &proposal.input,
-        )
-        .unwrap();
-    proposal.authorization.request_commitment = proposal.input.request.commitment().unwrap();
-    proposal.signature = FRIEND.node_key().sign_digest(proposal.work()).unwrap();
-}
-
 #[tokio::test]
 async fn grant_repo_admission_checks_all_assets_before_reserving() {
     use hellas_channel::test_support::channel::{
@@ -342,8 +306,7 @@ async fn grant_repo_admission_checks_all_assets_before_reserving() {
     use hellas_rpc::pb::content as pb;
     for extra in [ExtraAsset::None, ExtraAsset::Local, ExtraAsset::HubOnly] {
         let directory = tempfile::tempdir().unwrap();
-        let (mut node, mut proposal) =
-            compute_node_with_policy(directory.path(), false, repo_policy()).await;
+        let mut node = compute_node(directory.path(), repo_policy()).await;
         let probe = hellas_store::content::testing::AvailableHubFile::new(
             &mut node.content,
             "org/base",
@@ -352,7 +315,7 @@ async fn grant_repo_admission_checks_all_assets_before_reserving() {
         );
         let env = repo_model(&node.content, extra).await;
         let manifest = env.manifest(&evaluator()).unwrap();
-        bind_manifest(&mut proposal, &manifest);
+        let proposal = Compute.proposal(&node, FRIEND, ids::ALLOWANCE, 1, &manifest);
         let backend = Backend {
             finish: hellas_channel::test_support::backend::Completion::Immediate,
             signer: Arc::new(PROVIDER.node_key()),

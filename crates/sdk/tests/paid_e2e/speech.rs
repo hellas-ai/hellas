@@ -167,7 +167,7 @@ fn native_route(root: &std::path::Path) -> Route {
         presentation: Presentation::Speech {
             model: "mms".into(),
             target: hellas_gateway::SpeechTarget::Native {
-                package,
+                package: package.into(),
                 voices: vec![],
             },
         },

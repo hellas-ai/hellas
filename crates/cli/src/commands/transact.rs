@@ -3,6 +3,7 @@ use anyhow::{Context as _, bail, ensure};
 use clap::Args;
 use futures::TryFutureExt as _;
 use hellas_auth::authority::ResourceId;
+use hellas_client::model::{ComputeJob, ModelPackage, ModelResponse};
 use hellas_rpc::Assurance;
 use hellas_sdk::BackendState;
 use hellas_sdk::{
@@ -22,18 +23,56 @@ use std::{
 mod client;
 mod run;
 mod transcribe;
-pub use run::{RunArgs, run as run_program};
-pub use transcribe::{TranscribeArgs, transcribe};
+use run::RunArgs;
+use transcribe::TranscribeArgs;
 mod image;
-pub use image::{ImageArgs, image};
+use image::ImageArgs;
 mod text;
-pub use text::{TextArgs, text};
+use text::TextArgs;
 mod speak;
-pub use speak::{SpeakArgs, speak};
+use speak::SpeakArgs;
 mod decide;
-pub use decide::{DecideArgs, decide};
+use decide::DecideArgs;
 #[cfg(test)]
 mod tests;
+
+#[derive(clap::Subcommand)]
+pub enum JobCommand {
+    /// Execute a reusable job folder, or settle its provider channels.
+    Transact(TransactArgs),
+    /// Buy an HTTPS Fetch using the same job and payment path.
+    Fetch(FetchArgs),
+    /// Buy one call of a Catena program using the same job and payment path.
+    Run(RunArgs),
+    /// Synthesize a WAV with a client-rendered speech job.
+    Speak(SpeakArgs),
+    /// Transcribe one WAV with a client-rendered Whisper job.
+    Transcribe(TranscribeArgs),
+    /// Answer one prompt with a client-rendered Qwen text job.
+    Text(TextArgs),
+    /// Answer one decision request with a client-rendered d1 job.
+    Decide(DecideArgs),
+    /// Generate one PNG with a client-rendered Flux job.
+    Image(ImageArgs),
+}
+impl JobCommand {
+    pub async fn run(self, context: Context) -> super::CliResult<()> {
+        context
+            .command(async {
+                match self {
+                    Self::Transact(args) => run(args, &context).await,
+                    Self::Run(args) => run::run(args, &context).await,
+                    Self::Fetch(args) => fetch(args, &context).await,
+                    Self::Speak(args) => speak::speak(args, &context).await,
+                    Self::Transcribe(args) => transcribe::transcribe(args, &context).await,
+                    Self::Text(args) => text::text(args, &context).await,
+                    Self::Decide(args) => decide::decide(args, &context).await,
+                    Self::Image(args) => image::image(args, &context).await,
+                }
+            })
+            .await
+    }
+}
 
 /// `ENROLLMENT_ID@NODE_ID`, optionally followed by `@IP:PORT`.
 #[derive(Clone, Debug)]
@@ -172,10 +211,6 @@ pub(super) struct TargetArgs {
     /// machine's GPU runtime.
     #[arg(long, value_name = "EVALUATOR")]
     backend: Option<String>,
-    /// The model files or packages a helper or the gateway renders jobs
-    /// from; local execution reads the jobs' weights from them.
-    #[arg(skip)]
-    pub(super) models: Vec<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -279,15 +314,13 @@ use hellas_sdk::home::select_attempt;
 use hellas_sdk::{home::select_policy, transact::PaidAttemptPath};
 
 /// One deadline for the whole command, from `--timeout`; without one, wait
-/// until it is done. The endpoints the command bound close however it ends,
-/// after the executor that borrowed them has finished.
+/// until it is done.
 async fn bounded<T>(
-    context: &Context,
     timeout: Option<Duration>,
     work: impl AsyncFnOnce(Option<tokio::time::Instant>) -> super::CliResult<T>,
 ) -> super::CliResult<T> {
     let deadline = timeout.map(|timeout| tokio::time::Instant::now() + timeout);
-    let result = work(deadline).await.map_err(|error| {
+    work(deadline).await.map_err(|error| {
         match (timeout, error.downcast_ref::<ExecutionError>()) {
             (Some(timeout), Some(ExecutionError::Stopped(RequestStopped::Deadline))) => {
                 anyhow::anyhow!(
@@ -296,9 +329,7 @@ async fn bounded<T>(
             }
             _ => error,
         }
-    });
-    context.close().await;
-    result
+    })
 }
 
 /// Preparation under the command's deadline.
@@ -320,105 +351,117 @@ struct ResolvedBackend {
     attempt: Option<PathBuf>,
 }
 
-impl TargetArgs {
-    fn resolve_model_peer(
-        &self,
-        client: &ClientArgs,
-        context: &Context,
-        model: &mut PathBuf,
-    ) -> super::CliResult<()> {
-        let Some(uri) = model
-            .to_str()
-            .filter(|s| s.starts_with("hellas://") && !s.contains('@'))
-        else {
-            return Ok(());
-        };
-        let (node, mut addresses) = if let Some(access) = &self.access {
-            let holder =
-                hellas_auth::authority::NodeKey::from_public_key(context.producer.public_key())?;
-            let bundle = hellas_sdk::access_bundle::AccessBundle::load(
-                access,
-                &context.principal()?,
-                &holder,
-            )?;
-            let [offer] = bundle.offers.as_slice() else {
-                bail!("a job uses an access file with one offer")
-            };
-            let authority = offer.offer();
-            let node = hellas_sdk::client::ProviderAddress::of(&authority.provider)?.node;
-            let addresses = authority
-                .addresses
-                .iter()
-                .map(|s| s.parse::<SocketAddr>())
-                .collect::<Result<Vec<_>, _>>()?;
-            (node, addresses)
-        } else {
-            let provider = client.provider.as_ref().context(
-                "hellas://model-id needs an addressed provider or an explicit @NODE_ID[@IP:PORT]",
-            )?;
-            (provider.address.node, provider.addresses.clone())
-        };
-        addresses.extend(client.addresses.iter().copied());
-        let mut resolved = format!("{uri}@{node}");
-        for address in addresses {
-            resolved.push('@');
-            resolved.push_str(&address.to_string());
-        }
-        *model = resolved.into();
-        Ok(())
-    }
-
-    async fn open_model(
+/// Shared model selection, placement and payment flags for rendered jobs.
+#[derive(Debug, Args)]
+struct ModelArgs {
+    #[command(flatten)]
+    client: ClientArgs,
+    /// Local model path, Hub reference, or content-addressed model.
+    #[arg(long, value_name = "MODEL")]
+    model: PathBuf,
+    /// Pay the provider its quoted price per job, at most MAX.
+    #[arg(long, value_name = "MAX", requires = "provider", conflicts_with = "access", value_parser = clap::value_parser!(u64).range(1..))]
+    pay: Option<u64>,
+    #[command(flatten)]
+    target: TargetArgs,
+}
+impl ModelArgs {
+    async fn open(
         &mut self,
-        client: &ClientArgs,
         context: &Context,
-        path: &mut PathBuf,
-    ) -> super::CliResult<(String, Arc<hellas_client::model::ModelPackage>)> {
-        use hellas_client::model::{CatalogUnavailable, ModelPackage};
-        self.resolve_model_peer(client, context, path)?;
-        self.models = vec![path.clone()];
-        let evaluator = self.renderer()?;
-        let content = self.content(context).await?;
-        let package =
-            match ModelPackage::open_many(path, [evaluator.clone()], content.as_ref()).await {
-                Ok(mut packages) => packages
-                    .remove(&evaluator)
-                    .context("model evaluator is not prepared"),
-                Err(error) => {
-                    let Some(file) = self
-                        .access
-                        .as_ref()
-                        .filter(|_| error.is::<CatalogUnavailable>())
-                    else {
-                        return Err(error);
-                    };
-                    let uri = path
-                        .to_str()
-                        .and_then(|s| s.strip_prefix("hellas://"))
-                        .context("expected a model URI")?;
-                    let mut parts = uri.split('@');
-                    let id = parts.next().context("missing model id")?.parse()?;
-                    let node = parts.next().context("missing model provider")?.parse()?;
-                    let target = context
-                        .target(self.access_spec(
-                            file.clone(),
-                            client,
-                            context,
-                            Assurance::ProducerSigned,
-                        )?)
-                        .await?;
-                    let BackendState::Grant(grant) = target.state else {
-                        unreachable!("access selects a grant")
-                    };
-                    let store = grant.options.model_content(node, &grant.transport).await?;
-                    Ok(Arc::new(
-                        ModelPackage::open_peer(id, store, &evaluator).await?,
-                    ))
+        companions: Option<&crate::hub::Companions>,
+    ) -> super::CliResult<Arc<ModelPackage>> {
+        use hellas_client::model::{CatalogUnavailable, ModelPackage, peer_locator};
+        let spec = companions.map_or_else(|| self.model.clone().into(), |c| c.spec(&self.model));
+        let mut pinned = crate::hub::Revisions::default().pin_spec(&spec).await?;
+        let evaluator = self.target.renderer()?;
+        let mut private = None;
+        if let Some(uri) = hellas_client::model::peer_uri(&pinned.model) {
+            let (id, address) = peer_locator(uri)?;
+            let mut bare_contact = None;
+            if let Some(file) = &self.target.access {
+                let spec = self.target.access_spec(
+                    file.clone(),
+                    &self.client,
+                    context,
+                    Assurance::ProducerSigned,
+                )?;
+                let BackendState::Grant(grant) = context.target(spec).await?.state else {
+                    unreachable!("access selects a grant")
+                };
+                let offer = grant.options.target.offer();
+                let node = hellas_sdk::client::ProviderAddress::of(&offer.provider)?.node;
+                if address.is_none() {
+                    bare_contact = Some((node, offer.addresses.clone()));
                 }
-            }?;
-        Ok((evaluator, package))
+                if address.as_ref().is_none_or(|peer| peer.id == node) {
+                    private = Some((id, node, grant));
+                }
+            } else if let Some(provider) = &self.client.provider {
+                bare_contact = Some((
+                    provider.address.node,
+                    provider.addresses.iter().map(ToString::to_string).collect(),
+                ));
+            }
+            if address.is_none() {
+                let (node, mut ips) = bare_contact.context("hellas://model-id needs an addressed provider or an explicit @NODE_ID[@IP:PORT]")?;
+                ips.extend(self.client.addresses.iter().map(ToString::to_string));
+                pinned.model = std::iter::once(format!("{uri}@{node}"))
+                    .chain(ips)
+                    .collect::<Vec<_>>()
+                    .join("@")
+                    .into();
+            }
+        }
+        let content = self.target.content(context, Some(&pinned)).await?;
+        let package = match (pinned.open(&evaluator, content.as_ref()).await, private) {
+            (Err(error), Some((id, node, grant))) if error.is::<CatalogUnavailable>() => {
+                let store = grant.options.model_content(node, &grant.transport).await?;
+                ModelPackage::open_peer(id, store, &evaluator).await?
+            }
+            (result, _) => result?,
+        };
+        Ok(Arc::new(package))
     }
 
+    async fn run(
+        self,
+        context: &Context,
+        package: &ModelPackage,
+        job: ComputeJob,
+        evidence: impl FnOnce(&Path) -> Option<PathBuf>,
+        show: impl FnOnce(ModelResponse) -> super::CliResult<()> + Send,
+    ) -> super::CliResult<()> {
+        let evaluator = self.target.renderer()?;
+        run_quoted(
+            &self.client,
+            self.target,
+            context,
+            self.pay,
+            None,
+            async |price| {
+                Ok(Job::compute(
+                    price,
+                    evaluator,
+                    job.environment,
+                    job.plan,
+                    job.inputs,
+                    job.content,
+                )
+                .await?)
+            },
+            evidence,
+            |_, completed, _| {
+                show(package.decode(&completed.output)?)?;
+                std::io::stdout().lock().flush()?;
+                Ok(())
+            },
+        )
+        .await
+    }
+}
+
+impl TargetArgs {
     fn access_spec(
         &self,
         file: PathBuf,
@@ -443,43 +486,28 @@ impl TargetArgs {
     async fn content(
         &self,
         context: &Context,
+        model: Option<&hellas_client::model::ModelSpec>,
     ) -> super::CliResult<Option<hellas_store::content::DiskStore>> {
         #[cfg(feature = "compute")]
         if self.local {
-            return Ok(Some(
-                context
-                    .local_content
-                    .get_or_try_init(|| async {
-                        let files =
-                            hellas_client::model::ModelFiles::resolve(self.models.clone()).await?;
-                        let store = crate::compute::content(
-                            &context.home,
-                            &self.native,
-                            &files.local,
-                            &files.hub,
-                        )
-                        .await?;
-                        for uri in self
-                            .models
-                            .iter()
-                            .filter_map(|p| p.to_str())
-                            .filter(|s| s.starts_with("hellas://"))
-                        {
-                            if let Err(error) =
-                                hellas_client::model::acquire_peer_model(uri, &store).await
-                            {
-                                store.close().await;
-                                return Err(error);
-                            }
-                        }
-                        Ok::<_, anyhow::Error>(store)
-                    })
-                    .await?
-                    .clone(),
-            ));
+            let store = context
+                .local_content
+                .get_or_try_init(|| async {
+                    let files = match model {
+                        Some(model) => model.files().await?,
+                        None => Default::default(),
+                    };
+                    crate::compute::content(&context.home, &self.native, &files.local, &files.hub)
+                        .await
+                })
+                .await?;
+            if let Some(uri) = model.and_then(|spec| hellas_client::model::peer_uri(&spec.model)) {
+                hellas_client::model::acquire_peer_model(uri, store).await?;
+            }
+            return Ok(Some(store.clone()));
         }
         #[cfg(not(feature = "compute"))]
-        let _ = context;
+        let _ = (context, model);
         Ok(None)
     }
 
@@ -515,7 +543,7 @@ impl TargetArgs {
         if self.local {
             ensure!(pay == 0, "local work is not paid; drop --pay");
             let content = self
-                .content(context)
+                .content(context, None)
                 .await?
                 .context("local content is not prepared")?;
             return Ok(ResolvedBackend {
@@ -577,33 +605,14 @@ impl ResolvedBackend {
         Ok((executor, provider))
     }
 
-    async fn close(self) -> super::CliResult<()> {
-        match self.backend.state {
-            BackendState::Paid(paid) => paid.options.content.close().await,
-            BackendState::Local { execution, .. } => execution.content.close().await,
-            BackendState::Unavailable(_) | BackendState::Fetch { .. } | BackendState::Grant(_) => {}
+    async fn close(self) {
+        if let BackendState::Paid(paid) = self.backend.state {
+            paid.options.content.close().await;
         }
-        Ok(())
     }
 }
 
 /// A rendered model job at `price`.
-async fn compute_job(
-    price: u64,
-    evaluator: String,
-    rendered: hellas_client::model::ComputeJob,
-) -> super::CliResult<Job> {
-    Ok(Job::compute(
-        price,
-        evaluator,
-        rendered.environment,
-        rendered.plan,
-        rendered.inputs,
-        rendered.content,
-    )
-    .await?)
-}
-
 /// Helper commands quote first: resolve the target, take its price (a paid
 /// provider's quote, at most `pay`), build the job at that price, save it
 /// (in `save`, or under the client state by digest) and run it once.
@@ -619,7 +628,7 @@ async fn run_quoted(
     evidence: impl FnOnce(&Path) -> Option<PathBuf>,
     present: impl FnOnce(&Job, &Completed, &str) -> super::CliResult<()> + Send,
 ) -> super::CliResult<()> {
-    bounded(context, client.timeout, async |deadline| {
+    bounded(client.timeout, async |deadline| {
         let mut target = within(
             deadline,
             target.resolve(client, context, pay.unwrap_or(0), Assurance::ProducerSigned),
@@ -650,7 +659,8 @@ async fn run_quoted(
             .await
         }
         .await;
-        result.and(target.close().await)
+        target.close().await;
+        result
     })
     .await
 }
@@ -666,7 +676,7 @@ async fn run_job(
     evidence: Option<&Path>,
     present: impl FnOnce(&Completed, &str) -> super::CliResult<()> + Send,
 ) -> super::CliResult<()> {
-    bounded(context, client.timeout, async |deadline| {
+    bounded(client.timeout, async |deadline| {
         let mut target = within(
             deadline,
             target.resolve(client, context, job.price(), job.assurance()),
@@ -682,7 +692,8 @@ async fn run_job(
             present,
         )
         .await;
-        result.and(target.close().await)
+        target.close().await;
+        result
     })
     .await
 }
@@ -732,11 +743,11 @@ async fn execute(
     Ok(())
 }
 
-pub async fn run(args: TransactArgs, context: Context) -> super::CliResult<()> {
+pub async fn run(args: TransactArgs, context: &Context) -> super::CliResult<()> {
     // Load every input before network activity or an owner approval.
     let Some(job) = args.job.as_deref() else {
-        return bounded(&context, args.client.timeout, async |deadline| {
-            within(deadline, client::settle(&args.client, &context)).await
+        return bounded(args.client.timeout, async |deadline| {
+            within(deadline, client::settle(&args.client, context)).await
         })
         .await;
     };
@@ -745,7 +756,7 @@ pub async fn run(args: TransactArgs, context: Context) -> super::CliResult<()> {
     run_job(
         &args.client,
         args.target,
-        &context,
+        context,
         &job,
         output,
         |completed, provider| present_job(&job, completed, provider, output),
@@ -777,15 +788,15 @@ fn present_job(
     Ok(())
 }
 
-pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
+pub async fn fetch(args: FetchArgs, context: &Context) -> super::CliResult<()> {
     let mut request = args.request()?;
     let contract = args.contract()?;
     let assurance = args.assurance();
     let target = args.target;
-    bounded(&context, args.client.timeout, async |deadline| {
+    bounded(args.client.timeout, async |deadline| {
         let mut target = within(
             deadline,
-            target.resolve(&args.client, &context, args.pay.unwrap_or(0), assurance),
+            target.resolve(&args.client, context, args.pay.unwrap_or(0), assurance),
         )
         .await?;
         let result = async {
@@ -838,7 +849,7 @@ pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
             eprintln!("job: {}", directory.display());
             execute(
                 &args.client,
-                &context,
+                context,
                 &mut target,
                 &job,
                 deadline,
@@ -859,7 +870,8 @@ pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
             .await
         }
         .await;
-        result.and(target.close().await)
+        target.close().await;
+        result
     })
     .await
 }
@@ -1027,4 +1039,56 @@ fn wording(provider: &str, job: &Job, completed: &Completed) -> String {
         job.manifest().application().evaluator(),
         job.manifest().application().adaptor(),
     )
+}
+
+#[cfg(test)]
+async fn check_rendered_plan(
+    job: &ComputeJob,
+    max_steps: u64,
+    invalidate: impl FnOnce(&mut hellas_rpc::protocol::invocation::compute::Plan),
+) {
+    let object = job.environment.sources[0];
+    let source = hellas_channel::content::read(
+        &job.content.0,
+        &job.content.1,
+        object,
+        hellas_rpc::protocol::invocation::compute::MAX_SOURCE_BYTES,
+    )
+    .await
+    .unwrap();
+    let source = String::from_utf8(source.to_vec()).unwrap();
+    let module = hellas_executor::catena::compile::compile_sources(
+        &[source],
+        catena_lang::codegen::GpuDialect::Hip,
+    )
+    .unwrap();
+    let inputs = job
+        .inputs
+        .iter()
+        .map(|a| {
+            (
+                a.name.clone(),
+                hellas_rpc::ContentRef::for_bytes(a.bytes.as_bytes()),
+            )
+        })
+        .collect();
+    let limits = hellas_rpc::protocol::invocation::Limits {
+        max_upload_bytes: 4 << 20,
+        max_output_bytes: 1 << 20,
+        max_steps,
+        execution_timeout_ms: 90000,
+    };
+    let validate = |plan| {
+        hellas_executor::catena::validate::validate(
+            &module,
+            &job.environment,
+            &inputs,
+            plan,
+            &limits,
+        )
+    };
+    validate(&job.plan).unwrap();
+    let mut invalid = job.plan.clone();
+    invalidate(&mut invalid);
+    assert!(validate(&invalid).is_err());
 }

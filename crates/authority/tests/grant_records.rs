@@ -305,16 +305,14 @@ fn available_renderer_is_signed_independently_of_a_model_only_rule() {
         model: Some(ContentId::hash(b"model")),
         ..Default::default()
     };
-    policy.invocation_policy.admissions = vec![Admission::Compute {
-        rules: vec![rule.clone()],
-    }];
+    policy.invocation_policy.admissions = vec![Admission::Compute(rule.clone())];
     let signed = SignedOffer::sign(offer, &principal(1).1).unwrap();
     let decoded = SignedOffer::decode(&signed.encode().unwrap(), UnixMillis(1000)).unwrap();
     let policy = &decoded.offer().grant.policies[0];
     assert_eq!(policy.render_evaluators(), ["provider-cuda"].into());
     assert_eq!(
         policy.invocation_policy.admissions,
-        [Admission::Compute { rules: vec![rule] }]
+        [Admission::Compute(rule)]
     );
 }
 

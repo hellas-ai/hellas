@@ -564,7 +564,6 @@ async fn hub_provenance_requires_a_verified_file_at_an_immutable_revision() {
             &Scope::Owner,
             Source::HfXet {
                 repo: repo(crate::hf::RepoKind::Model),
-                commit: sha.clone(),
                 path: Some("config.json".into()),
             },
             Some(config),
@@ -619,7 +618,6 @@ async fn lfs_without_xet_id_requires_matching_sha_and_canonical_content() {
                 &Scope::Owner,
                 Source::HfXet {
                     repo: repo(crate::hf::RepoKind::Model),
-                    commit: revision.clone(),
                     path: Some("weights.bin".into()),
                 },
                 Some(expected),

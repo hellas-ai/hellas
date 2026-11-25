@@ -13,8 +13,28 @@ pub(crate) struct Staged {
     data: Data,
     chunks: Vec<Chunk>,
 }
+pub(super) fn validate_https(url: &url::Url) -> Result<()> {
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(Error::Invalid("HTTPS source URL"));
+    }
+    Ok(())
+}
+
 fn finish(mut bytes: Buffer, expected: Option<ContentRef>) -> Result<Staged> {
     let chunks = bytes.canonical()?;
+    indexed_stage(bytes, expected, chunks)
+}
+
+fn indexed_stage(
+    bytes: Buffer,
+    expected: Option<ContentRef>,
+    chunks: Vec<Chunk>,
+) -> Result<Staged> {
     let object = ContentRef::new(
         ContentId::from_bytes(hellas_xet::file_hash(&chunks).into_bytes()),
         bytes.len(),
@@ -74,14 +94,7 @@ pub(crate) async fn memory(
 ) -> Result<Acquisition> {
     match source {
         Source::Https { url, sha256, bytes } => {
-            if url.scheme() != "https"
-                || url.host_str().is_none()
-                || !url.username().is_empty()
-                || url.password().is_some()
-                || url.fragment().is_some()
-            {
-                return Err(Error::Invalid("HTTPS source URL"));
-            }
+            validate_https(&url)?;
             if expect.is_some_and(|expect| expect.bytes() != bytes) {
                 return Err(Error::Invalid("source length contract"));
             }
@@ -97,8 +110,8 @@ pub(crate) async fn memory(
                     return Err(Error::Invalid("HTTPS response status"));
                 }
                 let mut body = Buffer::new(&core, bytes, charge)?;
-                body.fill(response.into_body().into_reader(), sha256, &core.pool)?;
-                finish(body, expect)
+                let chunks = body.fill(response.into_body().into_reader(), sha256, &core.pool)?;
+                indexed_stage(body, expect, chunks)
             })
             .await
             .map_err(|_| Error::Invalid("acquisition worker failed"))??;
@@ -138,26 +151,27 @@ pub(crate) async fn memory(
             }
             peer(store, scope, &remote, &at, root, pin, requester).await
         }
-        Source::HfXet { repo, commit, path } => {
+        Source::HfXet { repo, path } => {
             repo.validate().map_err(hf_error)?;
-            if !crate::hf::immutable_sha(&commit) || repo.revision != commit {
+            if !crate::hf::immutable_sha(&repo.revision) {
                 return Err(Error::Invalid("HF immutable commit"));
             }
             if let Some(path) = &path {
                 super::tree::validate_path(path, false)?;
             }
             let core = store.clone();
-            let repo_id = repo.id.clone();
-            let model_repo = repo.kind == crate::hf::RepoKind::Model;
+            let source_repo = repo.clone();
             let (stages, root, files) = tokio::task::spawn_blocking(move || {
-                let cas = core.hf(repo);
+                let cas = core.hf(source_repo);
                 hf_stages(&cas, &core, path.as_deref(), expect, true)
             })
             .await
             .map_err(|_| Error::Invalid("HF worker failed"))??;
             let acquisition = publish(store, scope, stages, root, pin, requester).await?;
-            if model_repo {
-                store.record_hub_files(&repo_id, &commit, files).await?;
+            if repo.kind == crate::hf::RepoKind::Model {
+                store
+                    .record_hub_files(&repo.id, &repo.revision, files)
+                    .await?;
             }
             Ok(acquisition)
         }
@@ -166,7 +180,7 @@ pub(crate) async fn memory(
 async fn peer(
     store: &Core,
     scope: &Scope,
-    remote: &impl ContentStore,
+    remote: &dyn ContentStore,
     at: &Path,
     root: Target,
     pin: PinTarget,
@@ -237,11 +251,14 @@ impl DiskStore {
     /// Import a verified object through an already established peer connection.
     pub async fn acquire_peer_object(
         &self,
-        remote: &impl ContentStore,
+        remote: &dyn ContentStore,
         at: &Path,
         expect: ContentRef,
         pin: PinTarget,
     ) -> Result<()> {
+        if pin.holds(self, Target::Object(expect)).await? {
+            return Ok(());
+        }
         self.core
             .retry_capacity(&Scope::Owner, |core| {
                 let pin = pin.clone();
@@ -307,15 +324,15 @@ fn hf_file(
     if let Some(advertised) = advertised {
         cas.write_xet(advertised.id().digest(), file.size, &mut bytes, &core.pool)
             .map_err(hf_error)?;
+        finish(bytes, Some(advertised))
     } else {
-        let sha256 = file.lfs_sha256().map_err(hf_error)?;
-        bytes.fill(
+        let chunks = bytes.fill(
             cas.small_file(&file.path).map_err(hf_error)?,
-            sha256,
+            file.lfs_sha256().map_err(hf_error)?,
             &core.pool,
         )?;
+        indexed_stage(bytes, expect, chunks)
     }
-    finish(bytes, expect.or(advertised))
 }
 type HfStages = (
     BTreeMap<ContentId, Staged>,
@@ -347,12 +364,8 @@ fn hf_stages(
     }
     let mut leaves = BTreeMap::new();
     for file in &files {
-        let object = if let Some(hash) = &file.xet_hash {
-            ContentRef::new(
-                hash.parse()
-                    .map_err(|_| Error::Invalid("Hub Xet identity"))?,
-                file.size,
-            )
+        let object = if let Some(object) = file.advertised().map_err(hf_error)? {
+            object
         } else {
             let stage = hf_file(cas, file, core, &stages, None)?;
             let object = stage.object;
@@ -369,16 +382,10 @@ fn hf_stages(
     }
     if weights {
         for file in &files {
-            if let Some(hash) = &file.xet_hash {
-                let object = ContentRef::new(
-                    hash.parse()
-                        .map_err(|_| Error::Invalid("Hub Xet identity"))?,
-                    file.size,
-                );
-                if !stages.contains_key(&object.id()) {
-                    let stage = hf_file(cas, file, core, &stages, Some(object))?;
-                    stages.insert(object.id(), stage);
-                }
+            let object = leaves[&file.path];
+            if !stages.contains_key(&object.id()) {
+                let stage = hf_file(cas, file, core, &stages, Some(object))?;
+                stages.insert(object.id(), stage);
             }
         }
     }
@@ -442,7 +449,7 @@ impl Core {
         let resolving = repo.clone();
         let sha = tokio::task::spawn_blocking(move || {
             core.hf(resolving)
-                .resolve_revision(&core.pool)
+                .resolve_revision(false, &core.pool)
                 .map_err(hf_error)
         })
         .await

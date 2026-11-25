@@ -1,7 +1,7 @@
 use super::{Result, Runtime};
-use crate::daemon_config::Document;
 #[cfg(feature = "compute")]
-use crate::daemon_config::{BackendKind, ResourceKind};
+use crate::daemon_config::BackendKind;
+use crate::daemon_config::Document;
 #[cfg(feature = "compute")]
 use anyhow::Context as _;
 use hellas_client::model::ModelPackage;
@@ -18,7 +18,9 @@ pub(in crate::daemon) struct ModelIndex {
     hub: Vec<hellas_store::hf::PinnedFile>,
     models: Vec<(PathBuf, hellas_rpc::protocol::invocation::compute::Model)>,
 }
+#[derive(Default)]
 pub(super) struct Cached {
+    sources: hellas_client::model::ModelFiles,
     files: Files,
     packages: BTreeMap<String, Arc<ModelPackage>>,
 }
@@ -40,35 +42,29 @@ impl Runtime {
                 if evaluators.is_empty() {
                     return Err("model has no registered evaluator".into());
                 }
-                let files = if hellas_client::model::hf_uri(&path).is_some()
-                    || path.to_str().is_some_and(|s| s.starts_with("hellas://"))
-                {
-                    Files::new()
-                } else {
-                    let paths = hellas_client::model::ModelFiles::resolve([path.clone()])
-                        .await?
-                        .local;
-                    self.options.content.inspect_files(paths).await?
-                };
-                let cached = cache.entry(path.clone()).or_insert_with(|| Cached {
-                    files: Files::new(),
-                    packages: BTreeMap::new(),
-                });
-                if cached.files != files {
-                    cached.packages.clear();
-                    cached.files = files;
+                let cached = cache.entry(path.clone()).or_default();
+                let has_local = path.paths().any(hellas_client::model::is_local);
+                if has_local || cached.packages.is_empty() {
+                    let sources = path.files().await?;
+                    let files = self
+                        .options
+                        .content
+                        .inspect_files(sources.local.clone())
+                        .await?;
+                    if cached.files != files {
+                        cached.packages.clear();
+                        cached.files = files;
+                    }
+                    cached.sources = sources;
                 }
                 let missing = evaluators
                     .iter()
                     .filter(|evaluator| !cached.packages.contains_key(*evaluator))
                     .cloned()
                     .collect::<Vec<_>>();
-                if !missing.is_empty() {
-                    cached.packages.extend(
-                        ModelPackage::open_many(&path, missing, Some(&self.options.content))
-                            .await?,
-                    );
-                }
+                cached
+                    .packages
+                    .extend(path.open_many(missing, Some(&self.options.content)).await?);
                 Ok(cached
                     .packages
                     .iter()
@@ -79,7 +75,6 @@ impl Runtime {
             .await;
             models.insert(path, prepared.map_err(|error| error.to_string()));
         }
-        drop(cache);
         #[cfg(not(feature = "compute"))]
         return (models, BTreeMap::new());
         #[cfg(feature = "compute")]
@@ -89,50 +84,30 @@ impl Runtime {
                 let BackendKind::Local { content, .. } = &backend.kind else {
                     continue;
                 };
-                let mut paths = std::collections::BTreeSet::new();
-                paths.extend(
-                    document
-                        .routes
-                        .iter()
-                        .filter(|route| route.backends.contains(id))
-                        .filter_map(|route| {
-                            route.model_package().map(|(_, package)| package.clone())
-                        }),
-                );
-                paths.extend(
-                    document
-                        .resources
-                        .iter()
-                        .filter(|resource| resource.backend == *id)
-                        .filter_map(|resource| match &resource.kind {
-                            ResourceKind::Model { package, .. } => Some(package.clone()),
-                            _ => None,
-                        }),
-                );
+                let paths: std::collections::BTreeSet<_> = document
+                    .model_bindings()
+                    .filter_map(|(spec, backend)| (backend == id).then_some(spec))
+                    .collect();
                 let files: Result<_> = async {
-                    let mut files = hellas_client::model::ModelFiles {
-                        local: vec![],
-                        hub: vec![],
-                    };
+                    let mut files = self.options.content.inspect_files(content.clone()).await?;
+                    let mut hub = Vec::new();
                     let mut catalogs = Vec::new();
-                    for path in paths {
-                        let package = models
-                            .get(&path)
-                            .context("model package was not prepared")?
+                    for spec in paths {
+                        let packages = models[spec]
                             .as_ref()
-                            .map_err(|e| anyhow::anyhow!(e.clone()))?
+                            .map_err(|e| anyhow::anyhow!(e.clone()))?;
+                        let package = packages
                             .values()
                             .next()
                             .context("model has no registered evaluator")?;
-                        catalogs.push((path.clone(), package.model().clone()));
-                        let resolved = hellas_client::model::ModelFiles::resolve([path]).await?;
-                        files.local.extend(resolved.local);
-                        files.hub.extend(resolved.hub);
+                        let cached = &cache[spec];
+                        files.extend(cached.files.clone());
+                        hub.extend_from_slice(&cached.sources.hub);
+                        catalogs.push((spec.model.clone(), package.model().clone()));
                     }
-                    files.local.extend(content.iter().cloned());
                     Ok(ModelIndex {
-                        files: self.options.content.inspect_files(files.local).await?,
-                        hub: files.hub,
+                        files,
+                        hub,
                         models: catalogs,
                     })
                 }
@@ -147,9 +122,7 @@ impl Runtime {
     #[cfg(feature = "compute")]
     pub async fn index(&self, index: ModelIndex) -> Result<()> {
         let ModelIndex { files, hub, models } = index;
-        use hellas_store::content::{
-            ContentStore, IndexMode, PinName, PinPolicy, PinValue, Scope, Target,
-        };
+        use hellas_store::content::{ContentStore, IndexMode, PinTarget, PinValue, Scope, Target};
         for file in hub {
             file.acquire(&self.options.content).await?;
         }
@@ -173,17 +146,18 @@ impl Runtime {
                 .rescan(next.keys().cloned().collect(), IndexMode::Resume)
                 .await?;
             for object in files.into_values() {
-                let name = PinName::new(format!("models/{}", object.id()))?;
-                let old = hellas_store::content::owner_pin(&self.options.content, &name).await?;
+                let pin = PinTarget::model_object(object)?;
+                let old =
+                    hellas_store::content::owner_pin(&self.options.content, &pin.name).await?;
                 let value = PinValue {
                     target: Target::Object(object),
-                    policy: PinPolicy::Jobs,
+                    policy: pin.policy,
                     expires: None,
                 };
                 if old.as_ref() != Some(&value) {
                     self.options
                         .content
-                        .set_pin(&Scope::Owner, &name, old.as_ref(), Some(value))
+                        .set_pin(&Scope::Owner, &pin.name, old.as_ref(), Some(value))
                         .await?;
                 }
             }
@@ -191,7 +165,7 @@ impl Runtime {
         }
         drop(indexed);
         for (path, model) in models {
-            if let Some(uri) = path.to_str().filter(|s| s.starts_with("hellas://")) {
+            if let Some(uri) = hellas_client::model::peer_uri(&path) {
                 hellas_client::model::acquire_peer_model(uri, &self.options.content).await?;
             }
             hellas_client::model::publish_model(&self.options.content, &model).await?;

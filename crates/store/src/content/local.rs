@@ -178,18 +178,6 @@ impl LocalStore {
     pub fn ram_pool(&self) -> Reservations {
         self.core().pool.clone()
     }
-    /// Immutable source paths observed by this provider during verified Hub acquisition.
-    pub async fn verified_hub_files(
-        &self,
-        object: ContentRef,
-    ) -> Result<Vec<(String, String, String)>> {
-        let core = self.core();
-        core.lower
-            .as_deref()
-            .unwrap_or(core)
-            .hub_files(object)
-            .await
-    }
     pub(crate) fn core(&self) -> &Core {
         match self {
             Self::Disk(store) => &store.core,
@@ -275,20 +263,24 @@ impl LocalStore {
     }
 
     /// Check the complete declared closure in one readable-pin walk.
-    pub async fn missing_refs(&self, scope: &Scope, closure: Closure) -> Result<Vec<ContentRef>> {
-        let closure = canonical_closure(closure)?;
-        let ScopeKind::Work {
-            closure: admitted, ..
-        } = &scope.kind
-        else {
-            return Err(Error::Denied);
-        };
-        if &closure != admitted {
-            return Err(Error::Denied);
-        }
+    pub async fn require_complete(&self, scope: &Scope, expected: Option<Closure>) -> Result<()> {
         let checking = scope.clone();
         self.core()
-            .access(scope, move |core| core.missing_refs(&checking, &closure))
+            .access(scope, move |core| {
+                let ScopeKind::Work { closure, .. } = &checking.kind else {
+                    return Err(Error::Denied);
+                };
+                if let Some(expected) = expected
+                    && canonical_closure(expected)? != *closure
+                {
+                    return Err(Error::Denied);
+                }
+                if core.missing_refs(&checking, closure)?.is_empty() {
+                    Ok(())
+                } else {
+                    Err(Error::Missing)
+                }
+            })
             .await
     }
 

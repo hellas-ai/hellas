@@ -43,7 +43,7 @@ pub(super) struct Runtime {
         tokio::sync::Mutex<std::collections::BTreeMap<String, hellas_executor::ExecutorHandle>>,
     #[cfg(feature = "compute")]
     indexed: tokio::sync::Mutex<Files>,
-    models: tokio::sync::Mutex<BTreeMap<PathBuf, models::Cached>>,
+    models: tokio::sync::Mutex<BTreeMap<hellas_client::model::ModelSpec, models::Cached>>,
 }
 
 pub(super) enum PreparedBackend {

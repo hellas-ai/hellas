@@ -405,6 +405,20 @@ impl Model {
     }
 }
 impl Environment {
+    /// Open exactly the environment and model committed by a signed manifest.
+    pub fn open(
+        manifest: &crate::ProgramManifest,
+        bytes: &[u8],
+    ) -> Result<Self, crate::value::CanonicalDecodeError> {
+        let environment = Self::from_canonical_bytes(bytes)?;
+        if crate::ContentId::hash(bytes) != manifest.root()
+            || Some(environment.model.content_id()?) != manifest.model()
+        {
+            return Err(super::error("compute environment identity mismatch"));
+        }
+        Ok(environment)
+    }
+
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, crate::value::CanonicalDecodeError> {
         super::encode(&(ENVIRONMENT_DOMAIN, self))
     }
@@ -433,10 +447,10 @@ impl Environment {
         &self,
         evaluator: &str,
     ) -> Result<crate::ProgramManifest, crate::value::CanonicalDecodeError> {
-        Ok(crate::ProgramManifest::with_model(
+        Ok(crate::ProgramManifest::new(
             crate::Application::new(evaluator, ADAPTOR).map_err(|e| super::error(e.to_string()))?,
             crate::ContentId::hash(&self.canonical_bytes()?),
-            self.model.content_id()?,
+            Some(self.model.content_id()?),
         ))
     }
 }

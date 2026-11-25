@@ -4,6 +4,7 @@ fn manifest(evaluator: &str, adaptor: &str, root: u8) -> ProgramManifest {
     ProgramManifest::new(
         Application::new(evaluator, adaptor).unwrap(),
         ContentId::from_bytes([root; 32]),
+        None,
     )
 }
 
@@ -33,7 +34,7 @@ fn application_validates_each_exact_utf8_component() {
     let application = Application::new(boundary.clone(), boundary.clone()).unwrap();
     assert_eq!(application.evaluator(), boundary);
     assert_eq!(application.adaptor(), boundary);
-    let manifest = ProgramManifest::new(application, ContentId::from_bytes([0; 32]));
+    let manifest = ProgramManifest::new(application, ContentId::from_bytes([0; 32]), None);
     assert!(manifest.canonical_bytes().len() <= MAX_PROGRAM_MANIFEST_BYTES);
 
     let unnormalized = Application::new(" evaluator ", "Adaptor+Build").unwrap();

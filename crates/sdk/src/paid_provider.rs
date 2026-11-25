@@ -359,44 +359,26 @@ impl WorkHandler for MountedWorkService {
 impl MountedWork {
     pub(crate) async fn upload_stream(
         &self,
-        mut requests: std::pin::Pin<
-            Box<
-                dyn futures::Stream<
-                        Item = Result<hellas_rpc::pb::content::UploadRequest, WireStatus>,
-                    > + Send,
-            >,
-        >,
+        requests: hellas_store::content::UploadRequests,
         context: TransportContext,
         cancellation: hellas_channel::work::admission::Cancellation,
     ) -> Result<hellas_rpc::call::ResponseStream<hellas_rpc::pb::content::UploadResponse>, WireStatus>
     {
-        use futures::StreamExt;
-        use prost::Message;
+        let upload = hellas_channel::content::WorkUpload::read(requests, &context).await?;
         let denied = || {
             WireStatus::new(
                 hellas_wire::WireCode::PermissionDenied,
                 "invalid Work content opening",
             )
         };
-        let first = requests.next().await.ok_or_else(denied)??;
-        let Some(hellas_rpc::pb::content::upload_request::Part::Open(open)) = &first.part else {
-            return Err(denied());
-        };
-        let opening = open.work.as_ref().ok_or_else(denied)?;
-        let request =
-            AcceptWorkRequest::decode(opening.signed_opening.as_slice()).map_err(|_| denied())?;
         let service = self
-            .wait_handler(&context, request.route.as_ref())
+            .wait_handler(&context, upload.request().route.as_ref())
             .await
             .map_err(|_| denied())?
             .ok_or_else(denied)?;
         service
             .service
-            .upload_stream(
-                Box::pin(futures::stream::once(async move { Ok(first) }).chain(requests)),
-                context,
-                cancellation,
-            )
+            .upload_opened(upload, context, cancellation)
             .await
     }
     pub fn with_backend<B>(backend: B) -> Self

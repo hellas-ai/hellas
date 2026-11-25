@@ -283,6 +283,14 @@ async fn compute_folder_preserves_provider_held_assets_without_uploading_them() 
     .unwrap();
     let directory = tempfile::tempdir().unwrap();
     job.save(directory.path()).await.unwrap();
+    let mut other_model = hellas_channel::test_support::channel::work_policy();
+    other_model.admissions = vec![hellas_rpc::protocol::invocation::Admission::Compute(
+        hellas_rpc::protocol::invocation::Match {
+            model: Some(hellas_rpc::ContentId::hash(b"other model")),
+            ..Default::default()
+        },
+    )];
+    assert!(job.input().admits(&other_model, false).is_err());
     let loaded = Job::load(directory.path()).await.unwrap();
     assert_eq!(loaded.canonical_bytes(), job.canonical_bytes());
     assert_eq!(loaded.digest(), job.digest());

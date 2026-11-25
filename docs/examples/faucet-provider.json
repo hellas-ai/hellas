@@ -10,9 +10,7 @@
         "admissions": [
           {
             "kind": "compute",
-            "rules": [
-              { "evaluator": "hellas/catena-dfad87438018-hip" }
-            ]
+            "evaluator": "hellas/catena-dfad87438018-hip"
           }
         ],
         "limits": {

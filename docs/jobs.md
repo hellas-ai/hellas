@@ -38,6 +38,14 @@ hellas transcribe --model hf://unsloth/whisper-tiny@34457cb234c8624f23ac71600077
 hellas text --model hf://ggml-org/Qwen3-0.6B-GGUF@afe8ad3577aa22500b3cd1c880f153b3b0e1cae8/Qwen3-0.6B-BF16.gguf --prompt 'Why is the sky blue?' --local
 ```
 
+To follow the default branch for one invocation, omit the revision.
+
+```sh
+hellas transcribe --model hf://unsloth/whisper-tiny --audio speech.wav --local
+```
+
+A branch or tag can follow the repository name after `@`. Encode a slash in the ref name as `%2F`. An optional file path can follow any revision or the repository name. The CLI prints the resolved commit to stderr and uses it for the entire command. A gateway resolves each ref once at startup. Use the printed SHA to repeat a job or pre-acquire its assets with `hellas store acquire`.
+
 The [Nix one-liners](nix.md#local-gpu-one-liners) include pinned commands for text, transcription, MMS speech, Flux images and
 one gateway serving them together. The same `cli-cuda` or `cli-hip` output
 runs every modality; no development shell is needed.

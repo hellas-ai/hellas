@@ -56,12 +56,7 @@ impl BoundProgram {
         } else {
             hellas_channel::content::root(&content.0, &content.1, manifest.root()).await?
         };
-        let environment = Environment::from_canonical_bytes(&root)?;
-        if ContentId::hash(&root) != manifest.root()
-            || Some(environment.model.content_id()?) != manifest.model()
-        {
-            return Err("compute environment identity mismatch".into());
-        }
+        let environment = Environment::open(manifest, &root)?;
         let plan = Plan::from_canonical_bytes(prepared.input.parameters.as_bytes())?;
         let inputs = prepared
             .input

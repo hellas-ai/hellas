@@ -1,5 +1,6 @@
 //! Model families render the same opaque program-and-bytes Compute contract.
 use super::{
+    ModelSpec,
     flux::{Flux, Image, ImageRequest},
     native,
     qwen3::Qwen3,
@@ -51,7 +52,7 @@ impl ModelKind {
     }
     /// Gateway and request name, taken from the selected model file.
     pub fn named(path: &Path) -> Result<(Self, String)> {
-        source::Source::open(path)?.named()
+        source::Source::open(&path.into())?.named()
     }
 }
 
@@ -117,37 +118,42 @@ impl ModelPackage {
     /// GGUF metadata used by this package's tokenizer and template.
     pub fn gguf_path(&self) -> Result<&Path> {
         match &self.family {
-            Family::Qwen3(model) => Ok(model.path.as_ref().as_ref()),
+            Family::Qwen3(model) => Ok(model.path.metadata()),
             _ => bail!("model package is not GGUF"),
         }
     }
 
     pub fn gguf_name(&self) -> Result<&str> {
         match &self.family {
-            Family::Qwen3(model) => model_name(model.path.source()),
+            Family::Qwen3(model) => model_name(&model.path.source),
             _ => bail!("model package is not GGUF"),
         }
     }
+    pub async fn open(path: &Path, evaluator: &str) -> Result<Self> {
+        ModelSpec::from(path).open(evaluator, None).await
+    }
+}
+
+impl ModelSpec {
     /// Identify the model without selecting an evaluator or generating programs.
-    pub async fn identify(path: &Path) -> Result<hellas_rpc::ContentId> {
-        match Self::resolve(path, None).await? {
+    pub async fn identify(&self) -> Result<hellas_rpc::ContentId> {
+        match self.resolve(None).await? {
             source::Resolved::Gguf(gguf) => Ok(super::qwen3::model(gguf.weights)?.content_id()?),
             source::Resolved::Native(_, native) => Ok(native.model.content_id()?),
         }
     }
-    pub async fn open(path: &Path, evaluator: &str) -> Result<Self> {
+    pub async fn open(&self, evaluator: &str, store: Option<&DiskStore>) -> Result<ModelPackage> {
         let dialect = super::renderer(evaluator)?;
-        let source = Self::resolve(path, None).await?;
-        Self::open_resolved(&source, evaluator, dialect).await
+        let source = self.resolve(store).await?;
+        ModelPackage::open_resolved(&source, evaluator, dialect).await
     }
 
     /// Open each distinct renderer once, sharing one resolved weight identity.
-    /// A supplied content store reuses its inspected identity across calls.
     pub async fn open_many(
-        path: &Path,
+        &self,
         evaluators: impl IntoIterator<Item = String>,
         store: Option<&DiskStore>,
-    ) -> Result<std::collections::BTreeMap<String, Arc<Self>>> {
+    ) -> Result<std::collections::BTreeMap<String, Arc<ModelPackage>>> {
         let evaluators: std::collections::BTreeSet<_> = evaluators.into_iter().collect();
         let evaluators = evaluators
             .into_iter()
@@ -159,21 +165,23 @@ impl ModelPackage {
         if evaluators.is_empty() {
             return Ok(Default::default());
         }
-        let source = Self::resolve(path, store).await?;
+        let source = self.resolve(store).await?;
         let mut packages = std::collections::BTreeMap::new();
         for (evaluator, dialect) in evaluators {
-            let package = Self::open_resolved(&source, &evaluator, dialect).await?;
+            let package = ModelPackage::open_resolved(&source, &evaluator, dialect).await?;
             packages.insert(evaluator, Arc::new(package));
         }
         Ok(packages)
     }
 
-    async fn resolve(path: &Path, store: Option<&DiskStore>) -> Result<source::Resolved> {
-        let (path, store) = (path.to_owned(), store.cloned());
-        tokio::task::spawn_blocking(move || source::Source::open(&path)?.resolve(store.as_ref()))
+    async fn resolve(&self, store: Option<&DiskStore>) -> Result<source::Resolved> {
+        let (spec, store) = (self.clone(), store.cloned());
+        tokio::task::spawn_blocking(move || source::Source::open(&spec)?.resolve(store.as_ref()))
             .await?
     }
+}
 
+impl ModelPackage {
     pub(super) async fn open_resolved(
         source: &source::Resolved,
         evaluator: &str,
@@ -234,17 +242,16 @@ impl ModelPackage {
 
     /// Provider policy for exact rendered programs and their known setup contracts.
     pub fn compute_admissions(&self) -> Result<Vec<hellas_rpc::protocol::invocation::Admission>> {
-        use hellas_rpc::protocol::invocation::{Admission, policy::MAX_COMPUTE_PROGRAMS};
-        let programs = self.programs()?;
+        use hellas_rpc::protocol::invocation::Admission;
         let entries: &[&str] = match &self.family {
             Family::Whisper(_) => &["whisper.setup"],
             Family::Flux(_) => &["flux.setup-text", "flux.setup-denoise", "flux.setup-vae"],
             Family::Speech(model) => model.setup_entries(),
             _ => &[],
         };
-        programs
-            .chunks(MAX_COMPUTE_PROGRAMS)
-            .map(|group| Ok(Admission::compute_only(group, entries)?))
+        self.programs()?
+            .iter()
+            .map(|manifest| Ok(Admission::exact(manifest, entries)?))
             .collect()
     }
     pub fn kind(&self) -> ModelKind {

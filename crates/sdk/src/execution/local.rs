@@ -34,8 +34,8 @@ pub fn policy(
     };
     let manifest = environment.manifest(evaluator)?;
     Ok(InvocationPolicy {
-        admissions: vec![hellas_rpc::protocol::invocation::Admission::compute_only(
-            &[manifest],
+        admissions: vec![hellas_rpc::protocol::invocation::Admission::exact(
+            &manifest,
             &[],
         )?],
         limits: Limits {

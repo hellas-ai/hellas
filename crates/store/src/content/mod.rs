@@ -35,60 +35,20 @@ pub(crate) use disk::BadBacking;
 /// The content reference of one regular file, hashed in one pass; a file
 /// that changes while it is read is an error, never a wrong identity.
 pub fn file_content(path: &std::path::Path) -> std::io::Result<ContentRef> {
-    use std::io::{Error, ErrorKind, Read};
-    let mut file = hellas_private::open_regular_file(path)?;
-    let before = file.metadata()?;
-    let mut hasher = hellas_xet::XetFileHasher::new();
-    let mut buffer = vec![0; hellas_xet::MAX_CHUNK_SIZE];
-    let mut remaining = before.len();
-    let changed = || {
-        Error::new(
-            ErrorKind::InvalidData,
+    let mut file = crate::open_regular_file(path)?;
+    let stat = file.metadata()?;
+    let indexed = crate::hash_exact_length(&mut file, stat.len())?.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
             format!("{} changed while hashing", path.display()),
         )
-    };
-    while remaining != 0 {
-        let wanted = remaining.min(buffer.len() as u64) as usize;
-        let read = file.read(&mut buffer[..wanted])?;
-        if read == 0 {
-            return Err(changed());
-        }
-        hasher.update(&buffer[..read]);
-        remaining -= read as u64;
-    }
-    if file.read(&mut [0])? != 0 {
-        return Err(changed());
-    }
-    #[cfg(unix)]
-    let identity = |metadata: &std::fs::Metadata| {
-        use std::os::unix::fs::MetadataExt;
-        (
-            metadata.dev(),
-            metadata.ino(),
-            metadata.len(),
-            metadata.mtime(),
-            metadata.mtime_nsec(),
-            metadata.ctime(),
-            metadata.ctime_nsec(),
-        )
-    };
-    #[cfg(not(unix))]
-    let identity = |metadata: &std::fs::Metadata| {
-        (
-            metadata.len(),
-            metadata.modified().ok(),
-            metadata.created().ok(),
-        )
-    };
-    if identity(&before) != identity(&file.metadata()?)
-        || identity(&before) != identity(&std::fs::metadata(path)?)
-    {
-        return Err(changed());
-    }
-    Ok(ContentRef::new(
-        hellas_rpc::ContentId::from_bytes(hasher.finalize().into_bytes()),
-        before.len(),
-    ))
+    })?;
+    crate::still_the_file_that_was_read(path, crate::fastresume::FileIdentity::of(&stat), &file)
+        .map_err(|error| match error {
+            crate::StoreError::Read { source, .. } => source,
+            error => std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+        })?;
+    Ok(indexed.object())
 }
 pub use disk::{DiskStore, IndexMode};
 pub use local::{JobContent, LocalStore, VerifiedReader};
@@ -97,7 +57,7 @@ pub use page::{body_limit, chunk_page};
 pub use policy::{AllowList, Miss, MissDecision, OnMiss, Refuse, StoreStats};
 pub use remote::RemoteStore;
 pub use reservation::Reservations;
-pub use server::ContentService;
+pub use server::{ContentService, UploadRequests};
 pub use tree::{MAX_NAME_BYTES, MAX_PATH_BYTES, MAX_TREE_BYTES, MAX_TREE_ENTRIES, PinName, Tree};
 pub use upload::UploadSession;
 
@@ -177,6 +137,22 @@ pub struct PinValue {
 pub struct PinTarget {
     pub name: PinName,
     pub policy: PinPolicy,
+}
+impl PinTarget {
+    pub fn model_object(object: ContentRef) -> Result<Self> {
+        Ok(Self {
+            name: PinName::new(format!("models/{}", object.id()))?,
+            policy: PinPolicy::Jobs,
+        })
+    }
+    pub async fn holds(&self, store: &dyn ContentStore, target: Target) -> Result<bool> {
+        Ok(owner_pin(store, &self.name).await?
+            == Some(PinValue {
+                target,
+                policy: self.policy.clone(),
+                expires: None,
+            }))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -304,7 +280,6 @@ pub enum Source {
     },
     HfXet {
         repo: crate::hf::Repo,
-        commit: String,
         path: Option<String>,
     },
     Https {

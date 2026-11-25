@@ -694,11 +694,22 @@ impl Backend {
 pub fn grant_routes(
     policy: &GrantPolicy,
     id: &str,
+    model: Option<&str>,
 ) -> Result<Vec<hellas_gateway::Route>, WorkGatewayError> {
     if policy.https.is_some() {
         let (service, method, routes) = policy_http_routes(policy)?;
         return Ok(routes
             .into_iter()
+            .filter_map(|mut route| {
+                if let Some(name) = model {
+                    let models = route.models.as_mut()?;
+                    models.retain(|m| m == name);
+                    if models.is_empty() {
+                        return None;
+                    }
+                }
+                Some(route)
+            })
             .map(|route| hellas_gateway::Route {
                 backends: vec![id.into()],
                 presentation: hellas_gateway::Presentation::Http {
@@ -718,25 +729,10 @@ pub fn grant_routes(
     let Some(resource) = &policy.responses else {
         return Ok(vec![]);
     };
-    let routes: Vec<_> = policy
-        .invocation_policy
-        .admissions
-        .iter()
-        .filter_map(|admission| match admission {
-            Admission::Fetch { admission } => {
-                Some((admission.contract.schema(), admission.route.clone()))
-            }
-            _ => None,
-        })
-        .collect();
-    let mut sealed = routes.iter().filter_map(|(schema, route)| match route {
-        FetchRoutePolicy::SealedRoute { service, method }
-            if *schema == hellas_rpc::FetchSchema::StatelessResponsesV1 =>
-        {
-            Some((service, method))
-        }
-        _ => None,
-    });
+    if model.is_some_and(|name| name != resource.model) {
+        return Ok(vec![]);
+    }
+    let mut sealed = sealed_routes(policy, hellas_rpc::FetchSchema::StatelessResponsesV1);
     let (service, method) = sealed.next().ok_or(WorkGatewayError::Unsupported)?;
     if sealed.next().is_some() {
         return Err(WorkGatewayError::Unsupported);
@@ -759,6 +755,26 @@ pub(crate) fn http_route_path(upstream_path: &str) -> &str {
         .map_or(upstream_path, |offset| &upstream_path[offset..])
 }
 
+fn sealed_routes(
+    policy: &GrantPolicy,
+    schema: hellas_rpc::FetchSchema,
+) -> impl Iterator<Item = (&String, &String)> {
+    policy
+        .invocation_policy
+        .admissions
+        .iter()
+        .filter_map(move |entry| {
+            if let Admission::Fetch { admission } = entry
+                && admission.contract.schema() == schema
+                && let FetchRoutePolicy::SealedRoute { service, method } = &admission.route
+            {
+                Some((service, method))
+            } else {
+                None
+            }
+        })
+}
+
 /// A granted HTTPS resource as HTTP presentation routes on its one sealed route.
 fn policy_http_routes(
     policy: &GrantPolicy,
@@ -769,21 +785,7 @@ fn policy_http_routes(
         ))
     };
     let template = policy.https.as_ref().ok_or_else(unsealed)?;
-    let mut sealed = policy
-        .invocation_policy
-        .admissions
-        .iter()
-        .filter_map(|admission| match admission {
-            Admission::Fetch { admission }
-                if admission.contract.schema() == hellas_rpc::FetchSchema::HttpV1 =>
-            {
-                match &admission.route {
-                    FetchRoutePolicy::SealedRoute { service, method } => Some((service, method)),
-                    FetchRoutePolicy::OpenFetch { .. } => None,
-                }
-            }
-            _ => None,
-        });
+    let mut sealed = sealed_routes(policy, hellas_rpc::FetchSchema::HttpV1);
     let (service, method) = sealed.next().ok_or_else(unsealed)?;
     if sealed.any(|route| route != (service, method)) {
         return Err(unsealed());

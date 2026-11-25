@@ -580,7 +580,7 @@ async fn https_policy_conversion_keeps_models_and_refuses_colliding_local_paths(
     ];
     template.model_policy = None;
     let result = hellas_gateway::router::router(
-        grant_routes(&policy, "test").unwrap(),
+        grant_routes(&policy, "test", None).unwrap(),
         fixture.gateway.clone(),
         fixture.gateway.jobs.clone(),
         Default::default(),
@@ -1494,7 +1494,7 @@ fn routes(backend: &super::Backend, id: &str) -> Vec<hellas_gateway::Route> {
     let BackendState::Grant(grant) = &backend.state else {
         panic!("expected grant backend")
     };
-    grant_routes(&grant.policy, id).unwrap()
+    grant_routes(&grant.policy, id, None).unwrap()
 }
 
 #[tokio::test]

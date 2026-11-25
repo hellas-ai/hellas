@@ -75,9 +75,66 @@ async fn one_model_selects_f32_and_bf16_voices_by_range() -> Result<()> {
             &voices.join(file),
         )?;
     }
-    let source =
-        Arc::new(Snapshot::open(Origin::Local(root.to_owned()), Kind::Phonon)?.resolve(None)?);
+    let source = Arc::new(
+        Snapshot::open(
+            Origin::Local(root.to_owned()),
+            Kind::Phonon,
+            Default::default(),
+        )?
+        .resolve(None)?,
+    );
     let (env, content) = source.environment("test").await?;
+    // A split local install and an assembled snapshot describe exactly the same model.
+    let spec = crate::model::ModelSpec {
+        model: root.join("model/model.safetensors"),
+        codec: Some(root.join("codec/model.safetensors")),
+        voices: Some(voices.join(phonon::VOICE_CATALOG)),
+    };
+    let original_id = env.model.content_id()?;
+    let immutable = crate::model::ModelSpec {
+        model: format!("hellas://{original_id}").into(),
+        ..spec.clone()
+    };
+    assert!(
+        immutable
+            .identify()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("already commits")
+    );
+    assert_eq!(spec.identify().await?, original_id);
+    let files = spec.files().await?;
+    assert!(files.hub.is_empty());
+    assert!(files.local.contains(&voices.join("two.safetensors")));
+
+    // Alternate filenames at acquisition keep canonical names in the model.
+    let alternate = tempfile::tempdir()?;
+    std::fs::copy(
+        root.join("codec/config.json"),
+        alternate.path().join("config.json"),
+    )?;
+    let codec = alternate.path().join("custom.safetensors");
+    std::fs::copy(root.join("codec/model.safetensors"), &codec)?;
+    let spec = crate::model::ModelSpec {
+        codec: Some(codec),
+        ..spec
+    };
+    assert_eq!(spec.identify().await?, original_id);
+    std::fs::write(alternate.path().join("config.json"), br#"{"variant":2}"#)?;
+    let other_codec_id = spec.identify().await?;
+    assert_ne!(other_codec_id, original_id);
+    let catalog_path = voices.join("custom.jsonl");
+    std::fs::write(
+        &catalog_path,
+        r#"{"name":"Easton","filename":"one.safetensors"}"#,
+    )?;
+    let spec = crate::model::ModelSpec {
+        voices: Some(catalog_path),
+        ..spec
+    };
+    let other_voices_id = spec.identify().await?;
+    assert_ne!(other_voices_id, other_codec_id);
     let phonon = Phonon {
         tokenizer: tokenizers::Tokenizer::from_bytes(include_bytes!(
             "../../whisper/mini/tokenizer.json"

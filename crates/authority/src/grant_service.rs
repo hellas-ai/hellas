@@ -513,41 +513,19 @@ impl GrantService {
                 )
                 .map_err(|_| refused(GrantRefusalCode::Malformed))?;
                 let manifest = input.manifest();
-                let root = if policy
-                    .invocation_policy
-                    .content_closure(manifest, &[])
-                    .is_ok()
-                {
-                    bytes::Bytes::new()
-                } else {
-                    hellas_channel::content::root(&local, &scope, manifest.root())
-                        .await
-                        .map_err(|_| refused(GrantRefusalCode::Malformed))?
-                };
-                hellas_channel::content::match_program(
+                let (objects, _) = hellas_channel::content::admit_content(
                     &local,
                     &scope,
                     &policy.invocation_policy,
                     manifest,
-                    Some(&root),
+                    Some(a.input_content),
                 )
                 .await
                 .map_err(|_| refused(GrantRefusalCode::Malformed))?;
-                let objects = hellas_channel::job::content_closure(
-                    &policy.invocation_policy,
-                    manifest,
-                    &root,
-                    a.input_content,
-                )
-                .map_err(|_| refused(GrantRefusalCode::Malformed))?;
-                if !local
-                    .missing_refs(&scope, objects)
+                local
+                    .require_complete(&scope, Some(objects))
                     .await
-                    .map_err(|_| refused(GrantRefusalCode::Malformed))?
-                    .is_empty()
-                {
-                    return Err(refused(GrantRefusalCode::Malformed));
-                }
+                    .map_err(|_| refused(GrantRefusalCode::Malformed))?;
                 let ephemeral_bytes = local
                     .ephemeral_bytes(&scope)
                     .await

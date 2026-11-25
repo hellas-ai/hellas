@@ -7,6 +7,7 @@ use hellas_authority::model::grant::{
     resource::{AccountingProfile, HttpsResource, PathModelPolicy},
     responses::ResponsesResource,
 };
+use hellas_client::model::ModelSpec;
 use hellas_gateway::Presentation;
 use hellas_rpc::protocol::invocation::{Admission, InvocationPolicy, Limits, Match};
 
@@ -31,7 +32,7 @@ pub struct Resource {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ResourceKind {
     Model {
-        package: PathBuf,
+        package: ModelSpec,
         /// When omitted, derive the exact programs and setup entries from the package.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rules: Option<Vec<Match>>,
@@ -81,36 +82,30 @@ impl Resource {
     }
 }
 impl Document {
+    /// All native packages and the backends that serve them, from routes and grants alike.
+    pub(crate) fn model_bindings(&self) -> impl Iterator<Item = (&ModelSpec, &String)> {
+        let routes = self
+            .routes
+            .iter()
+            .filter_map(|r| Some((r.model_package()?.1, &r.backends)));
+        routes
+            .flat_map(|(spec, ids)| ids.iter().map(move |id| (spec, id)))
+            .chain(self.resources.iter().filter_map(|r| match &r.kind {
+                ResourceKind::Model { package, .. } => Some((package, &r.backend)),
+                _ => None,
+            }))
+    }
+
     pub(crate) fn model_evaluators(
         &self,
         info: &[hellas_gateway::BackendInfo],
-    ) -> BTreeMap<PathBuf, std::collections::BTreeSet<String>> {
-        let mut requested: BTreeMap<PathBuf, std::collections::BTreeSet<String>> = BTreeMap::new();
-        for route in &self.routes {
-            if let Some((_, package)) = route.model_package() {
-                let evaluators = requested.entry(package.clone()).or_default();
-                for id in &route.backends {
-                    if let Some(evaluator) = info
-                        .iter()
-                        .find(|backend| backend.id == *id)
-                        .and_then(|backend| backend.evaluator.clone())
-                    {
-                        evaluators.insert(evaluator);
-                    }
-                }
-            }
-        }
-        for resource in &self.resources {
-            if let ResourceKind::Model { package, .. } = &resource.kind {
-                let evaluators = requested.entry(package.clone()).or_default();
-                if let Some(evaluator) = info
-                    .iter()
-                    .find(|backend| backend.id == resource.backend)
-                    .and_then(|backend| backend.evaluator.clone())
-                {
-                    evaluators.insert(evaluator);
-                }
-            }
+    ) -> BTreeMap<ModelSpec, std::collections::BTreeSet<String>> {
+        let mut requested = BTreeMap::new();
+        for (spec, id) in self.model_bindings() {
+            let evaluators: &mut std::collections::BTreeSet<_> =
+                requested.entry(spec.clone()).or_default();
+            evaluators
+                .extend(hellas_gateway::BackendInfo::evaluator_for(info, id).map(str::to_owned));
         }
         requested
     }
@@ -122,8 +117,7 @@ impl Document {
     ) -> Result<NodeConfiguration, crate::daemon::Error> {
         let mut models = hellas_gateway::router::Models::new();
         for (path, evaluators) in self.model_evaluators(info) {
-            let packages =
-                hellas_client::model::ModelPackage::open_many(&path, evaluators, None).await?;
+            let packages = path.open_many(evaluators, None).await?;
             models.insert(path, Ok(packages));
         }
         self.configuration(info, &models)
@@ -272,11 +266,9 @@ impl Resource {
         let (invocation_policy, backend_evaluator, https, responses) =
             match (&self.kind, &backend.kind) {
                 (ResourceKind::Model { package, rules }, BackendKind::Local { .. }) => {
-                    let evaluator = backends
-                        .iter()
-                        .find(|b| b.id == self.backend)
-                        .and_then(|b| b.evaluator.as_deref())
-                        .ok_or("local backend has no evaluator")?;
+                    let evaluator =
+                        hellas_gateway::BackendInfo::evaluator_for(backends, &self.backend)
+                            .ok_or("local backend has no evaluator")?;
                     let package = models
                         .get(package)
                         .ok_or("model was not prepared")?
@@ -284,14 +276,20 @@ impl Resource {
                         .map_err(|error| error.clone())?
                         .get(evaluator)
                         .ok_or("model evaluator was not prepared")?;
+                    let admissions = match rules {
+                        Some(rules) => {
+                            if rules.len()
+                                > hellas_rpc::protocol::invocation::policy::MAX_COMPUTE_PROGRAMS
+                            {
+                                return Err("too many model resource rules".into());
+                            }
+                            rules.iter().cloned().map(Admission::Compute).collect()
+                        }
+                        None => package.compute_admissions()?,
+                    };
                     (
                         InvocationPolicy {
-                            admissions: match rules {
-                                Some(rules) => vec![Admission::Compute {
-                                    rules: rules.clone(),
-                                }],
-                                None => package.compute_admissions()?,
-                            },
+                            admissions,
                             limits: Limits {
                                 max_upload_bytes: 8 << 20,
                                 max_output_bytes: 4 << 20,

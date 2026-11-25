@@ -747,31 +747,19 @@ impl ProviderEndpoint {
 
         let manifest = bundle.manifest();
         let (store, scope) = self.close.store.invocation_content(work_id)?;
-        let root = if policy.content_closure(manifest, &[]).is_ok() {
-            bytes::Bytes::new()
-        } else {
-            let hellas_store::content::ScopeKind::Work { closure, .. } = &scope.kind else {
-                return Err(content_refusal(hellas_store::content::Error::Denied));
-            };
-            let root = *closure
-                .iter()
-                .find(|object| object.id() == manifest.root())
-                .ok_or_else(|| content_refusal(hellas_store::content::Error::Missing))?;
-            self.close.store.read_content(work_id, root).await?
-        };
-        crate::content::match_program(&store, &scope, policy, manifest, Some(&root))
+        let (objects, _) = crate::content::admit_content(
+            &store,
+            &scope,
+            policy,
+            manifest,
+            Some(authorization.input_content),
+        )
+        .await
+        .map_err(content_refusal)?;
+        store
+            .require_complete(&scope, Some(objects))
             .await
             .map_err(content_refusal)?;
-        let objects =
-            crate::job::content_closure(policy, manifest, &root, authorization.input_content)?;
-        if !store
-            .missing_refs(&scope, objects.clone())
-            .await
-            .map_err(content_refusal)?
-            .is_empty()
-        {
-            return Err(content_refusal(hellas_store::content::Error::Missing));
-        }
         // Reserve the exact backend before either acceptance frame. The returned
         // execution owner is transferred while this writer is still held.
         let accepted = execution
@@ -953,26 +941,18 @@ impl ProviderEndpoint {
             &bundle,
         )?;
         let content = self.close.store.invocation_content(work_id)?;
-        let setup = crate::content::match_program(
-            &content.0,
-            &content.1,
-            ready.invocation_policy(),
-            bundle.manifest(),
-            None,
-        )
-        .await
-        .map_err(|e| RunError::Backend(BackendFault::caused_by(e)))?;
         let admission = RunAdmission::Invoke(Box::new(
-            Admitted::new(
+            Admitted::checked(
                 bundle,
-                facts.limits,
-                facts.capacity_domain,
+                ready.invocation_policy(),
+                facts,
                 content,
                 WorkAdmission::payment(hellas_auth::PublicKey::Secp256k1(
                     ready.channel().client_key().to_bytes(),
                 )),
             )
-            .with_setup_entries(setup),
+            .await
+            .map_err(RunError::Backend)?,
         ));
 
         self.close
@@ -1786,18 +1766,7 @@ pub async fn run_admitted<B: WorkBackend>(
     let facts = policy
         .classify_manifest(manifest)
         .map_err(BackendFault::caused_by)?;
-    let setup_entries =
-        crate::content::match_program(&content.0, &content.1, policy, manifest, None)
-            .await
-            .map_err(BackendFault::caused_by)?;
-    let input = Admitted::new(
-        input,
-        facts.limits,
-        facts.capacity_domain,
-        content,
-        admission,
-    )
-    .with_setup_entries(setup_entries);
+    let input = Admitted::checked(input, policy, facts, content, admission).await?;
     execute(backend, input, progress).await
 }
 

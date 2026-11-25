@@ -361,7 +361,8 @@ impl Disk {
             }
             let (indexed, location) =
                 self.index(path, if lower { mode } else { IndexMode::Resume })?;
-            let id = ContentId::from_bytes(indexed.id.into_bytes());
+            let object = indexed.object();
+            let id = object.id();
             if !lower
                 && path.file_name().and_then(|name| name.to_str()) != Some(id.to_string().as_str())
             {
@@ -378,7 +379,7 @@ impl Disk {
                     id,
                     Arc::new(Stored::new(
                         Data::File(Arc::new(FileObject {
-                            object: ContentRef::new(id, indexed.len),
+                            object,
                             disk: self.clone(),
                             entries: Mutex::new(vec![location]),
                             staged: Mutex::new(None),
@@ -926,13 +927,7 @@ impl DiskStore {
                 let mut files = BTreeMap::new();
                 crate::fastresume::walk_lower(&paths, |path| {
                     let (indexed, _) = disk.index(path, IndexMode::Resume)?;
-                    files.insert(
-                        path.to_owned(),
-                        ContentRef::new(
-                            ContentId::from_bytes(indexed.id.into_bytes()),
-                            indexed.len,
-                        ),
-                    );
+                    files.insert(path.to_owned(), indexed.object());
                     Ok(())
                 })?;
                 Ok(files)
@@ -1109,7 +1104,8 @@ impl Disk {
                 continue;
             }
             let (indexed, location) = self.index(&entry.path(), IndexMode::Resume)?;
-            let id = ContentId::from_bytes(indexed.id.into_bytes());
+            let object = indexed.object();
+            let id = object.id();
             if entry.file_name().to_str() != Some(id.to_string().as_str()) {
                 let path = entry.path();
                 let shared =
@@ -1126,7 +1122,7 @@ impl Disk {
                 id,
                 Arc::new(Stored::new(
                     Data::File(Arc::new(FileObject {
-                        object: ContentRef::new(id, indexed.len),
+                        object,
                         disk: self.clone(),
                         entries: Mutex::new(vec![location]),
                         staged: Mutex::new(None),
@@ -1273,16 +1269,22 @@ impl super::core::Core {
         }
         Ok(())
     }
-    pub(crate) async fn hub_files(
+}
+
+impl super::LocalStore {
+    /// Immutable source paths observed by the provider that owns this job's lower store.
+    pub async fn verified_hub_files(
         &self,
         object: ContentRef,
     ) -> Result<Vec<(String, String, String)>> {
-        if let Some(disk) = &self.disk {
+        let core = self.core();
+        let core = core.lower.as_deref().unwrap_or(core);
+        if let Some(disk) = &core.disk {
             sqlx::query_as("SELECT repo,revision,path FROM hub_files WHERE object=? AND size=? ORDER BY repo,revision,path")
                 .bind(object.id().as_bytes().to_vec()).bind(i64::try_from(object.bytes()).map_err(|_| Error::Capacity)?)
                 .fetch_all(&disk.db).await.map_err(database)
         } else {
-            let state = self
+            let state = core
                 .state
                 .lock()
                 .map_err(|_| Error::Invalid("store lock"))?;

@@ -420,7 +420,7 @@ impl PreparedUpload {
         let reference = ContentRef::for_bytes(&bytes);
         let manifest = input.manifest();
         let policy = InvocationPolicy::from_canonical_bytes(input.application_policy.as_bytes())?;
-        let root = if policy.content_closure(manifest, &[]).is_ok() {
+        let root = if manifest.model().is_none() {
             None
         } else {
             Some(
@@ -1153,16 +1153,6 @@ impl GrantSession {
         policy
             .invocation_policy
             .admit(input, &self.options.signer.public_key())?;
-        let manifest = input.manifest();
-        if policy
-            .invocation_policy
-            .content_closure(manifest, &[])
-            .is_err()
-        {
-            let root =
-                hellas_channel::content::root(&content.0, &content.1, manifest.root()).await?;
-            policy.invocation_policy.content_closure(manifest, &root)?;
-        }
         let now = self.now();
         // The provider clock has advanced at least as far as this standing, so
         // measuring the signed limit from it never exceeds the allowance.

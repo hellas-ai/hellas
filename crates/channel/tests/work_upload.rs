@@ -1006,15 +1006,7 @@ async fn paid_repo_admission_checks_all_assets_before_acceptance() {
         let env = repo_model(&node, extra).await;
         let root = env.canonical_bytes().unwrap();
         let manifest = env.manifest(&evaluator()).unwrap();
-        let mut input = bundle(1);
-        input.request.execution_environment = manifest.content_id();
-        input = PreparedInvocation::new(
-            input.request,
-            &manifest,
-            input.input,
-            repo_policy().canonical_bytes().unwrap(),
-        )
-        .unwrap();
+        let input = bundle_for(&manifest, &repo_policy(), 1);
         let buyer = LocalStore::Memory(MemoryStore::new(Reservations::ram(16 << 20)));
         hellas_channel::content::upload_object(&buyer, &root)
             .await

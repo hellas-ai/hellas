@@ -39,16 +39,17 @@ pub(crate) async fn content(
     local: &[PathBuf],
     hub: &[hellas_store::hf::PinnedFile],
 ) -> CliResult<hellas_store::content::DiskStore> {
-    let mut configuration =
-        crate::content_configuration::ContentConfiguration::load(native.content_config.clone())?
-            .with_default_upper(home.join("provider/content"));
+    let mut configuration = crate::content_configuration::load(native.content_config.clone())?;
+    configuration
+        .upper
+        .get_or_insert_with(|| home.join("provider/content"));
     let paths = native
         .content
         .iter()
         .chain(local)
         .map(std::path::absolute)
         .collect::<std::io::Result<Vec<_>>>()?;
-    let mut initial = configuration.config().clone();
+    let mut initial = configuration.clone();
     initial.lower.extend(paths.iter().cloned());
     let content = initial
         .open(
@@ -61,8 +62,10 @@ pub(crate) async fn content(
         .await?;
     let prepared: CliResult<()> = async {
         content.finish_recovery().await?;
-        configuration.add_content(&content, paths).await?;
-        configuration.apply(&content).await?;
+        crate::content_configuration::add_content(&mut configuration, &content, paths).await?;
+        hellas_store::content::config::Reconciler::new(configuration.clone())?
+            .apply(&content, configuration)
+            .await?;
         for file in hub {
             file.acquire(&content).await?;
         }

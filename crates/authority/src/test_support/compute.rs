@@ -1,6 +1,6 @@
 //! CPU-only generic Compute invocation for service lifecycle tests.
 use super::*;
-use hellas_rpc::protocol::invocation::PreparedInvocation;
+use hellas_rpc::ProgramManifest;
 
 #[derive(Default)]
 pub struct Compute;
@@ -25,6 +25,7 @@ impl Compute {
         actor: Actor,
         allowance: GrantId,
         nonce: u64,
+        manifest: &ProgramManifest,
     ) -> Proposal {
         let store = &node.store;
         let def = store.state().grant(allowance).unwrap();
@@ -33,8 +34,11 @@ impl Compute {
             .channel_id(allowance, super::channel_client(actor.principal()))
             .unwrap();
         let policy = &def.policies[0];
-        let mut input: PreparedInvocation =
-            hellas_channel::test_support::channel::bundle(nonce as u8);
+        let mut input = hellas_channel::test_support::channel::bundle_for(
+            manifest,
+            &policy.invocation_policy,
+            nonce as u8,
+        );
         input.request.runner_public_key = hellas_auth::PublicKey::Secp256k1(
             grant_producer(store.state().provider().unwrap())
                 .unwrap()
@@ -42,7 +46,6 @@ impl Compute {
         );
         input.request.retain = false;
         input.request.nonce[..8].copy_from_slice(&nonce.to_be_bytes());
-        input.application_policy = JsonBytes(policy.invocation_policy.canonical_bytes().unwrap());
         let now = node.clock.now().0;
         let authorization = GrantJobAuthorizationV1 {
             channel_id: channel,

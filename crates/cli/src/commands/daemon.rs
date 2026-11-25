@@ -2,8 +2,10 @@
 use anyhow::{Context, Result, ensure};
 use hellas_auth::authority::{NodeKey, PrincipalId};
 use hellas_authority::authenticator::Authenticator;
+use hellas_client::model::ModelSpec;
 use hellas_gateway::{Presentation, Route};
 use hellas_private::StoreLocation;
+use hellas_sdk::daemon::{Core, Options};
 use hellas_sdk::daemon_config::{Backend, BackendKind, Document, Listener};
 use std::{
     path::{Path, PathBuf},
@@ -17,7 +19,7 @@ pub struct GatewayArgs {
     /// TOML routing and listener configuration.
     #[arg(long, conflicts_with_all = ["models", "upstreams", "bind","voices"])]
     pub config: Option<PathBuf>,
-    /// Model path or pinned hf:// checkpoint, PATH@CONTACT, or NAME@UPSTREAM.
+    /// Model path or URI, MODEL@CONTACT, or NAME@UPSTREAM. Phonon accepts ,codec=SOURCE,voices=SOURCE after the model selection.
     #[arg(long = "model", required_unless_present = "config")]
     pub models: Vec<String>,
     /// Named voices to serve with a native Phonon model (repeatable).
@@ -81,6 +83,7 @@ pub enum Edit {
 }
 
 pub struct ModelContext {
+    revisions: crate::hub::Revisions,
     voices: Vec<String>,
     pub home: PathBuf,
     pub principal: Option<PrincipalId>,
@@ -94,6 +97,7 @@ impl ModelContext {
         owner: Option<&dyn Authenticator>,
     ) -> Result<Self> {
         Ok(Self {
+            revisions: Default::default(),
             voices: vec![],
             home: home.into(),
             content: None,
@@ -108,18 +112,15 @@ impl ModelContext {
         })
     }
 
-    async fn open_many(
-        &self,
-        path: &Path,
-        evaluators: impl IntoIterator<Item = String>,
-    ) -> Result<std::collections::BTreeMap<String, Arc<hellas_client::model::ModelPackage>>> {
-        hellas_client::model::ModelPackage::open_many(path, evaluators, self.content.as_ref()).await
-    }
-
     async fn add(&self, document: &mut Document, model: &str) -> Result<()> {
-        let (name, destination) = split_model(model);
+        let (spec, destination) = model_spec(model)?;
+        let pinned = self.revisions.pin_spec(&spec).await?;
+        let name = pinned
+            .model
+            .to_str()
+            .context("model selection needs UTF-8")?;
         let Some(destination) = destination else {
-            let path = model_path(name)?.with_context(|| format!("model package {model}"))?;
+            let path = model_package(&pinned)?.with_context(|| format!("model package {model}"))?;
             document
                 .backends
                 .entry("local".into())
@@ -140,6 +141,10 @@ impl ModelContext {
             .get(destination)
             .is_some_and(|backend| matches!(backend.kind, BackendKind::Fetch { .. }))
         {
+            ensure!(
+                !pinned.has_companions(),
+                "companion sources require a native model"
+            );
             return document
                 .add_upstream_model(name, destination)
                 .map_err(anyhow::Error::from_boxed);
@@ -164,40 +169,34 @@ impl ModelContext {
                 store: self.home.join("trust"),
                 policy: destination.into(),
             });
-        let package = model_path(name)?;
-        let packages = if let Some(path) = &package {
-            let evaluators = bundle
+        let package = model_package(&pinned)?;
+        let policies = || {
+            bundle
                 .offers
                 .iter()
                 .flat_map(|offer| &offer.offer().grant.policies)
+        };
+        let mut programs = Vec::new();
+        if let Some(path) = &package {
+            let evaluators = policies()
                 .flat_map(|policy| policy.render_evaluators())
                 .map(str::to_owned);
-            self.open_many(path, evaluators).await?
-        } else {
-            Default::default()
-        };
-        let package_programs = packages
-            .iter()
-            .map(|(evaluator, package)| Ok((evaluator.clone(), package.programs()?)))
-            .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
+            for (evaluator, package) in path.open_many(evaluators, self.content.as_ref()).await? {
+                programs.push((evaluator, package.programs()?));
+            }
+        }
         let mut matches = vec![];
-        for policy in bundle
-            .offers
-            .iter()
-            .flat_map(|offer| &offer.offer().grant.policies)
-        {
+        for policy in policies() {
             if package.is_some() {
-                for evaluator in policy.render_evaluators() {
-                    let Some(programs) = package_programs.get(evaluator) else {
+                for (evaluator, manifests) in &programs {
+                    if !policy.render_evaluators().contains(evaluator.as_str()) {
                         continue;
-                    };
-                    if programs.iter().any(|manifest| {
-                        policy.invocation_policy.admissions.iter().any(|admission| {
-                            admission.evaluate(manifest, None)
-                                != hellas_rpc::protocol::invocation::Decision::Reject
-                        })
-                    }) {
-                        matches.push((policy.clone(), Some(evaluator.to_owned())));
+                    }
+                    if manifests
+                        .iter()
+                        .any(|m| policy.invocation_policy.candidates_for(m).next().is_some())
+                    {
+                        matches.push((policy, Some(evaluator.clone())));
                     }
                 }
             } else if policy
@@ -214,7 +213,7 @@ impl ModelContext {
                             .any(|path| path.models.iter().any(|model| model == name))
                     })
             {
-                matches.push((policy.clone(), None));
+                matches.push((policy, None));
             }
         }
         ensure!(
@@ -237,27 +236,7 @@ impl ModelContext {
                 .add_route(package_route(package, &id, &self.voices).await?)
                 .map_err(anyhow::Error::from_boxed)?;
         } else {
-            for mut route in hellas_sdk::grant_routes(&policy, &id).map_err(anyhow::Error::from)? {
-                match &mut route.presentation {
-                    Presentation::Responses { models, .. } => *models = vec![name.into()],
-                    Presentation::Http { targets } => {
-                        if !targets.values().all(|target| {
-                            target
-                                .route
-                                .models
-                                .as_ref()
-                                .is_some_and(|models| models.iter().any(|model| model == name))
-                        }) {
-                            continue;
-                        }
-                        for target in targets.values_mut() {
-                            target.route.models = Some(vec![name.into()]);
-                        }
-                    }
-                    Presentation::Model { .. } | Presentation::Speech { .. } => {
-                        anyhow::bail!("model resource needs a local package")
-                    }
-                }
+            for route in hellas_sdk::grant_routes(policy, &id, Some(name))? {
                 document
                     .add_route(route)
                     .map_err(anyhow::Error::from_boxed)?;
@@ -309,35 +288,68 @@ fn split_model(value: &str) -> (&str, Option<&str>) {
     let Some((source, contact)) = value.rsplit_once('@') else {
         return (value, None);
     };
-    if value.starts_with("hellas://")
-        && (contact.parse::<iroh::EndpointId>().is_ok()
-            || contact.parse::<std::net::SocketAddr>().is_ok())
-    {
+    if value.starts_with("hellas://") && hellas_client::model::peer_locator(value).is_ok() {
         return (value, None);
     }
-    if value.starts_with("hf://")
-        && (!source.contains('@')
+    if source.starts_with("hf://")
+        && (hellas_store::hf::is_bare_repo(source)
+            || contact.contains('/')
             || (value.to_ascii_lowercase().ends_with(".gguf")
                 && !source.to_ascii_lowercase().ends_with(".gguf")))
     {
-        (value, None)
-    } else {
-        (source, Some(contact))
+        return (value, None);
     }
+    (source, Some(contact))
 }
 
-fn model_path(source: &str) -> Result<Option<PathBuf>> {
-    if source.starts_with("hf://") || source.starts_with("hellas://") {
-        return Ok(Some(source.into()));
+/// The destination belongs to the primary model. Hub refs in companion fields remain intact.
+fn model_spec(value: &str) -> Result<(ModelSpec, Option<&str>)> {
+    let options = [",codec=", ",voices="]
+        .iter()
+        .filter_map(|key| value.find(key))
+        .min();
+    let (root, options) = options.map_or((value, ""), |index| value.split_at(index));
+    let (root, destination) = split_model(root);
+    let mut spec = ModelSpec::from(PathBuf::from(root));
+    for option in options.split(',').skip(1) {
+        let (key, value) = option
+            .split_once('=')
+            .context("model companion must be codec=SOURCE or voices=SOURCE")?;
+        let selected = match key {
+            "codec" => &mut spec.codec,
+            "voices" => &mut spec.voices,
+            _ => anyhow::bail!("unknown model companion {key}"),
+        };
+        ensure!(
+            !value.is_empty() && selected.is_none(),
+            "model companion {key} must occur once with a source"
+        );
+        *selected = Some(value.into());
     }
-    Ok(Path::new(source)
-        .exists()
-        .then(|| std::fs::canonicalize(source))
-        .transpose()?)
+    spec.check_locator()?;
+    Ok((spec, destination))
 }
 
-async fn package_route(package: PathBuf, backend: &str, voices: &[String]) -> Result<Route> {
-    let input = package.clone();
+fn model_package(spec: &ModelSpec) -> Result<Option<ModelSpec>> {
+    let mut spec = spec.clone();
+    use hellas_client::model::is_local;
+    if is_local(&spec.model) && !spec.model.try_exists()? {
+        ensure!(
+            !spec.has_companions(),
+            "companion sources require a native model"
+        );
+        return Ok(None);
+    }
+    for path in spec.paths_mut().filter(|p| is_local(p)) {
+        *path = path
+            .canonicalize()
+            .with_context(|| format!("model file {}", path.display()))?;
+    }
+    Ok(Some(spec))
+}
+
+async fn package_route(package: ModelSpec, backend: &str, voices: &[String]) -> Result<Route> {
+    let input = package.model.clone();
     let (modality, model) =
         tokio::task::spawn_blocking(move || hellas_client::model::ModelKind::named(&input))
             .await??;
@@ -424,17 +436,18 @@ pub async fn apply(document: &mut Document, edit: Edit, context: &ModelContext) 
                 .insert("api".into(), Listener::http(bind));
         }
         Edit::Route(RouteCommand::Rm { model }) => {
-            let (name, destination) = split_model(&model);
-            let package = model_path(name)?;
+            let (spec, destination) = model_spec(&model)?;
+            let pinned = context.revisions.pin_spec(&spec).await?;
+            let name = pinned
+                .model
+                .to_str()
+                .context("model selection needs UTF-8")?;
+            let package = model_package(&pinned)?;
             let mut removed = false;
             for route in &mut document.routes {
-                let matches = match &route.presentation {
-                    Presentation::Model { package: path, .. }
-                    | Presentation::Speech {
-                        target: hellas_gateway::SpeechTarget::Native { package: path, .. },
-                        ..
-                    } => package.as_ref() == Some(path),
-                    _ => route
+                let matches = match route.model_package() {
+                    Some((_, path)) => package.as_ref() == Some(path),
+                    None => route
                         .keys()
                         .iter()
                         .any(|(_, _, model)| model.as_deref() == Some(name)),
@@ -706,18 +719,14 @@ pub async fn gateway(
             .await?;
     let options = options(home.clone(), identity, owner, chain, node.clone(), None).await?;
     context.content = Some(options.content.clone());
-    let prepared = configured.resolve(&context).await;
-    let document = match prepared {
-        Ok((document, _)) => document,
-        Err(error) => {
-            options.content.close().await;
-            node.close().await;
-            return Err(error);
-        }
-    };
     run_daemon(
         options,
-        Start::Transient(document),
+        async |options| {
+            let (document, _) = configured.resolve(&context).await?;
+            Core::open(options, document)
+                .await
+                .map_err(anyhow::Error::from_boxed)
+        },
         #[cfg(feature = "otel")]
         metrics,
         async |core| {
@@ -815,41 +824,40 @@ pub async fn serve(
         store,
         Arc::new(|| hellas_auth::authority::UnixMillis::now().unwrap_or_default()),
     );
-    let start = if let Some((state, credential, authorization)) = declarative_start {
-        let caller = node
-            .authenticate_session(
-                &credential,
-                hellas_authority::node::SessionKey::Passkey(
-                    owner.context("--config requires --passkey")?,
-                ),
-            )
-            .await?;
-        let (document, paid_policy) = state;
-        Start::Reconcile(Box::new(Reconciliation {
-            document,
-            caller,
-            authorization,
-            paid_policy,
-        }))
-    } else if node.configuration().await?.is_some() {
-        Start::Restore(port)
-    } else {
-        let mut document = Document::default();
-        document.listeners.insert(
-            "work".into(),
-            Listener::Iroh {
-                chain: None,
-                port: port.unwrap_or(0),
-                backends: vec![],
-            },
-        );
-        Start::Transient(document)
-    };
-    let mut options = options(home.clone(), identity, owner, chain, node.clone(), endpoint).await?;
+    let mut options = options(home.clone(), identity, owner, chain, node, endpoint).await?;
     options.remote_control = hellas_sdk::node_control::RemoteControlAdmission::credential_gated();
     run_daemon(
         options,
-        start,
+        async |options| {
+            let core = if let Some(((document, paid_policy), credential, authorization)) =
+                declarative_start
+            {
+                let caller = options
+                    .node
+                    .authenticate_session(
+                        &credential,
+                        hellas_authority::node::SessionKey::Passkey(
+                            owner.context("--config requires --passkey")?,
+                        ),
+                    )
+                    .await?;
+                Core::reconcile(options, document, caller, authorization, paid_policy).await
+            } else if options.node.configuration().await?.is_some() {
+                Core::restore(options, port).await
+            } else {
+                let mut document = Document::default();
+                document.listeners.insert(
+                    "work".into(),
+                    Listener::Iroh {
+                        chain: None,
+                        port: port.unwrap_or(0),
+                        backends: vec![],
+                    },
+                );
+                Core::open(options, document).await
+            };
+            core.map_err(anyhow::Error::from_boxed)
+        },
         #[cfg(feature = "otel")]
         metrics,
         async |core| {
@@ -883,48 +891,16 @@ pub async fn serve(
     .await
 }
 
-enum Start {
-    Transient(Document),
-    Restore(Option<u16>),
-    Reconcile(Box<Reconciliation>),
-}
-struct Reconciliation {
-    document: Document,
-    caller: hellas_auth::authority::AuthenticatedCaller,
-    authorization: hellas_auth::authority::GrantId,
-    paid_policy: Option<hellas_channel::model::paid_policy::PaidPolicy>,
-}
-
 async fn run_daemon(
-    options: hellas_sdk::daemon::Options,
-    start: Start,
+    options: Options,
+    open: impl AsyncFnOnce(Options) -> Result<Arc<Core>>,
     #[cfg(feature = "otel")] metrics: Option<(std::net::SocketAddr, crate::metrics::MetricsBundle)>,
-    run: impl AsyncFnOnce(Arc<hellas_sdk::daemon::Core>) -> Result<()>,
+    run: impl AsyncFnOnce(Arc<Core>) -> Result<()>,
 ) -> Result<()> {
     let content = options.content.clone();
     let node = options.node.clone();
     let serving = async {
-        let core = match start {
-            Start::Transient(document) => hellas_sdk::daemon::Core::open(options, document).await,
-            Start::Restore(port) => hellas_sdk::daemon::Core::restore(options, port).await,
-            Start::Reconcile(start) => {
-                let Reconciliation {
-                    document,
-                    caller,
-                    authorization,
-                    paid_policy,
-                } = *start;
-                hellas_sdk::daemon::Core::reconcile(
-                    options,
-                    document,
-                    caller,
-                    authorization,
-                    paid_policy,
-                )
-                .await
-            }
-        }
-        .map_err(anyhow::Error::from_boxed)?;
+        let core = open(options).await?;
         let result = async {
             #[cfg(feature = "otel")]
             if let Some((address, bundle)) = metrics {
@@ -966,6 +942,7 @@ mod tests {
 
     pub(super) fn model_context(home: &Path) -> ModelContext {
         ModelContext {
+            revisions: Default::default(),
             voices: vec![],
             home: home.into(),
             principal: None,
@@ -976,6 +953,51 @@ mod tests {
                     .public_key(),
             )
             .unwrap(),
+        }
+    }
+
+    #[test]
+    fn gateway_model_companions_keep_their_own_refs_and_primary_destination() {
+        let (spec, destination) =
+            model_spec("hf://org/model@v2@alice,voices=hf://org/voices@v4,codec=/srv/codec")
+                .unwrap();
+        assert_eq!(destination, Some("alice"));
+        assert_eq!(spec.model, Path::new("hf://org/model@v2"));
+        assert_eq!(
+            spec.voices.as_deref(),
+            Some(Path::new("hf://org/voices@v4"))
+        );
+        assert_eq!(spec.codec.as_deref(), Some(Path::new("/srv/codec")));
+        assert_eq!(
+            model_spec("/a/model,with,commas").unwrap().0.model,
+            Path::new("/a/model,with,commas")
+        );
+        for invalid in [
+            "local,codec=",
+            "local,voices=a,voices=b",
+            "local,codec=a,catalog=b",
+            "hellas://fixed,codec=a",
+        ] {
+            assert!(model_spec(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn hub_route_ref_and_contact_are_independent() {
+        for uri in [
+            "hf://org/repo",
+            "hf://org/repo@release",
+            "hf://org/repo@release/path/to/model.gguf",
+            "hf://org/repo/weights@2.gguf",
+        ] {
+            assert_eq!(split_model(uri), (uri, None));
+        }
+        for uri in [
+            "hf://org/repo@release",
+            "hf://org/repo/path/to/model.gguf",
+            "hf://org/repo@release/model@2.gguf",
+        ] {
+            assert_eq!(split_model(&format!("{uri}@friend")), (uri, Some("friend")));
         }
     }
 
@@ -1068,8 +1090,8 @@ mod tests {
         let before = read_bytes();
         let hip = hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip);
         let cuda = hellas_client::model::evaluator(hellas_client::model::GpuDialect::Cuda);
-        let packages = context
-            .open_many(&path, [hip.clone(), hip, cuda])
+        let packages = ModelSpec::from(path.clone())
+            .open_many([hip.clone(), hip, cuda], context.content.as_ref())
             .await
             .unwrap();
         assert_eq!(packages.len(), 2);
@@ -1110,10 +1132,10 @@ mod tests {
         .await
         .unwrap();
         let evaluator = hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip);
-        let packages =
-            hellas_client::model::ModelPackage::open_many(&path, [evaluator.clone()], Some(&store))
-                .await
-                .unwrap();
+        let packages = ModelSpec::from(path)
+            .open_many([evaluator.clone()], Some(&store))
+            .await
+            .unwrap();
         packages[&evaluator].programs().unwrap();
         assert_weights_once(before);
         store.close().await;
@@ -1128,7 +1150,8 @@ mod tests {
         );
         for source in [uri.clone(), format!("{uri}@127.0.0.1:42")] {
             assert_eq!(split_model(&source), (source.as_str(), None));
-            assert_eq!(model_path(&source).unwrap(), Some(PathBuf::from(&source)));
+            let model = ModelSpec::from(PathBuf::from(&source));
+            assert_eq!(model_package(&model).unwrap(), Some(model));
             let grant = format!("{source}@friend");
             assert_eq!(split_model(&grant), (source.as_str(), Some("friend")));
         }

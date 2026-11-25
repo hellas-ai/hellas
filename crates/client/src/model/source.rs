@@ -1,34 +1,26 @@
 //! Model selection and resolution from immutable Hub references or local checkpoints.
 mod peer;
-use super::{ModelFiles, ModelKind, gguf, native, qwen3};
+use super::{ModelFiles, ModelKind, ModelSpec, gguf, native, qwen3};
 use anyhow::{Context, Result, ensure};
 use hellas_rpc::ContentRef;
 use hellas_store::{content::DiskStore, hf::PinnedFile};
+use native::{Kind, Origin};
 pub(crate) use peer::PeerModel;
-pub use peer::{CatalogUnavailable, acquire_peer_model, publish_model};
+pub use peer::{CatalogUnavailable, acquire_peer_model, peer_locator, publish_model};
 use std::{
     io::Write,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
-pub(super) enum GgufPath {
-    Local(PathBuf),
-    Header(tempfile::NamedTempFile, PathBuf),
+pub(super) struct GgufPath {
+    pub source: PathBuf,
+    header: Option<tempfile::TempPath>,
 }
+
 impl GgufPath {
-    pub(super) fn source(&self) -> &Path {
-        match self {
-            Self::Local(path) | Self::Header(_, path) => path,
-        }
-    }
-}
-impl AsRef<Path> for GgufPath {
-    fn as_ref(&self) -> &Path {
-        match self {
-            Self::Local(path) => path,
-            Self::Header(file, _) => file.path(),
-        }
+    pub(super) fn metadata(&self) -> &Path {
+        self.header.as_deref().unwrap_or(&self.source)
     }
 }
 
@@ -38,38 +30,94 @@ pub(super) struct Gguf {
     pub weights: ContentRef,
 }
 
-impl Gguf {
-    fn remote(
-        name: &Path,
-        object: ContentRef,
-        read: impl FnMut(std::ops::Range<u64>, &mut Vec<u8>) -> std::io::Result<()>,
-    ) -> Result<Self> {
-        let (header, bytes) = gguf::remote_header(object.bytes(), read)?;
-        let mut output = tempfile::Builder::new().suffix(".gguf").tempfile()?;
-        output.write_all(&bytes)?;
-        Ok(Self {
-            path: Arc::new(GgufPath::Header(output, name.to_owned())),
-            header: Arc::new(header),
-            weights: object,
-        })
+pub(super) enum File {
+    Local(PathBuf),
+    Remote(RemoteFile),
+}
+
+pub(super) enum RemoteFile {
+    Hub(PinnedFile),
+    Peer(PeerModel, ContentRef),
+}
+
+impl RemoteFile {
+    pub(super) fn object(&self) -> ContentRef {
+        match self {
+            Self::Hub(file) => file.object,
+            Self::Peer(_, object) => *object,
+        }
     }
-    fn hub(file: &PinnedFile) -> Result<Self> {
-        Self::remote(Path::new(&file.path), file.object, |range, bytes| {
-            file.read_range(range, bytes).map_err(std::io::Error::other)
+    pub(super) fn read_range(
+        &self,
+        range: std::ops::Range<u64>,
+        out: &mut impl Write,
+    ) -> Result<()> {
+        match self {
+            Self::Hub(file) => file.read_range(range, out)?,
+            Self::Peer(peer, object) => out.write_all(&peer.read(*object, range)?)?,
+        }
+        Ok(())
+    }
+}
+impl File {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Local(path) => path,
+            Self::Remote(RemoteFile::Hub(file)) => Path::new(&file.path),
+            Self::Remote(RemoteFile::Peer(..)) => Path::new("model.gguf"),
+        }
+    }
+
+    pub(super) fn register(&self, files: &mut ModelFiles) {
+        match self {
+            Self::Local(path) => files.local.push(path.clone()),
+            Self::Remote(RemoteFile::Hub(file)) => files.hub.push(file.clone()),
+            Self::Remote(RemoteFile::Peer(..)) => {}
+        }
+    }
+
+    pub(super) fn object(
+        &self,
+        inspected: &std::collections::BTreeMap<PathBuf, ContentRef>,
+    ) -> Result<ContentRef> {
+        Ok(match self {
+            Self::Local(path) => match inspected.get(path) {
+                Some(object) => *object,
+                None => hellas_store::content::file_content(path)?,
+            },
+            Self::Remote(file) => file.object(),
         })
     }
 
-    fn peer(peer: &PeerModel) -> Result<Self> {
-        Self::remote(
-            Path::new("model.gguf"),
-            peer.object("weights")?,
-            |range, bytes| {
-                bytes.extend_from_slice(
-                    &peer.read("weights", range).map_err(std::io::Error::other)?,
-                );
-                Ok(())
-            },
-        )
+    fn gguf(&self, store: Option<&DiskStore>) -> Result<Gguf> {
+        let (path, header, weights) = match self {
+            Self::Local(path) => {
+                let inspected = match store {
+                    Some(store) => tokio::runtime::Handle::current()
+                        .block_on(store.inspect_files(vec![path.clone()]))?,
+                    None => Default::default(),
+                };
+                let header = gguf::read_header(&mut hellas_private::open_regular_file(path)?)?;
+                (None, header, self.object(&inspected)?)
+            }
+            Self::Remote(file) => {
+                let weights = file.object();
+                let (header, bytes) = gguf::remote_header(weights.bytes(), |range, bytes| {
+                    file.read_range(range, bytes).map_err(std::io::Error::other)
+                })?;
+                let mut output = tempfile::Builder::new().suffix(".gguf").tempfile()?;
+                output.write_all(&bytes)?;
+                (Some(output.into_temp_path()), header, weights)
+            }
+        };
+        Ok(Gguf {
+            path: Arc::new(GgufPath {
+                source: self.path().into(),
+                header: path,
+            }),
+            header: Arc::new(header),
+            weights,
+        })
     }
 }
 
@@ -78,75 +126,87 @@ pub(super) enum Resolved {
     Native(native::Kind, Arc<native::Native>),
 }
 
-pub(super) enum Source {
-    LocalGguf(PathBuf),
-    HubGguf(PinnedFile),
-    PeerGguf(PeerModel),
-    Checkpoint(native::Kind, native::Origin, String),
+pub(super) enum Source<'a> {
+    Gguf(File),
+    Checkpoint(Kind, Origin, Option<&'a ModelSpec>),
 }
-impl Source {
-    pub fn open(path: &Path) -> Result<Self> {
-        if let Some(uri) = path.to_str().filter(|s| s.starts_with("hellas://")) {
+impl<'a> Source<'a> {
+    pub fn open(spec: &'a ModelSpec) -> Result<Self> {
+        let path = &spec.model;
+        spec.check_locator()?;
+        let (origin, selector) = if let Some(uri) = super::peer_uri(path) {
             return Self::peer(PeerModel::open(uri)?);
-        }
-        if let Some(uri) = super::hf_uri(path) {
+        } else if let Some(uri) = super::hf_uri(path) {
             let (repo, selector) = native::hub(uri)?;
-            if selector.as_deref().is_some_and(|key| {
-                Path::new(key)
-                    .extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
-            }) {
-                return Ok(Self::HubGguf(repo.select("gguf", selector.as_deref())?));
-            }
-            let name = repo.repo.id.rsplit('/').next().unwrap().to_owned();
-            let origin = native::Origin::Hub(repo);
-            if let Some(kind) = origin.kind()? {
-                ensure!(
-                    selector
-                        .as_deref()
-                        .is_none_or(|s| s == "model.safetensors" && kind != native::Kind::Flux),
-                    "select the checkpoint root for this model"
-                );
-                return Ok(Self::Checkpoint(kind, origin, name));
-            }
-            let native::Origin::Hub(repo) = origin else {
-                unreachable!()
-            };
-            return Ok(Self::HubGguf(repo.select("gguf", selector.as_deref())?));
-        }
-        let directory = if std::fs::metadata(path)?.is_file() {
-            if path.extension().is_none_or(|ext| ext != "safetensors") {
-                return Ok(Self::LocalGguf(path.to_owned()));
-            }
-            ensure!(
-                path.file_name().is_some_and(|s| s == "model.safetensors"),
-                "select the checkpoint root or model.safetensors"
-            );
-            path.parent()
-                .filter(|d| !d.as_os_str().is_empty())
-                .unwrap_or(Path::new("."))
+            (Origin::Hub(repo), selector)
         } else {
-            path
+            let metadata = std::fs::metadata(path)?;
+            let directory = if metadata.is_dir() {
+                path.as_path()
+            } else {
+                ensure!(
+                    metadata.is_file(),
+                    "checkpoint must be a regular file or directory"
+                );
+                if path.extension().is_none_or(|ext| ext != "safetensors") {
+                    return Self::gguf(File::Local(path.clone()), spec);
+                }
+                ensure!(
+                    path.file_name()
+                        .is_some_and(|name| name == "model.safetensors"),
+                    "select the checkpoint root or model.safetensors"
+                );
+                path.parent()
+                    .filter(|dir| !dir.as_os_str().is_empty())
+                    .unwrap_or(Path::new("."))
+            };
+            (Origin::Local(directory.into()), None)
         };
-        let origin = native::Origin::Local(directory.to_owned());
-        let kind = origin.kind()?.context("unrecognized model checkpoint")?;
-        let name = directory
-            .canonicalize()?
-            .file_name()
-            .and_then(|n| n.to_str())
-            .context("checkpoint needs a UTF-8 directory name")?
-            .to_owned();
-        Ok(Self::Checkpoint(kind, origin, name))
+        let explicit_gguf = selector.as_deref().is_some_and(|key| {
+            Path::new(key)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+        });
+        if !explicit_gguf && let Some(kind) = origin.kind()? {
+            ensure!(
+                !spec.has_companions() || kind == Kind::Phonon,
+                "codec and voices companions require a Phonon model"
+            );
+            ensure!(
+                selector
+                    .as_deref()
+                    .is_none_or(|s| s == "model.safetensors" && kind != Kind::Flux),
+                "select the checkpoint root for this model"
+            );
+            return Ok(Self::Checkpoint(kind, origin, Some(spec)));
+        }
+        let Origin::Hub(repo) = origin else {
+            anyhow::bail!("unrecognized model checkpoint");
+        };
+        Self::gguf(
+            File::Remote(RemoteFile::Hub(repo.select("gguf", selector.as_deref())?)),
+            spec,
+        )
+    }
+
+    fn gguf(file: File, spec: &ModelSpec) -> Result<Self> {
+        ensure!(
+            !spec.has_companions(),
+            "codec and voices companions require a Phonon model"
+        );
+        Ok(Self::Gguf(file))
     }
 
     fn peer(peer: PeerModel) -> Result<Self> {
-        if peer.model.assets.len() == 1 && peer.model.assets[0].name == "weights" {
-            return Ok(Self::PeerGguf(peer));
+        if let [asset] = peer.model.assets.as_slice()
+            && asset.name == "weights"
+        {
+            let object = asset.object;
+            return Ok(Self::Gguf(File::Remote(RemoteFile::Peer(peer, object))));
         }
-        let name = peer.model.content_id()?.to_string();
-        let origin = native::Origin::Peer(peer);
+        let origin = Origin::Peer(peer);
         let kind = origin.kind()?.context("unrecognized peer checkpoint")?;
-        Ok(Self::Checkpoint(kind, origin, name))
+        Ok(Self::Checkpoint(kind, origin, None))
     }
 
     pub fn named(&self) -> Result<(ModelKind, String)> {
@@ -158,22 +218,18 @@ impl Source {
             })
         }
         Ok(match self {
-            Self::LocalGguf(path) => (gguf_kind(path)?, super::package::model_name(path)?.into()),
-            Self::HubGguf(file) => {
-                let gguf = Gguf::hub(file)?;
-                (
-                    gguf_kind(gguf.path.as_ref().as_ref())?,
-                    super::package::model_name(gguf.path.source())?.into(),
-                )
+            Self::Gguf(file) => {
+                let kind = match file {
+                    File::Local(path) => gguf_kind(path)?,
+                    _ => gguf_kind(file.gguf(None)?.path.metadata())?,
+                };
+                let name = match file {
+                    File::Remote(RemoteFile::Peer(peer, _)) => peer.model.content_id()?.to_string(),
+                    _ => super::package::model_name(file.path())?.into(),
+                };
+                (kind, name)
             }
-            Self::PeerGguf(peer) => {
-                let gguf = Gguf::peer(peer)?;
-                (
-                    gguf_kind(gguf.path.as_ref().as_ref())?,
-                    peer.model.content_id()?.to_string(),
-                )
-            }
-            Self::Checkpoint(kind, _, name) => (
+            Self::Checkpoint(kind, origin, _) => (
                 match kind {
                     native::Kind::Flux => ModelKind::Image,
                     native::Kind::Whisper => ModelKind::Transcription,
@@ -181,51 +237,38 @@ impl Source {
                         ModelKind::Speech
                     }
                 },
-                name.clone(),
+                match origin {
+                    Origin::Hub(repo) => repo.repo.id.rsplit('/').next().unwrap().into(),
+                    Origin::Peer(peer) => peer.model.content_id()?.to_string(),
+                    Origin::Local(path) => path
+                        .canonicalize()?
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .context("checkpoint needs a UTF-8 directory name")?
+                        .into(),
+                },
             ),
         })
     }
 
     pub fn files(self) -> Result<ModelFiles> {
         Ok(match self {
-            Self::LocalGguf(path) => ModelFiles {
-                local: vec![path],
-                hub: vec![],
-            },
-            Self::PeerGguf(_) => ModelFiles {
-                local: vec![],
-                hub: vec![],
-            },
-            Self::HubGguf(file) => ModelFiles {
-                local: vec![],
-                hub: vec![file],
-            },
-            Self::Checkpoint(kind, origin, _) => native::Snapshot::open(origin, kind)?.files(),
+            Self::Gguf(file) => {
+                let mut files = ModelFiles::default();
+                file.register(&mut files);
+                files
+            }
+            Self::Checkpoint(kind, origin, companions) => {
+                native::Snapshot::open(origin, kind, companions)?.originals
+            }
         })
     }
     pub fn resolve(self, store: Option<&DiskStore>) -> Result<Resolved> {
         Ok(match self {
-            Self::PeerGguf(peer) => Resolved::Gguf(Gguf::peer(&peer)?),
-            Self::HubGguf(file) => Resolved::Gguf(Gguf::hub(&file)?),
-            Self::LocalGguf(path) => {
-                let weights = match store {
-                    Some(store) => tokio::runtime::Handle::current()
-                        .block_on(store.inspect_files(vec![path.clone()]))?
-                        .get(&path)
-                        .copied()
-                        .context("missing inspected GGUF file")?,
-                    None => hellas_store::content::file_content(&path)?,
-                };
-                let header = gguf::read_header(&mut hellas_private::open_regular_file(&path)?)?;
-                Resolved::Gguf(Gguf {
-                    path: Arc::new(GgufPath::Local(path)),
-                    header: Arc::new(header),
-                    weights,
-                })
-            }
-            Self::Checkpoint(kind, origin, _) => Resolved::Native(
+            Self::Gguf(file) => Resolved::Gguf(file.gguf(store)?),
+            Self::Checkpoint(kind, origin, companions) => Resolved::Native(
                 kind,
-                Arc::new(native::Snapshot::open(origin, kind)?.resolve(store)?),
+                Arc::new(native::Snapshot::open(origin, kind, companions)?.resolve(store)?),
             ),
         })
     }
@@ -239,10 +282,9 @@ impl super::ModelPackage {
         evaluator: &str,
     ) -> Result<Self> {
         let dialect = super::renderer(evaluator)?;
-        let resolved = tokio::task::spawn_blocking(move || {
-            Source::peer(PeerModel::connect(id, async move { Ok((store, None)) })?)?.resolve(None)
-        })
-        .await??;
+        let peer = PeerModel::connect(id, store, None).await?;
+        let resolved =
+            tokio::task::spawn_blocking(move || Source::peer(peer)?.resolve(None)).await??;
         Self::open_resolved(&resolved, evaluator, dialect).await
     }
 }

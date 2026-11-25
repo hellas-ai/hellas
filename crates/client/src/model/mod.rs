@@ -9,6 +9,10 @@ mod native;
 #[cfg(feature = "models")]
 mod package;
 #[cfg(feature = "models")]
+mod spec;
+#[cfg(feature = "models")]
+pub use spec::ModelSpec;
+#[cfg(feature = "models")]
 mod program;
 #[cfg(feature = "models")]
 mod source;
@@ -45,7 +49,7 @@ fn renderer(evaluator: &str) -> anyhow::Result<GpuDialect> {
 #[cfg(feature = "models")]
 pub use package::{ComputeJob, ModelKind, ModelPackage, ModelRequest, ModelResponse};
 #[cfg(feature = "models")]
-pub use source::{CatalogUnavailable, acquire_peer_model, publish_model};
+pub use source::{CatalogUnavailable, acquire_peer_model, peer_locator, publish_model};
 #[cfg(feature = "models")]
 mod qwen3;
 #[cfg(feature = "models")]
@@ -62,34 +66,32 @@ pub fn hf_uri(source: &std::path::Path) -> Option<&str> {
     source.to_str().filter(|s| s.starts_with("hf://"))
 }
 
+#[cfg(feature = "models")]
+pub fn peer_uri(source: &std::path::Path) -> Option<&str> {
+    source.to_str().filter(|s| s.starts_with("hellas://"))
+}
+
+#[cfg(feature = "models")]
+pub fn is_local(source: &std::path::Path) -> bool {
+    hf_uri(source).is_none() && peer_uri(source).is_none()
+}
+
 /// Execution sources prepared before activating a local backend.
 #[cfg(feature = "models")]
+#[derive(Default)]
 pub struct ModelFiles {
     pub local: Vec<std::path::PathBuf>,
     pub hub: Vec<hellas_store::hf::PinnedFile>,
 }
 #[cfg(feature = "models")]
-impl ModelFiles {
-    pub async fn resolve(
-        models: impl IntoIterator<Item = std::path::PathBuf>,
-    ) -> anyhow::Result<Self> {
-        let paths: Vec<_> = models.into_iter().collect();
-        tokio::task::spawn_blocking(move || {
-            let mut all = Self {
-                local: Vec::new(),
-                hub: Vec::new(),
-            };
-            for path in paths {
-                if path.to_str().is_some_and(|s| s.starts_with("hellas://")) {
-                    continue;
-                }
-                let files = source::Source::open(&path)?.files()?;
-                all.local.extend(files.local);
-                all.hub.extend(files.hub);
-            }
-            Ok(all)
-        })
-        .await?
+impl ModelSpec {
+    pub async fn files(&self) -> anyhow::Result<ModelFiles> {
+        self.check_locator()?;
+        if peer_uri(&self.model).is_some() {
+            return Ok(ModelFiles::default());
+        }
+        let spec = self.clone();
+        tokio::task::spawn_blocking(move || source::Source::open(&spec)?.files()).await?
     }
 }
 

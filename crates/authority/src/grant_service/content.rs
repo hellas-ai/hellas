@@ -1,26 +1,9 @@
 use super::*;
-use futures::{Stream, StreamExt};
+use futures::StreamExt;
 use hellas_rpc::{call::ResponseStream, pb::content as pb, services::content::ContentHandler};
 use hellas_store::content::{ContentService, JobContent, JobId, LocalStore, ScopeKind};
-use prost::Message;
 
-fn status(error: impl std::fmt::Display) -> WireStatus {
-    WireStatus::new(hellas_wire::WireCode::PermissionDenied, error.to_string())
-}
-fn object(reference: &pb::ContentRef) -> Result<hellas_rpc::ContentRef, WireStatus> {
-    Ok(hellas_rpc::ContentRef::new(
-        hellas_rpc::ContentId::from_slice(&reference.id).map_err(status)?,
-        reference.bytes,
-    ))
-}
-fn current_scope(
-    shared: &std::sync::Mutex<hellas_store::content::Scope>,
-) -> Result<hellas_store::content::Scope, WireStatus> {
-    shared
-        .lock()
-        .map(|scope| scope.clone())
-        .map_err(|_| status("content scope lock"))
-}
+use hellas_channel::content::upload_status as status;
 fn identity(job: &JobContent) -> (JobId, u64) {
     match &job.scope().kind {
         ScopeKind::Work {
@@ -152,26 +135,14 @@ impl GrantWork {
     }
     pub async fn upload_stream(
         &self,
-        mut requests: Pin<Box<dyn Stream<Item = Result<pb::UploadRequest, WireStatus>> + Send>>,
+        requests: hellas_store::content::UploadRequests,
         context: TransportContext,
         connection: hellas_channel::work::admission::Cancellation,
     ) -> Result<ResponseStream<pb::UploadResponse>, WireStatus> {
-        let first = requests
-            .next()
-            .await
-            .ok_or_else(|| status("missing Work opening"))??;
-        let Some(pb::upload_request::Part::Open(open)) = &first.part else {
-            return Err(status("missing Work opening"));
-        };
-        let opening = open
-            .work
-            .clone()
-            .ok_or_else(|| status("missing Work opening"))?;
-        let request =
-            AcceptWorkRequest::decode(opening.signed_opening.as_slice()).map_err(status)?;
-        let exporter = context
-            .open_exporter
-            .ok_or_else(|| status("missing connection exporter"))?;
+        let (opening, request, exporter, requests) =
+            hellas_channel::content::WorkUpload::read(requests, &context)
+                .await?
+                .into_parts();
         let mut store = self
             .service
             .node
@@ -180,9 +151,8 @@ impl GrantWork {
             .await
             .map_err(|_| status("authority writer unavailable"))?;
         let work = self.clone();
-        let open = open.clone();
         let parent = connection.clone();
-        let (authorization, manifest, policy, root, job, scope, writer, fresh, cleanup) =
+        let (authorization, manifest, policy, job, scope, writer, fresh, cleanup) =
             tokio::spawn(async move {
                 let a = GrantJobAuthorizationV1::decode(&request.authorization).map_err(status)?;
                 let client_signature = signature(&request.client_signature)
@@ -265,15 +235,6 @@ impl GrantWork {
                 )
                 .map_err(status)?;
                 let first_object = root.unwrap_or(a.input_content);
-                if open.pin.is_some()
-                    || object(
-                        open.object
-                            .as_ref()
-                            .ok_or_else(|| status("missing upload object"))?,
-                    )? != first_object
-                {
-                    return Err(status("first upload object is not the signed root"));
-                }
                 let existing = {
                     let held = work
                         .service
@@ -319,9 +280,7 @@ impl GrantWork {
                 let (scope, writer) = work
                     .content_work_locked(&mut store, job.scope().clone(), a, parent)
                     .map_err(status)?;
-                Ok::<_, WireStatus>((
-                    a, manifest, policy, root, job, scope, writer, fresh, cleanup,
-                ))
+                Ok::<_, WireStatus>((a, manifest, policy, job, scope, writer, fresh, cleanup))
             })
             .await
             .map_err(|_| status("content admission failed"))??;
@@ -336,16 +295,7 @@ impl GrantWork {
         }
         let service = ContentService::new(Arc::new(LocalStore::Job(job)), scope)
             .with_write_authority(writer.clone());
-        let shared = service.scope.clone();
-        let requests = requests.map(|request| request.and_then(|request| {
-            if matches!(&request.part, Some(pb::upload_request::Part::Open(open)) if open.work.is_some()) { Err(status("duplicate Work opening")) } else { Ok(request) }
-        }));
-        let mut replies = service
-            .upload(
-                Box::pin(futures::stream::once(async move { Ok(first) }).chain(requests)),
-                context,
-            )
-            .await?;
+        let mut replies = service.upload(requests, context).await?;
         let work = self.clone();
         Ok(ResponseStream::new(async_stream::try_stream! {
             let mut cleanup = cleanup;
@@ -353,19 +303,7 @@ impl GrantWork {
             while let Some(reply) = replies.next().await {
                 let reply = reply?;
                 if !widened && reply.complete {
-                    let (closure, local, bound, opened_root) = {
-                        let store = work.service.node.writer().await.map_err(status)?;
-                        work.access.authorize(&store, authorization.grant_id, work.service.node.observed_time(&store)).map_err(status)?;
-                        let job = work.service.pending_content(authorization.channel_id, id.id).map_err(|_| status("content scope ended"))?;
-                        if identity(&job).1 != reservation { Err(status("content scope changed"))?; }
-                        let local = LocalStore::Job(job.clone());
-                        let bytes = match root { Some(root) => hellas_channel::content::read(&local, job.scope(), root, hellas_channel::content::MAX_PROGRAM_ROOT_BYTES as u64).await.map_err(status)?, None => bytes::Bytes::new() };
-                        let closure = hellas_channel::job::content_closure(&policy, &manifest, &bytes, authorization.input_content).map_err(status)?;
-                        let bound = current_scope(&shared)?;
-                        (closure,local,bound,bytes)
-                    };
-                    hellas_channel::content::match_program(&local, &bound, &policy, &manifest, Some(&opened_root)).await.map_err(status)?;
-                    local.acquire_missing(&bound,closure.clone()).await.map_err(status)?;
+                    let closure = hellas_channel::content::stage_work(&service, &policy, &manifest, authorization.input_content).await?;
                     let mut store = work.service.node.writer().await.map_err(status)?;
                     work.access.authorize(&store, authorization.grant_id, work.service.node.observed_time(&store)).map_err(status)?;
                     let job = work.service.pending_content(authorization.channel_id, id.id).map_err(|_|status("content scope ended"))?;
@@ -373,7 +311,7 @@ impl GrantWork {
                     let job = job.widen(closure, policy.limits.max_upload_bytes).await.map_err(status)?;
                     work.service.set_pending_content(authorization.channel_id, job.clone()).map_err(status)?;
                     let (scope, _) = work.content_work_locked(&mut store, job.scope().clone(), authorization, connection.clone()).map_err(status)?;
-                    replace_scope(&shared, scope)?;
+                    service.replace_scope(scope)?;
                     widened = true;
                 }
                 yield reply;
@@ -382,20 +320,10 @@ impl GrantWork {
                 let _store = work.service.node.writer().await.map_err(status)?;
                 let job = work.service.pending_content(authorization.channel_id, id.id).map_err(|_| status("content scope ended"))?;
                 let local = LocalStore::Job(job.clone());
-                let ScopeKind::Work { closure, .. } = &job.scope().kind else { Err(status("invalid Work scope"))?; unreachable!() };
-                if !local.missing_refs(job.scope(), closure.clone()).await.map_err(status)?.is_empty() { Err(status("incomplete Work closure"))?; }
+                local.require_complete(job.scope(), None).await.map_err(status)?;
             }
             work.service.complete_content_upload(authorization.channel_id, reservation)?;
             cleanup.0.clear();
         }).with_write_authority(writer))
     }
-}
-fn replace_scope(
-    shared: &std::sync::Mutex<hellas_store::content::Scope>,
-    scope: hellas_store::content::Scope,
-) -> Result<(), WireStatus> {
-    *shared
-        .lock()
-        .map_err(|_| status("content scope unavailable"))? = scope;
-    Ok(())
 }

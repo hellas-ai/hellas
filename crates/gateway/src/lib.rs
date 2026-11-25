@@ -169,6 +169,16 @@ pub struct BackendInfo {
     pub error: Option<String>,
 }
 
+impl BackendInfo {
+    pub fn evaluator_for<'a>(backends: &'a [Self], id: &str) -> Option<&'a str> {
+        backends
+            .iter()
+            .find(|backend| backend.id == id)?
+            .evaluator
+            .as_deref()
+    }
+}
+
 /// The source every presentation runs its jobs on.
 pub trait WorkExecutionBackend: Send + Sync {
     fn backends(&self) -> Vec<BackendInfo>;
