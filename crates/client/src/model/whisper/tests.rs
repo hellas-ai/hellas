@@ -29,13 +29,23 @@ async fn jobs_bind_original_ranges_and_only_cast_float_weights() {
         })
         .await
         .unwrap();
-    assert_eq!(
-        job.environment.assets,
-        [NamedAsset {
-            name: "model.safetensors".into(),
-            object
-        }]
-    );
+    let model = &job.environment.model;
+    assert_eq!(model.assets.len(), CHECKPOINT.len());
+    for asset in &model.assets {
+        let bytes = std::fs::read(path.join(&asset.name)).unwrap();
+        assert_eq!(asset.object, ContentRef::for_bytes(&bytes));
+        if asset.name != "model.safetensors" {
+            let staged = hellas_channel::content::read(
+                &job.content.0,
+                &job.content.1,
+                asset.object,
+                asset.object.bytes(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(&staged[..], bytes);
+        }
+    }
     assert!(
         hellas_channel::content::read(&job.content.0, &job.content.1, object, object.bytes())
             .await
@@ -160,4 +170,26 @@ async fn decode_validates_the_result_header_and_decodes_client_side() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn changing_tokenizer_bytes_changes_model_and_manifest() {
+    let original = fixture();
+    let directory = tempfile::tempdir().unwrap();
+    for name in CHECKPOINT {
+        std::fs::copy(original.join(name), directory.path().join(name)).unwrap();
+    }
+    let tokenizer = directory.path().join("tokenizer.json");
+    let bytes = std::fs::read(&tokenizer).unwrap();
+    std::fs::write(tokenizer, [bytes.as_slice(), b"\n"].concat()).unwrap();
+    let evaluator = crate::model::evaluator(crate::model::GpuDialect::Hip);
+    let before = ModelPackage::open(original, &evaluator).await.unwrap();
+    let after = ModelPackage::open(directory.path(), &evaluator)
+        .await
+        .unwrap();
+    assert_ne!(
+        before.model().content_id().unwrap(),
+        after.model().content_id().unwrap()
+    );
+    assert_ne!(before.programs().unwrap(), after.programs().unwrap());
 }

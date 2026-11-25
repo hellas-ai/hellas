@@ -165,16 +165,21 @@ enum Commands {
     Fetch(commands::transact::FetchArgs),
     /// Buy one call of a Catena program using the same job and payment path.
     Run(commands::transact::RunArgs),
-    /// Print the program manifests for a local model or pinned hf:// checkpoint.
+    /// Print the program manifests or content-addressed model reference.
     Program {
-        /// Named voice whose exact speech program the provider admits.
+        /// Print the evaluator-independent hellas:// model reference.
         #[arg(long)]
-        voice: Vec<String>,
+        model_id: bool,
         #[arg(value_name = "MODEL")]
         model: PathBuf,
         /// The registered renderer (evaluator id) the program is compiled for.
-        #[arg(long, value_name = "EVALUATOR")]
-        backend: String,
+        #[arg(
+            long,
+            value_name = "EVALUATOR",
+            required_unless_present = "model_id",
+            conflicts_with = "model_id"
+        )]
+        backend: Option<String>,
     },
     /// Synthesize a WAV with a client-rendered speech job.
     Speak(commands::transact::SpeakArgs),
@@ -361,27 +366,29 @@ async fn async_main() {
             return;
         }
         Commands::Program {
+            model_id,
             model,
             backend,
-            voice,
         } => {
-            let result = hellas_client::model::ModelPackage::open_many_with_voices(
-                &model,
-                [backend.clone()],
-                None,
-                &voice,
-            )
-            .await
-            .and_then(|packages| packages[&backend].programs())
-            .map(|programs| {
-                for program in programs {
-                    println!(
-                        "{}/{}",
-                        program.application().evaluator(),
-                        program.content_id()
-                    );
+            let result = async {
+                use hellas_client::model::ModelPackage;
+                if model_id {
+                    println!("hellas://{}", ModelPackage::identify(&model).await?);
+                } else {
+                    let backend = backend
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("missing evaluator"))?;
+                    for program in ModelPackage::open(&model, backend).await?.programs()? {
+                        println!(
+                            "{}/{}",
+                            program.application().evaluator(),
+                            program.content_id()
+                        );
+                    }
                 }
-            });
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
             tracer_provider.shutdown();
             if let Err(error) = result {
                 eprintln!("error: {error:#}");

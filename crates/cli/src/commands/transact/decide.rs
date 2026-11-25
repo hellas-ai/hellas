@@ -1,6 +1,7 @@
 //! `hellas decide`: one decision request, expanded here into a prompt per
 //! question and run as a Compute job.
 use super::*;
+#[cfg(test)]
 use hellas_client::model::ModelPackage;
 use std::io::Read;
 
@@ -28,9 +29,6 @@ pub struct DecideArgs {
 pub async fn decide(mut args: DecideArgs, context: Context) -> super::super::CliResult<()> {
     context
         .model_command(async {
-            args.target.models = vec![args.model.clone()];
-            let evaluator = args.target.renderer()?;
-            let content = args.target.content(&context).await?;
             let body = if args.request == Path::new("-") {
                 let mut body = Vec::new();
                 std::io::stdin()
@@ -49,11 +47,10 @@ pub async fn decide(mut args: DecideArgs, context: Context) -> super::super::Cli
                 )?
             };
             let body = serde_json::from_slice(&body).context("request is not JSON")?;
-            let package =
-                ModelPackage::open_many(&args.model, [evaluator.clone()], content.as_ref())
-                    .await?
-                    .remove(&evaluator)
-                    .context("model evaluator is not prepared")?;
+            let (evaluator, package) = args
+                .target
+                .open_model(&args.client, &context, &mut args.model)
+                .await?;
             let preparing = package.clone();
             let request =
                 tokio::task::spawn_blocking(move || preparing.decision_request(body)).await??;

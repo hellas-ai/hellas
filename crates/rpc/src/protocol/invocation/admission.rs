@@ -127,11 +127,8 @@ impl InvocationPolicy {
             ));
         }
         let environment = compute::Environment::from_canonical_bytes(program_root)?;
-        let mut names = std::collections::BTreeSet::new();
-        for asset in &environment.assets {
-            if !names.insert(&asset.name) {
-                return Err(error("compute asset names must be unique"));
-            }
+        if Some(environment.model.content_id()?) != manifest.model() {
+            return Err(error("compute model differs from the signed manifest"));
         }
         let source_bytes = environment
             .sources
@@ -141,10 +138,13 @@ impl InvocationPolicy {
             return Err(error("compute sources exceed the 16 MiB limit"));
         }
         let mut objects = std::collections::BTreeMap::new();
-        for object in std::iter::once(root)
-            .chain(environment.sources)
-            .chain(environment.assets.into_iter().map(|asset| asset.object))
-        {
+        for object in std::iter::once(root).chain(environment.sources).chain(
+            environment
+                .model
+                .assets
+                .into_iter()
+                .map(|asset| asset.object),
+        ) {
             if objects
                 .insert(object.id(), object.bytes())
                 .is_some_and(|bytes| bytes != object.bytes())

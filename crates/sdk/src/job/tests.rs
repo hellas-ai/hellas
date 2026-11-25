@@ -256,7 +256,7 @@ async fn compute_folder_preserves_provider_held_assets_without_uploading_them() 
     let external = hellas_rpc::ContentRef::for_bytes(b"provider-held weights");
     let environment = Environment {
         sources: vec![source],
-        assets: vec![
+        model: hellas_rpc::protocol::invocation::compute::Model::new(vec![
             NamedAsset {
                 name: "local".into(),
                 object: local,
@@ -265,7 +265,8 @@ async fn compute_folder_preserves_provider_held_assets_without_uploading_them() 
                 name: "external".into(),
                 object: external,
             },
-        ],
+        ])
+        .unwrap(),
     };
     hellas_channel::content::upload_object(&content, &environment.canonical_bytes().unwrap())
         .await
@@ -326,13 +327,14 @@ async fn compute_folder_requires_sources_and_rejects_invalid_available_assets() 
             .unwrap();
         let environment = Environment {
             sources: vec![source],
-            assets: vec![NamedAsset {
+            model: hellas_rpc::protocol::invocation::compute::Model::new(vec![NamedAsset {
                 name: "weights".into(),
                 object: hellas_rpc::ContentRef::new(
                     asset.id(),
                     asset.bytes() + u64::from(!missing_source),
                 ),
-            }],
+            }])
+            .unwrap(),
         };
         hellas_channel::content::upload_object(&content, &environment.canonical_bytes().unwrap())
             .await
@@ -373,7 +375,7 @@ async fn large_compute_plan_folders_round_trip_with_bounded_documents() {
         .unwrap();
     let environment = compute::Environment {
         sources: vec![source],
-        assets: vec![],
+        model: Default::default(),
     };
     hellas_channel::content::upload_object(&content, &environment.canonical_bytes().unwrap())
         .await

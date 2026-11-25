@@ -30,17 +30,9 @@ pub struct Resource {
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ResourceKind {
-    Model {
-        package: PathBuf,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        voices: Vec<String>,
-    },
-    Https {
-        https: HttpsResource,
-    },
-    Responses {
-        responses: ResponsesResource,
-    },
+    Model { package: PathBuf },
+    Https { https: HttpsResource },
+    Responses { responses: ResponsesResource },
 }
 fn account_backed(https: &HttpsResource, credentials: &[Credential]) -> bool {
     credentials.iter().any(|credential| {
@@ -80,36 +72,6 @@ impl Resource {
     }
 }
 impl Document {
-    pub(crate) fn model_voices(
-        &self,
-        path: &std::path::Path,
-        backend: Option<&str>,
-    ) -> Vec<String> {
-        let mut voices = std::collections::BTreeSet::new();
-        let mut include = |list: &[String]| {
-            if list.is_empty() {
-                voices.insert("default".to_string());
-            }
-            voices.extend(list.iter().cloned());
-        };
-        for route in &self.routes {
-            if backend.is_none_or(|b| route.backends.iter().any(|id| id == b))
-                && route.model_package().is_some_and(|(_, p)| p == path)
-            {
-                include(route.model_voices());
-            }
-        }
-        for resource in &self.resources {
-            if let ResourceKind::Model { package, voices } = &resource.kind
-                && package == path
-                && backend.is_none_or(|b| resource.backend == b)
-            {
-                include(voices);
-            }
-        }
-        voices.into_iter().collect()
-    }
-
     pub(crate) fn model_evaluators(
         &self,
         info: &[hellas_gateway::BackendInfo],
@@ -151,13 +113,8 @@ impl Document {
     ) -> Result<NodeConfiguration, crate::daemon::Error> {
         let mut models = hellas_gateway::router::Models::new();
         for (path, evaluators) in self.model_evaluators(info) {
-            let packages = hellas_client::model::ModelPackage::open_many_with_voices(
-                &path,
-                evaluators,
-                None,
-                &self.model_voices(&path, None),
-            )
-            .await?;
+            let packages =
+                hellas_client::model::ModelPackage::open_many(&path, evaluators, None).await?;
             models.insert(path, Ok(packages));
         }
         self.configuration(info, &models)
@@ -187,7 +144,6 @@ impl Document {
                                 id.clone(),
                                 ResourceKind::Model {
                                     package: package.clone(),
-                                    voices: route.model_voices().to_vec(),
                                 },
                             );
                             resource.rates = Some(vec![]);
@@ -304,7 +260,7 @@ impl Resource {
         model_route: bool,
     ) -> Result<GrantPolicy, crate::daemon::Error> {
         let (invocation_policy, https, responses) = match (&self.kind, &backend.kind) {
-            (ResourceKind::Model { package, voices }, BackendKind::Local { .. }) => {
+            (ResourceKind::Model { package }, BackendKind::Local { .. }) => {
                 let evaluator = backends
                     .iter()
                     .find(|b| b.id == self.backend)
@@ -319,7 +275,7 @@ impl Resource {
                     .ok_or("model evaluator was not prepared")?;
                 (
                     InvocationPolicy {
-                        admissions: package.compute_admissions(voices)?,
+                        admissions: package.compute_admissions()?,
                         limits: Limits {
                             max_upload_bytes: 8 << 20,
                             max_output_bytes: 4 << 20,

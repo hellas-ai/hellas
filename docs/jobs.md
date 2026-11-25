@@ -67,6 +67,30 @@ hellas store acquire hf://LiquidAI/LFM3-1.7B-GGUF@cd0c74c575b5c416f3011b5b4c2980
 
 The provider checks the published Xet hash against the canonical content ID. It rejects files published with legacy Xet chunking. With `--local`, the local executor acquires the weights into its own content store.
 
+A program commits to a model ID covering its named checkpoint files and render
+metadata. An activated provider stores their catalog in
+`models/by-id/MODEL_ID` with the `jobs` policy. To permit peer reads of the
+whole model, the owner can list the catalog's tree ID and byte size, then set
+its pin to `public`:
+
+```sh
+hellas store pin ls models/by-id
+hellas store pin set models/by-id/MODEL_ID TREE_ID --bytes TREE_BYTES --tree --policy public
+```
+
+Use `hellas program --model-id MODEL` to print its reference without selecting an evaluator.
+With a public catalog, pass `--model hellas://MODEL_ID` to a job command. The
+buyer contacts the node in its signed access offer or the node selected by
+`--provider`. To specify a source explicitly, including with `hellas program`
+or a gateway route, use `hellas://MODEL_ID@NODE_ID` or
+`hellas://MODEL_ID@NODE_ID@IP:PORT`. The buyer verifies the catalog against the
+model ID and reads authenticated ranges for checkpoint headers and metadata.
+Publishing the tree permits readers to download every file in it, including
+weights. For private sharing, the owner can choose `--policy granted` and give the
+access credential `content.read` on the exact catalog pin. A job addressed by
+`--access` uses that authenticated connection when the catalog is private.
+A compute grant alone authorizes execution only.
+
 `hellas transact --job DIR` executes a caller-owned job folder for any
 application. `hellas run` (one call of a Catena program) and `hellas fetch`
 (one HTTPS request) build such a folder and go through the same SDK
@@ -248,7 +272,7 @@ configuration and tokenizer. The provider acquires the original weight files
 and the model's GPU setup prepares the text encoder, denoiser and VAE.
 The default image variant is 512×512 with four steps. A local snapshot can
 include `variants.json` with 1–64 unique width, height and step configurations.
-Keep the same file on the client and provider. `hellas program` prints the
+Variant settings are part of the model ID. `hellas program` prints the
 exact program for each allowed variant.
 
 ```sh

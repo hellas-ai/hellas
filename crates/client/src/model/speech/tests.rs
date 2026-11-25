@@ -19,9 +19,15 @@ async fn original_mms_ranges_prepare_once_for_different_utterances() -> Result<(
         assert!(model.render_job(&request("Hello", "other")).await.is_err());
         let job = model.render_job(&request("Hello", "default")).await?;
         let other = model.render_job(&request("Goodbye", "default")).await?;
-        assert_eq!(job.environment.assets.len(), 1);
-        assert_eq!(job.environment.assets[0].name, "model.safetensors");
-        assert_eq!(job.environment.assets[0].object, object);
+        assert_eq!(job.environment.model.assets.len(), CHECKPOINT.len());
+        let weight = job
+            .environment
+            .model
+            .assets
+            .iter()
+            .find(|a| a.name == "model.safetensors")
+            .unwrap();
+        assert_eq!(weight.object, object);
         let [setup, synth] = job.plan.calls.as_slice() else {
             panic!("expected setup then synthesis")
         };

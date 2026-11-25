@@ -54,11 +54,11 @@ enum Model {
 }
 impl Speech {
     pub async fn open_native(
-        source: super::native::Native,
+        source: std::sync::Arc<super::native::Native>,
         kind: super::native::Kind,
         dialect: super::GpuDialect,
     ) -> Result<Self> {
-        let (model, source, assets) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let (model, bundle, native) = tokio::task::spawn_blocking(move || -> Result<_> {
             let (model, bundle) = match kind {
                 super::native::Kind::Mms => {
                     let (config, tokenizer) = metadata(source.dir())?;
@@ -94,7 +94,7 @@ impl Speech {
                     )
                 }
                 super::native::Kind::Phonon => {
-                    let (m, s) = phonon::Phonon::open(&source, dialect)?;
+                    let (m, s) = phonon::Phonon::open(source.clone(), dialect)?;
                     (Model::Phonon(Box::new(m)), s)
                 }
                 super::native::Kind::OmniVoice => {
@@ -103,14 +103,10 @@ impl Speech {
                 }
                 super::native::Kind::Flux | super::native::Kind::Whisper => unreachable!(),
             };
-            Ok((
-                model,
-                super::program::render(&bundle, dialect)?,
-                source.assets(),
-            ))
+            Ok((model, super::program::render(&bundle, dialect)?, source))
         })
         .await??;
-        let (environment, content) = super::program::environment(&source, assets).await?;
+        let (environment, content) = native.environment(&bundle).await?;
         Ok(Self {
             environment,
             content,
@@ -121,7 +117,7 @@ impl Speech {
         match &self.model {
             Model::Mms { .. } => &[tts::preparation::SETUP_ENTRY],
             Model::OmniVoice(_) => &["omnivoice.setup"],
-            _ => &[],
+            Model::Phonon(_) => &["phonon.prepare-weights", "phonon.prepare-voice"],
         }
     }
     pub(super) fn environment(&self) -> &Environment {
@@ -199,9 +195,6 @@ impl Speech {
             Model::Phonon(_) => phonon::decode(output),
             Model::OmniVoice(_) => omnivoice::decode(output),
         }
-    }
-    pub(super) fn decode_phonon(output: &InvocationOutput) -> Result<Audio> {
-        phonon::decode(output)
     }
     fn decode_mms(output: &InvocationOutput) -> Result<Audio> {
         ensure!(

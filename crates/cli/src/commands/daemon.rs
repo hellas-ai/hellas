@@ -113,13 +113,7 @@ impl ModelContext {
         path: &Path,
         evaluators: impl IntoIterator<Item = String>,
     ) -> Result<std::collections::BTreeMap<String, Arc<hellas_client::model::ModelPackage>>> {
-        hellas_client::model::ModelPackage::open_many_with_voices(
-            path,
-            evaluators,
-            self.content.as_ref(),
-            &self.voices,
-        )
-        .await
+        hellas_client::model::ModelPackage::open_many(path, evaluators, self.content.as_ref()).await
     }
 
     async fn add(&self, document: &mut Document, model: &str) -> Result<()> {
@@ -318,6 +312,12 @@ fn split_model(value: &str) -> (&str, Option<&str>) {
     let Some((source, contact)) = value.rsplit_once('@') else {
         return (value, None);
     };
+    if value.starts_with("hellas://")
+        && (contact.parse::<iroh::EndpointId>().is_ok()
+            || contact.parse::<std::net::SocketAddr>().is_ok())
+    {
+        return (value, None);
+    }
     if value.starts_with("hf://")
         && (!source.contains('@')
             || (value.to_ascii_lowercase().ends_with(".gguf")
@@ -330,7 +330,7 @@ fn split_model(value: &str) -> (&str, Option<&str>) {
 }
 
 fn model_path(source: &str) -> Result<Option<PathBuf>> {
-    if source.starts_with("hf://") {
+    if source.starts_with("hf://") || source.starts_with("hellas://") {
         return Ok(Some(source.into()));
     }
     Ok(Path::new(source)
@@ -1120,6 +1120,21 @@ mod tests {
         packages[&evaluator].programs().unwrap();
         assert_weights_once(before);
         store.close().await;
+    }
+
+    #[test]
+    fn gateway_peer_address_survives_route_shorthand() {
+        let node = iroh::SecretKey::from_bytes(&[3; 32]).public();
+        let uri = format!(
+            "hellas://{}@{node}",
+            hellas_rpc::ContentId::hash(b"catalog")
+        );
+        for source in [uri.clone(), format!("{uri}@127.0.0.1:42")] {
+            assert_eq!(split_model(&source), (source.as_str(), None));
+            assert_eq!(model_path(&source).unwrap(), Some(PathBuf::from(&source)));
+            let grant = format!("{source}@friend");
+            assert_eq!(split_model(&grant), (source.as_str(), Some("friend")));
+        }
     }
 
     #[test]

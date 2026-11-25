@@ -35,7 +35,7 @@ pub struct Transcription {
 }
 impl Whisper {
     pub async fn open(source: Arc<Native>, dialect: super::GpuDialect) -> Result<Self> {
-        let (config, generation, tokenizer, setup, weights, bundle, assets) =
+        let (config, generation, tokenizer, setup, weights, bundle, native) =
             tokio::task::spawn_blocking(move || -> Result<_> {
                 let dir = source.dir();
                 let config = Config::read(dir)?;
@@ -74,11 +74,11 @@ impl Whisper {
                     setup,
                     weights,
                     super::program::render(&program.source, dialect)?,
-                    source.assets(),
+                    source,
                 ))
             })
             .await??;
-        let (environment, content) = super::program::environment(&bundle, assets).await?;
+        let (environment, content) = native.environment(&bundle).await?;
         Ok(Self {
             config,
             generation,

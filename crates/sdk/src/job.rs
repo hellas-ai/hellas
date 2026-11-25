@@ -593,7 +593,7 @@ impl Job {
                 .sources
                 .iter()
                 .copied()
-                .chain(environment.assets.iter().map(|asset| asset.object))
+                .chain(environment.model.assets.iter().map(|asset| asset.object))
             {
                 objects.insert(object.id(), object);
             }

@@ -113,7 +113,7 @@ impl Program {
         }
         let environment = compute::Environment {
             sources,
-            assets: Vec::new(),
+            model: Default::default(),
         };
         hellas_channel::content::upload_object(&content.0, &environment.canonical_bytes()?).await?;
         let inputs = self

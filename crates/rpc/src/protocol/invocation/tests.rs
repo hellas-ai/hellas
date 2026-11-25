@@ -490,7 +490,7 @@ fn a_fixed_fetch_contract_refuses_a_different_signed_endpoint() {
 fn compute_prepared(policy: &InvocationPolicy, plan: &compute::Plan) -> PreparedInvocation {
     let manifest = compute::Environment {
         sources: vec![crate::ContentRef::for_bytes(b"program")],
-        assets: vec![],
+        model: Default::default(),
     }
     .manifest(crate::protocol::invocation::compute::EVALUATOR)
     .unwrap();
@@ -629,10 +629,11 @@ fn application_admission_binds_owner_bytes_caller_and_staging_classification() {
 fn compute_program_selection_binds_sources_and_weights_before_admission() {
     let environment = compute::Environment {
         sources: vec![crate::ContentRef::for_bytes(b"approved program")],
-        assets: vec![compute::NamedAsset {
+        model: crate::protocol::invocation::compute::Model::new(vec![compute::NamedAsset {
             name: "weights".into(),
             object: crate::ContentRef::for_bytes(b"approved weights"),
-        }],
+        }])
+        .unwrap(),
     };
     let manifest = environment
         .manifest(crate::protocol::invocation::compute::EVALUATOR)
@@ -701,10 +702,12 @@ fn compute_program_selection_binds_sources_and_weights_before_admission() {
             let mut changed = environment.clone();
             match change {
                 0 => changed.sources[0] = crate::ContentRef::for_bytes(b"other program"),
-                1 => changed.assets[0].object = crate::ContentRef::for_bytes(b"other weights"),
+                1 => {
+                    changed.model.assets[0].object = crate::ContentRef::for_bytes(b"other weights")
+                }
                 _ => {
-                    let asset = changed.assets[0].object;
-                    changed.assets[0].object =
+                    let asset = changed.model.assets[0].object;
+                    changed.model.assets[0].object =
                         crate::ContentRef::new(asset.id(), asset.bytes() + 1);
                 }
             }
@@ -1254,7 +1257,7 @@ fn content_closure_opens_the_signed_root_and_returns_unique_exact_references() {
     let weights = crate::ContentRef::new(crate::ContentId::from_bytes([55; 32]), 1 << 30);
     let environment = compute::Environment {
         sources: vec![source, source],
-        assets: vec![
+        model: crate::protocol::invocation::compute::Model::new(vec![
             compute::NamedAsset {
                 name: "weights".into(),
                 object: weights,
@@ -1267,7 +1270,8 @@ fn content_closure_opens_the_signed_root_and_returns_unique_exact_references() {
                 name: "source".into(),
                 object: source,
             },
-        ],
+        ])
+        .unwrap(),
     };
     let bytes = environment.canonical_bytes().unwrap();
     assert_eq!(
@@ -1308,21 +1312,23 @@ fn content_closure_refuses_conflicting_lengths_names_and_impossible_source_sizes
     let object = crate::ContentRef::for_bytes(b"source");
     let environment = compute::Environment {
         sources: vec![object],
-        assets: vec![compute::NamedAsset {
+        model: crate::protocol::invocation::compute::Model::new(vec![compute::NamedAsset {
             name: "asset".into(),
             object,
-        }],
+        }])
+        .unwrap(),
     };
     let changes: &[fn(&mut compute::Environment)] = &[
         |e| {
-            e.assets[0].object = crate::ContentRef::new(e.sources[0].id(), e.sources[0].bytes() + 1)
+            e.model.assets[0].object =
+                crate::ContentRef::new(e.sources[0].id(), e.sources[0].bytes() + 1)
         },
-        |e| e.assets.push(e.assets[0].clone()),
-        |e| e.assets[0].name.clear(),
-        |e| e.assets[0].name = "x".repeat(257),
+        |e| e.model.assets.push(e.model.assets[0].clone()),
+        |e| e.model.assets[0].name.clear(),
+        |e| e.model.assets[0].name = "x".repeat(257),
         |e| {
             e.sources[0] = crate::ContentRef::new(e.sources[0].id(), compute::MAX_SOURCE_BYTES + 1);
-            e.assets.clear();
+            e.model.assets.clear();
         },
     ];
     for change in changes {
@@ -1341,11 +1347,11 @@ fn content_closure_refuses_conflicting_lengths_names_and_impossible_source_sizes
 fn content_closure_bounds_reference_arrays_before_decoding_their_members() {
     let empty = compute::Environment {
         sources: vec![],
-        assets: vec![],
+        model: Default::default(),
     }
     .canonical_bytes()
     .unwrap();
-    for field in ["assets", "sources"] {
+    for field in ["model", "sources"] {
         let mut bytes = empty.clone();
         let mut needle = encode(&field).unwrap();
         needle.push(0x80);
@@ -1385,7 +1391,7 @@ fn content_closure_bounds_reference_arrays_before_decoding_their_members() {
 fn content_closure_refuses_noncanonical_or_trailing_root_bytes_even_with_matching_hashes() {
     let root = compute::Environment {
         sources: vec![],
-        assets: vec![],
+        model: Default::default(),
     }
     .canonical_bytes()
     .unwrap();
@@ -1403,7 +1409,7 @@ fn content_closure_refuses_noncanonical_or_trailing_root_bytes_even_with_matchin
             .content_closure(&closure_manifest(&noncanonical), &noncanonical)
             .is_err()
     );
-    let key = encode(&"assets").unwrap();
+    let key = encode(&"model").unwrap();
     let fields = root
         .windows(key.len())
         .position(|bytes| bytes == key)
@@ -1551,7 +1557,7 @@ fn setup_declarations_bind_exact_admitted_program_and_evaluator() {
     use std::collections::{BTreeMap, BTreeSet};
     let env = compute::Environment {
         sources: vec![],
-        assets: vec![],
+        model: Default::default(),
     };
     let manifest = env.manifest(compute::EVALUATOR).unwrap();
     let mut p = policy();
@@ -1571,7 +1577,7 @@ fn setup_declarations_bind_exact_admitted_program_and_evaluator() {
     // Existing signed policies encode these two setup-map keys as lowercase text.
     assert_eq!(
         p.content_id().unwrap().to_string(),
-        "1123857c338e17f53a8b3e7ba59ec6ee7171f69ddc0523d3738401ab583bb74c"
+        "64b383e9249b32a01fd6e7cf3d4d66068f3f24852ba936b59ef13a5a2b1e6f18"
     );
     assert_eq!(p.pure_setup_entries(&manifest), entries);
     assert!(
@@ -1588,4 +1594,52 @@ fn setup_declarations_bind_exact_admitted_program_and_evaluator() {
         manifests[0] = ContentId::hash(b"other");
     }
     assert!(p.validate().is_err());
+}
+
+#[test]
+fn model_identity_is_order_independent_and_binds_metadata_across_programs() {
+    let file = |name: &str, data: &[u8]| compute::NamedAsset {
+        name: name.into(),
+        object: crate::ContentRef::for_bytes(data),
+    };
+    let weights = file("model.safetensors", b"weights");
+    let config = file("tokenizer.json", b"vocabulary");
+    let model = compute::Model::new(vec![config.clone(), weights.clone()]).unwrap();
+    let id = model.content_id().unwrap();
+    assert_eq!(
+        model,
+        compute::Model::from_canonical_bytes(&model.canonical_bytes().unwrap()).unwrap()
+    );
+    assert_eq!(
+        id,
+        compute::Model::new(vec![weights.clone(), config.clone()])
+            .unwrap()
+            .content_id()
+            .unwrap()
+    );
+    assert!(compute::Model::new(vec![weights.clone(), weights.clone()]).is_err());
+    let make = |source: &[u8], model| compute::Environment {
+        sources: vec![crate::ContentRef::for_bytes(source)],
+        model,
+    };
+    let first = make(b"program 1", model.clone());
+    let second = make(b"program 2", model);
+    let manifest = first.manifest(compute::EVALUATOR).unwrap();
+    let variant = second.manifest("other-renderer").unwrap();
+    assert_ne!(manifest.content_id(), variant.content_id());
+    assert_eq!(manifest.model(), Some(id));
+    assert_eq!(manifest.model(), variant.model());
+    let changed =
+        compute::Model::new(vec![weights, file("tokenizer.json", b"another vocabulary")]).unwrap();
+    assert_ne!(changed.content_id().unwrap(), id);
+    let forged = ProgramManifest::with_model(
+        manifest.application().clone(),
+        manifest.root(),
+        changed.content_id().unwrap(),
+    );
+    assert!(
+        policy()
+            .content_closure(&forged, &first.canonical_bytes().unwrap())
+            .is_err()
+    );
 }

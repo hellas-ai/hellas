@@ -176,8 +176,6 @@ pub(super) struct TargetArgs {
     /// from; local execution reads the jobs' weights from them.
     #[arg(skip)]
     pub(super) models: Vec<PathBuf>,
-    #[arg(skip)]
-    pub(super) voices: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -323,6 +321,125 @@ struct ResolvedBackend {
 }
 
 impl TargetArgs {
+    fn resolve_model_peer(
+        &self,
+        client: &ClientArgs,
+        context: &Context,
+        model: &mut PathBuf,
+    ) -> super::CliResult<()> {
+        let Some(uri) = model
+            .to_str()
+            .filter(|s| s.starts_with("hellas://") && !s.contains('@'))
+        else {
+            return Ok(());
+        };
+        let (node, mut addresses) = if let Some(access) = &self.access {
+            let holder =
+                hellas_auth::authority::NodeKey::from_public_key(context.producer.public_key())?;
+            let bundle = hellas_sdk::access_bundle::AccessBundle::load(
+                access,
+                &context.principal()?,
+                &holder,
+            )?;
+            let [offer] = bundle.offers.as_slice() else {
+                bail!("a job uses an access file with one offer")
+            };
+            let authority = offer.offer();
+            let node = hellas_sdk::client::ProviderAddress::of(&authority.provider)?.node;
+            let addresses = authority
+                .addresses
+                .iter()
+                .map(|s| s.parse::<SocketAddr>())
+                .collect::<Result<Vec<_>, _>>()?;
+            (node, addresses)
+        } else {
+            let provider = client.provider.as_ref().context(
+                "hellas://model-id needs an addressed provider or an explicit @NODE_ID[@IP:PORT]",
+            )?;
+            (provider.address.node, provider.addresses.clone())
+        };
+        addresses.extend(client.addresses.iter().copied());
+        let mut resolved = format!("{uri}@{node}");
+        for address in addresses {
+            resolved.push('@');
+            resolved.push_str(&address.to_string());
+        }
+        *model = resolved.into();
+        Ok(())
+    }
+
+    async fn open_model(
+        &mut self,
+        client: &ClientArgs,
+        context: &Context,
+        path: &mut PathBuf,
+    ) -> super::CliResult<(String, Arc<hellas_client::model::ModelPackage>)> {
+        use hellas_client::model::{CatalogUnavailable, ModelPackage};
+        self.resolve_model_peer(client, context, path)?;
+        self.models = vec![path.clone()];
+        let evaluator = self.renderer()?;
+        let content = self.content(context).await?;
+        let package =
+            match ModelPackage::open_many(path, [evaluator.clone()], content.as_ref()).await {
+                Ok(mut packages) => packages
+                    .remove(&evaluator)
+                    .context("model evaluator is not prepared"),
+                Err(error) => {
+                    let Some(file) = self
+                        .access
+                        .as_ref()
+                        .filter(|_| error.is::<CatalogUnavailable>())
+                    else {
+                        return Err(error);
+                    };
+                    let uri = path
+                        .to_str()
+                        .and_then(|s| s.strip_prefix("hellas://"))
+                        .context("expected a model URI")?;
+                    let mut parts = uri.split('@');
+                    let id = parts.next().context("missing model id")?.parse()?;
+                    let node = parts.next().context("missing model provider")?.parse()?;
+                    let target = context
+                        .target(self.access_spec(
+                            file.clone(),
+                            client,
+                            context,
+                            Assurance::ProducerSigned,
+                        )?)
+                        .await?;
+                    let BackendState::Grant(grant) = target.state else {
+                        unreachable!("access selects a grant")
+                    };
+                    let store = grant.options.model_content(node, &grant.transport).await?;
+                    Ok(Arc::new(
+                        ModelPackage::open_peer(id, store, &evaluator).await?,
+                    ))
+                }
+            }?;
+        Ok((evaluator, package))
+    }
+
+    fn access_spec(
+        &self,
+        file: PathBuf,
+        client: &ClientArgs,
+        context: &Context,
+        assurance: Assurance,
+    ) -> super::CliResult<TargetSpec> {
+        if let Some(provider) = &client.provider {
+            ensure!(
+                provider.addresses.is_empty(),
+                "grant addresses come from the signed offer"
+            );
+        }
+        Ok(TargetSpec::Access {
+            file,
+            provider: client.provider.as_ref().map(|p| p.address),
+            trust: client.trust(context, assurance)?.map(Box::new),
+            resource: self.resource,
+        })
+    }
+
     async fn content(
         &self,
         context: &Context,
@@ -333,18 +450,29 @@ impl TargetArgs {
                 context
                     .local_content
                     .get_or_try_init(|| async {
-                        let files = hellas_client::model::ModelFiles::for_voices(
-                            self.models.clone(),
-                            &self.voices,
-                        )
-                        .await?;
-                        crate::compute::content(
+                        let files =
+                            hellas_client::model::ModelFiles::resolve(self.models.clone()).await?;
+                        let store = crate::compute::content(
                             &context.home,
                             &self.native,
                             &files.local,
                             &files.hub,
                         )
-                        .await
+                        .await?;
+                        for uri in self
+                            .models
+                            .iter()
+                            .filter_map(|p| p.to_str())
+                            .filter(|s| s.starts_with("hellas://"))
+                        {
+                            if let Err(error) =
+                                hellas_client::model::acquire_peer_model(uri, &store).await
+                            {
+                                store.close().await;
+                                return Err(error);
+                            }
+                        }
+                        Ok::<_, anyhow::Error>(store)
                     })
                     .await?
                     .clone(),
@@ -410,20 +538,7 @@ impl TargetArgs {
             });
         }
         let spec = match self.access {
-            Some(file) => {
-                if let Some(provider) = &client.provider {
-                    ensure!(
-                        provider.addresses.is_empty(),
-                        "grant addresses come from the signed offer"
-                    );
-                }
-                TargetSpec::Access {
-                    file,
-                    provider: client.provider.as_ref().map(|p| p.address),
-                    trust: client.trust(context, assurance)?.map(Box::new),
-                    resource: self.resource,
-                }
-            }
+            Some(ref file) => self.access_spec(file.clone(), client, context, assurance)?,
             None => TargetSpec::Paid(Box::new(client.options_with_config(
                 context,
                 pay,

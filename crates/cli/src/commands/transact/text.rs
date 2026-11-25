@@ -29,11 +29,11 @@ pub struct TextArgs {
 pub async fn text(mut args: TextArgs, context: Context) -> super::super::CliResult<()> {
     context
         .model_command(async {
-            args.target.models = vec![args.model.clone()];
-            let evaluator = args.target.renderer()?;
-            let content = args.target.content(&context).await?;
-            let (package, presentation, rendered) =
-                prepare(&args, &evaluator, content.as_ref()).await?;
+            let (evaluator, package) = args
+                .target
+                .open_model(&args.client, &context, &mut args.model)
+                .await?;
+            let (presentation, rendered) = prepare(&args, &package).await?;
             let target = args.target;
             run_quoted(
                 &args.client,
@@ -59,17 +59,8 @@ pub async fn text(mut args: TextArgs, context: Context) -> super::super::CliResu
 
 async fn prepare(
     args: &TextArgs,
-    evaluator: &str,
-    content: Option<&hellas_store::content::DiskStore>,
-) -> anyhow::Result<(
-    Arc<ModelPackage>,
-    TextPresentation,
-    hellas_client::model::ComputeJob,
-)> {
-    let package = ModelPackage::open_many(&args.model, [evaluator.to_owned()], content)
-        .await?
-        .remove(evaluator)
-        .context("model evaluator is not prepared")?;
+    package: &Arc<ModelPackage>,
+) -> anyhow::Result<(TextPresentation, hellas_client::model::ComputeJob)> {
     let metadata = package.clone();
     let presentation =
         tokio::task::spawn_blocking(move || TextPresentation::from_gguf(metadata.gguf_path()?))
@@ -97,7 +88,7 @@ async fn prepare(
             stops: &[],
         })
         .await?;
-    Ok((package, presentation, rendered))
+    Ok((presentation, rendered))
 }
 
 #[cfg(test)]
@@ -133,9 +124,13 @@ mod tests {
             };
             args
         };
-        let render = async |args: TextArgs| prepare(&args, &args.target.renderer()?, None).await;
-        let (_, presentation, job) = render(parse(&[])).await.unwrap();
-        let (_, _, with_system) = render(parse(&["--system", "be brief"])).await.unwrap();
+        let render = async |args: TextArgs| {
+            let package =
+                Arc::new(ModelPackage::open(&args.model, &args.target.renderer()?).await?);
+            prepare(&args, &package).await
+        };
+        let (presentation, job) = render(parse(&[])).await.unwrap();
+        let (_, with_system) = render(parse(&["--system", "be brief"])).await.unwrap();
         assert_ne!(job.inputs, with_system.inputs);
         let (plan, inputs) = (job.plan, job.inputs);
         assert_eq!(plan.step.as_ref().unwrap().stop.max_steps, 3);

@@ -57,7 +57,9 @@ impl BoundProgram {
             hellas_channel::content::root(&content.0, &content.1, manifest.root()).await?
         };
         let environment = Environment::from_canonical_bytes(&root)?;
-        if ContentId::hash(&root) != manifest.root() {
+        if ContentId::hash(&root) != manifest.root()
+            || Some(environment.model.content_id()?) != manifest.model()
+        {
             return Err("compute environment identity mismatch".into());
         }
         let plan = Plan::from_canonical_bytes(prepared.input.parameters.as_bytes())?;
@@ -80,7 +82,7 @@ impl BoundProgram {
             sources.push(std::str::from_utf8(&bytes)?.to_owned());
         }
         let mut readers = BTreeMap::new();
-        for asset in &environment.assets {
+        for asset in &environment.model.assets {
             let reader = content
                 .0
                 .preflight(&content.1, asset.object)

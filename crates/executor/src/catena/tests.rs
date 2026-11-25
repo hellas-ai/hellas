@@ -109,7 +109,7 @@ fn limits() -> Limits {
 fn environment() -> Environment {
     Environment {
         sources: vec![],
-        assets: vec![],
+        model: Default::default(),
     }
 }
 fn counter() -> Plan {
@@ -379,10 +379,11 @@ fn slot_moves_asset_ownership_and_recurrent_flow_are_checked() {
     };
     let env = Environment {
         sources: vec![],
-        assets: vec![NamedAsset {
+        model: hellas_rpc::protocol::invocation::compute::Model::new(vec![NamedAsset {
             name: "w".into(),
             object: hellas_rpc::ContentRef::for_bytes(&[0; 8]),
-        }],
+        }])
+        .unwrap(),
     };
     assert!(validate::validate(&module, &env, &BTreeMap::new(), &plan, &limits(),).is_err());
     let mut plan = counter();
@@ -611,10 +612,11 @@ async fn cached_program_still_opens_current_pin_policy(warm_gpu: bool) {
             .iter()
             .map(|source| ContentRef::for_bytes(source.as_bytes()))
             .collect(),
-        assets: vec![NamedAsset {
+        model: hellas_rpc::protocol::invocation::compute::Model::new(vec![NamedAsset {
             name: "weights".into(),
             object: asset,
-        }],
+        }])
+        .unwrap(),
     };
     let manifest = environment
         .manifest(&super::evaluator(GpuDialect::Hip))
@@ -772,7 +774,7 @@ async fn an_executor_refuses_an_unregistered_evaluator() {
     use hellas_store::content::{LocalStore, MemoryStore, Reservations, Scope};
     let environment = Environment {
         sources: vec![ContentRef::for_bytes(SOURCE.as_bytes())],
-        assets: vec![],
+        model: Default::default(),
     };
     let content = (
         LocalStore::Memory(MemoryStore::new(Reservations::ram(1 << 20))),
@@ -848,10 +850,11 @@ fn only_approved_asset_only_setup_results_are_read_only() {
     let object = hellas_rpc::ContentRef::for_bytes(b"weight");
     let env = Environment {
         sources: vec![],
-        assets: vec![NamedAsset {
+        model: hellas_rpc::protocol::invocation::compute::Model::new(vec![NamedAsset {
             name: "w".into(),
             object,
-        }],
+        }])
+        .unwrap(),
     };
     let asset = Arg::Asset {
         name: "w".into(),

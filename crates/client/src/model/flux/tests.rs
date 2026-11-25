@@ -114,10 +114,15 @@ async fn image_job_bundles_three_stages_and_passes_state_in_slots() {
     .validate()
     .unwrap();
     assert_eq!(job.environment.sources.len(), 1);
-    assert_eq!(job.environment.assets.len(), 3);
+    assert_eq!(job.environment.model.assets.len(), 3 + METADATA.len() + 1);
     let programs = package.programs().unwrap();
     assert_eq!(programs.len(), 2);
     assert_ne!(programs[0], programs[1]);
+    assert!(
+        programs
+            .iter()
+            .all(|p| p.model() == Some(package.model().content_id().unwrap()))
+    );
     let evaluator = programs[0].application().evaluator();
     let manifest = job.environment.manifest(evaluator).unwrap();
     let admission =
@@ -127,17 +132,22 @@ async fn image_job_bundles_three_stages_and_passes_state_in_slots() {
     unrelated.sources = vec![ContentRef::for_bytes(b"unrelated source")];
     assert!(!admission.admits_manifest(&unrelated.manifest(evaluator).unwrap()));
 
-    for asset in &job.environment.assets {
-        assert!(
-            hellas_channel::content::read(
-                &job.content.0,
-                &job.content.1,
-                asset.object,
-                asset.object.bytes()
-            )
-            .await
-            .is_err()
-        );
+    for asset in &job.environment.model.assets {
+        let bytes = hellas_channel::content::read(
+            &job.content.0,
+            &job.content.1,
+            asset.object,
+            asset.object.bytes(),
+        )
+        .await;
+        if asset.name.ends_with(".safetensors") {
+            assert!(bytes.is_err());
+        } else {
+            assert_eq!(
+                bytes.unwrap().as_ref(),
+                std::fs::read(directory().join(&asset.name)).unwrap()
+            );
+        }
     }
     assert!(job.plan.step.is_none());
     let calls = &job.plan.calls;

@@ -122,7 +122,7 @@ async fn tiny_gguf_renders_the_complete_qwen3_step_job() {
         .unwrap(),
         root
     );
-    let [ref asset] = job.environment.assets[..] else {
+    let [ref asset] = job.environment.model.assets[..] else {
         panic!("one weights asset")
     };
     assert_eq!(asset.name, "weights");

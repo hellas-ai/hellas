@@ -1,5 +1,5 @@
 use super::*;
-use hellas_client::model::{ModelPackage, ModelRequest, ModelResponse, flux::ImageRequest};
+use hellas_client::model::{ModelRequest, ModelResponse, flux::ImageRequest};
 
 #[derive(Debug, Args)]
 pub struct ImageArgs {
@@ -30,7 +30,6 @@ pub struct ImageArgs {
 pub async fn image(mut args: ImageArgs, context: Context) -> super::super::CliResult<()> {
     context
         .model_command(async {
-            args.target.models = vec![args.model.clone()];
             let request = ImageRequest {
                 prompt: &args.prompt,
                 seed: args.seed,
@@ -39,13 +38,10 @@ pub async fn image(mut args: ImageArgs, context: Context) -> super::super::CliRe
                 steps: args.steps,
             };
             request.validate()?;
-            let evaluator = args.target.renderer()?;
-            let content = args.target.content(&context).await?;
-            let package =
-                ModelPackage::open_many(&args.model, [evaluator.clone()], content.as_ref())
-                    .await?
-                    .remove(&evaluator)
-                    .context("model evaluator is not prepared")?;
+            let (evaluator, package) = args
+                .target
+                .open_model(&args.client, &context, &mut args.model)
+                .await?;
             let rendered = package.render_job(&ModelRequest::Image(request)).await?;
             let target = args.target;
             run_quoted(
@@ -123,16 +119,22 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        assert_eq!(environment.assets.len(), 3);
-        for asset in &environment.assets {
-            assert!(
-                content
-                    .0
-                    .open_verified(&content.1, asset.object, None)
-                    .await
-                    .unwrap()
-                    .is_none()
-            );
+        assert_eq!(
+            environment
+                .model
+                .assets
+                .iter()
+                .filter(|a| a.name.ends_with(".safetensors"))
+                .count(),
+            3
+        );
+        for asset in &environment.model.assets {
+            let saved = content
+                .0
+                .open_verified(&content.1, asset.object, None)
+                .await
+                .unwrap();
+            assert_eq!(saved.is_none(), asset.name.ends_with(".safetensors"));
         }
     }
 }

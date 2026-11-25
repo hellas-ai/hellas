@@ -258,7 +258,7 @@ async fn job_constructor_checks_root_and_streaming_folder_round_trip_keeps_ident
     let external = hellas_rpc::ContentRef::for_bytes(b"provider-held asset");
     let environment = compute::Environment {
         sources: vec![source_ref],
-        assets: vec![
+        model: hellas_rpc::protocol::invocation::compute::Model::new(vec![
             compute::NamedAsset {
                 name: "local".into(),
                 object: asset,
@@ -267,7 +267,8 @@ async fn job_constructor_checks_root_and_streaming_folder_round_trip_keeps_ident
                 name: "external".into(),
                 object: external,
             },
-        ],
+        ])
+        .unwrap(),
     };
     let plan = hellas_channel::test_support::channel::plan();
     assert!(matches!(
@@ -306,4 +307,71 @@ async fn job_constructor_checks_root_and_streaming_folder_round_trip_keeps_ident
     job.save(root.path()).await.unwrap();
     let loaded = Job::load(root.path()).await.unwrap();
     assert_eq!(loaded.canonical_bytes(), job.canonical_bytes());
+}
+
+#[tokio::test]
+async fn authenticated_catalog_can_render_only_its_granted_pin() {
+    use hellas_client::model::{GpuDialect, ModelPackage, evaluator, publish_model};
+    use hellas_store::content::{ContentStore, PinName, PinPolicy, PinValue, owner_pin};
+    let eval = evaluator(GpuDialect::Hip);
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../client/src/model/package/mini-qwen3.gguf");
+    let local = ModelPackage::open(&path, &eval).await.unwrap();
+    let id = local.model().content_id().unwrap();
+    let name = PinName::new(format!("models/by-id/{id}")).unwrap();
+    let fixture = Fixture::build(true, None, Some(&name)).await;
+    hellas_channel::content::upload_object(&fixture.node_content, &std::fs::read(path).unwrap())
+        .await
+        .unwrap();
+    publish_model(&fixture.node_content, local.model())
+        .await
+        .unwrap();
+    let current = owner_pin(&fixture.node_content, &name)
+        .await
+        .unwrap()
+        .unwrap();
+    let granted = PinValue {
+        policy: PinPolicy::Granted,
+        ..current.clone()
+    };
+    fixture
+        .node_content
+        .set_pin(&Scope::Owner, &name, Some(&current), Some(granted.clone()))
+        .await
+        .unwrap();
+
+    let (server, addresses, serving) = serve_work(&fixture, None).await;
+    let client = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+        .unwrap()
+        .bind()
+        .await
+        .unwrap();
+    let options = fixture.options(addresses);
+    let transport = GrantTransport::Remote(client.clone());
+    let read = || options.model_content(server.id(), &transport);
+    let private = ModelPackage::open_peer(id, read().await.unwrap(), &eval)
+        .await
+        .unwrap();
+    assert_eq!(private.programs().unwrap(), local.programs().unwrap());
+    let unauthorized = hellas_rpc::ContentRef::for_bytes(b"another model").id();
+    assert!(
+        ModelPackage::open_peer(unauthorized, read().await.unwrap(), &eval)
+            .await
+            .is_err()
+    );
+    fixture
+        .node_content
+        .set_pin(&Scope::Owner, &name, Some(&granted), Some(current))
+        .await
+        .unwrap();
+    assert!(
+        ModelPackage::open_peer(id, read().await.unwrap(), &eval)
+            .await
+            .is_err()
+    );
+    drop(private);
+    client.close().await;
+    server.close().await;
+    serving.abort();
 }

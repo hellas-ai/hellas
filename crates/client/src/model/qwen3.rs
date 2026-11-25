@@ -23,6 +23,13 @@ use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 const PROMPT: &str = "prompt";
 const WEIGHTS: &str = "weights";
+
+pub(super) fn model(object: hellas_rpc::ContentRef) -> Result<Model> {
+    Ok(Model::new(vec![NamedAsset {
+        name: WEIGHTS.into(),
+        object,
+    }])?)
+}
 const LOGITS: &str = "logits";
 
 pub(super) struct Qwen3 {
@@ -111,14 +118,7 @@ impl Qwen3 {
                 Ok((config, views, object, source, states, decisions))
             })
             .await??;
-        let (environment, content) = super::program::environment(
-            &source,
-            vec![NamedAsset {
-                name: WEIGHTS.into(),
-                object,
-            }],
-        )
-        .await?;
+        let (environment, content) = super::program::environment(&source, model(object)?).await?;
         Ok(Self {
             path,
             config,

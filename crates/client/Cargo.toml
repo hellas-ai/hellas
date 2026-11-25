@@ -31,6 +31,9 @@ iroh = [
 work = ["dep:hellas-kernel", "dep:hellas-channel"]
 # Client-side model package: renders Compute jobs from model files.
 models = [
+    "dep:iroh",
+    "dep:futures",
+    "hellas-wire/iroh",
     "work",
     "dep:hexpr",
     "dep:anyhow",

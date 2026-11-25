@@ -1282,7 +1282,7 @@ async fn compute_job(source: &str, plan: Plan) -> (hellas_sdk::job::Job, hellas_
     bytes.push(source.as_bytes().to_vec());
     let environment = invocation::compute::Environment {
         sources,
-        assets: vec![],
+        model: Default::default(),
     };
     bytes.push(environment.canonical_bytes().unwrap());
     let content = source_content(bytes).await;

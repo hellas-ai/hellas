@@ -20,6 +20,13 @@ pub const MAX_SOURCE_BYTES: u64 = 16 << 20;
 #[serde(deny_unknown_fields)]
 pub struct Environment {
     pub sources: Vec<ContentRef>,
+    pub model: Model,
+}
+
+/// The model is the canonical, ordered set of all files needed to render a job.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Model {
     pub assets: Vec<NamedAsset>,
 }
 
@@ -308,21 +315,73 @@ pub fn validate_output(
 
 pub const ADAPTOR: &str = "compute-0.0.1";
 /// Canonical tag of a compute environment.
-const ENVIRONMENT_DOMAIN: &str = "hellas.compute.environment.v1";
+const ENVIRONMENT_DOMAIN: &str = "hellas.compute.environment.v2";
 /// Canonical tag of a compute plan.
 const PLAN_DOMAIN: &str = "hellas.compute.plan.v1";
-impl Environment {
-    pub fn canonical_bytes(&self) -> Result<Vec<u8>, crate::value::CanonicalDecodeError> {
-        super::encode(&(ENVIRONMENT_DOMAIN, self))
+const MODEL_DOMAIN: &str = "hellas.compute.model.v1";
+
+impl Model {
+    pub fn new(mut assets: Vec<NamedAsset>) -> Result<Self, crate::value::CanonicalDecodeError> {
+        assets.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        let model = Self { assets };
+        model.validate()?;
+        Ok(model)
     }
+
+    fn validate(&self) -> Result<(), crate::value::CanonicalDecodeError> {
+        if self.assets.len() > MAX_ENVIRONMENT_REFERENCES {
+            return Err(super::error("too many compute content references"));
+        }
+        let mut lengths = std::collections::BTreeMap::new();
+        let mut previous = None;
+        for asset in &self.assets {
+            super::label(&asset.name)?;
+            if asset.name.contains('\\')
+                || asset
+                    .name
+                    .split('/')
+                    .any(|part| matches!(part, "" | "." | ".."))
+                || previous.is_some_and(|name| name >= asset.name.as_str())
+            {
+                return Err(super::error(
+                    "model requires unique, sorted relative asset names",
+                ));
+            }
+            if lengths
+                .insert(asset.object.id(), asset.object.bytes())
+                .is_some_and(|n| n != asset.object.bytes())
+            {
+                return Err(super::error("model assets disagree on content length"));
+            }
+            previous = Some(asset.name.as_str());
+        }
+        Ok(())
+    }
+
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, crate::value::CanonicalDecodeError> {
+        self.validate()?;
+        let bytes = super::encode(&(MODEL_DOMAIN, self))?;
+        super::bound(&bytes, MAX_ENVIRONMENT_BYTES)?;
+        Ok(bytes)
+    }
+
+    pub fn content_id(&self) -> Result<crate::ContentId, crate::value::CanonicalDecodeError> {
+        Ok(crate::ContentId::hash(&self.canonical_bytes()?))
+    }
+
     pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, crate::value::CanonicalDecodeError> {
-        use crate::protocol::value::CanonicalDecoder;
         super::bound(bytes, MAX_ENVIRONMENT_BYTES)?;
-        let mut decoder = CanonicalDecoder::new(bytes);
+        let mut decoder = crate::protocol::value::CanonicalDecoder::new(bytes);
         decoder.array_exact(2)?;
-        decoder.expect_str(ENVIRONMENT_DOMAIN)?;
-        decoder.map_exact(2)?;
-        decoder.expect_str("assets")?;
+        decoder.expect_str(MODEL_DOMAIN)?;
+        let model = Self::decode(&mut decoder)?;
+        decoder.finish()?;
+        Ok(model)
+    }
+
+    fn decode(
+        decoder: &mut crate::protocol::value::CanonicalDecoder<'_>,
+    ) -> Result<Self, crate::value::CanonicalDecodeError> {
         let assets_len = decoder.array_len()?;
         if assets_len > MAX_ENVIRONMENT_REFERENCES {
             return Err(super::error("too many compute content references"));
@@ -337,12 +396,30 @@ impl Environment {
             decoder.expect_str("object")?;
             assets.push(NamedAsset {
                 name,
-                object: decode_ref(&mut decoder)?,
+                object: decode_ref(decoder)?,
             });
         }
+        let model = Self { assets };
+        model.validate()?;
+        Ok(model)
+    }
+}
+impl Environment {
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, crate::value::CanonicalDecodeError> {
+        super::encode(&(ENVIRONMENT_DOMAIN, self))
+    }
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, crate::value::CanonicalDecodeError> {
+        use crate::protocol::value::CanonicalDecoder;
+        super::bound(bytes, MAX_ENVIRONMENT_BYTES)?;
+        let mut decoder = CanonicalDecoder::new(bytes);
+        decoder.array_exact(2)?;
+        decoder.expect_str(ENVIRONMENT_DOMAIN)?;
+        decoder.map_exact(2)?;
+        decoder.expect_str("model")?;
+        let model = Model::decode(&mut decoder)?;
         decoder.expect_str("sources")?;
         let sources_len = decoder.array_len()?;
-        if sources_len > MAX_ENVIRONMENT_REFERENCES - assets_len {
+        if sources_len > MAX_ENVIRONMENT_REFERENCES - model.assets.len() {
             return Err(super::error("too many compute content references"));
         }
         let mut sources = Vec::with_capacity(sources_len);
@@ -350,15 +427,16 @@ impl Environment {
             sources.push(decode_ref(&mut decoder)?);
         }
         decoder.finish()?;
-        Ok(Self { sources, assets })
+        Ok(Self { sources, model })
     }
     pub fn manifest(
         &self,
         evaluator: &str,
     ) -> Result<crate::ProgramManifest, crate::value::CanonicalDecodeError> {
-        Ok(crate::ProgramManifest::new(
+        Ok(crate::ProgramManifest::with_model(
             crate::Application::new(evaluator, ADAPTOR).map_err(|e| super::error(e.to_string()))?,
             crate::ContentId::hash(&self.canonical_bytes()?),
+            self.model.content_id()?,
         ))
     }
 }

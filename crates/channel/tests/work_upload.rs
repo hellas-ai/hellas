@@ -571,10 +571,11 @@ async fn unseen_program_requires_complete_verified_source_and_asset_closure() {
         };
         let environment = Environment {
             sources: vec![ContentRef::for_bytes(source)],
-            assets: vec![NamedAsset {
+            model: hellas_rpc::protocol::invocation::compute::Model::new(vec![NamedAsset {
                 name: "weights.bin".into(),
                 object: ContentRef::for_bytes(&asset),
-            }],
+            }])
+            .unwrap(),
         };
         let manifest = environment
             .manifest(&hellas_channel::test_support::channel::evaluator())

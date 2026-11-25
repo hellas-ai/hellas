@@ -1,5 +1,5 @@
 use super::*;
-use hellas_client::model::{ModelPackage, ModelRequest, ModelResponse};
+use hellas_client::model::{ModelRequest, ModelResponse};
 use std::io::Read;
 
 #[derive(Debug, Args)]
@@ -26,20 +26,11 @@ pub struct SpeakArgs {
 pub async fn speak(mut args: SpeakArgs, context: Context) -> super::super::CliResult<()> {
     context
         .model_command(async {
-            args.target.models = vec![args.model.clone()];
-            args.target.voices = vec![args.voice.clone()];
-            let evaluator = args.target.renderer()?;
-            let content = args.target.content(&context).await?;
             let text = speech_text(args.text, std::io::stdin())?;
-            let package = ModelPackage::open_many_with_voices(
-                &args.model,
-                [evaluator.clone()],
-                content.as_ref(),
-                &args.target.voices,
-            )
-            .await?
-            .remove(&evaluator)
-            .context("model evaluator is not prepared")?;
+            let (evaluator, package) = args
+                .target
+                .open_model(&args.client, &context, &mut args.model)
+                .await?;
             let rendered = package
                 .render_job(&ModelRequest::Speech {
                     text: &text,

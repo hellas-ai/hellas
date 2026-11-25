@@ -62,17 +62,6 @@ impl Route {
         }
     }
 
-    /// Voices whose exact programs are prepared for this native speech route.
-    pub fn model_voices(&self) -> &[String] {
-        match &self.presentation {
-            Presentation::Speech {
-                target: crate::speech::SpeechTarget::Native { voices, .. },
-                ..
-            } => voices,
-            _ => &[],
-        }
-    }
-
     pub fn keys(&self) -> Vec<(String, String, Option<String>)> {
         let (paths, method, models) = match &self.presentation {
             Presentation::Model {

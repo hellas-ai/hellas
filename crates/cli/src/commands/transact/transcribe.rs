@@ -1,5 +1,7 @@
 use super::*;
-use hellas_client::model::{ModelPackage, ModelRequest, ModelResponse, wav};
+#[cfg(test)]
+use hellas_client::model::ModelPackage;
+use hellas_client::model::{ModelRequest, ModelResponse, wav};
 
 #[derive(Debug, Args)]
 pub struct TranscribeArgs {
@@ -26,19 +28,15 @@ pub struct TranscribeArgs {
 pub async fn transcribe(mut args: TranscribeArgs, context: Context) -> super::super::CliResult<()> {
     context
         .model_command(async {
-            args.target.models = vec![args.model.clone()];
-            let content = args.target.content(&context).await?;
             let samples = wav::decode(&super::super::read_bounded_regular_file(
                 &args.audio,
                 "WAV",
                 wav::MAX_WAV_BYTES,
             )?)?;
-            let evaluator = args.target.renderer()?;
-            let package =
-                ModelPackage::open_many(&args.model, [evaluator.clone()], content.as_ref())
-                    .await?
-                    .remove(&evaluator)
-                    .context("model evaluator is not prepared")?;
+            let (evaluator, package) = args
+                .target
+                .open_model(&args.client, &context, &mut args.model)
+                .await?;
             let rendered = package
                 .render_job(&ModelRequest::Transcription {
                     samples: &samples,

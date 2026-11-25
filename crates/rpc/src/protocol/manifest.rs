@@ -98,6 +98,7 @@ pub enum ApplicationError {
 pub struct ProgramManifest {
     application: Application,
     root: ContentId,
+    model: Option<ContentId>,
 }
 
 // The prepared invocation carries the manifest as its strict canonical byte string.
@@ -125,7 +126,24 @@ impl ProgramManifest {
     /// Binds an exact application identity to its application-owned root.
     #[must_use]
     pub const fn new(application: Application, root: ContentId) -> Self {
-        Self { application, root }
+        Self {
+            application,
+            root,
+            model: None,
+        }
+    }
+
+    /// Bind a model identity alongside the exact executable root.
+    pub const fn with_model(application: Application, root: ContentId, model: ContentId) -> Self {
+        Self {
+            application,
+            root,
+            model: Some(model),
+        }
+    }
+
+    pub const fn model(&self) -> Option<ContentId> {
+        self.model
     }
 
     /// Returns the complete, exact interpreter identity.
@@ -140,18 +158,21 @@ impl ProgramManifest {
         self.root
     }
 
-    /// Strict DAG-CBOR `[domain, [evaluator, adaptor], root]` encoding.
+    /// Strict DAG-CBOR tuple of domain, application, root, and model ID for model programs.
     ///
     /// Definite arrays and the minimal encoder give every manifest exactly one
     /// wire representation, independent of which application interprets it.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut encoder = DagCborEncoder::new();
-        encoder.array(3);
+        encoder.array(if self.model.is_some() { 4 } else { 3 });
         encoder.str(PROGRAM_MANIFEST_DOMAIN);
         encoder.array(2);
         encoder.str(&self.application.evaluator);
         encoder.str(&self.application.adaptor);
         encoder.bytes(self.root.as_bytes());
+        if let Some(model) = self.model {
+            encoder.bytes(model.as_bytes());
+        }
         encoder.into_bytes()
     }
 
@@ -168,17 +189,31 @@ impl ProgramManifest {
         }
 
         let mut decoder = CanonicalDecoder::new(bytes);
-        decoder.array_exact(3)?;
+        let fields = decoder.array_len()?;
+        if !matches!(fields, 3 | 4) {
+            return Err(CanonicalDecodeError::new(
+                "invalid program manifest field count",
+            ));
+        }
         decoder.expect_str(PROGRAM_MANIFEST_DOMAIN)?;
         decoder.array_exact(2)?;
         let evaluator = decoder.str()?.to_string();
         let adaptor = decoder.str()?.to_string();
         let root = ContentId::from_bytes(decoder.bytes_32()?);
+        let model = if fields == 4 {
+            Some(ContentId::from_bytes(decoder.bytes_32()?))
+        } else {
+            None
+        };
         decoder.finish()?;
 
         let application = Application::new(evaluator, adaptor)
             .map_err(|error| CanonicalDecodeError::new(error.to_string()))?;
-        let manifest = Self::new(application, root);
+        let manifest = Self {
+            application,
+            root,
+            model,
+        };
         if manifest.canonical_bytes() != bytes {
             return Err(CanonicalDecodeError::new(
                 "program manifest is not in canonical DAG-CBOR form",

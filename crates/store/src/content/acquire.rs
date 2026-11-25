@@ -136,65 +136,7 @@ pub(crate) async fn memory(
             if expect.is_some_and(|expect| expect != root.object()) {
                 return Err(Error::Invalid("peer expectation"));
             }
-            let mut stages: BTreeMap<ContentId, Staged> = BTreeMap::new();
-            let mut expanded = std::collections::BTreeSet::new();
-            let mut pending = vec![(root, String::new(), None)];
-            while let Some((target, path, _queue_charge)) = pending.pop() {
-                let object = target.object();
-                if matches!(target, Target::Tree(_)) && object.bytes() > MAX_TREE_BYTES as u64 {
-                    return Err(Error::Invalid("peer tree byte limit"));
-                }
-                if stages
-                    .get(&object.id())
-                    .is_some_and(|stage| stage.object != object)
-                {
-                    return Err(Error::Invalid("conflicting peer reference"));
-                }
-                if !stages.contains_key(&object.id()) {
-                    let charge = stage_charge(store, &stages, object.bytes())?;
-                    let path = Path::new(at.pin.clone(), join_path(&at.path, &path))?;
-                    let mut read = remote
-                        .read(&Scope::Public, &path, 0..object.bytes())
-                        .await?;
-                    if read.object != object {
-                        return Err(Error::Conflict);
-                    }
-                    let core = store.clone();
-                    let mut bytes = core
-                        .clone()
-                        .run(move |core| Buffer::new(&core, object.bytes(), charge))
-                        .await?;
-                    while let Some(chunk) = read.bytes.next().await {
-                        let chunk = chunk?;
-                        bytes = store
-                            .run(move |_| {
-                                bytes.write_all(&chunk)?;
-                                Ok(bytes)
-                            })
-                            .await?;
-                    }
-                    let stage = store.run(move |_| finish(bytes, Some(object))).await?;
-                    stages.insert(object.id(), stage);
-                }
-                if let Target::Tree(_) = target {
-                    if !expanded.insert(object.id()) {
-                        continue;
-                    }
-                    let data = stages[&object.id()].data.clone();
-                    let entries = store
-                        .run(move |_| Ok(Tree::decode(&data.load(object)?)?.entries().to_vec()))
-                        .await?;
-                    for (name, child) in &entries {
-                        let path = join_path(&path, name);
-                        super::tree::validate_path(&path, false)?;
-                        let queue_charge = store
-                            .pool
-                            .reserve((path.len() + std::mem::size_of::<Target>()) as u64)?;
-                        pending.push((*child, path, Some(queue_charge)));
-                    }
-                }
-            }
-            publish(store, scope, stages, root, pin, requester).await
+            peer(store, scope, &remote, &at, root, pin, requester).await
         }
         Source::HfXet { repo, commit, path } => {
             repo.validate().map_err(hf_error)?;
@@ -215,11 +157,113 @@ pub(crate) async fn memory(
         }
     }
 }
+async fn peer(
+    store: &Core,
+    scope: &Scope,
+    remote: &impl ContentStore,
+    at: &Path,
+    root: Target,
+    pin: PinTarget,
+    requester: Option<(Core, Scope)>,
+) -> Result<Acquisition> {
+    let mut stages: BTreeMap<ContentId, Staged> = BTreeMap::new();
+    let mut expanded = std::collections::BTreeSet::new();
+    let mut pending = vec![(root, String::new(), None)];
+    while let Some((target, path, _queue_charge)) = pending.pop() {
+        let object = target.object();
+        if matches!(target, Target::Tree(_)) && object.bytes() > MAX_TREE_BYTES as u64 {
+            return Err(Error::Invalid("peer tree byte limit"));
+        }
+        if stages
+            .get(&object.id())
+            .is_some_and(|stage| stage.object != object)
+        {
+            return Err(Error::Invalid("conflicting peer reference"));
+        }
+        if !stages.contains_key(&object.id()) {
+            let charge = stage_charge(store, &stages, object.bytes())?;
+            let path = Path::new(at.pin.clone(), join_path(&at.path, &path))?;
+            let mut read = remote
+                .read(&Scope::Public, &path, 0..object.bytes())
+                .await?;
+            if read.object != object {
+                return Err(Error::Conflict);
+            }
+            let core = store.clone();
+            let mut bytes = core
+                .clone()
+                .run(move |core| Buffer::new(&core, object.bytes(), charge))
+                .await?;
+            while let Some(chunk) = read.bytes.next().await {
+                let chunk = chunk?;
+                bytes = store
+                    .run(move |_| {
+                        bytes.write_all(&chunk)?;
+                        Ok(bytes)
+                    })
+                    .await?;
+            }
+            let stage = store.run(move |_| finish(bytes, Some(object))).await?;
+            stages.insert(object.id(), stage);
+        }
+        if let Target::Tree(_) = target {
+            if !expanded.insert(object.id()) {
+                continue;
+            }
+            let data = stages[&object.id()].data.clone();
+            let entries = store
+                .run(move |_| Ok(Tree::decode(&data.load(object)?)?.entries().to_vec()))
+                .await?;
+            for (name, child) in &entries {
+                let path = join_path(&path, name);
+                super::tree::validate_path(&path, false)?;
+                let queue_charge = store
+                    .pool
+                    .reserve((path.len() + std::mem::size_of::<Target>()) as u64)?;
+                pending.push((*child, path, Some(queue_charge)));
+            }
+        }
+    }
+    publish(store, scope, stages, root, pin, requester).await
+}
+
+impl DiskStore {
+    /// Import a verified object through an already established peer connection.
+    pub async fn acquire_peer_object(
+        &self,
+        remote: &impl ContentStore,
+        at: &Path,
+        expect: ContentRef,
+        pin: PinTarget,
+    ) -> Result<()> {
+        self.core
+            .retry_capacity(&Scope::Owner, |core| {
+                let pin = pin.clone();
+                async move {
+                    core.access(&Scope::Owner, |core| core.require_ready())
+                        .await?;
+                    peer(
+                        &core,
+                        &Scope::Owner,
+                        remote,
+                        at,
+                        Target::Object(expect),
+                        pin,
+                        None,
+                    )
+                    .await?;
+                    Ok(())
+                }
+            })
+            .await
+    }
+}
+
 fn join_path(parent: &str, name: &str) -> String {
-    if parent.is_empty() {
-        name.into()
-    } else {
-        format!("{parent}/{name}")
+    match (parent, name) {
+        ("", child) => child.to_owned(),
+        (base, "") => base.to_owned(),
+        (base, child) => format!("{base}/{child}"),
     }
 }
 fn stage_charge(

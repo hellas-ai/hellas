@@ -147,10 +147,11 @@ async fn unseen_grant_program_closure_reaches_only_the_ram_backend_and_never_fil
     let asset = b"grant-private-asset-body-9362".to_vec();
     let environment = Environment {
         sources: vec![ContentRef::for_bytes(&source)],
-        assets: vec![NamedAsset {
+        model: hellas_rpc::protocol::invocation::compute::Model::new(vec![NamedAsset {
             name: "private-asset-name-1928".into(),
             object: ContentRef::for_bytes(&asset),
-        }],
+        }])
+        .unwrap(),
     };
     let root = environment.canonical_bytes().unwrap();
     let manifest = environment

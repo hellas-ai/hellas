@@ -113,7 +113,13 @@ impl hellas_gateway::WorkExecutionBackend for SpeechBackend {
         assert_eq!(call.args[1], Arg::U64(11)); // hello with interleaved blanks
         let fail = call.args[6] == Arg::F32Bits(2f32.to_bits());
         assert!(fail || call.args[6] == Arg::F32Bits(1f32.to_bits()));
-        assert_eq!(job.environment.assets[0].name, "model.safetensors");
+        assert!(
+            job.environment
+                .model
+                .assets
+                .iter()
+                .any(|a| a.name == "model.safetensors")
+        );
         assert_eq!(job.inputs[0].name, "tokens");
         let prepared = &job.plan.calls[0].bind;
         assert_eq!(prepared.len(), call.args.len() - 7);

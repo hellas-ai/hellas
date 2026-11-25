@@ -252,6 +252,36 @@ pub struct GrantSessionOptions {
     /// Compilation and result waits are bounded only by signed job terms.
     pub control_timeout: Duration,
 }
+impl GrantSessionOptions {
+    /// Authenticate an existing access credential to read content under the provider's exact-pin grants.
+    pub async fn model_content(
+        &self,
+        node: iroh::EndpointId,
+        transport: &GrantTransport,
+    ) -> anyhow::Result<hellas_store::content::RemoteStore<IrohTransport>> {
+        let target = GrantTarget::from_offer(&self.target)?;
+        anyhow::ensure!(
+            hellas_client::ProviderAddress::of(&target.provider)?.node == node,
+            "catalog and access offer name different providers"
+        );
+        let session = target.resolve_transport(
+            transport,
+            self.target.trust(),
+            &self.application,
+            &self.signer,
+        )?;
+        let SessionTransport::Remote(link) = session else {
+            anyhow::bail!("model content requires a remote provider")
+        };
+        let connection = tokio::time::timeout(self.control_timeout, link.work()).await??;
+        Ok(hellas_store::content::RemoteStore::new(
+            connection,
+            hellas_store::content::Reservations::ram(
+                hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
+            ),
+        ))
+    }
+}
 /// A session borrows its transport: whoever binds the remote endpoint closes
 /// it, and whoever builds the local service shuts it down, after the session
 /// has shut down.

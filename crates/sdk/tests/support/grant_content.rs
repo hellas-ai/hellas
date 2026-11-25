@@ -32,6 +32,14 @@ pub(super) struct Fixture {
 }
 impl Fixture {
     pub(super) async fn with_reply(compute: bool, reply: Option<Reply>) -> Self {
+        Self::build(compute, reply, None).await
+    }
+
+    pub(super) async fn build(
+        compute: bool,
+        reply: Option<Reply>,
+        catalog: Option<&hellas_store::content::PinName>,
+    ) -> Self {
         let root = tempfile::tempdir().unwrap();
         let provider_root = root.path().join("provider");
         let enrollment = hellas_channel::test_support::software_enrollment(
@@ -89,17 +97,51 @@ impl Fixture {
             node_content.clone(),
         )
         .unwrap();
-        let credential = common::common_node::execution_credential(
-            &service.node(),
-            &secret,
-            principal(1).0,
-            grant.id,
-        )
-        .await;
-        let caller = common::session(&service.node(), &secret).await;
+        let node = service.node();
+        let caller = common::session(&node, &secret).await;
+        let authorization = common::common_node::EXECUTION_AUTHORIZATION;
+        let credential = if let Some(pin) = catalog {
+            use hellas_auth::authority::{GrantSpec, OperationId, Permission};
+            use hellas_authority::{
+                content,
+                grant_service::{WORK_EXECUTE, allowance_resource},
+            };
+            let authority = caller.authority();
+            let scope = GrantSpec {
+                authority,
+                subject: principal(1).0,
+                permissions: [
+                    Permission {
+                        operation: OperationId::new(content::READ).unwrap(),
+                        resource: content::pin_resource(authority, pin),
+                    },
+                    Permission {
+                        operation: OperationId::new(WORK_EXECUTE).unwrap(),
+                        resource: allowance_resource(authority, grant.id),
+                    },
+                ]
+                .into(),
+                not_before: UnixMillis(1000),
+                expires: UnixMillis(u64::MAX),
+                delegation_depth: 0,
+                issuance: None,
+            };
+            let [secret] = common::credentials::issue(
+                common::credentials::Issuer::Node(&node),
+                &caller,
+                GrantId([0; 16]),
+                Some(authorization),
+                scope,
+            )
+            .await;
+            secret
+        } else {
+            common::common_node::execution_credential(&node, &secret, principal(1).0, grant.id)
+                .await
+        };
         let application = Arc::new(ClientProfile {
             authority: caller.authority(),
-            authorization: common::common_node::EXECUTION_AUTHORIZATION,
+            authorization,
             credential,
             local: None,
         });

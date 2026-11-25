@@ -261,7 +261,7 @@ pub fn payment_policy() -> crate::model::work::JobPaymentPolicyV2 {
 pub fn environment() -> compute::Environment {
     compute::Environment {
         sources: vec![],
-        assets: vec![],
+        model: Default::default(),
     }
 }
 /// The evaluator a HIP executor registers, so test jobs run on one.

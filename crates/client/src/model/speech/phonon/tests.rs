@@ -9,19 +9,17 @@ fn voice_names_and_catalog_files_cannot_leave_their_directory() {
     for name in ["", ".", "..", "a/b", "..\\b", "a\nb", &"x".repeat(65)] {
         assert!(validate_voice(name).is_err(), "{name:?}");
     }
-    let catalog = [
-        r#"{"name": "Easton", "filename": "voices/abc.safetensors"}"#,
-        r#"{"name": "Up", "filename": "../abc.safetensors"}"#,
-        r#"{"name": "Root", "filename": "/abc.safetensors"}"#,
-        r#"{"name": "Back", "filename": "voices\\abc.safetensors"}"#,
-    ]
-    .join("\n");
-    assert_eq!(
-        voice_file(&catalog, "Easton").unwrap(),
-        "voices/abc.safetensors"
-    );
-    for name in ["Up", "Root", "Back", "Missing", "../Easton"] {
-        assert!(voice_file(&catalog, name).is_err(), "{name}");
+    let easton = r#"{"name":"Easton","filename":"voices/abc.safetensors"}"#;
+    let zoey = r#"{"name":"Zoey","filename":"voices/xyz.safetensors"}"#;
+    assert_eq!(catalog(&[easton, zoey].join("\n")).unwrap().len(), 2);
+    for invalid in [
+        r#"{"name":"Up","filename":"../abc.safetensors"}"#,
+        r#"{"name":"Root","filename":"/abc.safetensors"}"#,
+        r#"{"name":"Back","filename":"voices\\abc.safetensors"}"#,
+        r#"{"name":"No","filename":"abc.json"}"#,
+        easton,
+    ] {
+        assert!(catalog(&[easton, invalid].join("\n")).is_err(), "{invalid}");
     }
 }
 
@@ -30,6 +28,91 @@ fn voices_must_be_whole_frames_that_leave_room_for_text() {
     assert_eq!(phonon::voice_frames(&[1, 512, 250]).unwrap(), 250);
     assert!(phonon::voice_frames(&[1, 512, 0]).is_err());
     assert!(phonon::voice_frames(&[1, 256, 250]).is_err());
+}
+
+#[tokio::test]
+async fn one_model_selects_f32_and_bf16_voices_by_range() -> Result<()> {
+    use crate::model::native::{Kind, Origin, Snapshot};
+    use safetensors::{Dtype, tensor::TensorView};
+
+    let root = tempfile::tempdir()?;
+    let root = root.path();
+    for (directory, names) in [
+        ("model", phonon::MODEL_FILES.as_slice()),
+        ("codec", phonon::CODEC_FILES.as_slice()),
+    ] {
+        std::fs::create_dir_all(root.join(directory))?;
+        for name in names {
+            let path = root.join(directory).join(name);
+            if name.ends_with(".safetensors") {
+                safetensors::serialize_to_file(
+                    [("dummy", TensorView::new(Dtype::BF16, vec![1], &[0, 0])?)],
+                    None,
+                    &path,
+                )?;
+            } else {
+                std::fs::write(path, b"{}")?;
+            }
+        }
+    }
+    let voices = root.join("voices");
+    std::fs::create_dir_all(&voices)?;
+    std::fs::write(
+        voices.join(phonon::VOICE_CATALOG),
+        "{\"name\":\"Easton\",\"filename\":\"one.safetensors\"}\n{\"name\":\"Zoey\",\"filename\":\"two.safetensors\"}",
+    )?;
+    for (file, dtype, frames) in [
+        ("one.safetensors", Dtype::F32, 3),
+        ("two.safetensors", Dtype::BF16, 5),
+    ] {
+        let data = vec![0; 512 * frames * dtype.bitsize() / 8];
+        safetensors::serialize_to_file(
+            [(
+                "speaker_wavs",
+                TensorView::new(dtype, vec![1, 512, frames], &data)?,
+            )],
+            None,
+            &voices.join(file),
+        )?;
+    }
+    let source =
+        Arc::new(Snapshot::open(Origin::Local(root.to_owned()), Kind::Phonon)?.resolve(None)?);
+    let (env, content) = source.environment("test").await?;
+    let phonon = Phonon {
+        tokenizer: tokenizers::Tokenizer::from_bytes(include_bytes!(
+            "../../whisper/mini/tokenizer.json"
+        ))
+        .map_err(anyhow::Error::msg)?,
+        source,
+        program: Program {
+            source: String::new(),
+            raw: vec![],
+            outputs: 0,
+            setup: vec![],
+            synth: vec![],
+            latents: [Binding::Prepared(0), Binding::Prepared(1)],
+        },
+    };
+    let first = phonon.render_job(&env, &content, "hi", "default", 1.)?;
+    let second = phonon.render_job(&env, &content, "hi", "Zoey", 1.)?;
+    assert_eq!(first.environment, second.environment);
+    assert_eq!(first.plan.calls[1].entry, VOICE_ENTRY);
+    assert!(
+        matches!(&first.plan.calls[1].args[0], Arg::Asset { name, bytes, .. }
+        if name == "voices/one.safetensors" && *bytes == 3 * 512 * 4)
+    );
+    assert_eq!(second.plan.calls[1].entry, "phonon.setup");
+    assert!(
+        matches!(&second.plan.calls[1].args[0], Arg::Asset { name, bytes, .. }
+        if name == "voices/two.safetensors" && *bytes == 5 * 512 * 2)
+    );
+    assert_eq!(second.plan.calls[1].args[1], Arg::U64(5));
+    assert!(
+        phonon
+            .render_job(&env, &content, "hi", "unknown", 1.)
+            .is_err()
+    );
+    Ok(())
 }
 
 fn output(utterances: &[(&[f32], u64, u64)]) -> InvocationOutput {

@@ -249,8 +249,8 @@ impl Flux {
         );
         Ok(source)
     }
-    pub fn assets(&self) -> Vec<NamedAsset> {
-        self.source.assets()
+    pub(super) fn native(&self) -> &Native {
+        &self.source
     }
 
     pub fn programs(&self, evaluator: &str) -> Result<Vec<hellas_rpc::ProgramManifest>> {
@@ -258,7 +258,7 @@ impl Flux {
             .iter()
             .map(|&variant| {
                 Ok(
-                    super::program::describe(&self.program(variant)?, self.assets())
+                    super::program::describe(&self.program(variant)?, self.source.model.clone())
                         .manifest(evaluator)?,
                 )
             })
