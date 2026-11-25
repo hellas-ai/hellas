@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       workspace_regressions:
-        description: Run the serial consensus workspace regression check
+        description: Run the consensus workspace regression check
         type: boolean
         default: false
   schedule:

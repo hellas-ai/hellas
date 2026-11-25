@@ -1505,12 +1505,14 @@ async fn paid_finish(case: PaidScenario) {
     .unwrap();
     assert_eq!(recovered.descriptor().bond_edge(), bond);
     assert_eq!(approvals.0.lock().unwrap().len(), 1);
-    assert_eq!(
+    // The heartbeat keeps sealing while the session reopens, so the head
+    // may have moved past `offline_tip`.
+    assert!(
         recovered
             .with_state(|state| state.cursor().0)
             .await
-            .unwrap(),
-        offline_tip,
+            .unwrap()
+            >= offline_tip,
         "offline catch-up visits every missing height"
     );
     recovered.shutdown().await;
