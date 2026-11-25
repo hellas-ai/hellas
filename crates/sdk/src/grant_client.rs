@@ -279,7 +279,8 @@ impl GrantSessionOptions {
             hellas_store::content::Reservations::ram(
                 hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
             ),
-        ))
+        )
+        .reuse_read_manifest())
     }
 }
 /// A session borrows its transport: whoever binds the remote endpoint closes

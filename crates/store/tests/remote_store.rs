@@ -54,6 +54,35 @@ async fn ranged_and_empty_reads_verify_the_complete_manifest_before_data() {
     assert_eq!(fixture.reads.load(Ordering::SeqCst), reads);
 }
 #[tokio::test]
+async fn repeated_ranges_reuse_only_the_verified_list_for_the_current_object() {
+    let file = File::new(vec![3; 160_000], false);
+    let other = File::new(vec![4; 160_000], false);
+    let fixture = Fixture::new(
+        BTreeMap::from([(String::new(), file), ("other".into(), other)]),
+        Mode::Good,
+    );
+    let pool = Reservations::ram(4 << 20);
+    let store = RemoteStore::new(mux::mux(fixture.clone()), pool.clone()).reuse_read_manifest();
+    let mut first = store.read(&Scope::Public, &at(), 0..1).await.unwrap();
+    assert_eq!(&first.bytes.next().await.unwrap().unwrap()[..], &[3]);
+    drop(first);
+    assert!(pool.held() > 0);
+    fixture.corrupt_manifest.store(true, Ordering::SeqCst);
+    let mut next = store
+        .read(&Scope::Public, &at(), 120_000..120_001)
+        .await
+        .unwrap();
+    assert_eq!(&next.bytes.next().await.unwrap().unwrap()[..], &[3]);
+    drop(next);
+    fixture.moved.store(true, Ordering::SeqCst);
+    let mut moved = store.read(&Scope::Public, &at(), 0..1).await.unwrap();
+    assert!(moved.bytes.next().await.unwrap().is_err());
+    drop(moved);
+    let other = Path::new(at().pin, "other".into()).unwrap();
+    assert!(store.read(&Scope::Public, &other, 0..1).await.is_err());
+    assert_eq!(pool.held(), 0);
+}
+#[tokio::test]
 async fn pin_movement_or_corrupt_payload_is_rejected_before_range_bytes_escape() {
     for moved in [false, true] {
         let file = File::new(vec![3; 100], false);

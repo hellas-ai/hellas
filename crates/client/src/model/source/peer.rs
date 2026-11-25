@@ -53,25 +53,26 @@ impl PeerModel {
     async fn public(uri: String) -> Result<Self> {
         let (id, address) = peer_locator(&uri)?;
         let address = address.context("hellas://model-id needs a provider; use --provider, --access, or append @NODE_ID[@IP:PORT]")?;
-        let endpoint = if address.ip_addrs().next().is_some() {
-            iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
-        } else {
-            iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-        }
-        .bind()
-        .await?;
-        let connection = endpoint
-            .connect(
-                address,
-                hellas_rpc::services::content::Content::ALPN.as_bytes(),
-            )
+        // Advertised IPs can be private container addresses; retain relay discovery.
+        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+            .bind()
             .await?;
-        let remote = RemoteStore::new(
-            IrohTransport::new(connection),
-            Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
-        );
+        hellas_wire::iroh::close_on_error(&endpoint, async {
+            let connection = endpoint
+                .connect(
+                    address,
+                    hellas_rpc::services::content::Content::ALPN.as_bytes(),
+                )
+                .await?;
+            let remote = RemoteStore::new(
+                IrohTransport::new(connection),
+                Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
+            )
+            .reuse_read_manifest();
 
-        Self::connect(id, remote, Some(endpoint)).await
+            Self::connect(id, remote, Some(endpoint.clone())).await
+        })
+        .await
     }
 
     pub(super) async fn connect(

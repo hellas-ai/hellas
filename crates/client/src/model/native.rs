@@ -65,12 +65,7 @@ impl Origin {
                     object.bytes() <= MAX as u64,
                     "checkpoint metadata exceeds limit: {key}"
                 );
-                let bytes = peer.read(object, 0..object.bytes())?;
-                ensure!(
-                    ContentRef::for_bytes(&bytes) == object,
-                    "metadata identity mismatch: {key}"
-                );
-                bytes
+                peer.read(object, 0..object.bytes())?
             }
         })
     }
