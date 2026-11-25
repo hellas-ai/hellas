@@ -26,6 +26,7 @@ impl WorkExecutionBackend for Fake {
         crate::test_support::backend({
             Some(hellas_client::model::evaluator(
                 hellas_client::model::GpuDialect::Hip,
+                "gfx1151",
             ))
         })
     }
@@ -119,7 +120,8 @@ fn options(name: &str) -> crate::Route {
         modality: hellas_client::model::ModelKind::Transcription,
         model: name.into(),
         package: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../client/src/model/whisper/mini"),
+            .join("../client/src/model/whisper/mini")
+            .into(),
         max_tokens: 4,
     })
 }

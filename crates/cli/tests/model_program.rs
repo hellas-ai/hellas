@@ -4,7 +4,8 @@ use std::{path::Path, process::Command};
 fn program_reads_a_checkpoint_without_creating_an_identity() {
     let home = tempfile::tempdir().unwrap();
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../client/src/model/whisper/mini");
-    let evaluator = hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip);
+    let evaluator =
+        hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip, "gfx1151");
     let output = Command::new(env!("CARGO_BIN_EXE_hellas"))
         .arg("--home")
         .arg(home.path())

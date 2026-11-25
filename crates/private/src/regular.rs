@@ -432,6 +432,12 @@ pub fn read_private_bounded(
             "file must be private",
         ));
     }
+    read_zeroizing_bounded(file, maximum)
+}
+pub(super) fn read_zeroizing_bounded(
+    file: std::fs::File,
+    maximum: usize,
+) -> io::Result<zeroize::Zeroizing<Vec<u8>>> {
     if file.metadata()?.len() > maximum as u64 {
         return Err(too_large());
     }

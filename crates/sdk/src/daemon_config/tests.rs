@@ -25,6 +25,38 @@ fn info(id: &str, evaluator: &str) -> hellas_gateway::BackendInfo {
 }
 
 #[test]
+fn native_routes_and_resources_key_preparation_by_all_sources() {
+    let route = serde_json::json!({
+        "kind": "speech", "model": "english", "backends": ["gpu"],
+        "target": {
+            "kind": "native",
+            "package": { "model": "/models/phonon", "codec": "/codec/first", "voices": "/catalog" },
+            "voices": ["Easton", "Zoey"]
+        }
+    });
+    let configured: hellas_gateway::Route = serde_json::from_value(route.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&configured).unwrap(), route);
+    let mut alternative = configured.model_package().unwrap().1.clone();
+    alternative.codec = Some("/codec/second".into());
+    let document = Document {
+        routes: vec![configured],
+        resources: vec![Resource::new(
+            "second".into(),
+            "gpu".into(),
+            ResourceKind::Model {
+                package: alternative.clone(),
+                rules: None,
+            },
+        )],
+        ..Default::default()
+    };
+    let requested = document.model_evaluators(&[info("gpu", "catena")]);
+    assert_eq!(requested.len(), 2);
+    assert!(requested[&alternative].contains("catena"));
+    assert!(requested[document.routes[0].model_package().unwrap().1].contains("catena"));
+}
+
+#[test]
 fn empty_daemon_is_valid_but_impossible_capacity_is_not() {
     let mut document = Document::default();
     document.validate().unwrap();
@@ -104,10 +136,6 @@ fn iroh_duplicate_keys_use_resolved_evaluator_ids() {
     document
         .validate_resolved(&[info("first", "opaque/one"), info("second", "opaque/two")])
         .unwrap();
-    assert_eq!(
-        document.validate_resolved(&[]),
-        Err("local backend has no registered evaluator")
-    );
 }
 
 #[test]
@@ -250,7 +278,8 @@ async fn model_and_operator_inputs_keep_their_terms_in_one_configuration() {
             model: "tiny".into(),
             modality: hellas_client::model::ModelKind::Text,
             package: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../client/src/model/package/mini-qwen3.gguf"),
+                .join("../client/src/model/package/mini-qwen3.gguf")
+                .into(),
             max_tokens: 1,
         },
     });
@@ -262,7 +291,8 @@ async fn model_and_operator_inputs_keep_their_terms_in_one_configuration() {
             backends: vec!["models".into(), "operator".into(), "gpu".into()],
         },
     );
-    let evaluator = hellas_client::model::evaluator(hellas_client::model::GpuDialect::Cuda);
+    let evaluator =
+        hellas_client::model::evaluator(hellas_client::model::GpuDialect::Cuda, "sm_120");
     let configuration = document
         .configuration_for_test(&[info("gpu", &evaluator)])
         .await
@@ -292,7 +322,7 @@ async fn model_and_operator_inputs_keep_their_terms_in_one_configuration() {
         900_000
     );
     assert!(
-        matches!(&compute.invocation_policy.admissions[..], [Admission::Compute { evaluator: actual, .. }] if actual == &evaluator)
+        matches!(&compute.invocation_policy.admissions[..], [Admission::Compute(rule)] if rule.evaluator.as_ref() == Some(&evaluator))
     );
     let mut explicit = Resource::new(
         "models".into(),
@@ -368,7 +398,8 @@ async fn granted_upstream_routes_preserve_the_direct_local_paths() {
     );
     let configuration = document.configuration_for_test(&[]).await.unwrap();
     let granted =
-        crate::gateway_work::grant_routes(configuration.resource("api").unwrap(), "api").unwrap();
+        crate::gateway_work::grant_routes(configuration.resource("api").unwrap(), "api", None)
+            .unwrap();
     assert_eq!(
         serde_json::to_value(granted).unwrap(),
         serde_json::to_value(&document.routes).unwrap()
@@ -524,5 +555,49 @@ async fn segment_templates_are_validated_and_require_account_backing_for_covered
     assert_eq!(
         document.validate().unwrap_err(),
         "overlapping HTTP credential scopes"
+    );
+}
+
+#[tokio::test]
+async fn explicit_model_rules_preserve_their_shape_and_advertise_the_backend_renderer() {
+    use hellas_rpc::protocol::invocation::{Admission, Match};
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../client/src/model/package/mini-qwen3.gguf");
+    let evaluator =
+        hellas_client::model::evaluator(hellas_client::model::GpuDialect::Cuda, "sm_120");
+    let package = hellas_client::model::ModelPackage::open(&path, &evaluator)
+        .await
+        .unwrap();
+    let rules = vec![
+        Match {
+            model: Some(package.model().content_id().unwrap()),
+            ..Default::default()
+        },
+        Match {
+            repos: vec!["org/repo".into()],
+            ..Default::default()
+        },
+    ];
+    let resource: ResourceKind = serde_json::from_value(serde_json::json!({
+        "kind": "model", "package": path, "rules": rules,
+    }))
+    .unwrap();
+    let mut document = Document::default();
+    document.backends.insert("gpu".into(), local(&evaluator));
+    document
+        .resources
+        .push(Resource::new("test".into(), "gpu".into(), resource));
+    let configuration = document
+        .configuration_for_test(&[info("gpu", &evaluator)])
+        .await
+        .unwrap();
+    let policy = configuration.resource("test").unwrap();
+    assert_eq!(policy.render_evaluators(), [evaluator.as_str()].into());
+    assert_eq!(
+        policy.invocation_policy.admissions,
+        rules
+            .into_iter()
+            .map(Admission::Compute)
+            .collect::<Vec<_>>()
     );
 }

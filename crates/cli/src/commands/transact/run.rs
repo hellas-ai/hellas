@@ -113,7 +113,7 @@ impl Program {
         }
         let environment = compute::Environment {
             sources,
-            assets: Vec::new(),
+            model: Default::default(),
         };
         hellas_channel::content::upload_object(&content.0, &environment.canonical_bytes()?).await?;
         let inputs = self
@@ -155,12 +155,12 @@ impl Program {
     }
 }
 
-pub async fn run(args: RunArgs, context: Context) -> super::super::CliResult<()> {
+pub async fn run(args: RunArgs, context: &Context) -> super::super::CliResult<()> {
     let evaluator = args.target.renderer()?;
     super::run_quoted(
         &args.client,
         args.target,
-        &context,
+        context,
         args.pay,
         args.save_job.clone(),
         async |price| args.program.job(price, evaluator).await,

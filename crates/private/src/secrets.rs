@@ -128,7 +128,7 @@ impl SecretStore {
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                     Err(error) => return Err(file_error(error)),
                 }
-                crate::write_atomically(&path, ".secret", bytes).map_err(file_error)
+                crate::write_secret_file(&path, ".secret", bytes).map_err(file_error)
             }
         }
     }

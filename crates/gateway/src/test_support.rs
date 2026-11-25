@@ -50,15 +50,15 @@ pub async fn execution(
     presentation: Presentation,
 ) -> Arc<RouteExecution> {
     let packages = match &presentation {
-        Presentation::Model { package, .. } => hellas_client::model::ModelPackage::open_many(
-            package,
-            work.backends()
-                .into_iter()
-                .filter_map(|backend| backend.evaluator),
-            None,
-        )
-        .await
-        .unwrap(),
+        Presentation::Model { package, .. } => package
+            .open_many(
+                work.backends()
+                    .into_iter()
+                    .filter_map(|backend| backend.evaluator),
+                None,
+            )
+            .await
+            .unwrap(),
         _ => Default::default(),
     };
     Arc::new(RouteExecution { work, packages })

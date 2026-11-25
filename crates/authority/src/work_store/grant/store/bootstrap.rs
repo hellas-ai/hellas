@@ -49,10 +49,7 @@ impl StartupLock {
                 Err(error) => return Err(error.error.into()),
             }
         }
-        let file = hellas_private::open_regular_file_rw(&path)?;
-        if !hellas_private::is_private(&file)? {
-            return Err(NodeStoreError::Malformed);
-        }
+        let file = hellas_private::open_regular_file_nofollow_rw(&path)?;
         Ok(Self {
             _lock: lock(file, &path)?,
         })
@@ -371,9 +368,6 @@ fn remove_abandoned_bootstrap_stages(parent: &Path) -> Result<(), NodeStoreError
         else {
             continue;
         };
-        if !hellas_private::is_private(&file)? {
-            continue;
-        }
         if file.try_lock().is_ok() {
             let _lock = IdentityLock(file);
             std::fs::remove_dir_all(entry.path())?;
@@ -438,16 +432,14 @@ fn read_marker(
     network: NetworkId,
 ) -> Result<(IdentityLock, Marker), NodeStoreError> {
     let path = directory.join(MARKER);
-    let identity_lock = match hellas_private::open_regular_file_rw(&path) {
+    let identity_lock = match hellas_private::open_regular_file_nofollow_rw(&path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(NodeStoreError::Uninitialized);
         }
         Err(error) => return Err(error.into()),
     };
-    if !hellas_private::is_private(&identity_lock)?
-        || identity_lock.metadata()?.len() > MAX_MARKER_BYTES
-    {
+    if identity_lock.metadata()?.len() > MAX_MARKER_BYTES {
         return Err(NodeStoreError::Malformed);
     }
     let identity_lock = lock(identity_lock, &path)?;

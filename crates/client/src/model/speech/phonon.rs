@@ -14,7 +14,7 @@ use hellas_rpc::protocol::invocation::{
     Artifact, MAX_ARTIFACTS, compute::*, output::InvocationOutput,
 };
 use hellas_store::content::{LocalStore, Scope};
-use std::path::Path;
+use std::{collections::BTreeMap, sync::Arc};
 
 const SEED: u64 = 0;
 
@@ -32,44 +32,43 @@ pub fn validate_voice(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// The catalog's checkpoint file for a voice, as a path within its repository.
-pub fn voice_file(catalog: &str, name: &str) -> Result<String> {
-    validate_voice(name)?;
-    let file = phonon::voice_filename(catalog, name)?;
-    ensure!(
-        !file.contains('\\')
-            && Path::new(&file)
-                .components()
-                .all(|part| matches!(part, std::path::Component::Normal(_))),
-        "voice {name:?} has an unsafe checkpoint path {file:?}"
-    );
-    Ok(file)
+/// Resolve the complete published voice catalog before computing the model identity.
+pub(in crate::model) fn catalog(text: &str) -> Result<BTreeMap<String, String>> {
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        name: String,
+        filename: String,
+    }
+    let mut voices = BTreeMap::new();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let Entry { name, filename } = serde_json::from_str(line)?;
+        validate_voice(&name)?;
+        super::super::native::relative(&filename)?;
+        ensure!(
+            filename.ends_with(".safetensors"),
+            "invalid voice filename {filename:?}"
+        );
+        ensure!(
+            voices.insert(name.clone(), filename).is_none(),
+            "ambiguous Phonon voice {name:?}"
+        );
+    }
+    ensure!(!voices.is_empty(), "empty Phonon voice catalog");
+    Ok(voices)
 }
 
 pub(in crate::model) struct Phonon {
     tokenizer: tokenizers::Tokenizer,
     program: Program<Arg>,
-    voice: String,
-    voice_arg: Arg,
-    frames: u64,
+    source: Arc<Native>,
 }
 
 impl Phonon {
-    pub(crate) fn open(source: &Native, _dialect: GpuDialect) -> Result<(Self, String)> {
+    pub(crate) fn open(source: Arc<Native>, _dialect: GpuDialect) -> Result<(Self, String)> {
         let config = Config::read(&source.dir().join("model"), &source.dir().join("codec"))?;
         let tokenizer = phonon::read_tokenizer(&source.dir().join("model"))?;
-        ensure!(
-            source.voices.len() == 1,
-            "each Phonon manifest selects one voice"
-        );
-        let (voice, key) = source
-            .voices
-            .first_key_value()
-            .context("missing catalog voice")?;
-        let tensor = source.tensor(key, "speaker_wavs")?;
-        let frames = phonon::voice_frames(&tensor.shape)? as u64;
         let mut program =
-            phonon::preparation::build(&config, tensor.dtype, |codec, name, shape| {
+            phonon::preparation::build(&config, safetensors::Dtype::F32, |codec, name, shape| {
                 let file = if codec {
                     "codec/model.safetensors"
                 } else {
@@ -90,9 +89,7 @@ impl Phonon {
             Self {
                 tokenizer,
                 program,
-                voice: voice.clone(),
-                voice_arg: tensor.arg.clone(),
-                frames,
+                source,
             },
             hex,
         ))
@@ -120,11 +117,8 @@ impl Phonon {
         } else {
             voice
         };
-        ensure!(
-            voice == self.voice,
-            "voice {voice:?} is outside this manifest"
-        );
-        let frames = self.frames;
+        let tensor = self.source.voice(voice)?;
+        let frames = phonon::voice_frames(&tensor.shape)? as u64;
         let prompts = Prompt::split(&self.tokenizer, text)?;
         ensure!(
             prompts.len() <= MAX_ARTIFACTS / 2,
@@ -132,32 +126,36 @@ impl Phonon {
             MAX_ARTIFACTS / 2
         );
         let slot = |name: &str| Arg::Slot { name: name.into() };
-        let mut setup = vec![slot("speaker"), Arg::U64(frames)];
+        let mut calls = vec![Call {
+            entry: WEIGHT_ENTRY.into(),
+            args: self.program.raw.clone(),
+            bind: (0..self.program.outputs)
+                .map(|i| Bind::Name(format!("weight-{i}")))
+                .collect(),
+        }];
+        let speaker = match tensor.dtype {
+            safetensors::Dtype::BF16 => tensor.arg,
+            safetensors::Dtype::F32 => {
+                calls.push(Call {
+                    entry: VOICE_ENTRY.into(),
+                    args: vec![tensor.arg],
+                    bind: vec![Bind::Name("speaker".into())],
+                });
+                slot("speaker")
+            }
+            dtype => bail!("unsupported Phonon voice storage {dtype:?}"),
+        };
+        let mut setup = vec![speaker, Arg::U64(frames)];
         setup.extend(self.program.setup.iter().map(Self::operand));
-        let mut calls = vec![
-            Call {
-                entry: WEIGHT_ENTRY.into(),
-                args: self.program.raw.clone(),
-                bind: (0..self.program.outputs)
-                    .map(|i| Bind::Name(format!("weight-{i}")))
-                    .collect(),
-            },
-            Call {
-                entry: VOICE_ENTRY.into(),
-                args: vec![self.voice_arg.clone()],
-                bind: vec![Bind::Name("speaker".into())],
-            },
-            Call {
-                entry: "phonon.setup".into(),
-                args: setup,
-                // The text budget is checked when the package is opened.
-                bind: ["voice", "cond", "bos", "time"]
-                    .map(|name| Bind::Name(name.into()))
-                    .into_iter()
-                    .chain([Bind::Discard])
-                    .collect(),
-            },
-        ];
+        calls.push(Call {
+            entry: "phonon.setup".into(),
+            args: setup,
+            bind: ["voice", "cond", "bos", "time"]
+                .map(|name| Bind::Name(name.into()))
+                .into_iter()
+                .chain([Bind::Discard])
+                .collect(),
+        });
         let (mut inputs, mut outputs) = (Vec::new(), Vec::new());
         for (i, prompt) in prompts.iter().enumerate() {
             let (ids, waveform, result) = (

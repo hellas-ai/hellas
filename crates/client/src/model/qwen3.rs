@@ -23,6 +23,13 @@ use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 const PROMPT: &str = "prompt";
 const WEIGHTS: &str = "weights";
+
+pub(super) fn model(object: hellas_rpc::ContentRef) -> Result<Model> {
+    Ok(Model::new(vec![NamedAsset {
+        name: WEIGHTS.into(),
+        object,
+    }])?)
+}
 const LOGITS: &str = "logits";
 
 pub(super) struct Qwen3 {
@@ -83,7 +90,7 @@ impl Qwen3 {
         let metadata_path = path.clone();
         let (config, views, object, source, states, decisions) =
             tokio::task::spawn_blocking(move || -> Result<_> {
-                let path = metadata_path.as_ref().as_ref();
+                let path = metadata_path.metadata();
                 let (config, views) = metadata(path, &header)?;
                 let decisions = is_decision(path)?
                     .then(|| Decisions::read(path, usize::MAX))
@@ -111,14 +118,7 @@ impl Qwen3 {
                 Ok((config, views, object, source, states, decisions))
             })
             .await??;
-        let (environment, content) = super::program::environment(
-            &source,
-            vec![NamedAsset {
-                name: WEIGHTS.into(),
-                object,
-            }],
-        )
-        .await?;
+        let (environment, content) = super::program::environment(&source, model(object)?).await?;
         Ok(Self {
             path,
             config,

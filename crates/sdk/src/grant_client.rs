@@ -252,6 +252,37 @@ pub struct GrantSessionOptions {
     /// Compilation and result waits are bounded only by signed job terms.
     pub control_timeout: Duration,
 }
+impl GrantSessionOptions {
+    /// Authenticate an existing access credential to read content under the provider's exact-pin grants.
+    pub async fn model_content(
+        &self,
+        node: iroh::EndpointId,
+        transport: &GrantTransport,
+    ) -> anyhow::Result<hellas_store::content::RemoteStore<IrohTransport>> {
+        let target = GrantTarget::from_offer(&self.target)?;
+        anyhow::ensure!(
+            hellas_client::ProviderAddress::of(&target.provider)?.node == node,
+            "catalog and access offer name different providers"
+        );
+        let session = target.resolve_transport(
+            transport,
+            self.target.trust(),
+            &self.application,
+            &self.signer,
+        )?;
+        let SessionTransport::Remote(link) = session else {
+            anyhow::bail!("model content requires a remote provider")
+        };
+        let connection = tokio::time::timeout(self.control_timeout, link.work()).await??;
+        Ok(hellas_store::content::RemoteStore::new(
+            connection,
+            hellas_store::content::Reservations::ram(
+                hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
+            ),
+        )
+        .reuse_read_manifest())
+    }
+}
 /// A session borrows its transport: whoever binds the remote endpoint closes
 /// it, and whoever builds the local service shuts it down, after the session
 /// has shut down.
@@ -390,7 +421,7 @@ impl PreparedUpload {
         let reference = ContentRef::for_bytes(&bytes);
         let manifest = input.manifest();
         let policy = InvocationPolicy::from_canonical_bytes(input.application_policy.as_bytes())?;
-        let root = if policy.content_closure(manifest, &[]).is_ok() {
+        let root = if manifest.model().is_none() {
             None
         } else {
             Some(
@@ -1123,16 +1154,6 @@ impl GrantSession {
         policy
             .invocation_policy
             .admit(input, &self.options.signer.public_key())?;
-        let manifest = input.manifest();
-        if policy
-            .invocation_policy
-            .content_closure(manifest, &[])
-            .is_err()
-        {
-            let root =
-                hellas_channel::content::root(&content.0, &content.1, manifest.root()).await?;
-            policy.invocation_policy.content_closure(manifest, &root)?;
-        }
         let now = self.now();
         // The provider clock has advanced at least as far as this standing, so
         // measuring the signed limit from it never exceeds the allowance.
@@ -1175,7 +1196,11 @@ impl GrantSession {
             input_content: prepared.reference,
             prepared_input_digest,
             proposal_nonce: self.store.next_nonce()?,
-            acceptance_deadline_ms: UnixMillis(now.0 + (span / 2).min(30_000)),
+            // Allow admission (including verified asset staging) as long as the
+            // control request itself can wait, leaving time for execution.
+            acceptance_deadline_ms: UnixMillis(
+                now.0 + (span / 2).min(u64::try_from(grace.as_millis()).unwrap_or(u64::MAX)),
+            ),
             request_commitment,
             environment_commitment: input.request.execution_environment,
             terminal_deadline_ms: UnixMillis(terminal),

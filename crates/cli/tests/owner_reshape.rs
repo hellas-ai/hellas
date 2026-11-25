@@ -156,7 +156,7 @@ async fn owner_prepare_and_cli_delegate_sweep_execute_on_a_real_validator() {
     let native = Secp256k1Signer::from_secret_scalar([22; 32]).unwrap();
     let node = Secp256k1Signer::from_secret_scalar([23; 32]).unwrap();
     let key_path = home.path().join("owner.key");
-    std::fs::write(&key_path, [21; 32]).unwrap();
+    hellas_private::write_secret_file(&key_path, ".key", &[21; 32]).unwrap();
     let started = std::time::Instant::now();
     let (validator, rpc, config, chain_path) = start_validator(
         home.path(),

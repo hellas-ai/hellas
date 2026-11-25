@@ -166,7 +166,6 @@ async fn fetches_the_reference_file_and_verifies_it() {
                     revision: sha.clone(),
                     ..repo
                 },
-                commit: sha,
                 path: Some(path),
             },
             Some(expected),

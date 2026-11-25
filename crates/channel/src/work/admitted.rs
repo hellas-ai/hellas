@@ -2,7 +2,9 @@
 use super::BackendFault;
 use super::admission::{AdmittedWork, CapacityDomain, WorkAdmission, WorkPermit};
 use hellas_rpc::Retention;
-use hellas_rpc::protocol::invocation::{Limits, PreparedInvocation};
+use hellas_rpc::protocol::invocation::{
+    AdmissionFacts, InvocationPolicy, Limits, PreparedInvocation,
+};
 use hellas_store::content::{LocalStore, Scope};
 
 pub struct Admitted<I = PreparedInvocation, A = WorkAdmission> {
@@ -50,14 +52,6 @@ impl<I> Admitted<I> {
         self
     }
 
-    pub(crate) fn with_setup_entries(
-        mut self,
-        entries: std::collections::BTreeSet<String>,
-    ) -> Self {
-        self.pure_setup_entries = entries;
-        self
-    }
-
     pub async fn reserve(
         self,
         payment: impl core::future::Future<Output = Result<WorkPermit, BackendFault>>,
@@ -69,6 +63,29 @@ impl<I> Admitted<I> {
             limits: self.limits,
             domain: self.domain,
             content: self.content,
+            admission,
+        })
+    }
+}
+
+impl Admitted<PreparedInvocation> {
+    pub(super) async fn checked(
+        input: PreparedInvocation,
+        policy: &InvocationPolicy,
+        facts: AdmissionFacts,
+        content: (LocalStore, Scope),
+        admission: WorkAdmission,
+    ) -> Result<Self, BackendFault> {
+        let (_, pure_setup_entries) =
+            crate::content::admit_content(&content.0, &content.1, policy, input.manifest(), None)
+                .await
+                .map_err(BackendFault::caused_by)?;
+        Ok(Self {
+            input,
+            pure_setup_entries,
+            limits: facts.limits,
+            domain: facts.capacity_domain,
+            content,
             admission,
         })
     }

@@ -637,7 +637,7 @@ pub(super) fn resource_charge(
     let manifest = input.manifest();
     let fetch = policy
         .invocation_policy
-        .admissions_for(manifest)
+        .candidates_for(manifest)
         .any(|a| matches!(a, hellas_rpc::protocol::invocation::Admission::Fetch { .. }));
     if fetch {
         let artifact = input.input.artifacts.first().ok_or(GrantError::Malformed)?;

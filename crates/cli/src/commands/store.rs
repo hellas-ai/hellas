@@ -147,8 +147,7 @@ pub async fn run(
             "daemon addressing requires --profile"
         );
         let reconcile = args.content_config.is_some();
-        let loaded = crate::content_configuration::ContentConfiguration::load(args.content_config)?;
-        let config = loaded.config().clone();
+        let config = crate::content_configuration::load(args.content_config)?;
         if let StoreCommand::Index { paths, recheck } = args.command {
             return index(&config, home, paths, recheck).await;
         }
@@ -313,11 +312,7 @@ where
                     "acquire requires hf://repo@sha; run hellas store resolve first to print the immutable SHA"
                 );
                 eprintln!("commit: {}", repo.revision);
-                Source::HfXet {
-                    commit: repo.revision.clone(),
-                    repo,
-                    path,
-                }
+                Source::HfXet { repo, path }
             } else if let Some(node) = source.strip_prefix("peer://") {
                 ensure!(
                     bytes.is_none() || expect.is_some(),

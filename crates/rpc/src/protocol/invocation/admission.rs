@@ -22,7 +22,7 @@ impl AdmissionFacts {
     fn for_admission(admission: &Admission, limits: Limits) -> Result<Self, CanonicalDecodeError> {
         let hard = MAX_INVOCATION_BYTES as u64;
         let (input, frame, spool, events, payload) = match admission {
-            Admission::Compute { .. } => {
+            Admission::Compute(_) => {
                 let bounds = output::compute_bounds(limits)?;
                 (
                     hard,
@@ -108,31 +108,17 @@ impl InvocationPolicy {
         &self,
         manifest: &ProgramManifest,
         program_root: &[u8],
-    ) -> Result<Vec<ContentRef>, CanonicalDecodeError> {
+        input: Option<ContentRef>,
+    ) -> Result<(Vec<ContentRef>, Option<compute::Model>), CanonicalDecodeError> {
         self.classify_manifest(manifest)?;
-        if self
-            .admissions_for(manifest)
-            .any(|admission| matches!(admission, Admission::Fetch { .. }))
-        {
+        if manifest.model().is_none() {
             if !program_root.is_empty() {
                 return Err(error("Fetch has no program-root content opening"));
             }
-            return Ok(vec![]);
+            return Ok((input.into_iter().collect(), None));
         }
-        super::bound(program_root, compute::MAX_ENVIRONMENT_BYTES)?;
-        let root = ContentRef::for_bytes(program_root);
-        if root.id() != manifest.root() {
-            return Err(error(
-                "compute root opening differs from the signed manifest",
-            ));
-        }
-        let environment = compute::Environment::from_canonical_bytes(program_root)?;
-        let mut names = std::collections::BTreeSet::new();
-        for asset in &environment.assets {
-            if !names.insert(&asset.name) {
-                return Err(error("compute asset names must be unique"));
-            }
-        }
+        let environment = compute::Environment::open(manifest, program_root)?;
+        let root = ContentRef::new(manifest.root(), program_root.len() as u64);
         let source_bytes = environment
             .sources
             .iter()
@@ -143,7 +129,8 @@ impl InvocationPolicy {
         let mut objects = std::collections::BTreeMap::new();
         for object in std::iter::once(root)
             .chain(environment.sources)
-            .chain(environment.assets.into_iter().map(|asset| asset.object))
+            .chain(environment.model.assets.iter().map(|asset| asset.object))
+            .chain(input)
         {
             if objects
                 .insert(object.id(), object.bytes())
@@ -152,10 +139,13 @@ impl InvocationPolicy {
                 return Err(error("compute content identity has conflicting lengths"));
             }
         }
-        Ok(objects
-            .into_iter()
-            .map(|(id, bytes)| ContentRef::new(id, bytes))
-            .collect())
+        Ok((
+            objects
+                .into_iter()
+                .map(|(id, bytes)| ContentRef::new(id, bytes))
+                .collect(),
+            Some(environment.model),
+        ))
     }
 
     /// Only admitted, known application metadata may determine staging retention.
@@ -164,7 +154,7 @@ impl InvocationPolicy {
         manifest: &ProgramManifest,
     ) -> Result<AdmissionFacts, CanonicalDecodeError> {
         self.validate()?;
-        self.facts(self.admissions_for(manifest))
+        self.facts(self.candidates_for(manifest))
     }
     fn facts<'a>(
         &self,
@@ -198,13 +188,13 @@ impl InvocationPolicy {
         }
         let mut admitted = Vec::new();
         let mut last = None;
-        for admission in self.admissions_for(prepared.manifest()) {
+        for admission in self.candidates_for(prepared.manifest()) {
             let facts = AdmissionFacts::for_admission(admission, self.limits)?;
             let result = if encoded.len() > facts.max_encoded_prepared_input as usize {
                 Err(error("invocation input exceeds its admitted bound"))
             } else {
                 match admission {
-                    Admission::Compute { .. } => {
+                    Admission::Compute(_) => {
                         compute::Plan::from_canonical_bytes(prepared.input.parameters.as_bytes())
                             .and_then(|plan| plan.validate_bounds(&self.limits).map(|_| ()))
                     }
@@ -286,7 +276,7 @@ impl PreparedInvocation {
                 continue;
             }
             let result = match admission {
-                Admission::Compute { .. } => {
+                Admission::Compute(_) => {
                     if output.is_success() {
                         compute::Plan::from_canonical_bytes(self.input.parameters.as_bytes())
                             .and_then(|plan| compute::validate_output(&plan, &output))

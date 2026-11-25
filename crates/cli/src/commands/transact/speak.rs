@@ -1,73 +1,47 @@
 use super::*;
-use hellas_client::model::{ModelPackage, ModelRequest, ModelResponse};
+use hellas_client::model::{ModelRequest, ModelResponse};
 use std::io::Read;
 
 #[derive(Debug, Args)]
 pub struct SpeakArgs {
     #[command(flatten)]
-    client: ClientArgs,
-    /// Local speech model directory or pinned Hub checkpoint.
-    #[arg(long, value_name = "MODEL")]
-    model: PathBuf,
+    placement: ModelArgs,
+    #[command(flatten)]
+    companions: crate::hub::Companions,
     /// Text to synthesize. Reads standard input when omitted.
     #[arg(long)]
     text: Option<String>,
     #[arg(long, default_value = "default")]
     voice: String,
-    /// Pay the provider named by --provider its quoted price per job, at most MAX.
-    #[arg(long, value_name = "MAX", requires = "provider", conflicts_with = "access", value_parser = clap::value_parser!(u64).range(1..))]
-    pay: Option<u64>,
-    #[command(flatten)]
-    target: TargetArgs,
     #[arg(short = 'o', long, value_name = "WAV")]
     output: PathBuf,
 }
 
-pub async fn speak(mut args: SpeakArgs, context: Context) -> super::super::CliResult<()> {
-    context
-        .model_command(async {
-            args.target.models = vec![args.model.clone()];
-            args.target.voices = vec![args.voice.clone()];
-            let evaluator = args.target.renderer()?;
-            let content = args.target.content(&context).await?;
-            let text = speech_text(args.text, std::io::stdin())?;
-            let package = ModelPackage::open_many_with_voices(
-                &args.model,
-                [evaluator.clone()],
-                content.as_ref(),
-                &args.target.voices,
-            )
-            .await?
-            .remove(&evaluator)
-            .context("model evaluator is not prepared")?;
-            let rendered = package
-                .render_job(&ModelRequest::Speech {
-                    text: &text,
-                    voice: &args.voice,
-                    speed: 1.0,
-                })
-                .await?;
-            let target = args.target;
-            run_quoted(
-                &args.client,
-                target,
-                &context,
-                args.pay,
-                None,
-                async |price| compute_job(price, evaluator, rendered).await,
-                |directory| Some(directory.join("result")),
-                |_, completed, _| {
-                    let ModelResponse::Speech(audio) = package.decode(&completed.output)? else {
-                        bail!("expected speech");
-                    };
-                    std::fs::write(&args.output, audio.wav_bytes()?)?;
-                    println!("{}", args.output.display());
-                    std::io::stdout().lock().flush()?;
-                    Ok(())
-                },
-            )
-            .await
+pub async fn speak(mut args: SpeakArgs, context: &Context) -> super::super::CliResult<()> {
+    let text = speech_text(args.text, std::io::stdin())?;
+    let package = args.placement.open(context, Some(&args.companions)).await?;
+    let rendered = package
+        .render_job(&ModelRequest::Speech {
+            text: &text,
+            voice: &args.voice,
+            speed: 1.0,
         })
+        .await?;
+    args.placement
+        .run(
+            context,
+            &package,
+            rendered,
+            |directory| Some(directory.join("result")),
+            |response| {
+                let ModelResponse::Speech(audio) = response else {
+                    bail!("expected speech");
+                };
+                std::fs::write(&args.output, audio.wav_bytes()?)?;
+                println!("{}", args.output.display());
+                Ok(())
+            },
+        )
         .await
 }
 
@@ -109,7 +83,9 @@ mod tests {
             ];
             let cli =
                 crate::Cli::try_parse_from(base.into_iter().chain(extra.iter().copied())).unwrap();
-            let crate::Commands::Speak(args) = cli.command else {
+            let crate::Commands::Job(crate::commands::transact::JobCommand::Speak(args)) =
+                cli.command
+            else {
                 panic!()
             };
             args
@@ -117,7 +93,19 @@ mod tests {
         let args = parse(&[]);
         assert_eq!(args.voice, "default");
         assert_eq!(speech_text(args.text, &b"Hello."[..]).unwrap(), "Hello.");
-        let args = parse(&["--text", "Good morning.", "--voice", "Easton"]);
+        let args = parse(&[
+            "--text",
+            "Good morning.",
+            "--voice",
+            "Easton",
+            "--codec",
+            "local-codec",
+            "--voices",
+            "hf://org/voices@release",
+        ]);
+        let spec = args.companions.spec(&args.placement.model);
+        assert_eq!(spec.codec, Some("local-codec".into()));
+        assert_eq!(spec.voices, Some("hf://org/voices@release".into()));
         assert_eq!(args.voice, "Easton");
         assert_eq!(
             speech_text(args.text, std::io::empty()).unwrap(),

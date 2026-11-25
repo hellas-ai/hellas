@@ -89,15 +89,13 @@ pub enum ApplicationError {
 
 /// One application-owned, content-addressed execution environment.
 ///
-/// The application defines the meaning of `root`. For example, Catena causal
-/// LM roots exclude tokenizers, chat templates, decoding, and other
-/// presentation policy. An attested Fetch application instead includes its
-/// exact request structuring and response destructuring because those steps are
-/// trusted computation.
+/// Compute binds the environment root and complete model ID. Fetch binds the
+/// request and response contract in its application root.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProgramManifest {
     application: Application,
     root: ContentId,
+    model: Option<ContentId>,
 }
 
 // The prepared invocation carries the manifest as its strict canonical byte string.
@@ -124,8 +122,16 @@ impl ProgramManifest {
 
     /// Binds an exact application identity to its application-owned root.
     #[must_use]
-    pub const fn new(application: Application, root: ContentId) -> Self {
-        Self { application, root }
+    pub const fn new(application: Application, root: ContentId, model: Option<ContentId>) -> Self {
+        Self {
+            application,
+            root,
+            model,
+        }
+    }
+
+    pub const fn model(&self) -> Option<ContentId> {
+        self.model
     }
 
     /// Returns the complete, exact interpreter identity.
@@ -140,18 +146,21 @@ impl ProgramManifest {
         self.root
     }
 
-    /// Strict DAG-CBOR `[domain, [evaluator, adaptor], root]` encoding.
+    /// Strict DAG-CBOR tuple of domain, application, root, and model ID for model programs.
     ///
     /// Definite arrays and the minimal encoder give every manifest exactly one
     /// wire representation, independent of which application interprets it.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut encoder = DagCborEncoder::new();
-        encoder.array(3);
+        encoder.array(if self.model.is_some() { 4 } else { 3 });
         encoder.str(PROGRAM_MANIFEST_DOMAIN);
         encoder.array(2);
         encoder.str(&self.application.evaluator);
         encoder.str(&self.application.adaptor);
         encoder.bytes(self.root.as_bytes());
+        if let Some(model) = self.model {
+            encoder.bytes(model.as_bytes());
+        }
         encoder.into_bytes()
     }
 
@@ -168,23 +177,27 @@ impl ProgramManifest {
         }
 
         let mut decoder = CanonicalDecoder::new(bytes);
-        decoder.array_exact(3)?;
+        let fields = decoder.array_len()?;
+        if !matches!(fields, 3 | 4) {
+            return Err(CanonicalDecodeError::new(
+                "invalid program manifest field count",
+            ));
+        }
         decoder.expect_str(PROGRAM_MANIFEST_DOMAIN)?;
         decoder.array_exact(2)?;
         let evaluator = decoder.str()?.to_string();
         let adaptor = decoder.str()?.to_string();
         let root = ContentId::from_bytes(decoder.bytes_32()?);
+        let model = if fields == 4 {
+            Some(ContentId::from_bytes(decoder.bytes_32()?))
+        } else {
+            None
+        };
         decoder.finish()?;
 
         let application = Application::new(evaluator, adaptor)
             .map_err(|error| CanonicalDecodeError::new(error.to_string()))?;
-        let manifest = Self::new(application, root);
-        if manifest.canonical_bytes() != bytes {
-            return Err(CanonicalDecodeError::new(
-                "program manifest is not in canonical DAG-CBOR form",
-            ));
-        }
-        Ok(manifest)
+        Ok(Self::new(application, root, model))
     }
 
     /// Returns the Xet content identifier of the canonical manifest bytes.

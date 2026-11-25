@@ -502,7 +502,13 @@ async fn grant_root_completion_consults_the_policy_with_full_reference_and_reque
         )
         .build()
         .await;
-    let proposal = compute.proposal(&node, FRIEND, ids::ALLOWANCE, 1);
+    let proposal = compute.proposal(
+        &node,
+        FRIEND,
+        ids::ALLOWANCE,
+        1,
+        &hellas_channel::test_support::channel::manifest(),
+    );
     let content = node.content.clone();
     let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
     content

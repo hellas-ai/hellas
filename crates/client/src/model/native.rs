@@ -1,13 +1,17 @@
 //! Resolve the published checkpoint once for local and Hub-backed model renderers.
-use super::{ModelFiles, flux};
+mod companion;
+use super::{
+    ModelFiles, ModelSpec, flux,
+    source::{File, PeerModel, RemoteFile},
+};
 use anyhow::{Context, Result, bail, ensure};
 use catena_models::{omnivoice, phonon};
 use hellas_rpc::{
     ContentRef,
-    protocol::invocation::compute::{Arg, NamedAsset},
+    protocol::invocation::compute::{Arg, Model, NamedAsset},
 };
 use hellas_store::{
-    content::DiskStore,
+    content::{DiskStore, LocalStore, Scope},
     hf::{PinnedFile, PinnedRepo},
 };
 use std::{
@@ -29,6 +33,7 @@ pub(super) enum Kind {
 pub(super) enum Origin {
     Local(PathBuf),
     Hub(PinnedRepo),
+    Peer(PeerModel),
 }
 
 impl Origin {
@@ -36,12 +41,17 @@ impl Origin {
         Ok(match self {
             Self::Local(dir) => dir.join(key).try_exists()?,
             Self::Hub(repo) => repo.contains(key),
+            Self::Peer(peer) => peer.object(key).is_ok(),
         })
     }
-    fn file(&self, key: &str) -> Result<Weight> {
+    fn file(&self, key: &str, metadata: Option<ContentRef>) -> Result<File> {
         Ok(match self {
-            Self::Local(dir) => Weight::Local(dir.join(key)),
-            Self::Hub(repo) => Weight::Hub(repo.file(key)?),
+            Self::Local(dir) => File::Local(dir.join(key)),
+            Self::Hub(repo) => File::Remote(RemoteFile::Hub(match metadata {
+                Some(object) => PinnedFile::new(repo.repo.clone(), key.into(), object),
+                None => repo.file(key)?,
+            })),
+            Self::Peer(peer) => File::Remote(RemoteFile::Peer(peer.clone(), peer.object(key)?)),
         })
     }
     fn metadata(&self, key: &str) -> Result<Vec<u8>> {
@@ -49,6 +59,14 @@ impl Origin {
         Ok(match self {
             Self::Local(dir) => hellas_private::read_bounded_regular_file(&dir.join(key), MAX)?,
             Self::Hub(repo) => repo.metadata(key, MAX as u64)?,
+            Self::Peer(peer) => {
+                let object = peer.object(key)?;
+                ensure!(
+                    object.bytes() <= MAX as u64,
+                    "checkpoint metadata exceeds limit: {key}"
+                );
+                peer.read(object, 0..object.bytes())?
+            }
         })
     }
     pub(super) fn kind(&self) -> Result<Option<Kind>> {
@@ -85,40 +103,39 @@ pub(super) fn hub(uri: &str) -> Result<(PinnedRepo, Option<String>)> {
     )?)
 }
 
-enum Weight {
-    Local(PathBuf),
-    Hub(PinnedFile),
-}
-
 struct RangeReader<'a> {
-    file: &'a PinnedFile,
-    offset: u64,
+    file: &'a RemoteFile,
+    position: u64,
 }
 impl Read for RangeReader<'_> {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-        let count = (out.len() as u64).min(self.file.object.bytes() - self.offset);
+        let count = out.len().min(
+            (self.file.object().bytes() - self.position)
+                .try_into()
+                .unwrap_or(usize::MAX),
+        );
         if count != 0 {
+            let end = self.position + count as u64;
             self.file
-                .read_range(
-                    self.offset..self.offset + count,
-                    &mut &mut out[..count as usize],
-                )
+                .read_range(self.position..end, &mut &mut out[..count])
                 .map_err(std::io::Error::other)?;
-            self.offset += count;
+            self.position = end;
         }
-        Ok(count as usize)
+        Ok(count)
     }
 }
 
 pub(super) struct Snapshot {
-    dir: Arc<tempfile::TempDir>,
-    metadata: Vec<PathBuf>,
-    weights: BTreeMap<String, Weight>,
+    dir: tempfile::TempDir,
+    pub(super) originals: ModelFiles,
+    assets: Vec<NamedAsset>,
+    expected: Option<Arc<Model>>,
+    weights: BTreeMap<String, File>,
     indexed_names: BTreeMap<String, BTreeSet<String>>,
     voices: BTreeMap<String, String>,
 }
 
-fn relative(name: &str) -> Result<()> {
+pub(super) fn relative(name: &str) -> Result<()> {
     ensure!(
         !name.is_empty()
             && !name.contains('\\')
@@ -135,17 +152,33 @@ fn relative(name: &str) -> Result<()> {
 
 impl Snapshot {
     fn add(&mut self, origin: &Origin, prefix: &str, key: &str) -> Result<()> {
+        self.add_from(origin, &format!("{prefix}{key}"), key)
+    }
+    fn add_from(&mut self, origin: &Origin, name: &str, key: &str) -> Result<()> {
+        relative(name)?;
         relative(key)?;
-        let name = format!("{prefix}{key}");
+        let key = if matches!(origin, Origin::Peer(_)) {
+            name
+        } else {
+            key
+        };
         if key.ends_with(".safetensors") {
-            self.weights.insert(name, origin.file(key)?);
+            let weight = origin.file(key, None)?;
+            weight.register(&mut self.originals);
+            self.weights.insert(name.to_owned(), weight);
         } else {
             let path = self.dir.path().join(name);
             std::fs::create_dir_all(path.parent().unwrap())?;
-            std::fs::write(path, origin.metadata(key)?)?;
-            if let Origin::Local(root) = origin {
-                self.metadata.push(root.join(key));
-            }
+            let bytes = origin.metadata(key)?;
+            let object = ContentRef::for_bytes(&bytes);
+            self.assets.push(NamedAsset {
+                name: name.to_owned(),
+                object,
+            });
+            std::fs::write(path, &bytes)?;
+            origin
+                .file(key, Some(object))?
+                .register(&mut self.originals);
         }
         Ok(())
     }
@@ -182,34 +215,31 @@ impl Snapshot {
         }
         Ok(())
     }
-    pub(super) fn open(origin: Origin, kind: Kind, voices: &[String]) -> Result<Self> {
+    pub(super) fn open(origin: Origin, kind: Kind, companions: Option<&ModelSpec>) -> Result<Self> {
         let mut result = Self {
-            dir: Arc::new(tempfile::tempdir()?),
-            metadata: vec![],
+            dir: tempfile::tempdir()?,
+            assets: Vec::new(),
+            originals: ModelFiles::default(),
+            expected: match &origin {
+                Origin::Peer(peer) => Some(peer.model.clone()),
+                _ => None,
+            },
             weights: BTreeMap::new(),
             indexed_names: BTreeMap::new(),
             voices: BTreeMap::new(),
         };
+        let fixed: &[&str] = match kind {
+            Kind::Mms => &super::speech::CHECKPOINT,
+            Kind::Whisper => &super::whisper::CHECKPOINT,
+            Kind::OmniVoice => omnivoice::FILES,
+            Kind::Flux => &flux::METADATA,
+            Kind::Phonon => &[],
+        };
+        for key in fixed {
+            result.add(&origin, "", key)?;
+        }
         match kind {
-            Kind::Mms => {
-                for &key in &super::speech::CHECKPOINT {
-                    result.add(&origin, "", key)?;
-                }
-            }
-            Kind::Whisper => {
-                for &key in &super::whisper::CHECKPOINT {
-                    result.add(&origin, "", key)?;
-                }
-            }
-            Kind::OmniVoice => {
-                for &key in omnivoice::FILES {
-                    result.add(&origin, "", key)?;
-                }
-            }
             Kind::Flux => {
-                for key in flux::METADATA {
-                    result.add(&origin, "", key)?;
-                }
                 if origin.has("variants.json")? {
                     result.add(&origin, "", "variants.json")?;
                 }
@@ -223,149 +253,101 @@ impl Snapshot {
                 result.add(&origin, "", flux::VAE)?;
             }
             Kind::Phonon => {
-                let (model, codec, catalog) = match origin {
-                    Origin::Local(root)
-                        if root.join("model/processor_config.json").try_exists()? =>
-                    {
-                        (
-                            Origin::Local(root.join("model")),
-                            Origin::Local(root.join("codec")),
-                            Origin::Local(root.join("voices")),
-                        )
-                    }
-                    model => {
-                        let dep = |id, revision| {
-                            Ok::<_, anyhow::Error>(Origin::Hub(
-                                hub(&format!("hf://{id}@{revision}"))?.0,
-                            ))
-                        };
-                        (
-                            model,
-                            dep(phonon::CODEC, phonon::CODEC_REVISION)?,
-                            dep(phonon::VOICE_REPO, phonon::VOICE_REPO_REVISION)?,
-                        )
-                    }
-                };
+                let (model, codec, catalog) = companion::resolve(origin, companions)?;
                 for key in phonon::MODEL_FILES {
                     result.add(&model, "model/", key)?;
                 }
                 for key in phonon::CODEC_FILES {
-                    result.add(&codec, "codec/", key)?;
+                    codec.add(&mut result, "codec/", key)?;
                 }
-                result.add(&catalog, "voices/", phonon::VOICE_CATALOG)?;
+                catalog.add(&mut result, "voices/", phonon::VOICE_CATALOG)?;
                 let listing = std::fs::read_to_string(
                     result.dir.path().join("voices").join(phonon::VOICE_CATALOG),
                 )?;
-                for name in selected_voices(voices) {
-                    let key = super::speech::phonon::voice_file(&listing, &name)?;
-                    result.add(&catalog, "voices/", &key)?;
-                    result.voices.insert(name, format!("voices/{key}"));
+                for (name, key) in super::speech::phonon::catalog(&listing)? {
+                    let asset = format!("voices/{key}");
+                    if !result.weights.contains_key(&asset) {
+                        catalog.add(&mut result, "voices/", &key)?;
+                    }
+                    result.voices.insert(name, asset);
                 }
             }
+            _ => {}
         }
         Ok(result)
     }
 
-    pub(super) fn files(&self) -> ModelFiles {
-        let mut local = self.metadata.clone();
-        let mut hub = Vec::new();
-        for file in self.weights.values() {
-            match file {
-                Weight::Local(path) => local.push(path.clone()),
-                Weight::Hub(file) => hub.push(file.clone()),
-            }
-        }
-        ModelFiles { local, hub }
-    }
-    pub(super) fn resolve(self, store: Option<&DiskStore>) -> Result<Native> {
-        let paths = self
-            .weights
-            .values()
-            .filter_map(|w| match w {
-                Weight::Local(path) => Some(path.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
+    pub(super) fn resolve(mut self, store: Option<&DiskStore>) -> Result<Native> {
+        let paths = self.weights.values().filter_map(|file| match file {
+            File::Local(path) => Some(path.clone()),
+            _ => None,
+        });
         let inspected = match store {
-            Some(store) if !paths.is_empty() => {
-                tokio::runtime::Handle::current().block_on(store.inspect_files(paths))?
+            Some(store) => {
+                tokio::runtime::Handle::current().block_on(store.inspect_files(paths.collect()))?
             }
-            _ => BTreeMap::new(),
+            None => BTreeMap::new(),
         };
         let mut files = BTreeMap::new();
+        let mut voice_files = BTreeMap::new();
         for (key, weight) in self.weights {
-            let (object, header) = match weight {
-                Weight::Hub(file) => (
-                    file.object,
-                    catena_models::weights::read_safetensors_header(
-                        RangeReader {
-                            file: &file,
-                            offset: 0,
-                        },
-                        file.object.bytes(),
-                    )?,
-                ),
-                Weight::Local(path) => {
-                    let object = match inspected.get(&path) {
-                        Some(o) => *o,
-                        None => hellas_store::content::file_content(&path)?,
-                    };
-                    (
-                        object,
-                        catena_models::weights::read_safetensors_header(
-                            hellas_private::open_regular_file(&path)?,
-                            object.bytes(),
-                        )?,
-                    )
+            let object = weight.object(&inspected)?;
+            if key.starts_with("voices/") {
+                voice_files.insert(key.clone(), (weight, object));
+            } else {
+                let tensors = weight.tensors(&key, object)?;
+                if let Some(expected) = self.indexed_names.get(&key) {
+                    ensure!(tensors.keys().eq(expected), "invalid shard index for {key}");
                 }
-            };
-            let (base, metadata) = header;
-            let tensors: BTreeMap<_, _> = metadata
-                .tensors()
-                .into_iter()
-                .map(|(name, t)| {
-                    let (a, b) = t.data_offsets;
-                    (
-                        name.to_owned(),
-                        Tensor {
-                            dtype: t.dtype,
-                            shape: t.shape.clone(),
-                            arg: Arg::Asset {
-                                name: key.clone(),
-                                offset: (base + a) as u64,
-                                bytes: (b - a) as u64,
-                            },
-                        },
-                    )
-                })
-                .collect();
-            if let Some(expected) = self.indexed_names.get(&key) {
-                ensure!(tensors.keys().eq(expected), "invalid shard index for {key}");
+                files.insert(key.clone(), tensors);
             }
-            files.insert(key, (object, tensors));
+            self.assets.push(NamedAsset { name: key, object });
+        }
+        let model = Model::new(self.assets)?;
+        if let Some(expected) = self.expected {
+            ensure!(
+                model == *expected,
+                "checkpoint assets disagree with the named model"
+            );
         }
         Ok(Native {
+            model,
             dir: self.dir,
-            files: Arc::new(files),
+            files,
             voices: self.voices,
+            voice_files,
         })
     }
 }
 
-pub(super) fn selected_voices(voices: &[String]) -> BTreeSet<String> {
-    if voices.is_empty() {
-        return [phonon::DEFAULT_VOICE.to_owned()].into_iter().collect();
+impl File {
+    fn tensors(&self, key: &str, object: ContentRef) -> Result<BTreeMap<String, Tensor>> {
+        let file_bytes = object.bytes();
+        let reader: Box<dyn Read + '_> = match self {
+            Self::Local(path) => Box::new(hellas_private::open_regular_file(path)?),
+            Self::Remote(file) => Box::new(RangeReader { file, position: 0 }),
+        };
+        let (base, metadata) = catena_models::weights::read_safetensors_header(reader, file_bytes)?;
+        Ok(metadata
+            .tensors()
+            .into_iter()
+            .map(|(name, t)| {
+                let (a, b) = t.data_offsets;
+                (
+                    name.to_string(),
+                    Tensor {
+                        dtype: t.dtype,
+                        shape: t.shape.clone(),
+                        arg: Arg::Asset {
+                            name: key.to_owned(),
+                            offset: (base + a) as u64,
+                            bytes: (b - a) as u64,
+                        },
+                    },
+                )
+            })
+            .collect())
     }
-    voices
-        .iter()
-        .map(|v| {
-            if v == "default" {
-                phonon::DEFAULT_VOICE.to_owned()
-            } else {
-                v.clone()
-            }
-        })
-        .collect()
 }
 
 pub(crate) struct Tensor {
@@ -373,33 +355,66 @@ pub(crate) struct Tensor {
     pub dtype: safetensors::Dtype,
     pub shape: Vec<usize>,
 }
-type Files = BTreeMap<String, (ContentRef, BTreeMap<String, Tensor>)>;
-#[derive(Clone)]
+type Tensors = BTreeMap<String, Tensor>;
 pub(crate) struct Native {
-    dir: Arc<tempfile::TempDir>,
-    files: Arc<Files>,
-    pub voices: BTreeMap<String, String>,
+    pub model: Model,
+    dir: tempfile::TempDir,
+    files: BTreeMap<String, Tensors>,
+    voices: BTreeMap<String, String>,
+    voice_files: BTreeMap<String, (File, ContentRef)>,
 }
 impl Native {
     pub fn dir(&self) -> &Path {
         self.dir.path()
     }
-    pub fn assets(&self) -> Vec<NamedAsset> {
-        self.files
+    pub async fn environment(
+        &self,
+        source: &str,
+    ) -> Result<(
+        hellas_rpc::protocol::invocation::compute::Environment,
+        (LocalStore, Scope),
+    )> {
+        let (environment, content) =
+            super::program::environment(source, self.model.clone()).await?;
+        for NamedAsset { name, object } in self
+            .model
+            .assets
             .iter()
-            .filter(|(key, _)| {
-                !key.starts_with("voices/") || self.voices.values().any(|f| f == *key)
-            })
-            .map(|(name, (object, _))| NamedAsset {
-                name: name.clone(),
-                object: *object,
-            })
-            .collect()
+            .filter(|asset| !asset.name.ends_with(".safetensors"))
+        {
+            let bytes = tokio::fs::read(self.dir().join(name)).await?;
+            ensure!(
+                ContentRef::for_bytes(&bytes) == *object,
+                "checkpoint metadata changed: {name}"
+            );
+            hellas_channel::content::upload_object(&content.0, &bytes).await?;
+        }
+        Ok((environment, content))
+    }
+    pub fn voice(&self, name: &str) -> Result<Tensor> {
+        let key = self
+            .voices
+            .get(name)
+            .with_context(|| format!("unknown Phonon voice {name:?}"))?;
+        let (weight, object) = self
+            .voice_files
+            .get(key)
+            .context("missing catalog voice file")?;
+        if let File::Local(path) = weight {
+            ensure!(
+                hellas_store::content::file_content(path)? == *object,
+                "catalog voice changed: {key}"
+            );
+        }
+        weight
+            .tensors(key, *object)?
+            .remove("speaker_wavs")
+            .context("voice has no speaker_wavs")
     }
     pub fn tensor(&self, file: &str, tensor: &str) -> Result<&Tensor> {
         self.files
             .get(file)
-            .and_then(|(_, ts)| ts.get(tensor))
+            .and_then(|ts| ts.get(tensor))
             .with_context(|| format!("missing tensor {tensor} in {file}"))
     }
     pub fn tensor_in(&self, prefix: &str, tensor: &str) -> Result<&Tensor> {
@@ -407,7 +422,7 @@ impl Native {
             .files
             .iter()
             .filter(|(file, _)| file.starts_with(prefix))
-            .filter_map(|(_, (_, ts))| ts.get(tensor));
+            .filter_map(|(_, ts)| ts.get(tensor));
         let value = hits
             .next()
             .with_context(|| format!("missing {prefix} tensor {tensor}"))?;
@@ -417,25 +432,48 @@ impl Native {
         Ok(value)
     }
     #[cfg(any(test, feature = "test-support"))]
-    pub fn fixture(dir: &Path, files: Files) -> Self {
-        fn copy(src: &Path, dst: &Path) {
+    pub fn fixture(dir: &Path, files: BTreeMap<String, (ContentRef, Tensors)>) -> Self {
+        fn copy(src: &Path, dst: &Path, root: &Path, metadata: &mut BTreeMap<String, ContentRef>) {
             for item in std::fs::read_dir(src).unwrap() {
                 let item = item.unwrap();
                 let path = dst.join(item.file_name());
                 if item.file_type().unwrap().is_dir() {
                     std::fs::create_dir(&path).unwrap();
-                    copy(&item.path(), &path);
+                    copy(&item.path(), &path, root, metadata);
                 } else if item.path().extension().is_some_and(|ext| ext == "json") {
-                    std::fs::copy(item.path(), path).unwrap();
+                    let bytes = std::fs::read(item.path()).unwrap();
+                    metadata.insert(
+                        path.strip_prefix(root)
+                            .unwrap()
+                            .to_str()
+                            .unwrap()
+                            .to_string(),
+                        ContentRef::for_bytes(&bytes),
+                    );
+                    std::fs::write(path, bytes).unwrap();
                 }
             }
         }
         let root = tempfile::tempdir().unwrap();
-        copy(dir, root.path());
+        let mut metadata = BTreeMap::new();
+        copy(dir, root.path(), root.path(), &mut metadata);
+        let files = files
+            .into_iter()
+            .map(|(name, (object, tensors))| {
+                metadata.insert(name.clone(), object);
+                (name, tensors)
+            })
+            .collect();
+        let assets = metadata
+            .into_iter()
+            .map(|(name, object)| NamedAsset { name, object })
+            .collect();
         Self {
-            dir: Arc::new(root),
-            files: Arc::new(files),
+            model: Model::new(assets).unwrap(),
+            dir: root,
+            files,
             voices: Default::default(),
+            voice_files: Default::default(),
         }
     }
 }
@@ -468,8 +506,12 @@ mod tests {
         for name in ["model.safetensors", "audio_tokenizer/model.safetensors"] {
             std::os::unix::fs::symlink(&object_path, snapshot.join(name))?;
         }
-        let parsed = Snapshot::open(Origin::Local(snapshot.clone()), Kind::OmniVoice, &[])?;
-        let files = parsed.files();
+        let parsed = Snapshot::open(
+            Origin::Local(snapshot.clone()),
+            Kind::OmniVoice,
+            Default::default(),
+        )?;
+        let files = &parsed.originals;
         assert!(files.hub.is_empty());
         assert!(
             files
@@ -479,8 +521,15 @@ mod tests {
         let model = parsed.resolve(None)?;
         let content = hellas_store::content::file_content(&object_path)?;
         let pick = model.tensor("model.safetensors", "weight")?;
-        assert_eq!(model.assets().len(), 2);
-        assert!(model.assets().iter().all(|asset| asset.object == content));
+        assert_eq!(model.model.assets.len(), 5);
+        assert!(
+            model
+                .model
+                .assets
+                .iter()
+                .filter(|asset| asset.name.ends_with(".safetensors"))
+                .all(|asset| asset.object == content)
+        );
         assert_eq!(pick.shape, [2]);
         assert_eq!(pick.dtype, Dtype::BF16);
         assert_eq!(
@@ -497,7 +546,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_voices_control_the_signed_voice_selection() {
+    fn gateway_voice_allowlist_recognizes_default_alias() {
         assert!(super::super::voice_allowed(&[], "default"));
         assert!(super::super::voice_allowed(&[], "Easton"));
         assert!(!super::super::voice_allowed(&[], "Zoey"));

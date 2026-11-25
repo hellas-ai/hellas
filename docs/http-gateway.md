@@ -38,7 +38,13 @@ Whisper clients read the tokenizer, generation settings and safetensors header. 
 
 ```sh
 hellas gateway --model hf://unsloth/whisper-tiny@34457cb234c8624f23ac716000773b367000df6e@alice
-hellas program hf://MisterCD/whisper-small@98533e05a8a8d670fa562f13392b78841424f44f --backend hellas/catena-dfad87438018-cuda
+hellas program hf://MisterCD/whisper-small@98533e05a8a8d670fa562f13392b78841424f44f --backend hellas/catena-dfad87438018-cuda-sm_120
+```
+
+For Phonon, add `codec=SOURCE` and `voices=SOURCE` to the model selection to choose the codec and voice catalog. Put the destination on the primary model. Each source accepts a local path or Hub reference. Repeat `--voice` to select the voices the gateway serves.
+
+```sh
+hellas gateway --model '/srv/phonon/model@alice,codec=/srv/phonon/codec,voices=/srv/phonon/voices' --voice Easton --voice Zoey
 ```
 
 For MMS English and other speech checkpoints, see [speech](speech.md).

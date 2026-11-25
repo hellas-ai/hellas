@@ -52,7 +52,7 @@ preserved. Signed evidence accompanies successful and failed completions.
 The following revision contains the original MMS English inference tensors and tokenizer. Both clients and providers accept the pinned repository or a local checkpoint directory containing `model.safetensors`, `config.json`, `vocab.json`, `tokenizer_config.json` and `special_tokens_map.json`.
 
 ```sh
-hellas program hf://whatever0705/mms-tts-eng-with-discriminator@3975d411eef6e0a05ab701ce981a93dc3a2cfdae --backend hellas/catena-dfad87438018-hip
+hellas program hf://whatever0705/mms-tts-eng-with-discriminator@3975d411eef6e0a05ab701ce981a93dc3a2cfdae --backend hellas/catena-dfad87438018-hip-gfx1151
 ```
 
 The client renders from metadata. The provider verifies the safetensors file and prepares the required weights on its GPU. The speech decoder checks the status and sample count and encodes the valid finite waveform samples. Configure Compute admission for the program printed by `hellas program` and allow 1,920,000 bytes for the waveform plus 16 bytes for its status and sample count.
@@ -60,20 +60,31 @@ The client renders from metadata. The provider verifies the safetensors file and
 ## Original speech checkpoints
 
 OmniVoice keeps its model weights and audio tokenizer in one repository.
-Phonon uses the model revision you select and fixed revisions for its codec
-and voice catalog. The client reads the catalog and tensor headers. The provider
-acquires the original model, codec and selected voice files. Each Phonon voice
-has its own signed program.
+Phonon defaults to the codec and voice-catalog revisions exported by Catena. On
+`speak` and `program`, use `--codec REF` and `--voices REF` to select either
+companion independently. Each accepts a Hub repository, a ref with a branch,
+tag or exact commit, or a local path. You can select a codec safetensors file
+or a JSONL voice catalog directly. The model commits to the codec, the
+catalog and every voice checkpoint the catalog lists. A repository grant
+must cover the origins of all these assets.
+All voices share one program per evaluator. For a speech request, the client
+reads the selected voice’s tensor header and puts its byte range in the plan.
 
 ```sh
-hellas program "hf://${PHONON_ORG}/phonon-31m-en@8f7a37c94a4c58b04c8287300c53f11d2e208eae" --voice Easton --backend hellas/catena-dfad87438018-hip
+hellas program "hf://${PHONON_ORG}/phonon-31m-en@8f7a37c94a4c58b04c8287300c53f11d2e208eae" --backend hellas/catena-dfad87438018-hip-gfx1151
 ```
 
 A local OmniVoice snapshot has the same files as its Hub repository. An offline
 Phonon directory contains the original `model/`, `codec/` and `voices/`
 snapshots, including `voices/voices.jsonl` and the voice files named by the
-catalog. A standalone local Phonon model directory uses the pinned Hub
-dependencies.
+catalog. With separate local directories, specify the companions explicitly.
+For omitted companions of a standalone local checkpoint, Hellas looks for
+Catena’s pinned revisions in the local Hub cache. Local inputs stay offline.
+
+```sh
+hellas program --model-id ./phonon-model --codec ./codec --voices ./voices/voices.jsonl
+hellas speak --model ./phonon-model --codec ./codec --voices ./voices --voice Easton --text 'Hello.' -o speech.wav --local
+```
 
 ## Gateway configuration
 
@@ -103,7 +114,7 @@ kind = "paid"
 max_in_flight = 1
 provider = "NATIVE_ENROLLMENT_ID@NATIVE_NODE_ID"
 max_price = 20
-evaluator = "hellas/catena-dfad87438018-hip"
+evaluator = "hellas/catena-dfad87438018-hip-gfx1151"
 
 [[routes]]
 kind = "speech"
@@ -129,9 +140,16 @@ kind = "native"
 package = "hf://whatever0705/mms-tts-eng-with-discriminator@3975d411eef6e0a05ab701ce981a93dc3a2cfdae"
 ```
 
-For Phonon set `package` to its pinned Hub URI and add
-`voices = ["Easton", "Zoey"]` to the native target. Use the same list on the
-provider's model resource. Omitting the list serves Easton.
+For Phonon, `package` can name the model by itself or specify its codec and voice catalog. Each source accepts a local path or a Hub reference. This native gateway target serves two voices from a local catalog.
+
+```toml
+[routes.target]
+kind = "native"
+package = { model = "/srv/phonon/model", codec = "/srv/phonon/codec", voices = "/srv/phonon/voices" }
+voices = ["Easton", "Zoey"]
+```
+
+Omitting the target's voice list serves Easton. The model resource covers the entire catalog. Each speech job selects its voice by its checkpoint byte range.
 
 The adaptor maps `input` to upstream `text`, uses the configured upstream
 `model_id`, encodes `voice` as one path segment, and puts the mapped format in

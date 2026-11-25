@@ -199,7 +199,7 @@ fn corrupt_or_relocated_records_cannot_be_replaced_as_missing() {
 
 #[cfg(unix)]
 #[test]
-fn public_files_and_symlinks_are_refused() {
+fn public_policy_is_readable_and_symlinks_are_refused() {
     use std::os::unix::fs::{PermissionsExt, symlink};
     let directory = tempfile::tempdir().unwrap();
     let store = TrustPolicyStore::new(directory.path());
@@ -208,13 +208,10 @@ fn public_files_and_symlinks_are_refused() {
         .unwrap();
     let path = store.path("provider", ".json").unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-    assert!(store.load("provider").is_err());
-    assert!(
-        store
-            .approve("provider", 1, policy(), "replace public".into())
-            .is_err()
-    );
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(store.load("provider").is_ok());
+    store
+        .approve("provider", 1, policy(), "update policy".into())
+        .unwrap();
     symlink(&path, store.path("linked", ".json").unwrap()).unwrap();
     assert!(store.load("linked").is_err());
     assert!(

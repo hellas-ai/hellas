@@ -7,27 +7,54 @@ pub(crate) mod process;
 pub mod program;
 pub use process::{Cancellation, isolate_child};
 
-/// The evaluator id a GPU runtime registers: the programs it compiles. The
-/// executor runs only programs whose evaluator its runtime registered.
-pub fn evaluator(dialect: catena_lang::codegen::GpuDialect) -> String {
-    hellas_rpc::protocol::invocation::compute::evaluator(compile::name(dialect))
+/// A GPU runtime on the device it opened. It registers one evaluator id, and
+/// the executor runs only programs that name it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Gpu {
+    pub dialect: catena_lang::codegen::GpuDialect,
+    pub arch: String,
 }
-/// Resolve an opaque evaluator id registered by this executor build.
-pub fn registered_evaluator(id: &str) -> Result<catena_lang::codegen::GpuDialect, String> {
-    use catena_lang::codegen::GpuDialect;
-    [GpuDialect::Hip, GpuDialect::Cuda]
-        .into_iter()
-        .find(|dialect| evaluator(*dialect) == id)
-        .ok_or_else(|| format!("unregistered evaluator: {id}"))
-}
+impl Gpu {
+    /// The runtime on this host that registers `evaluator`; without one, the
+    /// native runtime: CUDA with an NVIDIA driver, otherwise HIP.
+    pub fn select(evaluator: Option<&str>) -> Result<Self, String> {
+        use catena_lang::codegen::GpuDialect;
+        let Some(evaluator) = evaluator else {
+            return Self::open(if std::path::Path::new("/dev/nvidiactl").exists() {
+                GpuDialect::Cuda
+            } else {
+                GpuDialect::Hip
+            });
+        };
+        let opened = [GpuDialect::Hip, GpuDialect::Cuda].map(Self::open);
+        if let Some(gpu) = opened
+            .iter()
+            .flatten()
+            .find(|gpu| gpu.evaluator() == evaluator)
+        {
+            return Ok(gpu.clone());
+        }
+        let registered: Vec<_> = opened
+            .into_iter()
+            .map(|gpu| gpu.map_or_else(|error| error, |gpu| gpu.evaluator()))
+            .collect();
+        Err(format!(
+            "unregistered evaluator {evaluator}; this host has {}",
+            registered.join(", ")
+        ))
+    }
 
-/// Select the native executor once, at its boundary with the host platform.
-pub fn default_gpu() -> catena_lang::codegen::GpuDialect {
-    use catena_lang::codegen::GpuDialect;
-    if std::path::Path::new("/dev/nvidiactl").exists() {
-        GpuDialect::Cuda
-    } else {
-        GpuDialect::Hip
+    /// Open `dialect`'s runtime on its current device.
+    fn open(dialect: catena_lang::codegen::GpuDialect) -> Result<Self, String> {
+        let arch = memory::architecture(dialect).map_err(|error| error.to_string())?;
+        Ok(Self { dialect, arch })
+    }
+
+    pub fn evaluator(&self) -> String {
+        hellas_rpc::protocol::invocation::compute::evaluator(
+            compile::name(self.dialect),
+            &self.arch,
+        )
     }
 }
 

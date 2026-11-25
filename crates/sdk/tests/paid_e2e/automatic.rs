@@ -123,7 +123,7 @@ impl WorkBackend for HostCompute {
             &content,
             &prepared,
             &limits,
-            &hellas_executor::catena::evaluator(hellas_executor::GpuDialect::Hip),
+            &hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip, "gfx1151"),
         )
         .await
         .map_err(|error| error.to_string());
@@ -1282,7 +1282,7 @@ async fn compute_job(source: &str, plan: Plan) -> (hellas_sdk::job::Job, hellas_
     bytes.push(source.as_bytes().to_vec());
     let environment = invocation::compute::Environment {
         sources,
-        assets: vec![],
+        model: Default::default(),
     };
     bytes.push(environment.canonical_bytes().unwrap());
     let content = source_content(bytes).await;
@@ -1659,10 +1659,9 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
     assert_eq!(files(&config.chain.provider().join("channels")), 0);
     let mut policy = paid_policy();
     policy.invocation_policy = InvocationPolicy {
-        admissions: vec![Admission::Compute {
-            evaluator: hellas_channel::test_support::channel::evaluator(),
-            programs: hellas_rpc::protocol::invocation::ComputePrograms::Any {},
-        }],
+        admissions: vec![Admission::evaluator(
+            hellas_channel::test_support::channel::evaluator(),
+        )],
         limits: Limits {
             max_upload_bytes: 1 << 20,
             max_output_bytes: 4096,

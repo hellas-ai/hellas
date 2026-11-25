@@ -1,0 +1,30 @@
+{
+  "name": "hellas-rtx5090",
+  "category": "NVIDIA",
+  "image": "ghcr.io/hellas-ai/hellas@sha256:CUDA_MANIFEST_DIGEST",
+  "cmd": [
+    "serve",
+    "--port",
+    "31145",
+    "--home",
+    "/var/lib/hellas/.hellas",
+    "--secrets-dir",
+    "/var/lib/hellas-secrets"
+  ],
+  "disk": 16,
+  "mounts": {
+    "persistent": {
+      "path": "/var/lib/hellas",
+      "size": 96
+    }
+  },
+  "ports": [],
+  "serverless": false,
+  "public": false,
+  "startSsh": false,
+  "startJupyter": false,
+  "env": {
+    "NVCC_APPEND_FLAGS": "--generate-code=arch=compute_120,code=sm_120",
+    "CATENA_GPU_CACHE_DIR": "/tmp/hellas-catena-sm120"
+  }
+}

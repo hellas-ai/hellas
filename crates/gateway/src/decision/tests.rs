@@ -20,6 +20,7 @@ impl WorkExecutionBackend for Fake {
     fn backends(&self) -> Vec<crate::BackendInfo> {
         crate::test_support::backend(Some(hellas_client::model::evaluator(
             hellas_client::model::GpuDialect::Hip,
+            "gfx1151",
         )))
     }
     fn run(
@@ -78,7 +79,8 @@ async fn app(work: Arc<Fake>) -> Router {
             modality: ModelKind::Decision,
             model: "mini".into(),
             package: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../client/src/model/package/mini-d1.gguf"),
+                .join("../client/src/model/package/mini-d1.gguf")
+                .into(),
             max_tokens: 128,
         })],
         work,

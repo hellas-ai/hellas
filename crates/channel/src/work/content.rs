@@ -1,5 +1,5 @@
 use super::*;
-use futures::{Stream, StreamExt};
+use futures::StreamExt;
 use hellas_rpc::{call::ResponseStream, pb::content as pb, services::content::ContentHandler};
 use hellas_store::content::{
     ContentService, ContentStore, Error, LocalStore, RemoteStore, Scope, ScopeKind, VerifiedReader,
@@ -14,26 +14,7 @@ pub(super) fn content_refusal(error: Error) -> Refusal {
     };
     Refusal::new(code, error.to_string())
 }
-fn status(error: impl std::fmt::Display) -> WireStatus {
-    WireStatus::new(hellas_wire::WireCode::PermissionDenied, error.to_string())
-}
-fn object(reference: &pb::ContentRef) -> Result<ContentRef, WireStatus> {
-    Ok(ContentRef::new(
-        ContentId::from_slice(&reference.id).map_err(status)?,
-        reference.bytes,
-    ))
-}
-
-fn current_scope(shared: &std::sync::Mutex<Scope>) -> Result<Scope, WireStatus> {
-    shared
-        .lock()
-        .map(|scope| scope.clone())
-        .map_err(|_| status(Error::Denied))
-}
-fn set_scope(shared: &std::sync::Mutex<Scope>, scope: Scope) -> Result<(), WireStatus> {
-    *shared.lock().map_err(|_| status(Error::Denied))? = scope;
-    Ok(())
-}
+use crate::content::upload_status as status;
 // The existing carrier callback checks paid rights under the endpoint writer,
 // releasing that writer on Pending. Scope's effect binding is still called only by Core.
 struct ContentWrite {
@@ -145,7 +126,7 @@ impl ClientEndpoint {
         let (policy, facts) =
             crate::job::job_facts(self.state().channel(), authorization, prepared)?;
         let manifest = prepared.manifest();
-        let root = if policy.content_closure(manifest, &[]).is_ok() {
+        let root = if manifest.model().is_none() {
             bytes::Bytes::new()
         } else {
             crate::content::root(&source.0, &source.1, manifest.root()).await?
@@ -236,7 +217,7 @@ where
         prepared.application_policy.as_bytes(),
     )
     .map_err(PaidWorkError::from)?;
-    let root = if policy.content_closure(manifest, &[]).is_ok() {
+    let root = if manifest.model().is_none() {
         None
     } else {
         Some(crate::content::root(&source.0, &source.1, manifest.root()).await?)
@@ -517,37 +498,34 @@ impl WorkService {
 
     pub async fn upload_stream(
         &self,
-        mut requests: std::pin::Pin<
-            Box<dyn Stream<Item = Result<pb::UploadRequest, WireStatus>> + Send>,
-        >,
+        requests: hellas_store::content::UploadRequests,
         context: TransportContext,
         connection: admission::Cancellation,
     ) -> Result<ResponseStream<pb::UploadResponse>, WireStatus> {
-        let first = requests
-            .next()
-            .await
-            .ok_or_else(|| status(Error::Invalid("missing Work opening")))??;
-        let Some(pb::upload_request::Part::Open(open)) = &first.part else {
-            return Err(status(Error::Invalid("missing Work opening")));
-        };
-        let opening = open
-            .work
-            .as_ref()
-            .ok_or_else(|| status(Error::Denied))?
-            .clone();
-        let request =
-            AcceptWorkRequest::decode(opening.signed_opening.as_slice()).map_err(status)?;
-        let exporter = context.open_exporter.ok_or_else(|| status(Error::Denied))?;
+        self.upload_opened(
+            crate::content::WorkUpload::read(requests, &context).await?,
+            context,
+            connection,
+        )
+        .await
+    }
+
+    pub async fn upload_opened(
+        &self,
+        upload: crate::content::WorkUpload,
+        context: TransportContext,
+        connection: admission::Cancellation,
+    ) -> Result<ResponseStream<pb::UploadResponse>, WireStatus> {
+        let (opening, request, exporter, requests) = upload.into_parts();
         let mut endpoint = self
             .endpoint
             .lock_owned()
             .await
             .map_err(|_| status(Error::Denied))?;
         let host = self.clone();
-        let open = open.clone();
         // Admission and map insertion outlive a cancelled RPC together; dropping
         // the detached result then runs cleanup for the actual completed scope.
-        let (authorization, manifest, policy, facts, root, store, scope, fresh, cleanup) =
+        let (authorization, manifest, policy, facts, store, scope, fresh, cleanup) =
             tokio::spawn(async move {
                 let (authorization, _, work) = endpoint
                     .authenticate_proposal(&request)
@@ -581,12 +559,6 @@ impl WorkService {
                     return Err(status(Error::Denied));
                 }
                 let first_object = root.unwrap_or(authorization.input_content);
-                if open.pin.is_some()
-                    || object(open.object.as_ref().ok_or_else(|| status(Error::Denied))?)?
-                        != first_object
-                {
-                    return Err(status(Error::Denied));
-                }
                 if endpoint
                     .state()
                     .job_by_id(work)
@@ -634,7 +606,6 @@ impl WorkService {
                     manifest,
                     policy,
                     facts,
-                    root,
                     store,
                     scope,
                     fresh,
@@ -643,14 +614,13 @@ impl WorkService {
             })
             .await
             .map_err(|_| status(Error::Denied))??;
-        let id = match scope.kind {
-            ScopeKind::Work { job, .. } => job.id,
-            _ => unreachable!(),
+        let ScopeKind::Work {
+            job, reservation, ..
+        } = scope.kind
+        else {
+            unreachable!()
         };
-        let reservation = match &scope.kind {
-            ScopeKind::Work { reservation, .. } => *reservation,
-            _ => unreachable!(),
-        };
+        let id = job.id;
         let scope = self.bound_content_scope(scope, authorization, Some(connection.clone()));
         if fresh {
             let monitor = scope.clone();
@@ -668,14 +638,7 @@ impl WorkService {
         ));
         let service =
             ContentService::new(Arc::new(store), scope).with_write_authority(writer.clone());
-        let shared = service.scope.clone();
-        let requests = requests.map(|request| request.and_then(|request| {
-            if matches!(&request.part, Some(pb::upload_request::Part::Open(open)) if open.work.is_some()) {
-                Err(status(Error::Invalid("duplicate Work opening")))
-            } else { Ok(request) }
-        }));
-        let incoming = futures::stream::once(async move { Ok(first) }).chain(requests);
-        let mut replies = service.upload(Box::pin(incoming), context).await?;
+        let mut replies = service.upload(requests, context).await?;
         let host = self.clone();
         Ok(ResponseStream::new(async_stream::try_stream! {
             let mut cleanup = cleanup;
@@ -683,22 +646,13 @@ impl WorkService {
             while let Some(reply) = replies.next().await {
                 let reply = reply?;
                 if !widened && reply.complete {
-                    let (closure, local, bound) = {
-                        let endpoint = host.endpoint().await.map_err(status)?;
-                        endpoint.check_upload_authority(&authorization).map_err(status)?;
-                        let root_bytes = match root { Some(root) => endpoint.close.store.read_content(id, root).await.map_err(status)?, None => bytes::Bytes::new() };
-                        let closure = crate::job::content_closure(&policy, &manifest, &root_bytes, authorization.input_content).map_err(status)?;
-                        let (local, _) = endpoint.close.store.invocation_content(id).map_err(status)?;
-                        let bound = current_scope(&shared)?;
-                        (closure,local,bound)
-                    };
-                    local.acquire_missing(&bound,closure.clone()).await.map_err(status)?;
+                    let closure = crate::content::stage_work(&service, &policy, &manifest, authorization.input_content).await?;
                     let mut endpoint = host.endpoint().await.map_err(status)?;
                     endpoint.check_upload_authority(&authorization).map_err(status)?;
                     if !endpoint.close.store.has_content_scope(id,reservation) {Err(status(Error::Denied))?;}
                     let (_, scope) = endpoint.close.store.widen_content(id, closure, policy.limits.max_upload_bytes).await.map_err(status)?;
                     if authorization.retention == hellas_rpc::Retention::Retain { endpoint.close.store.reserve_retained(id, facts.max_spool_bytes).await.map_err(status)?; }
-                    set_scope(&shared, host.bound_content_scope(scope, authorization, Some(connection.clone())))?;
+                    service.replace_scope(host.bound_content_scope(scope, authorization, Some(connection.clone())))?;
                     widened = true;
                 }
                 yield reply;
@@ -706,8 +660,7 @@ impl WorkService {
             {
                 let mut endpoint = host.endpoint().await.map_err(status)?;
                 let (local, scope) = endpoint.close.store.invocation_content(id).map_err(status)?;
-                let ScopeKind::Work { closure, .. } = &scope.kind else { Err(status(Error::Denied))?; unreachable!() };
-                if !local.missing_refs(&scope, closure.clone()).await.map_err(status)?.is_empty() { Err(status(Error::Missing))?; }
+                local.require_complete(&scope, None).await.map_err(status)?;
                 if !endpoint.close.store.has_content_scope(id, reservation) { Err(status(Error::Denied))?; }
                 endpoint.close.store.contents.get_mut(&id).and_then(|content|content.2.as_mut()).ok_or_else(||status(Error::Denied))?.1 = false;
             }

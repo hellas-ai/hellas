@@ -583,6 +583,7 @@ fn apple_offer_pin_verifies_static_root_policy_then_open_and_result() {
     let client = hellas_channel::test_support::principal(1).0;
     let producer = ProducerSigningKey::from_secret_bytes([2; 32]).unwrap();
     let policy = GrantPolicy {
+        backend_evaluator: None,
         config_change: Default::default(),
         resource: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test resource")),
         account: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),

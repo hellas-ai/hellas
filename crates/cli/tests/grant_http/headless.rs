@@ -7,7 +7,7 @@ async fn headless_gateway_hands_its_bearer_to_an_authenticated_client() {
     let cli = Cli::new(root.path(), "headless", ROOT_PASSKEY);
     let key = root.path().join("upstream.key");
     let bearer = root.path().join("bearer");
-    std::fs::write(&key, "upstream-secret").unwrap();
+    hellas_private::write_secret_file(&key, ".key", b"upstream-secret").unwrap();
     // Replacing an existing public file must still publish a private one.
     std::fs::write(&bearer, "old").unwrap();
     std::fs::set_permissions(&bearer, std::fs::Permissions::from_mode(0o644)).unwrap();

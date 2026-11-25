@@ -78,6 +78,7 @@ fn every_invocation_binding_is_checked_for_both_funding_forms() {
         wrong_manifest.manifest = hellas_rpc::ProgramManifest::new(
             input.manifest().application().clone(),
             ContentId::hash(b"other root"),
+            None,
         )
         .canonical_bytes();
         assert!(check(&wrong_manifest, &prepared).is_err());
@@ -116,6 +117,26 @@ fn every_invocation_binding_is_checked_for_both_funding_forms() {
             );
         }
     }
+}
+#[test]
+fn fetch_opening_carries_only_the_prepared_input() {
+    let input = fixture::fetch_bundle(1);
+    let binding = JobInputBinding {
+        environment_commitment: input.manifest().content_id(),
+        ..(&fixture::authorization()).into()
+    };
+    let reference = hellas_rpc::protocol::content::encode_reference(binding.input_content);
+    let mut opening = hellas_rpc::pb::content::WorkOpening {
+        manifest: input.manifest().canonical_bytes(),
+        ..Default::default()
+    };
+    let policy = fixture::fetch_policy();
+    assert!(check_content_opening(binding, &policy, &opening, &reference).is_ok());
+    opening.root = Some(hellas_rpc::pb::content::ContentRef {
+        id: input.manifest().root().as_bytes().to_vec(),
+        bytes: 1,
+    });
+    assert!(check_content_opening(binding, &policy, &opening, &reference).is_err());
 }
 #[test]
 fn fresh_authorizations_cannot_admit_another_provider_or_owner_policy() {
@@ -320,6 +341,7 @@ fn every_prepared_invocation_and_policy_field_is_bound_for_paid_and_grant_inputs
                 let manifest = hellas_rpc::ProgramManifest::new(
                     old.application().clone(),
                     ContentId::hash(b"another root"),
+                    None,
                 );
                 p.request.execution_environment = manifest.content_id();
                 *p = PreparedInvocation::new(
@@ -336,6 +358,7 @@ fn every_prepared_invocation_and_policy_field_is_bound_for_paid_and_grant_inputs
                     hellas_rpc::Application::new("other/evaluator", old.application().adaptor())
                         .unwrap(),
                     old.root(),
+                    None,
                 );
                 p.request.execution_environment = manifest.content_id();
                 *p = PreparedInvocation::new(
@@ -371,10 +394,7 @@ fn every_prepared_invocation_and_policy_field_is_bound_for_paid_and_grant_inputs
             policies.push(serde_json::from_value::<InvocationPolicy>(value).unwrap());
         }
         let mut other = policy.clone();
-        other.admissions = vec![Admission::Compute {
-            evaluator: "other/evaluator".into(),
-            programs: hellas_rpc::protocol::invocation::ComputePrograms::Any {},
-        }];
+        other.admissions = vec![Admission::evaluator("other/evaluator".into())];
         policies.push(other);
         for changed in policies {
             assert_ne!(

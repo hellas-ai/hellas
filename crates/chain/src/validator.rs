@@ -361,7 +361,7 @@ fn generate_network(args: GenerateNetworkArgs) -> Result<(), ValidatorError> {
     std::fs::write(output_dir.join("genesis.json"), genesis_json)?;
     if let Some(treasury_key) = treasury_key {
         let path = output_dir.join("treasury.key");
-        hellas_private::write_atomically(&path, ".tmp", &treasury_key)?;
+        hellas_private::write_secret_file(&path, ".tmp", &treasury_key)?;
     }
 
     for (index, my_key) in keys.iter().enumerate() {
@@ -399,7 +399,7 @@ fn generate_network(args: GenerateNetworkArgs) -> Result<(), ValidatorError> {
         };
         let rendered = toml::to_string_pretty(&config)?;
         let path = output_dir.join(format!("validator-{index}.toml"));
-        hellas_private::write_atomically(&path, ".tmp", rendered.as_bytes())?;
+        hellas_private::write_secret_file(&path, ".tmp", rendered.as_bytes())?;
     }
 
     println!("{}", output_dir.join("genesis.json").display());

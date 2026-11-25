@@ -137,43 +137,34 @@ impl Buffer {
         mut source: impl Read,
         sha: Option<[u8; 32]>,
         scratch: &Reservations,
-    ) -> Result<()> {
+    ) -> Result<Vec<Chunk>> {
         use sha2::{Digest, Sha256};
-        let mut hash = Sha256::new();
-        match self.body.as_mut().unwrap() {
-            Body::Ram(bytes) => {
-                bytes.resize(self.limit as usize, 0);
-                while self.len < self.limit {
-                    let end = (self.len as usize + hellas_xet::MAX_CHUNK_SIZE).min(bytes.len());
-                    let count = source.read(&mut bytes[self.len as usize..end])?;
-                    if count == 0 {
-                        return Err(Error::Invalid("source shorter than declared bytes"));
-                    }
-                    hash.update(&bytes[self.len as usize..self.len as usize + count]);
-                    self.len += count as u64;
-                }
+        if let Body::Ram(bytes) = self.body.as_mut().unwrap() {
+            bytes.resize(self.limit as usize, 0);
+            for chunk in bytes.chunks_mut(hellas_xet::MAX_CHUNK_SIZE) {
+                source
+                    .read_exact(chunk)
+                    .map_err(|error| match error.kind() {
+                        std::io::ErrorKind::UnexpectedEof => {
+                            Error::Invalid("source shorter than declared bytes")
+                        }
+                        _ => Error::Io(error),
+                    })?;
             }
-            Body::File(_, _) => {
-                let _scratch = scratch.reserve(hellas_xet::MAX_CHUNK_SIZE as u64)?;
-                let mut bytes = vec![0; hellas_xet::MAX_CHUNK_SIZE];
-                while self.len < self.limit {
-                    let wanted = (self.limit - self.len).min(bytes.len() as u64) as usize;
-                    let count = source.read(&mut bytes[..wanted])?;
-                    if count == 0 {
-                        return Err(Error::Invalid("source shorter than declared bytes"));
-                    }
-                    hash.update(&bytes[..count]);
-                    self.write_all(&bytes[..count])?;
-                }
+            if source.read(&mut [0])? != 0
+                || sha.is_some_and(|expected| Sha256::digest(&*bytes).as_slice() != expected)
+            {
+                return Err(Error::Invalid("source length or SHA-256"));
             }
+            self.len = self.limit;
+            return Ok(hellas_xet::chunk(bytes));
         }
-        let mut sentinel = [0];
-        if source.read(&mut sentinel)? != 0
-            || sha.is_some_and(|expected| hash.finalize().as_slice() != expected)
-        {
-            return Err(Error::Invalid("source length or SHA-256"));
-        }
-        Ok(())
+        // Hash the transport bytes as they reach the private staging file.
+        let _scratch = scratch.reserve(crate::STREAM_BUFFER as u64)?;
+        let indexed =
+            crate::index_stream(&mut source, self.limit, sha, |chunk| self.write_all(chunk))?
+                .ok_or(Error::Invalid("source length or SHA-256"))?;
+        Ok(indexed.chunks)
     }
     pub fn canonical(&mut self) -> Result<Vec<Chunk>> {
         if self.len != self.limit {

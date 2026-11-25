@@ -36,6 +36,18 @@ impl RemoteSession {
             finished: false,
         })
     }
+    async fn progress(&mut self, missing: &'static str) -> Result<pb::UploadResponse> {
+        let call = self.call.as_mut().ok_or(Error::Missing)?;
+        if let Some(response) = call.next().await {
+            return response.map_err(w::error);
+        }
+        self.call
+            .take()
+            .ok_or(Error::Missing)?
+            .finish()
+            .map_err(w::error)?;
+        Err(Error::Invalid(missing))
+    }
     async fn finish_object(&mut self) -> Result<()> {
         if !self.work {
             self.close().await?;
@@ -76,11 +88,7 @@ impl RemoteSession {
         })
         .await
         .map_err(w::error)?;
-        let progress = call
-            .next()
-            .await
-            .ok_or(Error::Invalid("missing upload progress"))?
-            .map_err(w::error)?;
+        let progress = self.progress("missing upload progress").await?;
         if progress.next_chunk != 0 || progress.complete != verified {
             return Err(Error::Invalid("upload declaration progress"));
         }
@@ -96,11 +104,7 @@ impl RemoteSession {
         })
         .await
         .map_err(w::error)?;
-        let progress = call
-            .next()
-            .await
-            .ok_or(Error::Invalid("missing upload progress"))?
-            .map_err(w::error)?;
+        let progress = self.progress("missing upload progress").await?;
         if progress.next_chunk != next as u64 || progress.complete != complete {
             return Err(Error::Invalid("upload payload progress"));
         }
@@ -123,9 +127,16 @@ impl Drop for RemoteSession {
     }
 }
 
+struct VerifiedManifest {
+    object: ContentRef,
+    chunks: Vec<Chunk>,
+    _charges: Vec<Arc<super::reservation::Reservation>>,
+}
+
 /// Calls use the already-authenticated connection, never self-asserted scopes.
 pub struct RemoteStore<T> {
     client: ContentClientImpl<T>,
+    last_manifest: Option<tokio::sync::Mutex<Option<Arc<VerifiedManifest>>>>,
     pool: Reservations,
     opening: Option<pb::WorkOpening>,
     upload: Arc<std::sync::Mutex<UploadState>>,
@@ -139,6 +150,7 @@ where
     pub fn new(transport: T, pool: Reservations) -> Self {
         Self {
             client: ContentClientImpl::new(transport),
+            last_manifest: None,
             pool,
             opening: None,
             upload: Arc::new(std::sync::Mutex::new(UploadState {
@@ -146,6 +158,12 @@ where
                 active: false,
             })),
         }
+    }
+    /// Retain one verified chunk list while a caller reads ranges of the same object.
+    /// Each read still resolves the path and checks the server's response.
+    pub fn reuse_read_manifest(mut self) -> Self {
+        self.last_manifest = Some(tokio::sync::Mutex::new(None));
+        self
     }
     pub fn with_opening(mut self, opening: pb::WorkOpening) -> Self {
         self.opening = Some(opening);
@@ -179,21 +197,24 @@ where
     T::Error: std::error::Error + Send + Sync + 'static,
     T::Stream: 'static,
 {
-    async fn manifest(
-        &self,
-        scope: &Scope,
-        at: &Path,
-    ) -> Result<(
-        ContentRef,
-        Vec<Chunk>,
-        Vec<Arc<super::reservation::Reservation>>,
-    )> {
+    async fn manifest(&self, scope: &Scope, at: &Path) -> Result<Arc<VerifiedManifest>> {
         let object = self
             .stat(scope, at)
             .await?
             .ok_or(Error::Missing)?
             .target
             .object();
+        let mut cache = match &self.last_manifest {
+            Some(cache) => Some(cache.lock().await),
+            None => None,
+        };
+        if let Some(slot) = cache.as_deref_mut() {
+            if let Some(hit) = slot.as_ref().filter(|manifest| manifest.object == object) {
+                return Ok(hit.clone());
+            }
+            // Release the previous object's reservation before loading its replacement.
+            *slot = None;
+        }
         let mut chunks = Vec::new();
         let mut charges = Vec::new();
         let mut cursor = Cursor {
@@ -240,7 +261,15 @@ where
             }
         }
         super::upload::verify_list(object, &chunks)?;
-        Ok((object, chunks, charges))
+        let manifest = Arc::new(VerifiedManifest {
+            object,
+            chunks,
+            _charges: charges,
+        });
+        if let Some(mut slot) = cache {
+            *slot = Some(manifest.clone());
+        }
+        Ok(manifest)
     }
 }
 #[async_trait::async_trait]
@@ -302,16 +331,26 @@ where
         at: &Path,
         range: std::ops::Range<u64>,
     ) -> Result<ByteStream> {
-        let (object, chunks, charges) = self.manifest(scope, at).await?;
+        let manifest = self.manifest(scope, at).await?;
+        let object = manifest.object;
         if range.start > range.end || range.end > object.bytes() {
             return Err(Error::Invalid("read range"));
         }
         let mut offset = 0u64;
-        let mut selected = Vec::new();
-        for chunk in chunks {
+        let mut selected = 0..0;
+        let mut aligned = range.clone();
+        for (index, chunk) in manifest.chunks.iter().enumerate() {
+            if offset >= range.end {
+                break;
+            }
             let end = offset + chunk.data_len;
-            if !range.is_empty() && offset < range.end && end > range.start {
-                selected.push((offset, chunk));
+            if !range.is_empty() && end > range.start {
+                if selected.is_empty() {
+                    selected.start = index;
+                    aligned.start = offset;
+                }
+                selected.end = index + 1;
+                aligned.end = end;
             }
             offset = end;
         }
@@ -319,16 +358,15 @@ where
             .client
             .read(pb::ReadRequest {
                 at: Some(w::path(at)),
-                start: selected.first().map_or(range.start, |(offset, _)| *offset),
-                end: selected
-                    .last()
-                    .map_or(range.end, |(offset, chunk)| offset + chunk.data_len),
+                start: aligned.start,
+                end: aligned.end,
                 expect: Some(super::page::wire_ref(object)),
             })
             .await
             .map_err(w::error)?;
         let stream = async_stream::try_stream! {
-            let _charges = charges;
+            let selected = &manifest.chunks[selected];
+            let mut offset = aligned.start;
             let mut next = 0usize; let mut reference_seen = false;
             let mut pending: Option<pb::ReadResponse> = None;
             while let Some(response) = call.next().await {
@@ -339,13 +377,14 @@ where
                     if !response.data.is_empty() || response.offset != range.start || next != 0 { Err(Error::Invalid("empty ranged response"))?; }
                     next += 1; continue;
                 }
-                let (offset, chunk) = selected.get(next).ok_or(Error::Invalid("extra read chunk"))?;
-                if response.offset != *offset || response.data.len() as u64 != chunk.data_len || hellas_xet::chunk(&response.data).as_slice() != [*chunk] { Err(Error::Invalid("read chunk verification"))?; }
+                let chunk = selected.get(next).ok_or(Error::Invalid("extra read chunk"))?;
+                if response.offset != offset || response.data.len() as u64 != chunk.data_len || hellas_xet::chunk(&response.data).as_slice() != [*chunk] { Err(Error::Invalid("read chunk verification"))?; }
                 if let Some(previous) = pending.take() {
                     let mut boundary = previous.data.clone(); boundary.push(response.data[0]);
                     if hellas_xet::chunk(&boundary).first().is_none_or(|chunk| chunk.data_len != previous.data.len() as u64) { Err(Error::Invalid("read chunk boundary"))?; }
                     yield slice(previous, &range);
                 }
+                offset += chunk.data_len;
                 next += 1; pending = Some(response);
             }
             if !reference_seen || (!range.is_empty() && next != selected.len()) || (range.is_empty() && next != 1) { Err(Error::Invalid("incomplete ranged response"))?; }
@@ -389,11 +428,7 @@ where
             })
             .await
             .map_err(w::error)?;
-        let progress = active
-            .next()
-            .await
-            .ok_or(Error::Invalid("missing upload answer"))?
-            .map_err(w::error)?;
+        let progress = remote.progress("missing upload answer").await?;
         if !progress.missing {
             if !progress.complete {
                 return Err(Error::Invalid("invalid missing answer"));

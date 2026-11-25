@@ -32,6 +32,87 @@ async fn same_home_owner_pairs_and_administers_the_daemon() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn split_worker_pairs_again_after_losing_its_keys_and_reuses_its_content() {
+    let root = tempfile::tempdir().unwrap();
+    let owner = Cli::new(root.path(), "owner", AGENT_PASSKEY);
+    let worker = Cli::new(root.path(), "worker", ROOT_PASSKEY);
+    use hellas_store::content::{
+        ContentStore as _, DiskStore, IndexMode, PinName, PinPolicy, PinTarget, Reservations, Scope,
+    };
+    let upper = worker.home.join("content");
+    let model = b"retained model asset";
+    let store = DiskStore::open(
+        hellas_private::StoreLocation::for_test(&upper),
+        vec![],
+        IndexMode::Resume,
+        None,
+        Reservations::ram(32 << 20),
+        false,
+    )
+    .await
+    .unwrap();
+    store.finish_recovery().await.unwrap();
+    let mut upload = store
+        .upload(
+            &Scope::Owner,
+            hellas_rpc::ContentRef::for_bytes(model),
+            Some(PinTarget {
+                name: PinName::new("model".into()).unwrap(),
+                policy: PinPolicy::Public,
+            }),
+        )
+        .await
+        .unwrap();
+    upload
+        .declare(&hellas_xet::chunk(model), true)
+        .await
+        .unwrap();
+    upload.accept_chunk(model).await.unwrap();
+    drop(upload);
+    store.close().await;
+    drop(store);
+    let mut previous = None;
+    for generation in ["first", "rebuilt"] {
+        let secrets = root.path().join(generation);
+        let mut process = worker.spawn(
+            &["serve", "--port", "0", "--secrets-dir", string(&secrets)],
+            &format!("{generation}.log"),
+        );
+        let invite = format!("hellas-invite:{}", process.wait_for("hellas-invite:").await);
+        let id = Invitation::decode(&invite).unwrap().node;
+        assert_ne!(previous, Some(id));
+        owner.run(&["pair", &invite, "--name", generation]).await;
+        process.wait_for("Daemon ready;").await;
+        assert!(secrets.join("identity").is_file());
+        assert!(secrets.join("provider/control.key.der").is_file());
+        assert!(secrets.join("provider/authority").is_dir());
+        assert!(!worker.home.join("identity").exists());
+        assert!(!worker.home.join("provider").exists());
+        assert!(!secrets.join("content").exists());
+        let profile = owner
+            .home
+            .join("nodes")
+            .join(generation)
+            .join("profile.json");
+        let output = root.path().join(format!("{generation}.model"));
+        owner
+            .run(&[
+                "store",
+                "--profile",
+                string(&profile),
+                "read",
+                "model",
+                "--out",
+                string(&output),
+            ])
+            .await;
+        assert_eq!(std::fs::read(output).unwrap(), model);
+        process.stop().await;
+        previous = Some(id);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn paired_owner_configures_routes_and_restart_preserves_them() {
     let occupied = std::net::TcpListener::bind("127.0.0.1:8080").unwrap();
     let root = tempfile::tempdir().unwrap();
@@ -85,7 +166,7 @@ async fn paired_owner_configures_routes_and_restart_preserves_them() {
     );
 
     let key = root.path().join("api.key");
-    std::fs::write(&key, "write-only-fixture-key").unwrap();
+    hellas_private::write_secret_file(&key, ".key", b"write-only-fixture-key").unwrap();
     owner
         .run(&[
             "backend",

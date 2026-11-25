@@ -10,7 +10,7 @@ pub struct ContentService<S> {
     pub store: Arc<S>,
     writer: Option<hellas_wire::WriteAuthority>,
     /// Shared only with the trusted host, which widens Work after root validation.
-    pub scope: Arc<Mutex<Scope>>,
+    scope: Arc<Mutex<Scope>>,
 }
 macro_rules! resolve_handler {
     ($store:ty) => {
@@ -97,13 +97,23 @@ impl<S> ContentService<S> {
             None => stream,
         }
     }
-    fn scope(&self) -> std::result::Result<Scope, WireStatus> {
+    pub fn replace_scope(&self, scope: Scope) -> std::result::Result<(), WireStatus> {
+        *self
+            .scope
+            .lock()
+            .map_err(|_| WireStatus::internal("content scope"))? = scope;
+        Ok(())
+    }
+    pub fn scope(&self) -> std::result::Result<Scope, WireStatus> {
         self.scope
             .lock()
             .map(|scope| scope.clone())
             .map_err(|_| WireStatus::internal("content scope"))
     }
 }
+pub type UploadRequests =
+    futures::stream::BoxStream<'static, std::result::Result<pb::UploadRequest, WireStatus>>;
+
 fn status(error: Error) -> WireStatus {
     let (code, message) = match error {
         Error::Locked => (
@@ -241,7 +251,7 @@ impl<S: ContentStore + 'static> ContentHandler for ContentService<S> {
                             Err(status(Error::Invalid("object already open")))?;
                         }
                         let scope = service.scope()?;
-                        if open.work.is_some() && !matches!(scope.kind, ScopeKind::Work { .. }) {
+                        if open.work.is_some() {
                             Err(status(Error::Denied))?;
                         }
                         let object = w::object(&required(open.object)?).map_err(status)?;

@@ -4298,6 +4298,7 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
         id,
         revision: hellas_auth::authority::Revision(1),
         policies: vec![GrantPolicy {
+            backend_evaluator: None,
             config_change: Default::default(),
             resource: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(
                 b"test resource",

@@ -190,15 +190,14 @@ impl AccessBundle {
         Ok(profile::publish_private(file, path, &bytes)?)
     }
 
-    /// Read a bundle file within the decode bound. A received copy usually
-    /// arrives with ordinary permissions, so they are not required here.
+    /// Read a private bundle containing the delegated credential.
     pub fn load(
         path: &Path,
         expected_subject: &PrincipalId,
         expected_holder: &NodeKey,
     ) -> Result<Self, AccessBundleError> {
-        let bytes = hellas_private::read_bounded_regular_file(path, MAX_ACCESS_BUNDLE_BYTES)
-            .map_err(|error| {
+        let bytes =
+            hellas_private::read_secret_file(path, MAX_ACCESS_BUNDLE_BYTES).map_err(|error| {
                 if error
                     .get_ref()
                     .is_some_and(|error| error.is::<hellas_private::ReadLimit>())

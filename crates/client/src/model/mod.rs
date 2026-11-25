@@ -9,41 +9,45 @@ mod native;
 #[cfg(feature = "models")]
 mod package;
 #[cfg(feature = "models")]
+mod spec;
+#[cfg(feature = "models")]
+pub use spec::ModelSpec;
+#[cfg(feature = "models")]
 mod program;
 #[cfg(feature = "models")]
 mod source;
 #[cfg(feature = "models")]
 pub use catena_lang::codegen::GpuDialect;
 
-/// Program renderers: catena-models' program assembly for each GPU target,
-/// registered under the evaluator id its programs name.
+/// Program renderers: catena-models' program assembly for each GPU runtime,
+/// registered under the runtime's evaluators, one per device architecture.
 #[cfg(feature = "models")]
-fn renderers() -> impl Iterator<Item = (String, GpuDialect)> {
-    use hellas_rpc::protocol::invocation::compute;
-    [(GpuDialect::Hip, "hip"), (GpuDialect::Cuda, "cuda")]
-        .map(|(dialect, name)| (compute::evaluator(name), dialect))
-        .into_iter()
-}
+const RENDERERS: [(GpuDialect, &str); 2] = [(GpuDialect::Hip, "hip"), (GpuDialect::Cuda, "cuda")];
 
-/// The evaluator id of programs rendered for `dialect`.
+/// The evaluator id of programs rendered for `dialect` on a device `arch`.
 #[cfg(feature = "models")]
-pub fn evaluator(dialect: GpuDialect) -> String {
-    renderers()
-        .find(|(_, d)| *d == dialect)
-        .map(|(id, _)| id)
-        .expect("every dialect renders")
+pub fn evaluator(dialect: GpuDialect, arch: &str) -> String {
+    let (_, runtime) = RENDERERS
+        .into_iter()
+        .find(|(d, _)| *d == dialect)
+        .expect("every dialect renders");
+    hellas_rpc::protocol::invocation::compute::evaluator(runtime, arch)
 }
 
 /// The renderer registered under `evaluator`.
 #[cfg(feature = "models")]
 fn renderer(evaluator: &str) -> anyhow::Result<GpuDialect> {
-    renderers()
-        .find(|(id, _)| id == evaluator)
-        .map(|(_, dialect)| dialect)
+    use hellas_rpc::protocol::invocation::compute;
+    RENDERERS
+        .into_iter()
+        .find(|(_, runtime)| compute::architecture(evaluator, runtime).is_some())
+        .map(|(dialect, _)| dialect)
         .ok_or_else(|| anyhow::anyhow!("no program renderer for evaluator {evaluator}"))
 }
 #[cfg(feature = "models")]
 pub use package::{ComputeJob, ModelKind, ModelPackage, ModelRequest, ModelResponse};
+#[cfg(feature = "models")]
+pub use source::{CatalogUnavailable, acquire_peer_model, peer_locator, publish_model};
 #[cfg(feature = "models")]
 mod qwen3;
 #[cfg(feature = "models")]
@@ -60,47 +64,48 @@ pub fn hf_uri(source: &std::path::Path) -> Option<&str> {
     source.to_str().filter(|s| s.starts_with("hf://"))
 }
 
+#[cfg(feature = "models")]
+pub fn peer_uri(source: &std::path::Path) -> Option<&str> {
+    source.to_str().filter(|s| s.starts_with("hellas://"))
+}
+
+#[cfg(feature = "models")]
+pub fn is_local(source: &std::path::Path) -> bool {
+    hf_uri(source).is_none() && peer_uri(source).is_none()
+}
+
 /// Execution sources prepared before activating a local backend.
 #[cfg(feature = "models")]
+#[derive(Default)]
 pub struct ModelFiles {
     pub local: Vec<std::path::PathBuf>,
     pub hub: Vec<hellas_store::hf::PinnedFile>,
 }
 #[cfg(feature = "models")]
-impl ModelFiles {
-    pub async fn resolve(
-        models: impl IntoIterator<Item = std::path::PathBuf>,
-    ) -> anyhow::Result<Self> {
-        Self::for_voices(models, &[]).await
-    }
-    pub async fn for_voices(
-        models: impl IntoIterator<Item = std::path::PathBuf>,
-        voices: &[String],
-    ) -> anyhow::Result<Self> {
-        let paths: Vec<_> = models.into_iter().collect();
-        let voices = voices.to_vec();
-        tokio::task::spawn_blocking(move || {
-            let mut all = Self {
-                local: Vec::new(),
-                hub: Vec::new(),
-            };
-            for path in paths {
-                let files = source::Source::open(&path)?.files(&voices)?;
-                all.local.extend(files.local);
-                all.hub.extend(files.hub);
-            }
-            Ok(all)
-        })
-        .await?
+impl ModelSpec {
+    pub async fn files(&self) -> anyhow::Result<ModelFiles> {
+        self.check_locator()?;
+        if peer_uri(&self.model).is_some() {
+            return Ok(ModelFiles::default());
+        }
+        let spec = self.clone();
+        tokio::task::spawn_blocking(move || source::Source::open(&spec)?.files()).await?
     }
 }
 
 #[cfg(feature = "models")]
 pub fn voice_allowed(voices: &[String], voice: &str) -> bool {
-    let selected = if voice == "default" {
-        catena_models::phonon::DEFAULT_VOICE
-    } else {
-        voice
-    };
-    native::selected_voices(voices).contains(selected)
+    fn name(v: &str) -> &str {
+        if v == "default" {
+            catena_models::phonon::DEFAULT_VOICE
+        } else {
+            v
+        }
+    }
+    if voices.is_empty() {
+        return name(voice) == catena_models::phonon::DEFAULT_VOICE;
+    }
+    voices
+        .iter()
+        .any(|configured| name(configured) == name(voice))
 }

@@ -108,6 +108,23 @@ impl Config {
     }
     pub async fn resolve(self, context: &ModelContext) -> Result<(Document, Option<PaidPolicy>)> {
         let mut document = self.document;
+        for route in &mut document.routes {
+            if let Presentation::Model { package, .. }
+            | Presentation::Speech {
+                target: hellas_gateway::SpeechTarget::Native { package, .. },
+                ..
+            } = &mut route.presentation
+            {
+                *package = context.revisions.pin_spec(package).await?;
+            }
+        }
+        for resource in &mut document.resources {
+            if let hellas_sdk::daemon_config::ResourceKind::Model { package, .. } =
+                &mut resource.kind
+            {
+                *package = context.revisions.pin_spec(package).await?;
+            }
+        }
         for (name, upstream) in self.upstreams {
             expand_upstream(&mut document, &name, &upstream.url, &upstream.key_file)?;
         }
@@ -132,10 +149,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn phonon_shorthand_and_toml_keep_the_same_companions_and_voices() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let model = root.path().join("english");
+        let codec = root.path().join("codec");
+        let voices = root.path().join("voices");
+        for path in [&model, &codec, &voices] {
+            std::fs::create_dir(path)?;
+        }
+        std::fs::write(model.join("tokenizer.5.0.0.json"), "{}")?;
+        let mut context = super::super::tests::model_context(root.path());
+        context.voices = vec!["Easton".into(), "Zoey".into()];
+        let shorthand = format!(
+            "{},codec={},voices={}",
+            model.display(),
+            codec.display(),
+            voices.display()
+        );
+        let (flags, _) = Config::gateway(vec![shorthand], vec![], None, true)?
+            .resolve(&context)
+            .await?;
+        let config = format!(
+            r#"
+            [listeners.api]
+            kind = "http"
+            bind = "127.0.0.1:8080"
+            [backends.local]
+            kind = "local"
+            max_in_flight = 8
+            [[routes]]
+            kind = "speech"
+            backends = ["local"]
+            model = "english"
+            [routes.target]
+            kind = "native"
+            package = {{ model = "{}", codec = "{}", voices = "{}" }}
+            voices = ["Easton", "Zoey"]
+        "#,
+            model.canonicalize().unwrap().display(),
+            codec.canonicalize().unwrap().display(),
+            voices.canonicalize().unwrap().display()
+        );
+        let (toml, _) = Config::parse(&config)?.resolve(&context).await?;
+        assert!(toml == flags);
+        assert_eq!(
+            toml.routes[0].model_package().unwrap().1,
+            &ModelSpec {
+                model: model.canonicalize()?,
+                codec: Some(codec.canonicalize()?),
+                voices: Some(voices.canonicalize()?)
+            }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn compilation_preserves_selection_and_matches_foreground_defaults() {
         let root = tempfile::tempdir().unwrap();
         let key = root.path().join("key");
-        std::fs::write(&key, "runtime-secret").unwrap();
+        hellas_private::write_secret_file(&key, ".key", b"runtime-secret").unwrap();
         let context = super::super::tests::model_context(root.path());
         let shorthand = format!("remote=https://example.com/v1,key-file={}", key.display());
         let flags = Config::gateway(

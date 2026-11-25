@@ -21,9 +21,10 @@ pub(crate) struct LocalArgs {
 #[cfg(feature = "compute")]
 #[derive(Args, Debug)]
 pub(crate) struct GpuArgs {
-    /// Registered local evaluator id; omitted selects the native executor.
-    #[arg(long = "evaluator", value_parser = hellas_executor::catena::registered_evaluator)]
-    pub(crate) evaluator: Option<hellas_executor::GpuDialect>,
+    /// Evaluator id a local GPU runtime registers; omitted selects the native
+    /// runtime.
+    #[arg(long = "evaluator")]
+    pub(crate) evaluator: Option<String>,
     /// Maximum programs retained in a GPU worker session.
     #[arg(long = "gpu-session-programs", default_value_t = hellas_executor::DEFAULT_GPU_SESSION_PROGRAMS, value_parser = crate::parsers::parse_positive_usize)]
     pub(crate) gpu_session_programs: usize,
@@ -33,22 +34,35 @@ pub(crate) struct GpuArgs {
 }
 
 #[cfg(feature = "compute")]
+impl GpuArgs {
+    pub(crate) fn config(&self) -> CliResult<hellas_executor::GpuConfig> {
+        Ok(hellas_executor::GpuConfig {
+            gpu: hellas_executor::catena::Gpu::select(self.evaluator.as_deref())
+                .map_err(anyhow::Error::msg)?,
+            session_programs: self.gpu_session_programs,
+            session_asset_bytes: self.gpu_session_asset_bytes,
+        })
+    }
+}
+
+#[cfg(feature = "compute")]
 pub(crate) async fn content(
     home: &hellas_private::StoreLocation,
     native: &LocalArgs,
     local: &[PathBuf],
     hub: &[hellas_store::hf::PinnedFile],
 ) -> CliResult<hellas_store::content::DiskStore> {
-    let mut configuration =
-        crate::content_configuration::ContentConfiguration::load(native.content_config.clone())?
-            .with_default_upper(home.join("provider/content"));
+    let mut configuration = crate::content_configuration::load(native.content_config.clone())?;
+    configuration
+        .upper
+        .get_or_insert_with(|| home.join("provider/content"));
     let paths = native
         .content
         .iter()
         .chain(local)
         .map(std::path::absolute)
         .collect::<std::io::Result<Vec<_>>>()?;
-    let mut initial = configuration.config().clone();
+    let mut initial = configuration.clone();
     initial.lower.extend(paths.iter().cloned());
     let content = initial
         .open(
@@ -61,8 +75,10 @@ pub(crate) async fn content(
         .await?;
     let prepared: CliResult<()> = async {
         content.finish_recovery().await?;
-        configuration.add_content(&content, paths).await?;
-        configuration.apply(&content).await?;
+        crate::content_configuration::add_content(&mut configuration, &content, paths).await?;
+        hellas_store::content::config::Reconciler::new(configuration.clone())?
+            .apply(&content, configuration)
+            .await?;
         for file in hub {
             file.acquire(&content).await?;
         }

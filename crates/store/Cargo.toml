@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 documentation.workspace = true
 
+[features]
+test-support = []
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
@@ -23,6 +26,7 @@ hellas-wire = { workspace = true, features = ["mux", "iroh"] }
 hellas-xet = { workspace = true, features = ["chunking"] }
 iroh = { workspace = true, features = ["tls-ring"] }
 lz4_flex = { version = "0.14", default-features = false, features = ["frame"] }
+percent-encoding = "2"
 prost = { version = "0.14", default-features = false, features = ["derive"] }
 serde.workspace = true
 serde_ipld_dagcbor.workspace = true

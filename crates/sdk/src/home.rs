@@ -58,16 +58,13 @@ impl Home {
         })
     }
 
-    /// Model preparation can open local content before execution has a backend.
-    pub async fn model_command(
+    /// Release command-owned endpoints and local content on every return path.
+    pub async fn command(
         &self,
         work: impl std::future::Future<Output = anyhow::Result<()>>,
     ) -> anyhow::Result<()> {
         let result = work.await;
-        #[cfg(feature = "compute")]
-        if let Some(content) = self.local_content.get() {
-            content.close().await;
-        }
+        self.close().await;
         result
     }
 
@@ -217,6 +214,11 @@ impl Home {
         ))?)
     }
     pub async fn close(&self) {
+        #[cfg(feature = "compute")]
+        if let Some(content) = self.local_content.get() {
+            content.close().await;
+        }
+
         for endpoint in [self.paid_endpoint.get(), self.grant_endpoint.get()]
             .into_iter()
             .flatten()

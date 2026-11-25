@@ -580,7 +580,7 @@ async fn https_policy_conversion_keeps_models_and_refuses_colliding_local_paths(
     ];
     template.model_policy = None;
     let result = hellas_gateway::router::router(
-        grant_routes(&policy, "test").unwrap(),
+        grant_routes(&policy, "test", None).unwrap(),
         fixture.gateway.clone(),
         fixture.gateway.jobs.clone(),
         Default::default(),
@@ -956,9 +956,9 @@ async fn remote_jobs_end_before_the_session_that_delivers_them() {
         panic!("one finished job")
     };
     let a = terminal.outcome.authorization;
-    // Signed 30 s before its acceptance deadline; one 5 s idle period is kept
-    // for the terminal state before the 15 min session ends.
-    let span = a.terminal_deadline_ms.0 - (a.acceptance_deadline_ms.0 - 30_000);
+    // The five-second control timeout bounds admission, and one further
+    // control timeout is kept for delivery before the session ends.
+    let span = a.terminal_deadline_ms.0 - (a.acceptance_deadline_ms.0 - 5_000);
     let carried = hellas_auth::authority::MAX_SESSION_LIFETIME_MS - 5_000;
     assert!(
         span <= carried && span > carried - 1_000,
@@ -1494,7 +1494,7 @@ fn routes(backend: &super::Backend, id: &str) -> Vec<hellas_gateway::Route> {
     let BackendState::Grant(grant) = &backend.state else {
         panic!("expected grant backend")
     };
-    grant_routes(&grant.policy, id).unwrap()
+    grant_routes(&grant.policy, id, None).unwrap()
 }
 
 #[tokio::test]

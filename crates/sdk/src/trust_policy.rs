@@ -135,9 +135,6 @@ impl TrustPolicyStore {
     pub fn load(&self, id: &str) -> io::Result<ApprovalRecord> {
         let path = self.path(id, ".json")?;
         let file = hellas_private::open_regular_file_nofollow(&path)?;
-        if !hellas_private::is_private(&file)? {
-            return Err(invalid("trust approval must be a private file"));
-        }
         let bytes = hellas_private::read_bounded(file, MAX_FILE)?;
         let record: ApprovalRecord = serde_json::from_slice(&bytes)?;
         record.check(id)?;
@@ -189,9 +186,6 @@ impl TrustPolicyStore {
         hellas_private::create_dir_all_durable(&self.directory)?;
         hellas_private::restrict_directory(&self.directory)?;
         let lock = hellas_private::open_lock_beside(&self.path(id, "")?)?;
-        if !hellas_private::is_private(&lock)? {
-            return Err(invalid("trust lock must be private"));
-        }
         lock.lock()?;
         let previous = match self.load(id) {
             Ok(record) => Some(record),

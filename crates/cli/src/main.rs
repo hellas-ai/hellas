@@ -11,6 +11,7 @@ mod content_configuration;
 mod wrap;
 
 mod commands;
+mod hub;
 mod identity;
 #[cfg(unix)]
 mod machines;
@@ -112,11 +113,8 @@ enum Commands {
     Admin(commands::admin::AdminArgs),
     /// Run the stateful daemon, with live edits or declarative desired state.
     Serve {
-        /// Reconcile a TOML daemon configuration and optional owner-approved paid terms.
-        #[arg(long = "config", conflicts_with = "port")]
-        config_file: Option<std::path::PathBuf>,
-        #[arg(long)]
-        port: Option<u16>,
+        #[command(flatten)]
+        args: commands::daemon::ServeArgs,
         #[cfg(feature = "otel")]
         #[arg(long)]
         metrics_port: Option<u16>,
@@ -134,6 +132,12 @@ enum Commands {
         #[cfg(feature = "otel")]
         #[arg(long, default_value = "127.0.0.1")]
         metrics_addr: std::net::IpAddr,
+    },
+    /// Replace a paired node's daemon configuration from a TOML file.
+    Configure {
+        #[command(flatten)]
+        control: commands::daemon::ControlArgs,
+        config: PathBuf,
     },
     Backend {
         #[command(flatten)]
@@ -159,33 +163,26 @@ enum Commands {
         #[arg(long = "address", value_delimiter = ',')]
         node_addrs: Vec<SocketAddr>,
     },
-    /// Execute a reusable job folder, or settle its provider channels.
-    Transact(commands::transact::TransactArgs),
-    /// Buy an HTTPS Fetch using the same job and payment path.
-    Fetch(commands::transact::FetchArgs),
-    /// Buy one call of a Catena program using the same job and payment path.
-    Run(commands::transact::RunArgs),
-    /// Print the program manifests for a local model or pinned hf:// checkpoint.
+    #[command(flatten)]
+    Job(commands::transact::JobCommand),
+    /// Print the program manifests or content-addressed model reference.
     Program {
-        /// Named voice whose exact speech program the provider admits.
+        /// Print the evaluator-independent hellas:// model reference.
         #[arg(long)]
-        voice: Vec<String>,
+        model_id: bool,
+        #[command(flatten)]
+        companions: hub::Companions,
         #[arg(value_name = "MODEL")]
         model: PathBuf,
         /// The registered renderer (evaluator id) the program is compiled for.
-        #[arg(long, value_name = "EVALUATOR")]
-        backend: String,
+        #[arg(
+            long,
+            value_name = "EVALUATOR",
+            required_unless_present = "model_id",
+            conflicts_with = "model_id"
+        )]
+        backend: Option<String>,
     },
-    /// Synthesize a WAV with a client-rendered speech job.
-    Speak(commands::transact::SpeakArgs),
-    /// Transcribe one WAV with a client-rendered Whisper job.
-    Transcribe(commands::transact::TranscribeArgs),
-    /// Answer one prompt with a client-rendered Qwen text job.
-    Text(commands::transact::TextArgs),
-    /// Answer one decision request with a client-rendered d1 job.
-    Decide(commands::transact::DecideArgs),
-    /// Generate one PNG with a client-rendered Flux job.
-    Image(commands::transact::ImageArgs),
     /// Inspect and manage node content with Owner authority.
     Store(commands::store::StoreArgs),
     /// Get devnet coins for this principal from a public faucet account.
@@ -257,7 +254,6 @@ async fn async_main() {
             std::process::exit(2);
         }
     };
-    let identity_path = home.join("identity");
     let selected_chain = if let Some(path) = &cli.chain_config {
         hellas_sdk::work_config::load_chain_profile(path).map_err(anyhow::Error::from)
     } else if let Some(name) = &cli.chain {
@@ -306,27 +302,44 @@ async fn async_main() {
         #[cfg(feature = "otel")]
         metrics.as_ref().map(|(_, bundle)| &bundle.registry),
     );
-    if let Commands::Trust(args) = cli.command {
-        let result = commands::trust::run(args);
-        tracer_provider.shutdown();
-        if let Err(error) = result {
-            eprintln!("error: {error:#}");
-            std::process::exit(1);
-        }
-        return;
+    let result = dispatch(
+        cli,
+        home,
+        selected_chain,
+        #[cfg(feature = "otel")]
+        metrics,
+    )
+    .await;
+    tracer_provider.shutdown();
+
+    if let Err(err) = result {
+        eprintln!("error: {err:#}");
+        std::process::exit(1);
     }
-    let owner = match cli.owner.load(&home).and_then(|owner| match owner {
+}
+
+async fn dispatch(
+    cli: Cli,
+    home: StoreLocation,
+    selected_chain: hellas_chain::genesis::ChainProfile,
+    #[cfg(feature = "otel")] metrics: Option<(SocketAddr, metrics::MetricsBundle)>,
+) -> anyhow::Result<()> {
+    if let Commands::Trust(args) = cli.command {
+        return commands::trust::run(args);
+    }
+    let content_dir = home.child("content");
+    let home = match &cli.command {
+        Commands::Serve { args, .. } if let Some(dir) = &args.secrets_dir => {
+            StoreLocation::from_home(&std::path::absolute(dir)?, home.durability())
+        }
+        _ => home,
+    };
+    let owner = cli.owner.load(&home).and_then(|owner| match owner {
         None if acts_for_principal(&cli.command) => {
             hellas_sdk::identity::principal(&home).map(Some)
         }
         owner => Ok(owner),
-    }) {
-        Ok(owner) => owner,
-        Err(error) => {
-            eprintln!("error: {error:#}");
-            std::process::exit(1);
-        }
-    };
+    })?;
     let passkey = owner
         .as_ref()
         .map(|key| key as &dyn hellas_authority::authenticator::Authenticator);
@@ -342,121 +355,70 @@ async fn async_main() {
                 ..
             },
         ) => {
-            let result = commands::admin::inspect_offline(args, &home).await;
-            tracer_provider.shutdown();
-            if let Err(err) = result {
-                eprintln!("error: {err:#}");
-                std::process::exit(1);
-            }
-            return;
+            return commands::admin::inspect_offline(args, &home).await;
         }
         #[cfg(unix)]
         Commands::Machines(args) => {
-            let result = machines::run(args).await;
-            tracer_provider.shutdown();
-            if let Err(err) = result {
-                eprintln!("error: {err:#}");
-                std::process::exit(1);
-            }
-            return;
+            return machines::run(args).await;
         }
         Commands::Program {
+            model_id,
+            companions,
             model,
             backend,
-            voice,
         } => {
-            let result = hellas_client::model::ModelPackage::open_many_with_voices(
-                &model,
-                [backend.clone()],
-                None,
-                &voice,
-            )
-            .await
-            .and_then(|packages| packages[&backend].programs())
-            .map(|programs| {
-                for program in programs {
+            let model = hub::Revisions::default()
+                .pin_spec(&companions.spec(&model))
+                .await?;
+            if model_id {
+                println!("hellas://{}", model.identify().await?);
+            } else {
+                let backend = backend
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("missing evaluator"))?;
+                for program in model.open(backend, None).await?.programs()? {
                     println!(
                         "{}/{}",
                         program.application().evaluator(),
                         program.content_id()
                     );
                 }
-            });
-            tracer_provider.shutdown();
-            if let Err(error) = result {
-                eprintln!("error: {error:#}");
-                std::process::exit(1);
             }
-            return;
+            return Ok(());
         }
         Commands::Store(args) if args.profile.is_none() => {
-            let result = commands::store::run(args, &home, None, passkey).await;
-            tracer_provider.shutdown();
-            if let Err(err) = result {
-                eprintln!("error: {err:#}");
-                std::process::exit(1);
-            }
-            return;
+            return commands::store::run(args, &home, None, passkey).await;
         }
-        command => command,
-    };
-
-    let command = match command {
         Commands::Faucet { amount } => {
-            let result = commands::faucet::faucet(
+            return commands::faucet::faucet(
                 amount,
                 owner.as_ref().expect("the faucet pays the principal"),
                 &selected_chain,
             )
             .await;
-            tracer_provider.shutdown();
-            if let Err(err) = result {
-                eprintln!("error: {err:#}");
-                std::process::exit(1);
-            }
-            return;
         }
         Commands::Chain { command } => {
-            let result =
-                commands::chain::run(command, owner.as_ref(), &selected_chain, &home).await;
-            tracer_provider.shutdown();
-            if let Err(err) = result {
-                eprintln!("error: {err:#}");
-                std::process::exit(1);
-            }
-            return;
+            return commands::chain::run(command, owner.as_ref(), &selected_chain, &home).await;
         }
         command => command,
     };
 
     // Before anything binds, and before any other startup work.
-    let local_identity = match hellas_sdk::identity::load_or_create(&identity_path) {
-        Ok(identity) => identity,
-        Err(err) => {
-            eprintln!("error: {err:#}");
-            std::process::exit(1);
-        }
-    };
+    let local_identity = hellas_sdk::identity::load_or_create(&home.join("identity"))?;
     let secret_key = local_identity.transport_key.clone();
-    let job_home =
-        || hellas_sdk::home::Home::new(&local_identity, owner.as_ref(), &home, &selected_chain);
 
-    let result = match command {
+    match command {
         Commands::Contact { name } => {
-            async {
-                let name = match name {
-                    Some(name) => name,
-                    None => std::env::var("USER")
-                        .map_err(|_| anyhow::anyhow!("pass --name: $USER is not set"))?,
-                };
-                let passkey = passkey.expect("a contact acts for the principal");
-                let contact =
-                    commands::contributions::contact(&name, passkey, &local_identity.node_key)
-                        .await?;
-                println!("{contact}");
-                Ok(())
-            }
-            .await
+            let name = match name {
+                Some(name) => name,
+                None => std::env::var("USER")
+                    .map_err(|_| anyhow::anyhow!("pass --name: $USER is not set"))?,
+            };
+            let passkey = passkey.expect("a contact acts for the principal");
+            let contact =
+                commands::contributions::contact(&name, passkey, &local_identity.node_key).await?;
+            println!("{contact}");
+            Ok(())
         }
         Commands::Share(args) => {
             commands::admin::share(args, &local_identity, passkey, &home).await
@@ -470,37 +432,39 @@ async fn async_main() {
             commands::store::run(args, &home, Some(&local_identity), passkey).await
         }
 
-        Commands::Serve {
-            port, config_file, ..
-        } => {
-            async {
-                commands::daemon::serve(
-                    &home,
-                    &local_identity,
-                    owner.as_ref(),
-                    &selected_chain,
-                    port,
-                    config_file,
-                    #[cfg(feature = "otel")]
-                    metrics,
-                )
-                .await
-            }
+        Commands::Serve { args, .. } => {
+            commands::daemon::serve(
+                &home,
+                &local_identity,
+                owner.as_ref(),
+                &selected_chain,
+                args,
+                content_dir,
+                #[cfg(feature = "otel")]
+                metrics,
+            )
             .await
         }
         Commands::Gateway { args, .. } => {
-            async {
-                commands::daemon::gateway(
-                    args,
-                    &home,
-                    &local_identity,
-                    owner.as_ref(),
-                    &selected_chain,
-                    #[cfg(feature = "otel")]
-                    metrics,
-                )
-                .await
-            }
+            commands::daemon::gateway(
+                args,
+                &home,
+                &local_identity,
+                owner.as_ref(),
+                &selected_chain,
+                #[cfg(feature = "otel")]
+                metrics,
+            )
+            .await
+        }
+        Commands::Configure { control, config } => {
+            commands::admin::daemon(
+                control,
+                Some(commands::daemon::Edit::Configure(config)),
+                &local_identity,
+                passkey,
+                &home,
+            )
             .await
         }
         Commands::Backend { control, command } => {
@@ -530,22 +494,15 @@ async fn async_main() {
             node_id,
             node_addrs,
         } => commands::rpc::run(node_id, node_addrs, secret_key).await,
-        Commands::Transact(args) => {
-            async { commands::transact::run(args, job_home()?).await }.await
+        Commands::Job(job) => {
+            job.run(hellas_sdk::home::Home::new(
+                &local_identity,
+                owner.as_ref(),
+                &home,
+                &selected_chain,
+            )?)
+            .await
         }
-        Commands::Fetch(args) => async { commands::transact::fetch(args, job_home()?).await }.await,
-        Commands::Run(args) => {
-            async { commands::transact::run_program(args, job_home()?).await }.await
-        }
-        Commands::Speak(args) => async { commands::transact::speak(args, job_home()?).await }.await,
-        Commands::Transcribe(args) => {
-            async { commands::transact::transcribe(args, job_home()?).await }.await
-        }
-        Commands::Decide(args) => {
-            async { commands::transact::decide(args, job_home()?).await }.await
-        }
-        Commands::Text(args) => async { commands::transact::text(args, job_home()?).await }.await,
-        Commands::Image(args) => async { commands::transact::image(args, job_home()?).await }.await,
         Commands::Program { .. } => {
             unreachable!("model commands handled before identity load")
         }
@@ -571,13 +528,6 @@ async fn async_main() {
             timeout_secs,
             no_interrogate,
         } => commands::monitor::run(timeout_secs, !no_interrogate, secret_key).await,
-    };
-
-    tracer_provider.shutdown();
-
-    if let Err(err) = result {
-        eprintln!("error: {err:#}");
-        std::process::exit(1);
     }
 }
 

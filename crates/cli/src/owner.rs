@@ -61,7 +61,7 @@ mod tests {
             );
         }
         let outside = home.path().join("outside.key");
-        std::fs::write(&outside, [0x41; 32]).unwrap();
+        hellas_private::write_secret_file(&outside, ".key", &[0x41; 32]).unwrap();
         let explicit = OwnerArgs {
             passkey: Some(outside),
         };

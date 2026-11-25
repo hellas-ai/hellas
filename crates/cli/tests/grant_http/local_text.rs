@@ -43,11 +43,10 @@ async fn local_gateway_serves_a_text_model_without_a_chain() {
     node.gateway.stop().await;
 }
 
-/// `gateway --model --model` and nothing else: the job reads its weights
-/// from the model, and the caller gets the executor's outcome. A host
-/// without a HIP runtime signs an execution failure, which reaches the
-/// caller as that failure.
+/// `gateway --model` and nothing else: the job reads its weights from the
+/// model, and the caller gets the executor's outcome.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a GPU runtime, which registers the local evaluator"]
 async fn local_gateway_runs_jobs_on_its_model_and_reports_their_outcome() {
     let model =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../client/src/model/package/mini-qwen3.gguf");

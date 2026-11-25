@@ -94,7 +94,7 @@ async fn local_gateway_whisper_matches_reference_tokens_without_a_chain() {
     let hellas_client::model::ModelResponse::Transcription(expected_text) =
         hellas_client::model::ModelPackage::open(
             &model,
-            &hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip),
+            &hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip, "gfx1151"),
         )
         .await
         .unwrap()

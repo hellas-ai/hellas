@@ -170,6 +170,7 @@ impl Disk {
                 return Err(Error::Invalid("unsupported content database version"));
             }
             sqlx::raw_sql("CREATE TABLE IF NOT EXISTS pins (name TEXT PRIMARY KEY NOT NULL, value BLOB NOT NULL); CREATE TABLE IF NOT EXISTS head (id INTEGER PRIMARY KEY CHECK(id=1), generation BLOB NOT NULL); INSERT OR IGNORE INTO head VALUES(1, x'0000000000000000'); CREATE TABLE IF NOT EXISTS work_owned (id INTEGER PRIMARY KEY CHECK(id=1)); PRAGMA user_version=1;").execute(&db).await.map_err(database)?;
+            sqlx::query("CREATE TABLE IF NOT EXISTS hub_files (object BLOB NOT NULL, size INTEGER NOT NULL, repo TEXT NOT NULL, revision TEXT NOT NULL, path TEXT NOT NULL, PRIMARY KEY(object,size,repo,revision,path))").execute(&db).await.map_err(database)?;
             sqlx::query("CREATE TABLE IF NOT EXISTS declarations (name TEXT PRIMARY KEY NOT NULL, digest BLOB NOT NULL)").execute(&db).await.map_err(database)?;
             sqlx::raw_sql("CREATE TABLE IF NOT EXISTS identity (id INTEGER PRIMARY KEY CHECK(id=1), value BLOB NOT NULL CHECK(length(value)=16)); INSERT OR IGNORE INTO identity VALUES(1, randomblob(16));").execute(&db).await.map_err(database)?;
             let identity: Vec<u8> = sqlx::query_scalar("SELECT value FROM identity WHERE id=1")
@@ -360,7 +361,8 @@ impl Disk {
             }
             let (indexed, location) =
                 self.index(path, if lower { mode } else { IndexMode::Resume })?;
-            let id = ContentId::from_bytes(indexed.id.into_bytes());
+            let object = indexed.object();
+            let id = object.id();
             if !lower
                 && path.file_name().and_then(|name| name.to_str()) != Some(id.to_string().as_str())
             {
@@ -377,7 +379,7 @@ impl Disk {
                     id,
                     Arc::new(Stored::new(
                         Data::File(Arc::new(FileObject {
-                            object: ContentRef::new(id, indexed.len),
+                            object,
                             disk: self.clone(),
                             entries: Mutex::new(vec![location]),
                             staged: Mutex::new(None),
@@ -925,13 +927,7 @@ impl DiskStore {
                 let mut files = BTreeMap::new();
                 crate::fastresume::walk_lower(&paths, |path| {
                     let (indexed, _) = disk.index(path, IndexMode::Resume)?;
-                    files.insert(
-                        path.to_owned(),
-                        ContentRef::new(
-                            ContentId::from_bytes(indexed.id.into_bytes()),
-                            indexed.len,
-                        ),
-                    );
+                    files.insert(path.to_owned(), indexed.object());
                     Ok(())
                 })?;
                 Ok(files)
@@ -1108,7 +1104,8 @@ impl Disk {
                 continue;
             }
             let (indexed, location) = self.index(&entry.path(), IndexMode::Resume)?;
-            let id = ContentId::from_bytes(indexed.id.into_bytes());
+            let object = indexed.object();
+            let id = object.id();
             if entry.file_name().to_str() != Some(id.to_string().as_str()) {
                 let path = entry.path();
                 let shared =
@@ -1125,7 +1122,7 @@ impl Disk {
                 id,
                 Arc::new(Stored::new(
                     Data::File(Arc::new(FileObject {
-                        object: ContentRef::new(id, indexed.len),
+                        object,
                         disk: self.clone(),
                         entries: Mutex::new(vec![location]),
                         staged: Mutex::new(None),
@@ -1239,5 +1236,65 @@ impl DiskStore {
 impl std::fmt::Debug for DiskStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("DiskStore")
+    }
+}
+
+impl super::core::Core {
+    pub(crate) async fn record_hub_files(
+        &self,
+        repo: &str,
+        revision: &str,
+        files: BTreeMap<String, ContentRef>,
+    ) -> Result<()> {
+        if let Some(disk) = &self.disk {
+            let mut tx = disk.db.begin().await.map_err(database)?;
+            for (path, object) in files {
+                sqlx::query("INSERT OR IGNORE INTO hub_files(object,size,repo,revision,path) VALUES(?,?,?,?,?)")
+                    .bind(object.id().as_bytes().to_vec()).bind(i64::try_from(object.bytes()).map_err(|_| Error::Capacity)?)
+                    .bind(repo).bind(revision).bind(path).execute(&mut *tx).await.map_err(database)?;
+            }
+            tx.commit().await.map_err(database)?;
+        } else {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| Error::Invalid("store lock"))?;
+            for (path, object) in files {
+                state.hub_files.entry(object).or_default().insert((
+                    repo.to_owned(),
+                    revision.to_owned(),
+                    path,
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl super::LocalStore {
+    /// Immutable source paths observed by the provider that owns this job's lower store.
+    pub async fn verified_hub_files(
+        &self,
+        object: ContentRef,
+    ) -> Result<Vec<(String, String, String)>> {
+        let core = self.core();
+        let core = core.lower.as_deref().unwrap_or(core);
+        if let Some(disk) = &core.disk {
+            sqlx::query_as("SELECT repo,revision,path FROM hub_files WHERE object=? AND size=? ORDER BY repo,revision,path")
+                .bind(object.id().as_bytes().to_vec()).bind(i64::try_from(object.bytes()).map_err(|_| Error::Capacity)?)
+                .fetch_all(&disk.db).await.map_err(database)
+        } else {
+            let state = core
+                .state
+                .lock()
+                .map_err(|_| Error::Invalid("store lock"))?;
+            Ok(state
+                .hub_files
+                .get(&object)
+                .into_iter()
+                .flatten()
+                .cloned()
+                .collect())
+        }
     }
 }

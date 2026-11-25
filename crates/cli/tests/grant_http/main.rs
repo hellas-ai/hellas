@@ -160,7 +160,7 @@ struct Cli {
 impl Cli {
     fn new(root: &Path, name: &str, passkey: [u8; 32]) -> Self {
         let path = root.join(format!("{name}.passkey"));
-        std::fs::write(&path, hex::encode(passkey)).unwrap();
+        hellas_private::write_secret_file(&path, ".key", hex::encode(passkey).as_bytes()).unwrap();
         let home = root.join(name);
         std::fs::create_dir_all(&home).unwrap();
         Self {

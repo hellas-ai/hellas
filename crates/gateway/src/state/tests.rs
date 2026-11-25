@@ -17,7 +17,7 @@ async fn open(work: Arc<dyn WorkExecutionBackend>) -> TextState {
             crate::Presentation::Model {
                 modality: hellas_client::model::ModelKind::Text,
                 model: "mini-qwen3".into(),
-                package: text_model(),
+                package: text_model().into(),
                 max_tokens: 128,
             },
         )
@@ -43,6 +43,7 @@ async fn authenticated_prefixes_arrive_before_the_paid_terminal() {
             crate::test_support::backend({
                 Some(hellas_client::model::evaluator(
                     hellas_client::model::GpuDialect::Hip,
+                    "gfx1151",
                 ))
             })
         }
@@ -137,6 +138,7 @@ async fn paid_capacity_is_a_retryable_error() {
             crate::test_support::backend({
                 Some(hellas_client::model::evaluator(
                     hellas_client::model::GpuDialect::Hip,
+                    "gfx1151",
                 ))
             })
         }
@@ -186,6 +188,7 @@ impl WorkExecutionBackend for Accepting {
         crate::test_support::backend({
             Some(hellas_client::model::evaluator(
                 hellas_client::model::GpuDialect::Hip,
+                "gfx1151",
             ))
         })
     }
@@ -372,6 +375,7 @@ impl WorkExecutionBackend for Capturing {
         crate::test_support::backend({
             Some(hellas_client::model::evaluator(
                 hellas_client::model::GpuDialect::Hip,
+                "gfx1151",
             ))
         })
     }
@@ -724,7 +728,7 @@ async fn test_router(
         vec![crate::test_support::route(crate::Presentation::Model {
             modality: hellas_client::model::ModelKind::Text,
             model: name.into(),
-            package,
+            package: package.into(),
             max_tokens: 128,
         })],
         work,

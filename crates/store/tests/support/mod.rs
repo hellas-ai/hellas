@@ -41,6 +41,7 @@ pub enum Mode {
     BadDeclarationOnce,
     BadTrailerOnce,
     HoldFirstDeclaration,
+    DenyOnUploadFrame(usize),
 }
 pub struct Fixture {
     pub files: BTreeMap<String, File>,
@@ -190,7 +191,12 @@ impl ContentHandler for Handler {
         let fixture = self.0.clone();
         Ok(ResponseStream::new(async_stream::try_stream! {
             let mut bytes=0u64;let mut written=0u64;let mut next=0u64;
+            let mut frame = 0;
             while let Some(request)=requests.next().await{
+                frame += 1;
+                if number == 0 && fixture.mode == Mode::DenyOnUploadFrame(frame) {
+                    Err(WireStatus::new(WireCode::PermissionDenied, "scope denied"))?;
+                }
                 match request?.part.unwrap(){
                     pb::upload_request::Part::Open(open)=>{bytes=open.object.unwrap().bytes;written=0;next=0;yield pb::UploadResponse{next_chunk:0,missing:true,complete:false};},
                     pb::upload_request::Part::List(_)=>{

@@ -176,6 +176,25 @@ resource withdraws it from `Catalogue` and new grants. The authority retains its
 recorded terms for existing allowances and accepted work. Each resource chooses
 whether changed terms keep or release previously accepted work.
 
+A model resource can declare `rules` inside its `kind` table. Each rule may
+specify an `evaluator`, a `program` ID, a `model` ID, or an ordered list of
+Hub `repos`. A job must satisfy every field of one rule. A repository rule requires a receipt in the provider's content store for every named asset.
+Each receipt records a previously verified acquisition from one of the listed repositories.
+An operator can activate an exact Hub checkpoint or use `hellas store acquire` at a pinned
+revision before accepting work. Admission reads receipts by content ID and size, including
+when a client names the model by a local path or `hellas://`. A missing receipt refuses
+the job even when the repository is online. Omitting
+`rules` derives exact program rules from the configured package. A rule may
+declare `pure_setup_entries` when it pins a program or model. The signed
+resource advertises its registered evaluator so a client can render a program
+for a grant whose rules leave that field open.
+
+An owner can replace the paired node's daemon configuration with
+`hellas configure --profile PROFILE daemon.toml`. Supply the complete document,
+including the work listener. The command uses the same TOML as `serve --config`
+and submits it against the observed daemon revision. Set paid policy through
+`admin work`, which requires its own authority.
+
 Each Fetch admission in a resource's `invocation_policy` carries a required
 `contract` descriptor. The descriptor selects a compiled request/result
 schema and commits the adapter, driver and egress terms. For example, the current
@@ -395,7 +414,7 @@ The receiving device runs jobs with it directly:
 
 ```sh
 hellas transcribe --model hf://unsloth/whisper-tiny@34457cb234c8624f23ac716000773b367000df6e --audio speech.wav --access me.access \
-  --backend hellas/catena-dfad87438018-hip
+  --backend hellas/catena-dfad87438018-hip-gfx1151
 ```
 
 Every job command (`transcribe`, `text`, `image`, `run`, `fetch` and

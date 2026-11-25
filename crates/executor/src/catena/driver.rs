@@ -40,6 +40,7 @@ pub struct Completed {
 
 fn asset_ranges(env: &Environment, plan: &Plan) -> BTreeMap<ContentRef, Vec<(u64, u64)>> {
     let by_name: BTreeMap<_, _> = env
+        .model
         .assets
         .iter()
         .map(|asset| (asset.name.as_str(), asset.object))
@@ -145,7 +146,7 @@ pub fn execute(
                 assets.pin_for_job(reader, object, ranges, &cancel, Some(deadline))?,
             );
         }
-        for asset in &env.assets {
+        for asset in &env.model.assets {
             if let Some(owner) = objects.get(&asset.object) {
                 resident.insert(asset.name.clone(), owner.clone());
             }

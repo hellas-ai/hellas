@@ -44,10 +44,10 @@ async fn an_expired_command_closes_the_endpoint_it_bound() {
     )
     .unwrap();
     let endpoint = context.paid_endpoint().await.unwrap();
-    let result: crate::commands::CliResult<()> =
-        bounded(&context, Some(Duration::from_millis(1)), async |deadline| {
+    let result: crate::commands::CliResult<()> = context
+        .command(bounded(Some(Duration::from_millis(1)), async |deadline| {
             within(deadline, std::future::pending()).await
-        })
+        }))
         .await;
     assert!(
         result
@@ -201,7 +201,9 @@ fn fetch_args(extra: &[&str]) -> FetchArgs {
         args.extend(["--contract", "http"]);
     }
     args.extend_from_slice(extra);
-    let crate::Commands::Fetch(args) = crate::Cli::try_parse_from(args).unwrap().command else {
+    let crate::Commands::Job(crate::commands::transact::JobCommand::Fetch(args)) =
+        crate::Cli::try_parse_from(args).unwrap().command
+    else {
         panic!("Fetch");
     };
     args
@@ -527,30 +529,31 @@ async fn run_writes_one_call_job_that_transact_loads_unchanged() {
         input.display().to_string(),
         provider(),
     );
-    let crate::Commands::Run(args) = crate::Cli::try_parse_from([
-        "hellas",
-        "run",
-        "--provider",
-        &id,
-        "--source",
-        &source,
-        "--entry",
-        "increment",
-        "--arg",
-        "u64:41",
-        "--input",
-        &input,
-        "--arg",
-        "input:data.bin",
-        "--returns",
-        "u64",
-        "--returns",
-        "buffer:16",
-        "--pay",
-        "20",
-    ])
-    .unwrap()
-    .command
+    let crate::Commands::Job(crate::commands::transact::JobCommand::Run(args)) =
+        crate::Cli::try_parse_from([
+            "hellas",
+            "run",
+            "--provider",
+            &id,
+            "--source",
+            &source,
+            "--entry",
+            "increment",
+            "--arg",
+            "u64:41",
+            "--input",
+            &input,
+            "--arg",
+            "input:data.bin",
+            "--returns",
+            "u64",
+            "--returns",
+            "buffer:16",
+            "--pay",
+            "20",
+        ])
+        .unwrap()
+        .command
     else {
         panic!("run");
     };

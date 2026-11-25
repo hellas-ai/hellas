@@ -14,15 +14,15 @@ use axum::{
 };
 pub(super) use hellas_adaptors::openai::audio_speech::PATH;
 use hellas_adaptors::openai::audio_speech::{HostedSpeech, SpeechRequest};
-use hellas_client::model::{ModelKind, ModelRequest, ModelResponse};
+use hellas_client::model::{ModelKind, ModelRequest, ModelResponse, ModelSpec};
 use serde::{Deserialize, Serialize};
-use std::{path::PathBuf, sync::Arc};
+use std::sync::Arc;
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SpeechTarget {
     Native {
-        package: PathBuf,
+        package: ModelSpec,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         voices: Vec<String>,
     },

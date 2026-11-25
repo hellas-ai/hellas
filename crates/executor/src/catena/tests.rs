@@ -109,7 +109,7 @@ fn limits() -> Limits {
 fn environment() -> Environment {
     Environment {
         sources: vec![],
-        assets: vec![],
+        model: Default::default(),
     }
 }
 fn counter() -> Plan {
@@ -379,10 +379,11 @@ fn slot_moves_asset_ownership_and_recurrent_flow_are_checked() {
     };
     let env = Environment {
         sources: vec![],
-        assets: vec![NamedAsset {
+        model: hellas_rpc::protocol::invocation::compute::Model::new(vec![NamedAsset {
             name: "w".into(),
             object: hellas_rpc::ContentRef::for_bytes(&[0; 8]),
-        }],
+        }])
+        .unwrap(),
     };
     assert!(validate::validate(&module, &env, &BTreeMap::new(), &plan, &limits(),).is_err());
     let mut plan = counter();
@@ -572,8 +573,7 @@ async fn cached_program_still_opens_current_pin_policy(warm_gpu: bool) {
     use hellas_rpc::{
         Assurance, ContentRef, JsonBytes,
         protocol::invocation::{
-            Admission, ComputePrograms, InvocationInput, InvocationPolicy, InvocationRequest,
-            PreparedInvocation,
+            Admission, InvocationInput, InvocationPolicy, InvocationRequest, PreparedInvocation,
         },
     };
     use hellas_store::content::{
@@ -611,23 +611,19 @@ async fn cached_program_still_opens_current_pin_policy(warm_gpu: bool) {
             .iter()
             .map(|source| ContentRef::for_bytes(source.as_bytes()))
             .collect(),
-        assets: vec![NamedAsset {
+        model: hellas_rpc::protocol::invocation::compute::Model::new(vec![NamedAsset {
             name: "weights".into(),
             object: asset,
-        }],
+        }])
+        .unwrap(),
     };
-    let manifest = environment
-        .manifest(&super::evaluator(GpuDialect::Hip))
-        .unwrap();
+    let manifest = environment.manifest(&hip_evaluator("gfx1151")).unwrap();
     let root_bytes = environment.canonical_bytes().unwrap();
     let root_object = ContentRef::for_bytes(&root_bytes);
     let mut limits = limits();
     limits.max_upload_bytes = hellas_channel::content::DEFAULT_MAX_STAGING_BYTES;
     let policy = InvocationPolicy {
-        admissions: vec![Admission::Compute {
-            evaluator: super::evaluator(GpuDialect::Hip),
-            programs: ComputePrograms::Any {},
-        }],
+        admissions: vec![Admission::evaluator(hip_evaluator("gfx1151"))],
         limits,
     };
     let input = InvocationInput {
@@ -674,14 +670,10 @@ async fn cached_program_still_opens_current_pin_policy(warm_gpu: bool) {
         .await
         .unwrap();
     let content = (LocalStore::Job(job.clone()), job.scope().clone());
-    let (environment, sources, mut readers) = super::program::BoundProgram::open(
-        &content,
-        &prepared,
-        &limits,
-        &super::evaluator(GpuDialect::Hip),
-    )
-    .await
-    .unwrap();
+    let (environment, sources, mut readers) =
+        super::program::BoundProgram::open(&content, &prepared, &limits, &hip_evaluator("gfx1151"))
+            .await
+            .unwrap();
     let compiling = prepared.clone();
     let module = tokio::task::spawn_blocking(move || {
         super::program::BoundProgram::compile_cancellable(
@@ -727,15 +719,11 @@ async fn cached_program_still_opens_current_pin_policy(warm_gpu: bool) {
     )
     .await
     .unwrap();
-    let failure = super::program::BoundProgram::open(
-        &content,
-        &prepared,
-        &limits,
-        &super::evaluator(GpuDialect::Hip),
-    )
-    .await
-    .err()
-    .unwrap();
+    let failure =
+        super::program::BoundProgram::open(&content, &prepared, &limits, &hip_evaluator("gfx1151"))
+            .await
+            .err()
+            .unwrap();
     assert!(
         failure.to_string().contains("missing compute asset"),
         "{failure}"
@@ -765,20 +753,19 @@ async fn an_executor_refuses_an_unregistered_evaluator() {
     use hellas_rpc::{
         Assurance, ContentRef, JsonBytes, Retention,
         protocol::invocation::{
-            Admission, ComputePrograms, InvocationInput, InvocationPolicy, InvocationRequest,
-            PreparedInvocation,
+            Admission, InvocationInput, InvocationPolicy, InvocationRequest, PreparedInvocation,
         },
     };
     use hellas_store::content::{LocalStore, MemoryStore, Reservations, Scope};
     let environment = Environment {
         sources: vec![ContentRef::for_bytes(SOURCE.as_bytes())],
-        assets: vec![],
+        model: Default::default(),
     };
     let content = (
         LocalStore::Memory(MemoryStore::new(Reservations::ram(1 << 20))),
         Scope::Owner,
     );
-    let registered = super::evaluator(GpuDialect::Hip);
+    let registered = hip_evaluator("gfx1151");
     let open = async |evaluator: &str| {
         let manifest = environment.manifest(evaluator).unwrap();
         let input = InvocationInput {
@@ -786,10 +773,7 @@ async fn an_executor_refuses_an_unregistered_evaluator() {
             artifacts: vec![],
         };
         let policy = InvocationPolicy {
-            admissions: vec![Admission::Compute {
-                evaluator: evaluator.into(),
-                programs: ComputePrograms::Any {},
-            }],
+            admissions: vec![Admission::evaluator(evaluator.into())],
             limits: limits(),
         };
         let prepared = PreparedInvocation::new(
@@ -812,11 +796,13 @@ async fn an_executor_refuses_an_unregistered_evaluator() {
             .unwrap()
             .to_string()
     };
-    assert!(
-        open("hellas/unregistered")
-            .await
-            .contains("unsupported compute evaluator")
-    );
+    for unregistered in ["hellas/unregistered", &hip_evaluator("gfx1100")] {
+        assert!(
+            open(unregistered)
+                .await
+                .contains("unsupported compute evaluator")
+        );
+    }
     // The same program for the registered evaluator passes the check and only
     // then misses its root in this empty store.
     assert!(
@@ -848,10 +834,11 @@ fn only_approved_asset_only_setup_results_are_read_only() {
     let object = hellas_rpc::ContentRef::for_bytes(b"weight");
     let env = Environment {
         sources: vec![],
-        assets: vec![NamedAsset {
+        model: hellas_rpc::protocol::invocation::compute::Model::new(vec![NamedAsset {
             name: "w".into(),
             object,
-        }],
+        }])
+        .unwrap(),
     };
     let asset = Arg::Asset {
         name: "w".into(),
@@ -944,4 +931,12 @@ fn prepared_gpu_buffers_share_the_asset_lru() -> Result<()> {
     let fresh = prepare(0)?;
     assert_eq!(fresh.0[0].try_to_u16_vec()?, [0x1122, 0x3344]);
     Ok(())
+}
+
+fn hip_evaluator(arch: &str) -> String {
+    super::Gpu {
+        dialect: GpuDialect::Hip,
+        arch: arch.into(),
+    }
+    .evaluator()
 }

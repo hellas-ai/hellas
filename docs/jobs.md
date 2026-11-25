@@ -38,14 +38,24 @@ hellas transcribe --model hf://unsloth/whisper-tiny@34457cb234c8624f23ac71600077
 hellas text --model hf://ggml-org/Qwen3-0.6B-GGUF@afe8ad3577aa22500b3cd1c880f153b3b0e1cae8/Qwen3-0.6B-BF16.gguf --prompt 'Why is the sky blue?' --local
 ```
 
+To follow the default branch for one invocation, omit the revision.
+
+```sh
+hellas transcribe --model hf://unsloth/whisper-tiny --audio speech.wav --local
+```
+
+A branch or tag can follow the repository name after `@`. Encode a slash in the ref name as `%2F`. An optional file path can follow any revision or the repository name. The CLI prints the resolved commit to stderr and uses it for the entire command. A gateway resolves each ref once at startup. Use the printed SHA to repeat a job or pre-acquire its assets with `hellas store acquire`.
+
 The [Nix one-liners](nix.md#local-gpu-one-liners) include pinned commands for text, transcription, MMS speech, Flux images and
 one gateway serving them together. The same `cli-cuda` or `cli-hip` output
 runs every modality; no development shell is needed.
 
 A Compute job names the evaluator its program is rendered for. Remote Compute
 commands render for `--backend EVALUATOR`, the id the provider's GPU runtime
-registers (such as `hellas/catena-dfad87438018-hip`), before they ask for a
+registers (such as `hellas/catena-dfad87438018-hip-gfx1151`), before they ask for a
 quote; the provider refuses a program for an evaluator it did not register.
+The id names the architecture of the device the runtime opened, because the
+same program rounds differently on different architectures.
 `--local` renders for this machine's GPU runtime.
 
 `hellas text --model MODEL --prompt TEXT [--system TEXT] [--max-tokens N]`
@@ -59,13 +69,44 @@ A pinned Hub GGUF works with `text`, `decide`, `program` and the gateway. Give t
 hellas text --model hf://LiquidAI/LFM3-1.7B-GGUF@cd0c74c575b5c416f3011b5b4c298077f26ca8c2/LFM3-1.7B-BF16.gguf --prompt 'What is the capital of France?' --local
 ```
 
-For remote jobs the client reads only the header. The provider can pre-acquire the file, or configure its content allow-list with the same repository, revision, file path, content ID and size. For example:
+With a published Xet ID, the remote buyer reads only the header. For a Git or LFS weight file without a published Xet ID, the buyer streams the pinned file once to compute its canonical content ID and reads headers from that download. The provider can pre-acquire the file, or configure its content allow-list with the same repository, revision, file path, content ID and size. For example:
 
 ```sh
 hellas store acquire hf://LiquidAI/LFM3-1.7B-GGUF@cd0c74c575b5c416f3011b5b4c298077f26ca8c2 --path LFM3-1.7B-BF16.gguf --expect a4896de517cae418383c2fd9954bc5ac33d8112b810c7895fb3feb70dca622dc --bytes 3466626336 --pin models/lfm3 --policy jobs
 ```
 
+A grant or paid policy constrained to Hub repositories requires a provider acquisition
+receipt for every model asset, including tokenizer, configuration, and voice files.
+Activate the exact Hub checkpoint or acquire the selected files before serving that
+policy. The buyer can use local files, a Hub revision, or a model ID. Admission checks
+the provider's durable receipts by content ID and size and works with the Hub offline.
+An on-miss allow-list can fetch approved missing content after the policy check.
+
 The provider checks the published Xet hash against the canonical content ID. It rejects files published with legacy Xet chunking. With `--local`, the local executor acquires the weights into its own content store.
+
+A program commits to a model ID covering its named checkpoint files and render
+metadata. An activated provider stores their catalog in
+`models/by-id/MODEL_ID` with the `jobs` policy. To permit peer reads of the
+whole model, the owner can list the catalog's tree ID and byte size, then set
+its pin to `public`:
+
+```sh
+hellas store pin ls models/by-id
+hellas store pin set models/by-id/MODEL_ID TREE_ID --bytes TREE_BYTES --tree --policy public
+```
+
+Use `hellas program --model-id MODEL` to print its reference without selecting an evaluator.
+With a public catalog, pass `--model hellas://MODEL_ID` to a job command. The
+buyer contacts the node in its signed access offer or the node selected by
+`--provider`. To specify a source explicitly, including with `hellas program`
+or a gateway route, use `hellas://MODEL_ID@NODE_ID` or
+`hellas://MODEL_ID@NODE_ID@IP:PORT`. The buyer verifies the catalog against the
+model ID and reads authenticated ranges for checkpoint headers and metadata.
+Publishing the tree permits readers to download every file in it, including
+weights. For private sharing, the owner can choose `--policy granted` and give the
+access credential `content.read` on the exact catalog pin. A job addressed by
+`--access` uses that authenticated connection when the catalog is private.
+A compute grant alone authorizes execution only.
 
 `hellas transact --job DIR` executes a caller-owned job folder for any
 application. `hellas run` (one call of a Catena program) and `hellas fetch`
@@ -80,7 +121,7 @@ Signing keys and funding/channel recovery journals remain durable.
 ```sh
 hellas faucet
 hellas run --provider ENROLLMENT_ID@NODE_ID --source counter.hex --entry advance \
-  --arg u64:2 --arg u64:3 --returns u64 --backend hellas/catena-dfad87438018-hip \
+  --arg u64:2 --arg u64:3 --returns u64 --backend hellas/catena-dfad87438018-hip-gfx1151 \
   --pay 20 --save-job ./add
 hellas transact --job ./add --provider ENROLLMENT_ID@NODE_ID@127.0.0.1:9000 -o ./result
 hellas fetch https://example.com/data --provider ENROLLMENT_ID@NODE_ID --pay 20 \
@@ -128,7 +169,7 @@ intentionally have different trust boundaries:
 
 | Application | Root and trusted computation | Outside that guarantee |
 | --- | --- | --- |
-| `hellas/catena-dfad87438018-<runtime>` (the id a GPU runtime registers, such as `-hip`), `compute-0.0.1` | The GPU runtime the program is compiled for, exact Catena Hex sources, named content-addressed assets, inputs, the call plan (calls, optional step loop and stop rule) and declared outputs | Where sources and weights come from, tokenizer, chat template, text decoding, and API presentation |
+| `hellas/catena-dfad87438018-<runtime>-<arch>` (the id a GPU runtime registers for the device it opened, such as `-hip-gfx1151` or `-cuda-sm_120`), `compute-0.0.1` | The GPU runtime and device architecture the program is compiled for, exact Catena Hex sources, named content-addressed assets, inputs, the call plan (calls, optional step loop and stop rule) and declared outputs | Where sources and weights come from, tokenizer, chat template, text decoding, and API presentation |
 | `hellas/fetch-0.0.2`, the contract's adaptor (`http-0.0.1`, `codex-responses-0.0.2` or `openai-responses-0.0.3`) | A strict stateless Responses field set; typed reconstruction of provider-shaped JSON; `stream=true` and upstream `store=false`; the exact official Codex or OpenAI HTTPS endpoint; no redirects; and SSE response projection | The truth, correctness, and availability of the adversarial upstream service; provider route label; credentials/auth-file location; and access policy |
 
 Fetch's purpose is to attest the exact transformation around a
@@ -184,7 +225,7 @@ are part of the job's content identity.
 format = "hellas.job.v1"
 
 [application]
-evaluator = "hellas/catena-dfad87438018-hip"
+evaluator = "hellas/catena-dfad87438018-hip-gfx1151"
 adaptor = "compute-0.0.1"
 
 [payment]
@@ -248,7 +289,7 @@ configuration and tokenizer. The provider acquires the original weight files
 and the model's GPU setup prepares the text encoder, denoiser and VAE.
 The default image variant is 512×512 with four steps. A local snapshot can
 include `variants.json` with 1–64 unique width, height and step configurations.
-Keep the same file on the client and provider. `hellas program` prints the
+Variant settings are part of the model ID. `hellas program` prints the
 exact program for each allowed variant.
 
 ```sh
@@ -264,7 +305,7 @@ the selected hardware and step count.
 ```sh
 hellas image --provider ENROLLMENT_ID@NODE_ID --model hf://black-forest-labs/FLUX.2-klein-4B@e7b7dc27f91deacad38e78976d1f2b499d76a294 \
   --prompt 'a small red fox' --seed 42 --width 512 --height 512 --steps 4 \
-  --backend hellas/catena-dfad87438018-hip --pay 20 -o fox.png
+  --backend hellas/catena-dfad87438018-hip-gfx1151 --pay 20 -o fox.png
 ```
 
 `image` saves the job before purchase, writes the PNG to `-o` (default
@@ -324,7 +365,7 @@ The request names a `state` (a string or any JSON value) and one or more
 
 ```sh
 hellas decide --provider ENROLLMENT_ID@NODE_ID --model hf://LiquidAI/d1-2B-GGUF@4a181094d1b6addfaa3a0956f78e7ab2aa406a0c/d1-2B-BF16.gguf \
-  --request request.json --backend hellas/catena-dfad87438018-hip --pay 20
+  --request request.json --backend hellas/catena-dfad87438018-hip-gfx1151 --pay 20
 ```
 
 `decide` reads the request from `--request FILE`, or from standard input by
@@ -449,10 +490,7 @@ cannot be replayed from those journals.
 
 ## Tracked native execution
 
-Compute job and attempt digests include the evaluator. Saved folders from earlier
-versions reopen using the evaluator in `job.toml`. Their pre-change paid and grant
-attempts use older digests. Running one of those jobs again uses a fresh default
-attempt and can incur another charge or consume grant allowance.
+Compute job and attempt digests include the evaluator.
 
 The SDK's `execution` module provides `ExecutionAttempt` and a borrowed
 `ExecutionSession` for paid or granted work without an HTTP listener. Open an

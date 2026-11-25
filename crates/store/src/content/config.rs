@@ -130,25 +130,14 @@ impl Declaration {
                 if let Some(path) = &path {
                     tree::validate_path(path, false)?;
                 }
-                Some(Source::HfXet {
-                    commit: repo.revision.clone(),
-                    repo,
-                    path,
-                })
+                Some(Source::HfXet { repo, path })
             }
             Some(uri) => {
                 if path.is_some() {
                     return Err(Error::Invalid("path is only for an HF source"));
                 }
                 let url = url::Url::parse(uri).map_err(|_| Error::Invalid("HTTPS source URL"))?;
-                if url.scheme() != "https"
-                    || url.host_str().is_none()
-                    || !url.username().is_empty()
-                    || url.password().is_some()
-                    || url.fragment().is_some()
-                {
-                    return Err(Error::Invalid("HTTPS source URL"));
-                }
+                super::acquire::validate_https(&url)?;
                 let bytes = match self {
                     Self::Object(object) => object.bytes,
                     _ => None,

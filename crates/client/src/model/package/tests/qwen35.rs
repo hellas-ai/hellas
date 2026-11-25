@@ -111,7 +111,7 @@ async fn dense_recurrent_model_renders_a_two_state_job() {
     let file = fixture(false);
     let job = ModelPackage::open(
         file.path(),
-        &crate::model::evaluator(crate::model::GpuDialect::Hip),
+        &crate::model::evaluator(crate::model::GpuDialect::Hip, "gfx1151"),
     )
     .await
     .unwrap()
@@ -142,7 +142,7 @@ async fn moe_model_binds_all_nine_declared_states() {
     let file = fixture(true);
     let job = ModelPackage::open(
         file.path(),
-        &crate::model::evaluator(crate::model::GpuDialect::Hip),
+        &crate::model::evaluator(crate::model::GpuDialect::Hip, "gfx1151"),
     )
     .await
     .unwrap()

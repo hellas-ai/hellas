@@ -184,7 +184,7 @@ impl FetchContract {
         ContentId::hash(&self.canonical_bytes())
     }
     pub fn manifest(&self) -> ProgramManifest {
-        ProgramManifest::new(self.application.clone(), self.content_id())
+        ProgramManifest::new(self.application.clone(), self.content_id(), None)
     }
     pub fn manifest_id(&self) -> ContentId {
         self.manifest().content_id()

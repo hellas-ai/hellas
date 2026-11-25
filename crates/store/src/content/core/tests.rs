@@ -167,10 +167,9 @@ async fn lower_admission_walks_a_shared_large_tree_once_for_the_whole_closure() 
         LocalStore::Memory(MemoryStore {
             core: upper.clone()
         })
-        .missing_refs(&scope, closure.clone())
+        .require_complete(&scope, Some(closure.clone()))
         .await
-        .unwrap()
-        .is_empty()
+        .is_ok()
     );
     let batched = provider
         .core
@@ -186,7 +185,7 @@ async fn lower_admission_walks_a_shared_large_tree_once_for_the_whole_closure() 
         LocalStore::Memory(MemoryStore {
             core: upper.clone()
         })
-        .missing_refs(&scope, undeclared)
+        .require_complete(&scope, Some(undeclared))
         .await,
         Err(Error::Denied)
     ));
@@ -212,7 +211,7 @@ async fn lower_admission_walks_a_shared_large_tree_once_for_the_whole_closure() 
         LocalStore::Memory(MemoryStore {
             core: upper.clone()
         })
-        .missing_refs(&scope, closure.clone())
+        .require_complete(&scope, Some(closure.clone()))
         .await,
         Err(Error::Invalid("content length contract"))
     ));

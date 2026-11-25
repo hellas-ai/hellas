@@ -249,8 +249,8 @@ impl Flux {
         );
         Ok(source)
     }
-    pub fn assets(&self) -> Vec<NamedAsset> {
-        self.source.assets()
+    pub(super) fn native(&self) -> &Native {
+        &self.source
     }
 
     pub fn programs(&self, evaluator: &str) -> Result<Vec<hellas_rpc::ProgramManifest>> {
@@ -258,7 +258,7 @@ impl Flux {
             .iter()
             .map(|&variant| {
                 Ok(
-                    super::program::describe(&self.program(variant)?, self.assets())
+                    super::program::describe(&self.program(variant)?, self.source.model.clone())
                         .manifest(evaluator)?,
                 )
             })
@@ -414,7 +414,7 @@ impl Image {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub fn fixture(directory: &Path, dialect: super::GpuDialect) -> Result<super::ModelPackage> {
+pub fn fixture(directory: &Path, evaluator: &str) -> Result<super::ModelPackage> {
     use super::native::Tensor;
     use hellas_rpc::ContentRef;
     use std::collections::BTreeMap;
@@ -446,8 +446,8 @@ pub fn fixture(directory: &Path, dialect: super::GpuDialect) -> Result<super::Mo
     }
     let native = Arc::new(Native::fixture(directory, files));
     Ok(super::ModelPackage::flux_fixture(
-        Flux::open(native, dialect)?,
-        dialect,
+        Flux::open(native, super::renderer(evaluator)?)?,
+        evaluator,
     ))
 }
 #[cfg(test)]

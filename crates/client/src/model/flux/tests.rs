@@ -1,5 +1,5 @@
 use super::*;
-use crate::model::{GpuDialect, ModelRequest, ModelResponse};
+use crate::model::{GpuDialect, ModelRequest, ModelResponse, evaluator};
 use hellas_rpc::ContentRef;
 use hellas_rpc::{JsonBytes, protocol::invocation::output::Outcome};
 use std::path::PathBuf;
@@ -101,7 +101,7 @@ async fn seeded_noise_matches_the_upstream_reference() {
 
 #[tokio::test]
 async fn image_job_bundles_three_stages_and_passes_state_in_slots() {
-    let package = fixture(&directory(), GpuDialect::Hip).unwrap();
+    let package = fixture(&directory(), &evaluator(GpuDialect::Hip, "gfx1151")).unwrap();
     let request = request();
     let job = package
         .render_job(&ModelRequest::Image(request))
@@ -114,30 +114,45 @@ async fn image_job_bundles_three_stages_and_passes_state_in_slots() {
     .validate()
     .unwrap();
     assert_eq!(job.environment.sources.len(), 1);
-    assert_eq!(job.environment.assets.len(), 3);
+    assert_eq!(job.environment.model.assets.len(), 3 + METADATA.len() + 1);
     let programs = package.programs().unwrap();
     assert_eq!(programs.len(), 2);
     assert_ne!(programs[0], programs[1]);
+    assert!(
+        programs
+            .iter()
+            .all(|p| p.model() == Some(package.model().content_id().unwrap()))
+    );
     let evaluator = programs[0].application().evaluator();
     let manifest = job.environment.manifest(evaluator).unwrap();
-    let admission =
-        hellas_rpc::protocol::invocation::Admission::compute_only(&programs, &[]).unwrap();
-    assert!(admission.admits_manifest(&manifest));
+    let admitted = |manifest: &_| {
+        package
+            .compute_admissions()
+            .unwrap()
+            .iter()
+            .any(|a| a.candidate(manifest))
+    };
+    assert!(admitted(&manifest));
     let mut unrelated = job.environment.clone();
     unrelated.sources = vec![ContentRef::for_bytes(b"unrelated source")];
-    assert!(!admission.admits_manifest(&unrelated.manifest(evaluator).unwrap()));
+    assert!(!admitted(&unrelated.manifest(evaluator).unwrap()));
 
-    for asset in &job.environment.assets {
-        assert!(
-            hellas_channel::content::read(
-                &job.content.0,
-                &job.content.1,
-                asset.object,
-                asset.object.bytes()
-            )
-            .await
-            .is_err()
-        );
+    for asset in &job.environment.model.assets {
+        let bytes = hellas_channel::content::read(
+            &job.content.0,
+            &job.content.1,
+            asset.object,
+            asset.object.bytes(),
+        )
+        .await;
+        if asset.name.ends_with(".safetensors") {
+            assert!(bytes.is_err());
+        } else {
+            assert_eq!(
+                bytes.unwrap().as_ref(),
+                std::fs::read(directory().join(&asset.name)).unwrap()
+            );
+        }
     }
     assert!(job.plan.step.is_none());
     let calls = &job.plan.calls;
@@ -228,7 +243,7 @@ async fn image_job_bundles_three_stages_and_passes_state_in_slots() {
 
 #[tokio::test]
 async fn image_bounds_are_checked_before_rendering_or_allocating_noise() {
-    let model = fixture(&directory(), GpuDialect::Hip).unwrap();
+    let model = fixture(&directory(), &evaluator(GpuDialect::Hip, "gfx1151")).unwrap();
     for (width, height, steps) in [
         (0, 16, 1),
         (15, 16, 1),
@@ -293,7 +308,7 @@ async fn tokenizer_ids_outside_the_model_vocabulary_are_refused() {
         text::tokenize(temp.path(), request().prompt).unwrap().ids[0],
         151936
     );
-    let package = fixture(temp.path(), GpuDialect::Hip).unwrap();
+    let package = fixture(temp.path(), &evaluator(GpuDialect::Hip, "gfx1151")).unwrap();
     let error = package
         .render_job(&ModelRequest::Image(request()))
         .await
@@ -304,7 +319,7 @@ async fn tokenizer_ids_outside_the_model_vocabulary_are_refused() {
 
 #[tokio::test]
 async fn image_output_is_checked_and_png_quantization_matches_upstream() {
-    let model = fixture(&directory(), GpuDialect::Hip).unwrap();
+    let model = fixture(&directory(), &evaluator(GpuDialect::Hip, "gfx1151")).unwrap();
     let mut values = vec![0f32; 16 * 16 * 3];
     values[..6].copy_from_slice(&[-1., 0.5 / 255., 1.5 / 255., 0.5, 1., 2.]);
     let output = |values: &[f32]| InvocationOutput {

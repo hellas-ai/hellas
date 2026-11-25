@@ -14,7 +14,7 @@ pub(crate) struct Core {
     pub(crate) pool: Reservations,
     pub(crate) changed: Arc<tokio::sync::Notify>,
     pub(crate) http: ureq::Agent,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) hf_hub: Option<String>,
     pub(crate) disk: Option<Arc<super::disk::Disk>>,
     pub(crate) gate: Arc<tokio::sync::Mutex<()>>,
@@ -55,6 +55,7 @@ pub(crate) struct State {
     pub(crate) objects: BTreeMap<ContentId, Arc<Stored>>,
     pub(crate) pins: BTreeMap<PinName, PinValue>,
     acquired: AcquiredOwners,
+    pub(crate) hub_files: BTreeMap<ContentRef, BTreeSet<(String, String, String)>>,
     pub(crate) on_miss: Arc<dyn OnMiss>,
     work: BTreeMap<ReservationId, Work>,
     active: BTreeSet<(ReservationId, ContentId)>,
@@ -76,7 +77,7 @@ impl Core {
             lower: None,
             needed: None,
             http: crate::hf::http().clone(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             hf_hub: None,
             changed: Arc::new(tokio::sync::Notify::new()),
             state: Arc::new(Mutex::new(State {
@@ -86,6 +87,7 @@ impl Core {
                 objects: BTreeMap::new(),
                 pins: BTreeMap::new(),
                 acquired: BTreeMap::new(),
+                hub_files: BTreeMap::new(),
                 on_miss: Arc::new(Refuse),
                 work: BTreeMap::new(),
                 active: BTreeSet::new(),
@@ -1981,7 +1983,7 @@ impl State {
 impl Core {
     pub(crate) fn hf(&self, repo: crate::hf::Repo) -> crate::hf::HfCas {
         let cas = crate::hf::HfCas::new(repo);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(hub) = &self.hf_hub {
             return cas.with_hub(hub.clone());
         }

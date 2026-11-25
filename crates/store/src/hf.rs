@@ -31,7 +31,8 @@ use std::io::Read as _;
 
 use hellas_xet::XetHash;
 mod file;
-pub use file::{PinnedFile, PinnedRepo};
+pub use file::{PinnedFile, PinnedRepo, Revisions, is_bare_repo};
+const HUB: &str = "https://huggingface.co";
 
 /// Which kind of repository a model lives in. The API path pluralises
 /// it, which is why this is not just a string.
@@ -91,14 +92,10 @@ pub enum FetchError {
         #[source]
         source: Box<ureq::Error>,
     },
-    #[error("{context}: {source}")]
-    Io {
-        context: String,
-        #[source]
-        source: std::io::Error,
-    },
     #[error("malformed reconstruction response: {0}")]
     Malformed(String),
+    #[error("Hub file I/O: {0}")]
+    Io(#[from] std::io::Error),
     #[error("decoding a xorb: {0}")]
     Xorb(#[from] crate::xorb::XorbError),
     #[error("{context}: response is longer than the {limit} bytes allowed")]
@@ -111,7 +108,8 @@ pub(crate) const LEGACY_CHUNKING: &str =
 type Result<T> = std::result::Result<T, FetchError>;
 
 /// A CAS read token and where to spend it.
-#[derive(Clone)]
+#[derive(Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct XetToken {
     pub access_token: String,
     /// Where the CAS lives. Dynamic — do not hardcode it.
@@ -119,12 +117,19 @@ pub struct XetToken {
 }
 
 /// One contiguous run of chunks inside one xorb.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
 pub struct Term {
+    #[serde(rename = "hash", deserialize_with = "hub_hash")]
     pub xorb: XetHash,
     /// Chunk indices, half-open.
+    #[serde(rename = "range")]
     pub chunks: core::ops::Range<u64>,
     pub unpacked_length: u64,
+}
+
+fn hub_hash<'de, D: serde::Deserializer<'de>>(input: D) -> std::result::Result<XetHash, D::Error> {
+    let text = <String as serde::Deserialize>::deserialize(input)?;
+    text.parse().map_err(serde::de::Error::custom)
 }
 
 /// Where to get some of a xorb's bytes.
@@ -150,73 +155,52 @@ pub struct Reconstruction {
 impl Reconstruction {
     /// Parses a `/v2/reconstructions` response.
     pub fn parse(json: &str) -> Result<Self> {
-        let value: serde_json::Value =
+        #[derive(serde::Deserialize)]
+        struct Plan {
+            #[serde(default)]
+            offset_into_first_range: serde_json::Value,
+            terms: Vec<Term>,
+            xorbs: std::collections::BTreeMap<String, Vec<Fetch>>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Fetch {
+            url: String,
+            ranges: Vec<Ranges>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Ranges {
+            chunks: std::ops::Range<u64>,
+            bytes: std::ops::RangeInclusive<u64>,
+        }
+        let plan: Plan =
             serde_json::from_str(json).map_err(|err| FetchError::Malformed(err.to_string()))?;
-        let bad = |what: &str| FetchError::Malformed(what.to_string());
-
-        let terms = value
-            .get("terms")
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| bad("terms missing"))?
-            .iter()
-            .map(|term| {
-                let range = term.get("range").ok_or_else(|| bad("term range missing"))?;
-                Ok(Term {
-                    xorb: hash_field(term, "hash")?,
-                    chunks: half_open(range)?,
-                    unpacked_length: u64_field(term, "unpacked_length")?,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let fetches = value
-            .get("xorbs")
-            .and_then(serde_json::Value::as_object)
-            .ok_or_else(|| bad("xorbs missing"))?
-            .iter()
-            .map(|(hash, entries)| {
-                let hash = hash
-                    .parse::<XetHash>()
-                    .map_err(|_| bad("xorb key is not a hash"))?;
-                let entries = entries
-                    .as_array()
-                    .ok_or_else(|| bad("xorb entries are not an array"))?
-                    .iter()
-                    .map(|entry| {
-                        let url = entry
-                            .get("url")
-                            .and_then(serde_json::Value::as_str)
-                            .ok_or_else(|| bad("fetch url missing"))?
-                            .to_string();
-                        entry
-                            .get("ranges")
-                            .and_then(serde_json::Value::as_array)
-                            .ok_or_else(|| bad("fetch ranges missing"))?
-                            .iter()
-                            .map(|range| {
-                                let chunks =
-                                    range.get("chunks").ok_or_else(|| bad("chunks missing"))?;
-                                let bytes =
-                                    range.get("bytes").ok_or_else(|| bad("bytes missing"))?;
-                                Ok(FetchRange {
-                                    url: url.clone(),
-                                    // Half-open.
-                                    chunks: half_open(chunks)?,
-                                    // Inclusive. Deliberately not the same shape.
-                                    bytes: inclusive(bytes)?,
-                                })
-                            })
-                            .collect::<Result<Vec<_>>>()
-                    })
-                    .collect::<Result<Vec<_>>>()?
-                    .concat();
-                Ok((hash, entries))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
+        let terms = plan.terms;
+        let mut fetches = Vec::with_capacity(plan.xorbs.len());
+        for (hash, entries) in plan.xorbs {
+            let hash = hash
+                .parse()
+                .map_err(|_| FetchError::Malformed("invalid xorb hash".into()))?;
+            let mut ranges = Vec::new();
+            for fetch in entries {
+                for range in fetch.ranges {
+                    if range.chunks.end < range.chunks.start || range.bytes.is_empty() {
+                        return Err(FetchError::Malformed("backwards Hub fetch range".into()));
+                    }
+                    ranges.push(FetchRange {
+                        url: fetch.url.clone(),
+                        chunks: range.chunks,
+                        bytes: range.bytes,
+                    });
+                }
+            }
+            fetches.push((hash, ranges));
+        }
         let mut allowed: std::collections::BTreeMap<XetHash, Vec<std::ops::Range<u64>>> =
             std::collections::BTreeMap::new();
         for term in &terms {
+            if term.chunks.end < term.chunks.start {
+                return Err(FetchError::Malformed("backwards Hub term range".into()));
+            }
             allowed
                 .entry(term.xorb)
                 .or_default()
@@ -240,15 +224,14 @@ impl Reconstruction {
                     index != 0 && allowed[index - 1].end >= range.chunks.end
                 });
                 if !covered {
-                    return Err(bad("fetch chunk range exceeds requested term union"));
+                    return Err(FetchError::Malformed(
+                        "fetch chunk range exceeds requested term union".into(),
+                    ));
                 }
             }
         }
         Ok(Self {
-            offset_into_first_range: value
-                .get("offset_into_first_range")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0),
+            offset_into_first_range: plan.offset_into_first_range.as_u64().unwrap_or(0),
             terms,
             fetches,
         })
@@ -271,51 +254,6 @@ impl Reconstruction {
     }
 }
 
-/// A `{start, end}` object read as a half-open chunk range.
-///
-/// A range that ends before it starts is refused here rather than
-/// underflowing at `end - start` several layers down, where the number
-/// it produces is enormous and the failure is a panic or an absurd
-/// allocation instead of a parse error.
-fn half_open(value: &serde_json::Value) -> Result<core::ops::Range<u64>> {
-    let start = u64_field(value, "start")?;
-    let end = u64_field(value, "end")?;
-    if end < start {
-        return Err(FetchError::Malformed(format!(
-            "range {start}..{end} ends before it starts"
-        )));
-    }
-    Ok(start..end)
-}
-
-/// The same, for the byte ranges — which are inclusive, so `start == end`
-/// is one byte and not zero.
-fn inclusive(value: &serde_json::Value) -> Result<core::ops::RangeInclusive<u64>> {
-    let start = u64_field(value, "start")?;
-    let end = u64_field(value, "end")?;
-    if end < start {
-        return Err(FetchError::Malformed(format!(
-            "byte range {start}..={end} ends before it starts"
-        )));
-    }
-    Ok(start..=end)
-}
-
-fn u64_field(value: &serde_json::Value, field: &str) -> Result<u64> {
-    value
-        .get(field)
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| FetchError::Malformed(format!("{field} missing or not a number")))
-}
-
-fn hash_field(value: &serde_json::Value, field: &str) -> Result<XetHash> {
-    value
-        .get(field)
-        .and_then(serde_json::Value::as_str)
-        .and_then(|hash| hash.parse::<XetHash>().ok())
-        .ok_or_else(|| FetchError::Malformed(format!("{field} missing or not a hash")))
-}
-
 /// A HuggingFace-backed source for one repository.
 #[derive(Clone, Debug)]
 pub struct HfCas {
@@ -330,7 +268,7 @@ impl HfCas {
     pub fn new(repo: Repo) -> Self {
         Self {
             repo,
-            hub: "https://huggingface.co".to_string(),
+            hub: HUB.into(),
         }
     }
 
@@ -353,21 +291,9 @@ impl HfCas {
     pub fn token(&self) -> Result<XetToken> {
         self.repo.validate()?;
         let url = self.hub_url(true, &["xet-read-token", &self.repo.revision])?;
-        let node_token = hf_origin(url.as_str()).then(node_token).flatten();
-        let body = get(url.as_str(), node_token.as_deref(), TOKEN_BODY_LIMIT)?;
-        let value: serde_json::Value = serde_json::from_slice(&body)
-            .map_err(|err| FetchError::Malformed(format!("token response: {err}")))?;
-        let field = |name: &str| {
-            value
-                .get(name)
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-                .ok_or_else(|| FetchError::Malformed(format!("token response has no {name}")))
-        };
-        Ok(XetToken {
-            access_token: field("accessToken")?,
-            cas_url: field("casUrl")?,
-        })
+        let body = get(url.as_str(), None, TOKEN_BODY_LIMIT)?;
+        serde_json::from_slice(&body)
+            .map_err(|err| FetchError::Malformed(format!("token response: {err}")))
     }
 
     /// Reads the file's layout across xorbs.
@@ -381,43 +307,31 @@ impl HfCas {
 }
 
 fn get(url: &str, bearer: Option<&str>, limit: u64) -> Result<Vec<u8>> {
-    let (_, body) = read_body(authenticated_get(url, bearer), url, limit)?;
-    Ok(body)
+    let mut response =
+        authenticated_get(url, bearer)
+            .call()
+            .map_err(|source| FetchError::Http {
+                context: format!("GET {url}"),
+                source: Box::new(source),
+            })?;
+    read_body(response.body_mut(), url, limit)
 }
 
-/// Reads at most `limit` bytes of a response, and refuses one more.
-///
-/// `read_to_end` on a response body is an allocation whose size the
-/// other end chooses. Reading `limit + 1` and refusing the overflow is
-/// the difference between a bounded read and a promise.
-fn read_body(
-    request: ureq::RequestBuilder<ureq::typestate::WithoutBody>,
-    url: &str,
-    limit: u64,
-) -> Result<(u16, Vec<u8>)> {
-    let context = || format!("GET {url}");
-    let mut response = request.call().map_err(|source| FetchError::Http {
-        context: context(),
-        source: Box::new(source),
-    })?;
-    let status = response.status().as_u16();
-    let mut body = Vec::new();
-    response
-        .body_mut()
-        .as_reader()
-        .take(limit.saturating_add(1))
-        .read_to_end(&mut body)
-        .map_err(|source| FetchError::Io {
-            context: context(),
-            source,
-        })?;
-    if body.len() as u64 > limit {
-        return Err(FetchError::TooLarge {
-            context: context(),
-            limit,
-        });
-    }
-    Ok((status, body))
+/// ureq probes the byte after the bound and rejects overlong bodies, including streamed responses.
+fn read_body(body: &mut ureq::Body, url: &str, limit: u64) -> Result<Vec<u8>> {
+    body.with_config()
+        .limit(limit)
+        .read_to_vec()
+        .map_err(|source| match source {
+            ureq::Error::BodyExceedsLimit(_) => FetchError::TooLarge {
+                context: url.to_owned(),
+                limit,
+            },
+            source => FetchError::Http {
+                context: url.to_owned(),
+                source: Box::new(source),
+            },
+        })
 }
 
 impl std::fmt::Debug for XetToken {
@@ -439,23 +353,13 @@ fn hf_origin(value: &str) -> bool {
                 || host.ends_with(".hf.co")
         })
 }
-fn node_token() -> Option<String> {
-    token_from(|name| std::env::var_os(name))
-}
 fn token_from(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<String> {
     if let Some(token) = env("HF_TOKEN").and_then(|value| value.into_string().ok())
         && !token.trim().is_empty()
     {
         return Some(token.trim().to_owned());
     }
-    let home = env("HF_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            env("XDG_CACHE_HOME").map(|path| std::path::PathBuf::from(path).join("huggingface"))
-        })
-        .or_else(|| {
-            env("HOME").map(|path| std::path::PathBuf::from(path).join(".cache/huggingface"))
-        })?;
+    let home = hf_home(env)?;
     let bytes = hellas_private::read_bounded_regular_file(
         &home.join("token"),
         hellas_private::MAX_SECRET_BYTES,
@@ -463,6 +367,33 @@ fn token_from(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<String
     .ok()?;
     let token = String::from_utf8(bytes).ok()?;
     (!token.trim().is_empty()).then(|| token.trim().to_owned())
+}
+fn hf_home(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<std::path::PathBuf> {
+    let path = |key| {
+        env(key)
+            .filter(|value| !value.is_empty())
+            .map(std::path::PathBuf::from)
+    };
+    path("HF_HOME")
+        .or_else(|| path("XDG_CACHE_HOME").map(|path| path.join("huggingface")))
+        .or_else(|| path("HOME").map(|path| path.join(".cache/huggingface")))
+}
+
+/// The standard Hub snapshot path for a repository and exact revision, without network access.
+pub fn cached_snapshot(repo: &str, revision: &str) -> Option<std::path::PathBuf> {
+    if !hellas_rpc::protocol::invocation::valid_hub_repo(repo) || !immutable_sha(revision) {
+        return None;
+    }
+    let hub = ["HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"]
+        .into_iter()
+        .find_map(|key| std::env::var_os(key).filter(|path| !path.is_empty()))
+        .map(std::path::PathBuf::from)
+        .or_else(|| hf_home(|key| std::env::var_os(key)).map(|home| home.join("hub")))?;
+    Some(
+        hub.join(format!("models--{}", repo.replace('/', "--")))
+            .join("snapshots")
+            .join(revision),
+    )
 }
 pub(crate) fn http() -> &'static ureq::Agent {
     static HTTP: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
@@ -477,19 +408,25 @@ fn authenticated_get(
     url: &str,
     bearer: Option<&str>,
 ) -> ureq::RequestBuilder<ureq::typestate::WithoutBody> {
-    authenticated(http().get(url), url, bearer)
-}
-/// The bearer goes only to HF origins.
-fn authenticated(
-    request: ureq::RequestBuilder<ureq::typestate::WithoutBody>,
-    url: &str,
-    bearer: Option<&str>,
-) -> ureq::RequestBuilder<ureq::typestate::WithoutBody> {
-    if let Some(token) = bearer.filter(|_| hf_origin(url)) {
-        request.header("Authorization", &format!("Bearer {token}"))
-    } else {
-        request
+    #[cfg(feature = "test-support")]
+    if url::Url::parse(url)
+        .is_ok_and(|url| url.scheme() == "http" && url.host_str() == Some("127.0.0.1"))
+    {
+        let loopback: ureq::Agent = ureq::Agent::config_builder()
+            .max_redirects(0)
+            .build()
+            .into();
+        return loopback.get(url);
     }
+    let request = http().get(url);
+    if hf_origin(url)
+        && let Some(token) = bearer
+            .map(str::to_owned)
+            .or_else(|| token_from(|key| std::env::var_os(key)))
+    {
+        return request.header("Authorization", &format!("Bearer {token}"));
+    }
+    request
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -501,24 +438,87 @@ pub(crate) struct RepoFile {
     #[serde(default)]
     pub lfs: Option<serde_json::Value>,
 }
+impl RepoFile {
+    pub(crate) fn advertised(&self) -> Result<Option<hellas_rpc::ContentRef>> {
+        self.xet_hash
+            .as_deref()
+            .map(|hash| {
+                let id = hash.parse().map_err(|_| {
+                    FetchError::Malformed(format!(
+                        "invalid published Xet identity for {}",
+                        self.path
+                    ))
+                })?;
+                Ok(hellas_rpc::ContentRef::new(id, self.size))
+            })
+            .transpose()
+    }
+
+    pub(crate) fn lfs_sha256(&self) -> Result<Option<[u8; 32]>> {
+        self.lfs
+            .as_ref()
+            .map(|lfs| {
+                lfs["oid"]
+                    .as_str()
+                    .and_then(|oid| hellas_auth::hex::parse(oid).ok())
+                    .ok_or_else(|| FetchError::Malformed("Hub LFS SHA-256".into()))
+            })
+            .transpose()
+    }
+
+    /// Hash the complete Git/LFS object while copying it to the buyer's selected storage.
+    /// Small render metadata and fallback weight files share this exact-length check.
+    fn download(
+        &self,
+        cas: &HfCas,
+        out: &mut impl std::io::Write,
+    ) -> Result<hellas_rpc::ContentRef> {
+        let indexed = crate::index_stream(
+            &mut cas.small_file(&self.path)?,
+            self.size,
+            self.lfs_sha256()?,
+            |chunk| out.write_all(chunk),
+        )?
+        .ok_or_else(|| {
+            FetchError::Malformed(format!(
+                "incorrect file length or SHA-256 for {}",
+                self.path
+            ))
+        })?;
+        let object = indexed.object();
+        if self.advertised()?.is_some_and(|id| id != object) {
+            return Err(FetchError::Malformed(format!(
+                "incorrect file digest for {}",
+                self.path
+            )));
+        }
+        Ok(object)
+    }
+}
 impl Repo {
     pub fn from_uri(uri: &str) -> Result<Self> {
         let value = uri
             .strip_prefix("hf://")
             .ok_or_else(|| FetchError::Malformed("expected hf://org/repo[@revision]".into()))?;
         let (id, revision) = value.split_once('@').unwrap_or((value, "main"));
+        // A slash in a branch or tag can be escaped when the URI also names a file.
+        let mut revision = percent_encoding::percent_decode_str(revision)
+            .decode_utf8()
+            .map_err(|_| FetchError::Malformed("invalid UTF-8 in Hub revision".into()))?
+            .into_owned();
+        if immutable_sha(&revision) {
+            revision.make_ascii_lowercase();
+        }
         let repo = Self {
             kind: RepoKind::Model,
             id: id.into(),
-            revision: revision.into(),
+            revision,
         };
         repo.validate()?;
         Ok(repo)
     }
     pub(crate) fn validate(&self) -> Result<()> {
-        let parts: Vec<_> = self.id.split('/').collect();
-        if parts.len() != 2
-            || parts.iter().any(|part| !safe_component(part))
+        if !hellas_rpc::protocol::invocation::valid_hub_repo(&self.id)
             || self.revision.is_empty()
             || self.revision.contains('\0')
         {
@@ -528,14 +528,6 @@ impl Repo {
         }
         Ok(())
     }
-}
-fn safe_component(value: &str) -> bool {
-    !value.is_empty()
-        && value != "."
-        && value != ".."
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
 }
 impl HfCas {
     fn hub_url(&self, api: bool, tail: &[&str]) -> Result<url::Url> {
@@ -557,24 +549,28 @@ impl HfCas {
         }
         Ok(url)
     }
-    pub(crate) fn resolve_revision(&self, pool: &crate::content::Reservations) -> Result<String> {
+    pub(crate) fn resolve_revision(
+        &self,
+        default_branch: bool,
+        pool: &crate::content::Reservations,
+    ) -> Result<String> {
         self.repo.validate()?;
         let _metadata = pool
             .reserve(RECONSTRUCTION_BODY_LIMIT)
             .map_err(|_| FetchError::Capacity)?;
-        let url = self.hub_url(true, &["revision", &self.repo.revision])?;
-        let token = hf_origin(url.as_str()).then(node_token).flatten();
-        let value: serde_json::Value = serde_json::from_slice(&get(
-            url.as_str(),
-            token.as_deref(),
-            RECONSTRUCTION_BODY_LIMIT,
-        )?)
-        .map_err(|_| FetchError::Malformed("repository revision response".into()))?;
+        let url = if default_branch {
+            self.hub_url(true, &[])?
+        } else {
+            self.hub_url(true, &["revision", &self.repo.revision])?
+        };
+        let value: serde_json::Value =
+            serde_json::from_slice(&get(url.as_str(), None, RECONSTRUCTION_BODY_LIMIT)?)
+                .map_err(|_| FetchError::Malformed("repository revision response".into()))?;
         value
             .get("sha")
             .and_then(serde_json::Value::as_str)
             .filter(|sha| immutable_sha(sha))
-            .map(str::to_owned)
+            .map(str::to_ascii_lowercase)
             .ok_or_else(|| FetchError::Malformed("repository has no immutable SHA".into()))
     }
     pub(crate) fn files(
@@ -598,8 +594,7 @@ impl HfCas {
             let charge = pool
                 .reserve(RECONSTRUCTION_BODY_LIMIT)
                 .map_err(|_| FetchError::Capacity)?;
-            let token = hf_origin(&url).then(node_token).flatten();
-            let mut response = authenticated_get(&url, token.as_deref())
+            let mut response = authenticated_get(&url, None)
                 .call()
                 .map_err(|_| FetchError::Malformed("Hub listing failed".into()))?;
             let next = response
@@ -610,16 +605,12 @@ impl HfCas {
                 .and_then(|link| link.trim().strip_prefix('<'))
                 .and_then(|link| link.split_once('>'))
                 .map(|(url, _)| url.to_owned());
-            let mut body = Vec::new();
-            response
-                .body_mut()
-                .as_reader()
-                .take(RECONSTRUCTION_BODY_LIMIT + 1)
-                .read_to_end(&mut body)
-                .map_err(|_| FetchError::Malformed("Hub listing body".into()))?;
-            if body.len() as u64 > RECONSTRUCTION_BODY_LIMIT {
-                return Err(FetchError::Capacity);
-            }
+            let body = read_body(response.body_mut(), &url, RECONSTRUCTION_BODY_LIMIT).map_err(
+                |error| match error {
+                    FetchError::TooLarge { .. } => FetchError::Capacity,
+                    other => other,
+                },
+            )?;
             let values: Vec<serde_json::Value> = serde_json::from_slice(&body)
                 .map_err(|_| FetchError::Malformed("Hub listing encoding".into()))?;
             for value in values.into_iter().filter(|value| {
@@ -647,14 +638,18 @@ impl HfCas {
             }
         }
     }
-    pub(crate) fn small_file(&self, path: &str) -> Result<impl std::io::Read + use<>> {
+    fn file_url(&self, path: &str) -> Result<url::Url> {
         let mut url = self.hub_url(false, &["resolve", &self.repo.revision])?;
         url.path_segments_mut()
             .map_err(|_| FetchError::Malformed("Hub path".into()))?
             .extend(path.split('/'));
-        let url = url.to_string();
-        let token = hf_origin(&url).then(node_token).flatten();
-        let response = authenticated_get(&url, token.as_deref())
+        Ok(url)
+    }
+
+    pub(crate) fn small_file(&self, path: &str) -> Result<impl std::io::Read + use<>> {
+        let url = self.file_url(path)?;
+        let url = url.as_str();
+        let response = authenticated_get(url, None)
             .call()
             .map_err(|_| FetchError::Malformed("Hub file request failed".into()))?;
         if response.status() != 200 {
@@ -878,7 +873,7 @@ mod credentials_tests {
             revision: "main".into(),
         });
         assert!(matches!(
-            cas.resolve_revision(&crate::content::Reservations::ram(0)),
+            cas.resolve_revision(false, &crate::content::Reservations::ram(0)),
             Err(FetchError::Capacity)
         ));
     }
@@ -920,12 +915,11 @@ mod credentials_tests {
                 }
             }
         });
-        let (_, body) = read_body(
-            ureq::get(&url).header("Authorization", "Bearer sentinel-private-token"),
-            &url,
-            2,
-        )
-        .unwrap();
+        let mut response = ureq::get(&url)
+            .header("Authorization", "Bearer sentinel-private-token")
+            .call()
+            .unwrap();
+        let body = read_body(response.body_mut(), &url, 2).unwrap();
         assert_eq!(body, b"ok");
         serving.join().unwrap();
     }

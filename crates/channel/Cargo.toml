@@ -11,6 +11,7 @@ documentation.workspace = true
 test-support = [
     "hellas-auth/test-support",
     "hellas-private/test-support",
+    "hellas-store/test-support",
     "hellas-wire/mux",
 ]
 

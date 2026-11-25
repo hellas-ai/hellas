@@ -70,7 +70,7 @@ pub fn preflight(
     }
     let mut objects = BTreeMap::new();
     let mut names = BTreeSet::new();
-    for asset in &env.assets {
+    for asset in &env.model.assets {
         if asset.name.is_empty() || !names.insert(&asset.name) {
             return Err(invalid(0, None, "unique nonempty asset name", &asset.name));
         }
@@ -78,7 +78,7 @@ pub fn preflight(
     for object in env
         .sources
         .iter()
-        .chain(env.assets.iter().map(|a| &a.object))
+        .chain(env.model.assets.iter().map(|a| &a.object))
         .chain(inputs.values())
     {
         if objects
@@ -271,7 +271,7 @@ fn check_call(
                 bytes,
             } => {
                 expected == ValueKind::MemRef
-                    && env.assets.iter().any(|a| {
+                    && env.model.assets.iter().any(|a| {
                         a.name == *name
                             && offset
                                 .checked_add(*bytes)

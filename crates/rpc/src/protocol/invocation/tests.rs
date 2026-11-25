@@ -19,10 +19,7 @@ fn fetch_admission() -> FetchAdmission {
 fn policy() -> InvocationPolicy {
     InvocationPolicy {
         admissions: vec![
-            Admission::Compute {
-                evaluator: compute::EVALUATOR.into(),
-                programs: ComputePrograms::Any {},
-            },
+            Admission::evaluator(compute::EVALUATOR.into()),
             Admission::Fetch {
                 admission: fetch_admission(),
             },
@@ -52,12 +49,7 @@ fn every_policy_term_changes_the_committed_identity() {
         |p| p.limits.max_steps += 1,
         |p| p.limits.execution_timeout_ms += 1,
         |p| p.admissions.remove(0).validate().unwrap(),
-        |p| {
-            p.admissions[0] = Admission::Compute {
-                evaluator: "another/evaluator-1".into(),
-                programs: ComputePrograms::Any {},
-            }
-        },
+        |p| p.admissions[0] = Admission::evaluator("another/evaluator-1".into()),
         |p| fetch_mut(p).route = FetchRoutePolicy::open_fetch(true, vec!["example.com".into()]),
         |p| fetch_mut(p).route = FetchRoutePolicy::open_fetch(false, vec!["example.net".into()]),
         |p| fetch_mut(p).route = FetchRoutePolicy::sealed_route("http", "fetch").unwrap(),
@@ -167,7 +159,7 @@ fn policy_is_bounded_canonical_and_has_no_compile_budget() {
     let bytes = p.canonical_bytes().unwrap();
     assert_eq!(
         p.content_id().unwrap().to_string(),
-        "9de3a4e03988e29d402e54ba54d6bac631f4c7884c0b9a6076a996bc1e2fc405"
+        "737bd1662b216c6321dd20547af48d3f5f1540beec02da9f29f9b6799d9772fd"
     );
     assert_eq!(InvocationPolicy::from_canonical_bytes(&bytes).unwrap(), p);
     let mut trailing = bytes.clone();
@@ -490,7 +482,7 @@ fn a_fixed_fetch_contract_refuses_a_different_signed_endpoint() {
 fn compute_prepared(policy: &InvocationPolicy, plan: &compute::Plan) -> PreparedInvocation {
     let manifest = compute::Environment {
         sources: vec![crate::ContentRef::for_bytes(b"program")],
-        assets: vec![],
+        model: Default::default(),
     }
     .manifest(crate::protocol::invocation::compute::EVALUATOR)
     .unwrap();
@@ -602,6 +594,7 @@ fn application_admission_binds_owner_bytes_caller_and_staging_classification() {
     let wrong = crate::ProgramManifest::new(
         crate::Application::new(compute::EVALUATOR, "another-adaptor").unwrap(),
         compute.manifest().root(),
+        None,
     );
     assert!(p.classify_manifest(&wrong).is_err());
     let mut routes = p.clone();
@@ -613,15 +606,14 @@ fn application_admission_binds_owner_bytes_caller_and_staging_classification() {
     routes.validate().unwrap();
     assert_eq!(
         routes
-            .admissions_for(&FetchContract::http().unwrap().manifest())
+            .candidates_for(&FetchContract::http().unwrap().manifest())
             .count(),
         2
     );
     let mut forged = p;
-    forged.admissions = vec![Admission::Compute {
-        evaluator: crate::protocol::fetch_contract::FETCH_EVALUATOR.into(),
-        programs: ComputePrograms::Any {},
-    }];
+    forged.admissions = vec![Admission::evaluator(
+        crate::protocol::fetch_contract::FETCH_EVALUATOR.into(),
+    )];
     assert!(forged.classify_manifest(prepared.manifest()).is_err());
 }
 
@@ -629,22 +621,21 @@ fn application_admission_binds_owner_bytes_caller_and_staging_classification() {
 fn compute_program_selection_binds_sources_and_weights_before_admission() {
     let environment = compute::Environment {
         sources: vec![crate::ContentRef::for_bytes(b"approved program")],
-        assets: vec![compute::NamedAsset {
+        model: crate::protocol::invocation::compute::Model::new(vec![compute::NamedAsset {
             name: "weights".into(),
             object: crate::ContentRef::for_bytes(b"approved weights"),
-        }],
+        }])
+        .unwrap(),
     };
     let manifest = environment
         .manifest(crate::protocol::invocation::compute::EVALUATOR)
         .unwrap();
     let mut restricted = policy();
-    restricted.admissions[0] = Admission::Compute {
-        evaluator: compute::EVALUATOR.into(),
-        programs: ComputePrograms::Only {
-            manifests: vec![manifest.content_id()],
-            pure_setup_entries: Default::default(),
-        },
-    };
+    restricted.admissions[0] = Admission::Compute(Match {
+        evaluator: Some(compute::EVALUATOR.into()),
+        program: Some(manifest.content_id()),
+        ..Default::default()
+    });
     assert_ne!(
         restricted.content_id().unwrap(),
         policy().content_id().unwrap()
@@ -656,7 +647,7 @@ fn compute_program_selection_binds_sources_and_weights_before_admission() {
     );
     let json = serde_json::to_value(&restricted).unwrap();
     assert_eq!(
-        json["admissions"][0]["programs"]["manifests"][0],
+        json["admissions"][0]["program"],
         manifest.content_id().to_string()
     );
     assert_eq!(
@@ -701,10 +692,12 @@ fn compute_program_selection_binds_sources_and_weights_before_admission() {
             let mut changed = environment.clone();
             match change {
                 0 => changed.sources[0] = crate::ContentRef::for_bytes(b"other program"),
-                1 => changed.assets[0].object = crate::ContentRef::for_bytes(b"other weights"),
+                1 => {
+                    changed.model.assets[0].object = crate::ContentRef::for_bytes(b"other weights")
+                }
                 _ => {
-                    let asset = changed.assets[0].object;
-                    changed.assets[0].object =
+                    let asset = changed.model.assets[0].object;
+                    changed.model.assets[0].object =
                         crate::ContentRef::new(asset.id(), asset.bytes() + 1);
                 }
             }
@@ -727,30 +720,57 @@ fn compute_program_selection_binds_sources_and_weights_before_admission() {
 fn compute_program_selection_is_explicit_and_bounded() {
     let mut p = policy();
     let id = ContentId::hash(b"manifest");
-    for manifests in [
+    for ids in [
         vec![],
         vec![id, id],
-        (0..=policy::MAX_COMPUTE_PROGRAMS)
+        (0..=policy::MAX_COMPUTE_PROGRAMS * policy::MAX_ADMISSIONS)
             .map(|n| ContentId::hash(&n.to_le_bytes()))
             .collect(),
     ] {
-        p.admissions[0] = Admission::Compute {
-            evaluator: compute::EVALUATOR.into(),
-            programs: ComputePrograms::Only {
-                manifests,
-                pure_setup_entries: Default::default(),
-            },
-        };
+        p.admissions = ids
+            .into_iter()
+            .map(|id| {
+                Admission::Compute(Match {
+                    program: Some(id),
+                    ..Default::default()
+                })
+            })
+            .collect();
         assert!(p.canonical_bytes().is_err());
     }
-    let mut value = serde_json::to_value(policy()).unwrap();
-    value["admissions"][0]
-        .as_object_mut()
-        .unwrap()
-        .remove("programs");
-    assert!(serde_json::from_value::<InvocationPolicy>(value).is_err());
-    assert!(serde_json::from_str::<ComputePrograms>(r#"{"mode":"any","manifests":[]}"#).is_err());
-    assert!(serde_json::from_str::<ComputePrograms>(r#"{"mode":"only"}"#).is_err());
+    // A full Flux variant inventory with the three real setup permissions fits the signed envelope.
+    let app = crate::Application::new(compute::EVALUATOR, compute::ADAPTOR).unwrap();
+    p.admissions = (0..policy::MAX_COMPUTE_PROGRAMS)
+        .map(|n| {
+            let manifest = crate::ProgramManifest::new(
+                app.clone(),
+                ContentId::hash(&n.to_le_bytes()),
+                Some(id),
+            );
+            Admission::exact(
+                &manifest,
+                &["flux.setup-text", "flux.setup-denoise", "flux.setup-vae"],
+            )
+            .unwrap()
+        })
+        .collect();
+    assert!(p.canonical_bytes().is_ok());
+    let fetch = Admission::Fetch {
+        admission: fetch_admission(),
+    };
+    p.admissions
+        .extend(std::iter::repeat_n(fetch, policy::MAX_ADMISSIONS));
+    assert!(
+        p.validate()
+            .unwrap_err()
+            .to_string()
+            .contains("bounded application admissions")
+    );
+    assert!(
+        serde_json::from_str::<Admission>(r#"{"kind":"compute","programs":{"mode":"any"}}"#)
+            .is_err()
+    );
+    assert!(serde_json::from_str::<Admission>(r#"{"kind":"compute","rules":[{}]}"#).is_err());
     // Old policy bytes are never silently interpreted as unrestricted compute.
     assert!(
         InvocationPolicy::from_canonical_bytes(
@@ -1245,6 +1265,7 @@ fn closure_manifest(root: &[u8]) -> crate::ProgramManifest {
     crate::ProgramManifest::new(
         crate::Application::new(compute::EVALUATOR, compute::ADAPTOR).unwrap(),
         crate::ContentId::hash(root),
+        Some(compute::Model::default().content_id().unwrap()),
     )
 }
 
@@ -1254,7 +1275,7 @@ fn content_closure_opens_the_signed_root_and_returns_unique_exact_references() {
     let weights = crate::ContentRef::new(crate::ContentId::from_bytes([55; 32]), 1 << 30);
     let environment = compute::Environment {
         sources: vec![source, source],
-        assets: vec![
+        model: crate::protocol::invocation::compute::Model::new(vec![
             compute::NamedAsset {
                 name: "weights".into(),
                 object: weights,
@@ -1267,7 +1288,8 @@ fn content_closure_opens_the_signed_root_and_returns_unique_exact_references() {
                 name: "source".into(),
                 object: source,
             },
-        ],
+        ])
+        .unwrap(),
     };
     let bytes = environment.canonical_bytes().unwrap();
     assert_eq!(
@@ -1277,7 +1299,7 @@ fn content_closure_opens_the_signed_root_and_returns_unique_exact_references() {
     let manifest = environment
         .manifest(crate::protocol::invocation::compute::EVALUATOR)
         .unwrap();
-    let actual = policy().content_closure(&manifest, &bytes).unwrap();
+    let (actual, _) = policy().content_closure(&manifest, &bytes, None).unwrap();
     assert_eq!(actual.len(), 3);
     assert!(actual.contains(&crate::ContentRef::for_bytes(&bytes)));
     assert!(actual.contains(&source));
@@ -1292,15 +1314,21 @@ fn content_closure_opens_the_signed_root_and_returns_unique_exact_references() {
     other.sources.clear();
     assert!(
         policy()
-            .content_closure(&manifest, &other.canonical_bytes().unwrap())
+            .content_closure(&manifest, &other.canonical_bytes().unwrap(), None)
             .is_err()
     );
     let mut unapproved = policy();
     unapproved.admissions.remove(0);
-    assert!(unapproved.content_closure(&manifest, &bytes).is_err());
+    assert!(unapproved.content_closure(&manifest, &bytes, None).is_err());
     let fetch = FetchContract::http().unwrap().manifest();
-    assert!(policy().content_closure(&fetch, &[]).unwrap().is_empty());
-    assert!(policy().content_closure(&fetch, &bytes).is_err());
+    assert!(
+        policy()
+            .content_closure(&fetch, &[], None)
+            .unwrap()
+            .0
+            .is_empty()
+    );
+    assert!(policy().content_closure(&fetch, &bytes, None).is_err());
 }
 
 #[test]
@@ -1308,21 +1336,23 @@ fn content_closure_refuses_conflicting_lengths_names_and_impossible_source_sizes
     let object = crate::ContentRef::for_bytes(b"source");
     let environment = compute::Environment {
         sources: vec![object],
-        assets: vec![compute::NamedAsset {
+        model: crate::protocol::invocation::compute::Model::new(vec![compute::NamedAsset {
             name: "asset".into(),
             object,
-        }],
+        }])
+        .unwrap(),
     };
     let changes: &[fn(&mut compute::Environment)] = &[
         |e| {
-            e.assets[0].object = crate::ContentRef::new(e.sources[0].id(), e.sources[0].bytes() + 1)
+            e.model.assets[0].object =
+                crate::ContentRef::new(e.sources[0].id(), e.sources[0].bytes() + 1)
         },
-        |e| e.assets.push(e.assets[0].clone()),
-        |e| e.assets[0].name.clear(),
-        |e| e.assets[0].name = "x".repeat(257),
+        |e| e.model.assets.push(e.model.assets[0].clone()),
+        |e| e.model.assets[0].name.clear(),
+        |e| e.model.assets[0].name = "x".repeat(257),
         |e| {
             e.sources[0] = crate::ContentRef::new(e.sources[0].id(), compute::MAX_SOURCE_BYTES + 1);
-            e.assets.clear();
+            e.model.assets.clear();
         },
     ];
     for change in changes {
@@ -1331,7 +1361,7 @@ fn content_closure_refuses_conflicting_lengths_names_and_impossible_source_sizes
         let bytes = changed.canonical_bytes().unwrap();
         assert!(
             policy()
-                .content_closure(&closure_manifest(&bytes), &bytes)
+                .content_closure(&closure_manifest(&bytes), &bytes, None)
                 .is_err()
         );
     }
@@ -1341,11 +1371,11 @@ fn content_closure_refuses_conflicting_lengths_names_and_impossible_source_sizes
 fn content_closure_bounds_reference_arrays_before_decoding_their_members() {
     let empty = compute::Environment {
         sources: vec![],
-        assets: vec![],
+        model: Default::default(),
     }
     .canonical_bytes()
     .unwrap();
-    for field in ["assets", "sources"] {
+    for field in ["model", "sources"] {
         let mut bytes = empty.clone();
         let mut needle = encode(&field).unwrap();
         needle.push(0x80);
@@ -1365,7 +1395,7 @@ fn content_closure_bounds_reference_arrays_before_decoding_their_members() {
         bytes.splice(offset..offset + 1, members);
         assert!(bytes.len() <= compute::MAX_ENVIRONMENT_BYTES);
         let error = policy()
-            .content_closure(&closure_manifest(&bytes), &bytes)
+            .content_closure(&closure_manifest(&bytes), &bytes, None)
             .unwrap_err();
         assert!(
             error
@@ -1376,7 +1406,7 @@ fn content_closure_bounds_reference_arrays_before_decoding_their_members() {
     }
     let bytes = vec![0; compute::MAX_ENVIRONMENT_BYTES + 1];
     let error = policy()
-        .content_closure(&closure_manifest(&bytes), &bytes)
+        .content_closure(&closure_manifest(&bytes), &bytes, None)
         .unwrap_err();
     assert!(error.to_string().contains("exceeds its byte budget"));
 }
@@ -1385,7 +1415,7 @@ fn content_closure_bounds_reference_arrays_before_decoding_their_members() {
 fn content_closure_refuses_noncanonical_or_trailing_root_bytes_even_with_matching_hashes() {
     let root = compute::Environment {
         sources: vec![],
-        assets: vec![],
+        model: Default::default(),
     }
     .canonical_bytes()
     .unwrap();
@@ -1393,17 +1423,17 @@ fn content_closure_refuses_noncanonical_or_trailing_root_bytes_even_with_matchin
     trailing.push(0);
     assert!(
         policy()
-            .content_closure(&closure_manifest(&trailing), &trailing)
+            .content_closure(&closure_manifest(&trailing), &trailing, None)
             .is_err()
     );
     let mut noncanonical = vec![0x98, 2];
     noncanonical.extend_from_slice(&root[1..]);
     assert!(
         policy()
-            .content_closure(&closure_manifest(&noncanonical), &noncanonical)
+            .content_closure(&closure_manifest(&noncanonical), &noncanonical, None)
             .is_err()
     );
-    let key = encode(&"assets").unwrap();
+    let key = encode(&"model").unwrap();
     let fields = root
         .windows(key.len())
         .position(|bytes| bytes == key)
@@ -1413,7 +1443,7 @@ fn content_closure_refuses_noncanonical_or_trailing_root_bytes_even_with_matchin
     wrong_count[fields - 1] = 0xa3;
     assert!(
         policy()
-            .content_closure(&closure_manifest(&wrong_count), &wrong_count)
+            .content_closure(&closure_manifest(&wrong_count), &wrong_count, None)
             .is_err()
     );
     let mut reordered = root[..fields].to_vec();
@@ -1423,7 +1453,7 @@ fn content_closure_refuses_noncanonical_or_trailing_root_bytes_even_with_matchin
     reordered.push(0x80);
     assert!(
         policy()
-            .content_closure(&closure_manifest(&reordered), &reordered)
+            .content_closure(&closure_manifest(&reordered), &reordered, None)
             .is_err()
     );
 }
@@ -1548,44 +1578,99 @@ fn http_bounds_cover_raw_audio_headers_framing_and_retained_envelopes() {
 
 #[test]
 fn setup_declarations_bind_exact_admitted_program_and_evaluator() {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeSet;
     let env = compute::Environment {
         sources: vec![],
-        assets: vec![],
+        model: Default::default(),
     };
     let manifest = env.manifest(compute::EVALUATOR).unwrap();
     let mut p = policy();
-    let id = manifest.content_id();
-    let second = ContentId::from_bytes([1; 32]);
+    p.admissions = vec![Admission::exact(&manifest, &["weights.prep"]).unwrap()];
     let entries = BTreeSet::from(["weights.prep".to_owned()]);
-    p.admissions = vec![Admission::Compute {
-        evaluator: compute::EVALUATOR.into(),
-        programs: ComputePrograms::Only {
-            manifests: vec![id, second],
-            pure_setup_entries: BTreeMap::from([
-                (id, entries.clone()),
-                (second, BTreeSet::from(["second.prep".into()])),
-            ]),
-        },
-    }];
-    // Existing signed policies encode these two setup-map keys as lowercase text.
-    assert_eq!(
-        p.content_id().unwrap().to_string(),
-        "1123857c338e17f53a8b3e7ba59ec6ee7171f69ddc0523d3738401ab583bb74c"
-    );
-    assert_eq!(p.pure_setup_entries(&manifest), entries);
+    assert_eq!(p.admitted_setup(&manifest, &[]), Some(entries));
     assert!(
-        p.pure_setup_entries(&env.manifest("other").unwrap())
-            .is_empty()
+        p.admitted_setup(&env.manifest("other").unwrap(), &[])
+            .is_none()
     );
     let bytes = p.canonical_bytes().unwrap();
     assert_eq!(InvocationPolicy::from_canonical_bytes(&bytes).unwrap(), p);
-    if let Admission::Compute {
-        programs: ComputePrograms::Only { manifests, .. },
-        ..
-    } = &mut p.admissions[0]
-    {
-        manifests[0] = ContentId::hash(b"other");
-    }
+    let Admission::Compute(rule) = &mut p.admissions[0] else {
+        unreachable!()
+    };
+    rule.program = None;
     assert!(p.validate().is_err());
+}
+
+#[test]
+fn repo_match_requires_every_asset_to_have_a_verified_origin_in_the_set() {
+    use std::collections::BTreeSet;
+    let manifest = compute::Environment {
+        sources: vec![],
+        model: Default::default(),
+    }
+    .manifest(compute::EVALUATOR)
+    .unwrap();
+    let base = BTreeSet::from(["org/model".to_owned()]);
+    let voices = BTreeSet::from(["org/voices".to_owned()]);
+    let mut rule = Match {
+        repos: vec!["org/model".into(), "org/voices".into()],
+        ..Default::default()
+    };
+    assert!(rule.matches(&manifest, None));
+    assert!(!rule.matches(&manifest, Some(&[])));
+    assert!(!rule.matches(&manifest, Some(&[base.clone(), BTreeSet::new()])));
+    let receipts = [base, voices];
+    assert!(rule.matches(&manifest, Some(&receipts)));
+    rule.repos.pop();
+    assert!(!rule.matches(&manifest, Some(&receipts)));
+    rule.repos.push("org/*".into());
+    assert!(Admission::Compute(rule).validate().is_err());
+}
+
+#[test]
+fn model_identity_is_order_independent_and_binds_metadata_across_programs() {
+    let file = |name: &str, data: &[u8]| compute::NamedAsset {
+        name: name.into(),
+        object: crate::ContentRef::for_bytes(data),
+    };
+    let weights = file("model.safetensors", b"weights");
+    let config = file("tokenizer.json", b"vocabulary");
+    let model = compute::Model::new(vec![config.clone(), weights.clone()]).unwrap();
+    let id = model.content_id().unwrap();
+    assert_eq!(
+        model,
+        compute::Model::from_canonical_bytes(&model.canonical_bytes().unwrap()).unwrap()
+    );
+    assert_eq!(
+        id,
+        compute::Model::new(vec![weights.clone(), config.clone()])
+            .unwrap()
+            .content_id()
+            .unwrap()
+    );
+    assert!(compute::Model::new(vec![weights.clone(), weights.clone()]).is_err());
+    let make = |source: &[u8], model| compute::Environment {
+        sources: vec![crate::ContentRef::for_bytes(source)],
+        model,
+    };
+    let first = make(b"program 1", model.clone());
+    let second = make(b"program 2", model);
+    let manifest = first.manifest(compute::EVALUATOR).unwrap();
+    let variant = second.manifest("other-renderer").unwrap();
+    assert_ne!(manifest.content_id(), variant.content_id());
+    assert_eq!(manifest.model(), Some(id));
+    assert_eq!(manifest.model(), variant.model());
+    let changed =
+        compute::Model::new(vec![weights, file("tokenizer.json", b"another vocabulary")]).unwrap();
+    assert_ne!(changed.content_id().unwrap(), id);
+    let forged = ProgramManifest::new(
+        manifest.application().clone(),
+        manifest.root(),
+        Some(changed.content_id().unwrap()),
+    );
+    assert!(
+        policy()
+            .content_closure(&forged, &first.canonical_bytes().unwrap(), None)
+            .is_err()
+    );
 }

@@ -257,7 +257,7 @@ async fn model_job_restart_inner(provider_held: bool) {
 
     let package = ModelPackage::open(
         &fixture,
-        &hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip),
+        &hellas_client::model::evaluator(hellas_client::model::GpuDialect::Hip, "gfx1151"),
     )
     .await
     .expect("the miniature Qwen model opens");
@@ -271,7 +271,7 @@ async fn model_job_restart_inner(provider_held: bool) {
         .expect("the model renders a Compute job");
 
     let weights = std::fs::read(&fixture).expect("the model weights are readable");
-    let [weights_asset] = &job.environment.assets[..] else {
+    let [weights_asset] = &job.environment.model.assets[..] else {
         panic!("the model job names exactly one weight asset");
     };
     assert_eq!(weights_asset.object, ContentRef::for_bytes(&weights));

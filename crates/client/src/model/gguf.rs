@@ -66,15 +66,14 @@ pub fn read_header<R: Read + Seek>(input: &mut R) -> Result<Header, Error> {
 /// Grow the prefix only into bytes required by the remaining GGUF records.
 #[cfg(feature = "models")]
 pub(super) fn remote_header(
-    file: &hellas_store::hf::PinnedFile,
+    size: u64,
+    mut read: impl FnMut(std::ops::Range<u64>, &mut Vec<u8>) -> io::Result<()>,
 ) -> Result<(Header, Vec<u8>), Error> {
     let mut prefix = io::Cursor::new(Vec::new());
-    let size = file.object.bytes();
     let header = read_header_for_bytes(&mut prefix, size, |cursor, needed, through| {
         let start = cursor.get_ref().len() as u64;
         if needed > start {
-            file.read_range(start..through, cursor.get_mut())
-                .map_err(io::Error::other)?;
+            read(start..through, cursor.get_mut())?;
         }
         Ok(())
     })?;

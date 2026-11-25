@@ -867,7 +867,7 @@ impl State {
                 .admissions
                 .iter()
                 .any(|admission| match admission {
-                    hellas_rpc::protocol::invocation::Admission::Compute { .. } => false,
+                    hellas_rpc::protocol::invocation::Admission::Compute(_) => false,
                     hellas_rpc::protocol::invocation::Admission::Fetch { admission } => {
                         admission.contract.manifest_id() == auth.environment_commitment
                             && (admission.contract.schema()

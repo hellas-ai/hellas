@@ -156,34 +156,17 @@ impl ChannelStore {
         work: Digest,
         object: ContentRef,
     ) -> Result<bytes::Bytes, WorkStoreError> {
-        if object.bytes() > crate::content::MAX_CONTENT_BYTES as u64 {
-            return Err(Error::Invalid("prepared input byte limit").into());
+        let (store, scope) = self.invocation_content(work)?;
+        if matches!(store, LocalStore::Memory(_)) {
+            return Err(Error::Denied.into());
         }
-        Ok(crate::content::read_reader(
-            self.open_content_reader(work, object)
-                .await?
-                .ok_or(Error::Missing)?,
+        Ok(crate::content::read_staged(
+            &store,
+            &scope,
             object,
-            &self.content.ram_pool(),
+            crate::content::MAX_CONTENT_BYTES as u64,
         )
         .await?)
-    }
-
-    pub(crate) async fn open_content_reader(
-        &self,
-        work: Digest,
-        object: ContentRef,
-    ) -> Result<Option<hellas_store::content::VerifiedReader>, WorkStoreError> {
-        let (store, scope) = self.invocation_content(work)?;
-        Ok(match store {
-            LocalStore::Disk(node) => node.open_staged(&scope, object).await?,
-            LocalStore::Job(job) => {
-                LocalStore::Job(job)
-                    .open_verified(&scope, object, None)
-                    .await?
-            }
-            LocalStore::Memory(_) => return Err(Error::Denied.into()),
-        })
     }
 
     pub(crate) async fn reserve_retained(

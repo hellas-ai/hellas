@@ -6,14 +6,13 @@ use crate::{
 use axum::{
     Json, Router, body::Body, extract::Request, http::StatusCode, response::Response, routing::get,
 };
-use hellas_client::model::ModelPackage;
+use hellas_client::model::{ModelPackage, ModelSpec};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
     sync::Arc,
 };
 
-pub type Models = BTreeMap<PathBuf, Result<BTreeMap<String, Arc<ModelPackage>>, String>>;
+pub type Models = BTreeMap<ModelSpec, Result<BTreeMap<String, Arc<ModelPackage>>, String>>;
 use tower::ServiceExt;
 
 pub async fn router(
@@ -22,16 +21,13 @@ pub async fn router(
     jobs: Arc<crate::jobs::Jobs>,
     memory: Arc<crate::RoutingState>,
 ) -> GatewayResult<Router> {
-    let mut evaluators: BTreeMap<PathBuf, BTreeSet<String>> = BTreeMap::new();
+    let mut evaluators: BTreeMap<ModelSpec, BTreeSet<String>> = BTreeMap::new();
     let backends = work.backends();
     for route in &routes {
         if let Some((_, package)) = route.model_package() {
             for id in &route.backends {
-                let evaluator = backends
-                    .iter()
-                    .find(|backend| backend.id == *id)
-                    .and_then(|backend| backend.evaluator.clone())
-                    .ok_or_else(|| {
+                let evaluator =
+                    crate::BackendInfo::evaluator_for(&backends, id).ok_or_else(|| {
                         crate::GatewayError::Presentation(
                             format!("backend {id} has no Compute evaluator").into(),
                         )
@@ -39,31 +35,18 @@ pub async fn router(
                 evaluators
                     .entry(package.clone())
                     .or_default()
-                    .insert(evaluator);
+                    .insert(evaluator.into());
             }
         }
     }
     let mut models = Models::new();
-    for (path, evaluators) in evaluators {
-        let mut voices = BTreeSet::new();
-        for route in &routes {
-            if route.model_package().is_some_and(|(_, p)| p == &path) {
-                if route.model_voices().is_empty() {
-                    voices.insert("default".to_string());
-                }
-                voices.extend(route.model_voices().iter().cloned());
-            }
-        }
+    for (spec, evaluators) in evaluators {
         models.insert(
-            path.clone(),
-            Ok(ModelPackage::open_many_with_voices(
-                &path,
-                evaluators,
-                None,
-                &voices.into_iter().collect::<Vec<_>>(),
-            )
-            .await
-            .map_err(|error| crate::GatewayError::Presentation(error.into()))?),
+            spec.clone(),
+            Ok(spec
+                .open_many(evaluators, None)
+                .await
+                .map_err(|error| crate::GatewayError::Presentation(error.into()))?),
         );
     }
     let (router, errors) = with_models(routes, work, jobs, memory, &models).await?;

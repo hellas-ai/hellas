@@ -543,7 +543,8 @@ async fn controlled_gateway(
         .await
         .unwrap();
     let routes =
-        hellas_sdk::grant_routes(&session.target.offer().grant.policies[0], "friend").unwrap();
+        hellas_sdk::grant_routes(&session.target.offer().grant.policies[0], "friend", None)
+            .unwrap();
     let target = hellas_sdk::Backend::grant(
         session.target.offer().grant.policies[0].clone(),
         session,

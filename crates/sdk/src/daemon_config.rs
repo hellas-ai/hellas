@@ -344,12 +344,13 @@ impl Document {
             let mut keys = std::collections::BTreeSet::new();
             for id in backends {
                 let key = match &self.backends[id].kind {
+                    // A local backend without a GPU registers no evaluator and serves nothing.
                     BackendKind::Local { .. } => {
-                        let evaluator = resolved
-                            .iter()
-                            .find(|backend| backend.id == *id)
-                            .and_then(|backend| backend.evaluator.as_deref())
-                            .ok_or("local backend has no registered evaluator")?;
+                        let Some(evaluator) =
+                            hellas_gateway::BackendInfo::evaluator_for(resolved, id)
+                        else {
+                            continue;
+                        };
                         ("compute", evaluator, "")
                     }
                     BackendKind::Fetch {

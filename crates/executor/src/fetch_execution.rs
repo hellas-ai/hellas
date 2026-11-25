@@ -497,6 +497,13 @@ mod tests {
             .unwrap();
         let mut config = ExecutorSpawnConfig::new(key.clone(), routes);
         config.fetch_max_in_flight = 1;
+        #[cfg(feature = "compute")]
+        {
+            config.gpu_config = Some(crate::GpuConfig::new(crate::catena::Gpu {
+                dialect: crate::GpuDialect::Hip,
+                arch: "gfx1151".into(),
+            }));
+        }
         let executor = Executor::spawn_configured(config).await.unwrap();
         let (entered, started) = tokio::sync::oneshot::channel();
         let entered = std::sync::Mutex::new(Some(entered));
@@ -583,10 +590,9 @@ mod tests {
 
         // Retained content lost after admission still yields an authenticated failure.
         let compute_policy = InvocationPolicy {
-            admissions: vec![Admission::Compute {
-                evaluator: hellas_channel::test_support::channel::evaluator(),
-                programs: hellas_rpc::protocol::invocation::ComputePrograms::Any {},
-            }],
+            admissions: vec![Admission::evaluator(
+                hellas_channel::test_support::channel::evaluator(),
+            )],
             limits,
         };
         let mut compute = hellas_channel::test_support::channel::bundle(1);

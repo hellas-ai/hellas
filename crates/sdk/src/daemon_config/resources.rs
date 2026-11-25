@@ -7,8 +7,9 @@ use hellas_authority::model::grant::{
     resource::{AccountingProfile, HttpsResource, PathModelPolicy},
     responses::ResponsesResource,
 };
+use hellas_client::model::ModelSpec;
 use hellas_gateway::Presentation;
-use hellas_rpc::protocol::invocation::{Admission, InvocationPolicy, Limits};
+use hellas_rpc::protocol::invocation::{Admission, InvocationPolicy, Limits, Match};
 
 /// Operator terms for a named resource. Core derives the executable policy and
 /// the authority journal assigns its revision at commit.
@@ -31,9 +32,10 @@ pub struct Resource {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ResourceKind {
     Model {
-        package: PathBuf,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        voices: Vec<String>,
+        package: ModelSpec,
+        /// When omitted, derive the exact programs and setup entries from the package.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rules: Option<Vec<Match>>,
     },
     Https {
         https: HttpsResource,
@@ -80,66 +82,30 @@ impl Resource {
     }
 }
 impl Document {
-    pub(crate) fn model_voices(
-        &self,
-        path: &std::path::Path,
-        backend: Option<&str>,
-    ) -> Vec<String> {
-        let mut voices = std::collections::BTreeSet::new();
-        let mut include = |list: &[String]| {
-            if list.is_empty() {
-                voices.insert("default".to_string());
-            }
-            voices.extend(list.iter().cloned());
-        };
-        for route in &self.routes {
-            if backend.is_none_or(|b| route.backends.iter().any(|id| id == b))
-                && route.model_package().is_some_and(|(_, p)| p == path)
-            {
-                include(route.model_voices());
-            }
-        }
-        for resource in &self.resources {
-            if let ResourceKind::Model { package, voices } = &resource.kind
-                && package == path
-                && backend.is_none_or(|b| resource.backend == b)
-            {
-                include(voices);
-            }
-        }
-        voices.into_iter().collect()
+    /// All native packages and the backends that serve them, from routes and grants alike.
+    pub(crate) fn model_bindings(&self) -> impl Iterator<Item = (&ModelSpec, &String)> {
+        let routes = self
+            .routes
+            .iter()
+            .filter_map(|r| Some((r.model_package()?.1, &r.backends)));
+        routes
+            .flat_map(|(spec, ids)| ids.iter().map(move |id| (spec, id)))
+            .chain(self.resources.iter().filter_map(|r| match &r.kind {
+                ResourceKind::Model { package, .. } => Some((package, &r.backend)),
+                _ => None,
+            }))
     }
 
     pub(crate) fn model_evaluators(
         &self,
         info: &[hellas_gateway::BackendInfo],
-    ) -> BTreeMap<PathBuf, std::collections::BTreeSet<String>> {
-        let mut requested: BTreeMap<PathBuf, std::collections::BTreeSet<String>> = BTreeMap::new();
-        for route in &self.routes {
-            if let Some((_, package)) = route.model_package() {
-                let evaluators = requested.entry(package.clone()).or_default();
-                for id in &route.backends {
-                    if let Some(evaluator) = info
-                        .iter()
-                        .find(|backend| backend.id == *id)
-                        .and_then(|backend| backend.evaluator.clone())
-                    {
-                        evaluators.insert(evaluator);
-                    }
-                }
-            }
-        }
-        for resource in &self.resources {
-            if let ResourceKind::Model { package, .. } = &resource.kind {
-                let evaluators = requested.entry(package.clone()).or_default();
-                if let Some(evaluator) = info
-                    .iter()
-                    .find(|backend| backend.id == resource.backend)
-                    .and_then(|backend| backend.evaluator.clone())
-                {
-                    evaluators.insert(evaluator);
-                }
-            }
+    ) -> BTreeMap<ModelSpec, std::collections::BTreeSet<String>> {
+        let mut requested = BTreeMap::new();
+        for (spec, id) in self.model_bindings() {
+            let evaluators: &mut std::collections::BTreeSet<_> =
+                requested.entry(spec.clone()).or_default();
+            evaluators
+                .extend(hellas_gateway::BackendInfo::evaluator_for(info, id).map(str::to_owned));
         }
         requested
     }
@@ -151,13 +117,7 @@ impl Document {
     ) -> Result<NodeConfiguration, crate::daemon::Error> {
         let mut models = hellas_gateway::router::Models::new();
         for (path, evaluators) in self.model_evaluators(info) {
-            let packages = hellas_client::model::ModelPackage::open_many_with_voices(
-                &path,
-                evaluators,
-                None,
-                &self.model_voices(&path, None),
-            )
-            .await?;
+            let packages = path.open_many(evaluators, None).await?;
             models.insert(path, Ok(packages));
         }
         self.configuration(info, &models)
@@ -187,7 +147,7 @@ impl Document {
                                 id.clone(),
                                 ResourceKind::Model {
                                     package: package.clone(),
-                                    voices: route.model_voices().to_vec(),
+                                    rules: None,
                                 },
                             );
                             resource.rates = Some(vec![]);
@@ -303,83 +263,95 @@ impl Resource {
         models: &hellas_gateway::router::Models,
         model_route: bool,
     ) -> Result<GrantPolicy, crate::daemon::Error> {
-        let (invocation_policy, https, responses) = match (&self.kind, &backend.kind) {
-            (ResourceKind::Model { package, voices }, BackendKind::Local { .. }) => {
-                let evaluator = backends
-                    .iter()
-                    .find(|b| b.id == self.backend)
-                    .and_then(|b| b.evaluator.as_deref())
-                    .ok_or("local backend has no evaluator")?;
-                let package = models
-                    .get(package)
-                    .ok_or("model was not prepared")?
-                    .as_ref()
-                    .map_err(|error| error.clone())?
-                    .get(evaluator)
-                    .ok_or("model evaluator was not prepared")?;
-                (
-                    InvocationPolicy {
-                        admissions: package.compute_admissions(voices)?,
-                        limits: Limits {
-                            max_upload_bytes: 8 << 20,
-                            max_output_bytes: 4 << 20,
-                            max_steps: 4096,
-                            execution_timeout_ms: self.max_job_millis.get(),
-                        },
-                    },
-                    None,
-                    None,
-                )
-            }
-            (kind, BackendKind::Fetch { upstream, .. }) => {
-                let (https, responses) = match (kind, upstream) {
-                    (ResourceKind::Https { https }, Upstream::Http { credentials, .. }) => {
-                        if https.account_backed != account_backed(https, credentials) {
-                            return Err(
-                                "HTTPS account_backed disagrees with backend credential scopes"
-                                    .into(),
-                            );
+        let (invocation_policy, backend_evaluator, https, responses) =
+            match (&self.kind, &backend.kind) {
+                (ResourceKind::Model { package, rules }, BackendKind::Local { .. }) => {
+                    let evaluator =
+                        hellas_gateway::BackendInfo::evaluator_for(backends, &self.backend)
+                            .ok_or("local backend has no evaluator")?;
+                    let package = models
+                        .get(package)
+                        .ok_or("model was not prepared")?
+                        .as_ref()
+                        .map_err(|error| error.clone())?
+                        .get(evaluator)
+                        .ok_or("model evaluator was not prepared")?;
+                    let admissions = match rules {
+                        Some(rules) => {
+                            if rules.len()
+                                > hellas_rpc::protocol::invocation::policy::MAX_COMPUTE_PROGRAMS
+                            {
+                                return Err("too many model resource rules".into());
+                            }
+                            rules.iter().cloned().map(Admission::Compute).collect()
                         }
-                        (Some(https.clone()), None)
-                    }
-                    (ResourceKind::Responses { responses }, Upstream::OpenaiResponses { .. }) => {
-                        (None, Some(responses.clone()))
-                    }
-                    _ => return Err("resource and backend protocols disagree".into()),
-                };
-                let mut policy = backend.fetch_policy()?;
-                if !model_route {
-                    policy.limits = Limits {
-                        max_upload_bytes: 128 << 10,
-                        max_output_bytes: if responses.is_some() {
-                            1 << 20
-                        } else {
-                            4 << 20
-                        },
-                        max_steps: 1,
-                        execution_timeout_ms: self.max_job_millis.get(),
+                        None => package.compute_admissions()?,
                     };
-                    for admission in &mut policy.admissions {
-                        if let Admission::Fetch { admission } = admission {
-                            admission.limits =
-                                hellas_rpc::protocol::invocation::fetch::FetchLimits {
-                                    max_request_body_bytes: 64 << 10,
-                                    max_output_events: 4096,
-                                    max_spool_bytes: if responses.is_some() {
-                                        4 << 20
-                                    } else {
-                                        8 << 20
-                                    },
-                                    max_encoded_result_frame: 4 << 20,
-                                    max_encoded_prepared_input: 128 << 10,
-                                };
+                    (
+                        InvocationPolicy {
+                            admissions,
+                            limits: Limits {
+                                max_upload_bytes: 8 << 20,
+                                max_output_bytes: 4 << 20,
+                                max_steps: 4096,
+                                execution_timeout_ms: self.max_job_millis.get(),
+                            },
+                        },
+                        Some(evaluator.to_owned()),
+                        None,
+                        None,
+                    )
+                }
+                (kind, BackendKind::Fetch { upstream, .. }) => {
+                    let (https, responses) = match (kind, upstream) {
+                        (ResourceKind::Https { https }, Upstream::Http { credentials, .. }) => {
+                            if https.account_backed != account_backed(https, credentials) {
+                                return Err(
+                                    "HTTPS account_backed disagrees with backend credential scopes"
+                                        .into(),
+                                );
+                            }
+                            (Some(https.clone()), None)
+                        }
+                        (
+                            ResourceKind::Responses { responses },
+                            Upstream::OpenaiResponses { .. },
+                        ) => (None, Some(responses.clone())),
+                        _ => return Err("resource and backend protocols disagree".into()),
+                    };
+                    let mut policy = backend.fetch_policy()?;
+                    if !model_route {
+                        policy.limits = Limits {
+                            max_upload_bytes: 128 << 10,
+                            max_output_bytes: if responses.is_some() {
+                                1 << 20
+                            } else {
+                                4 << 20
+                            },
+                            max_steps: 1,
+                            execution_timeout_ms: self.max_job_millis.get(),
+                        };
+                        for admission in &mut policy.admissions {
+                            if let Admission::Fetch { admission } = admission {
+                                admission.limits =
+                                    hellas_rpc::protocol::invocation::fetch::FetchLimits {
+                                        max_request_body_bytes: 64 << 10,
+                                        max_output_events: 4096,
+                                        max_spool_bytes: if responses.is_some() {
+                                            4 << 20
+                                        } else {
+                                            8 << 20
+                                        },
+                                        max_encoded_result_frame: 4 << 20,
+                                        max_encoded_prepared_input: 128 << 10,
+                                    };
+                            }
                         }
                     }
+                    (policy, None, https, responses)
                 }
-                (policy, https, responses)
-            }
-            _ => return Err("resource and backend protocols disagree".into()),
-        };
+                _ => return Err("resource and backend protocols disagree".into()),
+            };
         Ok(GrantPolicy {
             resource: self.resource,
             account: self.account,
@@ -387,6 +359,7 @@ impl Resource {
             name: self.name.clone(),
             config_change: self.config_change,
             invocation_policy,
+            backend_evaluator,
             https,
             responses,
             pricing: Pricing {
