@@ -11,6 +11,13 @@ mod models;
 use models::Files;
 pub(super) use models::ModelIndex;
 
+/// Opens the GPU runtime local backends execute on.
+#[cfg(all(feature = "compute", not(test)))]
+const OPEN_GPU: hellas_executor::catena::OpenGpu = hellas_executor::catena::Gpu::open;
+/// Daemon unit tests run local backends on a fake device.
+#[cfg(all(feature = "compute", test))]
+const OPEN_GPU: hellas_executor::catena::OpenGpu = crate::test_support::open_gpu;
+
 pub struct Options {
     pub discovery: bool,
     pub endpoint: Option<iroh::Endpoint>,
@@ -369,7 +376,7 @@ impl Runtime {
                 }
                 #[cfg(feature = "compute")]
                 {
-                    let gpu = hellas_executor::catena::Gpu::select(evaluator.as_deref())?;
+                    let gpu = hellas_executor::catena::Gpu::select(OPEN_GPU, evaluator.as_deref())?;
                     let evaluator = gpu.evaluator();
                     let mut executors = self.executors.lock().await;
                     let backend = if let Some(backend) = executors.get(&evaluator) {

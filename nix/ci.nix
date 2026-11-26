@@ -59,9 +59,6 @@ let
         export CARGO_TARGET_DIR="''${CARGO_TARGET_DIR:-target/check/${builtins.baseNameOf cargoVendorDir}}"
         export CARGO_NET_OFFLINE=${lib.boolToString offline}
         export SQLX_OFFLINE=true
-        ${lib.optionalString pkgs.stdenv.hostPlatform.isDarwin ''
-          export RUST_TEST_THREADS=1
-        ''}
         ${cmd}
       ''
       (
@@ -120,11 +117,19 @@ let
           pkgs.actionlint
           pkgs.shellcheck
         ];
-    # The same tests as `checks.<system>.unit`, uninstrumented; coverage and
-    # its floors are enforced only by that derivation.
-    unit = mkCargo "check-unit" "cargo test --locked --workspace" (cargoEnv rustToolchain);
-    # Tests wait on events and fail only on a documented hang guard, so they
-    # run with libtest's default parallelism rather than one at a time.
+    # `checks.<system>.unit`, which package.nix instruments for coverage on
+    # x86_64-linux.
+    unit =
+      let
+        env = cargoEnv rustToolchain;
+      in
+      mkCargo "check-unit" ''
+        # Nix builds run on a pseudo-terminal, where nextest would draw a
+        # progress bar rather than log each test.
+        cargo nextest run --locked --workspace --show-progress counter
+        # nextest does not run doctests; the compile_fail ones pin type safety.
+        cargo test --locked --workspace --doc
+      '' (env // { inputs = env.inputs ++ [ pkgs.cargo-nextest ]; });
     regressions = mkCargo "check-regressions" ''
       cargo test --locked ${s.workspace}
     '' (cargoEnv rustToolchain);
@@ -256,10 +261,7 @@ let
     http-fetch = mkCargo "check-http-fetch" "cargo test ${s.http}" (cargoEnv rustToolchain);
     # Native host composition has one implementation for both funding modes.
     sdk-paid-work = mkCargo "check-sdk-paid-work" ''
-      # These native cases each start a six-validator devnet. Serializing the
-      # test harness avoids cross-test resource starvation; the cases retain
-      # their own concurrent-client and cancellation assertions.
-      RUST_TEST_THREADS=1 cargo test ${s.sdk-integration}
+      cargo test ${s.sdk-integration}
       cargo clippy ${s.sdk-integration} --all-targets -- -D warnings
     '' (cargoEnv rustToolchain);
     # The chain service's wire-id pins compile only under `chain`, which

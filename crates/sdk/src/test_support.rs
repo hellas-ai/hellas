@@ -578,3 +578,18 @@ pub fn request_job(
 }
 
 pub(crate) use hellas_gateway::test_server as server;
+
+/// A fake HIP gfx1151 device, so daemon tests run local backends on hosts
+/// without a GPU. It has no CUDA device.
+#[cfg(feature = "compute")]
+pub(crate) fn open_gpu(
+    dialect: hellas_executor::GpuDialect,
+) -> Result<hellas_executor::catena::Gpu, String> {
+    match dialect {
+        hellas_executor::GpuDialect::Hip => Ok(hellas_executor::catena::Gpu {
+            dialect,
+            arch: "gfx1151".into(),
+        }),
+        hellas_executor::GpuDialect::Cuda => Err("no CUDA device".into()),
+    }
+}

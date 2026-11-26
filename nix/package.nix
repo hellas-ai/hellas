@@ -262,9 +262,6 @@ let
         buildPhaseCargoCommand = command;
         installPhaseCommand = "mkdir -p $out";
       }
-      // lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
-        RUST_TEST_THREADS = "1";
-      }
     );
 
   craneChecks = {
@@ -277,54 +274,6 @@ let
         cargoClippyExtraArgs = clippyArgs;
       }
     );
-    # The workspace tests, run once with line-coverage instrumentation. On
-    # the validator host the run fails on a failing test; coverage is reported,
-    # never enforced. cargo-llvm-cov instruments only workspace crates through
-    # its rustc wrapper, so the dependencies in `cargoDeps` stay valid; keeping
-    # its target directory at `target` is what lets Cargo reuse them. The
-    # output holds lcov.info, summary.json and summary.txt. Other hosts run the
-    # same tests uninstrumented.
-    unit =
-      if pkgs.stdenv.hostPlatform.system == "x86_64-linux" then
-        craneLib.mkCargoDerivation (
-          craneArgs
-          // {
-            pname = "hellas-unit";
-            cargoArtifacts = cargoDeps;
-            # Terminal check: nothing consumes its target directory.
-            doInstallCargoArtifacts = false;
-            nativeBuildInputs = craneArgs.nativeBuildInputs ++ [
-              cargoLlvmCov
-              pkgs.cargo-nextest
-            ];
-            CARGO_LLVM_COV_TARGET_DIR = "target";
-            NEXTEST_SHOW_PROGRESS = "counter";
-            buildPhaseCargoCommand = ''
-              cargo llvm-cov nextest --locked --workspace --no-report
-              # nextest does not run doctests; the compile_fail ones pin type safety.
-              cargo test --locked --workspace --doc
-              mkdir -p "$out"
-              cargo llvm-cov report --lcov --output-path "$out/lcov.info"
-              cargo llvm-cov report --json --summary-only --output-path "$out/summary.json"
-              cargo llvm-cov report --summary-only | tee "$out/summary.txt"
-            '';
-            installPhaseCommand = "";
-          }
-        )
-      else
-        craneLib.cargoTest (
-          craneArgs
-          // {
-            pname = "hellas-unit";
-            cargoArtifacts = cargoDeps;
-            # Terminal check: nothing consumes its target directory.
-            doInstallCargoArtifacts = false;
-            cargoTestExtraArgs = "--workspace";
-          }
-          // lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
-            RUST_TEST_THREADS = "1";
-          }
-        );
     # Type-checks each library as a dependent builds it, then every target of
     # every release selection, independently of feature unification in tests.
     feature-targets = craneLib.mkCargoDerivation (
@@ -339,14 +288,38 @@ let
         installPhaseCommand = "mkdir -p $out";
       }
     );
-    regressions = craneLib.cargoTest (
+  }
+  # ci.nix's unit tests, run once with line-coverage instrumentation on the
+  # validator host; other hosts run its command as is. The run fails on a
+  # failing test; coverage is reported, never enforced. cargo-llvm-cov
+  # instruments only workspace crates through its rustc wrapper, so the
+  # dependencies in `cargoDeps` stay valid; keeping its target directory at
+  # `target` is what lets Cargo reuse them. The output holds lcov.info,
+  # summary.json and summary.txt.
+  // lib.optionalAttrs (system == "x86_64-linux") {
+    unit = craneLib.mkCargoDerivation (
       craneArgs
       // {
-        pname = "hellas-regressions";
+        pname = "hellas-unit";
         cargoArtifacts = cargoDeps;
         # Terminal check: nothing consumes its target directory.
         doInstallCargoArtifacts = false;
-        cargoTestExtraArgs = "--workspace --features ${integrationFeatures} -- --test-threads=1";
+        nativeBuildInputs = craneArgs.nativeBuildInputs ++ [
+          cargoLlvmCov
+          pkgs.cargo-nextest
+        ];
+        CARGO_LLVM_COV_TARGET_DIR = "target";
+        NEXTEST_SHOW_PROGRESS = "counter";
+        buildPhaseCargoCommand = ''
+          cargo llvm-cov nextest --locked --workspace --no-report
+          # nextest does not run doctests; the compile_fail ones pin type safety.
+          cargo test --locked --workspace --doc
+          mkdir -p "$out"
+          cargo llvm-cov report --lcov --output-path "$out/lcov.info"
+          cargo llvm-cov report --json --summary-only --output-path "$out/summary.json"
+          cargo llvm-cov report --summary-only | tee "$out/summary.txt"
+        '';
+        installPhaseCommand = "";
       }
     );
   };
