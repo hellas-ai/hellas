@@ -1,5 +1,8 @@
 #![cfg(feature = "apple-app-attest")]
 
+#[path = "fixtures/apple.rs"]
+mod device;
+
 use std::collections::BTreeMap;
 
 use base64::Engine as _;
@@ -143,6 +146,36 @@ fn signed_assertion(
     )
     .unwrap();
     encoded
+}
+
+#[test]
+fn device_genesis_verifies_at_enrollment_time() {
+    let mut bundle = device::enrollment();
+    let hellas_rpc::PlatformEnrollment::AppleAppAttest(enrollment) = bundle.platform else {
+        panic!("expected App Attest enrollment");
+    };
+    let policy = ApplePolicy {
+        expected_rp_id_hash: apple_app_id_hash(APP_ID),
+        allowed_cd_hashes: vec![decode_hex_32(
+            "320cb97347ecf28369401a21ba85553008c8d8009ae6f3bffa159a0dede1eab6",
+        )],
+    };
+    let credential = register_apple(
+        &AppleCredential {
+            attestation: enrollment.attestation_object,
+            client_data_hash: enrollment.client_data_hash,
+        },
+        policy.expected_rp_id_hash,
+        apple_app_attest_root_ca(),
+        AnchorTime(enrollment.validation_time),
+    )
+    .unwrap();
+    let verify = |genesis: &hellas_rpc::SignedProviderGenesis| {
+        hellas_attestation::verify_apple_provider_genesis(genesis, &credential, &policy)
+    };
+    verify(&bundle.genesis).unwrap();
+    bundle.genesis.statement.installation_nonce[0] ^= 1;
+    assert_eq!(verify(&bundle.genesis), Err(AttestationError::Signature));
 }
 
 #[test]
