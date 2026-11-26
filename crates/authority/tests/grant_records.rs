@@ -1,3 +1,6 @@
+#[path = "../../attestation/tests/fixtures/apple.rs"]
+mod device;
+
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use hellas_auth::PublicKey;
 use hellas_auth::authority::{GrantId, Revision, UnixMillis};
@@ -458,6 +461,11 @@ fn signed_model_policy_is_authenticated() {
         .unwrap();
     bytes[position..position + 7].copy_from_slice(b"model-b");
     assert!(SignedOffer::decode(&bytes, UnixMillis(1000)).is_err());
+}
+
+#[test]
+fn device_enrollment_verifies_as_grant_provider() {
+    verify_provider(&device::enrollment()).unwrap();
 }
 
 #[test]
