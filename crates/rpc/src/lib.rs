@@ -44,8 +44,6 @@ pub mod call;
 pub mod compute_event;
 #[cfg(feature = "chain")]
 pub mod edge_index;
-#[cfg(feature = "execute")]
-pub mod execution_event;
 #[cfg(feature = "fetch")]
 pub mod fetch;
 #[cfg(feature = "fetch")]
