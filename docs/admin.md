@@ -114,10 +114,10 @@ If private file publication fails, no issuance request is sent.
 `bind-provider` requires `host.provider.bind` on the host resource. It binds the
 provider enrollment of an authority bootstrapped without one, such as an embedded
 host that initialized before its provider enrolled. The node verifies the canonical
-enrollment offline: a software root signature, or an App Attest credential
-registered against its own RP-ID hash and CDHash at the enrollment's validation
-time. This is not requester trust; callers still pin the genesis and Apple policy
-independently. The binding is journaled and survives restart and offline recovery.
+enrollment offline. It checks the software root signature or the App Attest
+certificate chain at the enrollment's validation time and the root assertion
+against that credential. The consumer applies its Apple policy when it uses
+the provider. The binding is journaled and survives restart and offline recovery.
 Repeating it with the identical enrollment succeeds, so a lost reply can be retried.
 Any other enrollment is refused with `FailedPrecondition` (`provider already bound`),
 and a malformed or unverifiable one with `InvalidArgument`. There is no unbind. The

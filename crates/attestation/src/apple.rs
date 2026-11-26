@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -79,6 +79,7 @@ impl AppleCredential {
 /// The persistable output of one successful Apple credential registration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RegisteredAppleCredential {
+    pub rp_id_hash: [u8; 32],
     pub id: ContentId,
     pub public_key: [u8; 33],
 }
@@ -103,28 +104,86 @@ pub struct AppleClaims {
     pub counter: u32,
 }
 
+/// The Gate app, accepted by default in any build.
+pub const DEFAULT_APP_ID: &str = "2F53L9ZR3N.ai.hellas.gate";
+
+/// The consumer's Apple requirements: the accepted `TEAMID.bundle` app IDs
+/// and, optionally, the exact builds (CDHashes) accepted for them.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApplePolicy {
-    pub expected_rp_id_hash: [u8; 32],
-    pub allowed_cd_hashes: Vec<[u8; 32]>,
+    require_apple_app_id: BTreeSet<String>,
+    require_apple_cdhash: Option<BTreeSet<[u8; 32]>>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum AppleVerdict {
-    Accepted,
-    CodeDenied,
+impl Default for ApplePolicy {
+    fn default() -> Self {
+        Self {
+            require_apple_app_id: BTreeSet::from([DEFAULT_APP_ID.to_owned()]),
+            require_apple_cdhash: None,
+        }
+    }
 }
 
-pub fn appraise_apple(claims: &AppleClaims, policy: &ApplePolicy) -> AppleVerdict {
-    if policy.allowed_cd_hashes.contains(&claims.cd_hash) {
-        AppleVerdict::Accepted
-    } else {
-        AppleVerdict::CodeDenied
+impl ApplePolicy {
+    pub fn new(
+        require_apple_app_id: BTreeSet<String>,
+        require_apple_cdhash: Option<BTreeSet<[u8; 32]>>,
+    ) -> Result<Self, AttestationError> {
+        if require_apple_app_id.is_empty() {
+            return Err(AttestationError::Malformed("Apple app ID policy"));
+        }
+        Ok(Self {
+            require_apple_app_id,
+            require_apple_cdhash,
+        })
+    }
+
+    /// Register a credential whose RP ID is one of the accepted app IDs.
+    pub fn register(
+        &self,
+        credential: &AppleCredential,
+        root: &[u8],
+        anchor: AnchorTime,
+    ) -> Result<RegisteredAppleCredential, AttestationError> {
+        let registered = register_apple(credential, root, anchor)?;
+        if !self
+            .require_apple_app_id
+            .iter()
+            .any(|id| apple_app_id_hash(id) == registered.rp_id_hash)
+        {
+            return Err(AttestationError::Credential);
+        }
+        Ok(registered)
+    }
+
+    /// Verify an assertion from a credential this policy registered.
+    pub fn verify_assertion(
+        &self,
+        assertion: &[u8],
+        client_data_hash: &[u8; 32],
+        credential: &RegisteredAppleCredential,
+    ) -> Result<AppleClaims, AttestationError> {
+        self.check_build(verify_apple_assertion(
+            assertion,
+            client_data_hash,
+            credential,
+        )?)
+    }
+
+    pub fn check_build(&self, claims: AppleClaims) -> Result<AppleClaims, AttestationError> {
+        if self
+            .require_apple_cdhash
+            .as_ref()
+            .is_some_and(|hashes| !hashes.contains(&claims.cd_hash))
+        {
+            return Err(AttestationError::Credential);
+        }
+        Ok(claims)
     }
 }
 
 pub fn register_apple(
     credential: &AppleCredential,
-    expected_rp_id_hash: [u8; 32],
     root: &[u8],
     anchor: AnchorTime,
 ) -> Result<RegisteredAppleCredential, AttestationError> {
@@ -133,7 +192,7 @@ pub fn register_apple(
         return Err(AttestationError::Credential);
     }
     let leaf = verify_chain(&object.statement.certificates, root, anchor)?;
-    let auth = attestation_auth_data(&object.auth_data, expected_rp_id_hash)?;
+    let auth = attestation_auth_data(&object.auth_data)?;
     let extensions = leaf
         .tbs_certificate()
         .extensions()
@@ -159,6 +218,7 @@ pub fn register_apple(
     }
     let compressed = public_key(&leaf, auth.credential_id)?;
     Ok(RegisteredAppleCredential {
+        rp_id_hash: auth.rp_id_hash,
         id: credential.content_id(),
         public_key: compressed,
     })
@@ -168,12 +228,7 @@ pub fn apple_credential_identity(
     attestation: &[u8],
 ) -> Result<AppleCredentialIdentity, AttestationError> {
     let object: AttestationObject = cbor(attestation, "Apple attestation")?;
-    let rp_id_hash = object
-        .auth_data
-        .get(..32)
-        .and_then(|value| value.try_into().ok())
-        .ok_or(AttestationError::Credential)?;
-    let auth = attestation_auth_data(&object.auth_data, rp_id_hash)?;
+    let auth = attestation_auth_data(&object.auth_data)?;
     let leaf = object
         .statement
         .certificates
@@ -183,7 +238,7 @@ pub fn apple_credential_identity(
     let cd_hash = attestation_cd_hash(auth.credential_data)?;
     Ok(AppleCredentialIdentity {
         public_key: public_key(&leaf, auth.credential_id)?,
-        rp_id_hash,
+        rp_id_hash: auth.rp_id_hash,
         cd_hash,
     })
 }
@@ -219,18 +274,17 @@ fn public_key(
         .map_err(|_| AttestationError::Credential)
 }
 
-pub fn verify_apple_assertion(
+fn verify_apple_assertion(
     assertion: &[u8],
     client_data_hash: &[u8; 32],
     credential: &RegisteredAppleCredential,
-    policy: &ApplePolicy,
 ) -> Result<AppleClaims, AttestationError> {
     let assertion: Assertion = cbor(assertion, "Apple assertion")?;
     let rp_id_hash = assertion
         .authenticator_data
         .get(..32)
         .ok_or(AttestationError::Binding)?;
-    if rp_id_hash != policy.expected_rp_id_hash {
+    if rp_id_hash != credential.rp_id_hash {
         return Err(AttestationError::Binding);
     }
     let signature =
@@ -241,11 +295,7 @@ pub fn verify_apple_assertion(
         Sha256::digest([assertion.authenticator_data.as_slice(), client_data_hash].concat());
     key.verify(&digest, &signature)
         .map_err(|_| AttestationError::Signature)?;
-    let claims = assertion_auth_data(&assertion.authenticator_data)?;
-    if !policy.allowed_cd_hashes.contains(&claims.cd_hash) {
-        return Err(AttestationError::Credential);
-    }
-    Ok(claims)
+    assertion_auth_data(&assertion.authenticator_data)
 }
 
 fn verify_chain(
@@ -292,19 +342,13 @@ fn verify_chain(
 }
 
 struct AttestationAuth<'a> {
+    rp_id_hash: [u8; 32],
     credential_id: &'a [u8],
     credential_data: &'a [u8],
 }
 
-fn attestation_auth_data(
-    data: &[u8],
-    rp_id_hash: [u8; 32],
-) -> Result<AttestationAuth<'_>, AttestationError> {
-    if data.len() < 55
-        || data[..32] != rp_id_hash
-        || data[32] != AUTH_DATA_FLAGS
-        || data[33..37] != [0; 4]
-    {
+fn attestation_auth_data(data: &[u8]) -> Result<AttestationAuth<'_>, AttestationError> {
+    if data.len() < 55 || data[32] != AUTH_DATA_FLAGS || data[33..37] != [0; 4] {
         return Err(AttestationError::Credential);
     }
     if data[37..53] != *PRODUCTION_AAGUID {
@@ -321,6 +365,7 @@ fn attestation_auth_data(
         return Err(AttestationError::Credential);
     }
     Ok(AttestationAuth {
+        rp_id_hash: data[..32].try_into().unwrap(),
         credential_id,
         credential_data: &data[credential_end..],
     })
@@ -397,8 +442,7 @@ struct Assertion {
 pub fn verify_apple_provider_genesis(
     genesis: &hellas_rpc::SignedProviderGenesis,
     credential: &RegisteredAppleCredential,
-    policy: &ApplePolicy,
-) -> Result<(), AttestationError> {
+) -> Result<AppleClaims, AttestationError> {
     use hellas_auth::PublicKey;
     use hellas_rpc::{PlatformCredential, RootKind, RootProof};
     let statement = &genesis.statement;
@@ -415,9 +459,7 @@ pub fn verify_apple_provider_genesis(
         assertion,
         &apple_client_data_hash(&statement.canonical_bytes()),
         credential,
-        policy,
-    )?;
-    Ok(())
+    )
 }
 
 #[cfg(test)]

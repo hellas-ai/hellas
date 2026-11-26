@@ -1,4 +1,5 @@
 use super::*;
+use hellas_attestation::apple_app_id_hash;
 #[path = "../../../attestation/tests/fixtures/apple.rs"]
 mod device;
 use hellas_auth::authority::{GrantId, Revision, UnixMillis};
@@ -196,6 +197,7 @@ fn apple_open_response(
     );
     let apple = AppleAppAttestTrust::new("TESTTEAM.example.app", vec![cd_hash], counter_store);
     *apple.credential.lock().unwrap() = Some(RegisteredAppleCredential {
+        rp_id_hash: apple_app_id_hash("TESTTEAM.example.app"),
         id: credential_id,
         public_key,
     });

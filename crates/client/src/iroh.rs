@@ -3,7 +3,7 @@ use crate::error::ClientContext;
 use crate::{ClientError, ClientResult, ExecutionRuntime};
 use hellas_attestation::{
     AnchorTime, AppleCredential, ApplePolicy, AssertionCounterStore, RegisteredAppleCredential,
-    apple_app_attest_root_ca, apple_app_id_hash, register_apple, verify_apple_assertion,
+    apple_app_attest_root_ca,
 };
 use hellas_auth::{Digest, PublicKey};
 use hellas_rpc::pb::execute::{OpenRequest, OpenResponse, open_response};
@@ -42,6 +42,14 @@ impl AppleAppAttestTrust {
         }
     }
 
+    fn policy(&self) -> ClientResult<ApplePolicy> {
+        ApplePolicy::new(
+            [self.app_id.clone()].into(),
+            Some(self.allowed_cd_hashes.iter().copied().collect()),
+        )
+        .map_err(|source| ClientError::source("invalid Apple App Attest policy", source))
+    }
+
     fn registered_credential(
         &self,
         enrollment: &AppleAppAttestEnrollment,
@@ -61,15 +69,16 @@ impl AppleAppAttestTrust {
             }
             return Ok(existing.clone());
         }
-        let verified = register_apple(
-            &credential,
-            apple_app_id_hash(&self.app_id),
-            apple_app_attest_root_ca(),
-            AnchorTime(enrollment.validation_time),
-        )
-        .map_err(|source| {
-            ClientError::source("provider App Attest enrollment registration failed", source)
-        })?;
+        let verified = self
+            .policy()?
+            .register(
+                &credential,
+                apple_app_attest_root_ca(),
+                AnchorTime(enrollment.validation_time),
+            )
+            .map_err(|source| {
+                ClientError::source("provider App Attest enrollment registration failed", source)
+            })?;
         *registered = Some(verified.clone());
         Ok(verified)
     }
@@ -142,15 +151,10 @@ impl ProviderTrustAnchor {
                 let apple = self.apple_app_attest.as_ref().ok_or_else(|| ClientError::protocol(
                     "pinned Apple provider requires an App Attest app identity and CDhash allowlist"))?;
                 let credential = apple.registered_credential(enrollment)?;
-                hellas_attestation::verify_apple_provider_genesis(
-                    &bundle.genesis,
-                    &credential,
-                    &ApplePolicy {
-                        expected_rp_id_hash: apple_app_id_hash(&apple.app_id),
-                        allowed_cd_hashes: apple.allowed_cd_hashes.clone(),
-                    },
-                )
-                .map_err(|e| {
+                let policy = apple.policy()?;
+                hellas_attestation::verify_apple_provider_genesis(&bundle.genesis, &credential)
+                    .and_then(|claims| policy.check_build(claims))
+                    .map_err(|e| {
                     ClientError::source(
                         "provider enrollment root assertion or credential is invalid",
                         e,
@@ -427,16 +431,10 @@ fn verify_open_response(
                 )
             })?;
             let credential = apple.registered_credential(enrollment)?;
-            let claims = verify_apple_assertion(
-                &assertion,
-                binding.as_bytes(),
-                &credential,
-                &ApplePolicy {
-                    expected_rp_id_hash: apple_app_id_hash(&apple.app_id),
-                    allowed_cd_hashes: apple.allowed_cd_hashes.clone(),
-                },
-            )
-            .map_err(|source| {
+            let claims = apple
+                .policy()?
+                .verify_assertion(&assertion, binding.as_bytes(), &credential)
+                .map_err(|source| {
                 ClientError::source(
                     "provider App Attest open assertion verification failed",
                     source,
