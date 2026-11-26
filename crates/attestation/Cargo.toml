@@ -40,3 +40,4 @@ x509-cert = { workspace = true, optional = true }
 
 [dev-dependencies]
 hex.workspace = true
+rcgen = "0.14"
