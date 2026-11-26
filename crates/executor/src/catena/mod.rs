@@ -14,19 +14,23 @@ pub struct Gpu {
     pub dialect: catena_lang::codegen::GpuDialect,
     pub arch: String,
 }
+/// Opens a dialect's runtime. [`Gpu::open`] probes the host; tests pass a
+/// fake device.
+pub type OpenGpu = fn(catena_lang::codegen::GpuDialect) -> Result<Gpu, String>;
 impl Gpu {
-    /// The runtime on this host that registers `evaluator`; without one, the
-    /// native runtime: CUDA with an NVIDIA driver, otherwise HIP.
-    pub fn select(evaluator: Option<&str>) -> Result<Self, String> {
+    /// The runtime, opened through `open`, that registers `evaluator`.
+    /// Without an evaluator, the native runtime: CUDA with an NVIDIA driver,
+    /// otherwise HIP.
+    pub fn select(open: OpenGpu, evaluator: Option<&str>) -> Result<Self, String> {
         use catena_lang::codegen::GpuDialect;
         let Some(evaluator) = evaluator else {
-            return Self::open(if std::path::Path::new("/dev/nvidiactl").exists() {
+            return open(if std::path::Path::new("/dev/nvidiactl").exists() {
                 GpuDialect::Cuda
             } else {
                 GpuDialect::Hip
             });
         };
-        let opened = [GpuDialect::Hip, GpuDialect::Cuda].map(Self::open);
+        let opened = [GpuDialect::Hip, GpuDialect::Cuda].map(open);
         if let Some(gpu) = opened
             .iter()
             .flatten()
@@ -44,8 +48,8 @@ impl Gpu {
         ))
     }
 
-    /// Open `dialect`'s runtime on its current device.
-    fn open(dialect: catena_lang::codegen::GpuDialect) -> Result<Self, String> {
+    /// Open `dialect`'s runtime on the host's current device.
+    pub fn open(dialect: catena_lang::codegen::GpuDialect) -> Result<Self, String> {
         let arch = memory::architecture(dialect).map_err(|error| error.to_string())?;
         Ok(Self { dialect, arch })
     }

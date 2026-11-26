@@ -37,8 +37,11 @@ pub(crate) struct GpuArgs {
 impl GpuArgs {
     pub(crate) fn config(&self) -> CliResult<hellas_executor::GpuConfig> {
         Ok(hellas_executor::GpuConfig {
-            gpu: hellas_executor::catena::Gpu::select(self.evaluator.as_deref())
-                .map_err(anyhow::Error::msg)?,
+            gpu: hellas_executor::catena::Gpu::select(
+                hellas_executor::catena::Gpu::open,
+                self.evaluator.as_deref(),
+            )
+            .map_err(anyhow::Error::msg)?,
             session_programs: self.gpu_session_programs,
             session_asset_bytes: self.gpu_session_asset_bytes,
         })
