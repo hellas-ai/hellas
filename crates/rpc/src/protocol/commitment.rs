@@ -6,6 +6,7 @@ use crate::tags;
 use hellas_auth::Digest;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 #[repr(u8)]
 pub enum Assurance {
     #[default]

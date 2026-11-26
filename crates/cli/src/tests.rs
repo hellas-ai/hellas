@@ -68,10 +68,10 @@ fn image_cli_and_gateway_surfaces_are_available() {
 mod machines;
 
 const TEST_REMOTE_TRUST_ARGS: &[&str] = &[
-    "--trust-store",
-    "/state/trust",
-    "--trust-policy",
-    "provider",
+    "--require-apple-app-id",
+    "TEAM.app",
+    "--require-apple-cdhash",
+    "00",
     "--assurance",
     "apple-app-attest",
 ];

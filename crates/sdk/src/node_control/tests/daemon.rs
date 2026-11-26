@@ -326,23 +326,6 @@ async fn removing_a_backend_preserves_its_accepted_request_and_routes_the_next_o
                 expires: UnixMillis(u64::MAX),
                 label: None,
             };
-            let trust_store = f.directory.path().join("trust").join(id);
-            crate::trust_policy::TrustPolicyStore::new(&trust_store)
-                .approve(
-                    id,
-                    0,
-                    crate::trust_policy::TrustPolicy {
-                        provider_genesis: hellas_client::ProviderAddress::of(
-                            &bundle.offers[0].offer().provider,
-                        )
-                        .unwrap()
-                        .enrollment,
-                        assurance: hellas_rpc::Assurance::ProducerSigned,
-                        apple: None,
-                    },
-                    "independent test approval".into(),
-                )
-                .unwrap();
             document.backends.insert(
                 id.into(),
                 Backend {
@@ -354,10 +337,9 @@ async fn removing_a_backend_preserves_its_accepted_request_and_routes_the_next_o
                         )),
                         resource: None,
                         evaluator: None,
-                        trust: Some(crate::daemon_config::Trust {
-                            store: trust_store,
-                            policy: id.into(),
-                        }),
+                        assurance: Default::default(),
+                        require_apple_app_id: None,
+                        require_apple_cdhash: None,
                     },
                 },
             );
@@ -428,37 +410,6 @@ async fn removing_a_backend_preserves_its_accepted_request_and_routes_the_next_o
         let held = tokio::spawn(send());
         providers[0].0.backend.started.notified().await;
         assert_eq!(core.watch().0.jobs.len(), 1);
-        // Unchanged document entries still recheck an external trust approval.
-        let trust =
-            crate::trust_policy::TrustPolicyStore::new(f.directory.path().join("trust/second"));
-        let approved = trust.load("second").unwrap();
-        let mut changed = approved.policy.clone();
-        changed.provider_genesis = hellas_rpc::ContentId::from_bytes([99; 32]);
-        trust
-            .approve(
-                "second",
-                approved.revision,
-                changed,
-                "replacement pin".into(),
-            )
-            .unwrap();
-        let stored = f.node.configuration().await.unwrap();
-        assert!(
-            rpc.configure(request(&core.watch().0.document, core.watch().0.revision.0))
-                .await
-                .is_err()
-        );
-        assert_eq!(core.watch().0.revision, Revision(1));
-        assert_eq!(f.node.configuration().await.unwrap(), stored);
-        assert!(!held.is_finished());
-        trust
-            .approve(
-                "second",
-                approved.revision + 1,
-                approved.policy,
-                "restored pin".into(),
-            )
-            .unwrap();
         let mut document = core.watch().0.document;
         document.remove_backend("first").unwrap();
         rpc.configure(request(&document, core.watch().0.revision.0))

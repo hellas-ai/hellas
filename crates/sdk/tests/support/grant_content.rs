@@ -172,11 +172,12 @@ impl Fixture {
         .unwrap();
         let target = UnpinnedOffer::decode(&signed.encode().unwrap(), self.now)
             .unwrap()
-            .pin(&hellas_client::ProviderTrustAnchor {
-                expected_genesis: self.enrollment.content_id(),
-                required_assurance: Assurance::ProducerSigned,
-                apple_app_attest: None,
-            })
+            .pin(&hellas_client::ProviderTrustAnchor::new(
+                self.enrollment.content_id(),
+                Assurance::ProducerSigned,
+                Default::default(),
+                hellas_sdk::identity::assertion_counters(self.root.path()),
+            ))
             .unwrap();
         GrantSessionOptions {
             target,

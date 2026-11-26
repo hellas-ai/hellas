@@ -78,11 +78,12 @@ impl Pair {
     async fn open(&self) {
         hellas_client::confidential_open::<Open>(
             &self.outgoing,
-            &ProviderTrustAnchor {
-                expected_genesis: crate::grant_client::tests::provider_enrollment(2).content_id(),
-                required_assurance: Assurance::ProducerSigned,
-                apple_app_attest: None,
-            },
+            &ProviderTrustAnchor::new(
+                crate::grant_client::tests::provider_enrollment(2).content_id(),
+                Assurance::ProducerSigned,
+                Default::default(),
+                std::sync::Arc::new(crate::test_support::SoftwareOnly),
+            ),
         )
         .await
         .unwrap();
@@ -517,11 +518,12 @@ async fn cancelling_application_authentication_closes_the_uncached_connection() 
             pair.provider.id(),
             pair.provider.bound_sockets(),
             pair.client.clone(),
-            ProviderTrustAnchor {
-                expected_genesis: crate::grant_client::tests::provider_enrollment(2).content_id(),
-                required_assurance: Assurance::ProducerSigned,
-                apple_app_attest: None,
-            },
+            ProviderTrustAnchor::new(
+                crate::grant_client::tests::provider_enrollment(2).content_id(),
+                Assurance::ProducerSigned,
+                Default::default(),
+                std::sync::Arc::new(crate::test_support::SoftwareOnly),
+            ),
         )
         .with_application(f.application.clone(), Arc::new(principal(1).1));
         let dialing = tokio::spawn(async move { link.work().await });

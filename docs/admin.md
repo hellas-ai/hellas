@@ -423,8 +423,9 @@ checked against this home's principal and device, and the provider's offer
 signature is verified. A single-policy offer selects its resource
 automatically; an offer with several policies also takes `--resource ID`. The
 provider address comes from the verified signed offer. An explicit
-`--provider ENROLLMENT_ID@NODE_ID` must match it. Apple providers also require
-the caller's independently approved `--trust-store` and `--trust-policy`.
+`--provider ENROLLMENT_ID@NODE_ID` must match it. Job commands use the
+[requester's Apple policy](paid-gateway.md#buy) to verify Apple providers.
+Use `--assurance apple-app-attest` to require a Secure Enclave provider.
 Repeated jobs reuse durable attempts by provider, grant and job; `--attempt
 FILE` selects an explicit record. See [jobs](jobs.md) for recovery and results.
 The file holds the credential secret: keep it private.
@@ -629,10 +630,10 @@ further limits ingress. Neither a local socket nor an allowed transport key
 grants application authority. A standalone `NodeControl` has no daemon methods
 until it is attached to a `Core`.
 
-Caller trust remains separate from administration. `hellas trust approve`
-requires a reviewed policy, expected revision and reason. SDK Grant and Paid
-backend entries select that policy with their `trust` field; an access bundle
-cannot substitute its own pins. See [paid work trust](paid-gateway.md).
+Grant and Paid backend entries verify Apple providers using the consumer's
+`require_apple_app_id` and `require_apple_cdhash` settings. Set
+`assurance = "apple-app-attest"` to require a Secure Enclave provider.
+See [paid work](paid-gateway.md).
 
 ## HTTP gateway authority
 

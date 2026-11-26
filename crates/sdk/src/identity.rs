@@ -78,10 +78,8 @@ pub fn grant_data_path(home: &Path) -> PathBuf {
     home.join("grants")
 }
 
-pub fn assertion_counters(
-    home: &Path,
-) -> anyhow::Result<Arc<dyn AssertionCounterStore + Send + Sync>> {
-    Ok(Arc::new(FilesystemAssertionCounterStore::in_home(home)))
+pub fn assertion_counters(home: &Path) -> Arc<dyn AssertionCounterStore + Send + Sync> {
+    Arc::new(FilesystemAssertionCounterStore::in_home(home))
 }
 
 fn create_root(_installation_nonce: [u8; 32]) -> anyhow::Result<PlatformRoot> {

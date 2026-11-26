@@ -152,22 +152,23 @@ Unanswered offers expire at their bond timeout.
 provider's enrollment bundle and the node ID it binds. Each live Open checks
 that the provider presents exactly that enrollment, that it names the live
 transport, and verifies the producer proof; a retained channel whose offer names
-another enrollment is refused on restart. Apple-attested providers additionally
-require the existing independent trust store: pass `--trust-store DIR` and
-`--trust-policy ID`. Approve app IDs and release CDHashes independently:
+another enrollment is refused on restart.
+
+Every Apple-attested provider must match the requester's Apple policy. By
+default, clients accept any build of `2F53L9ZR3N.ai.hellas.gate`. Use
+`--assurance apple-app-attest` to require a Secure Enclave provider.
+Repeat `--require-apple-app-id ID` to replace the default app ID with the IDs
+you accept, and repeat `--require-apple-cdhash HEX` to limit those apps to
+specific builds. For example, to require a specific build of another app:
 
 ```sh
-hellas trust --store /var/lib/hellas-gateway/trust approve provider-a \
-  --expected-revision 0 --policy /srv/hellas/provider-a-trust.json \
-  --reason 'Reviewed Apple application and release hashes'
+hellas fetch https://api.example.com/v1/models --contract http \
+  --pay 20 --provider ENROLLMENT_ID@NODE_ID --assurance apple-app-attest \
+  --require-apple-app-id TEAMID.com.example.provider --require-apple-cdhash "$REVIEWED_CDHASH"
 ```
 
-The existing trust JSON contains `provider_genesis`, `assurance`, and `apple`
-with `app_id` and `cd_hashes`; `provider_genesis` must equal the address's
-enrollment ID. Missing or mismatched
-Apple approval fails before funding or disclosure. Approval replacement retains
-its revision checks and persistent assertion counters. Software providers do not
-need them. Granted jobs and gateways keep the same independent approval requirements.
+The caller's Hellas home holds the assertion counters. Apple policy checks
+apply before funding or request disclosure and also cover grant-funded work.
 
 Owners delegate or reclaim coins with their principal key:
 
@@ -197,7 +198,9 @@ compatible chain revision.
 
 Embedding applications can put a `Paid` backend and model/HTTP routes in a
 `daemon_config::Document`, then run `daemon::Core`. Each backend names its
-provider, maximum price, evaluator and optional approved trust policy. Several
+provider, maximum price and evaluator. Optional `assurance`,
+`require_apple_app_id` and `require_apple_cdhash` fields use the same rules as
+the CLI flags. Use arrays of strings for app IDs and CDHashes. Several
 requests share its channel within the configured capacity; proposals serialize
 only the channel negotiation, and collection and settlement remain owned by
 each job. The stateless CLI exposes local models, grants and upstreams.

@@ -22,50 +22,50 @@ Attestation only works on a genuine, locked-down Apple machine.
    interface and the portable verifier.
 3. **Publish the offer.** Paid offers carry the enrollment and signed bond
    proposal, bound together by the provider's settlement key. Grant Offers
-   carry the enrollment with the grant. Paid clients compare the offered bundle
-   with independently approved enrollment and Apple software pins.
+   carry the enrollment with the grant. Clients check the enrollment and apply
+   their Apple policy before sending work.
 4. **Serve with Apple assurance:** start the sealed-Fetch provider from Gate.
    The command-line node does not own DeviceCheck enrollment or native proof
    production.
 
 ## Requester
 
-Buy an Apple-attested HTTPS Fetch with `hellas fetch`. `--trust-policy` selects
-a named policy from the caller's private `--trust-store`. Approve the enrollment,
-Apple app ID, CDHashes and exact manifest IDs through the separate `hellas trust
-... approve` operation using independently reviewed release metadata. Offers
-cannot replace these pins. See the
-[paid work guide](../../../docs/paid-gateway.md) for funding.
+Buy an Apple-attested HTTPS Fetch with `hellas fetch`:
 
 ```sh
 hellas fetch https://api.example.com/v1/models --contract http \
-  --assurance apple-app-attest --trust-store ./trust --trust-policy provider-a \
-  --pay 20 --provider ENROLLMENT_ID@NODE_ID
+  --assurance apple-app-attest --pay 20 --provider ENROLLMENT_ID@NODE_ID
 ```
 
-`hellas gateway` runs producer-signed work only; it has no Apple assurance
-option. Paid Fetch journals contain accounting metadata, never request
-or response bodies. These storage rules do not establish an upstream API's
-retention policy. Native token Work remains producer-signed; Apple assurance
-here is the paid Fetch path. Owner and principal routes use grant-funded Work with the same provider authentication.
+The assurance flag requires a Secure Enclave provider. Apple providers must
+match the caller's Apple policy at either assurance level. That policy
+accepts any build of `2F53L9ZR3N.ai.hellas.gate` by default. Add repeatable
+`--require-apple-app-id` flags to replace the Gate ID, and repeat
+`--require-apple-cdhash` to limit acceptance to exact builds. Assertion
+counters persist in the caller's Hellas home.
+
+Paid Fetch journals contain accounting metadata and omit request and response
+bodies. See the [paid work guide](../../../docs/paid-gateway.md) for funding
+and daemon backend settings.
 
 Before any prompt byte leaves the requester, the client verifies, in order:
 pin match → decode bundle → live peer == genesis transport key →
 `register_apple` chain verification against the pinned Apple root + app id →
-CDhash in the allowlist → open proof bound to this connection's QUIC exporter.
+match any configured CDHash pins → open proof bound to this connection's QUIC exporter.
 Any failure aborts before send.
 
 ## Graduation checklist (validate on real hardware)
 
 1. Package + sign the app; confirm the entitlement denylist passes.
 2. Create a fresh App Attest identity; publish the bundle; capture the pin.
-3. From a second machine, connect with the pin + app-id + cdhashes; confirm the
-   open gate blocks any prompt before verification completes.
+3. From a second machine, connect with the provider address and
+   `--assurance apple-app-attest`. Confirm verification completes before any
+   prompt is sent.
 4. Send a request through the paid HTTPS gateway; confirm the returned
    transcript verifies and its payment is acknowledged.
 5. With `--zdr`, confirm no payload archive is created and no request/response
    body is present in either Fetch journal.
 6. Restart the provider; confirm resume requires a fresh open verification.
-7. Confirm a CDhash outside the allowlist is rejected at open.
+7. Set a CDHash pin for a different build and confirm verification rejects the provider.
 8. Downgrade SIP / boot policy; confirm attestation fails and attested serving
    disables (the Secure Enclave key is invalidated).

@@ -593,10 +593,14 @@ async fn connect_offer(client: &Endpoint, provider: &Provider) -> IrohTransport 
         .await
         .unwrap();
     let transport = IrohTransport::new(connection);
+    let home = tempfile::tempdir().unwrap();
     let trust = hellas_client::ProviderAddress::of(&provider.enrollment)
         .unwrap()
-        .trust(Assurance::ProducerSigned, None)
-        .unwrap();
+        .trust(
+            Assurance::ProducerSigned,
+            Default::default(),
+            hellas_sdk::identity::assertion_counters(home.path()),
+        );
     hellas_client::confidential_open::<hellas_rpc::services::work_setup::Open>(&transport, &trust)
         .await
         .unwrap();
@@ -2195,11 +2199,12 @@ fn grant_composition<'a>(
         .unwrap();
         let target = UnpinnedOffer::decode(&signed.encode().unwrap(), now)
             .unwrap()
-            .pin(&hellas_client::ProviderTrustAnchor {
-                expected_genesis: provider.enrollment.content_id(),
-                required_assurance: Assurance::ProducerSigned,
-                apple_app_attest: None,
-            })
+            .pin(&hellas_client::ProviderTrustAnchor::new(
+                provider.enrollment.content_id(),
+                Assurance::ProducerSigned,
+                Default::default(),
+                hellas_sdk::identity::assertion_counters(root),
+            ))
             .unwrap();
         let location = StoreLocation::for_test(&data_root.join("channels"));
         let options = GrantSessionOptions {
@@ -2284,7 +2289,7 @@ async fn finish(case: Box<Case>) {
         provider: hellas_client::ProviderAddress::of(&provider.enrollment).unwrap(),
         provider_addrs: provider.endpoint.bound_sockets(),
         assurance: Assurance::ProducerSigned,
-        apple_trust: None,
+        apple_policy: Default::default(),
         expected_price: JOB_PRICE,
         acceptance_blocks: 16,
         terminal_blocks: 64,

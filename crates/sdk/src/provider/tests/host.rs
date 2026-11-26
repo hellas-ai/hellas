@@ -79,11 +79,12 @@ impl Host {
         .unwrap();
         let target = UnpinnedOffer::decode(&signed.encode().unwrap(), self.world.clock.now())
             .unwrap()
-            .pin(&hellas_client::ProviderTrustAnchor {
-                expected_genesis: provider.content_id(),
-                required_assurance: Assurance::ProducerSigned,
-                apple_app_attest: None,
-            })
+            .pin(&hellas_client::ProviderTrustAnchor::new(
+                provider.content_id(),
+                Assurance::ProducerSigned,
+                Default::default(),
+                crate::identity::assertion_counters(self.root.path()),
+            ))
             .unwrap();
         let location = StoreLocation::for_test(&self.root.path().join("client"));
         GrantSessionOptions {

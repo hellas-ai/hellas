@@ -1151,7 +1151,7 @@ async fn paid_fixture_for(
         provider: provider_address,
         provider_addrs,
         assurance: Assurance::ProducerSigned,
-        apple_trust: None,
+        apple_policy: Default::default(),
         expected_price: PRICE,
         acceptance_blocks: 16,
         terminal_blocks: 64,

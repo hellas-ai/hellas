@@ -87,8 +87,6 @@ enum IdentityCommand {
 #[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Commands {
-    /// Approve and inspect caller-owned provider trust policies.
-    Trust(commands::trust::TrustArgs),
     #[cfg(unix)]
     /// Create, list and destroy machines through a configured provider.
     Machines(machines::MachinesArgs),
@@ -324,9 +322,6 @@ async fn dispatch(
     selected_chain: hellas_chain::genesis::ChainProfile,
     #[cfg(feature = "otel")] metrics: Option<(SocketAddr, metrics::MetricsBundle)>,
 ) -> anyhow::Result<()> {
-    if let Commands::Trust(args) = cli.command {
-        return commands::trust::run(args);
-    }
     let content_dir = home.child("content");
     let home = match &cli.command {
         Commands::Serve { args, .. } if let Some(dir) = &args.secrets_dir => {
@@ -506,7 +501,6 @@ async fn dispatch(
         Commands::Program { .. } => {
             unreachable!("model commands handled before identity load")
         }
-        Commands::Trust(args) => commands::trust::run(args),
         Commands::Chain { .. } | Commands::Faucet { .. } => {
             unreachable!("chain commands handled before identity load")
         }

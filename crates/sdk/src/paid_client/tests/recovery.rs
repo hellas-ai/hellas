@@ -198,11 +198,12 @@ async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
             .await
             .unwrap();
         let (bundle, key) = enrollment(server.id());
-        let trust = hellas_client::ProviderTrustAnchor {
-            expected_genesis: bundle.content_id(),
-            required_assurance: Assurance::ProducerSigned,
-            apple_app_attest: None,
-        };
+        let trust = hellas_client::ProviderTrustAnchor::new(
+            bundle.content_id(),
+            Assurance::ProducerSigned,
+            Default::default(),
+            crate::identity::assertion_counters(fixture.root.path()),
+        );
         let serving = tokio::spawn({
             let server = server.clone();
             let provider = provider.clone();
@@ -264,7 +265,7 @@ async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
                     config: fixture.config.clone(),
                     provider: crate::test_support::address(server.id()),
                     provider_addrs: server.bound_sockets(),
-                    apple_trust: None,
+                    apple_policy: Default::default(),
                     assurance: Assurance::ProducerSigned,
                     expected_price: PRICE,
                     acceptance_blocks: 50,

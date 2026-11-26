@@ -92,7 +92,8 @@ async fn a_home_contact_receives_access_and_executes_a_compute_job() {
         .target(TargetSpec::Access {
             file,
             provider: None,
-            trust: None,
+            assurance: Default::default(),
+            apple_policy: Default::default(),
             resource: None,
         })
         .await

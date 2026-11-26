@@ -20,7 +20,7 @@ impl OfferConnection {
     /// Dials the addressed node and refuses any enrollment other than the
     /// addressed one before a request is signed or disclosed.
     async fn open(args: &PaidWorkOptions, endpoint: &Endpoint) -> Result<Self> {
-        let trust = args.trust()?;
+        let trust = args.trust();
         let address = EndpointAddr::from_parts(
             args.provider.node,
             args.provider_addrs.iter().copied().map(TransportAddr::Ip),

@@ -21,33 +21,32 @@ mod address;
 pub use address::{ProviderAddress, ProviderAddressError};
 
 #[derive(Clone)]
-pub struct AppleAppAttestTrust {
-    pub app_id: String,
-    pub allowed_cd_hashes: Vec<[u8; 32]>,
-    pub counter_store: Arc<dyn AssertionCounterStore + Send + Sync>,
+pub struct ProviderTrustAnchor {
+    pub expected_genesis: ContentId,
+    pub required_assurance: Assurance,
+    policy: ApplePolicy,
+    counter_store: Arc<dyn AssertionCounterStore + Send + Sync>,
     credential: Arc<Mutex<Option<RegisteredAppleCredential>>>,
 }
 
-impl AppleAppAttestTrust {
+impl ProviderTrustAnchor {
     pub fn new(
-        app_id: impl Into<String>,
-        allowed_cd_hashes: Vec<[u8; 32]>,
+        expected_genesis: ContentId,
+        required_assurance: Assurance,
+        policy: ApplePolicy,
         counter_store: Arc<dyn AssertionCounterStore + Send + Sync>,
     ) -> Self {
         Self {
-            app_id: app_id.into(),
-            allowed_cd_hashes,
+            expected_genesis,
+            required_assurance,
+            policy,
             counter_store,
             credential: Arc::new(Mutex::new(None)),
         }
     }
 
-    fn policy(&self) -> ClientResult<ApplePolicy> {
-        ApplePolicy::new(
-            [self.app_id.clone()].into(),
-            Some(self.allowed_cd_hashes.iter().copied().collect()),
-        )
-        .map_err(|source| ClientError::source("invalid Apple App Attest policy", source))
+    pub fn policy(&self) -> &ApplePolicy {
+        &self.policy
     }
 
     fn registered_credential(
@@ -70,7 +69,7 @@ impl AppleAppAttestTrust {
             return Ok(existing.clone());
         }
         let verified = self
-            .policy()?
+            .policy
             .register(
                 &credential,
                 apple_app_attest_root_ca(),
@@ -84,35 +83,26 @@ impl AppleAppAttestTrust {
     }
 }
 
-impl std::fmt::Debug for AppleAppAttestTrust {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("AppleAppAttestTrust")
-            .field("app_id", &self.app_id)
-            .field("allowed_cd_hashes", &self.allowed_cd_hashes)
-            .field("counter_store", &"<injected>")
-            .field("credential", &"<verified requester-side>")
-            .finish()
+impl std::fmt::Debug for ProviderTrustAnchor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderTrustAnchor")
+            .field("expected_genesis", &self.expected_genesis)
+            .field("required_assurance", &self.required_assurance)
+            .field("policy", &self.policy)
+            .finish_non_exhaustive()
     }
 }
 
-impl PartialEq for AppleAppAttestTrust {
+impl PartialEq for ProviderTrustAnchor {
     fn eq(&self, other: &Self) -> bool {
-        self.app_id == other.app_id
-            && self.allowed_cd_hashes == other.allowed_cd_hashes
+        self.expected_genesis == other.expected_genesis
+            && self.required_assurance == other.required_assurance
+            && self.policy == other.policy
             && Arc::ptr_eq(&self.counter_store, &other.counter_store)
             && Arc::ptr_eq(&self.credential, &other.credential)
     }
 }
-
-impl Eq for AppleAppAttestTrust {}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ProviderTrustAnchor {
-    pub expected_genesis: ContentId,
-    pub required_assurance: Assurance,
-    pub apple_app_attest: Option<AppleAppAttestTrust>,
-}
+impl Eq for ProviderTrustAnchor {}
 
 impl ProviderTrustAnchor {
     /// Verify reusable enrollment evidence, without advancing a live assertion
@@ -148,18 +138,15 @@ impl ProviderTrustAnchor {
                 RootProof::AppleAppAttest(_),
                 PlatformEnrollment::AppleAppAttest(enrollment),
             ) => {
-                let apple = self.apple_app_attest.as_ref().ok_or_else(|| ClientError::protocol(
-                    "pinned Apple provider requires an App Attest app identity and CDhash allowlist"))?;
-                let credential = apple.registered_credential(enrollment)?;
-                let policy = apple.policy()?;
+                let credential = self.registered_credential(enrollment)?;
                 hellas_attestation::verify_apple_provider_genesis(&bundle.genesis, &credential)
-                    .and_then(|claims| policy.check_build(claims))
+                    .and_then(|claims| self.policy.check_build(claims))
                     .map_err(|e| {
-                    ClientError::source(
-                        "provider enrollment root assertion or credential is invalid",
-                        e,
-                    )
-                })?;
+                        ClientError::source(
+                            "provider enrollment root assertion or credential is invalid",
+                            e,
+                        )
+                    })?;
             }
             _ => {
                 return Err(ClientError::protocol(
@@ -425,22 +412,17 @@ fn verify_open_response(
                     ));
                 }
             };
-            let apple = trust.apple_app_attest.as_ref().ok_or_else(|| {
-                ClientError::protocol(
-                    "pinned Apple provider requires an App Attest app identity and CDhash allowlist",
-                )
-            })?;
-            let credential = apple.registered_credential(enrollment)?;
-            let claims = apple
-                .policy()?
+            let credential = trust.registered_credential(enrollment)?;
+            let claims = trust
+                .policy
                 .verify_assertion(&assertion, binding.as_bytes(), &credential)
                 .map_err(|source| {
-                ClientError::source(
-                    "provider App Attest open assertion verification failed",
-                    source,
-                )
-            })?;
-            apple
+                    ClientError::source(
+                        "provider App Attest open assertion verification failed",
+                        source,
+                    )
+                })?;
+            trust
                 .counter_store
                 .advance(&credential.public_key, claims.counter)
                 .map_err(|source| {

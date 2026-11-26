@@ -43,11 +43,12 @@ pub fn pinned_offer(grant: GrantDef, addresses: Vec<String>) -> PinnedOffer {
     .unwrap();
     UnpinnedOffer::decode(&signed.encode().unwrap(), UnixMillis(1000))
         .unwrap()
-        .pin(&ProviderTrustAnchor {
-            expected_genesis: provider.content_id(),
-            required_assurance: Assurance::ProducerSigned,
-            apple_app_attest: None,
-        })
+        .pin(&ProviderTrustAnchor::new(
+            provider.content_id(),
+            Assurance::ProducerSigned,
+            Default::default(),
+            std::sync::Arc::new(crate::test_support::SoftwareOnly),
+        ))
         .unwrap()
 }
 async fn setup(

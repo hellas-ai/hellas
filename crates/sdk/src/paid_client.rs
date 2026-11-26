@@ -65,9 +65,7 @@ pub struct PaidWorkOptions {
     /// Direct UDP addresses of `provider.node`.
     pub provider_addrs: Vec<SocketAddr>,
     pub assurance: hellas_rpc::Assurance,
-    /// Independent approval an Apple provider requires; it must name
-    /// `provider.enrollment`.
-    pub apple_trust: Option<hellas_client::ProviderTrustAnchor>,
+    pub apple_policy: hellas_client::ApplePolicy,
     /// The most a job may cost. A quote above it is refused; a job's own
     /// signed price must equal the price the provider quotes.
     pub expected_price: u64,
@@ -179,16 +177,16 @@ impl PaidWorkOptions {
             self.terminal_blocks,
             self.payment_blocks,
             self.timeout,
-        )?;
-        self.trust()?;
-        Ok(())
+        )
     }
 
     /// The trust every connection to the addressed provider must satisfy.
-    pub fn trust(&self) -> Result<hellas_client::ProviderTrustAnchor> {
-        Ok(self
-            .provider
-            .trust(self.assurance, self.apple_trust.as_ref())?)
+    pub fn trust(&self) -> hellas_client::ProviderTrustAnchor {
+        self.provider.trust(
+            self.assurance,
+            self.apple_policy.clone(),
+            crate::identity::assertion_counters(self.config.chain.home()),
+        )
     }
 }
 
@@ -567,7 +565,7 @@ impl PaidWorkSession {
         check_client_party(&signed.offer().proposal, owner.principal(), &settlement_key)?;
         let bond = signed.offer().proposal.bond_edge();
         // Fresh and retained offers alike must name the addressed enrollment.
-        let trust = args.trust()?;
+        let trust = args.trust();
         trust.verify_enrollment(&signed.offer().provider)?;
         if let Some(bind) = intent.before_open.take() {
             bind()?;

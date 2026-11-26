@@ -82,7 +82,7 @@ async fn recover_funding_channels_inner(
         if hellas_client::ProviderAddress::of(&signed.offer().provider)? != args.provider {
             continue;
         }
-        args.trust()?.verify_enrollment(&signed.offer().provider)?;
+        args.trust().verify_enrollment(&signed.offer().provider)?;
         let matches: Vec<_> = intents
             .iter()
             .filter(|i| {

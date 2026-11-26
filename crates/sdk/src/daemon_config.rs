@@ -102,8 +102,12 @@ pub enum BackendKind {
         resource: Option<ResourceId>,
         #[serde(default)]
         evaluator: Option<String>,
-        #[serde(default)]
-        trust: Option<Trust>,
+        #[serde(default, with = "crate::apple_policy::AssuranceName")]
+        assurance: hellas_rpc::Assurance,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        require_apple_app_id: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        require_apple_cdhash: Option<Vec<String>>,
     },
     Paid {
         provider: String,
@@ -122,8 +126,12 @@ pub enum BackendKind {
         max_price: u64,
         #[serde(default)]
         evaluator: Option<String>,
-        #[serde(default)]
-        trust: Option<Trust>,
+        #[serde(default, with = "crate::apple_policy::AssuranceName")]
+        assurance: hellas_rpc::Assurance,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        require_apple_app_id: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        require_apple_cdhash: Option<Vec<String>>,
     },
     Fetch {
         service: String,
@@ -131,13 +139,6 @@ pub enum BackendKind {
         upstream: Upstream,
     },
 }
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Trust {
-    pub store: PathBuf,
-    pub policy: String,
-}
-
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Upstream {

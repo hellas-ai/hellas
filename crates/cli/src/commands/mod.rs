@@ -16,7 +16,6 @@ mod owner;
 pub mod rpc;
 pub mod store;
 pub mod transact;
-pub mod trust;
 
 /// Open an operator-selected ordinary file without hanging on a FIFO or
 /// device, then retain at most one byte beyond its protocol limit.

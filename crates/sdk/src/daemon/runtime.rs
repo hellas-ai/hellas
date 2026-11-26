@@ -1,8 +1,5 @@
 use super::Result;
-use crate::{
-    Backend, BackendEntry, BackendState,
-    daemon_config::{BackendKind, Trust},
-};
+use crate::{Backend, BackendEntry, BackendState, daemon_config::BackendKind};
 use hellas_auth::authority::{NodeKey, PrincipalId};
 use hellas_store::content::DiskStore;
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
@@ -227,57 +224,10 @@ impl Runtime {
         ))?)
     }
 
-    fn trust(
-        &self,
-        trust: &Option<Trust>,
-        counters: Arc<dyn hellas_attestation::AssertionCounterStore + Send + Sync>,
-    ) -> Result<Option<hellas_client::ProviderTrustAnchor>> {
-        trust
-            .as_ref()
-            .map(|trust| {
-                let store = crate::trust_policy::TrustPolicyStore::new(&trust.store);
-                Ok(store.approved(&trust.policy, counters.clone())?)
-            })
-            .transpose()
-    }
-
-    pub fn approval_current(&self, configured: &BackendKind, active: &Backend) -> Result<bool> {
-        let (trust, active) = match (configured, &active.state) {
-            (BackendKind::Grant { trust, .. }, BackendState::Grant(grant)) => {
-                (trust, grant.options.target.trust().clone())
-            }
-            (BackendKind::Paid { trust, .. }, BackendState::Paid(paid)) => {
-                (trust, paid.options.trust()?)
-            }
-            (BackendKind::Local { .. }, BackendState::Local { .. })
-            | (BackendKind::Fetch { .. }, BackendState::Fetch { .. }) => return Ok(true),
-            _ => return Ok(false),
-        };
-        let Some(approved) = self.trust(
-            trust,
-            Arc::new(crate::FilesystemAssertionCounterStore::in_home(
-                &self.options.home,
-            )),
-        )?
-        else {
-            return Ok(true);
-        };
-        let apple_pins = |trust: &hellas_client::ProviderTrustAnchor| {
-            trust
-                .apple_app_attest
-                .as_ref()
-                .map(|apple| (apple.app_id.clone(), apple.allowed_cd_hashes.clone()))
-        };
-        Ok(active.expected_genesis == approved.expected_genesis
-            && active.required_assurance == approved.required_assurance
-            && apple_pins(&active) == apple_pins(&approved))
-    }
-
     pub async fn open_backend(
         &self,
         configured: &crate::daemon_config::Backend,
         execution: &crate::daemon_config::Execution,
-        counters: Arc<crate::counter_store::FilesystemAssertionCounterStore>,
     ) -> Result<PreparedBackend> {
         #[cfg(not(feature = "compute"))]
         let _ = execution;
@@ -290,7 +240,9 @@ impl Runtime {
                 access,
                 resource,
                 evaluator,
-                trust,
+                assurance,
+                require_apple_app_id,
+                require_apple_cdhash,
             } => {
                 let principal = self.principal()?;
                 let holder = NodeKey::from_public_key(self.options.signer.public_key())?;
@@ -302,12 +254,15 @@ impl Runtime {
                     &principal,
                     &holder,
                 )?;
-                let trust = self.trust(trust, counters.clone())?;
                 let backend = crate::home::access_target(
                     bundle,
                     *resource,
                     None,
-                    trust,
+                    *assurance,
+                    crate::apple_policy::from_requirements(
+                        require_apple_app_id.as_deref(),
+                        require_apple_cdhash.as_deref(),
+                    )?,
                     self.options.signer.clone(),
                     &self.options.home,
                     self.consumer_endpoint().await?,
@@ -337,24 +292,24 @@ impl Runtime {
                 provider,
                 max_price,
                 evaluator,
-                trust,
+                assurance,
+                require_apple_app_id,
+                require_apple_cdhash,
             } => {
                 let provider = provider.parse()?;
                 let chain = self.chain(chain)?;
                 let endpoint = self.consumer_endpoint().await?;
-                let apple_trust = self.trust(trust, counters.clone())?;
                 let options = crate::paid_client::PaidWorkOptions {
                     // Quoting reads no content. Activation supplies the recovered client store.
                     content: self.options.content.clone(),
                     config: crate::work_config::WorkConfig::from_chain_dir(chain)?,
                     provider,
                     provider_addrs: addresses.clone(),
-                    assurance: apple_trust
-                        .as_ref()
-                        .map_or(hellas_rpc::Assurance::ProducerSigned, |trust| {
-                            trust.required_assurance
-                        }),
-                    apple_trust,
+                    assurance: *assurance,
+                    apple_policy: crate::apple_policy::from_requirements(
+                        require_apple_app_id.as_deref(),
+                        require_apple_cdhash.as_deref(),
+                    )?,
                     expected_price: *max_price,
                     acceptance_blocks: *acceptance_blocks,
                     terminal_blocks: *terminal_blocks,

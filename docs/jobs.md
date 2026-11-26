@@ -443,9 +443,19 @@ Without an explicit cap, it uses the provider's deliverable response limit.
 A configured gateway `GET /v1/models` passthrough takes precedence over generated
 model discovery. Other configured methods on that path keep their normal routing.
 
-Apple-attested providers require the independent `--trust-store` and
-`--trust-policy` approval. Fetch additionally selects
-`--assurance apple-app-attest`; raw folders declare that assurance in `[fetch]`.
+Apple-attested providers must match the [requester's Apple policy](paid-gateway.md).
+The job commands take repeatable `--require-apple-app-id` and
+`--require-apple-cdhash` flags. Use `--assurance apple-app-attest` to require
+a Secure Enclave provider. A job folder can declare these settings:
+
+```toml
+[fetch]
+assurance = "apple-app-attest"
+require_apple_app_id = ["TEAMID.com.example.provider"]
+```
+
+Omit `require_apple_app_id` to accept the built-in Gate app ID. Set
+`require_apple_cdhash` to an array of full CDHashes to restrict accepted builds.
 
 ### Sealed Fetch
 

@@ -2,8 +2,8 @@
 //! per allowance, plus the one Auth grant and credential the contact connects
 //! with. The grant holds a `work.execute` permission for each allowance and the
 //! credential is bound to the contact device's node key. It carries the
-//! credential secret, so files are private and published once. It carries no
-//! provider trust; the contact still approves a trust policy independently.
+//! credential secret, so files are private and published once. The contact verifies the
+//! signed offer against their own provider requirements.
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use crate::node_control::profile::{self, ClientProfile};

@@ -43,6 +43,8 @@ pub struct Job {
     price: u64,
     input: Arc<JobInput>,
     manifest: ProgramManifest,
+    pub require_apple_app_id: Option<Vec<String>>,
+    pub require_apple_cdhash: Option<Vec<String>>,
 }
 #[derive(Clone)]
 pub enum JobInput {
@@ -91,7 +93,12 @@ struct FetchFiles {
     service: String,
     method: String,
     request: String,
-    assurance: String,
+    #[serde(with = "crate::apple_policy::AssuranceName")]
+    assurance: Assurance,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    require_apple_app_id: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    require_apple_cdhash: Option<Vec<String>>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -310,6 +317,8 @@ impl Job {
         Ok(Self {
             price,
             input: Arc::new(input),
+            require_apple_app_id: None,
+            require_apple_cdhash: None,
             manifest,
         })
     }
@@ -486,12 +495,7 @@ impl Job {
                     )
                     .await?,
                 )?;
-                let assurance = match fetch.assurance.as_str() {
-                    "producer-signed" => Assurance::ProducerSigned,
-                    "apple-app-attest" => Assurance::AppleAppAttest,
-                    _ => return Err(invalid("unknown assurance")),
-                };
-                Self::fetch(
+                let mut job = Self::fetch(
                     doc.payment.price,
                     contract,
                     fetch.service,
@@ -501,8 +505,11 @@ impl Job {
                         hellas_rpc::fetch::MAX_FETCH_REQUEST_BODY_BYTES,
                     )
                     .await?,
-                    assurance,
-                )?
+                    fetch.assurance,
+                )?;
+                job.require_apple_app_id = fetch.require_apple_app_id;
+                job.require_apple_cdhash = fetch.require_apple_cdhash;
+                job
             }
             (None, Some(compute)) => {
                 let bytes = read(&compute.environment, compute::MAX_ENVIRONMENT_BYTES).await?;
@@ -645,11 +652,9 @@ impl Job {
                     service: service.clone(),
                     method: method.clone(),
                     request: "request.json".into(),
-                    assurance: match assurance {
-                        Assurance::ProducerSigned => "producer-signed",
-                        Assurance::AppleAppAttest => "apple-app-attest",
-                    }
-                    .into(),
+                    assurance: *assurance,
+                    require_apple_app_id: self.require_apple_app_id.clone(),
+                    require_apple_cdhash: self.require_apple_cdhash.clone(),
                 });
             }
             JobInput::Compute {

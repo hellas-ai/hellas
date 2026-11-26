@@ -96,10 +96,8 @@ response as well as its envelopes (base64 expands binary bodies).
 
 `hellas fetch --contract http` names the HTTPS descriptor built into the release;
 `--contract FILE` names an exact descriptor. The contract is never taken from the
-provider's quote. Software providers require the provider address
-`ENROLLMENT_ID@NODE_ID`. Apple-attested
-providers also require an independently approved `--trust-store` and `--trust-policy`
-with app IDs and release CDHashes; see the [paid gateway guide](../../docs/paid-gateway.md).
+provider's quote. Paid clients take a provider address `ENROLLMENT_ID@NODE_ID`.
+Apple providers must also match the [requester's Apple policy](../../docs/paid-gateway.md).
 The signed offer carries the provider enrollment and channel policy. Every paid
 Work and WorkSetup connection verifies a fresh Open proof before sending its
 request. The proof binds the TLS exporter, nonce, service ALPN, enrollment and
@@ -145,10 +143,10 @@ admitting another job. Compute step loops deliver one signed, chained event per
 step; Fetch currently returns a complete bounded response. Fetch journals are
 metadata-only on both endpoints.
 
-Apple App Attest requires a provisioned, signed macOS host. `ProducerSigned`
-verifies the key and transcript but does not attest the binary. These are the
-implemented assurance choices, checked explicitly before request disclosure and
-again during result verification.
+Apple App Attest requires a provisioned, signed macOS host. The
+`apple-app-attest` assurance setting requires that provider root.
+`producer-signed` also accepts software roots. The Apple policy applies
+whenever the provider presents a Secure Enclave root.
 
 Tests inspect provider journal files after each commit and rotation, reopen
 them after simulated process loss, verify payment recovery without bodies,
