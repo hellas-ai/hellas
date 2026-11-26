@@ -5,8 +5,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use hellas_rpc::pb::execute::AssuranceEvidence;
-use hellas_rpc::{APPLE_APP_ATTEST, ContentId, DagCborEncoder};
+use hellas_rpc::{ContentId, DagCborEncoder};
 use p256::ecdsa::signature::Verifier;
 use p256::ecdsa::{Signature, VerifyingKey};
 use rustls_pki_types::{CertificateDer, UnixTime};
@@ -18,7 +17,7 @@ use x509_cert::Certificate;
 
 use x509_cert::der::Decode;
 
-use crate::{AnchorTime, AttestationError, Binding};
+use crate::{AnchorTime, AttestationError};
 
 /// Canonical tag of an Apple App Attest credential.
 const CREDENTIAL_TAG: &str = "hellas.apple.app-attest.credential.v1";
@@ -218,24 +217,6 @@ fn public_key(
         .as_bytes()
         .try_into()
         .map_err(|_| AttestationError::Credential)
-}
-
-pub fn verify_apple(
-    evidence: &AssuranceEvidence,
-    expected: Binding,
-    credential: &RegisteredAppleCredential,
-    policy: &ApplePolicy,
-    counters: &dyn AssertionCounterStore,
-) -> Result<AppleClaims, AttestationError> {
-    if evidence.codec != APPLE_APP_ATTEST {
-        return Err(AttestationError::Codec);
-    }
-    if evidence.credential != credential.id.as_bytes() {
-        return Err(AttestationError::Credential);
-    }
-    let claims = verify_apple_assertion(&evidence.proof, expected.as_bytes(), credential, policy)?;
-    counters.advance(&credential.public_key, claims.counter)?;
-    Ok(claims)
 }
 
 pub fn verify_apple_assertion(

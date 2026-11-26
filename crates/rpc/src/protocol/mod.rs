@@ -7,7 +7,6 @@ pub mod fetch_contract;
 pub use fetch_contract::{FETCH_EVALUATOR, FetchContract, FetchEgress, FetchSchema};
 pub mod identity;
 pub mod invocation;
-pub mod job;
 pub mod manifest;
 pub mod open;
 pub mod retention;
@@ -23,7 +22,6 @@ pub use identity::{
     ProviderEnrollmentBundle, ProviderGenesisDecodeError, ProviderGenesisStatement, RootKind,
     RootProof, SignedProviderGenesis,
 };
-pub use job::APPLE_APP_ATTEST;
 pub use manifest::{Application, ApplicationError, MAX_APPLICATION_ID_BYTES, ProgramManifest};
 pub use open::{
     OPEN_EXPORTER_LEN, OPEN_NONCE_LEN, OPEN_PROOF_DOMAIN, OPEN_PROVIDER_ROLE, open_proof_binding,

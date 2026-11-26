@@ -1,6 +1,6 @@
 //! Internal worker events. These are Rust values, not an execution RPC.
 //! Signed transcript envelopes retain their canonical wire representation.
-use crate::pb::execute::{AssuranceEvidence, OutputEventEnvelope};
+use crate::pb::execute::OutputEventEnvelope;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct WorkEvent {
@@ -13,7 +13,6 @@ pub struct WorkChunk {
 #[derive(Clone, Debug, PartialEq)]
 pub struct WorkFinished {
     pub terminal_output_event: Option<OutputEventEnvelope>,
-    pub assurance_evidence: Vec<AssuranceEvidence>,
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct WorkFailed {

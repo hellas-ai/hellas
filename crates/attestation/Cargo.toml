@@ -1,6 +1,6 @@
 [package]
 name = "hellas-attestation"
-description = "Attestation evidence for Hellas receipts"
+description = "Platform attestation for Hellas provider identities"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -25,7 +25,7 @@ apple-app-attest = [
 base64 = { workspace = true, optional = true }
 ciborium = { workspace = true, optional = true }
 hellas-auth.workspace = true
-hellas-rpc = { workspace = true, features = ["execute"] }
+hellas-rpc.workspace = true
 p256 = { workspace = true, optional = true }
 rustls-pki-types = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
