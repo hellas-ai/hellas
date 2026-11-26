@@ -409,7 +409,7 @@ pub fn verify_apple_provider_genesis(
         return Err(AttestationError::Credential);
     }
     let RootProof::AppleAppAttest(assertion) = &genesis.root_proof else {
-        return Err(AttestationError::Codec);
+        return Err(AttestationError::RootProofKind);
     };
     verify_apple_assertion(
         assertion,

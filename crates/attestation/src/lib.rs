@@ -46,8 +46,8 @@ impl RootProver for hellas_auth::ProducerSigningKey {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum AttestationError {
-    #[error("wrong evidence codec")]
-    Codec,
+    #[error("wrong root proof kind")]
+    RootProofKind,
     #[error("invalid evidence credential")]
     Credential,
     #[error("malformed {0}")]
