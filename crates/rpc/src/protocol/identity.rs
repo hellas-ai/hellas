@@ -65,6 +65,15 @@ pub enum RootKind {
     Software = 3,
 }
 
+impl RootKind {
+    pub fn assurance(self) -> crate::Assurance {
+        match self {
+            Self::SecureEnclave => crate::Assurance::AppleAppAttest,
+            Self::Software => crate::Assurance::ProducerSigned,
+        }
+    }
+}
+
 /// A platform attestation credential the provider registered, if any.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlatformCredential {

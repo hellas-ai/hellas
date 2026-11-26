@@ -662,11 +662,7 @@ async fn run_job(
         .require_apple_cdhash
         .clone()
         .or_else(|| job.require_apple_cdhash.clone());
-    let assurance = effective.assurance.unwrap_or(job.assurance());
-    ensure!(
-        !matches!(job.input(), JobInput::Fetch { .. }) || assurance == job.assurance(),
-        "--assurance differs from the fetch job"
-    );
+    let assurance = effective.assurance.unwrap_or_default().max(job.assurance());
     bounded(client.timeout, async |deadline| {
         let mut target = within(
             deadline,

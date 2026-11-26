@@ -267,6 +267,7 @@ pub struct PaidWorkResult {
 /// accepted jobs collect concurrently through the shared journal.
 /// Cancellation retains recovery state; call `run(None, true, None)` to resume it.
 pub struct PaidWorkSession {
+    provider_assurance: hellas_rpc::Assurance,
     args: PaidWorkOptions,
     descriptor: WorkChannelDescriptor,
     policy: ProviderChannelPolicy,
@@ -567,6 +568,13 @@ impl PaidWorkSession {
         // Fresh and retained offers alike must name the addressed enrollment.
         let trust = args.trust();
         trust.verify_enrollment(&signed.offer().provider)?;
+        let provider_assurance = signed
+            .offer()
+            .provider
+            .genesis
+            .statement
+            .root_kind
+            .assurance();
         if let Some(bind) = intent.before_open.take() {
             bind()?;
         }
@@ -725,6 +733,7 @@ impl PaidWorkSession {
         );
         // No suspension between giving the observer ownership and returning it.
         Ok(Self {
+            provider_assurance,
             args,
             descriptor,
             policy,
@@ -809,7 +818,7 @@ impl PaidWorkSession {
         check_request(
             &self.policy,
             &prepared,
-            &self.dialer.trust,
+            self.provider_assurance,
             hellas_auth::PublicKey::Secp256k1(self.descriptor.channel().client_key().to_bytes()),
         )?;
         let ready = fresh_readiness(&self.client, self.args.timeout).await?;
@@ -828,7 +837,7 @@ impl PaidWorkSession {
     }
 
     pub(crate) fn assurance(&self) -> hellas_rpc::Assurance {
-        self.args.assurance
+        self.provider_assurance
     }
 
     pub(crate) async fn pay(&mut self, mut result: PaidWorkResult) -> Result<PaidWorkResult> {
@@ -879,6 +888,7 @@ impl PaidWorkSession {
         purchase: Option<&mut crate::transact::Purchase>,
     ) -> Result<Option<PaidWorkResult>> {
         let Self {
+            provider_assurance,
             args,
             descriptor,
             policy,
@@ -891,7 +901,7 @@ impl PaidWorkSession {
             check_request(
                 policy,
                 prepared,
-                &dialer.trust,
+                *provider_assurance,
                 hellas_auth::PublicKey::Secp256k1(descriptor.channel().client_key().to_bytes()),
             )?;
         }
@@ -1056,7 +1066,7 @@ impl PaidWorkSession {
                 check_request(
                     policy,
                     &pending,
-                    &dialer.trust,
+                    *provider_assurance,
                     hellas_auth::PublicKey::Secp256k1(descriptor.channel().client_key().to_bytes()),
                 )?;
                 let result = execute_paid_job(
@@ -1440,12 +1450,12 @@ fn verify_transcript(
 pub(crate) fn check_request(
     policy: &ProviderChannelPolicy,
     prepared: &PreparedInvocation,
-    trust: &hellas_client::ProviderTrustAnchor,
+    provider_assurance: hellas_rpc::Assurance,
     caller: hellas_auth::PublicKey,
 ) -> Result<()> {
-    if trust.required_assurance != prepared.request.assurance {
+    if prepared.request.assurance > provider_assurance {
         return Err(PaidClientError::InputMismatch(
-            "assurance differs from provider trust",
+            "input requires stronger assurance than the provider supplies",
         ));
     }
     policy.invocation_policy.admit(prepared, &caller)?;

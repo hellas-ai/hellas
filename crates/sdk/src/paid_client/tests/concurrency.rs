@@ -134,6 +134,7 @@ async fn paid_concurrency(cancel: bool) {
             .unwrap()
             .content_store();
         let session = Arc::new(Mutex::new(PaidWorkSession {
+            provider_assurance: Assurance::ProducerSigned,
             args: PaidWorkOptions {
                 content,
                 config: fixture.config.clone(),
@@ -496,6 +497,7 @@ pub(crate) async fn cached_paid_backend() -> (
     };
     let cached = paid.session.clone();
     *cached.lock().await = Some(PaidWorkSession {
+        provider_assurance: Assurance::ProducerSigned,
         dialer: Arc::new(ProviderDialer::new(
             endpoint.id(),
             vec![],

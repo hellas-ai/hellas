@@ -492,8 +492,9 @@ fn apple_offer_pin_verifies_static_root_policy_then_open_and_result() {
     use hellas_authority::model::grant::{records::*, *};
     use std::num::NonZeroU64;
     let counters = Arc::new(TestCounterStore::default());
-    let (trust, response, public_key) =
+    let (mut trust, response, public_key) =
         apple_open_response(&[5; 32], &[6; 32], 2, counters.clone());
+    trust.required_assurance = Assurance::ProducerSigned;
     let bundle =
         ProviderEnrollmentBundle::from_canonical_bytes(&response.provider_genesis).unwrap();
     assert!(

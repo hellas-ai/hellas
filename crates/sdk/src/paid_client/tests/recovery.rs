@@ -260,6 +260,7 @@ async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
                 .await
                 .unwrap();
             let mut session = PaidWorkSession {
+                provider_assurance: Assurance::ProducerSigned,
                 args: PaidWorkOptions {
                     content,
                     config: fixture.config.clone(),

@@ -197,10 +197,13 @@ pub async fn retained_settlement_channels(
             continue;
         }
         checked_descriptor(&setup, entry.bond_edge, owner, delegate)?;
-        let assurance = match signed.offer().provider.genesis.statement.root_kind {
-            hellas_rpc::RootKind::SecureEnclave => hellas_rpc::Assurance::AppleAppAttest,
-            _ => hellas_rpc::Assurance::ProducerSigned,
-        };
+        let assurance = signed
+            .offer()
+            .provider
+            .genesis
+            .statement
+            .root_kind
+            .assurance();
         channels.push(RetainedSettlementChannel {
             bond: entry.bond_edge,
             price: signed.offer().policy.payment_policy.fixed_price,

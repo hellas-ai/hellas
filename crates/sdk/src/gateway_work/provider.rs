@@ -130,9 +130,9 @@ impl WorkBackend for IrohBackend {
         input: Admitted,
         progress: PaidProgress,
     ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
-        if input.invocation().request.assurance != self.assurance {
+        if input.invocation().request.assurance > self.assurance {
             return Err(BackendFault::caused_by(std::io::Error::other(
-                "invocation assurance differs from this listener's prover",
+                "invocation requires stronger assurance than this listener provides",
             )));
         }
         let input = if input.admission().backend().is_some() {
