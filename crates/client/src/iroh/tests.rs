@@ -328,24 +328,12 @@ fn assert_attestation_error(error: ClientError, expected: hellas_attestation::At
     assert_eq!(source.downcast_ref(), Some(&expected));
 }
 
-#[test]
-fn recorded_apple_open_checks_app_build_and_connection_before_advancing_counter() {
-    let bundle = device::enrollment();
+fn recorded_open() -> (PeerIdentity, OpenResponse, [u8; 32], [u8; 32]) {
     let peer = PeerIdentity(recorded_bytes(
         "c19b5b4a27162ec685aeb6b715d4436827b8b01fe8ebecb3e9f38e7a0b247452",
     ));
-    let address = ProviderAddress {
-        enrollment: "b714c1ab606aa40d01de47e47eb3d4d7d54c7283d02beac9d3e1d8e17e433f39"
-            .parse()
-            .unwrap(),
-        node: ::iroh::EndpointId::from_bytes(&peer.0).unwrap(),
-    };
-    let cd_hash =
-        recorded_bytes("320cb97347ecf28369401a21ba85553008c8d8009ae6f3bffa159a0dede1eab6");
-    let counters = Arc::new(TestCounterStore::default());
-    let policy = |hashes| ApplePolicy::new([SPIKE_APP_ID.into()].into(), hashes).unwrap();
     let response = OpenResponse {
-        provider_genesis: bundle.canonical_bytes(),
+        provider_genesis: device::enrollment().canonical_bytes(),
         proof: Some(open_response::Proof::AppleAppAttestAssertion(
             include_bytes!("../../../attestation/tests/fixtures/apple-open.cbor").to_vec(),
         )),
@@ -353,20 +341,47 @@ fn recorded_apple_open_checks_app_build_and_connection_before_advancing_counter(
     let exporter =
         recorded_bytes("df4676398cad6e7e1f620ce4f15959fc1015d7c1a384d2f1f766b0ef670e96be");
     let nonce = recorded_bytes("3884ecd401c63ea961c1254d8baf27cfde2b086ab85ca86c07ef3b29cf969466");
-    let open = |trust: &ProviderTrustAnchor| {
-        verify_open_response(trust, &exporter, &nonce, ALPN, peer, response.clone())
-    };
-    let anchor = |policy| address.trust(Assurance::ProducerSigned, policy, counters.clone());
+    (peer, response, exporter, nonce)
+}
+
+fn recorded_trust(policy: ApplePolicy, counters: Arc<TestCounterStore>) -> ProviderTrustAnchor {
+    let address = "b714c1ab606aa40d01de47e47eb3d4d7d54c7283d02beac9d3e1d8e17e433f39@c19b5b4a27162ec685aeb6b715d4436827b8b01fe8ebecb3e9f38e7a0b247452".parse::<ProviderAddress>().unwrap();
+    address.trust(Assurance::ProducerSigned, policy, counters)
+}
+
+#[test]
+fn default_policy_rejects_the_recorded_spike_app() {
+    let trust = recorded_trust(ApplePolicy::default(), Arc::default());
     assert_attestation_error(
-        open(&anchor(ApplePolicy::default())).unwrap_err(),
+        trust.verify_enrollment(&device::enrollment()).unwrap_err(),
         hellas_attestation::AttestationError::Credential,
     );
+}
+
+#[test]
+fn different_cdhash_rejects_recorded_open_before_counter_advances() {
+    let counters = Arc::new(TestCounterStore::default());
+    let policy = ApplePolicy::new([SPIKE_APP_ID.into()].into(), Some([[0; 32]].into())).unwrap();
+    let trust = recorded_trust(policy, counters.clone());
+    let (peer, response, exporter, nonce) = recorded_open();
     assert_attestation_error(
-        open(&anchor(policy(Some([[0; 32]].into())))).unwrap_err(),
+        verify_open_response(&trust, &exporter, &nonce, ALPN, peer, response).unwrap_err(),
         hellas_attestation::AttestationError::Credential,
     );
     assert!(counters.counters.lock().unwrap().is_empty());
-    let approved = anchor(policy(Some([cd_hash].into())));
+}
+
+#[test]
+fn recorded_cdhash_accepts_the_connection_bound_open() {
+    let (peer, response, exporter, nonce) = recorded_open();
+    let bundle = device::enrollment();
+    let cd_hash =
+        recorded_bytes("320cb97347ecf28369401a21ba85553008c8d8009ae6f3bffa159a0dede1eab6");
+    let policy = ApplePolicy::new([SPIKE_APP_ID.into()].into(), Some([cd_hash].into())).unwrap();
+    let approved = recorded_trust(policy, Arc::default());
+    let open = |trust: &ProviderTrustAnchor| {
+        verify_open_response(trust, &exporter, &nonce, ALPN, peer, response.clone())
+    };
     // Before the accepted Open, so a broken binding cannot hide behind the counter.
     for (exporter, nonce, alpn) in [
         ([0; 32], nonce, ALPN),
