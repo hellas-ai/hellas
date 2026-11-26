@@ -451,6 +451,19 @@ impl Job {
     pub fn digest(&self) -> Digest {
         hash_tuple(FORMAT, &[&self.canonical_bytes()])
     }
+    /// Auto-saved folders distinguish consumer requirements without changing the purchase identity.
+    pub fn folder_digest(&self) -> Digest {
+        let job = self.digest();
+        if self.require_apple_app_id.is_none() && self.require_apple_cdhash.is_none() {
+            return job;
+        }
+        let requirements = hellas_rpc::canonical_dag_cbor(&(
+            &self.require_apple_app_id,
+            &self.require_apple_cdhash,
+        ))
+        .expect("job requirements contain only strings");
+        hash_tuple("hellas.job.folder.v1", &[job.as_bytes(), &requirements])
+    }
     pub fn purchase_nonce(&self, channel: Digest, proposal_nonce: u64) -> [u8; 32] {
         purchase_nonce(self.digest(), channel, proposal_nonce, None)
     }

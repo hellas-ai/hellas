@@ -832,7 +832,7 @@ pub async fn fetch(args: FetchArgs, context: &Context) -> super::CliResult<()> {
                     .chain
                     .client()
                     .join("jobs")
-                    .join(job.digest().to_string())
+                    .join(job.folder_digest().to_string())
             });
             job.save(&directory).await?;
             eprintln!("job: {}", directory.display());
