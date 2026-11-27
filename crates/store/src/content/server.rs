@@ -24,7 +24,9 @@ macro_rules! resolve_handler {
                 + Send,
                 WireStatus,
             > {
-                let repo = crate::hf::Repo::from_uri(&request.uri)
+                let repo: crate::hf::Repo = request
+                    .uri
+                    .parse()
                     .map_err(|_| status(Error::Invalid("HF URI")))?;
                 let (commit_sha, object) = self
                     .store
@@ -126,6 +128,11 @@ fn status(error: Error) -> WireStatus {
             "this store is owned by a node with paid work; run the command against the daemon",
         ),
         Error::Missing => (WireCode::NotFound, "content is missing"),
+        error @ Error::HfNotFound(_) => {
+            let mut status = WireStatus::new(WireCode::NotFound, error.to_string());
+            status.details = bytes::Bytes::from_static(w::HF_NOT_FOUND);
+            return status;
+        }
         Error::Conflict => (WireCode::Aborted, "pin or cursor changed"),
         Error::Capacity => (WireCode::ResourceExhausted, "content reservation exhausted"),
         Error::Invalid(message) => (WireCode::InvalidArgument, message),

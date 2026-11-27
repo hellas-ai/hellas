@@ -452,6 +452,10 @@ where
         if !matches!(scope.kind, ScopeKind::Owner) {
             return Err(Error::Denied);
         }
+        let hub = match &source {
+            Source::HfXet { repo, .. } => Some(repo.to_string()),
+            _ => None,
+        };
         let response = self
             .client
             .acquire(pb::AcquireRequest {
@@ -460,7 +464,15 @@ where
                 pin: Some(w::pin_target(&pin)),
             })
             .await
-            .map_err(w::error)?;
+            .map_err(|status| match hub {
+                Some(repo)
+                    if status.code() == hellas_wire::WireCode::NotFound
+                        && status.details().as_ref() == w::HF_NOT_FOUND =>
+                {
+                    Error::HfNotFound(repo)
+                }
+                _ => w::error(status),
+            })?;
         let object = w::object(&response)?;
         if expect.is_some_and(|expected| expected != object) {
             return Err(Error::Invalid("acquisition mismatch"));

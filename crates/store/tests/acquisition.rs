@@ -43,6 +43,7 @@ async fn untrusted_scopes_cannot_acquire_and_invalid_sources_never_reserve() {
     let repo = hellas_store::hf::Repo {
         id: "org/repo".into(),
         revision: "main".into(),
+        default_branch: false,
         kind: hellas_store::hf::RepoKind::Model,
     };
     assert!(

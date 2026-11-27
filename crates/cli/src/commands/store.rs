@@ -9,6 +9,7 @@ use hellas_rpc::{ContentRef, services::resolve::ResolveClientImpl};
 use hellas_sdk::identity::LocalIdentity;
 use hellas_sdk::node_control::profile::ClientProfile;
 use hellas_store::content::{self, config::Reconciler, owner_pin as find_pin, *};
+use hellas_store::hf::Repo;
 use hellas_wire::StreamTransport;
 use std::{future::Future, io::Write as _, net::SocketAddr, path::PathBuf};
 
@@ -93,7 +94,7 @@ pub enum StoreCommand {
     /// Collect unpinned upper objects.
     Collect,
     /// Resolve an HF revision once, printing its immutable SHA and tree reference.
-    Resolve { uri: String },
+    Resolve { source: Repo },
 }
 
 #[derive(Subcommand)]
@@ -165,8 +166,7 @@ pub async fn run(
                 Some(endpoint)
             } else { None };
             let resolving = store.clone();
-            let result = execute(&store, args.command, move |uri| async move {
-                let repo = hellas_store::hf::Repo::from_uri(&uri)?;
+            let result = execute(&store, args.command, move |repo| async move {
                 Ok(resolving.resolve_hf(&Scope::Owner, repo).await?)
             }).await;
             if let Some(endpoint) = peer { endpoint.close().await; }
@@ -216,9 +216,9 @@ where
 {
     let resolver = ResolveClientImpl::new(transport.clone());
     let store = RemoteStore::new(transport, ram());
-    execute(&store, command, move |uri| async move {
+    execute(&store, command, move |repo| async move {
         let reply = resolver
-            .resolve(hellas_rpc::pb::resolve::ResolveRequest { uri })
+            .resolve(hellas_rpc::pb::resolve::ResolveRequest { uri: repo.uri() })
             .await?;
         let tree = reply.tree.context("Resolve reply has no tree")?;
         let object = ContentRef::new(hellas_rpc::ContentId::from_slice(&tree.id)?, tree.bytes);
@@ -230,7 +230,7 @@ where
 async fn execute<S, F, R>(store: &S, command: StoreCommand, resolve: F) -> CliResult<()>
 where
     S: ContentStore,
-    F: FnOnce(String) -> R,
+    F: FnOnce(Repo) -> R,
     R: Future<Output = CliResult<(String, ContentRef)>>,
 {
     match command {
@@ -306,7 +306,7 @@ where
                     sha256.is_none() && source_pin.is_none(),
                     "HF has no --sha256 or --source-pin"
                 );
-                let repo = hellas_store::hf::Repo::from_uri(&source)?;
+                let repo: Repo = source.parse()?;
                 ensure!(
                     hellas_store::hf::immutable_sha(&repo.revision),
                     "acquire requires hf://repo@sha; run hellas store resolve first to print the immutable SHA"
@@ -408,8 +408,8 @@ where
             let result = store.collect(&Scope::Owner).await?;
             println!("objects\t{}\nbytes\t{}", result.objects, result.bytes);
         }
-        StoreCommand::Resolve { uri } => {
-            let (sha, tree) = resolve(uri).await?;
+        StoreCommand::Resolve { source } => {
+            let (sha, tree) = resolve(source).await?;
             println!("commit\t{sha}");
             target(Target::Tree(tree));
         }

@@ -120,7 +120,8 @@ impl Declaration {
                 if sha256.is_some() {
                     return Err(Error::Invalid("HF source has no transport SHA-256"));
                 }
-                let repo = crate::hf::Repo::from_uri(uri)
+                let repo: crate::hf::Repo = uri
+                    .parse()
                     .map_err(|_| Error::Invalid("HF repository URI"))?;
                 if !crate::hf::immutable_sha(&repo.revision) {
                     return Err(Error::Invalid(

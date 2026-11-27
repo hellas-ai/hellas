@@ -77,6 +77,8 @@ pub enum Error {
     WorkOwned,
     #[error("content is missing")]
     Missing,
+    #[error("HF repository or revision not found: {0}")]
+    HfNotFound(String),
     #[error("pin or cursor changed")]
     Conflict,
     #[error("content reservation exhausted")]

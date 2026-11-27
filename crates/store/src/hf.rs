@@ -31,7 +31,7 @@ use std::io::Read as _;
 
 use hellas_xet::XetHash;
 mod file;
-pub use file::{PinnedFile, PinnedRepo, Revisions, is_bare_repo};
+pub use file::{ModelReference, PinnedFile, PinnedRepo, Revisions, is_bare_repo};
 const HUB: &str = "https://huggingface.co";
 
 /// Which kind of repository a model lives in. The API path pluralises
@@ -62,8 +62,10 @@ pub struct Repo {
     pub kind: RepoKind,
     /// `org/name`.
     pub id: String,
-    /// Branch, tag or commit sha.
+    /// Branch, tag or commit SHA.
     pub revision: String,
+    /// Resolve the repository's default branch when no ref was supplied.
+    pub default_branch: bool,
 }
 
 /// The most a token response may be.
@@ -92,8 +94,12 @@ pub enum FetchError {
         #[source]
         source: Box<ureq::Error>,
     },
-    #[error("malformed reconstruction response: {0}")]
+    #[error("invalid HF data: {0}")]
     Malformed(String),
+    #[error("invalid HF locator: {0}; expected hf://ORG/REPO[@ref][/path]")]
+    Locator(&'static str),
+    #[error("HF repository or revision not found: {0}")]
+    NotFound(String),
     #[error("Hub file I/O: {0}")]
     Io(#[from] std::io::Error),
     #[error("decoding a xorb: {0}")]
@@ -495,16 +501,49 @@ impl RepoFile {
         Ok(object)
     }
 }
+impl std::str::FromStr for Repo {
+    type Err = FetchError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        let reference = ModelReference::parse(value)?;
+        if reference.selector.is_some() {
+            return Err(FetchError::Locator(
+                "expected a repository without a file path",
+            ));
+        }
+        Ok(reference.repo)
+    }
+}
+
+/// `ORG/REPO`, or `ORG/REPO@REF` when a ref was named.
+impl std::fmt::Display for Repo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.default_branch {
+            write!(f, "{}", self.id)
+        } else {
+            write!(f, "{}@{}", self.id, self.revision)
+        }
+    }
+}
+
 impl Repo {
-    pub fn from_uri(uri: &str) -> Result<Self> {
-        let value = uri
-            .strip_prefix("hf://")
-            .ok_or_else(|| FetchError::Malformed("expected hf://org/repo[@revision]".into()))?;
-        let (id, revision) = value.split_once('@').unwrap_or((value, "main"));
+    pub fn uri(&self) -> String {
+        if self.default_branch {
+            return format!("hf://{}", self.id);
+        }
+        let revision = percent_encoding::utf8_percent_encode(
+            &self.revision,
+            percent_encoding::NON_ALPHANUMERIC,
+        );
+        format!("hf://{}@{revision}", self.id)
+    }
+
+    fn new(id: &str, revision: Option<&str>) -> Result<Self> {
         // A slash in a branch or tag can be escaped when the URI also names a file.
-        let mut revision = percent_encoding::percent_decode_str(revision)
+        let default_branch = revision.is_none();
+        let mut revision = percent_encoding::percent_decode_str(revision.unwrap_or("main"))
             .decode_utf8()
-            .map_err(|_| FetchError::Malformed("invalid UTF-8 in Hub revision".into()))?
+            .map_err(|_| FetchError::Locator("invalid UTF-8 in revision"))?
             .into_owned();
         if immutable_sha(&revision) {
             revision.make_ascii_lowercase();
@@ -513,6 +552,7 @@ impl Repo {
             kind: RepoKind::Model,
             id: id.into(),
             revision,
+            default_branch,
         };
         repo.validate()?;
         Ok(repo)
@@ -520,16 +560,26 @@ impl Repo {
     pub(crate) fn validate(&self) -> Result<()> {
         if !hellas_rpc::protocol::invocation::valid_hub_repo(&self.id)
             || self.revision.is_empty()
-            || self.revision.contains('\0')
+            || self.revision.chars().any(char::is_control)
+            || self.revision.contains(['@', '?', '#', '\\'])
         {
-            return Err(FetchError::Malformed(
-                "invalid HF repository or revision".into(),
-            ));
+            return Err(FetchError::Locator("invalid repository or revision"));
         }
         Ok(())
     }
 }
 impl HfCas {
+    fn repo_error(&self, error: FetchError) -> FetchError {
+        match error {
+            FetchError::Http { source, .. }
+                if matches!(*source, ureq::Error::StatusCode(404 | 401)) =>
+            {
+                FetchError::NotFound(self.repo.to_string())
+            }
+            error => error,
+        }
+    }
+
     fn hub_url(&self, api: bool, tail: &[&str]) -> Result<url::Url> {
         let mut url =
             url::Url::parse(&self.hub).map_err(|_| FetchError::Malformed("Hub origin".into()))?;
@@ -563,9 +613,11 @@ impl HfCas {
         } else {
             self.hub_url(true, &["revision", &self.repo.revision])?
         };
-        let value: serde_json::Value =
-            serde_json::from_slice(&get(url.as_str(), None, RECONSTRUCTION_BODY_LIMIT)?)
-                .map_err(|_| FetchError::Malformed("repository revision response".into()))?;
+        let value: serde_json::Value = serde_json::from_slice(
+            &get(url.as_str(), None, RECONSTRUCTION_BODY_LIMIT)
+                .map_err(|error| self.repo_error(error))?,
+        )
+        .map_err(|_| FetchError::Malformed("repository revision response".into()))?;
         value
             .get("sha")
             .and_then(serde_json::Value::as_str)
@@ -594,9 +646,12 @@ impl HfCas {
             let charge = pool
                 .reserve(RECONSTRUCTION_BODY_LIMIT)
                 .map_err(|_| FetchError::Capacity)?;
-            let mut response = authenticated_get(&url, None)
-                .call()
-                .map_err(|_| FetchError::Malformed("Hub listing failed".into()))?;
+            let mut response = authenticated_get(&url, None).call().map_err(|source| {
+                self.repo_error(FetchError::Http {
+                    context: format!("GET {url}"),
+                    source: Box::new(source),
+                })
+            })?;
             let next = response
                 .headers()
                 .get("link")
@@ -871,6 +926,7 @@ mod credentials_tests {
             kind: RepoKind::Model,
             id: "org/repo".into(),
             revision: "main".into(),
+            default_branch: false,
         });
         assert!(matches!(
             cas.resolve_revision(false, &crate::content::Reservations::ram(0)),

@@ -52,6 +52,7 @@ fn indexed_stage(
 fn hf_error(error: crate::hf::FetchError) -> Error {
     match error {
         crate::hf::FetchError::Capacity => Error::Capacity,
+        crate::hf::FetchError::NotFound(repo) => Error::HfNotFound(repo),
         crate::hf::FetchError::Malformed(reason) if reason == crate::hf::LEGACY_CHUNKING => {
             Error::Invalid(crate::hf::LEGACY_CHUNKING)
         }
@@ -456,6 +457,7 @@ impl Core {
         .map_err(|_| Error::Invalid("resolve worker failed"))??;
         let repo = crate::hf::Repo {
             revision: sha.clone(),
+            default_branch: false,
             ..repo
         };
         let checking = scope.clone();

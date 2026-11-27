@@ -229,6 +229,7 @@ fn repo(kind: crate::hf::RepoKind) -> crate::hf::Repo {
         kind,
         id: "org/repo".into(),
         revision: "a".repeat(40),
+        default_branch: false,
     }
 }
 
@@ -459,7 +460,7 @@ async fn disk_resolve_obeys_recovery_and_reclaims_before_retrying_the_same_commi
     .await
     .unwrap();
     store.core.hf_hub = Some("http://127.0.0.1:1".into());
-    let repo = crate::hf::Repo::from_uri("hf://org/repo").unwrap();
+    let repo = "hf://org/repo".parse::<crate::hf::Repo>().unwrap();
     assert!(matches!(
         store.resolve_hf(&Scope::Owner, repo.clone()).await,
         Err(Error::Denied)
