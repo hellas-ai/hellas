@@ -207,6 +207,27 @@ impl LocalStore {
         scope: &Scope,
         closure: Closure,
     ) -> Result<std::collections::BTreeSet<ContentId>> {
+        self.acquire_misses(scope, closure, None).await
+    }
+
+    /// Acquisition choices follow the authenticated work closure, not the hints.
+    pub async fn acquire_hinted_misses(
+        &self,
+        scope: &Scope,
+        closure: Closure,
+        caller: HintCaller,
+        hints: &SourceHints,
+    ) -> Result<std::collections::BTreeSet<ContentId>> {
+        self.acquire_misses(scope, closure, Some((caller, hints)))
+            .await
+    }
+
+    async fn acquire_misses(
+        &self,
+        scope: &Scope,
+        closure: Closure,
+        hints: Option<(HintCaller, &SourceHints)>,
+    ) -> Result<std::collections::BTreeSet<ContentId>> {
         let core = self.core();
         let checking = scope.clone();
         let requested = canonical_closure(closure)?;
@@ -221,14 +242,16 @@ impl LocalStore {
         let ScopeKind::Work { job, .. } = &scope.kind else {
             return Err(Error::Denied);
         };
+        let policy = destination
+            .state
+            .lock()
+            .map_err(|_| Error::Invalid("store lock"))?
+            .on_miss
+            .clone();
+        let mut owner = scope.clone();
+        owner.kind = ScopeKind::Owner;
         let mut acquired = std::collections::BTreeSet::new();
         for object in missing {
-            let policy = destination
-                .state
-                .lock()
-                .map_err(|_| Error::Invalid("store lock"))?
-                .on_miss
-                .clone();
             let decision = policy.decide(
                 &Miss {
                     scope: scope.clone(),
@@ -236,27 +259,69 @@ impl LocalStore {
                 },
                 &destination.data_pool().stats()?,
             );
+            let pin = PinTarget {
+                name: PinName::new(format!(
+                    "work/{}/{}/acquired/{}",
+                    job.channel,
+                    job.id,
+                    object.id()
+                ))?,
+                policy: PinPolicy::Jobs,
+            };
+            let requester = (core.clone(), scope.clone());
             if let MissDecision::Acquire { source } = decision {
-                let mut owner = scope.clone();
-                owner.kind = ScopeKind::Owner;
                 destination
                     .acquire_scoped(
                         &owner,
                         source,
                         Some(object),
-                        AcquirePin::Named(PinTarget {
-                            name: PinName::new(format!(
-                                "work/{}/{}/acquired/{}",
-                                job.channel,
-                                job.id,
-                                object.id()
-                            ))?,
-                            policy: PinPolicy::Jobs,
-                        }),
-                        Some((core.clone(), scope.clone())),
+                        AcquirePin::Named(pin),
+                        Some(requester),
                     )
                     .await?;
                 acquired.insert(object.id());
+                continue;
+            }
+            if let Some((caller, hints)) = hints
+                && let Some(policy) = policy.hints()
+            {
+                for locator in hints.sources(object.id()) {
+                    if !policy.follows(caller, locator) {
+                        continue;
+                    }
+                    let Ok(source) = locator.clone().into_source(Some(object.bytes()), None) else {
+                        continue;
+                    };
+                    // Each peer seed may cost up to the expected object.
+                    let attempts = match &source {
+                        Source::Peer { seeds, .. } => seeds.len() as u64,
+                        _ => 1,
+                    };
+                    if !attempts
+                        .checked_mul(object.bytes())
+                        .is_some_and(|bytes| policy.charge(*job, bytes))
+                    {
+                        continue;
+                    }
+                    match destination
+                        .acquire_hint(
+                            &owner,
+                            source,
+                            object,
+                            pin.clone(),
+                            requester.clone(),
+                            policy,
+                        )
+                        .await
+                    {
+                        Ok(()) => {
+                            acquired.insert(object.id());
+                            break;
+                        }
+                        Err(Error::Denied) => return Err(Error::Denied),
+                        Err(_) => continue,
+                    }
+                }
             }
         }
         Ok(acquired)

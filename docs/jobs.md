@@ -75,12 +75,9 @@ With a published Xet ID, the remote buyer reads only the header. For a Git or LF
 hellas store acquire hf://LiquidAI/LFM3-1.7B-GGUF@cd0c74c575b5c416f3011b5b4c298077f26ca8c2/LFM3-1.7B-BF16.gguf --expect a4896de517cae418383c2fd9954bc5ac33d8112b810c7895fb3feb70dca622dc --bytes 3466626336 --policy jobs
 ```
 
-A grant or paid policy constrained to Hub repositories requires a provider acquisition
-receipt for every model asset, including tokenizer, configuration, and voice files.
-Activate the exact Hub checkpoint or acquire the selected files before serving that
-policy. The buyer can use local files, a Hub revision, or a model ID. Admission checks
-the provider's durable receipts by content ID and size and works with the Hub offline.
-An on-miss allow-list can fetch approved missing content after the policy check.
+The provider can use pre-acquired content or fetch missing content from its
+allow-list after the policy check. Grant and paid rules match the same
+model and program IDs regardless of the source.
 
 The provider checks the published Xet hash against the canonical content ID. It rejects files published with legacy Xet chunking. With `--local`, the local executor acquires the weights into its own content store.
 
@@ -99,8 +96,8 @@ Use `hellas program --model-id MODEL` to print its reference without selecting a
 With a public catalog, pass `--model hellas://MODEL_ID` to a job command. The
 buyer contacts the node in its signed access offer or the node selected by
 `--provider`. To specify a source explicitly, including with `hellas program`
-or a gateway route, use `hellas://MODEL_ID@NODE_ID` or
-`hellas://MODEL_ID@NODE_ID@IP:PORT`. The buyer verifies the catalog against the
+or a gateway route, use `hellas://MODEL_ID?seed=NODE_ID` or
+`hellas://MODEL_ID?seed=NODE_ID@IP:PORT`. The buyer verifies the catalog against the
 model ID and reads authenticated ranges for checkpoint headers and metadata.
 Publishing the tree permits readers to download every file in it, including
 weights. For private sharing, the owner can choose `--policy granted` and give the
@@ -461,6 +458,19 @@ a sealed Responses backend. Work authorization comes from the mounted grant
 or paid channel. There is no separate Fetch configuration file.
 See [paid Work](../crates/channel/README.md) for channel configuration and
 [HTTPS Fetch](../crates/providers/HTTPS.md) for provider credentials and egress.
+
+## Source hints
+
+For remote Compute and Fetch jobs, repeat
+`--source-hint 'CONTENT_ID=LOCATOR'` to offer alternate locations for objects
+the job already declares. A locator can be an HTTPS URL, a Hub file, or a
+Hellas object locator. A provider only uses hints on a cache miss when its
+content policy follows hints from that caller and locator kind; HTTPS hints
+are off by default and never reach private or loopback addresses unless the
+provider allows them (see [the store README](../crates/store/README.md#job-source-hints)).
+The job identity and
+signed request are independent of the hints, which can be supplied again on
+retry.
 
 ## Folder rules and retries
 

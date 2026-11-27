@@ -204,7 +204,11 @@ async fn public_content_is_served_by_the_host_without_a_running_provider() {
     };
     let root = tempfile::tempdir().unwrap();
     let store = common::content_store(root.path()).await;
-    let public = PinName::new("published/tokenizer".into()).unwrap();
+    let public = PinName::new(format!(
+        "object/{}",
+        ContentRef::for_bytes(b"public tokenizer bytes").id()
+    ))
+    .unwrap();
     let private = PinName::new("private/source".into()).unwrap();
     for (name, policy, body) in [
         (
@@ -287,8 +291,8 @@ async fn public_content_is_served_by_the_host_without_a_running_provider() {
         .acquire(
             &Scope::Owner,
             Source::Peer {
-                node: *connection.remote_id().as_bytes(),
-                at: path.clone(),
+                id: ContentRef::for_bytes(b"public tokenizer bytes").id(),
+                seeds: vec![iroh::EndpointAddr::new(connection.remote_id())],
             },
             Some(ContentRef::for_bytes(b"public tokenizer bytes")),
             PinTarget {

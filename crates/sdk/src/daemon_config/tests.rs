@@ -574,7 +574,7 @@ async fn explicit_model_rules_preserve_their_shape_and_advertise_the_backend_ren
             ..Default::default()
         },
         Match {
-            repos: vec!["org/repo".into()],
+            evaluator: Some(evaluator.clone()),
             ..Default::default()
         },
     ];

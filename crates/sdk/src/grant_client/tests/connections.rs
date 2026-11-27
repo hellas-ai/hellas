@@ -690,8 +690,8 @@ async fn exact_pin_content_reads_use_the_live_grant_on_the_authenticated_work_ca
                 .acquire(
                     &Scope::Owner,
                     Source::Peer {
-                        node: *pair.provider.id().as_bytes(),
-                        at: at.clone()
+                        id: object.id(),
+                        seeds: vec![pair.provider.addr()]
                     },
                     Some(object),
                     PinTarget {
@@ -710,6 +710,7 @@ async fn exact_pin_content_reads_use_the_live_grant_on_the_authenticated_work_ca
             .send(hellas_rpc::pb::content::UploadRequest {
                 part: Some(hellas_rpc::pb::content::upload_request::Part::Open(
                     hellas_rpc::pb::content::UploadOpen {
+                        source_hints: Vec::new(),
                         object: Some(hellas_rpc::pb::content::ContentRef {
                             id: object.id().as_bytes().to_vec(),
                             bytes: object.bytes(),

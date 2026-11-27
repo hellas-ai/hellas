@@ -3,7 +3,7 @@ use hellas_auth::Digest;
 use hellas_rpc::{ContentId, ContentRef};
 use hellas_store::content::{
     ContentStore, Cursor, DiskStore, Error, LocalStore, PinName, PinPolicy, PinTarget, Scope,
-    ScopeKind, UploadSession, chunk_page,
+    ScopeKind, SourceHints, UploadSession, chunk_page,
 };
 
 pub(crate) mod tree;
@@ -18,6 +18,7 @@ pub struct WorkUpload {
     request: hellas_rpc::pb::work::AcceptWorkRequest,
     opening: hellas_rpc::pb::content::WorkOpening,
     exporter: [u8; 32],
+    hints: SourceHints,
     requests: hellas_store::content::UploadRequests,
 }
 impl WorkUpload {
@@ -30,9 +31,16 @@ impl WorkUpload {
         hellas_rpc::pb::content::WorkOpening,
         hellas_rpc::pb::work::AcceptWorkRequest,
         [u8; 32],
+        SourceHints,
         hellas_store::content::UploadRequests,
     ) {
-        (self.opening, self.request, self.exporter, self.requests)
+        (
+            self.opening,
+            self.request,
+            self.exporter,
+            self.hints,
+            self.requests,
+        )
     }
     pub async fn read(
         mut requests: hellas_store::content::UploadRequests,
@@ -52,6 +60,8 @@ impl WorkUpload {
             return Err(denied());
         };
         let opening = open.work.take().ok_or_else(denied)?;
+        let hints =
+            SourceHints::decode(&std::mem::take(&mut open.source_hints)).map_err(upload_status)?;
         let request =
             hellas_rpc::pb::work::AcceptWorkRequest::decode(opening.signed_opening.as_slice())
                 .map_err(|_| denied())?;
@@ -72,6 +82,7 @@ impl WorkUpload {
             request,
             opening,
             exporter: context.open_exporter.ok_or_else(denied)?,
+            hints,
             requests: futures::stream::once(async move { Ok(first) })
                 .chain(requests)
                 .boxed(),
@@ -84,14 +95,16 @@ pub async fn stage_work(
     policy: &hellas_rpc::protocol::invocation::InvocationPolicy,
     manifest: &hellas_rpc::ProgramManifest,
     input: ContentRef,
+    hints: &SourceHints,
+    caller: hellas_store::content::HintCaller,
 ) -> Result<Vec<ContentRef>, hellas_wire::WireStatus> {
     let bound = service.scope()?;
-    let (closure, _) = admit_content(&service.store, &bound, policy, manifest, Some(input))
+    let closure = work_closure(&service.store, &bound, policy, manifest, input)
         .await
         .map_err(upload_status)?;
     service
         .store
-        .acquire_missing(&bound, closure.clone())
+        .acquire_hinted_misses(&bound, closure.clone(), caller, hints)
         .await
         .map_err(upload_status)?;
     Ok(closure)
@@ -101,56 +114,22 @@ pub fn upload_status(error: impl std::fmt::Display) -> hellas_wire::WireStatus {
     hellas_wire::WireStatus::new(hellas_wire::WireCode::PermissionDenied, error.to_string())
 }
 
-/// Check the provider's current policy and verified acquisition receipts. Staging and
-/// acceptance also open the complete object closure; execution asks for setup permissions.
-pub async fn admit_content(
+/// Read the authenticated model root and expand its verified content closure.
+pub async fn work_closure(
     store: &LocalStore,
     scope: &Scope,
     policy: &hellas_rpc::protocol::invocation::InvocationPolicy,
     manifest: &hellas_rpc::ProgramManifest,
-    prepared: Option<ContentRef>,
-) -> Result<(Vec<ContentRef>, std::collections::BTreeSet<String>), Error> {
-    use std::collections::BTreeSet;
-    let needs_receipts = policy
-        .compute_rules()
-        .any(|rule| !rule.repos.is_empty() && rule.matches(manifest, None));
-    let mut receipts = vec![];
-    let mut closure = vec![];
-    if prepared.is_some() || needs_receipts {
-        let bytes = if manifest.model().is_some() {
-            root(store, scope, manifest.root()).await?
-        } else {
-            bytes::Bytes::new()
-        };
-        let (objects, model) = policy
-            .content_closure(manifest, &bytes, prepared)
-            .map_err(|_| Error::Invalid("invalid program content closure"))?;
-        closure = objects;
-        if needs_receipts {
-            let model = model.ok_or(Error::Denied)?;
-            for object in model
-                .assets
-                .into_iter()
-                .map(|asset| asset.object)
-                .collect::<BTreeSet<_>>()
-            {
-                receipts.push(
-                    store
-                        .verified_hub_files(object)
-                        .await?
-                        .into_iter()
-                        .map(|(repo, _, _)| repo)
-                        .collect(),
-                );
-            }
-        }
-    }
-    Ok((
-        closure,
-        policy
-            .admitted_setup(manifest, &receipts)
-            .ok_or(Error::Denied)?,
-    ))
+    prepared: ContentRef,
+) -> Result<Vec<ContentRef>, Error> {
+    let bytes = if manifest.model().is_some() {
+        root(store, scope, manifest.root()).await?
+    } else {
+        bytes::Bytes::new()
+    };
+    policy
+        .content_closure(manifest, &bytes, Some(prepared))
+        .map_err(|_| Error::Invalid("invalid program content closure"))
 }
 pub async fn read(
     store: &LocalStore,
@@ -190,7 +169,7 @@ pub(crate) async fn read_staged(
 
 pub fn object_pin(object: ContentRef) -> Result<PinTarget, Error> {
     Ok(PinTarget {
-        name: PinName::new(format!("object/{}", object.id()))?,
+        name: PinName::object(object.id()),
         policy: PinPolicy::Owner,
     })
 }
@@ -203,8 +182,7 @@ pub async fn root(store: &LocalStore, scope: &Scope, id: ContentId) -> Result<by
             .ok_or(Error::Missing)?;
         return read_staged(store, scope, object, MAX_PROGRAM_ROOT_BYTES as u64).await;
     }
-    let at =
-        hellas_store::content::Path::new(PinName::new(format!("object/{id}"))?, String::new())?;
+    let at = hellas_store::content::Path::new(PinName::object(id), String::new())?;
     let object = store
         .stat(scope, &at)
         .await?

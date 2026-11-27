@@ -139,6 +139,7 @@ pub struct RemoteStore<T> {
     last_manifest: Option<tokio::sync::Mutex<Option<Arc<VerifiedManifest>>>>,
     pool: Reservations,
     opening: Option<pb::WorkOpening>,
+    source_hints: Vec<u8>,
     upload: Arc<std::sync::Mutex<UploadState>>,
 }
 impl<T> RemoteStore<T>
@@ -153,6 +154,7 @@ where
             last_manifest: None,
             pool,
             opening: None,
+            source_hints: Vec::new(),
             upload: Arc::new(std::sync::Mutex::new(UploadState {
                 call: None,
                 active: false,
@@ -167,6 +169,10 @@ where
     }
     pub fn with_opening(mut self, opening: pb::WorkOpening) -> Self {
         self.opening = Some(opening);
+        self
+    }
+    pub fn with_source_hints(mut self, hints: &SourceHints) -> Self {
+        self.source_hints = hints.encode();
         self
     }
     /// Transfer one verified local object through the common paged upload path.
@@ -423,6 +429,11 @@ where
                 part: Some(pb::upload_request::Part::Open(pb::UploadOpen {
                     object: Some(super::page::wire_ref(object)),
                     pin: pin.as_ref().map(w::pin_target),
+                    source_hints: if opening.is_some() {
+                        self.source_hints.clone()
+                    } else {
+                        Vec::new()
+                    },
                     work: opening,
                 })),
             })
@@ -456,7 +467,7 @@ where
         let root = match root {
             AcquirePin::Named(pin) => Root::Pin(w::pin_target(&pin)),
             AcquirePin::Automatic { policy, alias } => Root::Automatic(pb::AutomaticRoot {
-                policy: Some(w::policy(&policy)),
+                policy: policy.as_ref().map(w::policy),
                 alias: alias.map(|name| name.as_str().to_owned()),
             }),
         };
@@ -472,14 +483,19 @@ where
                 root: Some(root),
             })
             .await
-            .map_err(|status| match hub {
-                Some(repo)
-                    if status.code() == hellas_wire::WireCode::NotFound
-                        && status.details().as_ref() == w::HF_NOT_FOUND =>
-                {
-                    Error::HfNotFound(repo)
+            .map_err(|status| {
+                let from_hub = status
+                    .metadata()
+                    .get(w::ERROR_SOURCE)
+                    .and_then(|value| value.as_text())
+                    == Some("hub");
+                match (hub.filter(|_| from_hub), status.code()) {
+                    (Some(repo), hellas_wire::WireCode::NotFound) => Error::HfNotFound(repo),
+                    (Some(repo), hellas_wire::WireCode::PermissionDenied) => {
+                        Error::HfUnauthorized(repo)
+                    }
+                    _ => w::error(status),
                 }
-                _ => w::error(status),
             })?;
         let target = w::target_from(
             response
@@ -494,6 +510,7 @@ where
             object,
             target,
             root: PinName::new(response.root)?,
+            hub_alias: response.hub_alias.map(PinName::new).transpose()?,
             commit: response.commit,
         })
     }

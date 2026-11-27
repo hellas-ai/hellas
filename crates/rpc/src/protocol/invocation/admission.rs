@@ -109,13 +109,13 @@ impl InvocationPolicy {
         manifest: &ProgramManifest,
         program_root: &[u8],
         input: Option<ContentRef>,
-    ) -> Result<(Vec<ContentRef>, Option<compute::Model>), CanonicalDecodeError> {
+    ) -> Result<Vec<ContentRef>, CanonicalDecodeError> {
         self.classify_manifest(manifest)?;
         if manifest.model().is_none() {
             if !program_root.is_empty() {
                 return Err(error("Fetch has no program-root content opening"));
             }
-            return Ok((input.into_iter().collect(), None));
+            return Ok(input.into_iter().collect());
         }
         let environment = compute::Environment::open(manifest, program_root)?;
         let root = ContentRef::new(manifest.root(), program_root.len() as u64);
@@ -139,13 +139,10 @@ impl InvocationPolicy {
                 return Err(error("compute content identity has conflicting lengths"));
             }
         }
-        Ok((
-            objects
-                .into_iter()
-                .map(|(id, bytes)| ContentRef::new(id, bytes))
-                .collect(),
-            Some(environment.model),
-        ))
+        Ok(objects
+            .into_iter()
+            .map(|(id, bytes)| ContentRef::new(id, bytes))
+            .collect())
     }
 
     /// Only admitted, known application metadata may determine staging retention.

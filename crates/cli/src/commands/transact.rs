@@ -124,8 +124,32 @@ pub(crate) fn duration(value: &str) -> Result<Duration, String> {
     Ok(Duration::from_millis(millis))
 }
 
+#[derive(Clone, Debug)]
+struct SourceHint {
+    id: hellas_rpc::ContentId,
+    source: hellas_store::content::Locator,
+}
+
+impl std::str::FromStr for SourceHint {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (id, source) = value
+            .split_once('=')
+            .context("source hint must be CONTENT_ID=LOCATOR")?;
+        Ok(Self {
+            id: id.parse()?,
+            source: source.parse()?,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Args)]
 pub struct ClientArgs {
+    /// Offer another source for an object in this job's content closure. Repeat for alternatives.
+    #[arg(long = "source-hint", value_name = "CONTENT_ID=LOCATOR")]
+    source_hints: Vec<SourceHint>,
+
     /// Provider address ENROLLMENT_ID@NODE_ID, optionally followed by @IP:PORT.
     /// Paid work requires it; --access derives it from the signed offer.
     #[arg(long)]
@@ -201,7 +225,7 @@ pub(super) struct TargetArgs {
     /// Run on this machine's executor under your own limits; nothing is
     /// paid, granted or tracked.
     #[cfg(feature = "compute")]
-    #[arg(long, conflicts_with_all = ["access", "provider", "backend", "settle", "buy_again", "validators", "addresses", "acceptance_blocks", "terminal_blocks", "payment_blocks", "trust_store"])]
+    #[arg(long, conflicts_with_all = ["access", "provider", "backend", "settle", "buy_again", "validators", "addresses", "acceptance_blocks", "terminal_blocks", "payment_blocks", "trust_store", "source_hints"])]
     local: bool,
     #[cfg(feature = "compute")]
     #[command(flatten)]
@@ -371,14 +395,16 @@ impl ModelArgs {
         context: &Context,
         companions: Option<&crate::hub::Companions>,
     ) -> super::CliResult<Arc<ModelPackage>> {
-        use hellas_client::model::{CatalogUnavailable, ModelPackage, peer_locator};
+        use hellas_client::model::{CatalogUnavailable, ModelPackage};
         let spec = companions.map_or_else(|| self.model.clone().into(), |c| c.spec(&self.model));
         let mut pinned = crate::hub::Revisions::default().pin_spec(&spec).await?;
         let evaluator = self.target.renderer()?;
         let mut private = None;
-        if let Some(uri) = hellas_client::model::peer_uri(&pinned.model) {
-            let (id, address) = peer_locator(uri)?;
-            let mut bare_contact = None;
+        use hellas_store::content::Locator;
+        if let Some(Locator::Hellas { id, mut seeds }) =
+            hellas_client::model::model_locator(&pinned.model)?
+        {
+            let mut provider = None;
             if let Some(file) = &self.target.access {
                 let spec = self.target.access_spec(
                     file.clone(),
@@ -391,26 +417,30 @@ impl ModelArgs {
                 };
                 let offer = grant.options.target.offer();
                 let node = hellas_sdk::client::ProviderAddress::of(&offer.provider)?.node;
-                if address.is_none() {
-                    bare_contact = Some((node, offer.addresses.clone()));
-                }
-                if address.as_ref().is_none_or(|peer| peer.id == node) {
+                provider = Some((node, offer.addresses.clone()));
+                if seeds.is_empty() || seeds.iter().any(|seed| seed.id == node) {
                     private = Some((id, node, grant));
                 }
-            } else if let Some(provider) = &self.client.provider {
-                bare_contact = Some((
-                    provider.address.node,
-                    provider.addresses.iter().map(ToString::to_string).collect(),
+            } else if let Some(remote) = &self.client.provider {
+                provider = Some((
+                    remote.address.node,
+                    remote.addresses.iter().map(ToString::to_string).collect(),
                 ));
             }
-            if address.is_none() {
-                let (node, mut ips) = bare_contact.context("hellas://model-id needs an addressed provider or an explicit @NODE_ID[@IP:PORT]")?;
-                ips.extend(self.client.addresses.iter().map(ToString::to_string));
-                pinned.model = std::iter::once(format!("{uri}@{node}"))
-                    .chain(ips)
-                    .collect::<Vec<_>>()
-                    .join("@")
-                    .into();
+            if seeds.is_empty()
+                && let Some((node, ips)) = provider
+            {
+                for ip in ips
+                    .iter()
+                    .filter_map(|ip| ip.parse().ok())
+                    .chain(self.client.addresses.iter().copied())
+                {
+                    seeds.push(iroh::EndpointAddr::new(node).with_ip_addr(ip));
+                }
+                if seeds.is_empty() {
+                    seeds.push(iroh::EndpointAddr::new(node));
+                }
+                pinned.model = Locator::Hellas { id, seeds }.to_string().into();
             }
         }
         let content = self.target.content(context, Some(&pinned)).await?;
@@ -501,8 +531,11 @@ impl TargetArgs {
                         .await
                 })
                 .await?;
-            if let Some(uri) = model.and_then(|spec| hellas_client::model::peer_uri(&spec.model)) {
-                hellas_client::model::acquire_peer_model(uri, store).await?;
+            if let Some(model) = model
+                && let Some(hellas_store::content::Locator::Hellas { id, seeds }) =
+                    hellas_client::model::model_locator(&model.model)?
+            {
+                hellas_client::model::acquire_peer_model(id, seeds, store).await?;
             }
             return Ok(Some(store.clone()));
         }
@@ -691,6 +724,16 @@ async fn execute(
     evidence: Option<&Path>,
     present: impl FnOnce(&Completed, &str) -> super::CliResult<()> + Send,
 ) -> super::CliResult<()> {
+    let mut sources = std::collections::BTreeMap::<_, Vec<_>>::new();
+    for hint in &client.source_hints {
+        sources
+            .entry(hint.id)
+            .or_default()
+            .push(hint.source.clone());
+    }
+    let job = &job
+        .clone()
+        .with_source_hints(hellas_store::content::SourceHints::new(sources)?);
     let (executor, provider) = within(deadline, target.executor(client, context, job)).await?;
     let stop = hellas_sdk::execution::stop_on(async {
         let _ = tokio::signal::ctrl_c().await;

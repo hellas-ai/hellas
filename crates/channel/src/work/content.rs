@@ -180,6 +180,7 @@ pub(super) async fn transfer_proposal<T>(
     endpoint: &mut impl ClientChannel,
     request: AcceptWorkRequest,
     source: &(LocalStore, Scope),
+    hints: &hellas_store::content::SourceHints,
 ) -> Result<Digest, ProposeError>
 where
     T: StreamTransport + Clone + Send + Sync,
@@ -258,7 +259,9 @@ where
             return endpoint.client().await?.accepted(&response).await;
         }
     }
-    let remote = RemoteStore::new(transport, pool).with_opening(opening);
+    let remote = RemoteStore::new(transport, pool)
+        .with_opening(opening)
+        .with_source_hints(hints);
     let remote_scope = Scope::work(
         hellas_store::content::JobId {
             channel: authorization.channel_id,
@@ -516,7 +519,7 @@ impl WorkService {
         context: TransportContext,
         connection: admission::Cancellation,
     ) -> Result<ResponseStream<pb::UploadResponse>, WireStatus> {
-        let (opening, request, exporter, requests) = upload.into_parts();
+        let (opening, request, exporter, hints, requests) = upload.into_parts();
         let mut endpoint = self
             .endpoint
             .lock_owned()
@@ -646,7 +649,7 @@ impl WorkService {
             while let Some(reply) = replies.next().await {
                 let reply = reply?;
                 if !widened && reply.complete {
-                    let closure = crate::content::stage_work(&service, &policy, &manifest, authorization.input_content).await?;
+                    let closure = crate::content::stage_work(&service, &policy, &manifest, authorization.input_content, &hints, hellas_store::content::HintCaller::Paid).await?;
                     let mut endpoint = host.endpoint().await.map_err(status)?;
                     endpoint.check_upload_authority(&authorization).map_err(status)?;
                     if !endpoint.close.store.has_content_scope(id,reservation) {Err(status(Error::Denied))?;}

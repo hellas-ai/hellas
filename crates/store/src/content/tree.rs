@@ -11,6 +11,10 @@ pub const MAX_TREE_BYTES: usize = 4 + MAX_TREE_ENTRIES * (4 + MAX_NAME_BYTES + 1
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PinName(String);
 impl PinName {
+    pub fn object(id: ContentId) -> Self {
+        Self(format!("object/{id}"))
+    }
+
     pub fn new(name: String) -> Result<Self> {
         validate_path(&name, false)?;
         Ok(Self(name))

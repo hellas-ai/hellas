@@ -126,49 +126,51 @@ async fn peer_acquisition_fetches_a_verified_tree_and_leaves_by_path_without_par
         ]),
         Mode::Good,
     );
-    let server = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-        .relay_mode(iroh::RelayMode::Disabled)
-        .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
-        .unwrap()
-        .alpns(vec![Content::ALPN.as_bytes().to_vec()])
-        .bind()
-        .await
-        .unwrap();
+    async fn serve(
+        fixture: std::sync::Arc<Fixture>,
+    ) -> (iroh::Endpoint, tokio::task::JoinHandle<()>) {
+        let server = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+            .unwrap()
+            .alpns(vec![Content::ALPN.as_bytes().to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let endpoint = server.clone();
+        let serving = tokio::spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                let fixture = fixture.clone();
+                tokio::spawn(async move {
+                    let Ok(connection) = incoming.await else {
+                        return;
+                    };
+                    let transport = IrohTransport::new(connection);
+                    while let Ok(Some(stream)) = transport.accept().await {
+                        let service = ContentServer(Handler(fixture.clone()));
+                        tokio::spawn(async move {
+                            let _ = Dispatcher::<IrohTransport>::dispatch(&service, stream).await;
+                        });
+                    }
+                });
+            }
+        });
+        (server, serving)
+    }
+    let incomplete = Fixture::new(BTreeMap::from([(String::new(), root.clone())]), Mode::Good);
+    let (first, incomplete_task) = serve(incomplete.clone()).await;
+    let (server, serving) = serve(fixture).await;
     let client = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
         .relay_mode(iroh::RelayMode::Disabled)
         .bind()
         .await
         .unwrap();
-    let addr = server.addr();
-    let endpoint = server.clone();
-    let serving = tokio::spawn(async move {
-        while let Some(incoming) = endpoint.accept().await {
-            let fixture = fixture.clone();
-            tokio::spawn(async move {
-                let Ok(connection) = incoming.await else {
-                    return;
-                };
-                let transport = IrohTransport::new(connection);
-                while let Ok(Some(inbound)) = transport.accept().await {
-                    let handler = Handler(fixture.clone());
-                    tokio::spawn(async move {
-                        let _ = <ContentServer<Handler> as Dispatcher<IrohTransport>>::dispatch(
-                            &ContentServer(handler),
-                            inbound,
-                        )
-                        .await;
-                    });
-                }
-            });
-        }
-    });
     let peers = Pool::for_service::<Content>(client.clone(), PoolOptions::default());
-    peers.connection(addr).await.unwrap();
     let pool = Reservations::ram(8 << 20);
     let store = MemoryStore::new(pool.clone()).with_peers(peers);
     let source = Source::Peer {
-        node: *server.id().as_bytes(),
-        at: Path::new(PinName::new("source".into()).unwrap(), String::new()).unwrap(),
+        id: root.object.id(),
+        seeds: vec![first.addr(), server.addr()],
     };
     let got = store
         .acquire(
@@ -183,6 +185,7 @@ async fn peer_acquisition_fetches_a_verified_tree_and_leaves_by_path_without_par
         .await
         .unwrap();
     assert_eq!(got.object, root.object);
+    assert!(incomplete.reads.load(std::sync::atomic::Ordering::Relaxed) > 0);
     let mut read = store
         .read(
             &Scope::Public,
@@ -227,26 +230,21 @@ async fn peer_acquisition_fetches_a_verified_tree_and_leaves_by_path_without_par
             .unwrap()
             .is_none()
     );
-    let old = store
-        .pins(&Scope::Owner, "peer", Cursor::default())
-        .await
-        .unwrap()
-        .pins[0]
-        .1
-        .clone();
-    store
-        .set_pin(
-            &Scope::Owner,
-            &PinName::new("peer".into()).unwrap(),
-            Some(&old),
-            None,
-        )
-        .await
-        .unwrap();
+    let alias = PinName::new("peer".into()).unwrap();
+    let canonical = PinName::object(root.object.id());
+    for name in [alias, canonical] {
+        let old = owner_pin(&store, &name).await.unwrap().unwrap();
+        store
+            .set_pin(&Scope::Owner, &name, Some(&old), None)
+            .await
+            .unwrap();
+    }
     assert_eq!(store.collect(&Scope::Owner).await.unwrap().objects, 4);
     assert_eq!(pool.held(), 0);
     drop(store);
     client.close().await;
     server.close().await;
+    first.close().await;
+    incomplete_task.abort();
     serving.abort();
 }

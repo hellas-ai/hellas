@@ -185,6 +185,7 @@ pub fn upload_frames(
         let reference = ContentRef::for_bytes(bytes);
         frames.push(pb::UploadRequest {
             part: Some(pb::upload_request::Part::Open(pb::UploadOpen {
+                source_hints: Vec::new(),
                 object: Some(wire_ref(reference)),
                 pin: None,
                 work: (frames.is_empty()).then(|| opening.clone()),

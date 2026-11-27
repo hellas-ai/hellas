@@ -43,10 +43,8 @@ match all its specified fields. Omit a field to leave it unconstrained.
 | `evaluator` | The exact interpreter named by the manifest. |
 | `program` | The content ID of the exact executable manifest. |
 | `model` | The ID of the model committed by that manifest and its opened environment. |
-| `repos` | Every model asset was verified at an immutable revision of a repo in this sorted list of Hub names. Git-stored metadata qualifies by hashing the downloaded file. |
 
-For example, `{"kind":"compute","model":"MODEL_ID"}` admits variants of that model. A rule can
-name multiple repositories for a model assembled from different checkpoints.
+For example, `{"kind":"compute","model":"MODEL_ID"}` admits variants of that model.
 An evaluator-only rule also admits arbitrary programs on that evaluator.
 Only a rule pinning a program or model can declare `pure_setup_entries`.
 Fetch has its own admission in the same policy.

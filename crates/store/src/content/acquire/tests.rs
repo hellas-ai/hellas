@@ -104,7 +104,7 @@ async fn cold_https_acquisition_pins_only_verified_bytes_and_sha_is_not_the_id()
             },
             None,
             AcquirePin::Automatic {
-                policy: PinPolicy::Public,
+                policy: Some(PinPolicy::Public),
                 alias: None,
             },
         )
@@ -113,7 +113,7 @@ async fn cold_https_acquisition_pins_only_verified_bytes_and_sha_is_not_the_id()
     serving.join().unwrap();
     assert_eq!(got.object, ContentRef::for_bytes(b"canonical HTTPS bytes"));
     assert_ne!(got.object.id().as_bytes(), &sha);
-    assert_eq!(got.root.as_str(), format!("https/{}", got.object.id()));
+    assert_eq!(got.root.as_str(), format!("object/{}", got.object.id()));
     let mut read = store
         .read(
             &Scope::Public,
@@ -359,7 +359,8 @@ async fn resolve_tree_fetches_git_files_but_not_weights_and_missing_weights_stay
     });
     let cas = crate::hf::HfCas::new(repo(crate::hf::RepoKind::Model)).with_hub(base);
     let pool = Reservations::ram(16 << 20);
-    let (stages, root, _) = hf_stages(&cas, &Core::new(pool.clone()), None, None, false).unwrap();
+    let (stages, root, _) =
+        hf_stages(&cas, &Core::new(pool.clone()), None, None, false, false).unwrap();
     serving.join().unwrap();
     assert!(!stages.contains_key(&weight.id()));
     let store = MemoryStore::new(pool.clone());
@@ -368,7 +369,8 @@ async fn resolve_tree_fetches_git_files_but_not_weights_and_missing_weights_stay
         &Scope::Owner,
         stages,
         root,
-        (pin("resolved"), None),
+        AcquirePin::Named(pin("resolved")),
+        None,
         None,
     )
     .await
@@ -545,6 +547,74 @@ async fn disk_resolve_obeys_recovery_and_reclaims_before_retrying_the_same_commi
 }
 
 #[tokio::test]
+async fn model_activation_adds_jobs_alias_without_changing_owner_root() {
+    let body = b"{}";
+    let object = ContentRef::for_bytes(body);
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = DiskStore::open(
+        hellas_private::StoreLocation::for_test(directory.path()),
+        vec![],
+        IndexMode::Resume,
+        None,
+        Reservations::ram(16 << 20),
+        false,
+    )
+    .await
+    .unwrap();
+    store.finish_recovery().await.unwrap();
+    let (url, http, seed) = https(body);
+    store.core.http = http;
+    store
+        .acquire_with(
+            &Scope::Owner,
+            Source::Https {
+                url,
+                sha256: None,
+                bytes: None,
+            },
+            Some(object),
+            AcquirePin::Automatic {
+                policy: Some(PinPolicy::Owner),
+                alias: None,
+            },
+        )
+        .await
+        .unwrap();
+    seed.join().unwrap();
+    let canonical = PinName::object(object.id());
+    let before = owner_pin(&store, &canonical).await.unwrap().unwrap();
+    let sha = "a".repeat(40);
+    let (base, serving) = hub(|_| {
+        vec![
+            (
+                format!("/api/models/org/repo/tree/{sha}?recursive=true"),
+                200,
+                serde_json::json!([{"type": "file", "path": "config.json", "size": body.len()}])
+                    .to_string()
+                    .into_bytes(),
+            ),
+            (
+                format!("/org/repo/resolve/{sha}/config.json"),
+                200,
+                body.to_vec(),
+            ),
+        ]
+    });
+    store.core.hf_hub = Some(base);
+    let file = crate::hf::PinnedFile::new(
+        repo(crate::hf::RepoKind::Model),
+        "config.json".into(),
+        object,
+    );
+    file.acquire(&store).await.unwrap();
+    serving.join().unwrap();
+    let jobs = PinTarget::model_object(object).unwrap();
+    assert!(jobs.holds(&store, Target::Object(object)).await.unwrap());
+    assert_eq!(owner_pin(&store, &canonical).await.unwrap(), Some(before));
+    store.close().await;
+}
+
+#[tokio::test]
 async fn hub_provenance_requires_a_verified_file_at_an_immutable_revision() {
     let sha = "a".repeat(40);
     let config = ContentRef::for_bytes(b"{}");
@@ -675,6 +745,16 @@ async fn automatic_hub_acquisition_locks_once_and_roots_the_alias() {
                 200,
                 b"{}".to_vec(),
             ),
+            (
+                format!("/api/models/org/repo/tree/{sha}?recursive=true"),
+                200,
+                listing.to_string().into_bytes(),
+            ),
+            (
+                format!("/org/repo/resolve/{sha}/sub/model.json"),
+                200,
+                b"{}".to_vec(),
+            ),
         ]
     });
     let mut store = MemoryStore::new(Reservations::ram(64 * 1024 * 1024));
@@ -690,7 +770,7 @@ async fn automatic_hub_acquisition_locks_once_and_roots_the_alias() {
             },
             None,
             AcquirePin::Automatic {
-                policy: PinPolicy::Jobs,
+                policy: Some(PinPolicy::Jobs),
                 alias,
             },
         )
@@ -702,7 +782,7 @@ async fn automatic_hub_acquisition_locks_once_and_roots_the_alias() {
     );
     let tree = acquire("hf://org/repo", None, None).await.unwrap();
     assert_eq!(tree.commit.as_deref(), Some(sha.as_str()));
-    assert_eq!(tree.root.as_str(), format!("hf/org/repo@{sha}"));
+    assert_eq!(tree.root.as_str(), format!("object/{}", tree.object.id()));
     assert!(matches!(tree.target, Target::Tree(_)));
     let leaf = acquire(
         &format!("hf://org/repo@{sha}"),
@@ -711,10 +791,7 @@ async fn automatic_hub_acquisition_locks_once_and_roots_the_alias() {
     )
     .await
     .unwrap();
-    assert_eq!(
-        leaf.root.as_str(),
-        format!("hf/org/repo@{sha}/sub/model.json")
-    );
+    assert_eq!(leaf.root.as_str(), format!("object/{}", leaf.object.id()));
     assert_eq!(leaf.target, Target::Object(ContentRef::for_bytes(b"{}")));
     store.collect(&owner).await.unwrap();
     let value = PinValue {
@@ -729,5 +806,21 @@ async fn automatic_hub_acquisition_locks_once_and_roots_the_alias() {
         owner_pin(&store, &tree.root).await.unwrap().unwrap().target,
         tree.target
     );
+    store
+        .resolve_hf(&owner, format!("hf://org/repo@{sha}").parse().unwrap())
+        .await
+        .unwrap();
+    let hub_alias = PinName::new(format!("hf/org/repo@{sha}")).unwrap();
+    assert_eq!(tree.hub_alias.as_ref(), Some(&hub_alias));
+    assert!(leaf.hub_alias.is_none());
+    for root in [&tree.root, &hub_alias] {
+        let pin = owner_pin(&store, root).await.unwrap().unwrap();
+        assert_eq!(
+            pin.policy,
+            PinPolicy::Jobs,
+            "resolve preserves acquisition visibility"
+        );
+        assert_eq!(pin.target, tree.target);
+    }
     serving.join().unwrap();
 }

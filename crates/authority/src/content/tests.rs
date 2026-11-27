@@ -440,6 +440,7 @@ async fn idle_work_upload_ends_on_its_proposal_cancellation_or_deadline() {
         let mut call = ContentClientImpl::new(client).upload().await.unwrap();
         call.send(pb::UploadRequest {
             part: Some(pb::upload_request::Part::Open(pb::UploadOpen {
+                source_hints: Vec::new(),
                 object: Some(pb::ContentRef {
                     id: object.id().as_bytes().to_vec(),
                     bytes: object.bytes(),
@@ -544,7 +545,10 @@ async fn revoked_owner_cannot_publish_an_acquisition_that_finishes_after_revocat
     let source = Arc::new(MemoryStore::new(Reservations::ram(1 << 20)));
     let value = put(
         &source,
-        "source",
+        &format!(
+            "object/{}",
+            ContentRef::for_bytes(b"download finishing after revocation").id()
+        ),
         b"download finishing after revocation",
         PinPolicy::Public,
     )
@@ -606,14 +610,14 @@ async fn revoked_owner_cannot_publish_an_acquisition_that_finishes_after_revocat
     .with_peers(peers);
     store.finish_recovery().await.unwrap();
     let acquiring = store.clone();
-    let source_node = *server.id().as_bytes();
+    let source_node = server.addr();
     let task = tokio::spawn(async move {
         acquiring
             .acquire(
                 &scope,
                 Source::Peer {
-                    node: source_node,
-                    at: at("source"),
+                    id: value.target.object().id(),
+                    seeds: vec![source_node],
                 },
                 Some(value.target.object()),
                 PinTarget {

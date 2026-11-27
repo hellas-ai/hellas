@@ -44,13 +44,43 @@ does not grant job access. Config owns the targets and policies of `config/*` pi
 
 HF files using legacy (pre-2026) Xet chunking are refused; content identity stays canonical CDC.
 
-Immutable HF declarations use `hf://org/repo@COMMIT_SHA`. Object declarations
-can use `url`, optional HF `path`, `expect`, `bytes`, HTTPS `sha256`, and
-`policy`. HTTPS declarations require both `expect` and the exact `bytes`
-length; CLI HTTPS acquisition also permits a length without `expect`. With
-no URL, `expect` and `bytes` together name a local object. HF credentials come from `HF_TOKEN` or the node user's HF token
+Immutable Hub declarations use `hf://org/repo@COMMIT_SHA[/path]`.
+Object declarations can use `url` for a locator and specify `expect`,
+`bytes`, HTTPS `sha256` and `policy`. HTTPS declarations require both
+`expect` and the exact `bytes` length. CLI HTTPS acquisition also permits a
+length without `expect`. With no URL, `expect` and `bytes` name a local object. HF credentials come from `HF_TOKEN` or the node user's HF token
 file and are sent only to HF HTTPS origins. Downloads stream on blocking
 workers with bounded reservations and the existing read/idle timeouts.
+
+### Job source hints
+
+A remote job may carry unsigned hints naming locators for objects in its
+authenticated content closure. Hints sit outside the job identity, so a bad
+hint only fails its own fetch, and every fetched object is verified against
+its declared ID and length. A provider follows no hints unless it opts in:
+
+```toml
+[content.policy.on_miss.hints]
+callers = ["paid", "grant"]
+kinds = ["hellas", "hf"]
+per_job_bytes = 104857600
+total_bytes = 1073741824
+```
+
+HTTPS hints are off unless `kinds` names `"https"`. Enabling them lets eligible
+callers choose URLs this provider fetches, and logs a warning at startup. Each
+hint connection, and each redirect hop, goes only to the addresses resolved
+for it, and refuses loopback, private (RFC 1918, ULA), link-local (including
+`169.254.169.254`), unspecified and other non-global addresses, so an HTTP
+proxy on such an address is refused too. `allow_private_addresses = true`
+lifts that check and logs a stronger warning; use it only on an isolated test
+network.
+
+`allow_list` entries take precedence. A Hub hint must name a single file, and
+a Hellas hint must name a seed. Each attempt is charged the expected object
+size (per seed for Hellas) against the job and the provider before any
+egress, and keeps its charge if it fails. Budgets reset when the provider
+installs the policy again.
 
 ## Owner commands
 
@@ -82,21 +112,25 @@ hellas store --profile owner-profile.json resolve hf://org/repo
 hellas store --profile owner-profile.json acquire https://huggingface.co/org/repo/tree/release
 hellas store --profile owner-profile.json acquire hf://org/repo@release/model.bin --pin model
 hellas store --profile owner-profile.json acquire https://example.org/model
-hellas store --profile owner-profile.json acquire peer://NODE_ID --source-pin published
+hellas store --profile owner-profile.json acquire hellas://CONTENT_ID?seed=NODE_ID
 hellas store --profile owner-profile.json pin set alias CONTENT_ID --bytes EXACT_BYTES --policy jobs
 hellas store --profile owner-profile.json pin rm alias
 ```
 
 A pin is a named garbage-collection root with a visibility policy. Acquire
-roots a repository at `hf/ORG/REPO@SHA`, a Hub file or directory under that
-name followed by its path, and other sources at `https/CONTENT_ID` or
-`peer/CONTENT_ID`. `--pin NAME` adds an alias. Both roots use `--policy`,
-which defaults to `owner`. Pin mutations use fresh compare-and-swap
+roots content at `object/CONTENT_ID`. Whole Hub repositories also get an
+`hf/ORG/REPO@SHA` alias (`hf-dataset/` for datasets). `--pin NAME` adds a
+caller alias in the same transaction. New roots default to `owner`.
+Acquiring or resolving an existing root preserves its policy and expiry.
+An explicit conflicting policy fails. Use `pin set` to change visibility.
+Pin mutations use fresh compare-and-swap
 metadata. `stat` and `read` accept `--path` within a tree; reads support byte
 ranges, and pin listing uses protocol pagination. HTTPS uses the response
-length when available; supply `--bytes` if the server omits it. A peer URI
-identifies a node, and `--source-pin` selects its public content root. Owner
-operations require the authenticated control carrier.
+length when available. Supply `--bytes` if the server omits it.
+`hellas://CONTENT_ID` reads the peer's public `object/CONTENT_ID` root.
+Append `?seed=NODE_ID[@IP:PORT]` to identify a peer, or repeat `seed=`
+to try several in order. Without a seed the acquisition fails with
+`no peer known to hold ID; add ?seed=`. Owner operations require the authenticated control carrier.
 
 ## Verification
 

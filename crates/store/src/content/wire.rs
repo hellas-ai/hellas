@@ -2,7 +2,7 @@ use super::*;
 use hellas_auth::{Digest, authority::UnixMillis};
 use hellas_rpc::{ContentId, ContentRef, pb::content as pb};
 
-pub(crate) const HF_NOT_FOUND: &[u8] = b"hf-revision";
+pub(crate) const ERROR_SOURCE: &str = "hellas-content-error-source";
 
 pub(crate) fn object(object: &pb::ContentRef) -> Result<ContentRef> {
     Ok(ContentRef::new(
@@ -167,9 +167,9 @@ pub(crate) fn source(source: Source) -> pb::Source {
     use pb::source::Kind;
     pb::Source {
         kind: Some(match source {
-            Source::Peer { node, at } => Kind::Peer(pb::Peer {
-                node: node.to_vec(),
-                at: Some(path(&at)),
+            Source::Peer { id, seeds } => Kind::Peer(pb::Peer {
+                id: id.as_bytes().to_vec(),
+                seeds: seeds.iter().map(super::locator::display_seed).collect(),
             }),
             Source::Https { url, sha256, bytes } => Kind::Https(pb::Https {
                 url: url.to_string(),
@@ -179,7 +179,7 @@ pub(crate) fn source(source: Source) -> pb::Source {
             Source::HfXet { repo, path } => Kind::HfXet(pb::HfXet {
                 repo: repo.id,
                 dataset: repo.kind == crate::hf::RepoKind::Dataset,
-                commit: repo.revision,
+                revision: repo.revision,
                 default_branch: repo.default_branch,
                 path,
             }),
@@ -194,6 +194,9 @@ pub(crate) fn error(status: hellas_wire::WireStatus) -> Error {
         WireCode::NotFound => Error::Missing,
         WireCode::Aborted => Error::Conflict,
         WireCode::ResourceExhausted => Error::Capacity,
+        WireCode::InvalidArgument if status.message() == super::locator::NO_PEER => {
+            super::locator::no_peer()
+        }
         WireCode::InvalidArgument if status.message() == super::acquire::HTTPS_LENGTH_REQUIRED => {
             Error::Invalid(super::acquire::HTTPS_LENGTH_REQUIRED)
         }
@@ -218,11 +221,16 @@ pub(crate) fn source_from(source: pb::Source) -> Result<Source> {
     use pb::source::Kind;
     Ok(match source.kind.ok_or(Error::Invalid("missing source"))? {
         Kind::Peer(peer) => Source::Peer {
-            node: peer
-                .node
-                .try_into()
-                .map_err(|_| Error::Invalid("peer id"))?,
-            at: path_from(peer.at.ok_or(Error::Invalid("missing peer path"))?)?,
+            id: hellas_rpc::ContentId::from_bytes(
+                peer.id
+                    .try_into()
+                    .map_err(|_| Error::Invalid("content ID"))?,
+            ),
+            seeds: peer
+                .seeds
+                .iter()
+                .map(|value| super::locator::seed(value))
+                .collect::<Result<_>>()?,
         },
         Kind::Https(source) => Source::Https {
             url: source
@@ -238,7 +246,7 @@ pub(crate) fn source_from(source: pb::Source) -> Result<Source> {
         Kind::HfXet(source) => Source::HfXet {
             repo: crate::hf::Repo {
                 id: source.repo,
-                revision: source.commit,
+                revision: source.revision,
                 default_branch: source.default_branch,
                 kind: if source.dataset {
                     crate::hf::RepoKind::Dataset

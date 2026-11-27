@@ -139,7 +139,7 @@ impl GrantWork {
         context: TransportContext,
         connection: hellas_channel::work::admission::Cancellation,
     ) -> Result<ResponseStream<pb::UploadResponse>, WireStatus> {
-        let (opening, request, exporter, requests) =
+        let (opening, request, exporter, hints, requests) =
             hellas_channel::content::WorkUpload::read(requests, &context)
                 .await?
                 .into_parts();
@@ -303,7 +303,7 @@ impl GrantWork {
             while let Some(reply) = replies.next().await {
                 let reply = reply?;
                 if !widened && reply.complete {
-                    let closure = hellas_channel::content::stage_work(&service, &policy, &manifest, authorization.input_content).await?;
+                    let closure = hellas_channel::content::stage_work(&service, &policy, &manifest, authorization.input_content, &hints, hellas_store::content::HintCaller::Grant).await?;
                     let mut store = work.service.node.writer().await.map_err(status)?;
                     work.access.authorize(&store, authorization.grant_id, work.service.node.observed_time(&store)).map_err(status)?;
                     let job = work.service.pending_content(authorization.channel_id, id.id).map_err(|_|status("content scope ended"))?;

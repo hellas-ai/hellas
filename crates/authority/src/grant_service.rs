@@ -513,12 +513,12 @@ impl GrantService {
                 )
                 .map_err(|_| refused(GrantRefusalCode::Malformed))?;
                 let manifest = input.manifest();
-                let (objects, _) = hellas_channel::content::admit_content(
+                let objects = hellas_channel::content::work_closure(
                     &local,
                     &scope,
                     &policy.invocation_policy,
                     manifest,
-                    Some(a.input_content),
+                    a.input_content,
                 )
                 .await
                 .map_err(|_| refused(GrantRefusalCode::Malformed))?;

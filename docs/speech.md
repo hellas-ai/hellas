@@ -65,8 +65,8 @@ Phonon defaults to the codec and voice-catalog revisions exported by Catena. On
 companion independently. Each accepts a Hub repository, a ref with a branch,
 tag or exact commit, or a local path. You can select a codec safetensors file
 or a JSONL voice catalog directly. The model commits to the codec, the
-catalog and every voice checkpoint the catalog lists. A repository grant
-must cover the origins of all these assets.
+catalog and every voice checkpoint the catalog lists. A grant can pin the
+resulting model ID.
 All voices share one program per evaluator. For a speech request, the client
 reads the selected voice’s tensor header and puts its byte range in the plan.
 

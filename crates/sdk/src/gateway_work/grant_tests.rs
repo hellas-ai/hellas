@@ -903,7 +903,7 @@ async fn queued_requests_wait_without_a_deadline_and_cancel_on_disconnect() {
         let (requester, stream) =
             Requester::<OutputEvent, WorkGatewayError>::new(crate::test_support::job());
         let run = fixture.gateway.backends["test"].run(
-            WorkRequest::Job(job.input().clone()),
+            WorkRequest::Job(job.input().clone(), job.source_hints().clone()),
             requester,
             &fixture.gateway.signer,
             fixture.gateway.backends["test"].use_session(),
@@ -979,7 +979,7 @@ async fn disconnect_during_control_does_not_propose() {
         Requester::<OutputEvent, WorkGatewayError>::new(crate::test_support::job());
     {
         let run = fixture.gateway.backends["test"].run(
-            WorkRequest::Job(job.input().clone()),
+            WorkRequest::Job(job.input().clone(), job.source_hints().clone()),
             requester,
             &fixture.gateway.signer,
             fixture.gateway.backends["test"].use_session(),

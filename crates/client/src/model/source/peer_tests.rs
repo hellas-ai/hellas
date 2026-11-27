@@ -8,6 +8,8 @@ use hellas_store::content::{
     ContentService, MemoryStore, PinPolicy, PinValue, Target, Tree, owner_pin,
 };
 use hellas_wire::{Dispatcher, StreamTransport};
+use hellas_wire::{ServiceMarker, iroh::IrohTransport};
+use std::net::SocketAddr;
 
 #[tokio::test]
 async fn catalog_visibility_and_verified_header_select_the_same_program_as_local() {
@@ -32,7 +34,7 @@ async fn catalog_visibility_and_verified_header_select_the_same_program_as_local
         .unwrap();
     let id = model.content_id().unwrap();
     let uri = std::path::PathBuf::from(format!(
-        "hellas://{id}@{}@{}",
+        "hellas://{id}?seed={}@{}",
         server.id(),
         server.bound_sockets()[0]
     ));
@@ -80,9 +82,13 @@ async fn catalog_visibility_and_verified_header_select_the_same_program_as_local
     .await
     .unwrap();
     local_store.finish_recovery().await.unwrap();
-    acquire_peer_model(uri.to_str().unwrap(), &local_store)
-        .await
-        .unwrap();
+    acquire_peer_model(
+        id,
+        vec![iroh::EndpointAddr::new(server.id()).with_ip_addr(server.bound_sockets()[0])],
+        &local_store,
+    )
+    .await
+    .unwrap();
     let stored = owner_pin(
         &local_store,
         &PinName::new(format!("models/{}", object.id())).unwrap(),

@@ -64,8 +64,10 @@ impl ModelSpec {
     }
 
     pub fn check_locator(&self) -> anyhow::Result<()> {
+        let locator = super::model_locator(&self.model)?;
         anyhow::ensure!(
-            !self.has_companions() || super::peer_uri(&self.model).is_none(),
+            !self.has_companions()
+                || !matches!(locator, Some(hellas_store::content::Locator::Hellas { .. })),
             "a hellas:// model already commits to its codec and voices"
         );
         Ok(())

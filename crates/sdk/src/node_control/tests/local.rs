@@ -387,3 +387,17 @@ async fn same_uid_with_pinned_tls_but_no_credential_cannot_dispatch_an_operation
     listener.shutdown().await.unwrap();
     assert_eq!(f.service.local_slots.available_permits(), MAX_CONNECTIONS);
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_socket_path_longer_than_sun_path_binds_and_connects() {
+    let f = fixture().await;
+    let directory = f.directory.path().join("d".repeat(100));
+    std::fs::create_dir(&directory).unwrap();
+    hellas_private::restrict_directory(&directory).unwrap();
+    let socket = directory.join("control.sock");
+    let listener = f.service.bind_local(&socket, tls_configs().0).unwrap();
+    hellas_wire::local::connect_stream(&socket).await.unwrap();
+    listener.shutdown().await.unwrap();
+    assert!(!socket.exists());
+}

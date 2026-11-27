@@ -747,12 +747,12 @@ impl ProviderEndpoint {
 
         let manifest = bundle.manifest();
         let (store, scope) = self.close.store.invocation_content(work_id)?;
-        let (objects, _) = crate::content::admit_content(
+        let objects = crate::content::work_closure(
             &store,
             &scope,
             policy,
             manifest,
-            Some(authorization.input_content),
+            authorization.input_content,
         )
         .await
         .map_err(content_refusal)?;
@@ -951,7 +951,6 @@ impl ProviderEndpoint {
                     ready.channel().client_key().to_bytes(),
                 )),
             )
-            .await
             .map_err(RunError::Backend)?,
         ));
 
@@ -1766,7 +1765,7 @@ pub async fn run_admitted<B: WorkBackend>(
     let facts = policy
         .classify_manifest(manifest)
         .map_err(BackendFault::caused_by)?;
-    let input = Admitted::checked(input, policy, facts, content, admission).await?;
+    let input = Admitted::checked(input, policy, facts, content, admission)?;
     execute(backend, input, progress).await
 }
 
@@ -3759,6 +3758,7 @@ pub async fn propose_work<T>(
         hellas_store::content::LocalStore,
         hellas_store::content::Scope,
     ),
+    hints: &hellas_store::content::SourceHints,
     proposed: Option<Arc<AtomicBool>>,
 ) -> Result<Digest, ProposeError>
 where
@@ -3767,7 +3767,7 @@ where
     T::Stream: 'static,
 {
     let request = endpoint.propose(proposal, content, proposed).await?;
-    content::transfer_proposal(transport, endpoint, request, content).await
+    content::transfer_proposal(transport, endpoint, request, content, hints).await
 }
 
 /// Resend a retained proposal over a live transport and journal its answer.
@@ -3783,6 +3783,7 @@ pub async fn resume_work_proposal<T>(
         hellas_store::content::LocalStore,
         hellas_store::content::Scope,
     ),
+    hints: &hellas_store::content::SourceHints,
 ) -> Result<Digest, ProposeError>
 where
     T: StreamTransport + Clone + Send + Sync,
@@ -3790,7 +3791,7 @@ where
     T::Stream: 'static,
 {
     let request = endpoint.client().await?.resume_proposal(work_id).await?;
-    content::transfer_proposal(transport, endpoint, request, content).await
+    content::transfer_proposal(transport, endpoint, request, content, hints).await
 }
 
 // ── Wire shapes ───────────────────────────────────────────────────────

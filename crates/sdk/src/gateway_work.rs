@@ -345,10 +345,17 @@ pub enum WorkRequest {
     /// The contract comes from the admitting policy.
     Fetch(WorkFetchRequest),
     /// A complete input; any admitting provider may run it.
-    Job(JobInput),
+    Job(JobInput, hellas_store::content::SourceHints),
 }
 
 impl WorkRequest {
+    pub(crate) fn source_hints(&self) -> hellas_store::content::SourceHints {
+        match self {
+            Self::Job(_, hints) => hints.clone(),
+            Self::Fetch(_) => Default::default(),
+        }
+    }
+
     /// The one input `policy` admits for this request. A Fetch tries each
     /// Fetch contract of `policy`; an HTTPS body is first repaired under
     /// `https`, a complete HTTPS job's body too. Two admitting contracts are
@@ -361,7 +368,7 @@ impl WorkRequest {
         retain: bool,
     ) -> Result<JobInput, JobError> {
         let request = match self {
-            WorkRequest::Job(input) => {
+            WorkRequest::Job(input, _) => {
                 let mut input = input.clone();
                 if let (
                     Some(https),
@@ -645,7 +652,7 @@ impl Backend {
                 return Err(std::io::Error::other(error.clone()).into());
             }
             BackendState::Local { timeout, .. } => {
-                let WorkRequest::Job(input) = request else {
+                let WorkRequest::Job(input, _) = request else {
                     return Err(
                         JobError::Invalid("local backend needs a Compute job".into()).into(),
                     );
@@ -1413,13 +1420,16 @@ impl WorkExecutionBackend for ExecutorGateway {
         self.request(
             backend,
             request_job,
-            WorkRequest::Job(JobInput::Compute {
-                evaluator,
-                environment: job.environment,
-                plan: job.plan,
-                inputs: job.inputs,
-                content: Arc::new(job.content),
-            }),
+            WorkRequest::Job(
+                JobInput::Compute {
+                    evaluator,
+                    environment: job.environment,
+                    plan: job.plan,
+                    inputs: job.inputs,
+                    content: Arc::new(job.content),
+                },
+                Default::default(),
+            ),
         )
     }
     fn drain(&self) -> BoxFuture<'_, Result<(), WorkShutdownError>> {

@@ -5,7 +5,9 @@ mod acquire;
 pub mod config;
 mod core;
 mod disk;
+mod hints;
 mod local;
+mod locator;
 mod memory;
 mod page;
 mod policy;
@@ -50,12 +52,17 @@ pub fn file_content(path: &std::path::Path) -> std::io::Result<ContentRef> {
         })?;
     Ok(indexed.object())
 }
+pub(crate) use acquire::Publication;
 pub use acquire::validate_https;
 pub use disk::{DiskStore, IndexMode};
+pub use hints::SourceHints;
 pub use local::{JobContent, LocalStore, VerifiedReader};
+pub use locator::{Locator, LocatorError, LocatorKind};
 pub use memory::MemoryStore;
 pub use page::{body_limit, chunk_page};
-pub use policy::{AllowList, Miss, MissDecision, OnMiss, Refuse, StoreStats};
+pub use policy::{
+    AllowList, HintCaller, HintPolicy, Miss, MissDecision, OnMiss, Refuse, StoreStats,
+};
 pub use remote::RemoteStore;
 pub use reservation::Reservations;
 pub use server::{ContentService, UploadRequests};
@@ -80,6 +87,8 @@ pub enum Error {
     Missing,
     #[error("HF repository or revision not found: {0}")]
     HfNotFound(String),
+    #[error("HF authorization failed for {0}; set HF_TOKEN to a token with repository access")]
+    HfUnauthorized(String),
     #[error("pin or cursor changed")]
     Conflict,
     #[error("content reservation exhausted")]
@@ -142,6 +151,12 @@ pub struct PinTarget {
     pub policy: PinPolicy,
 }
 impl PinTarget {
+    fn automatic(self) -> AcquirePin {
+        AcquirePin::Automatic {
+            policy: Some(self.policy),
+            alias: Some(self.name),
+        }
+    }
     pub fn model_object(object: ContentRef) -> Result<Self> {
         Ok(Self {
             name: PinName::new(format!("models/{}", object.id()))?,
@@ -278,8 +293,8 @@ pub enum ScopeKind {
 #[derive(Clone, Debug)]
 pub enum Source {
     Peer {
-        node: [u8; 32],
-        at: Path,
+        id: hellas_rpc::ContentId,
+        seeds: Vec<iroh::EndpointAddr>,
     },
     HfXet {
         repo: crate::hf::Repo,
@@ -322,6 +337,7 @@ pub struct Acquisition {
     pub object: ContentRef,
     pub target: Target,
     pub root: PinName,
+    pub hub_alias: Option<PinName>,
     pub commit: Option<String>,
 }
 
@@ -329,7 +345,7 @@ pub struct Acquisition {
 pub enum AcquirePin {
     Named(PinTarget),
     Automatic {
-        policy: PinPolicy,
+        policy: Option<PinPolicy>,
         alias: Option<PinName>,
     },
 }

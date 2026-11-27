@@ -748,9 +748,40 @@ async fn suite(mut case: Case) {
                     .is_none()
             );
         } else {
+            let acquired = result.unwrap();
+            assert_eq!(acquired.object, ContentRef::for_bytes(b"cold HTTPS bytes"));
+            assert_eq!(acquired.root, PinName::object(acquired.object.id()));
+            let current = owner_pin(client.as_ref(), &acquired.root)
+                .await
+                .unwrap()
+                .unwrap();
+            let retained = PinValue {
+                expires: Some(hellas_auth::authority::UnixMillis(4_000_000_000_000)),
+                ..current.clone()
+            };
+            client
+                .set_pin(
+                    &Scope::Owner,
+                    &acquired.root,
+                    Some(&current),
+                    Some(retained.clone()),
+                )
+                .await
+                .unwrap();
+            put(
+                client.as_ref(),
+                &Scope::Owner,
+                b"cold HTTPS bytes",
+                Some(PinTarget {
+                    name: acquired.root.clone(),
+                    policy: PinPolicy::Owner,
+                }),
+                &case.core().pool,
+            )
+            .await;
             assert_eq!(
-                result.unwrap().object,
-                ContentRef::for_bytes(b"cold HTTPS bytes")
+                owner_pin(client.as_ref(), &acquired.root).await.unwrap(),
+                Some(retained)
             );
             assert_eq!(
                 read(client.as_ref(), &Scope::Owner, &at("https", ""), 0..16).await,
@@ -758,6 +789,73 @@ async fn suite(mut case: Case) {
             );
         }
     }
+    // A named alias that already holds another target aborts the complete publication.
+    let body = b"conflicting alias";
+    let (url, http, serving) = https(body);
+    case.core_mut().http = http;
+    let client = case.client(Scope::Owner);
+    let target = ContentRef::for_bytes(body);
+    let previous = owner_pin(client.as_ref(), &name("https")).await.unwrap();
+    let error = client
+        .acquire(
+            &Scope::Owner,
+            Source::Https {
+                url,
+                sha256: None,
+                bytes: Some(target.bytes()),
+            },
+            Some(target),
+            pin("https", PinPolicy::Public),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Conflict));
+    assert!(
+        owner_pin(client.as_ref(), &PinName::object(target.id()))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        owner_pin(client.as_ref(), &name("https")).await.unwrap(),
+        previous
+    );
+    serving.join().unwrap();
+
+    // Both Hub authorization responses keep their actionable error through RPC.
+    let (base, serving) = hub(|_| {
+        vec![
+            ("/api/models/org/private".into(), 401, vec![]),
+            ("/api/models/org/gated".into(), 403, vec![]),
+            ("/api/models/org/unknown".into(), 404, vec![]),
+        ]
+    });
+    case.core_mut().hf_hub = Some(base);
+    let client = case.client(Scope::Owner);
+    for repo in ["private", "gated", "unknown"] {
+        let error = client
+            .acquire_with(
+                &Scope::Owner,
+                Source::HfXet {
+                    repo: format!("hf://org/{repo}").parse().unwrap(),
+                    path: None,
+                },
+                None,
+                AcquirePin::Automatic {
+                    policy: None,
+                    alias: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        if repo == "unknown" {
+            assert!(matches!(error, Error::HfNotFound(_)));
+        } else {
+            assert!(matches!(error, Error::HfUnauthorized(_)));
+            assert!(error.to_string().contains("HF_TOKEN"));
+        }
+    }
+    serving.join().unwrap();
     let sha = "a".repeat(40);
     let weights = ContentRef::for_bytes(b"weights");
     let xorb = hellas_xet::XetHash::ZERO;
@@ -808,7 +906,10 @@ async fn suite(mut case: Case) {
         source.as_ref(),
         &Scope::Owner,
         b"peer bytes",
-        Some(pin("peer-source", PinPolicy::Public)),
+        Some(pin(
+            &format!("object/{}", ContentRef::for_bytes(b"peer bytes").id()),
+            PinPolicy::Public,
+        )),
         &case.core().pool,
     )
     .await;
@@ -859,8 +960,8 @@ async fn suite(mut case: Case) {
         .acquire(
             &Scope::Owner,
             Source::Peer {
-                node: *server.id().as_bytes(),
-                at: at("peer-source", ""),
+                id: ContentRef::for_bytes(b"peer bytes").id(),
+                seeds: vec![server.addr()],
             },
             Some(ContentRef::for_bytes(b"peer bytes")),
             pin("peer", PinPolicy::Public),
@@ -1018,6 +1119,23 @@ async fn a_remote_owner_resolves_and_acquires_an_hf_repo_a_job_then_reads() {
             .await,
         Err(Error::Missing)
     ));
+    // Resolve created owner roots. Change their visibility explicitly before
+    // requesting Jobs visibility for the acquisition and its additional alias.
+    for name in [
+        format!("hf/org/repo@{sha}"),
+        format!("object/{}", tree.id()),
+    ] {
+        let name = PinName::new(name).unwrap();
+        let current = owner_pin(&owner, &name).await.unwrap().unwrap();
+        let shared = PinValue {
+            policy: PinPolicy::Jobs,
+            ..current.clone()
+        };
+        owner
+            .set_pin(&Scope::Owner, &name, Some(&current), Some(shared))
+            .await
+            .unwrap();
+    }
     let acquired = owner
         .acquire(
             &Scope::Owner,
@@ -1064,6 +1182,7 @@ async fn a_remote_owner_resolves_and_acquires_an_hf_repo_a_job_then_reads() {
 
     remove(&owner, "models/org/repo").await;
     remove(&owner, &format!("hf/org/repo@{sha}")).await;
+    remove(&owner, &format!("object/{}", tree.id())).await;
     assert!(owner.collect(&Scope::Owner).await.unwrap().objects > 0);
     assert!(
         !root

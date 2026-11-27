@@ -16,10 +16,29 @@ pub struct PinnedFile {
 }
 
 /// A model repository, optional ref name and optional file within the repository.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelReference {
     pub repo: Repo,
     pub selector: Option<String>,
+}
+
+impl std::fmt::Display for ModelReference {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.repo.uri())?;
+        if let Some(file) = &self.selector {
+            const FILE_PATH: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
+                .add(b'%')
+                .add(b'?')
+                .add(b'#')
+                .add(b' ');
+            write!(
+                f,
+                "/{}",
+                percent_encoding::utf8_percent_encode(file, FILE_PATH)
+            )?;
+        }
+        Ok(())
+    }
 }
 
 impl ModelReference {
@@ -141,11 +160,11 @@ impl Revisions {
     /// Return a pinned URI for a mutable ref. Exact refs do no I/O and keep their spelling.
     pub fn pin(
         &mut self,
-        uri: &str,
+        mut reference: ModelReference,
         pool: &crate::content::Reservations,
         resolved: impl FnOnce(&str, &str),
     ) -> Result<Option<String>> {
-        let ModelReference { repo, selector } = ModelReference::parse(uri)?;
+        let repo = &reference.repo;
         let default_branch = repo.default_branch;
         if immutable_sha(&repo.revision) {
             return Ok(None);
@@ -165,17 +184,9 @@ impl Revisions {
                 entry.insert(sha)
             }
         };
-        let mut uri = format!("hf://{}@{sha}", repo.id);
-        if let Some(file) = selector {
-            const FILE_PATH: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
-                .add(b'%')
-                .add(b'?')
-                .add(b'#')
-                .add(b' ');
-            uri.push('/');
-            uri.push_str(&percent_encoding::utf8_percent_encode(&file, FILE_PATH).to_string());
-        }
-        Ok(Some(uri))
+        reference.repo.revision.clone_from(sha);
+        reference.repo.default_branch = false;
+        Ok(Some(reference.to_string()))
     }
 }
 
@@ -187,8 +198,10 @@ pub struct PinnedRepo {
 }
 
 impl PinnedRepo {
-    pub fn open(uri: &str, pool: &crate::content::Reservations) -> Result<(Self, Option<String>)> {
-        let reference = ModelReference::parse(uri)?;
+    pub fn open(
+        reference: ModelReference,
+        pool: &crate::content::Reservations,
+    ) -> Result<(Self, Option<String>)> {
         let repo = reference.repo;
         if !immutable_sha(&repo.revision) {
             return Err(FetchError::Malformed(
@@ -290,15 +303,18 @@ impl PinnedFile {
             }
             return Ok(());
         }
-        let url = HfCas::new(self.repo.clone()).file_url(&self.path)?;
+        let cas = HfCas::new(self.repo.clone());
+        let url = cas.file_url(&self.path)?;
         let bounds = format!("{}-{}", range.start, range.end - 1);
         let mut response = authenticated_get(url.as_str(), None)
             .header("Range", &format!("bytes={bounds}"))
             .header("Accept-Encoding", "identity")
             .call()
-            .map_err(|source| FetchError::Http {
-                context: "Hub file range".into(),
-                source: Box::new(source),
+            .map_err(|source| {
+                cas.repo_error(FetchError::Http {
+                    context: "Hub file range".into(),
+                    source: Box::new(source),
+                })
             })?;
         if response.status() != 206
             || response
@@ -327,7 +343,7 @@ impl PinnedFile {
 
     /// Make this verified object available to local execution jobs.
     pub async fn acquire(&self, store: &crate::content::DiskStore) -> crate::content::Result<()> {
-        use crate::content::{ContentStore, LocalStore, PinTarget, Scope, Target};
+        use crate::content::{LocalStore, PinTarget, Publication, Scope, Target};
         let pin = PinTarget::model_object(self.object)?;
         if pin.holds(store, Target::Object(self.object)).await?
             && LocalStore::Disk(store.clone())
@@ -341,7 +357,14 @@ impl PinnedFile {
             return Ok(());
         }
         store
-            .acquire(&Scope::Owner, self.source(), Some(self.object), pin)
+            .core
+            .acquire_scoped(
+                &Scope::Owner,
+                self.source(),
+                Some(self.object),
+                Publication::Model(pin),
+                None,
+            )
             .await?;
         Ok(())
     }
@@ -382,12 +405,12 @@ mod tests {
             ("hf://org/repo@releases%2Fv1/nested/c", B, "nested/c"),
         ] {
             let pinned = revisions
-                .pin(uri, &pool, |repo, sha| {
+                .pin(ModelReference::parse(uri).unwrap(), &pool, |repo, sha| {
                     observed.push((repo.to_owned(), sha.to_owned()))
                 })
                 .unwrap();
             assert_eq!(pinned.unwrap(), format!("hf://org/repo@{sha}/{file}"));
-            assert!(PinnedRepo::open(uri, &pool).is_err());
+            assert!(PinnedRepo::open(ModelReference::parse(uri).unwrap(), &pool).is_err());
         }
         assert_eq!(
             observed,
@@ -397,7 +420,7 @@ mod tests {
         assert!(
             revisions
                 .pin(
-                    &upper,
+                    ModelReference::parse(&upper).unwrap(),
                     &crate::content::Reservations::ram(0),
                     |_, _| panic!("exact ref resolved")
                 )
@@ -410,9 +433,13 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            next.pin("hf://org/repo", &pool, |_, _| {})
-                .unwrap()
-                .unwrap(),
+            next.pin(
+                ModelReference::parse("hf://org/repo").unwrap(),
+                &pool,
+                |_, _| {}
+            )
+            .unwrap()
+            .unwrap(),
             format!("hf://org/repo@{B}")
         );
         server.join().unwrap();

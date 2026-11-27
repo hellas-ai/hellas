@@ -11,6 +11,6 @@ pub type UnixMessagePipe = LengthDelimitedMessagePipe<UnixStream>;
 
 impl LengthDelimitedMessagePipe<UnixStream> {
     pub async fn connect(path: impl AsRef<Path>) -> io::Result<Self> {
-        Self::new(UnixStream::connect(path).await?, DEFAULT_MAX_MESSAGE_BYTES)
+        Self::new(connect_stream(path).await?, DEFAULT_MAX_MESSAGE_BYTES)
     }
 }

@@ -57,7 +57,7 @@ impl RepoKind {
 /// *authorisation*: a token is scoped to one repository and one
 /// revision, so fetching by content id alone is not possible against
 /// this source. A peer source would not need this.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Repo {
     pub kind: RepoKind,
     /// `org/name`.
@@ -100,6 +100,8 @@ pub enum FetchError {
     Locator(&'static str),
     #[error("HF repository or revision not found: {0}")]
     NotFound(String),
+    #[error("HF authorization failed for {0}; set HF_TOKEN to a token with repository access")]
+    Unauthorized(String),
     #[error("Hub file I/O: {0}")]
     Io(#[from] std::io::Error),
     #[error("decoding a xorb: {0}")]
@@ -297,7 +299,7 @@ impl HfCas {
     pub fn token(&self) -> Result<XetToken> {
         self.repo.validate()?;
         let url = self.hub_url(true, &["xet-read-token", &self.repo.revision])?;
-        let body = get(url.as_str(), None, TOKEN_BODY_LIMIT)?;
+        let body = get(url.as_str(), None, TOKEN_BODY_LIMIT).map_err(|e| self.repo_error(e))?;
         serde_json::from_slice(&body)
             .map_err(|err| FetchError::Malformed(format!("token response: {err}")))
     }
@@ -387,7 +389,7 @@ fn hf_home(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<std::path
 
 /// The standard Hub snapshot path for a repository and exact revision, without network access.
 pub fn cached_snapshot(repo: &str, revision: &str) -> Option<std::path::PathBuf> {
-    if !hellas_rpc::protocol::invocation::valid_hub_repo(repo) || !immutable_sha(revision) {
+    if !valid_hub_repo(repo) || !immutable_sha(revision) {
         return None;
     }
     let hub = ["HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"]
@@ -558,7 +560,7 @@ impl Repo {
         Ok(repo)
     }
     pub(crate) fn validate(&self) -> Result<()> {
-        if !hellas_rpc::protocol::invocation::valid_hub_repo(&self.id)
+        if !valid_hub_repo(&self.id)
             || self.revision.is_empty()
             || self.revision.chars().any(char::is_control)
             || self.revision.contains(['@', '?', '#', '\\'])
@@ -571,10 +573,13 @@ impl Repo {
 impl HfCas {
     fn repo_error(&self, error: FetchError) -> FetchError {
         match error {
-            FetchError::Http { source, .. }
-                if matches!(*source, ureq::Error::StatusCode(404 | 401)) =>
-            {
+            FetchError::Http { source, .. } if matches!(*source, ureq::Error::StatusCode(404)) => {
                 FetchError::NotFound(self.repo.to_string())
+            }
+            FetchError::Http { source, .. }
+                if matches!(*source, ureq::Error::StatusCode(401 | 403)) =>
+            {
+                FetchError::Unauthorized(self.repo.to_string())
             }
             error => error,
         }
@@ -704,9 +709,12 @@ impl HfCas {
     pub(crate) fn small_file(&self, path: &str) -> Result<impl std::io::Read + use<>> {
         let url = self.file_url(path)?;
         let url = url.as_str();
-        let response = authenticated_get(url, None)
-            .call()
-            .map_err(|_| FetchError::Malformed("Hub file request failed".into()))?;
+        let response = authenticated_get(url, None).call().map_err(|source| {
+            self.repo_error(FetchError::Http {
+                context: "Hub file request failed".into(),
+                source: Box::new(source),
+            })
+        })?;
         if response.status() != 200 {
             return Err(FetchError::Malformed("Hub file status".into()));
         }
@@ -850,6 +858,19 @@ impl HfCas {
         Ok(())
     }
 }
+/// A Hub model repository at its root, without a revision or file selector.
+fn valid_hub_repo(id: &str) -> bool {
+    let component = |s: &str| {
+        !matches!(s, "" | "." | "..")
+            && s.bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
+    };
+    id.len() <= 256
+        && id
+            .split_once('/')
+            .is_some_and(|(org, repo)| component(org) && component(repo))
+}
+
 pub fn immutable_sha(sha: &str) -> bool {
     sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit())
 }

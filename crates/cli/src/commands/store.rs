@@ -9,7 +9,7 @@ use hellas_rpc::{ContentRef, services::resolve::ResolveClientImpl};
 use hellas_sdk::identity::LocalIdentity;
 use hellas_sdk::node_control::profile::ClientProfile;
 use hellas_store::content::{self, config::Reconciler, owner_pin as find_pin, *};
-use hellas_store::hf::{ModelReference, Repo};
+use hellas_store::hf::Repo;
 use hellas_wire::StreamTransport;
 use std::{future::Future, io::Write as _, net::SocketAddr, path::PathBuf};
 
@@ -65,12 +65,13 @@ pub enum StoreCommand {
     },
     /// Acquire and root a Hub repository or path, HTTPS file, or peer object.
     Acquire {
-        source: AcquireSource,
+        source: Locator,
         /// Add a named GC root with the selected visibility policy.
         #[arg(long)]
         pin: Option<String>,
-        #[arg(long, default_value = "owner")]
-        policy: String,
+        /// Visibility for newly created roots (default owner). Existing roots retain their policy.
+        #[arg(long)]
+        policy: Option<PinPolicy>,
         /// Expected ContentId; supply --bytes with it.
         #[arg(long, requires = "bytes")]
         expect: Option<String>,
@@ -80,12 +81,6 @@ pub enum StoreCommand {
         /// Optional HTTPS transport digest; distinct from ContentId.
         #[arg(long)]
         sha256: Option<String>,
-        /// A path inside the peer source pin. Hub paths belong in the locator.
-        #[arg(long)]
-        path: Option<String>,
-        /// Public pin to read from the node named by peer://NODE.
-        #[arg(long)]
-        source_pin: Option<String>,
     },
     /// Set, enumerate or remove pins with compare-and-swap.
     Pin {
@@ -96,34 +91,6 @@ pub enum StoreCommand {
     Collect,
     /// Resolve an HF revision once, printing its immutable SHA and tree reference.
     Resolve { source: Repo },
-}
-
-#[derive(Clone, Debug)]
-pub enum AcquireSource {
-    Hub(ModelReference),
-    Https(reqwest::Url),
-    Peer(iroh::EndpointId),
-}
-
-impl std::str::FromStr for AcquireSource {
-    type Err = anyhow::Error;
-
-    fn from_str(value: &str) -> CliResult<Self> {
-        if value.starts_with("hf://") {
-            return Ok(Self::Hub(ModelReference::parse(value)?));
-        }
-        if let Some(node) = value.strip_prefix("peer://") {
-            return Ok(Self::Peer(node.parse().context("expected peer://NODE")?));
-        }
-        let url = reqwest::Url::parse(value)
-            .context("expected hf://ORG/REPO[@ref][/path], https://URL, or peer://NODE")?;
-        if url.host_str() == Some("huggingface.co") {
-            return Ok(Self::Hub(ModelReference::from_url(&url)?));
-        }
-        validate_https(&url)
-            .context("expected an HTTPS file URL without credentials or a fragment")?;
-        Ok(Self::Https(url))
-    }
 }
 
 #[derive(Subcommand)]
@@ -137,7 +104,7 @@ pub enum PinCommand {
         tree: bool,
         /// owner, jobs, granted, public, or channel:ID.
         #[arg(long, default_value = "owner")]
-        policy: String,
+        policy: PinPolicy,
         #[arg(long)]
         expires_ms: Option<u64>,
     },
@@ -186,6 +153,17 @@ pub async fn run(
         )?;
         let result = async {
             store.finish_recovery().await?;
+            if config.uses_peers()
+                || matches!(
+                    &args.command,
+                    StoreCommand::Acquire {
+                        source: Locator::Hellas { .. },
+                        ..
+                    }
+                )
+            {
+                crate::content_configuration::enable_peers(&store).await?;
+            }
             // Only an explicit file declares a desired set; a bare owner
             // command must not treat absent configuration as deleting config/*.
             if reconcile {
@@ -193,34 +171,11 @@ pub async fn run(
                     .apply(&store, config)
                     .await?;
             }
-            let peer = if matches!(
-                &args.command,
-                StoreCommand::Acquire {
-                    source: AcquireSource::Peer(_),
-                    ..
-                }
-            ) {
-                let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-                    .bind()
-                    .await?;
-                store
-                    .clone()
-                    .with_peers(hellas_wire::iroh::Pool::for_service::<
-                        hellas_rpc::services::content::Content,
-                    >(endpoint.clone(), Default::default()));
-                Some(endpoint)
-            } else {
-                None
-            };
             let resolving = store.clone();
-            let result = execute(&store, args.command, move |repo| async move {
+            execute(&store, args.command, move |repo| async move {
                 Ok(resolving.resolve_hf(&Scope::Owner, repo).await?)
             })
-            .await;
-            if let Some(endpoint) = peer {
-                endpoint.close().await;
-            }
-            result
+            .await
         }
         .await;
         store.close().await;
@@ -329,8 +284,6 @@ where
             expect,
             bytes,
             sha256,
-            path,
-            source_pin,
         } => {
             let expect = expect
                 .map(|id| -> CliResult<_> {
@@ -341,50 +294,17 @@ where
                 })
                 .transpose()?;
             let alias = pin.map(PinName::new).transpose()?;
-            let policy = selected.parse()?;
-            let source = match source {
-                AcquireSource::Hub(reference) => {
-                    ensure!(
-                        bytes.is_none() || expect.is_some(),
-                        "HF --bytes requires --expect"
-                    );
-                    ensure!(
-                        sha256.is_none() && source_pin.is_none() && path.is_none(),
-                        "HF has no --sha256, --source-pin or --path; put the path in the locator"
-                    );
-                    Source::HfXet {
-                        repo: reference.repo,
-                        path: reference.selector,
-                    }
-                }
-                AcquireSource::Peer(node) => {
-                    ensure!(
-                        bytes.is_none() || expect.is_some(),
-                        "peer --bytes requires --expect"
-                    );
-                    ensure!(sha256.is_none(), "peer source has no --sha256");
-                    Source::Peer {
-                        node: *node.as_bytes(),
-                        at: Path::new(
-                            PinName::new(source_pin.context("peer source requires --source-pin")?)?,
-                            path.unwrap_or_default(),
-                        )?,
-                    }
-                }
-                AcquireSource::Https(url) => {
-                    ensure!(
-                        path.is_none() && source_pin.is_none(),
-                        "HTTPS has no --path or --source-pin"
-                    );
-                    Source::Https {
-                        url,
-                        bytes,
-                        sha256: sha256
-                            .map(|sha| hellas_auth::hex::parse(&sha))
-                            .transpose()?,
-                    }
-                }
-            };
+            let policy = selected;
+            ensure!(
+                matches!(&source, Locator::Https(_)) || bytes.is_none() || expect.is_some(),
+                "HF and peer --bytes requires --expect"
+            );
+            let source = source.into_source(
+                bytes,
+                sha256
+                    .map(|sha| hellas_auth::hex::parse(&sha))
+                    .transpose()?,
+            )?;
             let acquired = store
                 .acquire_with(
                     &Scope::Owner,
@@ -401,7 +321,12 @@ where
             }
             target(acquired.target);
             println!("root\t{}", acquired.root.as_str());
-            if let Some(alias) = alias.filter(|alias| alias != &acquired.root) {
+            if let Some(hub) = &acquired.hub_alias {
+                println!("root\t{}", hub.as_str());
+            }
+            if let Some(alias) = alias.filter(|alias| {
+                alias != &acquired.root && Some(alias) != acquired.hub_alias.as_ref()
+            }) {
                 println!("root\t{}", alias.as_str());
             }
         }
@@ -426,7 +351,7 @@ where
                     } else {
                         Target::Object(object)
                     },
-                    policy: selected.parse()?,
+                    policy: selected,
                     expires: expires_ms.map(hellas_auth::authority::UnixMillis),
                 };
                 let previous = find_pin(store, &name).await?;
@@ -597,7 +522,7 @@ mod tests {
                         id: object.id().to_string(),
                         bytes: object.bytes(),
                         tree: false,
-                        policy: "owner".into(),
+                        policy: PinPolicy::Owner,
                         expires_ms: None,
                     },
                 },
@@ -683,22 +608,20 @@ mod tests {
         let node = iroh::SecretKey::from_bytes(&[9; 32]).public();
         for source in [
             format!("hf://org/repo@{}", "a".repeat(40)),
-            format!("peer://{node}"),
+            format!(
+                "hellas://{}?seed={node}",
+                ContentRef::for_bytes(b"peer").id()
+            ),
         ] {
-            let source_pin = source
-                .starts_with("peer://")
-                .then(|| "public/source".to_owned());
             let error = execute(
                 &store,
                 StoreCommand::Acquire {
                     source: source.parse().unwrap(),
                     pin: Some("destination".into()),
-                    policy: "owner".into(),
+                    policy: None,
                     expect: None,
                     bytes: Some(1),
                     sha256: None,
-                    path: None,
-                    source_pin,
                 },
                 |_| async { anyhow::bail!("unexpected Resolve") },
             )
@@ -748,7 +671,7 @@ mod tests {
             let crate::Commands::Store(StoreArgs {
                 command:
                     StoreCommand::Acquire {
-                        source: AcquireSource::Hub(reference),
+                        source: Locator::Hub(reference),
                         pin: None,
                         ..
                     },
@@ -762,7 +685,13 @@ mod tests {
             assert_eq!(reference.selector.as_deref(), path);
         }
         let node = iroh::SecretKey::from_bytes(&[9; 32]).public();
-        for source in ["https://example.org/file", &format!("peer://{node}")] {
+        for source in [
+            "https://example.org/file",
+            &format!(
+                "hellas://{}?seed={node}",
+                ContentRef::for_bytes(b"peer").id()
+            ),
+        ] {
             assert!(crate::Cli::try_parse_from(["hellas", "store", "acquire", source]).is_ok());
         }
         for (source, message) in [
@@ -778,8 +707,8 @@ mod tests {
                 "https://huggingface.co/org/repo//mistyped/file",
                 "expected /tree/REF",
             ),
-            ("http://example.org/file", "expected an HTTPS file URL"),
-            ("peer://not-a-node", "expected peer://NODE"),
+            ("http://example.org/file", "HTTPS source URL"),
+            ("peer://not-a-node", "HTTPS source URL"),
         ] {
             let error = crate::Cli::try_parse_from(["hellas", "store", "acquire", source])
                 .err()

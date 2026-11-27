@@ -78,6 +78,9 @@ pub(crate) async fn content(
         .await?;
     let prepared: CliResult<()> = async {
         content.finish_recovery().await?;
+        if configuration.uses_peers() {
+            crate::content_configuration::enable_peers(&content).await?;
+        }
         crate::content_configuration::add_content(&mut configuration, &content, paths).await?;
         hellas_store::content::config::Reconciler::new(configuration.clone())?
             .apply(&content, configuration)

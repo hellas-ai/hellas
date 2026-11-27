@@ -56,26 +56,45 @@ fn hf_error(error: crate::hf::FetchError) -> Error {
     match error {
         crate::hf::FetchError::Capacity => Error::Capacity,
         crate::hf::FetchError::NotFound(repo) => Error::HfNotFound(repo),
+        crate::hf::FetchError::Unauthorized(repo) => Error::HfUnauthorized(repo),
         crate::hf::FetchError::Malformed(reason) if reason == crate::hf::LEGACY_CHUNKING => {
             Error::Invalid(crate::hf::LEGACY_CHUNKING)
         }
         _ => Error::Invalid("HF acquisition failed"),
     }
 }
+#[derive(Clone)]
+pub(crate) enum Publication {
+    Acquire(AcquirePin),
+    Model(PinTarget),
+}
+
+impl From<AcquirePin> for Publication {
+    fn from(pin: AcquirePin) -> Self {
+        Self::Acquire(pin)
+    }
+}
+
 async fn publish(
     store: &Core,
     scope: &Scope,
     stages: BTreeMap<ContentId, Staged>,
     target: Target,
-    (pin, alias): (PinTarget, Option<PinName>),
+    pin: impl Into<Publication>,
+    hub_alias: Option<PinName>,
     requester: Option<(Core, Scope)>,
 ) -> Result<Acquisition> {
+    let pin = pin.into();
     let object = target.object();
-    let root = pin.name.clone();
-    store
+    let published_alias = hub_alias
+        .clone()
+        .filter(|_| matches!(pin, Publication::Acquire(AcquirePin::Automatic { .. })));
+    let root = store
         .effect(scope, move |store| {
             store.require_ready()?;
-            store.check_acquisition(&pin, &requester)?;
+            if let Publication::Acquire(AcquirePin::Named(pin)) = &pin {
+                store.check_acquisition(pin, &requester)?;
+            }
             store.publish_acquired(
                 stages
                     .into_values()
@@ -83,7 +102,7 @@ async fn publish(
                     .collect(),
                 target,
                 pin,
-                alias,
+                hub_alias,
                 requester,
             )
         })
@@ -92,45 +111,29 @@ async fn publish(
         object,
         target,
         root,
+        hub_alias: published_alias,
         commit: None,
     })
 }
 
-fn root_pin(
-    pin: AcquirePin,
-    name: impl FnOnce() -> String,
-) -> Result<(PinTarget, Option<PinName>)> {
-    match pin {
-        AcquirePin::Named(pin) => Ok((pin, None)),
-        AcquirePin::Automatic { policy, alias } => {
-            let name = PinName::new(name())?;
-            let alias = alias.filter(|alias| alias != &name);
-            Ok((PinTarget { name, policy }, alias))
-        }
-    }
-}
-
-fn hf_root(repo: &crate::hf::Repo, path: Option<&str>) -> String {
+fn hf_tree_alias(repo: &crate::hf::Repo) -> Result<PinName> {
     let prefix = if repo.kind == crate::hf::RepoKind::Dataset {
         "hf-dataset"
     } else {
         "hf"
     };
-    let mut root = format!("{prefix}/{}@{}", repo.id, repo.revision);
-    if let Some(path) = path {
-        root.push('/');
-        root.push_str(path);
-    }
-    root
+    PinName::new(format!("{prefix}/{}@{}", repo.id, repo.revision))
 }
 pub(crate) async fn memory(
     store: &Core,
     scope: &Scope,
     source: Source,
     expect: Option<ContentRef>,
-    pin: AcquirePin,
+    pin: Publication,
     requester: Option<(Core, Scope)>,
+    hint: Option<&HintPolicy>,
 ) -> Result<Acquisition> {
+    let hinted = hint.is_some();
     match source {
         Source::Https { url, sha256, bytes } => {
             validate_https(&url)?;
@@ -146,7 +149,7 @@ pub(crate) async fn memory(
                 .map(|bytes| Ok::<_, Error>((bytes, store.reserve(bytes)?)))
                 .transpose()?;
             let core = store.clone();
-            let http = store.http.clone();
+            let http = hint.map_or_else(|| store.http.clone(), |policy| policy.agent(&store.http));
             let stage = tokio::task::spawn_blocking(move || {
                 let response = http
                     .get(url.as_str())
@@ -174,61 +177,94 @@ pub(crate) async fn memory(
             .await
             .map_err(|_| Error::Invalid("acquisition worker failed"))??;
             let target = Target::Object(stage.object);
-            let pin = root_pin(pin, || format!("https/{}", stage.object.id()))?;
             publish(
                 store,
                 scope,
                 BTreeMap::from([(stage.object.id(), stage)]),
                 target,
                 pin,
+                None,
                 requester,
             )
             .await
         }
-        Source::Peer { node, at } => {
+        Source::Peer { id, seeds } => {
+            if expect.is_some_and(|expect| expect.id() != id) {
+                return Err(Error::Invalid("peer expectation"));
+            }
             let pool = store
                 .state
                 .lock()
                 .map_err(|_| Error::Invalid("store lock"))?
                 .peers
                 .clone()
-                .ok_or(Error::Invalid("no peer connection pool"))?;
-            let node =
-                iroh::EndpointId::from_bytes(&node).map_err(|_| Error::Invalid("peer identity"))?;
-            let transport = pool
-                .transport(node)
-                .await
-                .map_err(|_| Error::Invalid("peer connection failed"))?;
-            let remote = RemoteStore::new(transport, store.pool.clone());
-            let root = remote
-                .stat(&Scope::Public, &at)
-                .await?
-                .ok_or(Error::Missing)?
-                .target;
-            if expect.is_some_and(|expect| expect != root.object()) {
-                return Err(Error::Invalid("peer expectation"));
+                .filter(|_| !seeds.is_empty())
+                .ok_or_else(super::locator::no_peer)?;
+            let at = Path::new(PinName::object(id), String::new())?;
+            for seed in seeds {
+                let Ok(transport) = pool.transport(seed).await else {
+                    continue;
+                };
+                let remote = RemoteStore::new(transport, store.pool.clone());
+                let Ok(Some(found)) = remote.stat(&Scope::Public, &at).await else {
+                    continue;
+                };
+                let root = found.target;
+                if hinted && !matches!(root, Target::Object(_)) {
+                    continue;
+                }
+                if root.object().id() != id || expect.is_some_and(|expect| expect != root.object())
+                {
+                    continue;
+                }
+                match peer_stages(store, &remote, &at, root).await {
+                    Ok(stages) => {
+                        return publish(store, scope, stages, root, pin, None, requester).await;
+                    }
+                    Err(
+                        Error::Denied
+                        | Error::Missing
+                        | Error::Conflict
+                        | Error::Remote(_)
+                        | Error::Invalid(_),
+                    ) => continue,
+                    Err(error) => return Err(error),
+                }
             }
-            let pin = root_pin(pin, || format!("peer/{}", root.object().id()))?;
-            peer(store, scope, &remote, &at, root, pin, requester).await
+            Err(super::locator::no_peer())
         }
-        Source::HfXet { repo, path } => {
+        Source::HfXet { mut repo, path } => {
             repo.validate().map_err(hf_error)?;
             if let Some(path) = &path {
                 super::tree::validate_path(path, false)?;
             }
+            if hinted && (repo.default_branch || !crate::hf::immutable_sha(&repo.revision)) {
+                let core = store.clone();
+                let source = repo.clone();
+                repo.revision = tokio::task::spawn_blocking(move || {
+                    let default_branch = source.default_branch;
+                    core.hf(source)
+                        .resolve_revision(default_branch, &core.pool)
+                        .map_err(hf_error)
+                })
+                .await
+                .map_err(|_| Error::Invalid("resolve worker failed"))??;
+                repo.default_branch = false;
+            }
             if !crate::hf::immutable_sha(&repo.revision) {
                 return Err(Error::Invalid("HF immutable commit"));
             }
-            let pin = root_pin(pin, || hf_root(&repo, path.as_deref()))?;
+            let hub_alias = path.is_none().then(|| hf_tree_alias(&repo)).transpose()?;
             let core = store.clone();
             let source_repo = repo.clone();
             let (stages, root, files) = tokio::task::spawn_blocking(move || {
                 let cas = core.hf(source_repo);
-                hf_stages(&cas, &core, path.as_deref(), expect, true)
+                hf_stages(&cas, &core, path.as_deref(), expect, true, hinted)
             })
             .await
             .map_err(|_| Error::Invalid("HF worker failed"))??;
-            let mut acquisition = publish(store, scope, stages, root, pin, requester).await?;
+            let mut acquisition =
+                publish(store, scope, stages, root, pin, hub_alias, requester).await?;
             acquisition.commit = Some(repo.revision.clone());
             if repo.kind == crate::hf::RepoKind::Model {
                 store
@@ -239,15 +275,12 @@ pub(crate) async fn memory(
         }
     }
 }
-async fn peer(
+async fn peer_stages(
     store: &Core,
-    scope: &Scope,
     remote: &dyn ContentStore,
     at: &Path,
     root: Target,
-    pin: (PinTarget, Option<PinName>),
-    requester: Option<(Core, Scope)>,
-) -> Result<Acquisition> {
+) -> Result<BTreeMap<ContentId, Staged>> {
     let mut stages: BTreeMap<ContentId, Staged> = BTreeMap::new();
     let mut expanded = std::collections::BTreeSet::new();
     let mut pending = vec![(root, String::new(), None)];
@@ -306,7 +339,7 @@ async fn peer(
             }
         }
     }
-    publish(store, scope, stages, root, pin, requester).await
+    Ok(stages)
 }
 
 impl DiskStore {
@@ -327,13 +360,15 @@ impl DiskStore {
                 async move {
                     core.access(&Scope::Owner, |core| core.require_ready())
                         .await?;
-                    peer(
+                    let target = Target::Object(expect);
+                    let stages = peer_stages(&core, remote, at, target).await?;
+                    publish(
                         &core,
                         &Scope::Owner,
-                        remote,
-                        at,
-                        Target::Object(expect),
-                        (pin, None),
+                        stages,
+                        target,
+                        Publication::Model(pin),
+                        None,
                         None,
                     )
                     .await?;
@@ -407,6 +442,7 @@ fn hf_stages(
     path: Option<&str>,
     expect: Option<ContentRef>,
     weights: bool,
+    file_only: bool,
 ) -> Result<HfStages> {
     let (mut files, _metadata) = cas.files(&core.pool).map_err(hf_error)?;
     let mut stages = BTreeMap::new();
@@ -419,6 +455,9 @@ fn hf_stages(
             root,
             BTreeMap::from([(file.path.clone(), root.object())]),
         ));
+    }
+    if file_only {
+        return Err(Error::Missing);
     }
     let prefix = path.map_or_else(String::new, |path| format!("{path}/"));
     if path.is_some() {
@@ -549,18 +588,18 @@ impl Core {
     ) -> Result<(String, ContentRef)> {
         self.access(scope, |core| core.require_ready()).await?;
         let core = self.clone();
-        let name = PinName::new(hf_root(&repo, None))?;
+        let alias = hf_tree_alias(&repo)?;
         let sha = repo.revision.clone();
         let (stages, root, _) = tokio::task::spawn_blocking(move || {
-            hf_stages(&core.hf(repo), &core, None, None, false)
+            hf_stages(&core.hf(repo), &core, None, None, false, false)
         })
         .await
         .map_err(|_| Error::Invalid("resolve worker failed"))??;
-        let pin = PinTarget {
-            name,
-            policy: PinPolicy::Owner,
+        let pin = AcquirePin::Automatic {
+            policy: None,
+            alias: None,
         };
-        let object = publish(self, scope, stages, root, (pin, None), None)
+        let object = publish(self, scope, stages, root, pin, Some(alias), None)
             .await?
             .object;
         Ok((sha, object))
