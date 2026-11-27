@@ -77,9 +77,3 @@ message OutputEventEnvelope {
   PublicKey public_key = 3;
   bytes payload = 4;
 }
-
-message AssuranceEvidence {
-  string codec = 1;
-  bytes credential = 2;
-  bytes proof = 3;
-}

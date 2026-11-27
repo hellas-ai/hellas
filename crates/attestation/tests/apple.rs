@@ -1,5 +1,8 @@
 #![cfg(feature = "apple-app-attest")]
 
+#[path = "fixtures/apple.rs"]
+mod device;
+
 use std::collections::BTreeMap;
 
 use base64::Engine as _;
@@ -146,6 +149,36 @@ fn signed_assertion(
 }
 
 #[test]
+fn device_genesis_verifies_at_enrollment_time() {
+    let mut bundle = device::enrollment();
+    let hellas_rpc::PlatformEnrollment::AppleAppAttest(enrollment) = bundle.platform else {
+        panic!("expected App Attest enrollment");
+    };
+    let policy = ApplePolicy {
+        expected_rp_id_hash: apple_app_id_hash(APP_ID),
+        allowed_cd_hashes: vec![decode_hex_32(
+            "320cb97347ecf28369401a21ba85553008c8d8009ae6f3bffa159a0dede1eab6",
+        )],
+    };
+    let credential = register_apple(
+        &AppleCredential {
+            attestation: enrollment.attestation_object,
+            client_data_hash: enrollment.client_data_hash,
+        },
+        policy.expected_rp_id_hash,
+        apple_app_attest_root_ca(),
+        AnchorTime(enrollment.validation_time),
+    )
+    .unwrap();
+    let verify = |genesis: &hellas_rpc::SignedProviderGenesis| {
+        hellas_attestation::verify_apple_provider_genesis(genesis, &credential, &policy)
+    };
+    verify(&bundle.genesis).unwrap();
+    bundle.genesis.statement.installation_nonce[0] ^= 1;
+    assert_eq!(verify(&bundle.genesis), Err(AttestationError::Signature));
+}
+
+#[test]
 fn real_attestation_registers_against_apple_chain() {
     let fixture = fixture();
     let credential = fixture_credential(&fixture);
@@ -161,11 +194,23 @@ fn real_attestation_registers_against_apple_chain() {
         ),
         Err(AttestationError::Credential)
     );
+    let mut changed = credential;
+    changed.client_data_hash[0] ^= 1;
+    assert_eq!(
+        register_apple(
+            &changed,
+            apple_app_id_hash(APP_ID),
+            apple_app_attest_root_ca(),
+            AnchorTime(FIXTURE_VALIDATION_TIME),
+        ),
+        Err(AttestationError::Credential)
+    );
 }
 
 #[test]
 fn real_assertion_verifies_with_app_rp_id_and_direct_cd_hash_allowlist() {
     let fixture = fixture();
+    let other_key = registered(&signing_key());
     let registered = registered_fixture(&fixture);
     let client_data_hash = decode_hex_32(fixture.assertion_client_data_hash_hex);
     let assertion = decode_base64(fixture.assertion_object_base64);
@@ -193,6 +238,16 @@ fn real_assertion_verifies_with_app_rp_id_and_direct_cd_hash_allowlist() {
         ),
         Err(AttestationError::Credential)
     );
+    let mut changed = client_data_hash;
+    changed[0] ^= 1;
+    assert_eq!(
+        verify_apple_assertion(&assertion, &changed, &registered, &policy),
+        Err(AttestationError::Signature)
+    );
+    assert_eq!(
+        verify_apple_assertion(&assertion, &client_data_hash, &other_key, &policy),
+        Err(AttestationError::Signature)
+    );
 }
 
 #[test]
@@ -206,6 +261,19 @@ fn credential_identity_extracts_real_build_identity_without_rp_id_relation() {
     assert_eq!(identity.cd_hash, REAL_CD_HASH);
     let hashed_cd_hash: [u8; 32] = Sha256::digest(identity.cd_hash).into();
     assert_ne!(apple_app_id_hash(APP_ID), hashed_cd_hash);
+
+    // register_apple would reject a changed key ID at the nonce check first, so
+    // check the key-ID binding here. The ID follows the RP hash, flags, counter,
+    // AAGUID and ID length.
+    let mut object: BTreeMap<String, ciborium::Value> =
+        ciborium::from_reader(credential.attestation.as_slice()).unwrap();
+    object.get_mut("authData").unwrap().as_bytes_mut().unwrap()[55] ^= 1;
+    let mut attestation = Vec::new();
+    ciborium::into_writer(&object, &mut attestation).unwrap();
+    assert_eq!(
+        apple_credential_identity(&attestation),
+        Err(AttestationError::Credential)
+    );
 }
 
 #[test]

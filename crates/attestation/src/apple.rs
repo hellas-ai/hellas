@@ -5,8 +5,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use hellas_rpc::pb::execute::AssuranceEvidence;
-use hellas_rpc::{APPLE_APP_ATTEST, ContentId, DagCborEncoder};
+use hellas_rpc::{ContentId, DagCborEncoder};
 use p256::ecdsa::signature::Verifier;
 use p256::ecdsa::{Signature, VerifyingKey};
 use rustls_pki_types::{CertificateDer, UnixTime};
@@ -18,7 +17,7 @@ use x509_cert::Certificate;
 
 use x509_cert::der::Decode;
 
-use crate::{AnchorTime, AttestationError, Binding};
+use crate::{AnchorTime, AttestationError};
 
 /// Canonical tag of an Apple App Attest credential.
 const CREDENTIAL_TAG: &str = "hellas.apple.app-attest.credential.v1";
@@ -220,24 +219,6 @@ fn public_key(
         .map_err(|_| AttestationError::Credential)
 }
 
-pub fn verify_apple(
-    evidence: &AssuranceEvidence,
-    expected: Binding,
-    credential: &RegisteredAppleCredential,
-    policy: &ApplePolicy,
-    counters: &dyn AssertionCounterStore,
-) -> Result<AppleClaims, AttestationError> {
-    if evidence.codec != APPLE_APP_ATTEST {
-        return Err(AttestationError::Codec);
-    }
-    if evidence.credential != credential.id.as_bytes() {
-        return Err(AttestationError::Credential);
-    }
-    let claims = verify_apple_assertion(&evidence.proof, expected.as_bytes(), credential, policy)?;
-    counters.advance(&credential.public_key, claims.counter)?;
-    Ok(claims)
-}
-
 pub fn verify_apple_assertion(
     assertion: &[u8],
     client_data_hash: &[u8; 32],
@@ -428,7 +409,7 @@ pub fn verify_apple_provider_genesis(
         return Err(AttestationError::Credential);
     }
     let RootProof::AppleAppAttest(assertion) = &genesis.root_proof else {
-        return Err(AttestationError::Codec);
+        return Err(AttestationError::RootProofKind);
     };
     verify_apple_assertion(
         assertion,
@@ -437,4 +418,59 @@ pub fn verify_apple_provider_genesis(
         policy,
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod chain_tests {
+    use super::*;
+    use rcgen::{
+        BasicConstraints, CertificateParams, CertifiedIssuer, CustomExtension,
+        ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
+    };
+
+    #[test]
+    fn generated_chain_requires_selected_root_time_and_attestation_eku() {
+        fn ca_params(name: &str) -> CertificateParams {
+            let mut params = CertificateParams::default();
+            params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, name);
+            params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+            params
+        }
+        let valid_time = AnchorTime(1_790_996_283);
+        let root =
+            CertifiedIssuer::self_signed(ca_params("test root"), KeyPair::generate().unwrap())
+                .unwrap();
+        let intermediate = CertifiedIssuer::signed_by(
+            ca_params("test intermediate"),
+            KeyPair::generate().unwrap(),
+            &root,
+        )
+        .unwrap();
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::default();
+        params
+            .custom_extensions
+            .push(CustomExtension::from_oid_content(
+                &[2, 5, 29, 37],
+                APP_ATTEST_EKU_DER.to_vec(),
+            ));
+        let leaf = params.signed_by(&key, &intermediate).unwrap();
+        let chain = vec![
+            ByteBuf::from(leaf.der().to_vec()),
+            ByteBuf::from(intermediate.der().to_vec()),
+        ];
+        assert!(verify_chain(&chain, root.der(), valid_time).is_ok());
+        assert!(verify_chain(&chain, apple_app_attest_root_ca(), valid_time).is_err());
+        assert!(verify_chain(&chain, root.der(), AnchorTime(0)).is_err());
+        let mut wrong_usage = CertificateParams::default();
+        wrong_usage
+            .extended_key_usages
+            .push(ExtendedKeyUsagePurpose::ServerAuth);
+        let leaf = wrong_usage.signed_by(&key, &intermediate).unwrap();
+        let chain = vec![ByteBuf::from(leaf.der().to_vec()), chain[1].clone()];
+        assert!(verify_chain(&chain, root.der(), valid_time).is_err());
+    }
 }

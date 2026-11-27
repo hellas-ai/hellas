@@ -3,43 +3,17 @@ mod apple;
 use std::future::Future;
 
 use hellas_auth::Digest;
-use hellas_rpc::pb::execute::AssuranceEvidence;
-use hellas_rpc::{DagCborEncoder, EventCommitment};
 
 #[cfg(feature = "apple-app-attest")]
 pub use apple::{
     AppleClaims, AppleCredential, AppleCredentialIdentity, ApplePolicy, AppleVerdict,
     AssertionCounterStore, RegisteredAppleCredential, apple_app_attest_root_ca, apple_app_id_hash,
     apple_client_data_hash, apple_credential_identity, appraise_apple, register_apple,
-    verify_apple, verify_apple_assertion, verify_apple_provider_genesis,
+    verify_apple_assertion, verify_apple_provider_genesis,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Binding(Digest);
-
-impl Binding {
-    pub fn new(statement_tag: &str, terminal: EventCommitment) -> Self {
-        let mut e = DagCborEncoder::new();
-        e.array(2);
-        e.str(statement_tag);
-        e.bytes(terminal.as_bytes());
-        Self(Digest::hash(&e.into_bytes()))
-    }
-
-    pub const fn as_bytes(&self) -> &[u8; 32] {
-        self.0.as_bytes()
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AnchorTime(pub u64);
-
-pub trait Attester {
-    fn attest(
-        &self,
-        binding: Binding,
-    ) -> impl Future<Output = Result<AssuranceEvidence, AttestationError>> + Send;
-}
 
 /// Produces the root proofs that bind a provider identity to its enrollment
 /// statement and to a live confidential transport.
@@ -72,13 +46,13 @@ impl RootProver for hellas_auth::ProducerSigningKey {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum AttestationError {
-    #[error("wrong evidence codec")]
-    Codec,
+    #[error("wrong root proof kind")]
+    RootProofKind,
     #[error("invalid evidence credential")]
     Credential,
     #[error("malformed {0}")]
     Malformed(&'static str),
-    #[error("evidence does not bind the terminal event")]
+    #[error("evidence does not bind the expected challenge")]
     Binding,
     #[error("evidence signature is invalid")]
     Signature,
