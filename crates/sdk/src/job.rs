@@ -1,4 +1,5 @@
 //! Caller-owned job folders. Purchase nonces derive from durable channel state.
+use hellas_attestation::{AppleAppId, AppleCdHash};
 use hellas_auth::{Digest, ProducerSigningKey, PublicKey, hash_tuple};
 use hellas_rpc::{
     Assurance, ContentRef, FetchContract, JsonBytes, ProgramManifest,
@@ -43,8 +44,8 @@ pub struct Job {
     price: u64,
     input: Arc<JobInput>,
     manifest: ProgramManifest,
-    pub require_apple_app_id: Option<Vec<String>>,
-    pub require_apple_cdhash: Option<Vec<String>>,
+    pub require_apple_app_id: Option<Vec<AppleAppId>>,
+    pub require_apple_cdhash: Option<Vec<AppleCdHash>>,
 }
 #[derive(Clone)]
 pub enum JobInput {
@@ -93,12 +94,12 @@ struct FetchFiles {
     service: String,
     method: String,
     request: String,
-    #[serde(with = "crate::apple_policy::AssuranceName")]
+    #[serde(with = "crate::assurance_name::AssuranceName")]
     assurance: Assurance,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    require_apple_app_id: Option<Vec<String>>,
+    require_apple_app_id: Option<Vec<AppleAppId>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    require_apple_cdhash: Option<Vec<String>>,
+    require_apple_cdhash: Option<Vec<AppleCdHash>>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

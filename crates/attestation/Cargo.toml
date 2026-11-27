@@ -12,6 +12,7 @@ default = []
 apple-app-attest = [
     "dep:base64",
     "dep:ciborium",
+    "dep:hex",
     "dep:p256",
     "dep:rustls-pki-types",
     "dep:webpki",
@@ -26,6 +27,7 @@ base64 = { workspace = true, optional = true }
 ciborium = { workspace = true, optional = true }
 hellas-auth.workspace = true
 hellas-rpc.workspace = true
+hex = { workspace = true, optional = true }
 p256 = { workspace = true, optional = true }
 rustls-pki-types = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }

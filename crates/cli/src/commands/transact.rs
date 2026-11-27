@@ -2,6 +2,7 @@
 use anyhow::{Context as _, bail, ensure};
 use clap::Args;
 use futures::TryFutureExt as _;
+use hellas_attestation::{AppleAppId, AppleCdHash, ApplePolicy, AttestationError};
 use hellas_auth::authority::ResourceId;
 use hellas_client::model::{ComputeJob, ModelPackage, ModelResponse};
 use hellas_rpc::Assurance;
@@ -160,10 +161,10 @@ pub struct ClientArgs {
     assurance: Option<Assurance>,
     /// Accepted Apple team and bundle ID. Repeat for additional apps.
     #[arg(long, value_name = "ID")]
-    require_apple_app_id: Option<Vec<String>>,
+    require_apple_app_id: Option<Vec<AppleAppId>>,
     /// Accepted Apple CDHash. Repeat for additional builds.
     #[arg(long, value_name = "HEX")]
-    require_apple_cdhash: Option<Vec<String>>,
+    require_apple_cdhash: Option<Vec<AppleCdHash>>,
 }
 
 #[derive(Debug, Args)]
@@ -290,8 +291,8 @@ impl ClientArgs {
         })
     }
 
-    fn apple_policy(&self) -> super::CliResult<hellas_client::ApplePolicy> {
-        hellas_sdk::apple_policy::from_requirements(
+    fn apple_policy(&self) -> Result<ApplePolicy, AttestationError> {
+        ApplePolicy::from_requirements(
             self.require_apple_app_id.as_deref(),
             self.require_apple_cdhash.as_deref(),
         )

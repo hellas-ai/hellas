@@ -67,7 +67,7 @@ fn fixture_credential(fixture: &Fixture) -> AppleCredential {
 }
 
 fn registered_fixture(fixture: &Fixture) -> RegisteredAppleCredential {
-    ApplePolicy::new([APP_ID.to_string()].into(), None)
+    ApplePolicy::new([APP_ID.parse().unwrap()].into(), None)
         .unwrap()
         .register(
             &fixture_credential(fixture),
@@ -155,14 +155,10 @@ fn device_genesis_verifies_at_enrollment_time() {
     let hellas_rpc::PlatformEnrollment::AppleAppAttest(enrollment) = bundle.platform else {
         panic!("expected App Attest enrollment");
     };
+    let cd_hash = "320cb97347ecf28369401a21ba85553008c8d8009ae6f3bffa159a0dede1eab6";
     let policy = ApplePolicy::new(
-        [APP_ID.to_string()].into(),
-        Some(
-            [decode_hex_32(
-                "320cb97347ecf28369401a21ba85553008c8d8009ae6f3bffa159a0dede1eab6",
-            )]
-            .into(),
-        ),
+        [APP_ID.parse().unwrap()].into(),
+        Some([cd_hash.parse().unwrap()].into()),
     )
     .unwrap();
     let credential = policy
@@ -202,7 +198,7 @@ fn real_attestation_registers_against_apple_chain() {
     let mut changed = credential;
     changed.client_data_hash[0] ^= 1;
     assert_eq!(
-        ApplePolicy::new([APP_ID.to_string()].into(), None)
+        ApplePolicy::new([APP_ID.parse().unwrap()].into(), None)
             .unwrap()
             .register(
                 &changed,
@@ -220,8 +216,11 @@ fn real_assertion_verifies_with_app_rp_id_and_direct_cd_hash_allowlist() {
     let registered = registered_fixture(&fixture);
     let client_data_hash = decode_hex_32(fixture.assertion_client_data_hash_hex);
     let assertion = decode_base64(fixture.assertion_object_base64);
-    let policy =
-        ApplePolicy::new([APP_ID.to_string()].into(), Some([REAL_CD_HASH].into())).unwrap();
+    let policy = ApplePolicy::new(
+        [APP_ID.parse().unwrap()].into(),
+        Some([REAL_CD_HASH.into()].into()),
+    )
+    .unwrap();
 
     let claims = policy
         .verify_assertion(&assertion, &client_data_hash, &registered)
@@ -229,9 +228,10 @@ fn real_assertion_verifies_with_app_rp_id_and_direct_cd_hash_allowlist() {
     assert_eq!(claims.counter, 1);
     assert_eq!(claims.cd_hash, REAL_CD_HASH);
 
+    let hashed_cd_hash: [u8; 32] = Sha256::digest(REAL_CD_HASH).into();
     let hashed_cd_policy = ApplePolicy::new(
-        [APP_ID.to_string()].into(),
-        Some([Sha256::digest(REAL_CD_HASH).into()].into()),
+        [APP_ID.parse().unwrap()].into(),
+        Some([hashed_cd_hash.into()].into()),
     )
     .unwrap();
     assert_eq!(
@@ -284,8 +284,8 @@ fn verifies_assertion_from_an_updated_allowlisted_cd_hash() {
     let old_cd_hash = [1; 32];
     let updated_cd_hash = [2; 32];
     let policy = ApplePolicy::new(
-        [APP_ID.to_string()].into(),
-        Some([old_cd_hash, updated_cd_hash].into()),
+        [APP_ID.parse().unwrap()].into(),
+        Some([old_cd_hash.into(), updated_cd_hash.into()].into()),
     )
     .unwrap();
     let client_data_hash = [3; 32];
@@ -312,12 +312,15 @@ fn rejects_wrong_app_rp_id_and_cd_hash_outside_allowlist() {
     let allowed_cd_hash = [1; 32];
     let denied_cd_hash = [2; 32];
     let client_data_hash = [3; 32];
-    let policy =
-        ApplePolicy::new([APP_ID.to_string()].into(), Some([allowed_cd_hash].into())).unwrap();
+    let policy = ApplePolicy::new(
+        [APP_ID.parse().unwrap()].into(),
+        Some([allowed_cd_hash.into()].into()),
+    )
+    .unwrap();
 
     let wrong_app = assertion(
         &signing_key,
-        apple_app_id_hash("OTHERTEAM.example.app"),
+        apple_app_id_hash("OTHERTEAM0.example.app"),
         allowed_cd_hash,
         1,
         &client_data_hash,
@@ -346,7 +349,11 @@ fn rejects_signed_assertion_that_omits_cd_hash_evidence() {
     let registered = registered(&signing_key);
     let rp_id_hash = apple_app_id_hash(APP_ID);
     let client_data_hash = [3; 32];
-    let policy = ApplePolicy::new([APP_ID.to_string()].into(), Some([[1; 32]].into())).unwrap();
+    let policy = ApplePolicy::new(
+        [APP_ID.parse().unwrap()].into(),
+        Some([[1; 32].into()].into()),
+    )
+    .unwrap();
     let mut authenticator_data = Vec::new();
     authenticator_data.extend_from_slice(&rp_id_hash);
     authenticator_data.push(0xc0);
@@ -375,7 +382,7 @@ fn rejects_credential_with_invalid_authenticator_flags() {
             Err(AttestationError::Credential)
         );
         assert_eq!(
-            ApplePolicy::new([APP_ID.to_string()].into(), None)
+            ApplePolicy::new([APP_ID.parse().unwrap()].into(), None)
                 .unwrap()
                 .register(
                     &AppleCredential {
@@ -400,8 +407,11 @@ fn rejects_signed_assertion_with_invalid_authenticator_flags() {
     let mut object: BTreeMap<String, ByteBuf> =
         ciborium::from_reader(assertion.as_slice()).unwrap();
     let mut auth_data = object.remove("authenticatorData").unwrap().into_vec();
-    let policy =
-        ApplePolicy::new([APP_ID.to_string()].into(), Some([REAL_CD_HASH].into())).unwrap();
+    let policy = ApplePolicy::new(
+        [APP_ID.parse().unwrap()].into(),
+        Some([REAL_CD_HASH.into()].into()),
+    )
+    .unwrap();
 
     for flags in [0x00, 0x40, 0x80, 0xc1] {
         auth_data[32] = flags;
@@ -421,7 +431,11 @@ fn repeated_verification_does_not_advance_counter_state() {
     let rp_id_hash = apple_app_id_hash(APP_ID);
     let cd_hash = [1; 32];
     let client_data_hash = [3; 32];
-    let policy = ApplePolicy::new([APP_ID.to_string()].into(), Some([cd_hash].into())).unwrap();
+    let policy = ApplePolicy::new(
+        [APP_ID.parse().unwrap()].into(),
+        Some([cd_hash.into()].into()),
+    )
+    .unwrap();
     let assertion = assertion(&signing_key, rp_id_hash, cd_hash, 2, &client_data_hash);
 
     let first = policy

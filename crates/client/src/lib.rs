@@ -14,7 +14,7 @@ pub use offer::{PinnedOffer, UnpinnedOffer};
 
 pub use error::{ClientError, ClientResult};
 #[cfg(feature = "iroh")]
-pub use hellas_attestation::{ApplePolicy, DEFAULT_APP_ID};
+pub use hellas_attestation::ApplePolicy;
 #[cfg(feature = "iroh")]
 pub use iroh::{
     ProviderAddress, ProviderAddressError, ProviderTrustAnchor, RemoteNodeTarget, confidential_open,

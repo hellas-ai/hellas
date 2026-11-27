@@ -69,9 +69,9 @@ mod machines;
 
 const TEST_REMOTE_TRUST_ARGS: &[&str] = &[
     "--require-apple-app-id",
-    "TEAM.app",
+    "TEAM123456.app",
     "--require-apple-cdhash",
-    "00",
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     "--assurance",
     "apple-app-attest",
 ];
@@ -105,6 +105,35 @@ fn identity_enrollment_id_has_an_explicit_dispatch_command() {
             command: IdentityCommand::ShowEnrollmentId,
         }
     ));
+}
+
+#[test]
+fn fetch_parses_apple_policy_flags_and_rejects_a_short_cdhash() {
+    let fetch = [
+        "hellas",
+        "fetch",
+        "https://example.test/path",
+        "--contract",
+        "http",
+        "--access",
+        "fixture.access",
+    ];
+    Cli::try_parse_from(
+        fetch
+            .into_iter()
+            .chain(TEST_REMOTE_TRUST_ARGS.iter().copied()),
+    )
+    .unwrap();
+
+    let error = Cli::try_parse_from(fetch.into_iter().chain(["--require-apple-cdhash", "00"]))
+        .err()
+        .expect("short CDHash must be rejected");
+    assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    assert!(
+        error
+            .to_string()
+            .contains("Apple CDHash must be 64 hexadecimal digits")
+    );
 }
 
 #[test]

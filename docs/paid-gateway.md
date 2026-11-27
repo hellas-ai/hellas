@@ -164,7 +164,7 @@ specific builds. For example, to require a specific build of another app:
 ```sh
 hellas fetch https://api.example.com/v1/models --contract http \
   --pay 20 --provider ENROLLMENT_ID@NODE_ID --assurance apple-app-attest \
-  --require-apple-app-id TEAMID.com.example.provider --require-apple-cdhash "$REVIEWED_CDHASH"
+  --require-apple-app-id TEAM123456.com.example.provider --require-apple-cdhash "$REVIEWED_CDHASH"
 ```
 
 The caller's Hellas home holds the assertion counters. Apple policy checks

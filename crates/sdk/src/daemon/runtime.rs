@@ -1,5 +1,6 @@
 use super::Result;
 use crate::{Backend, BackendEntry, BackendState, daemon_config::BackendKind};
+use hellas_attestation::ApplePolicy;
 use hellas_auth::authority::{NodeKey, PrincipalId};
 use hellas_store::content::DiskStore;
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
@@ -259,7 +260,7 @@ impl Runtime {
                     *resource,
                     None,
                     *assurance,
-                    crate::apple_policy::from_requirements(
+                    ApplePolicy::from_requirements(
                         require_apple_app_id.as_deref(),
                         require_apple_cdhash.as_deref(),
                     )?,
@@ -306,7 +307,7 @@ impl Runtime {
                     provider,
                     provider_addrs: addresses.clone(),
                     assurance: *assurance,
-                    apple_policy: crate::apple_policy::from_requirements(
+                    apple_policy: ApplePolicy::from_requirements(
                         require_apple_app_id.as_deref(),
                         require_apple_cdhash.as_deref(),
                     )?,

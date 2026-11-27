@@ -177,7 +177,7 @@ fn apple_open_response(
     let genesis = SignedProviderGenesis {
         root_proof: RootProof::AppleAppAttest(apple_assertion(
             &signing_key,
-            apple_app_id_hash("TESTTEAM.example.app"),
+            apple_app_id_hash("TESTTEAM00.example.app"),
             cd_hash,
             1,
             &hellas_attestation::apple_client_data_hash(&statement.canonical_bytes()),
@@ -201,15 +201,15 @@ fn apple_open_response(
         expected_genesis,
         Assurance::AppleAppAttest,
         ApplePolicy::new(
-            ["TESTTEAM.example.app".into()].into(),
-            Some([cd_hash].into()),
+            ["TESTTEAM00.example.app".parse().unwrap()].into(),
+            Some([cd_hash.into()].into()),
         )
         .unwrap(),
         counter_store,
     );
     *trust.credential.lock().unwrap() = Some(RegisteredAppleCredential {
         id: credential_id,
-        rp_id_hash: apple_app_id_hash("TESTTEAM.example.app"),
+        rp_id_hash: apple_app_id_hash("TESTTEAM00.example.app"),
         public_key,
     });
     (
@@ -219,7 +219,7 @@ fn apple_open_response(
             proof: Some(open_response::Proof::AppleAppAttestAssertion(
                 apple_assertion(
                     &signing_key,
-                    apple_app_id_hash("TESTTEAM.example.app"),
+                    apple_app_id_hash("TESTTEAM00.example.app"),
                     cd_hash,
                     counter,
                     binding.as_bytes(),
@@ -361,7 +361,11 @@ fn default_policy_rejects_the_recorded_spike_app() {
 #[test]
 fn different_cdhash_rejects_recorded_open_before_counter_advances() {
     let counters = Arc::new(TestCounterStore::default());
-    let policy = ApplePolicy::new([SPIKE_APP_ID.into()].into(), Some([[0; 32]].into())).unwrap();
+    let policy = ApplePolicy::new(
+        [SPIKE_APP_ID.parse().unwrap()].into(),
+        Some([[0; 32].into()].into()),
+    )
+    .unwrap();
     let trust = recorded_trust(policy, counters.clone());
     let (peer, response, exporter, nonce) = recorded_open();
     assert_attestation_error(
@@ -377,7 +381,11 @@ fn recorded_cdhash_accepts_the_connection_bound_open() {
     let bundle = device::enrollment();
     let cd_hash =
         recorded_bytes("320cb97347ecf28369401a21ba85553008c8d8009ae6f3bffa159a0dede1eab6");
-    let policy = ApplePolicy::new([SPIKE_APP_ID.into()].into(), Some([cd_hash].into())).unwrap();
+    let policy = ApplePolicy::new(
+        [SPIKE_APP_ID.parse().unwrap()].into(),
+        Some([cd_hash.into()].into()),
+    )
+    .unwrap();
     let approved = recorded_trust(policy, Arc::default());
     let open = |trust: &ProviderTrustAnchor| {
         verify_open_response(trust, &exporter, &nonce, ALPN, peer, response.clone())
@@ -438,7 +446,7 @@ fn apple_enrollment_is_registered_once_per_trust_anchor() {
     let counters = Arc::new(TestCounterStore::default());
     let apple = ProviderAddress::of(&device::enrollment()).unwrap().trust(
         Assurance::AppleAppAttest,
-        ApplePolicy::new([SPIKE_APP_ID.into()].into(), None).unwrap(),
+        ApplePolicy::new([SPIKE_APP_ID.parse().unwrap()].into(), None).unwrap(),
         counters,
     );
 

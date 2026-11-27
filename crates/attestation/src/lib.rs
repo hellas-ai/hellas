@@ -6,9 +6,9 @@ use hellas_auth::Digest;
 
 #[cfg(feature = "apple-app-attest")]
 pub use apple::{
-    AppleClaims, AppleCredential, AppleCredentialIdentity, ApplePolicy, AssertionCounterStore,
-    DEFAULT_APP_ID, RegisteredAppleCredential, apple_app_attest_root_ca, apple_app_id_hash,
-    apple_client_data_hash, apple_credential_identity, register_apple,
+    AppleAppId, AppleCdHash, AppleClaims, AppleCredential, AppleCredentialIdentity, ApplePolicy,
+    AssertionCounterStore, DEFAULT_APP_ID, RegisteredAppleCredential, apple_app_attest_root_ca,
+    apple_app_id_hash, apple_client_data_hash, apple_credential_identity, register_apple,
     verify_apple_provider_genesis,
 };
 

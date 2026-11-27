@@ -46,8 +46,8 @@ async fn folder_round_trip_preserves_semantics_and_exact_signed_input() {
     let mut job = fetch();
     let default_folder = directory.path().join(job.folder_digest().to_string());
     job.save(&default_folder).await.unwrap();
-    job.require_apple_app_id = Some(vec!["TEAM.app".into()]);
-    job.require_apple_cdhash = Some(vec!["ab".repeat(32)]);
+    job.require_apple_app_id = Some(vec!["TEAM123456.app".parse().unwrap()]);
+    job.require_apple_cdhash = Some(vec![[0xab; 32].into()]);
     let folder = directory.path().join(job.folder_digest().to_string());
     job.save(&folder).await.unwrap();
     let loaded = Job::load(&folder).await.unwrap();

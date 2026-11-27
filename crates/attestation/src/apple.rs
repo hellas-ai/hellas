@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
+use std::str::FromStr;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -9,7 +10,7 @@ use hellas_rpc::{ContentId, DagCborEncoder};
 use p256::ecdsa::signature::Verifier;
 use p256::ecdsa::{Signature, VerifyingKey};
 use rustls_pki_types::{CertificateDer, UnixTime};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use sha2::{Digest as _, Sha256};
 use webpki::{EndEntityCert, KeyUsage, anchor_from_trusted_cert, ring};
@@ -107,18 +108,93 @@ pub struct AppleClaims {
 /// The Gate app, accepted by default in any build.
 pub const DEFAULT_APP_ID: &str = "2F53L9ZR3N.ai.hellas.gate";
 
+/// An Apple team ID and bundle ID joined by a dot.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct AppleAppId(String);
+
+impl FromStr for AppleAppId {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        value.to_owned().try_into()
+    }
+}
+
+impl TryFrom<String> for AppleAppId {
+    type Error = &'static str;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        if value.split_once('.').is_some_and(|(team, bundle)| {
+            team.len() == 10
+                && team
+                    .bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+                && !bundle.is_empty()
+        }) {
+            Ok(Self(value))
+        } else {
+            Err(
+                "Apple app ID must contain a 10-character uppercase alphanumeric team ID, a dot, and a non-empty bundle ID",
+            )
+        }
+    }
+}
+
+impl From<AppleAppId> for String {
+    fn from(id: AppleAppId) -> Self {
+        id.0
+    }
+}
+
+/// The 32-byte code directory hash of an Apple app build.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct AppleCdHash([u8; 32]);
+
+impl FromStr for AppleCdHash {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let mut bytes = [0; 32];
+        hex::decode_to_slice(value, &mut bytes)
+            .map_err(|_| "Apple CDHash must be 64 hexadecimal digits")?;
+        Ok(Self(bytes))
+    }
+}
+
+impl TryFrom<String> for AppleCdHash {
+    type Error = &'static str;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<AppleCdHash> for String {
+    fn from(hash: AppleCdHash) -> Self {
+        hex::encode(hash.0)
+    }
+}
+
+impl From<[u8; 32]> for AppleCdHash {
+    fn from(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
 /// The consumer's Apple requirements: the accepted `TEAMID.bundle` app IDs
 /// and, optionally, the exact builds (CDHashes) accepted for them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApplePolicy {
-    require_apple_app_id: BTreeSet<String>,
-    require_apple_cdhash: Option<BTreeSet<[u8; 32]>>,
+    require_apple_app_id: BTreeSet<AppleAppId>,
+    require_apple_cdhash: Option<BTreeSet<AppleCdHash>>,
 }
 
 impl Default for ApplePolicy {
     fn default() -> Self {
         Self {
-            require_apple_app_id: BTreeSet::from([DEFAULT_APP_ID.to_owned()]),
+            require_apple_app_id: BTreeSet::from([AppleAppId(DEFAULT_APP_ID.to_owned())]),
             require_apple_cdhash: None,
         }
     }
@@ -126,8 +202,8 @@ impl Default for ApplePolicy {
 
 impl ApplePolicy {
     pub fn new(
-        require_apple_app_id: BTreeSet<String>,
-        require_apple_cdhash: Option<BTreeSet<[u8; 32]>>,
+        require_apple_app_id: BTreeSet<AppleAppId>,
+        require_apple_cdhash: Option<BTreeSet<AppleCdHash>>,
     ) -> Result<Self, AttestationError> {
         if require_apple_app_id.is_empty() {
             return Err(AttestationError::Malformed("Apple app ID policy"));
@@ -136,6 +212,20 @@ impl ApplePolicy {
             require_apple_app_id,
             require_apple_cdhash,
         })
+    }
+
+    pub fn from_requirements(
+        app_ids: Option<&[AppleAppId]>,
+        cd_hashes: Option<&[AppleCdHash]>,
+    ) -> Result<Self, AttestationError> {
+        let app_ids = match app_ids {
+            Some(ids) => ids.iter().cloned().collect(),
+            None => Self::default().require_apple_app_id,
+        };
+        Self::new(
+            app_ids,
+            cd_hashes.map(|hashes| hashes.iter().copied().collect()),
+        )
     }
 
     /// Register a credential whose RP ID is one of the accepted app IDs.
@@ -149,7 +239,7 @@ impl ApplePolicy {
         if !self
             .require_apple_app_id
             .iter()
-            .any(|id| apple_app_id_hash(id) == registered.rp_id_hash)
+            .any(|id| apple_app_id_hash(&id.0) == registered.rp_id_hash)
         {
             return Err(AttestationError::Credential);
         }
@@ -174,7 +264,7 @@ impl ApplePolicy {
         if self
             .require_apple_cdhash
             .as_ref()
-            .is_some_and(|hashes| !hashes.contains(&claims.cd_hash))
+            .is_some_and(|hashes| !hashes.contains(&AppleCdHash(claims.cd_hash)))
         {
             return Err(AttestationError::Credential);
         }
