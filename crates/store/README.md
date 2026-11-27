@@ -70,23 +70,33 @@ authentication failures never fall back locally. Local-grant defaults to its
 own authority-local upper. `index` remains local and only writes derived
 index metadata, so it can prepare lowers while the daemon owns the store.
 
-Resolve is explicit: it resolves a mutable revision once, prints the immutable
-SHA, and pins the resulting tree under `hf/REPO@SHA`. Acquire accepts immutable
-HF sources and publishes only the requested destination pin:
+Both `resolve` and `acquire` lock a mutable Hub ref to one commit. Resolve
+prints the commit and roots the repository tree without downloading weights.
+Acquire fetches the selected repository, directory or file and prints its
+content ID, commit and root names. It accepts `hf://ORG/REPO[@ref][/path]` and
+Hugging Face repository, `tree`, `resolve` and `blob` URLs. Encode slashes in
+refs as `%2F`. A missing ref follows the repository’s default branch.
 
 ```sh
 hellas store --profile owner-profile.json resolve hf://org/repo
-hellas store --profile owner-profile.json acquire hf://org/repo@COMMIT_SHA --pin model
-hellas store --profile owner-profile.json acquire https://example.org/model --bytes EXACT_BYTES --pin model
-hellas store --profile owner-profile.json acquire peer://NODE_ID --source-pin published --pin model
+hellas store --profile owner-profile.json acquire https://huggingface.co/org/repo/tree/release
+hellas store --profile owner-profile.json acquire hf://org/repo@release/model.bin --pin model
+hellas store --profile owner-profile.json acquire https://example.org/model
+hellas store --profile owner-profile.json acquire peer://NODE_ID --source-pin published
 hellas store --profile owner-profile.json pin set alias CONTENT_ID --bytes EXACT_BYTES --policy jobs
 hellas store --profile owner-profile.json pin rm alias
 ```
 
-Command-created pins default to Owner. Pin mutations use fresh compare-and-swap
+A pin is a named garbage-collection root with a visibility policy. Acquire
+roots a repository at `hf/ORG/REPO@SHA`, a Hub file or directory under that
+name followed by its path, and other sources at `https/CONTENT_ID` or
+`peer/CONTENT_ID`. `--pin NAME` adds an alias. Both roots use `--policy`,
+which defaults to `owner`. Pin mutations use fresh compare-and-swap
 metadata. `stat` and `read` accept `--path` within a tree; reads support byte
-ranges, and pin listing uses protocol pagination. Peer acquisition uses Public
-Content; Owner operations require the authenticated control carrier.
+ranges, and pin listing uses protocol pagination. HTTPS uses the response
+length when available; supply `--bytes` if the server omits it. A peer URI
+identifies a node, and `--source-pin` selects its public content root. Owner
+operations require the authenticated control carrier.
 
 ## Verification
 

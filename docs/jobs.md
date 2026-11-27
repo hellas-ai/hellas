@@ -44,7 +44,7 @@ To follow the default branch for one invocation, omit the revision.
 hellas transcribe --model hf://unsloth/whisper-tiny --audio speech.wav --local
 ```
 
-A branch or tag can follow the repository name after `@`. Encode a slash in the ref name as `%2F`. An optional file path can follow any revision or the repository name. The CLI prints the resolved commit to stderr and uses it for the entire command. A gateway resolves each ref once at startup. Use the printed SHA to repeat a job or pre-acquire its assets with `hellas store acquire`.
+A branch or tag can follow the repository name after `@`. Encode a slash in the ref name as `%2F`. An optional file path can follow any revision or the repository name. The CLI prints the resolved commit to stderr and uses it for the entire command. A gateway resolves each ref once at startup. Use the printed SHA to repeat a job. To pre-acquire assets, `hellas store acquire` accepts the same Hub locator or a Hugging Face web URL, locks the ref to one commit, and prints the commit, content ID and root name.
 
 The [Nix one-liners](nix.md#local-gpu-one-liners) include pinned commands for text, transcription, MMS speech, Flux images and
 one gateway serving them together. The same `cli-cuda` or `cli-hip` output
@@ -72,7 +72,7 @@ hellas text --model hf://LiquidAI/LFM3-1.7B-GGUF@cd0c74c575b5c416f3011b5b4c29807
 With a published Xet ID, the remote buyer reads only the header. For a Git or LFS weight file without a published Xet ID, the buyer streams the pinned file once to compute its canonical content ID and reads headers from that download. The provider can pre-acquire the file, or configure its content allow-list with the same repository, revision, file path, content ID and size. For example:
 
 ```sh
-hellas store acquire hf://LiquidAI/LFM3-1.7B-GGUF@cd0c74c575b5c416f3011b5b4c298077f26ca8c2 --path LFM3-1.7B-BF16.gguf --expect a4896de517cae418383c2fd9954bc5ac33d8112b810c7895fb3feb70dca622dc --bytes 3466626336 --pin models/lfm3 --policy jobs
+hellas store acquire hf://LiquidAI/LFM3-1.7B-GGUF@cd0c74c575b5c416f3011b5b4c298077f26ca8c2/LFM3-1.7B-BF16.gguf --expect a4896de517cae418383c2fd9954bc5ac33d8112b810c7895fb3feb70dca622dc --bytes 3466626336 --policy jobs
 ```
 
 A grant or paid policy constrained to Hub repositories requires a provider acquisition
