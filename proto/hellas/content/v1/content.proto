@@ -6,7 +6,7 @@ service Content {
   rpc Chunks(ChunksRequest) returns (ChunksResponse);
   rpc Read(ReadRequest) returns (stream ReadResponse);
   rpc Upload(stream UploadRequest) returns (stream UploadResponse);
-  rpc Acquire(AcquireRequest) returns (ContentRef);
+  rpc Acquire(AcquireRequest) returns (AcquireResponse);
   rpc SetPin(SetPinRequest) returns (SetPinResponse);
   rpc ListPins(ListPinsRequest) returns (ListPinsResponse);
   rpc WatchPins(WatchPinsRequest) returns (stream WatchPinsResponse);
@@ -55,10 +55,13 @@ message UploadRequest {
 }
 message UploadResponse { uint64 next_chunk = 1; bool missing = 2; bool complete = 3; }
 message Peer { bytes node = 1; Path at = 2; }
-message HfXet { string repo = 1; string commit = 2; optional string path = 3; bool dataset = 4; }
-message Https { string url = 1; optional bytes sha256 = 2; uint64 bytes = 3; }
+message HfXet { string repo = 1; string commit = 2; optional string path = 3; bool dataset = 4; bool default_branch = 5; }
+message Https { string url = 1; optional bytes sha256 = 2; optional uint64 bytes = 3; }
 message Source { oneof kind { Peer peer = 1; HfXet hf_xet = 2; Https https = 3; } }
-message AcquireRequest { Source source = 1; ContentRef expect = 2; PinTarget pin = 3; }
+// Automatic roots the result under a name derived from the source, plus an optional alias.
+message AutomaticRoot { PinPolicy policy = 1; optional string alias = 2; }
+message AcquireRequest { Source source = 1; ContentRef expect = 2; oneof root { PinTarget pin = 3; AutomaticRoot automatic = 4; } }
+message AcquireResponse { Target target = 1; string root = 2; optional string commit = 3; }
 message SetPinRequest { string name = 1; PinValue expected = 2; PinValue value = 3; }
 message SetPinResponse {}
 message ListPinsRequest { string prefix = 1; Cursor cursor = 2; }

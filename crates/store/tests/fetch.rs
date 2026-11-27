@@ -22,6 +22,7 @@ fn reference_repo() -> Repo {
         kind: RepoKind::Dataset,
         id: "xet-team/xet-spec-reference-files".to_string(),
         revision: "main".to_string(),
+        default_branch: false,
     }
 }
 
@@ -164,6 +165,7 @@ async fn fetches_the_reference_file_and_verifies_it() {
             Source::HfXet {
                 repo: Repo {
                     revision: sha.clone(),
+                    default_branch: false,
                     ..repo
                 },
                 path: Some(path),

@@ -442,30 +442,60 @@ where
         Ok(UploadSession::remote(object, remote, self.pool.clone()))
     }
 
-    async fn acquire(
+    async fn acquire_with(
         &self,
         scope: &Scope,
         source: Source,
         expect: Option<ContentRef>,
-        pin: PinTarget,
+        root: AcquirePin,
     ) -> Result<Acquisition> {
         if !matches!(scope.kind, ScopeKind::Owner) {
             return Err(Error::Denied);
         }
+        use pb::acquire_request::Root;
+        let root = match root {
+            AcquirePin::Named(pin) => Root::Pin(w::pin_target(&pin)),
+            AcquirePin::Automatic { policy, alias } => Root::Automatic(pb::AutomaticRoot {
+                policy: Some(w::policy(&policy)),
+                alias: alias.map(|name| name.as_str().to_owned()),
+            }),
+        };
+        let hub = match &source {
+            Source::HfXet { repo, .. } => Some(repo.to_string()),
+            _ => None,
+        };
         let response = self
             .client
             .acquire(pb::AcquireRequest {
                 source: Some(w::source(source)),
                 expect: expect.map(super::page::wire_ref),
-                pin: Some(w::pin_target(&pin)),
+                root: Some(root),
             })
             .await
-            .map_err(w::error)?;
-        let object = w::object(&response)?;
+            .map_err(|status| match hub {
+                Some(repo)
+                    if status.code() == hellas_wire::WireCode::NotFound
+                        && status.details().as_ref() == w::HF_NOT_FOUND =>
+                {
+                    Error::HfNotFound(repo)
+                }
+                _ => w::error(status),
+            })?;
+        let target = w::target_from(
+            response
+                .target
+                .ok_or(Error::Invalid("missing acquired target"))?,
+        )?;
+        let object = target.object();
         if expect.is_some_and(|expected| expected != object) {
             return Err(Error::Invalid("acquisition mismatch"));
         }
-        Ok(Acquisition { object })
+        Ok(Acquisition {
+            object,
+            target,
+            root: PinName::new(response.root)?,
+            commit: response.commit,
+        })
     }
     async fn set_pin(
         &self,

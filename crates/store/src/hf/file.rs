@@ -16,38 +16,110 @@ pub struct PinnedFile {
 }
 
 /// A model repository, optional ref name and optional file within the repository.
-struct ModelReference {
+#[derive(Clone, Debug)]
+pub struct ModelReference {
     pub repo: Repo,
     pub selector: Option<String>,
-    pub default_branch: bool,
 }
 
 impl ModelReference {
-    fn parse(uri: &str) -> Result<Self> {
-        let (org, rest) = uri
-            .strip_prefix("hf://")
-            .and_then(|s| s.split_once('/'))
-            .ok_or_else(|| FetchError::Malformed("expected hf://org/repo[@ref][/file]".into()))?;
-        let (repository, selector) = rest
-            .split_once('/')
-            .map_or((rest, None), |(r, f)| (r, Some(f)));
-        if let Some(path) = selector {
-            crate::content::tree::validate_path(path, false)
-                .map_err(|_| FetchError::Malformed("invalid model file selector".into()))?;
+    pub fn parse(uri: &str) -> Result<Self> {
+        if let Some(value) = uri.strip_prefix("hf://") {
+            let (org, rest) = value
+                .split_once('/')
+                .ok_or(FetchError::Locator("missing repository"))?;
+            if org.eq_ignore_ascii_case("huggingface.co") {
+                return Err(FetchError::Locator("omit huggingface.co/ after hf://"));
+            }
+            let (name, path) = rest
+                .split_once('/')
+                .map_or((rest, None), |(name, path)| (name, Some(path)));
+            let (repository, revision) = name
+                .split_once('@')
+                .map_or((name, None), |(name, revision)| (name, Some(revision)));
+            return Self::from_parts(org, repository, revision, path);
         }
-        let repo = Repo::from_uri(&format!("hf://{org}/{repository}"))?;
-        Ok(Self {
-            repo,
-            selector: selector.map(str::to_owned),
-            default_branch: !repository.contains('@'),
-        })
+        let url = url::Url::parse(uri).map_err(|_| FetchError::Locator("invalid Hub URL"))?;
+        Self::from_url(&url)
+    }
+
+    pub fn from_url(url: &url::Url) -> Result<Self> {
+        if url.scheme() != "https"
+            || url.host_str() != Some("huggingface.co")
+            || url.port().is_some()
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return Err(FetchError::Locator("expected an HTTPS huggingface.co URL"));
+        }
+        let mut parts = url
+            .path()
+            .strip_prefix('/')
+            .unwrap_or(url.path())
+            .splitn(5, '/');
+        let org = parts
+            .next()
+            .ok_or(FetchError::Locator("missing repository"))?;
+        let repository = parts
+            .next()
+            .ok_or(FetchError::Locator("missing repository"))?;
+        let (revision, path) = match parts.next() {
+            None => (None, None),
+            Some("") if parts.next().is_none() => (None, None),
+            Some("tree") => (
+                Some(
+                    parts
+                        .next()
+                        .ok_or(FetchError::Locator("missing tree revision"))?,
+                ),
+                parts.next().filter(|path| !path.is_empty()),
+            ),
+            Some("resolve" | "blob") => (
+                Some(
+                    parts
+                        .next()
+                        .ok_or(FetchError::Locator("missing file revision"))?,
+                ),
+                Some(
+                    parts
+                        .next()
+                        .ok_or(FetchError::Locator("missing file path"))?,
+                ),
+            ),
+            Some(_) => {
+                return Err(FetchError::Locator(
+                    "expected /tree/REF, /resolve/REF or /blob/REF",
+                ));
+            }
+        };
+        Self::from_parts(org, repository, revision, path)
+    }
+
+    fn from_parts(
+        org: &str,
+        repository: &str,
+        revision: Option<&str>,
+        path: Option<&str>,
+    ) -> Result<Self> {
+        let repo = Repo::new(&format!("{org}/{repository}"), revision)?;
+        let selector = path
+            .map(|path| -> Result<String> {
+                let path = percent_encoding::percent_decode_str(path)
+                    .decode_utf8()
+                    .map_err(|_| FetchError::Locator("invalid UTF-8 in file path"))?;
+                crate::content::tree::validate_path(&path, false)
+                    .map_err(|_| FetchError::Locator("invalid file path"))?;
+                Ok(path.into_owned())
+            })
+            .transpose()?;
+        Ok(Self { repo, selector })
     }
 }
 
 /// Whether a gateway selection still needs to interpret its first `@` as a Hub revision.
 pub fn is_bare_repo(uri: &str) -> bool {
     ModelReference::parse(uri)
-        .is_ok_and(|reference| reference.default_branch && reference.selector.is_none())
+        .is_ok_and(|reference| reference.repo.default_branch && reference.selector.is_none())
 }
 
 /// Revisions observed while resolving the inputs of one command or gateway.
@@ -73,11 +145,8 @@ impl Revisions {
         pool: &crate::content::Reservations,
         resolved: impl FnOnce(&str, &str),
     ) -> Result<Option<String>> {
-        let ModelReference {
-            repo,
-            selector,
-            default_branch,
-        } = ModelReference::parse(uri)?;
+        let ModelReference { repo, selector } = ModelReference::parse(uri)?;
+        let default_branch = repo.default_branch;
         if immutable_sha(&repo.revision) {
             return Ok(None);
         }
@@ -98,8 +167,13 @@ impl Revisions {
         };
         let mut uri = format!("hf://{}@{sha}", repo.id);
         if let Some(file) = selector {
+            const FILE_PATH: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
+                .add(b'%')
+                .add(b'?')
+                .add(b'#')
+                .add(b' ');
             uri.push('/');
-            uri.push_str(&file);
+            uri.push_str(&percent_encoding::utf8_percent_encode(&file, FILE_PATH).to_string());
         }
         Ok(Some(uri))
     }
@@ -354,7 +428,7 @@ mod tests {
         bytes.extend([1, 2, 3, 4]);
         let path = "shard.safetensors";
         let sha = "a".repeat(40);
-        let repo = Repo::from_uri(&format!("hf://org/model@{sha}")).unwrap();
+        let repo: Repo = format!("hf://org/model@{sha}").parse().unwrap();
         let oid = "60ef6645a381c2305e5bd66b09ae8a7e82374faaa89c756bf5c54e043e4d05d5";
         for lfs in [
             None,

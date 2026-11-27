@@ -69,7 +69,7 @@ mod tests {
                 Source::Https {
                     url,
                     sha256: None,
-                    bytes: object.bytes(),
+                    bytes: Some(object.bytes()),
                 },
             ),
         )]))))
@@ -174,6 +174,7 @@ mod tests {
                             name: PinName::new("channel-private".into())?,
                             policy: PinPolicy::Channel(private_channel),
                         },
+                        None,
                         None,
                     )
                 })

@@ -244,7 +244,7 @@ impl LocalStore {
                         &owner,
                         source,
                         Some(object),
-                        PinTarget {
+                        AcquirePin::Named(PinTarget {
                             name: PinName::new(format!(
                                 "work/{}/{}/acquired/{}",
                                 job.channel,
@@ -252,7 +252,7 @@ impl LocalStore {
                                 object.id()
                             ))?,
                             policy: PinPolicy::Jobs,
-                        },
+                        }),
                         Some((core.clone(), scope.clone())),
                     )
                     .await?;

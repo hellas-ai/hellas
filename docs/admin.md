@@ -180,8 +180,10 @@ A model resource can declare `rules` inside its `kind` table. Each rule may
 specify an `evaluator`, a `program` ID, a `model` ID, or an ordered list of
 Hub `repos`. A job must satisfy every field of one rule. A repository rule requires a receipt in the provider's content store for every named asset.
 Each receipt records a previously verified acquisition from one of the listed repositories.
-An operator can activate an exact Hub checkpoint or use `hellas store acquire` at a pinned
-revision before accepting work. Admission reads receipts by content ID and size, including
+An operator can activate an exact Hub checkpoint or run `hellas store acquire`
+with a Hub locator or Hugging Face web URL before accepting work. Acquire locks
+the revision and creates a root automatically. `--pin NAME` adds an alias.
+Admission reads receipts by content ID and size, including
 when a client names the model by a local path or `hellas://`. A missing receipt refuses
 the job even when the repository is online. Omitting
 `rules` derives exact program rules from the configured package. A rule may

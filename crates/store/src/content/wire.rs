@@ -2,6 +2,8 @@ use super::*;
 use hellas_auth::{Digest, authority::UnixMillis};
 use hellas_rpc::{ContentId, ContentRef, pb::content as pb};
 
+pub(crate) const HF_NOT_FOUND: &[u8] = b"hf-revision";
+
 pub(crate) fn object(object: &pb::ContentRef) -> Result<ContentRef> {
     Ok(ContentRef::new(
         ContentId::from_slice(&object.id).map_err(|_| Error::Invalid("content id"))?,
@@ -178,6 +180,7 @@ pub(crate) fn source(source: Source) -> pb::Source {
                 repo: repo.id,
                 dataset: repo.kind == crate::hf::RepoKind::Dataset,
                 commit: repo.revision,
+                default_branch: repo.default_branch,
                 path,
             }),
         }),
@@ -191,6 +194,9 @@ pub(crate) fn error(status: hellas_wire::WireStatus) -> Error {
         WireCode::NotFound => Error::Missing,
         WireCode::Aborted => Error::Conflict,
         WireCode::ResourceExhausted => Error::Capacity,
+        WireCode::InvalidArgument if status.message() == super::acquire::HTTPS_LENGTH_REQUIRED => {
+            Error::Invalid(super::acquire::HTTPS_LENGTH_REQUIRED)
+        }
         WireCode::InvalidArgument if status.message() == crate::hf::LEGACY_CHUNKING => {
             Error::Invalid(crate::hf::LEGACY_CHUNKING)
         }
@@ -233,6 +239,7 @@ pub(crate) fn source_from(source: pb::Source) -> Result<Source> {
             repo: crate::hf::Repo {
                 id: source.repo,
                 revision: source.commit,
+                default_branch: source.default_branch,
                 kind: if source.dataset {
                     crate::hf::RepoKind::Dataset
                 } else {

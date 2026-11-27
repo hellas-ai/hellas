@@ -50,6 +50,7 @@ pub fn file_content(path: &std::path::Path) -> std::io::Result<ContentRef> {
         })?;
     Ok(indexed.object())
 }
+pub use acquire::validate_https;
 pub use disk::{DiskStore, IndexMode};
 pub use local::{JobContent, LocalStore, VerifiedReader};
 pub use memory::MemoryStore;
@@ -77,6 +78,8 @@ pub enum Error {
     WorkOwned,
     #[error("content is missing")]
     Missing,
+    #[error("HF repository or revision not found: {0}")]
+    HfNotFound(String),
     #[error("pin or cursor changed")]
     Conflict,
     #[error("content reservation exhausted")]
@@ -285,7 +288,7 @@ pub enum Source {
     Https {
         url: url::Url,
         sha256: Option<[u8; 32]>,
-        bytes: u64,
+        bytes: Option<u64>,
     },
 }
 
@@ -314,9 +317,21 @@ pub struct ByteStream {
     pub bytes: Pin<Box<dyn Stream<Item = Result<Bytes>> + Send>>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Acquisition {
     pub object: ContentRef,
+    pub target: Target,
+    pub root: PinName,
+    pub commit: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub enum AcquirePin {
+    Named(PinTarget),
+    Automatic {
+        policy: PinPolicy,
+        alias: Option<PinName>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -362,6 +377,16 @@ pub trait ContentStore: Send + Sync {
         source: Source,
         expect: Option<ContentRef>,
         pin: PinTarget,
+    ) -> Result<Acquisition> {
+        self.acquire_with(s, source, expect, AcquirePin::Named(pin))
+            .await
+    }
+    async fn acquire_with(
+        &self,
+        s: &Scope,
+        source: Source,
+        expect: Option<ContentRef>,
+        pin: AcquirePin,
     ) -> Result<Acquisition>;
     async fn set_pin(
         &self,
@@ -397,14 +422,14 @@ macro_rules! impl_local_content {
             ) -> Result<UploadSession> {
                 self.$($access)+.upload(s, object, pin).await
             }
-            async fn acquire(
+            async fn acquire_with(
                 &self,
                 s: &Scope,
                 source: Source,
                 expect: Option<ContentRef>,
-                pin: PinTarget,
+                pin: AcquirePin,
             ) -> Result<Acquisition> {
-                self.$($access)+.acquire(s, source, expect, pin).await
+                self.$($access)+.acquire_with(s, source, expect, pin).await
             }
             async fn set_pin(
                 &self,

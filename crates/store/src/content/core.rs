@@ -103,6 +103,7 @@ impl Core {
         objects: Vec<(ContentRef, super::storage::Data, Vec<Chunk>)>,
         target: Target,
         pin: PinTarget,
+        alias: Option<PinName>,
         requester: Option<(Core, Scope)>,
     ) -> Result<()> {
         let owner = requester
@@ -119,7 +120,18 @@ impl Core {
             .into_iter()
             .map(|(object, data, chunks)| (object.id(), Arc::new(Stored::new(data, chunks))))
             .collect();
+        let policy = pin.policy.clone();
         state.publish(objects, target, pin)?;
+        if let Some(alias) = alias {
+            state.change_pin(
+                alias,
+                Some(PinValue {
+                    target,
+                    policy,
+                    expires: None,
+                }),
+            )?;
+        }
         if let Some(owner) = owner {
             state.add_acquired(name, owner);
         }
@@ -1329,12 +1341,12 @@ impl ContentStore for Core {
         })
         .await
     }
-    async fn acquire(
+    async fn acquire_with(
         &self,
         s: &Scope,
         source: Source,
         expect: Option<ContentRef>,
-        pin: PinTarget,
+        pin: AcquirePin,
     ) -> Result<Acquisition> {
         self.acquire_scoped(s, source, expect, pin, None).await
     }
@@ -1445,13 +1457,31 @@ impl Core {
     pub(crate) async fn acquire_scoped(
         &self,
         s: &Scope,
-        source: Source,
+        mut source: Source,
         expect: Option<ContentRef>,
-        pin: PinTarget,
+        pin: AcquirePin,
         requester: Option<(Core, Scope)>,
     ) -> Result<Acquisition> {
         if !matches!(s.kind, ScopeKind::Owner) {
             return Err(Error::Denied);
+        }
+        if let AcquirePin::Automatic { alias, .. } = &pin {
+            if alias
+                .as_ref()
+                .is_some_and(|name| name.as_str().starts_with("config/"))
+            {
+                return Err(Error::Invalid(
+                    "config/ pins belong to content configuration",
+                ));
+            }
+            if let Source::HfXet { repo, path } = &mut source {
+                if let Some(path) = path {
+                    super::tree::validate_path(path, false)?;
+                }
+                self.access(s, |core| core.require_ready()).await?;
+                repo.revision = self.lock_hf(repo.clone()).await?;
+                repo.default_branch = false;
+            }
         }
         let scope = s.clone();
         self.retry_capacity(s, move |core| {
@@ -1465,7 +1495,10 @@ impl Core {
                 let (checking_pin, checking_requester) = (pin.clone(), requester.clone());
                 core.access(&scope, move |core| {
                     core.require_ready()?;
-                    core.check_acquisition(&checking_pin, &checking_requester)
+                    if let AcquirePin::Named(pin) = &checking_pin {
+                        core.check_acquisition(pin, &checking_requester)?;
+                    }
+                    Ok(())
                 })
                 .await?;
                 super::acquire::memory(&core, &scope, source, expect, pin, requester).await

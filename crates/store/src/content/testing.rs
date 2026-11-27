@@ -96,7 +96,9 @@ impl AvailableHubFile {
         );
         store.core.hf_hub = Some(url);
         let file = crate::hf::PinnedFile::new(
-            crate::hf::Repo::from_uri(&format!("hf://{repo}@{sha}")).unwrap(),
+            format!("hf://{repo}@{sha}")
+                .parse::<crate::hf::Repo>()
+                .unwrap(),
             path.into(),
             ContentRef::for_bytes(bytes),
         );
