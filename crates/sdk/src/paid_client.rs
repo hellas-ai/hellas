@@ -499,8 +499,13 @@ impl PaidWorkSession {
         let setups =
             offer::RetainedSetups::discover(&journal_root, config.network(), args.provider).await?;
         let floor = setups.floor();
-        let remote = crate::client_chain::connect_at(config, read_timeout, floor).await?;
-        let chain = WorkBlocks::new(remote.clone()).with_min_height(floor);
+        // Source selection for new funding is the first stage of that funding.
+        let funding_deadline = crate::client_chain::Deadline::after(funding_timeout(args.timeout));
+        let remote = match floor {
+            None if intent.allow_funding => funding::connect(config, funding_deadline).await?,
+            _ => crate::client_chain::connect_at(config, read_timeout, floor.unwrap_or(0)).await?,
+        };
+        let chain = WorkBlocks::new(remote.clone()).with_min_height(floor.unwrap_or(0));
         let retained = setups.select(&chain).await?;
         let reconnect = retained.is_some();
         let (mut store, signed) = match retained {
@@ -537,7 +542,7 @@ impl PaidWorkSession {
                     &remote,
                     quote,
                     crate::client_owner::FundingControls {
-                        timeout: funding_timeout(args.timeout),
+                        deadline: funding_deadline,
                         approval: funding.approval.as_deref(),
                         before_sign: intent.before_open.take(),
                     },

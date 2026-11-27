@@ -11,6 +11,22 @@ pub struct RecoveredFundingChannel {
     pub funding_value: u64,
 }
 
+/// Select a source as the first stage of funding. Its expiry is the funding
+/// deadline's, so it reports the owner funding timeout.
+pub(super) async fn connect(
+    config: &crate::work_config::WorkConfig,
+    deadline: crate::client_chain::Deadline,
+) -> Result<RemoteLightClient> {
+    crate::client_chain::connect_until(config, deadline, 0)
+        .await
+        .map_err(|error| match error {
+            hellas_chain::QueryError::ReadUnavailableTimeout { .. } => {
+                crate::client_owner::ClientOwnerError::Timeout(deadline.budget()).into()
+            }
+            error => error.into(),
+        })
+}
+
 /// Finish a previously signed funding intent by reservation identity. This
 /// cannot obtain a quote, allocate an intent, or request an owner signature.
 pub async fn recover_funding_intent(
@@ -20,15 +36,15 @@ pub async fn recover_funding_intent(
     approval: Option<&dyn FundingApproval>,
 ) -> Result<Funding> {
     args.validate()?;
-    let timeout = read_timeout(args.timeout);
-    let chain = crate::client_chain::connect(&args.config, timeout).await?;
+    let deadline = crate::client_chain::Deadline::after(super::funding_timeout(args.timeout));
+    let chain = connect(&args.config, deadline).await?;
     owner
         .recover_funding_intent(
             &chain,
             args.provider.node,
             reservation,
             crate::client_owner::FundingControls {
-                timeout: super::funding_timeout(args.timeout),
+                deadline,
                 approval,
                 before_sign: None,
             },

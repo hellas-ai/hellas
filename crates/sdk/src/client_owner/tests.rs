@@ -181,7 +181,7 @@ fn durable_funding_retries_one_signature_and_reserves_other_providers() {
                         provider(3),
                         200,
                         FundingControls {
-                            timeout: FUNDING_DEADLINE,
+                            deadline: crate::client_chain::Deadline::after(FUNDING_DEADLINE),
                             approval: Some(&Deny),
                             before_sign: None,
                         },
@@ -198,7 +198,7 @@ fn durable_funding_retries_one_signature_and_reserves_other_providers() {
                     provider(3),
                     200,
                     FundingControls {
-                        timeout: FUNDING_DEADLINE,
+                        deadline: crate::client_chain::Deadline::after(FUNDING_DEADLINE),
                         approval: Some(&gate),
                         before_sign: None,
                     },
@@ -218,7 +218,7 @@ fn durable_funding_retries_one_signature_and_reserves_other_providers() {
                     provider(3),
                     200,
                     FundingControls {
-                        timeout: FUNDING_DEADLINE,
+                        deadline: crate::client_chain::Deadline::after(FUNDING_DEADLINE),
                         approval: Some(&gate),
                         before_sign: None,
                     },
@@ -268,7 +268,7 @@ fn durable_funding_retries_one_signature_and_reserves_other_providers() {
                     provider(3),
                     200,
                     FundingControls {
-                        timeout: FUNDING_DEADLINE,
+                        deadline: crate::client_chain::Deadline::after(FUNDING_DEADLINE),
                         approval: Some(&gate),
                         before_sign: None,
                     },
@@ -297,7 +297,7 @@ fn durable_funding_retries_one_signature_and_reserves_other_providers() {
                     provider(3),
                     [7; 16],
                     FundingControls {
-                        timeout: FUNDING_DEADLINE,
+                        deadline: crate::client_chain::Deadline::after(FUNDING_DEADLINE),
                         approval: Some(&gate),
                         before_sign: None,
                     },
@@ -314,7 +314,7 @@ fn durable_funding_retries_one_signature_and_reserves_other_providers() {
                     provider(3),
                     200,
                     FundingControls {
-                        timeout: FUNDING_DEADLINE,
+                        deadline: crate::client_chain::Deadline::after(FUNDING_DEADLINE),
                         approval: Some(&gate),
                         before_sign: None,
                     }
@@ -324,7 +324,7 @@ fn durable_funding_retries_one_signature_and_reserves_other_providers() {
                     provider(3),
                     200,
                     FundingControls {
-                        timeout: FUNDING_DEADLINE,
+                        deadline: crate::client_chain::Deadline::after(FUNDING_DEADLINE),
                         approval: Some(&gate),
                         before_sign: None,
                     }
