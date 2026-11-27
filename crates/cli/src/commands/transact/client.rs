@@ -34,9 +34,8 @@ pub(super) async fn settle(args: &ClientArgs, context: &Context) -> CliResult<()
     let mut closed = 0;
     for channel in channels {
         let options = args.options_with_config(
-            context,
             channel.price,
-            channel.assurance,
+            args.assurance.unwrap_or_default().max(channel.assurance),
             config.clone(),
             content.clone(),
         )?;

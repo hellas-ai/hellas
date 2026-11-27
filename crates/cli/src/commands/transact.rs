@@ -2,6 +2,7 @@
 use anyhow::{Context as _, bail, ensure};
 use clap::Args;
 use futures::TryFutureExt as _;
+use hellas_attestation::{AppleAppId, AppleCdHash, ApplePolicy, AttestationError};
 use hellas_auth::authority::ResourceId;
 use hellas_client::model::{ComputeJob, ModelPackage, ModelResponse};
 use hellas_rpc::Assurance;
@@ -155,11 +156,15 @@ pub struct ClientArgs {
     /// Validator WebSocket URL; repeat to override the selected chain defaults.
     #[arg(long = "validator")]
     validators: Vec<String>,
-    /// Independent Apple App Attest approval directory and policy.
-    #[arg(long, requires = "trust_policy")]
-    trust_store: Option<PathBuf>,
-    #[arg(long, requires = "trust_store")]
-    trust_policy: Option<String>,
+    /// Required provider assurance.
+    #[arg(long, value_enum)]
+    assurance: Option<Assurance>,
+    /// Accepted Apple team and bundle ID. Repeat for additional apps.
+    #[arg(long, value_name = "ID")]
+    require_apple_app_id: Option<Vec<AppleAppId>>,
+    /// Accepted Apple CDHash. Repeat for additional builds.
+    #[arg(long, value_name = "HEX")]
+    require_apple_cdhash: Option<Vec<AppleCdHash>>,
 }
 
 #[derive(Debug, Args)]
@@ -201,7 +206,7 @@ pub(super) struct TargetArgs {
     /// Run on this machine's executor under your own limits; nothing is
     /// paid, granted or tracked.
     #[cfg(feature = "compute")]
-    #[arg(long, conflicts_with_all = ["access", "provider", "backend", "settle", "buy_again", "validators", "addresses", "acceptance_blocks", "terminal_blocks", "payment_blocks", "trust_store"])]
+    #[arg(long, conflicts_with_all = ["access", "provider", "backend", "settle", "buy_again", "validators", "addresses", "acceptance_blocks", "terminal_blocks", "payment_blocks", "require_apple_app_id", "require_apple_cdhash", "assurance"])]
     local: bool,
     #[cfg(feature = "compute")]
     #[command(flatten)]
@@ -221,8 +226,6 @@ pub struct FetchArgs {
     /// Pay the provider named by --provider its quoted price per job, at most MAX.
     #[arg(long, value_name = "MAX", requires = "provider", conflicts_with = "access", value_parser = clap::value_parser!(u64).range(1..))]
     pay: Option<u64>,
-    #[arg(long, default_value = "producer-signed", value_parser = ["producer-signed", "apple-app-attest"])]
-    assurance: String,
     #[arg(short = 'X', long, default_value = "GET")]
     method: String,
     #[arg(short = 'H', long = "header")]
@@ -262,7 +265,6 @@ impl ClientArgs {
 
     fn options_with_config(
         &self,
-        context: &Context,
         price: u64,
         assurance: Assurance,
         config: hellas_sdk::work_config::WorkConfig,
@@ -279,7 +281,7 @@ impl ClientArgs {
                 .chain(&self.addresses)
                 .copied()
                 .collect(),
-            apple_trust: self.trust(context, assurance)?,
+            apple_policy: self.apple_policy()?,
             assurance,
             expected_price: price,
             acceptance_blocks: self.acceptance_blocks,
@@ -289,22 +291,11 @@ impl ClientArgs {
         })
     }
 
-    fn trust(
-        &self,
-        context: &Context,
-        assurance: Assurance,
-    ) -> super::CliResult<Option<hellas_client::ProviderTrustAnchor>> {
-        match (&self.trust_store, &self.trust_policy, assurance) {
-            (Some(store), Some(policy), _) => Ok(Some(
-                hellas_sdk::trust_policy::TrustPolicyStore::new(store).resolve(
-                    policy,
-                    assurance,
-                    hellas_sdk::identity::assertion_counters(&context.home)?,
-                )?,
-            )),
-            (None, None, Assurance::ProducerSigned) => Ok(None),
-            _ => bail!("Apple providers require --trust-store and --trust-policy"),
-        }
+    fn apple_policy(&self) -> Result<ApplePolicy, AttestationError> {
+        ApplePolicy::from_requirements(
+            self.require_apple_app_id.as_deref(),
+            self.require_apple_cdhash.as_deref(),
+        )
     }
 }
 
@@ -383,8 +374,7 @@ impl ModelArgs {
                 let spec = self.target.access_spec(
                     file.clone(),
                     &self.client,
-                    context,
-                    Assurance::ProducerSigned,
+                    self.client.assurance.unwrap_or_default(),
                 )?;
                 let BackendState::Grant(grant) = context.target(spec).await?.state else {
                     unreachable!("access selects a grant")
@@ -466,7 +456,6 @@ impl TargetArgs {
         &self,
         file: PathBuf,
         client: &ClientArgs,
-        context: &Context,
         assurance: Assurance,
     ) -> super::CliResult<TargetSpec> {
         if let Some(provider) = &client.provider {
@@ -478,7 +467,8 @@ impl TargetArgs {
         Ok(TargetSpec::Access {
             file,
             provider: client.provider.as_ref().map(|p| p.address),
-            trust: client.trust(context, assurance)?.map(Box::new),
+            assurance,
+            apple_policy: client.apple_policy()?,
             resource: self.resource,
         })
     }
@@ -550,9 +540,8 @@ impl TargetArgs {
             });
         }
         let spec = match self.access {
-            Some(ref file) => self.access_spec(file.clone(), client, context, assurance)?,
+            Some(ref file) => self.access_spec(file.clone(), client, assurance)?,
             None => TargetSpec::Paid(Box::new(client.options_with_config(
-                context,
                 pay,
                 assurance,
                 client::config(client, context).await?,
@@ -615,7 +604,12 @@ async fn run_quoted(
     bounded(client.timeout, async |deadline| {
         let mut target = within(
             deadline,
-            target.resolve(client, context, pay.unwrap_or(0), Assurance::ProducerSigned),
+            target.resolve(
+                client,
+                context,
+                pay.unwrap_or(0),
+                client.assurance.unwrap_or_default(),
+            ),
         )
         .await?;
         let result = async {
@@ -660,10 +654,20 @@ async fn run_job(
     evidence: Option<&Path>,
     present: impl FnOnce(&Completed, &str) -> super::CliResult<()> + Send,
 ) -> super::CliResult<()> {
+    let mut effective = client.clone();
+    effective.require_apple_app_id = client
+        .require_apple_app_id
+        .clone()
+        .or_else(|| job.require_apple_app_id.clone());
+    effective.require_apple_cdhash = client
+        .require_apple_cdhash
+        .clone()
+        .or_else(|| job.require_apple_cdhash.clone());
+    let assurance = effective.assurance.unwrap_or_default().max(job.assurance());
     bounded(client.timeout, async |deadline| {
         let mut target = within(
             deadline,
-            target.resolve(client, context, job.price(), job.assurance()),
+            target.resolve(&effective, context, job.price(), assurance),
         )
         .await?;
         let result = execute(
@@ -775,7 +779,7 @@ fn present_job(
 pub async fn fetch(args: FetchArgs, context: &Context) -> super::CliResult<()> {
     let mut request = args.request()?;
     let contract = args.contract()?;
-    let assurance = args.assurance();
+    let assurance = args.client.assurance.unwrap_or_default();
     let target = args.target;
     bounded(args.client.timeout, async |deadline| {
         let mut target = within(
@@ -814,7 +818,7 @@ pub async fn fetch(args: FetchArgs, context: &Context) -> super::CliResult<()> {
                     .min(u64::from(hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES))
                     as u32;
             }
-            let job = Job::fetch(
+            let mut job = Job::fetch(
                 price,
                 contract.clone(),
                 service,
@@ -822,12 +826,14 @@ pub async fn fetch(args: FetchArgs, context: &Context) -> super::CliResult<()> {
                 serde_json::to_vec(&request)?,
                 assurance,
             )?;
+            job.require_apple_app_id = args.client.require_apple_app_id.clone();
+            job.require_apple_cdhash = args.client.require_apple_cdhash.clone();
             let directory = args.save_job.clone().unwrap_or_else(|| {
                 context
                     .chain
                     .client()
                     .join("jobs")
-                    .join(job.digest().to_string())
+                    .join(job.folder_digest().to_string())
             });
             job.save(&directory).await?;
             eprintln!("job: {}", directory.display());
@@ -878,13 +884,6 @@ impl FetchArgs {
         Ok(contract)
     }
 
-    fn assurance(&self) -> Assurance {
-        if self.assurance == "apple-app-attest" {
-            Assurance::AppleAppAttest
-        } else {
-            Assurance::ProducerSigned
-        }
-    }
     fn request(&self) -> super::CliResult<hellas_rpc::http_fetch::HttpFetchRequest> {
         use base64::{Engine as _, engine::general_purpose::STANDARD};
         use hellas_rpc::http_fetch::*;

@@ -186,7 +186,8 @@ pub enum TargetSpec {
     Access {
         file: PathBuf,
         provider: Option<hellas_client::ProviderAddress>,
-        trust: Option<Box<hellas_client::ProviderTrustAnchor>>,
+        assurance: Assurance,
+        apple_policy: hellas_client::ApplePolicy,
         resource: Option<ResourceId>,
     },
     Paid(Box<PaidWorkOptions>),
@@ -231,7 +232,8 @@ impl Home {
             TargetSpec::Access {
                 file,
                 provider,
-                trust,
+                assurance,
+                apple_policy,
                 resource,
             } => {
                 let principal = self.principal()?;
@@ -246,7 +248,8 @@ impl Home {
                     bundle,
                     resource,
                     provider,
-                    trust.map(|trust| *trust),
+                    assurance,
+                    apple_policy,
                     Arc::new(self.producer.clone()),
                     &self.home,
                     self.grant_endpoint().await?,
@@ -298,11 +301,13 @@ impl Home {
 }
 
 /// Resolve the same signed grant for an access file or an embedded gateway document.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn access_target(
     bundle: crate::access_bundle::AccessBundle,
     resource: Option<ResourceId>,
     expected: Option<hellas_client::ProviderAddress>,
-    trust: Option<hellas_client::ProviderTrustAnchor>,
+    assurance: Assurance,
+    apple_policy: hellas_client::ApplePolicy,
     signer: Arc<ProducerSigningKey>,
     home: &StoreLocation,
     endpoint: iroh::Endpoint,
@@ -331,11 +336,11 @@ pub(crate) fn access_target(
         expected.is_none_or(|expected| provider == expected),
         "offer does not match --provider"
     );
-    let trust = trust.unwrap_or(hellas_client::ProviderTrustAnchor {
-        expected_genesis: provider.enrollment,
-        required_assurance: Assurance::ProducerSigned,
-        apple_app_attest: None,
-    });
+    let trust = provider.trust(
+        assurance,
+        apple_policy,
+        crate::identity::assertion_counters(home),
+    );
     let target = UnpinnedOffer::decode(&offer.encode()?, UnixMillis(0))?.pin(&trust)?;
     Ok(Target::grant(
         policy.clone(),

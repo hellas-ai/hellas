@@ -18,11 +18,8 @@ The gateway serves local or pinned GGUF text and decision models, original
 Whisper, MMS, OmniVoice, Flux and Phonon checkpoints. It discovers the modality and API paths from the model.
 Append `@CONTACT` to a model path or pinned URI to use a remote Compute grant. A Fetch
 grant uses `NAME@CONTACT`, checked against the models in its signed offer.
-Import contacts and access with `hellas pair … --name CONTACT`. For an App
-Attest provider, independently approve its pins under the same contact name:
-`hellas trust --store "$HELLAS_HOME/trust" approve CONTACT --policy POLICY.json
---expected-revision 0 --reason REASON` (use `~/.hellas/trust` for the default
-home). The bundle cannot approve or replace those pins.
+Import contacts and access with `hellas pair … --name CONTACT`. The gateway
+verifies Apple providers against the built-in Gate app ID by default.
 
 ## Model sources
 
@@ -121,6 +118,11 @@ The TOML schema is the SDK's daemon document (`listeners`, `backends`, `routes`,
 `upstreams` and optional `paid_policy`. Models and upstreams are resolved into
 that document with the same logic as route/backend edits. Use a pinned Hub URI or a local model path. Multiple local model routes share a serialized executor for each
 evaluator, rather than running GPU jobs concurrently.
+
+For a remote Grant or Paid backend, set `assurance = "apple-app-attest"` to
+require a Secure Enclave provider. Set `require_apple_app_id` to an array of
+app IDs to replace the default, or `require_apple_cdhash` to an array of
+full CDHashes to restrict accepted builds. See [paid work](paid-gateway.md).
 
 `execution.queue_capacity`, `execution.session_programs` and
 `execution.session_asset_bytes` bound the local executor. Queue capacity may be

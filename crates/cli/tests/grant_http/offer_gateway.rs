@@ -515,12 +515,23 @@ async fn generic_fetch_through_a_grant_uses_the_provider_sealed_credential_witho
         "65536",
         "--access",
         string(&access),
+        "--require-apple-app-id",
+        "2F53L9ZR3N.ai.test",
     ];
     let mut caller_credential = arguments.clone();
     caller_credential.extend(["-H", "Authorization: Bearer caller-secret"]);
     let refused = host.client.output(&caller_credential).await;
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("invalid request headers"));
+    let mut attested = arguments.clone();
+    attested.extend(["--assurance", "apple-app-attest"]);
+    let refused = host.client.output(&attested).await;
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("Apple App Attest assurance requires a Secure Enclave provider root"),
+        "{stderr}"
+    );
     assert_eq!(host.https.calls.load(Ordering::SeqCst), 0);
     let result: Value = serde_json::from_str(&host.client.run(&arguments).await).unwrap();
     assert_eq!(result["choices"][0]["message"]["content"], "hello");

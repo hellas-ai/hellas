@@ -1,4 +1,5 @@
 //! The daemon's single configuration document. Runtime credentials are write-only.
+use hellas_attestation::{AppleAppId, AppleCdHash};
 use hellas_auth::authority::ResourceId;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, net::SocketAddr, num::NonZeroUsize, path::PathBuf};
@@ -102,8 +103,12 @@ pub enum BackendKind {
         resource: Option<ResourceId>,
         #[serde(default)]
         evaluator: Option<String>,
-        #[serde(default)]
-        trust: Option<Trust>,
+        #[serde(default, with = "crate::assurance_name::AssuranceName")]
+        assurance: hellas_rpc::Assurance,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        require_apple_app_id: Option<Vec<AppleAppId>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        require_apple_cdhash: Option<Vec<AppleCdHash>>,
     },
     Paid {
         provider: String,
@@ -122,8 +127,12 @@ pub enum BackendKind {
         max_price: u64,
         #[serde(default)]
         evaluator: Option<String>,
-        #[serde(default)]
-        trust: Option<Trust>,
+        #[serde(default, with = "crate::assurance_name::AssuranceName")]
+        assurance: hellas_rpc::Assurance,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        require_apple_app_id: Option<Vec<AppleAppId>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        require_apple_cdhash: Option<Vec<AppleCdHash>>,
     },
     Fetch {
         service: String,
@@ -131,13 +140,6 @@ pub enum BackendKind {
         upstream: Upstream,
     },
 }
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Trust {
-    pub store: PathBuf,
-    pub policy: String,
-}
-
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Upstream {

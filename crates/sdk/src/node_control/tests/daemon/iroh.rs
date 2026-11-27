@@ -201,7 +201,9 @@ async fn both_listeners_keep_admitted_backends_when_fetch_configuration_changes(
                     )),
                     resource: None,
                     evaluator: None,
-                    trust: None,
+                    assurance: Default::default(),
+                    require_apple_app_id: None,
+                    require_apple_cdhash: None,
                 },
             },
         );

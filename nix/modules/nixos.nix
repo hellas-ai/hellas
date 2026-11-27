@@ -80,9 +80,6 @@ let
     modelPaths settings
     ++ lib.filter (path: !(lib.hasPrefix "credential:" path)) (
       lib.mapAttrsToList (_: upstream: upstream.key_file) (settings.upstreams or { })
-    )
-    ++ lib.concatMap (backend: lib.optional (backend ? trust) backend.trust.store) (
-      lib.attrValues (settings.backends or { })
     );
   providerWritablePaths = lib.optional (outsideManagedRoots [ hellasLib.defaultStateDir ] cfg.home) (
     normalizeRuntimePath cfg.home

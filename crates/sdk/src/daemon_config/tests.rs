@@ -85,7 +85,9 @@ fn iroh_only_accepts_local_and_fetch_backends() {
             access: None,
             resource: None,
             evaluator: None,
-            trust: None,
+            assurance: Default::default(),
+            require_apple_app_id: None,
+            require_apple_cdhash: None,
         },
         BackendKind::Paid {
             addresses: vec![],
@@ -97,7 +99,9 @@ fn iroh_only_accepts_local_and_fetch_backends() {
             provider: "provider".into(),
             max_price: 1,
             evaluator: None,
-            trust: None,
+            assurance: Default::default(),
+            require_apple_app_id: None,
+            require_apple_cdhash: None,
         },
     ] {
         document.backends.insert("remote".into(), backend(kind));
@@ -195,7 +199,9 @@ fn keys_are_inputs_and_only_omitted_keys_in_existing_entries_are_retained() {
                 access: Some("private-grant-credential".into()),
                 resource: None,
                 evaluator: None,
-                trust: None,
+                assurance: Default::default(),
+                require_apple_app_id: None,
+                require_apple_cdhash: None,
             },
         },
     );

@@ -1,4 +1,5 @@
 use super::*;
+use hellas_attestation::apple_app_id_hash;
 #[path = "../../../attestation/tests/fixtures/apple.rs"]
 mod device;
 use hellas_auth::authority::{GrantId, Revision, UnixMillis};
@@ -14,6 +15,7 @@ use serde::Serialize;
 use serde_bytes::ByteBuf;
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
+const SPIKE_APP_ID: &str = "2F53L9ZR3N.ai.hellas.app-attest-spike";
 const ALPN: &[u8] = b"/hellas.work.v1.Work/2.0";
 const ENROLLED_PEER: PeerIdentity = PeerIdentity([3; 32]);
 const OTHER_PEER: PeerIdentity = PeerIdentity([7; 32]);
@@ -53,11 +55,12 @@ fn signed_open_response(
     );
     let signature = producer.sign_digest(binding).unwrap();
     (
-        ProviderTrustAnchor {
+        ProviderTrustAnchor::new(
             expected_genesis,
-            required_assurance: Assurance::ProducerSigned,
-            apple_app_attest: None,
-        },
+            Assurance::ProducerSigned,
+            ApplePolicy::default(),
+            Arc::new(TestCounterStore::default()),
+        ),
         OpenResponse {
             provider_genesis,
             proof: Some(open_response::Proof::ProducerSignature(signature_to_pb(
@@ -174,7 +177,7 @@ fn apple_open_response(
     let genesis = SignedProviderGenesis {
         root_proof: RootProof::AppleAppAttest(apple_assertion(
             &signing_key,
-            apple_app_id_hash("TESTTEAM.example.app"),
+            apple_app_id_hash("TESTTEAM00.example.app"),
             cd_hash,
             1,
             &hellas_attestation::apple_client_data_hash(&statement.canonical_bytes()),
@@ -194,23 +197,29 @@ fn apple_open_response(
         expected_genesis,
         ALPN,
     );
-    let apple = AppleAppAttestTrust::new("TESTTEAM.example.app", vec![cd_hash], counter_store);
-    *apple.credential.lock().unwrap() = Some(RegisteredAppleCredential {
+    let trust = ProviderTrustAnchor::new(
+        expected_genesis,
+        Assurance::AppleAppAttest,
+        ApplePolicy::new(
+            ["TESTTEAM00.example.app".parse().unwrap()].into(),
+            Some([cd_hash.into()].into()),
+        )
+        .unwrap(),
+        counter_store,
+    );
+    *trust.credential.lock().unwrap() = Some(RegisteredAppleCredential {
         id: credential_id,
+        rp_id_hash: apple_app_id_hash("TESTTEAM00.example.app"),
         public_key,
     });
     (
-        ProviderTrustAnchor {
-            expected_genesis,
-            required_assurance: Assurance::AppleAppAttest,
-            apple_app_attest: Some(apple),
-        },
+        trust,
         OpenResponse {
             provider_genesis,
             proof: Some(open_response::Proof::AppleAppAttestAssertion(
                 apple_assertion(
                     &signing_key,
-                    apple_app_id_hash("TESTTEAM.example.app"),
+                    apple_app_id_hash("TESTTEAM00.example.app"),
                     cd_hash,
                     counter,
                     binding.as_bytes(),
@@ -249,7 +258,11 @@ fn addressed_software_provider_requires_its_enrollment_and_a_valid_open_from_its
     let nonce = [6; 32];
     let (_, response) = signed_open_response(&exporter, &nonce);
     let address = address_of(&response);
-    let trust = address.trust(Assurance::ProducerSigned, None).unwrap();
+    let trust = address.trust(
+        Assurance::ProducerSigned,
+        ApplePolicy::default(),
+        Arc::new(TestCounterStore::default()),
+    );
     verify_open_response(
         &trust,
         &exporter,
@@ -286,7 +299,11 @@ fn addressed_software_provider_requires_its_enrollment_and_a_valid_open_from_its
         ..address
     };
     let error = verify_open_response(
-        &other.trust(Assurance::ProducerSigned, None).unwrap(),
+        &other.trust(
+            Assurance::ProducerSigned,
+            ApplePolicy::default(),
+            Arc::new(TestCounterStore::default()),
+        ),
         &exporter,
         &nonce,
         ALPN,
@@ -298,7 +315,6 @@ fn addressed_software_provider_requires_its_enrollment_and_a_valid_open_from_its
         error.to_string().contains("genesis pin mismatch"),
         "{error}"
     );
-    assert!(address.trust(Assurance::AppleAppAttest, None).is_err());
 }
 
 fn recorded_bytes(hex: &str) -> [u8; 32] {
@@ -312,31 +328,12 @@ fn assert_attestation_error(error: ClientError, expected: hellas_attestation::At
     assert_eq!(source.downcast_ref(), Some(&expected));
 }
 
-#[test]
-fn recorded_apple_open_needs_app_and_cdhash_approval_and_its_connection() {
-    let bundle = device::enrollment();
+fn recorded_open() -> (PeerIdentity, OpenResponse, [u8; 32], [u8; 32]) {
     let peer = PeerIdentity(recorded_bytes(
         "c19b5b4a27162ec685aeb6b715d4436827b8b01fe8ebecb3e9f38e7a0b247452",
     ));
-    let address = ProviderAddress {
-        enrollment: "b714c1ab606aa40d01de47e47eb3d4d7d54c7283d02beac9d3e1d8e17e433f39"
-            .parse()
-            .unwrap(),
-        node: ::iroh::EndpointId::from_bytes(&peer.0).unwrap(),
-    };
-    let cd_hash =
-        recorded_bytes("320cb97347ecf28369401a21ba85553008c8d8009ae6f3bffa159a0dede1eab6");
-    let trust = ProviderTrustAnchor {
-        expected_genesis: address.enrollment,
-        required_assurance: Assurance::AppleAppAttest,
-        apple_app_attest: Some(AppleAppAttestTrust::new(
-            "2F53L9ZR3N.ai.hellas.app-attest-spike",
-            vec![cd_hash],
-            Arc::new(TestCounterStore::default()),
-        )),
-    };
     let response = OpenResponse {
-        provider_genesis: bundle.canonical_bytes(),
+        provider_genesis: device::enrollment().canonical_bytes(),
         proof: Some(open_response::Proof::AppleAppAttestAssertion(
             include_bytes!("../../../attestation/tests/fixtures/apple-open.cbor").to_vec(),
         )),
@@ -344,36 +341,55 @@ fn recorded_apple_open_needs_app_and_cdhash_approval_and_its_connection() {
     let exporter =
         recorded_bytes("df4676398cad6e7e1f620ce4f15959fc1015d7c1a384d2f1f766b0ef670e96be");
     let nonce = recorded_bytes("3884ecd401c63ea961c1254d8baf27cfde2b086ab85ca86c07ef3b29cf969466");
+    (peer, response, exporter, nonce)
+}
+
+fn recorded_trust(policy: ApplePolicy, counters: Arc<TestCounterStore>) -> ProviderTrustAnchor {
+    let address = "b714c1ab606aa40d01de47e47eb3d4d7d54c7283d02beac9d3e1d8e17e433f39@c19b5b4a27162ec685aeb6b715d4436827b8b01fe8ebecb3e9f38e7a0b247452".parse::<ProviderAddress>().unwrap();
+    address.trust(Assurance::ProducerSigned, policy, counters)
+}
+
+#[test]
+fn default_policy_rejects_the_recorded_spike_app() {
+    let trust = recorded_trust(ApplePolicy::default(), Arc::default());
+    assert_attestation_error(
+        trust.verify_enrollment(&device::enrollment()).unwrap_err(),
+        hellas_attestation::AttestationError::Credential,
+    );
+}
+
+#[test]
+fn different_cdhash_rejects_recorded_open_before_counter_advances() {
+    let counters = Arc::new(TestCounterStore::default());
+    let policy = ApplePolicy::new(
+        [SPIKE_APP_ID.parse().unwrap()].into(),
+        Some([[0; 32].into()].into()),
+    )
+    .unwrap();
+    let trust = recorded_trust(policy, counters.clone());
+    let (peer, response, exporter, nonce) = recorded_open();
+    assert_attestation_error(
+        verify_open_response(&trust, &exporter, &nonce, ALPN, peer, response).unwrap_err(),
+        hellas_attestation::AttestationError::Credential,
+    );
+    assert!(counters.counters.lock().unwrap().is_empty());
+}
+
+#[test]
+fn recorded_cdhash_accepts_the_connection_bound_open() {
+    let (peer, response, exporter, nonce) = recorded_open();
+    let bundle = device::enrollment();
+    let cd_hash =
+        recorded_bytes("320cb97347ecf28369401a21ba85553008c8d8009ae6f3bffa159a0dede1eab6");
+    let policy = ApplePolicy::new(
+        [SPIKE_APP_ID.parse().unwrap()].into(),
+        Some([cd_hash.into()].into()),
+    )
+    .unwrap();
+    let approved = recorded_trust(policy, Arc::default());
     let open = |trust: &ProviderTrustAnchor| {
         verify_open_response(trust, &exporter, &nonce, ALPN, peer, response.clone())
     };
-    assert!(address.trust(Assurance::AppleAppAttest, None).is_err());
-    assert!(open(&address.trust(Assurance::ProducerSigned, None).unwrap()).is_err());
-    for wrong_app in [true, false] {
-        let mut bad = trust.clone();
-        let apple = bad.apple_app_attest.as_mut().unwrap();
-        if wrong_app {
-            apple.app_id = "OTHER.app".into();
-        } else {
-            apple.allowed_cd_hashes = vec![[0; 32]];
-        }
-        let bad = address
-            .trust(Assurance::AppleAppAttest, Some(&bad))
-            .unwrap();
-        assert!(open(&bad).is_err());
-    }
-    let elsewhere = ProviderAddress {
-        enrollment: ContentId::from_bytes([9; 32]),
-        ..address
-    };
-    assert!(
-        elsewhere
-            .trust(Assurance::AppleAppAttest, Some(&trust))
-            .is_err()
-    );
-    let approved = address
-        .trust(Assurance::AppleAppAttest, Some(&trust))
-        .unwrap();
     // Before the accepted Open, so a broken binding cannot hide behind the counter.
     for (exporter, nonce, alpn) in [
         ([0; 32], nonce, ALPN),
@@ -428,7 +444,11 @@ fn apple_enrollment_is_registered_once_per_trust_anchor() {
         panic!("expected App Attest enrollment");
     };
     let counters = Arc::new(TestCounterStore::default());
-    let apple = AppleAppAttestTrust::new("2F53L9ZR3N.ai.hellas.app-attest-spike", vec![], counters);
+    let apple = ProviderAddress::of(&device::enrollment()).unwrap().trust(
+        Assurance::AppleAppAttest,
+        ApplePolicy::new([SPIKE_APP_ID.parse().unwrap()].into(), None).unwrap(),
+        counters,
+    );
 
     let first = apple.registered_credential(&enrollment).unwrap();
     let second = apple
@@ -495,8 +515,9 @@ fn apple_offer_pin_verifies_static_root_policy_then_open_and_result() {
     use hellas_authority::model::grant::{records::*, *};
     use std::num::NonZeroU64;
     let counters = Arc::new(TestCounterStore::default());
-    let (trust, response, public_key) =
+    let (mut trust, response, public_key) =
         apple_open_response(&[5; 32], &[6; 32], 2, counters.clone());
+    trust.required_assurance = Assurance::ProducerSigned;
     let bundle =
         ProviderEnrollmentBundle::from_canonical_bytes(&response.provider_genesis).unwrap();
     assert!(
@@ -557,16 +578,6 @@ fn apple_offer_pin_verifies_static_root_policy_then_open_and_result() {
         counters.counters.lock().unwrap().is_empty(),
         "static enrollment is reusable"
     );
-    for wrong_app in [true, false] {
-        let mut bad = trust.clone();
-        let apple = bad.apple_app_attest.as_mut().unwrap();
-        if wrong_app {
-            apple.app_id = "OTHER.app".into();
-        } else {
-            apple.allowed_cd_hashes = vec![[0; 32]];
-        }
-        assert!(import().pin(&bad).is_err());
-    }
     let verified = verify_open_response(
         pinned.trust(),
         &[5; 32],

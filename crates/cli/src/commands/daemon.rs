@@ -171,17 +171,6 @@ impl ModelContext {
                 .context("a grant requires the contact's principal key")?,
             &self.holder,
         )?;
-        let trust = bundle
-            .offers
-            .first()
-            .filter(|offer| {
-                offer.offer().provider.genesis.statement.root_kind
-                    == hellas_rpc::RootKind::SecureEnclave
-            })
-            .map(|_| hellas_sdk::daemon_config::Trust {
-                store: self.home.join("trust"),
-                policy: destination.into(),
-            });
         let package = model_package(&pinned)?;
         let policies = || {
             bundle
@@ -236,14 +225,7 @@ impl ModelContext {
         let (policy, evaluator) = matches.pop().unwrap();
         let access =
             base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bundle.encode()?);
-        let id = grant_backend(
-            document,
-            destination,
-            policy.resource,
-            access,
-            evaluator,
-            trust,
-        );
+        let id = grant_backend(document, destination, policy.resource, access, evaluator);
         if let Some(package) = package {
             document
                 .add_route(package_route(package, &id, &self.voices).await?)
@@ -273,15 +255,24 @@ fn grant_backend(
     resource: hellas_auth::authority::ResourceId,
     access: String,
     evaluator: Option<String>,
-    trust: Option<hellas_sdk::daemon_config::Trust>,
 ) -> String {
     let id = grant_backend_id(destination, resource);
-    let max_in_flight = document
-        .backends
-        .get(&id)
+    let previous = document.backends.remove(&id);
+    let max_in_flight = previous
+        .as_ref()
         .map_or(std::num::NonZeroUsize::new(8).unwrap(), |backend| {
             backend.max_in_flight
         });
+    let (assurance, require_apple_app_id, require_apple_cdhash) =
+        match previous.map(|backend| backend.kind) {
+            Some(BackendKind::Grant {
+                assurance,
+                require_apple_app_id,
+                require_apple_cdhash,
+                ..
+            }) => (assurance, require_apple_app_id, require_apple_cdhash),
+            _ => Default::default(),
+        };
     document.backends.insert(
         id.clone(),
         Backend {
@@ -290,7 +281,9 @@ fn grant_backend(
                 access: Some(access),
                 resource: Some(resource),
                 evaluator,
-                trust,
+                assurance,
+                require_apple_app_id,
+                require_apple_cdhash,
             },
         },
     );
@@ -1229,26 +1222,12 @@ mod tests {
         let resource = hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"model"));
         let mut document = Document::default();
         let contact = "a".repeat(64);
-        let id = grant_backend(
-            &mut document,
-            &contact,
-            resource,
-            "first".into(),
-            None,
-            None,
-        );
+        let id = grant_backend(&mut document, &contact, resource, "first".into(), None);
         validate_name(&id).unwrap();
         document.backends.get_mut(&id).unwrap().max_in_flight =
             std::num::NonZeroUsize::new(3).unwrap();
         assert_eq!(
-            grant_backend(
-                &mut document,
-                &contact,
-                resource,
-                "repaired".into(),
-                None,
-                None
-            ),
+            grant_backend(&mut document, &contact, resource, "repaired".into(), None),
             id
         );
         assert_eq!(document.backends[&id].max_in_flight.get(), 3);
@@ -1257,7 +1236,7 @@ mod tests {
         );
         let other = format!("{}b", &contact[..63]);
         assert_ne!(
-            grant_backend(&mut document, &other, resource, "other".into(), None, None),
+            grant_backend(&mut document, &other, resource, "other".into(), None),
             id
         );
     }
@@ -1273,7 +1252,6 @@ mod tests {
             &contact,
             hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"model")),
             "access".into(),
-            None,
             None,
         );
         document.routes.push(Route {

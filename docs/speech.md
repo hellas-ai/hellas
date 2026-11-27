@@ -95,8 +95,8 @@ Choose execution placement with each route's `backends` list. The example uses
 remote paid providers. A native target can also use a local Compute backend or a
 remote grant backend. A hosted target can use a local `kind = "fetch"` backend
 with the same service, method and upstream policy, or a remote grant backend.
-Use the backend's `trust` settings for remote Apple App Attest. Native speech also
-requires a provider that supports the package's evaluator.
+Remote Apple providers must match the [backend's Apple policy](http-gateway.md#shared-toml-configuration).
+Native speech requires a provider that supports the package's evaluator.
 
 ```toml
 [listeners.api]

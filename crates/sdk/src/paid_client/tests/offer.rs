@@ -48,11 +48,7 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
             imported.offer().proposal.bond_edge(),
             fixture.descriptor.bond_edge()
         );
-        let trust = hellas_client::ProviderTrustAnchor {
-            expected_genesis: imported.offer().provider.content_id(),
-            required_assurance: Assurance::ProducerSigned,
-            apple_app_attest: None,
-        };
+        let trust = hellas_client::ProviderTrustAnchor::new(imported.offer().provider.content_id(), Assurance::ProducerSigned, Default::default(), crate::identity::assertion_counters(fixture.root.path()));
         trust.verify_enrollment(&imported.offer().provider).unwrap();
         let backend = super::recovery::Backend::default();
         let backend_calls = backend.0.clone();
@@ -205,13 +201,13 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
             .observe_ready(fixture.ready.clone())
             .await
             .unwrap();
-        let mut session = PaidWorkSession {
+        let mut session = PaidWorkSession { provider_assurance: Assurance::ProducerSigned,
             args: PaidWorkOptions {
                 content,
                 config: fixture.config.clone(),
                 provider: crate::test_support::address(server.id()),
                 provider_addrs: server.bound_sockets(),
-                apple_trust: None,
+                apple_policy: Default::default(),
                 assurance: Assurance::ProducerSigned,
                 expected_price: crate::test_support::PRICE,
                 acceptance_blocks: 49,
@@ -250,7 +246,7 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
         args.content = store.content_store();
         let client = ClientService::new(ClientEndpoint::recover(store, signer(1)).unwrap());
         client.observer().observe_ready(fixture.ready.clone()).await.unwrap();
-        let mut session = PaidWorkSession { args, descriptor, policy, dialer, client, observer: None, needs_recovery: true };
+        let mut session = PaidWorkSession { provider_assurance: Assurance::ProducerSigned, args, descriptor, policy, dialer, client, observer: None, needs_recovery: true };
         let job = crate::job::Job::fetch(crate::test_support::PRICE, hellas_channel::test_support::test_responses_contract(), "openai".into(), "responses".into(), crate::test_support::BODY.to_vec(), Assurance::ProducerSigned).unwrap();
         // The acceptance is reported once, before any output, and names the
         // work and the provider whose transcript the result carries.

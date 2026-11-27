@@ -93,11 +93,12 @@ async fn paid_concurrency(cancel: bool) {
             .unwrap();
         let mount = crate::work_router::WorkRouter::payment(mount);
         let (bundle, producer) = enrollment(server.id());
-        let trust = hellas_client::ProviderTrustAnchor {
-            expected_genesis: bundle.content_id(),
-            required_assurance: Assurance::ProducerSigned,
-            apple_app_attest: None,
-        };
+        let trust = hellas_client::ProviderTrustAnchor::new(
+            bundle.content_id(),
+            Assurance::ProducerSigned,
+            Default::default(),
+            crate::identity::assertion_counters(fixture.root.path()),
+        );
         let serving = tokio::spawn({
             let server = server.clone();
             async move {
@@ -133,12 +134,13 @@ async fn paid_concurrency(cancel: bool) {
             .unwrap()
             .content_store();
         let session = Arc::new(Mutex::new(PaidWorkSession {
+            provider_assurance: Assurance::ProducerSigned,
             args: PaidWorkOptions {
                 content,
                 config: fixture.config.clone(),
                 provider: crate::test_support::address(server.id()),
                 provider_addrs: server.bound_sockets(),
-                apple_trust: None,
+                apple_policy: Default::default(),
                 assurance: Assurance::ProducerSigned,
                 expected_price: PRICE,
                 acceptance_blocks: 49,
@@ -467,7 +469,7 @@ pub(crate) async fn cached_paid_backend() -> (
         config,
         provider: crate::test_support::address(endpoint.id()),
         provider_addrs: vec![],
-        apple_trust: None,
+        apple_policy: Default::default(),
         assurance: Assurance::ProducerSigned,
         expected_price: PRICE,
         acceptance_blocks: 49,
@@ -495,11 +497,12 @@ pub(crate) async fn cached_paid_backend() -> (
     };
     let cached = paid.session.clone();
     *cached.lock().await = Some(PaidWorkSession {
+        provider_assurance: Assurance::ProducerSigned,
         dialer: Arc::new(ProviderDialer::new(
             endpoint.id(),
             vec![],
             endpoint.clone(),
-            options.trust().unwrap(),
+            options.trust(),
         )),
         args: options,
         descriptor: fixture.descriptor.clone(),

@@ -97,13 +97,7 @@ async fn paid_deadline_options_reach_the_signed_job_configuration() {
             .await
             .unwrap();
         let options = args
-            .options_with_config(
-                &context,
-                20,
-                Assurance::ProducerSigned,
-                config,
-                content.clone(),
-            )
+            .options_with_config(20, Assurance::ProducerSigned, config, content.clone())
             .unwrap();
         assert_eq!(
             (

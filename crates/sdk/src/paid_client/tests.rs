@@ -203,7 +203,7 @@ async fn insufficient_quoted_collateral_is_rejected_before_a_bond_request_or_jou
         provider,
         provider_addrs: vec![],
         assurance: Assurance::ProducerSigned,
-        apple_trust: None,
+        apple_policy: Default::default(),
         expected_price: policy.payment_policy.fixed_price,
         acceptance_blocks: 300,
         terminal_blocks: 3000,
@@ -303,11 +303,12 @@ async fn both_paid_connections_open_before_disclosure_and_refuse_wrong_assurance
             .await
             .unwrap();
         let (bundle, key) = enrollment(server.id());
-        let trust = hellas_client::ProviderTrustAnchor {
-            expected_genesis: bundle.content_id(),
-            required_assurance: Assurance::ProducerSigned,
-            apple_app_attest: None,
-        };
+        let trust = hellas_client::ProviderTrustAnchor::new(
+            bundle.content_id(),
+            Assurance::ProducerSigned,
+            Default::default(),
+            std::sync::Arc::new(crate::test_support::SoftwareOnly),
+        );
         let addresses = server.bound_sockets();
         let serving = server.clone();
         let (done, completed) = tokio::sync::oneshot::channel();
@@ -474,32 +475,24 @@ fn fetch_request(assurance: Assurance) -> (ProviderChannelPolicy, PreparedInvoca
 fn fetch_preflight_requires_matching_trust_caller_and_ephemeral_retention() {
     use hellas_rpc::Retention;
     let (policy, prepared, caller) = fetch_request(Assurance::AppleAppAttest);
-    let mut trust = hellas_client::ProviderTrustAnchor {
-        expected_genesis: hellas_rpc::ContentId::from_bytes([8; 32]),
-        required_assurance: Assurance::ProducerSigned,
-        apple_app_attest: None,
-    };
     assert!(
-        check_request(&policy, &prepared, &trust, caller)
+        check_request(&policy, &prepared, Assurance::ProducerSigned, caller)
             .unwrap_err()
             .to_string()
-            .contains("assurance differs")
+            .contains("requires stronger assurance")
     );
-    trust.required_assurance = Assurance::AppleAppAttest;
-    // Preflight checks the anchor selection; the live Open validates its proof.
-    check_request(&policy, &prepared, &trust, caller).unwrap();
+    check_request(&policy, &prepared, Assurance::AppleAppAttest, caller).unwrap();
     let other = ProducerSigningKey::from_secret_bytes([9; 32])
         .unwrap()
         .public_key();
     assert!(
-        check_request(&policy, &prepared, &trust, other)
+        check_request(&policy, &prepared, Assurance::AppleAppAttest, other)
             .unwrap_err()
             .to_string()
             .contains("differs from its invocation")
     );
     let (policy, prepared, caller) = fetch_request(Assurance::ProducerSigned);
-    trust.required_assurance = Assurance::ProducerSigned;
-    check_request(&policy, &prepared, &trust, caller).unwrap();
+    check_request(&policy, &prepared, Assurance::AppleAppAttest, caller).unwrap();
     assert_eq!(prepared.request.assurance, Assurance::ProducerSigned);
     assert!(
         hellas_rpc::protocol::invocation::fetch::prepare(
@@ -707,7 +700,7 @@ async fn gateway_keeps_the_quote_used_for_rendering_until_session_open() {
         provider: address,
         provider_addrs: server.bound_sockets().to_vec(),
         assurance: Assurance::ProducerSigned,
-        apple_trust: None,
+        apple_policy: Default::default(),
         expected_price: policy.payment_policy.fixed_price,
         acceptance_blocks: 300,
         terminal_blocks: 3000,

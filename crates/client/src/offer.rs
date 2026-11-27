@@ -16,17 +16,7 @@ impl UnpinnedOffer {
             .map_err(|e| ClientError::source("invalid Offer", e))
     }
     pub fn pin(self, trust: &ProviderTrustAnchor) -> ClientResult<PinnedOffer> {
-        let provider = &self.0.offer().provider;
-        let assurance = match provider.genesis.statement.root_kind {
-            hellas_rpc::RootKind::Software => hellas_rpc::Assurance::ProducerSigned,
-            hellas_rpc::RootKind::SecureEnclave => hellas_rpc::Assurance::AppleAppAttest,
-        };
-        if trust.required_assurance != assurance {
-            return Err(ClientError::protocol(
-                "grant assurance differs from the provider root",
-            ));
-        }
-        trust.verify_enrollment(provider)?;
+        trust.verify_enrollment(&self.0.offer().provider)?;
         Ok(PinnedOffer {
             signed: self.0,
             trust: trust.clone(),

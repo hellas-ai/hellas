@@ -505,30 +505,22 @@ impl Core {
         document.validate().map_err(Error::from)?;
         let old = self.snapshot.load_full();
         let mut reuse = BTreeSet::new();
-        let counters = Arc::new(
-            crate::counter_store::FilesystemAssertionCounterStore::in_home(
-                &self.runtime.options.home,
-            ),
-        );
         for (id, backend) in &document.backends {
             if entries.contains_key(id) {
                 continue;
             }
             let unchanged = old.document.backends.get(id) == Some(backend);
-            let approved = match old.work.backend(id) {
-                Some(active) if unchanged => self
-                    .runtime
-                    .approval_current(&backend.kind, active)
-                    .unwrap_or(false),
-                _ => false,
-            };
-            if unchanged && approved {
+            if unchanged
+                && old.work.backend(id).is_some_and(|backend| {
+                    !matches!(backend.state, crate::BackendState::Unavailable(_))
+                })
+            {
                 reuse.insert(id.clone());
             } else {
                 entries.insert(
                     id.clone(),
                     self.runtime
-                        .open_backend(backend, &document.execution, counters.clone())
+                        .open_backend(backend, &document.execution)
                         .await
                         .unwrap_or_else(|error| {
                             runtime::PreparedBackend::unavailable(

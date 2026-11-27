@@ -197,10 +197,13 @@ pub async fn retained_settlement_channels(
             continue;
         }
         checked_descriptor(&setup, entry.bond_edge, owner, delegate)?;
-        let assurance = match signed.offer().provider.genesis.statement.root_kind {
-            hellas_rpc::RootKind::SecureEnclave => hellas_rpc::Assurance::AppleAppAttest,
-            _ => hellas_rpc::Assurance::ProducerSigned,
-        };
+        let assurance = signed
+            .offer()
+            .provider
+            .genesis
+            .statement
+            .root_kind
+            .assurance();
         channels.push(RetainedSettlementChannel {
             bond: entry.bond_edge,
             price: signed.offer().policy.payment_policy.fixed_price,
@@ -417,7 +420,7 @@ async fn open_settlement(
         .offer()
         .ok_or(PaidClientError::MissingState("settlement signed offer"))?;
     signed.check()?;
-    args.trust()?.verify_enrollment(&signed.offer().provider)?;
+    args.trust().verify_enrollment(&signed.offer().provider)?;
     if hellas_client::ProviderAddress::of(&signed.offer().provider)? != args.provider {
         return Err(PaidClientError::RetainedEnrollment(args.provider));
     }

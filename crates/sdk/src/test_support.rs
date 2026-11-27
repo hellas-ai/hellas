@@ -593,3 +593,11 @@ pub(crate) fn open_gpu(
         hellas_executor::GpuDialect::Cuda => Err("no CUDA device".into()),
     }
 }
+
+/// Software-provider fixtures never issue an App Attest assertion.
+pub(crate) struct SoftwareOnly;
+impl hellas_attestation::AssertionCounterStore for SoftwareOnly {
+    fn advance(&self, _: &[u8; 33], _: u32) -> Result<(), hellas_attestation::AttestationError> {
+        unreachable!("software provider issued an App Attest assertion")
+    }
+}

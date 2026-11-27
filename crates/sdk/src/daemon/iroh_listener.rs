@@ -83,10 +83,7 @@ impl Bound {
         };
         let backend = IrohBackend {
             core: Arc::downgrade(core),
-            assurance: match open.enrollment().genesis.statement.root_kind {
-                hellas_rpc::RootKind::Software => hellas_rpc::Assurance::ProducerSigned,
-                hellas_rpc::RootKind::SecureEnclave => hellas_rpc::Assurance::AppleAppAttest,
-            },
+            assurance: open.enrollment().genesis.statement.root_kind.assurance(),
         };
         let prepare = async {
             let grants = GrantService::from_node(

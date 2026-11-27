@@ -72,6 +72,7 @@ hellas-presentation = { workspace = true }
 hellas-private.workspace = true
 hellas-providers.workspace = true
 hellas-rpc = { workspace = true, default-features = false, features = [
+    "clap",
     "all-protocols",
     "work",
     "host-control",

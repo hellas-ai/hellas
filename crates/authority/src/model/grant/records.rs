@@ -64,11 +64,10 @@ pub fn encode_contact_card(card: &ContactCard) -> Result<Vec<u8>, GrantError> {
 pub fn decode_contact_card(bytes: &[u8]) -> Result<ContactCard, GrantError> {
     decode_canonical_bounded(bytes, MAX_CONTACT_CARD_BYTES).map_err(|_| GrantError::Malformed)
 }
-/// A node binding its own provider has no independent pins, so an App Attest
-/// credential is registered against its own RP-ID hash and CDHash at the
-/// enrollment's validation time. Requesters still pin both before trusting it.
+/// Check the provider's enrollment for internal consistency. Each consumer
+/// applies its own app and build requirements when connecting to the provider.
 pub fn verify_provider(provider: &ProviderEnrollmentBundle) -> Result<(), GrantError> {
-    use hellas_attestation::{AnchorTime, AppleCredential, ApplePolicy};
+    use hellas_attestation::{AnchorTime, AppleCredential};
     let PlatformEnrollment::AppleAppAttest(enrollment) = &provider.platform else {
         return verify_software_enrollment(provider);
     };
@@ -80,20 +79,16 @@ pub fn verify_provider(provider: &ProviderEnrollmentBundle) -> Result<(), GrantE
             attestation: enrollment.attestation_object.clone(),
             client_data_hash: enrollment.client_data_hash,
         },
-        identity.rp_id_hash,
         hellas_attestation::apple_app_attest_root_ca(),
         AnchorTime(enrollment.validation_time),
     )
     .map_err(|_| GrantError::Signature)?;
-    hellas_attestation::verify_apple_provider_genesis(
-        &provider.genesis,
-        &credential,
-        &ApplePolicy {
-            expected_rp_id_hash: identity.rp_id_hash,
-            allowed_cd_hashes: vec![identity.cd_hash],
-        },
-    )
-    .map_err(|_| GrantError::Signature)
+    let claims = hellas_attestation::verify_apple_provider_genesis(&provider.genesis, &credential)
+        .map_err(|_| GrantError::Signature)?;
+    if claims.cd_hash != identity.cd_hash {
+        return Err(GrantError::Signature);
+    }
+    Ok(())
 }
 
 /// Whether a resource revision preserves work already admitted under its old terms.

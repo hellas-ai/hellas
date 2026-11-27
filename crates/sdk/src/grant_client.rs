@@ -124,7 +124,7 @@ pub enum GrantProtocolError {
     AcceptanceIdentity,
     #[error("missing acceptance outcome")]
     AcceptanceOutcome,
-    #[error("input assurance differs from the pinned provider policy")]
+    #[error("input requires stronger assurance than the provider supplies")]
     Assurance,
     #[error("result frame exceeds signed bound")]
     FrameBound,
@@ -664,16 +664,10 @@ impl GrantSession {
     pub(crate) fn reusable_with(&self, options: &GrantSessionOptions) -> bool {
         let old = self.options.target.trust();
         let next = options.target.trust();
-        let apple = |trust: &ProviderTrustAnchor| {
-            trust
-                .apple_app_attest
-                .as_ref()
-                .map(|apple| (apple.app_id.clone(), apple.allowed_cd_hashes.clone()))
-        };
         let application = &self.options.application;
         old.expected_genesis == next.expected_genesis
             && old.required_assurance == next.required_assurance
-            && apple(old) == apple(next)
+            && old.policy() == next.policy()
             && application.authority == options.application.authority
             && application.authorization == options.application.authorization
             && application.credential.id() == options.application.credential.id()
@@ -1007,7 +1001,14 @@ impl GrantSession {
     }
 
     pub(crate) fn assurance(&self) -> hellas_rpc::Assurance {
-        self.options.target.trust().required_assurance
+        self.options
+            .target
+            .offer()
+            .provider
+            .genesis
+            .statement
+            .root_kind
+            .assurance()
     }
 
     pub(crate) fn execution_signer(&self) -> &ProducerSigningKey {
@@ -1117,7 +1118,7 @@ impl GrantSession {
         if self.store.book().pending_proposal().is_some() {
             return Err(GrantClientError::RecoveryRequired);
         }
-        if input.request.assurance != self.options.target.trust().required_assurance {
+        if input.request.assurance > self.assurance() {
             return Err(GrantProtocolError::Assurance.into());
         }
         let channel = self.store.channel().id;

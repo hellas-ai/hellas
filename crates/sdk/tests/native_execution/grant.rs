@@ -80,11 +80,12 @@ async fn granted_compute_executes_through_the_native_facade() {
     .unwrap();
     let target = UnpinnedOffer::decode(&offer.encode().unwrap(), now)
         .unwrap()
-        .pin(&ProviderTrustAnchor {
-            expected_genesis: provider.content_id(),
-            required_assurance: Assurance::ProducerSigned,
-            apple_app_attest: None,
-        })
+        .pin(&ProviderTrustAnchor::new(
+            provider.content_id(),
+            Assurance::ProducerSigned,
+            Default::default(),
+            hellas_sdk::identity::assertion_counters(root.path()),
+        ))
         .unwrap();
     let location = StoreLocation::for_test(&root.path().join("client"));
     let options = GrantSessionOptions {
@@ -219,11 +220,12 @@ async fn local_grant_session_executes_without_http() {
     .unwrap();
     let target = UnpinnedOffer::decode(&offer.encode().unwrap(), now)
         .unwrap()
-        .pin(&ProviderTrustAnchor {
-            expected_genesis: provider.content_id(),
-            required_assurance: Assurance::ProducerSigned,
-            apple_app_attest: None,
-        })
+        .pin(&ProviderTrustAnchor::new(
+            provider.content_id(),
+            Assurance::ProducerSigned,
+            Default::default(),
+            hellas_sdk::identity::assertion_counters(root.path()),
+        ))
         .unwrap();
     let contract = test_responses_contract();
     let input = hellas_sdk::job::JobInput::Fetch {

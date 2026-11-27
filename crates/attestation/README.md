@@ -66,7 +66,7 @@ bootstrap this — the anchor has to come from outside the channel.
      │   1. hash(bundle) == pin ................. right provider, not a MITM
      │   2. register_apple(attestation) ......... APPLE vouches for the SE key
      │   3. live peer == bundle transport key ... not a relay in the middle
-     │   4. CDhash ∈ my allowlist ............... the exact build I trust
+     │   4. app ID and optional CDHash pins ..... the requester's Apple policy
      │   5. assertion binds THIS connection ..... live & fresh, not replayed
      │                                            │
      │  ✅ all pass → trust established           │
@@ -90,9 +90,9 @@ Each link is verified **at open, before the prompt leaves the requester**:
    certificate chain: this key lives in a real Secure Enclave on a genuine,
    un-jailbroken Apple device. Apple will not sign that for an emulator or a
    tampered machine.
-2. **The build is one you chose to trust.** The CDhash inside the attestation
-   names the exact binary; you allowlist builds you have audited not to leak.
-   A modified build has a different CDhash → rejected.
+2. **The app matches your policy.** The default accepts any build of
+   `2F53L9ZR3N.ai.hellas.gate`. You can replace that app ID and supply
+   exact CDHashes to accept only builds you reviewed.
 3. **The platform cannot be pried open.** For the attestation to exist and the
    key to function, the machine runs with SIP on, hardened runtime, and — 
    enforced at packaging — no debugger/injection entitlements. So the operator,
@@ -167,10 +167,10 @@ core now.
 ## Key entry points
 
 - `register_apple` — verify an Apple attestation object against the pinned root
-  CA and app identity; produce a chain-verified `RegisteredAppleCredential`.
-- `verify_apple_assertion` — verify a live assertion against a registered
-  credential (RP-ID = `SHA256(teamID.bundleID)`; CDhash matched directly
-  against the allowlist).
+  CA; produce a chain-verified `RegisteredAppleCredential` with its RP-ID hash.
+- `ApplePolicy` — the requester's accepted app IDs (RP-ID =
+  `SHA256(teamID.bundleID)`, Gate by default) and optional CDHash pins;
+  `register` and `verify_assertion` apply it.
 - `AssertionCounterStore` — injected port for per-key monotonic counter
   high-water marks (the filesystem impl lives in the caller).
 - The confidential open handshake lives in `hellas-rpc` (`open`,

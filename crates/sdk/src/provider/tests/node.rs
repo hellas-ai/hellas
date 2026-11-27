@@ -2766,11 +2766,12 @@ impl RunningPaidNode {
         );
         let transport_key = SecretKey::from_bytes(&[0x63; 32]);
         let open = test_remote_execution();
-        let trust = hellas_client::ProviderTrustAnchor {
-            expected_genesis: open.enrollment.content_id(),
-            required_assurance: Assurance::ProducerSigned,
-            apple_app_attest: None,
-        };
+        let trust = hellas_client::ProviderTrustAnchor::new(
+            open.enrollment.content_id(),
+            Assurance::ProducerSigned,
+            Default::default(),
+            crate::identity::assertion_counters(root),
+        );
         let endpoint = match Endpoint::builder(presets::Minimal)
             .secret_key(transport_key)
             .alpns(alpns)

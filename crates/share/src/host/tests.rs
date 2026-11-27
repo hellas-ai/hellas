@@ -302,11 +302,12 @@ impl ShareFixtureBuilder {
             hellas_auth::authority::UnixMillis::now().unwrap_or_default(),
         )
         .unwrap()
-        .pin(&hellas_sdk::client::ProviderTrustAnchor {
-            expected_genesis: provider_bundle.content_id(),
-            required_assurance: Assurance::ProducerSigned,
-            apple_app_attest: None,
-        })
+        .pin(&hellas_sdk::client::ProviderTrustAnchor::new(
+            provider_bundle.content_id(),
+            Assurance::ProducerSigned,
+            Default::default(),
+            hellas_sdk::identity::assertion_counters(root.path()),
+        ))
         .unwrap();
         let access = {
             use hellas_auth::authority::{GrantSpec, UnixMillis};
@@ -569,7 +570,9 @@ async fn controlled_gateway(
                     access: None,
                     resource: None,
                     evaluator: None,
-                    trust: None,
+                    assurance: Assurance::ProducerSigned,
+                    require_apple_app_id: None,
+                    require_apple_cdhash: None,
                 },
             },
         )]

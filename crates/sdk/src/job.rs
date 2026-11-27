@@ -1,4 +1,5 @@
 //! Caller-owned job folders. Purchase nonces derive from durable channel state.
+use hellas_attestation::{AppleAppId, AppleCdHash};
 use hellas_auth::{Digest, ProducerSigningKey, PublicKey, hash_tuple};
 use hellas_rpc::{
     Assurance, ContentRef, FetchContract, JsonBytes, ProgramManifest,
@@ -43,6 +44,8 @@ pub struct Job {
     price: u64,
     input: Arc<JobInput>,
     manifest: ProgramManifest,
+    pub require_apple_app_id: Option<Vec<AppleAppId>>,
+    pub require_apple_cdhash: Option<Vec<AppleCdHash>>,
 }
 #[derive(Clone)]
 pub enum JobInput {
@@ -91,7 +94,12 @@ struct FetchFiles {
     service: String,
     method: String,
     request: String,
-    assurance: String,
+    #[serde(with = "crate::assurance_name::AssuranceName")]
+    assurance: Assurance,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    require_apple_app_id: Option<Vec<AppleAppId>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    require_apple_cdhash: Option<Vec<AppleCdHash>>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -310,6 +318,8 @@ impl Job {
         Ok(Self {
             price,
             input: Arc::new(input),
+            require_apple_app_id: None,
+            require_apple_cdhash: None,
             manifest,
         })
     }
@@ -442,6 +452,19 @@ impl Job {
     pub fn digest(&self) -> Digest {
         hash_tuple(FORMAT, &[&self.canonical_bytes()])
     }
+    /// Auto-saved folders distinguish consumer requirements without changing the purchase identity.
+    pub fn folder_digest(&self) -> Digest {
+        let job = self.digest();
+        if self.require_apple_app_id.is_none() && self.require_apple_cdhash.is_none() {
+            return job;
+        }
+        let requirements = hellas_rpc::canonical_dag_cbor(&(
+            &self.require_apple_app_id,
+            &self.require_apple_cdhash,
+        ))
+        .expect("job requirements contain only strings");
+        hash_tuple("hellas.job.folder.v1", &[job.as_bytes(), &requirements])
+    }
     pub fn purchase_nonce(&self, channel: Digest, proposal_nonce: u64) -> [u8; 32] {
         purchase_nonce(self.digest(), channel, proposal_nonce, None)
     }
@@ -486,12 +509,7 @@ impl Job {
                     )
                     .await?,
                 )?;
-                let assurance = match fetch.assurance.as_str() {
-                    "producer-signed" => Assurance::ProducerSigned,
-                    "apple-app-attest" => Assurance::AppleAppAttest,
-                    _ => return Err(invalid("unknown assurance")),
-                };
-                Self::fetch(
+                let mut job = Self::fetch(
                     doc.payment.price,
                     contract,
                     fetch.service,
@@ -501,8 +519,11 @@ impl Job {
                         hellas_rpc::fetch::MAX_FETCH_REQUEST_BODY_BYTES,
                     )
                     .await?,
-                    assurance,
-                )?
+                    fetch.assurance,
+                )?;
+                job.require_apple_app_id = fetch.require_apple_app_id;
+                job.require_apple_cdhash = fetch.require_apple_cdhash;
+                job
             }
             (None, Some(compute)) => {
                 let bytes = read(&compute.environment, compute::MAX_ENVIRONMENT_BYTES).await?;
@@ -645,11 +666,9 @@ impl Job {
                     service: service.clone(),
                     method: method.clone(),
                     request: "request.json".into(),
-                    assurance: match assurance {
-                        Assurance::ProducerSigned => "producer-signed",
-                        Assurance::AppleAppAttest => "apple-app-attest",
-                    }
-                    .into(),
+                    assurance: *assurance,
+                    require_apple_app_id: self.require_apple_app_id.clone(),
+                    require_apple_cdhash: self.require_apple_cdhash.clone(),
                 });
             }
             JobInput::Compute {

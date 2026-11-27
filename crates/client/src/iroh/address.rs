@@ -1,8 +1,9 @@
 //! The one string a buyer learns out of band to reach and trust a provider.
-use super::ProviderTrustAnchor;
+use super::{ApplePolicy, AssertionCounterStore, ProviderTrustAnchor};
 use crate::{ClientError, ClientResult};
 use hellas_auth::PublicKey;
 use hellas_rpc::{Assurance, ContentId, ProviderEnrollmentBundle};
+use std::sync::Arc;
 use std::{fmt, str::FromStr};
 
 /// `ENROLLMENT_ID@NODE_ID`: the content id of the provider's enrollment bundle
@@ -39,30 +40,14 @@ impl ProviderAddress {
         })
     }
 
-    /// The trust every connection to this provider requires. An Apple provider
-    /// also needs its independent approval, which must name this enrollment.
+    /// Pin the enrollment and apply the consumer's policy to Apple providers.
     pub fn trust(
         &self,
         assurance: Assurance,
-        approval: Option<&ProviderTrustAnchor>,
-    ) -> ClientResult<ProviderTrustAnchor> {
-        match approval {
-            Some(approval) if approval.expected_genesis != self.enrollment => Err(
-                ClientError::protocol("provider approval names a different enrollment"),
-            ),
-            Some(approval) if approval.required_assurance != assurance => Err(
-                ClientError::protocol("provider approval assurance differs from request"),
-            ),
-            Some(approval) => Ok(approval.clone()),
-            None if assurance == Assurance::ProducerSigned => Ok(ProviderTrustAnchor {
-                expected_genesis: self.enrollment,
-                required_assurance: assurance,
-                apple_app_attest: None,
-            }),
-            None => Err(ClientError::protocol(
-                "Apple assurance requires an independent provider approval",
-            )),
-        }
+        policy: ApplePolicy,
+        counters: Arc<dyn AssertionCounterStore + Send + Sync>,
+    ) -> ProviderTrustAnchor {
+        ProviderTrustAnchor::new(self.enrollment, assurance, policy, counters)
     }
 }
 
@@ -138,32 +123,5 @@ mod tests {
         ] {
             assert!(invalid.parse::<ProviderAddress>().is_err(), "{invalid}");
         }
-    }
-
-    #[test]
-    fn trust_pins_the_addressed_enrollment() {
-        let address = address();
-        let trust = address.trust(Assurance::ProducerSigned, None).unwrap();
-        assert_eq!(trust.expected_genesis, address.enrollment);
-        assert!(trust.apple_app_attest.is_none());
-        assert!(address.trust(Assurance::AppleAppAttest, None).is_err());
-        let mut approval = trust.clone();
-        assert_eq!(
-            address
-                .trust(Assurance::ProducerSigned, Some(&approval))
-                .unwrap(),
-            approval
-        );
-        assert!(
-            address
-                .trust(Assurance::AppleAppAttest, Some(&approval))
-                .is_err()
-        );
-        approval.expected_genesis = ContentId::from_bytes([8; 32]);
-        assert!(
-            address
-                .trust(Assurance::ProducerSigned, Some(&approval))
-                .is_err()
-        );
     }
 }
