@@ -1037,6 +1037,23 @@ async fn cleanup_preserves_live_stages_and_inert_unmarked_directories() {
     assert!(!live.exists());
     assert!(inert.exists());
 }
+
+#[test]
+fn cleanup_accepts_a_stage_published_after_its_marker_was_opened() {
+    let parent = tempfile::tempdir().unwrap();
+    let stage = parent.path().join(".bootstrap-publishing");
+    std::fs::create_dir(&stage).unwrap();
+    let marker = stage.join(MARKER);
+    let writer = lock(File::create(&marker).unwrap(), &marker).unwrap();
+    let reader = hellas_private::open_regular_file_nofollow_rw(&marker).unwrap();
+
+    let published = parent.path().join("node");
+    std::fs::rename(&stage, &published).unwrap();
+    drop(writer);
+    remove_unlocked_bootstrap_stage(&stage, reader).unwrap();
+    assert!(published.join(MARKER).is_file());
+}
+
 #[tokio::test]
 async fn concurrent_bootstrap_commits_only_one_complete_store() {
     let parent = tempfile::tempdir().unwrap();

@@ -360,17 +360,31 @@ fn remove_abandoned_bootstrap_stages(parent: &Path) -> Result<(), NodeStoreError
             .file_name()
             .as_encoded_bytes()
             .starts_with(b".bootstrap-")
-            || !entry.file_type()?.is_dir()
         {
             continue;
+        }
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() => {}
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
         }
         let Ok(file) = hellas_private::open_regular_file_nofollow_rw(&entry.path().join(MARKER))
         else {
             continue;
         };
-        if file.try_lock().is_ok() {
-            let _lock = IdentityLock(file);
-            std::fs::remove_dir_all(entry.path())?;
+        remove_unlocked_bootstrap_stage(&entry.path(), file)?;
+    }
+    Ok(())
+}
+
+fn remove_unlocked_bootstrap_stage(path: &Path, marker: File) -> std::io::Result<()> {
+    if marker.try_lock().is_ok() {
+        let _lock = IdentityLock(marker);
+        // A writer can publish the stage and release the marker after we open it.
+        match std::fs::remove_dir_all(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            result => result?,
         }
     }
     Ok(())

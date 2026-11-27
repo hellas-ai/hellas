@@ -335,12 +335,12 @@ impl RetainedSetups {
         })
     }
 
-    pub(crate) fn floor(&self) -> u64 {
+    /// `None` when no setup is retained.
+    pub(crate) fn floor(&self) -> Option<u64> {
         self.setups
             .iter()
             .map(|entry| journal_floor(&entry.store))
             .max()
-            .unwrap_or(0)
     }
 
     pub(crate) async fn select<

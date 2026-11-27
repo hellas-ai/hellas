@@ -94,7 +94,7 @@ pub(crate) type FundingBinding<'a> =
     Box<dyn FnOnce() -> Result<(), crate::transact::PurchaseError> + Send + 'a>;
 
 pub(crate) struct FundingControls<'a> {
-    pub timeout: Duration,
+    pub deadline: crate::client_chain::Deadline,
     pub approval: Option<&'a dyn crate::paid_client::FundingApproval>,
     /// Runs after application reservation, before owner signing or replay submission.
     pub before_sign: Option<FundingBinding<'a>>,
@@ -120,11 +120,11 @@ impl ClientOwner {
     ) -> Result<Funding, ClientOwnerError> {
         let network = self.chain.network();
         let FundingControls {
-            timeout,
+            deadline,
             approval,
             mut before_sign,
         } = controls;
-        tokio::time::timeout(timeout, async {
+        tokio::time::timeout_at(deadline.at(), async {
             let _serial = self.serial.lock().await;
             let path = self
                 .root
@@ -162,7 +162,7 @@ impl ClientOwner {
             .await
         })
         .await
-        .map_err(|_| ClientOwnerError::Timeout(timeout))?
+        .map_err(|_| ClientOwnerError::Timeout(deadline.budget()))?
     }
 
     pub(crate) async fn funding_intents(&self) -> Result<Vec<FundingIntent>, ClientOwnerError> {
@@ -357,7 +357,7 @@ impl ClientOwner {
             provider,
             need,
             FundingControls {
-                timeout,
+                deadline: crate::client_chain::Deadline::after(timeout),
                 approval: None,
                 before_sign: None,
             },
@@ -384,11 +384,11 @@ impl ClientOwner {
     ) -> Result<Funding, ClientOwnerError> {
         let network = self.chain.network();
         let FundingControls {
-            timeout,
+            deadline,
             approval,
             mut before_sign,
         } = controls;
-        tokio::time::timeout(timeout, async {
+        tokio::time::timeout_at(deadline.at(), async {
             let _serial = self.serial.lock().await;
             let path = self.path(provider);
             if let Some(gate) = approval {
@@ -581,7 +581,7 @@ impl ClientOwner {
             result
         })
         .await
-        .map_err(|_| ClientOwnerError::Timeout(timeout))?
+        .map_err(|_| ClientOwnerError::Timeout(deadline.budget()))?
     }
 
     async fn finish(

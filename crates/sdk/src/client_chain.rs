@@ -37,11 +37,46 @@ pub async fn connect_at(
     timeout: Duration,
     min_height: u64,
 ) -> Result<RemoteLightClient, QueryError> {
+    connect_until(config, Deadline::after(timeout), min_height).await
+}
+
+/// A bound shared by consecutive stages. Each stage gets what the earlier ones
+/// left, and every stage reports the same budget when it expires.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Deadline {
+    at: tokio::time::Instant,
+    budget: Duration,
+}
+
+impl Deadline {
+    pub(crate) fn after(budget: Duration) -> Self {
+        Self {
+            at: tokio::time::Instant::now() + budget,
+            budget,
+        }
+    }
+
+    pub(crate) fn at(self) -> tokio::time::Instant {
+        self.at
+    }
+
+    pub(crate) fn budget(self) -> Duration {
+        self.budget
+    }
+}
+
+/// [`connect_at`] within a deadline that earlier stages may have partly spent.
+/// It returns `ReadUnavailableTimeout` only when that deadline expires.
+pub(crate) async fn connect_until(
+    config: &WorkConfig,
+    deadline: Deadline,
+    min_height: u64,
+) -> Result<RemoteLightClient, QueryError> {
+    let (deadline, timeout) = (deadline.at, deadline.budget);
     let verifier = Arc::new(
         hellas_chain::proof_verify::ProofVerifier::for_profile(&config.chain).map_err(invalid)?,
     );
     let mut reason = "no finalized remote snapshot is available".to_owned();
-    let deadline = tokio::time::Instant::now() + timeout;
     loop {
         if tokio::time::Instant::now() >= deadline {
             return Err(QueryError::ReadUnavailableTimeout { timeout, reason });
