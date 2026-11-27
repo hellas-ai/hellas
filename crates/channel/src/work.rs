@@ -747,12 +747,12 @@ impl ProviderEndpoint {
 
         let manifest = bundle.manifest();
         let (store, scope) = self.close.store.invocation_content(work_id)?;
-        let (objects, _) = crate::content::admit_content(
+        let objects = crate::content::work_closure(
             &store,
             &scope,
             policy,
             manifest,
-            Some(authorization.input_content),
+            authorization.input_content,
         )
         .await
         .map_err(content_refusal)?;
@@ -951,7 +951,6 @@ impl ProviderEndpoint {
                     ready.channel().client_key().to_bytes(),
                 )),
             )
-            .await
             .map_err(RunError::Backend)?,
         ));
 
@@ -1766,7 +1765,7 @@ pub async fn run_admitted<B: WorkBackend>(
     let facts = policy
         .classify_manifest(manifest)
         .map_err(BackendFault::caused_by)?;
-    let input = Admitted::checked(input, policy, facts, content, admission).await?;
+    let input = Admitted::checked(input, policy, facts, content, admission)?;
     execute(backend, input, progress).await
 }
 

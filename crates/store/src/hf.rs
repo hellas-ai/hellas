@@ -387,7 +387,7 @@ fn hf_home(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<std::path
 
 /// The standard Hub snapshot path for a repository and exact revision, without network access.
 pub fn cached_snapshot(repo: &str, revision: &str) -> Option<std::path::PathBuf> {
-    if !hellas_rpc::protocol::invocation::valid_hub_repo(repo) || !immutable_sha(revision) {
+    if !valid_hub_repo(repo) || !immutable_sha(revision) {
         return None;
     }
     let hub = ["HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"]
@@ -558,7 +558,7 @@ impl Repo {
         Ok(repo)
     }
     pub(crate) fn validate(&self) -> Result<()> {
-        if !hellas_rpc::protocol::invocation::valid_hub_repo(&self.id)
+        if !valid_hub_repo(&self.id)
             || self.revision.is_empty()
             || self.revision.chars().any(char::is_control)
             || self.revision.contains(['@', '?', '#', '\\'])
@@ -850,6 +850,19 @@ impl HfCas {
         Ok(())
     }
 }
+/// A Hub model repository at its root, without a revision or file selector.
+fn valid_hub_repo(id: &str) -> bool {
+    let component = |s: &str| {
+        !matches!(s, "" | "." | "..")
+            && s.bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
+    };
+    id.len() <= 256
+        && id
+            .split_once('/')
+            .is_some_and(|(org, repo)| component(org) && component(repo))
+}
+
 pub fn immutable_sha(sha: &str) -> bool {
     sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit())
 }

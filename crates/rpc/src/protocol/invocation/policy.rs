@@ -11,19 +11,6 @@ pub const MAX_POLICY_BYTES: usize = 64 * 1024;
 pub const MAX_ADMISSIONS: usize = 64;
 pub const MAX_COMPUTE_PROGRAMS: usize = 64;
 
-/// A Hub model repository at its root, without a revision or file selector.
-pub fn valid_hub_repo(id: &str) -> bool {
-    let component = |s: &str| {
-        !matches!(s, "" | "." | "..")
-            && s.bytes()
-                .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
-    };
-    id.len() <= 256
-        && id
-            .split_once('/')
-            .is_some_and(|(org, repo)| component(org) && component(repo))
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Match {
@@ -33,20 +20,12 @@ pub struct Match {
     pub program: Option<ContentId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<ContentId>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub repos: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub pure_setup_entries: BTreeSet<String>,
 }
 
 impl Match {
-    /// A caller selecting candidates can defer the receipt check. Provider admission
-    /// supplies a set for every distinct asset in the manifest's verified model.
-    pub fn matches(
-        &self,
-        manifest: &ProgramManifest,
-        receipts: Option<&[BTreeSet<String>]>,
-    ) -> bool {
+    pub fn matches(&self, manifest: &ProgramManifest) -> bool {
         manifest.application().adaptor() == compute::ADAPTOR
             && manifest.model().is_some()
             && self
@@ -55,26 +34,11 @@ impl Match {
                 .is_none_or(|e| e == manifest.application().evaluator())
             && self.program.is_none_or(|p| p == manifest.content_id())
             && self.model.is_none_or(|m| Some(m) == manifest.model())
-            && (self.repos.is_empty()
-                || receipts.is_none_or(|assets| {
-                    !assets.is_empty()
-                        && assets
-                            .iter()
-                            .all(|sources| self.repos.iter().any(|repo| sources.contains(repo)))
-                }))
     }
     fn validate(&self) -> Result<(), CanonicalDecodeError> {
         if let Some(evaluator) = &self.evaluator {
             Application::new(evaluator.clone(), compute::ADAPTOR)
                 .map_err(|e| error(e.to_string()))?;
-        }
-        if self.repos.len() > MAX_COMPUTE_PROGRAMS
-            || self.repos.iter().any(|id| !valid_hub_repo(id))
-            || self.repos.windows(2).any(|w| w[0] >= w[1])
-        {
-            return Err(error(
-                "match repositories must be bounded, unique and sorted",
-            ));
         }
         if self.model.is_none() && self.program.is_none() && !self.pure_setup_entries.is_empty() {
             return Err(error(
@@ -170,7 +134,7 @@ impl Admission {
     }
     pub fn candidate(&self, manifest: &ProgramManifest) -> bool {
         match self {
-            Self::Compute(rule) => rule.matches(manifest, None),
+            Self::Compute(rule) => rule.matches(manifest),
             Self::Fetch { admission } => manifest == &admission.contract.manifest(),
         }
     }
@@ -240,11 +204,7 @@ impl InvocationPolicy {
         Ok(ContentId::hash(&self.canonical_bytes()?))
     }
     /// Union the setup permissions of rules actually satisfied by this model.
-    pub fn admitted_setup(
-        &self,
-        manifest: &ProgramManifest,
-        receipts: &[BTreeSet<String>],
-    ) -> Option<BTreeSet<String>> {
+    pub fn admitted_setup(&self, manifest: &ProgramManifest) -> Option<BTreeSet<String>> {
         if manifest.application().adaptor() != compute::ADAPTOR {
             return self
                 .candidates_for(manifest)
@@ -253,7 +213,7 @@ impl InvocationPolicy {
         }
         let mut rules = self
             .compute_rules()
-            .filter(|r| r.matches(manifest, Some(receipts)))
+            .filter(|r| r.matches(manifest))
             .peekable();
         rules.peek()?;
         Some(

@@ -1299,7 +1299,7 @@ fn content_closure_opens_the_signed_root_and_returns_unique_exact_references() {
     let manifest = environment
         .manifest(crate::protocol::invocation::compute::EVALUATOR)
         .unwrap();
-    let (actual, _) = policy().content_closure(&manifest, &bytes, None).unwrap();
+    let actual = policy().content_closure(&manifest, &bytes, None).unwrap();
     assert_eq!(actual.len(), 3);
     assert!(actual.contains(&crate::ContentRef::for_bytes(&bytes)));
     assert!(actual.contains(&source));
@@ -1325,7 +1325,6 @@ fn content_closure_opens_the_signed_root_and_returns_unique_exact_references() {
         policy()
             .content_closure(&fetch, &[], None)
             .unwrap()
-            .0
             .is_empty()
     );
     assert!(policy().content_closure(&fetch, &bytes, None).is_err());
@@ -1587,11 +1586,8 @@ fn setup_declarations_bind_exact_admitted_program_and_evaluator() {
     let mut p = policy();
     p.admissions = vec![Admission::exact(&manifest, &["weights.prep"]).unwrap()];
     let entries = BTreeSet::from(["weights.prep".to_owned()]);
-    assert_eq!(p.admitted_setup(&manifest, &[]), Some(entries));
-    assert!(
-        p.admitted_setup(&env.manifest("other").unwrap(), &[])
-            .is_none()
-    );
+    assert_eq!(p.admitted_setup(&manifest), Some(entries));
+    assert!(p.admitted_setup(&env.manifest("other").unwrap()).is_none());
     let bytes = p.canonical_bytes().unwrap();
     assert_eq!(InvocationPolicy::from_canonical_bytes(&bytes).unwrap(), p);
     let Admission::Compute(rule) = &mut p.admissions[0] else {
@@ -1602,29 +1598,9 @@ fn setup_declarations_bind_exact_admitted_program_and_evaluator() {
 }
 
 #[test]
-fn repo_match_requires_every_asset_to_have_a_verified_origin_in_the_set() {
-    use std::collections::BTreeSet;
-    let manifest = compute::Environment {
-        sources: vec![],
-        model: Default::default(),
-    }
-    .manifest(compute::EVALUATOR)
-    .unwrap();
-    let base = BTreeSet::from(["org/model".to_owned()]);
-    let voices = BTreeSet::from(["org/voices".to_owned()]);
-    let mut rule = Match {
-        repos: vec!["org/model".into(), "org/voices".into()],
-        ..Default::default()
-    };
-    assert!(rule.matches(&manifest, None));
-    assert!(!rule.matches(&manifest, Some(&[])));
-    assert!(!rule.matches(&manifest, Some(&[base.clone(), BTreeSet::new()])));
-    let receipts = [base, voices];
-    assert!(rule.matches(&manifest, Some(&receipts)));
-    rule.repos.pop();
-    assert!(!rule.matches(&manifest, Some(&receipts)));
-    rule.repos.push("org/*".into());
-    assert!(Admission::Compute(rule).validate().is_err());
+fn repository_policy_is_rejected() {
+    let old = serde_json::json!({"repos": ["org/model"]});
+    assert!(serde_json::from_value::<Match>(old).is_err());
 }
 
 #[test]

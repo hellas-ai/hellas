@@ -52,19 +52,6 @@ fn counted_hub(
     (base, serving)
 }
 
-/// Fetch one Git-backed file from a real pinned Hub listing and resolution response.
-#[cfg(feature = "test-support")]
-pub async fn acquire_git_file(
-    store: &DiskStore,
-    repo: &str,
-    path: &str,
-    bytes: &[u8],
-) -> ContentRef {
-    AvailableHubFile::serve(&mut store.clone(), repo, path, bytes)
-        .acquire()
-        .await
-}
-
 #[cfg(feature = "test-support")]
 pub struct AvailableHubFile {
     calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,

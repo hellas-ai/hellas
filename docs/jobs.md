@@ -75,12 +75,9 @@ With a published Xet ID, the remote buyer reads only the header. For a Git or LF
 hellas store acquire hf://LiquidAI/LFM3-1.7B-GGUF@cd0c74c575b5c416f3011b5b4c298077f26ca8c2/LFM3-1.7B-BF16.gguf --expect a4896de517cae418383c2fd9954bc5ac33d8112b810c7895fb3feb70dca622dc --bytes 3466626336 --policy jobs
 ```
 
-A grant or paid policy constrained to Hub repositories requires a provider acquisition
-receipt for every model asset, including tokenizer, configuration, and voice files.
-Activate the exact Hub checkpoint or acquire the selected files before serving that
-policy. The buyer can use local files, a Hub revision, or a model ID. Admission checks
-the provider's durable receipts by content ID and size and works with the Hub offline.
-An on-miss allow-list can fetch approved missing content after the policy check.
+The provider can use pre-acquired content or fetch missing content from its
+allow-list after the policy check. Grant and paid rules match the same
+model and program IDs regardless of the source.
 
 The provider checks the published Xet hash against the canonical content ID. It rejects files published with legacy Xet chunking. With `--local`, the local executor acquires the weights into its own content store.
 

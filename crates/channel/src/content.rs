@@ -86,7 +86,7 @@ pub async fn stage_work(
     input: ContentRef,
 ) -> Result<Vec<ContentRef>, hellas_wire::WireStatus> {
     let bound = service.scope()?;
-    let (closure, _) = admit_content(&service.store, &bound, policy, manifest, Some(input))
+    let closure = work_closure(&service.store, &bound, policy, manifest, input)
         .await
         .map_err(upload_status)?;
     service
@@ -101,56 +101,22 @@ pub fn upload_status(error: impl std::fmt::Display) -> hellas_wire::WireStatus {
     hellas_wire::WireStatus::new(hellas_wire::WireCode::PermissionDenied, error.to_string())
 }
 
-/// Check the provider's current policy and verified acquisition receipts. Staging and
-/// acceptance also open the complete object closure; execution asks for setup permissions.
-pub async fn admit_content(
+/// Read the authenticated model root and expand its verified content closure.
+pub async fn work_closure(
     store: &LocalStore,
     scope: &Scope,
     policy: &hellas_rpc::protocol::invocation::InvocationPolicy,
     manifest: &hellas_rpc::ProgramManifest,
-    prepared: Option<ContentRef>,
-) -> Result<(Vec<ContentRef>, std::collections::BTreeSet<String>), Error> {
-    use std::collections::BTreeSet;
-    let needs_receipts = policy
-        .compute_rules()
-        .any(|rule| !rule.repos.is_empty() && rule.matches(manifest, None));
-    let mut receipts = vec![];
-    let mut closure = vec![];
-    if prepared.is_some() || needs_receipts {
-        let bytes = if manifest.model().is_some() {
-            root(store, scope, manifest.root()).await?
-        } else {
-            bytes::Bytes::new()
-        };
-        let (objects, model) = policy
-            .content_closure(manifest, &bytes, prepared)
-            .map_err(|_| Error::Invalid("invalid program content closure"))?;
-        closure = objects;
-        if needs_receipts {
-            let model = model.ok_or(Error::Denied)?;
-            for object in model
-                .assets
-                .into_iter()
-                .map(|asset| asset.object)
-                .collect::<BTreeSet<_>>()
-            {
-                receipts.push(
-                    store
-                        .verified_hub_files(object)
-                        .await?
-                        .into_iter()
-                        .map(|(repo, _, _)| repo)
-                        .collect(),
-                );
-            }
-        }
-    }
-    Ok((
-        closure,
-        policy
-            .admitted_setup(manifest, &receipts)
-            .ok_or(Error::Denied)?,
-    ))
+    prepared: ContentRef,
+) -> Result<Vec<ContentRef>, Error> {
+    let bytes = if manifest.model().is_some() {
+        root(store, scope, manifest.root()).await?
+    } else {
+        bytes::Bytes::new()
+    };
+    policy
+        .content_closure(manifest, &bytes, Some(prepared))
+        .map_err(|_| Error::Invalid("invalid program content closure"))
 }
 pub async fn read(
     store: &LocalStore,

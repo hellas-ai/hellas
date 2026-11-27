@@ -306,9 +306,7 @@ pub fn content_closure(
     program_root: &[u8],
     prepared: ContentRef,
 ) -> Result<Vec<ContentRef>, PaidWorkError> {
-    Ok(policy
-        .content_closure(manifest, program_root, Some(prepared))?
-        .0)
+    Ok(policy.content_closure(manifest, program_root, Some(prepared))?)
 }
 
 /// Verify the content opening against an authenticated paid or grant proposal.

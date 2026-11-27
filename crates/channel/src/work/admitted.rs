@@ -69,17 +69,16 @@ impl<I> Admitted<I> {
 }
 
 impl Admitted<PreparedInvocation> {
-    pub(super) async fn checked(
+    pub(super) fn checked(
         input: PreparedInvocation,
         policy: &InvocationPolicy,
         facts: AdmissionFacts,
         content: (LocalStore, Scope),
         admission: WorkAdmission,
     ) -> Result<Self, BackendFault> {
-        let (_, pure_setup_entries) =
-            crate::content::admit_content(&content.0, &content.1, policy, input.manifest(), None)
-                .await
-                .map_err(BackendFault::caused_by)?;
+        let pure_setup_entries = policy
+            .admitted_setup(input.manifest())
+            .ok_or_else(|| BackendFault::caused_by(hellas_store::content::Error::Denied))?;
         Ok(Self {
             input,
             pure_setup_entries,
