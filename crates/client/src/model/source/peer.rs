@@ -3,10 +3,8 @@ use anyhow::{Context, Result, ensure};
 use futures::StreamExt;
 use hellas_rpc::{ContentId, ContentRef, protocol::invocation::compute::Model};
 use hellas_store::content::{ContentStore, Path, PinName, RemoteStore, Reservations, Scope};
-use hellas_wire::{ServiceMarker, iroh::IrohTransport};
 use std::{
     collections::BTreeMap,
-    net::SocketAddr,
     ops::Range,
     sync::{Arc, LazyLock},
 };
@@ -46,31 +44,36 @@ fn peer_io<T: Send + 'static>(
 }
 
 impl PeerModel {
-    pub(super) fn open(uri: &str) -> Result<Self> {
-        peer_io(Self::public(uri.to_owned()))
+    pub(super) fn open(id: ContentId, seeds: Vec<iroh::EndpointAddr>) -> Result<Self> {
+        peer_io(Self::public(id, seeds))
     }
 
-    async fn public(uri: String) -> Result<Self> {
-        let (id, address) = peer_locator(&uri)?;
-        let address = address.context("hellas://model-id needs a provider; use --provider, --access, or append @NODE_ID[@IP:PORT]")?;
-        // Advertised IPs can be private container addresses; retain relay discovery.
+    async fn public(id: ContentId, seeds: Vec<iroh::EndpointAddr>) -> Result<Self> {
+        use hellas_rpc::services::content::Content;
+        ensure!(!seeds.is_empty(), "no peer known to hold {id}; add ?seed=");
         let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
             .bind()
             .await?;
         hellas_wire::iroh::close_on_error(&endpoint, async {
-            let connection = endpoint
-                .connect(
-                    address,
-                    hellas_rpc::services::content::Content::ALPN.as_bytes(),
+            let pool = hellas_wire::iroh::Pool::for_service::<Content>(
+                endpoint.clone(),
+                Default::default(),
+            );
+            for seed in seeds {
+                let Ok(transport) = pool.transport(seed).await else {
+                    continue;
+                };
+                let remote = RemoteStore::new(
+                    transport,
+                    Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
                 )
-                .await?;
-            let remote = RemoteStore::new(
-                IrohTransport::new(connection),
-                Reservations::ram(hellas_channel::content::DEFAULT_MAX_STAGING_BYTES),
-            )
-            .reuse_read_manifest();
-
-            Self::connect(id, remote, Some(endpoint.clone())).await
+                .reuse_read_manifest();
+                match Self::connect(id, remote, Some(endpoint.clone())).await {
+                    Err(error) if error.is::<CatalogUnavailable>() => continue,
+                    result => return result,
+                }
+            }
+            Err(CatalogUnavailable.into())
         })
         .await
     }
@@ -124,30 +127,14 @@ impl PeerModel {
     }
 }
 
-pub fn peer_locator(uri: &str) -> Result<(ContentId, Option<iroh::EndpointAddr>)> {
-    let mut parts = uri
-        .strip_prefix("hellas://")
-        .context("expected a model URI")?
-        .split('@');
-    let id = parts.next().unwrap().parse()?;
-    let Some(node) = parts.next() else {
-        return Ok((id, None));
-    };
-    let mut address = iroh::EndpointAddr::new(node.parse()?);
-    for socket in parts {
-        address = address.with_ip_addr(
-            socket
-                .parse::<SocketAddr>()
-                .context("invalid model peer address")?,
-        );
-    }
-    Ok((id, Some(address)))
-}
-
 /// Acquire all original objects for a peer-backed local executor.
-pub async fn acquire_peer_model(uri: &str, store: &hellas_store::content::DiskStore) -> Result<()> {
+pub async fn acquire_peer_model(
+    id: ContentId,
+    seeds: Vec<iroh::EndpointAddr>,
+    store: &hellas_store::content::DiskStore,
+) -> Result<()> {
     use hellas_store::content::PinTarget;
-    let peer = PeerModel::public(uri.to_owned()).await?;
+    let peer = PeerModel::public(id, seeds).await?;
     for asset in &peer.model.assets {
         let object = asset.object;
         let at = Path::new(peer.pin.clone(), object.id().to_string())?;

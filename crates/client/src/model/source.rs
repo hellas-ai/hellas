@@ -3,10 +3,13 @@ mod peer;
 use super::{ModelFiles, ModelKind, ModelSpec, gguf, native, qwen3};
 use anyhow::{Context, Result, ensure};
 use hellas_rpc::ContentRef;
-use hellas_store::{content::DiskStore, hf::PinnedFile};
+use hellas_store::{
+    content::{DiskStore, Locator},
+    hf::PinnedFile,
+};
 use native::{Kind, Origin};
 pub(crate) use peer::PeerModel;
-pub use peer::{CatalogUnavailable, acquire_peer_model, peer_locator, publish_model};
+pub use peer::{CatalogUnavailable, acquire_peer_model, publish_model};
 use std::{
     io::Write,
     path::{Path, PathBuf},
@@ -134,33 +137,38 @@ impl<'a> Source<'a> {
     pub fn open(spec: &'a ModelSpec) -> Result<Self> {
         let path = &spec.model;
         spec.check_locator()?;
-        let (origin, selector) = if let Some(uri) = super::peer_uri(path) {
-            return Self::peer(PeerModel::open(uri)?);
-        } else if let Some(uri) = super::hf_uri(path) {
-            let (repo, selector) = native::hub(uri)?;
-            (Origin::Hub(repo), selector)
-        } else {
-            let metadata = std::fs::metadata(path)?;
-            let directory = if metadata.is_dir() {
-                path.as_path()
-            } else {
-                ensure!(
-                    metadata.is_file(),
-                    "checkpoint must be a regular file or directory"
-                );
-                if path.extension().is_none_or(|ext| ext != "safetensors") {
-                    return Self::gguf(File::Local(path.clone()), spec);
-                }
-                ensure!(
-                    path.file_name()
-                        .is_some_and(|name| name == "model.safetensors"),
-                    "select the checkpoint root or model.safetensors"
-                );
-                path.parent()
-                    .filter(|dir| !dir.as_os_str().is_empty())
-                    .unwrap_or(Path::new("."))
-            };
-            (Origin::Local(directory.into()), None)
+        let (origin, selector) = match super::model_locator(path)? {
+            Some(Locator::Hellas { id, seeds }) => return Self::peer(PeerModel::open(id, seeds)?),
+            Some(Locator::Hub(reference)) => {
+                let (repo, selector) = native::hub(reference)?;
+                (Origin::Hub(repo), selector)
+            }
+            Some(Locator::Https(_)) => {
+                anyhow::bail!("--model takes a local path, an hf:// locator or hellas://ID")
+            }
+            None => {
+                let metadata = std::fs::metadata(path)?;
+                let directory = if metadata.is_dir() {
+                    path.as_path()
+                } else {
+                    ensure!(
+                        metadata.is_file(),
+                        "checkpoint must be a regular file or directory"
+                    );
+                    if path.extension().is_none_or(|ext| ext != "safetensors") {
+                        return Self::gguf(File::Local(path.clone()), spec);
+                    }
+                    ensure!(
+                        path.file_name()
+                            .is_some_and(|name| name == "model.safetensors"),
+                        "select the checkpoint root or model.safetensors"
+                    );
+                    path.parent()
+                        .filter(|dir| !dir.as_os_str().is_empty())
+                        .unwrap_or(Path::new("."))
+                };
+                (Origin::Local(directory.into()), None)
+            }
         };
         let explicit_gguf = selector.as_deref().is_some_and(|key| {
             Path::new(key)

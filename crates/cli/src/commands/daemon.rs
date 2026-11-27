@@ -301,7 +301,10 @@ fn split_model(value: &str) -> (&str, Option<&str>) {
     let Some((source, contact)) = value.rsplit_once('@') else {
         return (value, None);
     };
-    if value.starts_with("hellas://") && hellas_client::model::peer_locator(value).is_ok() {
+    use hellas_store::content::Locator;
+    if value.starts_with("hellas://")
+        && matches!(value.parse::<Locator>(), Ok(Locator::Hellas { .. }))
+    {
         return (value, None);
     }
     if source.starts_with("hf://")
@@ -1212,7 +1215,7 @@ mod tests {
     fn gateway_peer_address_survives_route_shorthand() {
         let node = iroh::SecretKey::from_bytes(&[3; 32]).public();
         let uri = format!(
-            "hellas://{}@{node}",
+            "hellas://{}?seed={node}",
             hellas_rpc::ContentId::hash(b"catalog")
         );
         for source in [uri.clone(), format!("{uri}@127.0.0.1:42")] {

@@ -96,8 +96,8 @@ Use `hellas program --model-id MODEL` to print its reference without selecting a
 With a public catalog, pass `--model hellas://MODEL_ID` to a job command. The
 buyer contacts the node in its signed access offer or the node selected by
 `--provider`. To specify a source explicitly, including with `hellas program`
-or a gateway route, use `hellas://MODEL_ID@NODE_ID` or
-`hellas://MODEL_ID@NODE_ID@IP:PORT`. The buyer verifies the catalog against the
+or a gateway route, use `hellas://MODEL_ID?seed=NODE_ID` or
+`hellas://MODEL_ID?seed=NODE_ID@IP:PORT`. The buyer verifies the catalog against the
 model ID and reads authenticated ranges for checkpoint headers and metadata.
 Publishing the tree permits readers to download every file in it, including
 weights. For private sharing, the owner can choose `--policy granted` and give the

@@ -167,8 +167,8 @@ async fn peer_acquisition_fetches_a_verified_tree_and_leaves_by_path_without_par
     let pool = Reservations::ram(8 << 20);
     let store = MemoryStore::new(pool.clone()).with_peers(peers);
     let source = Source::Peer {
-        node: *server.id().as_bytes(),
-        at: Path::new(PinName::new("source".into()).unwrap(), String::new()).unwrap(),
+        id: root.object.id(),
+        seeds: vec![server.addr()],
     };
     let got = store
         .acquire(

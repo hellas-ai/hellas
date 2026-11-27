@@ -57,7 +57,7 @@ impl RepoKind {
 /// *authorisation*: a token is scoped to one repository and one
 /// revision, so fetching by content id alone is not possible against
 /// this source. A peer source would not need this.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Repo {
     pub kind: RepoKind,
     /// `org/name`.

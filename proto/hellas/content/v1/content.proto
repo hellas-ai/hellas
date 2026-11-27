@@ -54,7 +54,7 @@ message UploadRequest {
   oneof part { UploadOpen open = 1; ChunkList list = 2; bytes chunk = 3; }
 }
 message UploadResponse { uint64 next_chunk = 1; bool missing = 2; bool complete = 3; }
-message Peer { bytes node = 1; Path at = 2; }
+message Peer { bytes id = 1; repeated string seeds = 2; }
 message HfXet { string repo = 1; string commit = 2; optional string path = 3; bool dataset = 4; bool default_branch = 5; }
 message Https { string url = 1; optional bytes sha256 = 2; optional uint64 bytes = 3; }
 message Source { oneof kind { Peer peer = 1; HfXet hf_xet = 2; Https https = 3; } }

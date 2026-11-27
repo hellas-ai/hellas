@@ -6,6 +6,7 @@ pub mod config;
 mod core;
 mod disk;
 mod local;
+mod locator;
 mod memory;
 mod page;
 mod policy;
@@ -53,6 +54,7 @@ pub fn file_content(path: &std::path::Path) -> std::io::Result<ContentRef> {
 pub use acquire::validate_https;
 pub use disk::{DiskStore, IndexMode};
 pub use local::{JobContent, LocalStore, VerifiedReader};
+pub use locator::{Locator, LocatorError};
 pub use memory::MemoryStore;
 pub use page::{body_limit, chunk_page};
 pub use policy::{AllowList, Miss, MissDecision, OnMiss, Refuse, StoreStats};
@@ -278,8 +280,8 @@ pub enum ScopeKind {
 #[derive(Clone, Debug)]
 pub enum Source {
     Peer {
-        node: [u8; 32],
-        at: Path,
+        id: hellas_rpc::ContentId,
+        seeds: Vec<iroh::EndpointAddr>,
     },
     HfXet {
         repo: crate::hf::Repo,

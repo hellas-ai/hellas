@@ -47,7 +47,7 @@ fn renderer(evaluator: &str) -> anyhow::Result<GpuDialect> {
 #[cfg(feature = "models")]
 pub use package::{ComputeJob, ModelKind, ModelPackage, ModelRequest, ModelResponse};
 #[cfg(feature = "models")]
-pub use source::{CatalogUnavailable, acquire_peer_model, peer_locator, publish_model};
+pub use source::{CatalogUnavailable, acquire_peer_model, publish_model};
 #[cfg(feature = "models")]
 mod qwen3;
 #[cfg(feature = "models")]
@@ -58,20 +58,23 @@ pub mod whisper;
 #[cfg(feature = "models")]
 pub mod wav;
 
-/// Return the immutable Hub model reference when the source is remote.
 #[cfg(feature = "models")]
-pub fn hf_uri(source: &std::path::Path) -> Option<&str> {
-    source.to_str().filter(|s| s.starts_with("hf://"))
-}
-
-#[cfg(feature = "models")]
-pub fn peer_uri(source: &std::path::Path) -> Option<&str> {
-    source.to_str().filter(|s| s.starts_with("hellas://"))
+pub fn model_locator(
+    source: &std::path::Path,
+) -> anyhow::Result<Option<hellas_store::content::Locator>> {
+    let Some(value) = source.to_str() else {
+        return Ok(None);
+    };
+    if value.contains("://") {
+        Ok(Some(value.parse()?))
+    } else {
+        Ok(None)
+    }
 }
 
 #[cfg(feature = "models")]
 pub fn is_local(source: &std::path::Path) -> bool {
-    hf_uri(source).is_none() && peer_uri(source).is_none()
+    source.to_str().is_none_or(|value| !value.contains("://"))
 }
 
 /// Execution sources prepared before activating a local backend.
@@ -85,7 +88,10 @@ pub struct ModelFiles {
 impl ModelSpec {
     pub async fn files(&self) -> anyhow::Result<ModelFiles> {
         self.check_locator()?;
-        if peer_uri(&self.model).is_some() {
+        if matches!(
+            model_locator(&self.model)?,
+            Some(hellas_store::content::Locator::Hellas { .. })
+        ) {
             return Ok(ModelFiles::default());
         }
         let spec = self.clone();

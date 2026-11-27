@@ -165,8 +165,10 @@ impl Runtime {
         }
         drop(indexed);
         for (path, model) in models {
-            if let Some(uri) = hellas_client::model::peer_uri(&path) {
-                hellas_client::model::acquire_peer_model(uri, &self.options.content).await?;
+            if let Some(hellas_store::content::Locator::Hellas { id, seeds }) =
+                hellas_client::model::model_locator(&path)?
+            {
+                hellas_client::model::acquire_peer_model(id, seeds, &self.options.content).await?;
             }
             hellas_client::model::publish_model(&self.options.content, &model).await?;
         }

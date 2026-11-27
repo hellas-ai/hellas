@@ -54,7 +54,6 @@ pub(crate) async fn add_content(
                 format!("config/content-{index:04}"),
                 Declaration::Object(Object {
                     url: None,
-                    path: None,
                     bytes: Some(object.bytes()),
                     expect: Some(object.id().to_string()),
                     sha256: None,
@@ -65,5 +64,19 @@ pub(crate) async fn add_content(
         }
     }
     config.validate()?;
+    Ok(())
+}
+
+pub(crate) async fn enable_peers(
+    store: &hellas_store::content::DiskStore,
+) -> crate::commands::CliResult<()> {
+    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+        .bind()
+        .await?;
+    store
+        .clone()
+        .with_peers(hellas_wire::iroh::Pool::for_service::<
+            hellas_rpc::services::content::Content,
+        >(endpoint, Default::default()));
     Ok(())
 }

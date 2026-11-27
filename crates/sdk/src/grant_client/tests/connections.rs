@@ -690,8 +690,8 @@ async fn exact_pin_content_reads_use_the_live_grant_on_the_authenticated_work_ca
                 .acquire(
                     &Scope::Owner,
                     Source::Peer {
-                        node: *pair.provider.id().as_bytes(),
-                        at: at.clone()
+                        id: object.id(),
+                        seeds: vec![pair.provider.addr()]
                     },
                     Some(object),
                     PinTarget {

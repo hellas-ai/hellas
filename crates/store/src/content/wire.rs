@@ -167,9 +167,9 @@ pub(crate) fn source(source: Source) -> pb::Source {
     use pb::source::Kind;
     pb::Source {
         kind: Some(match source {
-            Source::Peer { node, at } => Kind::Peer(pb::Peer {
-                node: node.to_vec(),
-                at: Some(path(&at)),
+            Source::Peer { id, seeds } => Kind::Peer(pb::Peer {
+                id: id.as_bytes().to_vec(),
+                seeds: seeds.iter().map(super::locator::display_seed).collect(),
             }),
             Source::Https { url, sha256, bytes } => Kind::Https(pb::Https {
                 url: url.to_string(),
@@ -194,6 +194,9 @@ pub(crate) fn error(status: hellas_wire::WireStatus) -> Error {
         WireCode::NotFound => Error::Missing,
         WireCode::Aborted => Error::Conflict,
         WireCode::ResourceExhausted => Error::Capacity,
+        WireCode::InvalidArgument if status.message() == super::locator::NO_PEER => {
+            super::locator::no_peer()
+        }
         WireCode::InvalidArgument if status.message() == super::acquire::HTTPS_LENGTH_REQUIRED => {
             Error::Invalid(super::acquire::HTTPS_LENGTH_REQUIRED)
         }
@@ -218,11 +221,16 @@ pub(crate) fn source_from(source: pb::Source) -> Result<Source> {
     use pb::source::Kind;
     Ok(match source.kind.ok_or(Error::Invalid("missing source"))? {
         Kind::Peer(peer) => Source::Peer {
-            node: peer
-                .node
-                .try_into()
-                .map_err(|_| Error::Invalid("peer id"))?,
-            at: path_from(peer.at.ok_or(Error::Invalid("missing peer path"))?)?,
+            id: hellas_rpc::ContentId::from_bytes(
+                peer.id
+                    .try_into()
+                    .map_err(|_| Error::Invalid("content ID"))?,
+            ),
+            seeds: peer
+                .seeds
+                .iter()
+                .map(|value| super::locator::seed(value))
+                .collect::<Result<_>>()?,
         },
         Kind::Https(source) => Source::Https {
             url: source

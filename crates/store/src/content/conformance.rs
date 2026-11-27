@@ -808,7 +808,10 @@ async fn suite(mut case: Case) {
         source.as_ref(),
         &Scope::Owner,
         b"peer bytes",
-        Some(pin("peer-source", PinPolicy::Public)),
+        Some(pin(
+            &format!("object/{}", ContentRef::for_bytes(b"peer bytes").id()),
+            PinPolicy::Public,
+        )),
         &case.core().pool,
     )
     .await;
@@ -859,8 +862,8 @@ async fn suite(mut case: Case) {
         .acquire(
             &Scope::Owner,
             Source::Peer {
-                node: *server.id().as_bytes(),
-                at: at("peer-source", ""),
+                id: ContentRef::for_bytes(b"peer bytes").id(),
+                seeds: vec![server.addr()],
             },
             Some(ContentRef::for_bytes(b"peer bytes")),
             pin("peer", PinPolicy::Public),

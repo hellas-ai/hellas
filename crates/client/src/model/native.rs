@@ -12,7 +12,7 @@ use hellas_rpc::{
 };
 use hellas_store::{
     content::{DiskStore, LocalStore, Scope},
-    hf::{PinnedFile, PinnedRepo},
+    hf::{ModelReference, PinnedFile, PinnedRepo},
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -94,9 +94,9 @@ impl Origin {
         })
     }
 }
-pub(super) fn hub(uri: &str) -> Result<(PinnedRepo, Option<String>)> {
+pub(super) fn hub(reference: ModelReference) -> Result<(PinnedRepo, Option<String>)> {
     Ok(PinnedRepo::open(
-        uri,
+        reference,
         &hellas_store::content::Reservations::ram(
             hellas_channel::content::DEFAULT_MAX_STAGING_BYTES,
         ),

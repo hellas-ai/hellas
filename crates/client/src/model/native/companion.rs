@@ -14,8 +14,12 @@ pub(super) struct Companion {
 
 impl Companion {
     fn open(path: &Path, primary: &'static str) -> Result<Self> {
-        let (origin, selected) = if let Some(uri) = crate::model::hf_uri(path) {
-            let (repo, key) = hub(uri)?;
+        use hellas_store::content::Locator;
+        let (origin, selected) = if let Some(locator) = crate::model::model_locator(path)? {
+            let Locator::Hub(reference) = locator else {
+                anyhow::bail!("companion sources require a local file or Hub locator");
+            };
+            let (repo, key) = hub(reference)?;
             let selected = match key {
                 Some(key) if !repo.contains(&key) => format!("{key}/{primary}"),
                 Some(key) => key,

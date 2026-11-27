@@ -82,7 +82,7 @@ hellas store --profile owner-profile.json resolve hf://org/repo
 hellas store --profile owner-profile.json acquire https://huggingface.co/org/repo/tree/release
 hellas store --profile owner-profile.json acquire hf://org/repo@release/model.bin --pin model
 hellas store --profile owner-profile.json acquire https://example.org/model
-hellas store --profile owner-profile.json acquire peer://NODE_ID --source-pin published
+hellas store --profile owner-profile.json acquire hellas://CONTENT_ID?seed=NODE_ID
 hellas store --profile owner-profile.json pin set alias CONTENT_ID --bytes EXACT_BYTES --policy jobs
 hellas store --profile owner-profile.json pin rm alias
 ```

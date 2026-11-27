@@ -63,15 +63,14 @@ impl Policy {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum Declaration {
-    Hf(String),
+    Locator(Locator),
     Object(Object),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Object {
-    pub url: Option<String>,
-    pub path: Option<String>,
+    pub url: Option<Locator>,
     pub bytes: Option<u64>,
     pub expect: Option<String>,
     pub sha256: Option<String>,
@@ -80,7 +79,7 @@ pub struct Object {
 impl Declaration {
     fn policy(&self) -> Result<PinPolicy> {
         match self {
-            Self::Hf(_) => Ok(PinPolicy::Jobs),
+            Self::Locator(_) => Ok(PinPolicy::Jobs),
             Self::Object(object) => object
                 .policy
                 .as_ref()
@@ -90,8 +89,8 @@ impl Declaration {
         }
     }
     fn specification(&self) -> Result<(Option<Source>, Option<ContentRef>)> {
-        let (url, path, expected, sha256) = match self {
-            Self::Hf(uri) => (Some(uri.as_str()), None, None, None),
+        let (url, expected, sha256) = match self {
+            Self::Locator(locator) => (Some(locator), None, None),
             Self::Object(object) => {
                 let expected = match (&object.expect, object.bytes) {
                     (Some(id), Some(bytes)) => Some(ContentRef::new(
@@ -112,46 +111,26 @@ impl Declaration {
                     .map(hellas_auth::hex::parse)
                     .transpose()
                     .map_err(|_| Error::Invalid("HTTPS SHA-256"))?;
-                (object.url.as_deref(), object.path.clone(), expected, sha256)
+                (object.url.as_ref(), expected, sha256)
             }
         };
         let source = match url {
-            Some(uri) if uri.starts_with("hf://") => {
-                if sha256.is_some() {
-                    return Err(Error::Invalid("HF source has no transport SHA-256"));
-                }
-                let repo: crate::hf::Repo = uri
-                    .parse()
-                    .map_err(|_| Error::Invalid("HF repository URI"))?;
-                if !crate::hf::immutable_sha(&repo.revision) {
+            Some(locator) => {
+                if let Locator::Hub(reference) = locator
+                    && !crate::hf::immutable_sha(&reference.repo.revision)
+                {
                     return Err(Error::Invalid(
                         "configured HF source requires an immutable commit SHA",
                     ));
                 }
-                if let Some(path) = &path {
-                    tree::validate_path(path, false)?;
+                let bytes = expected.map(|value| value.bytes());
+                if matches!(locator, Locator::Https(_)) && bytes.is_none() {
+                    return Err(Error::Invalid("HTTPS source requires bytes"));
                 }
-                Some(Source::HfXet { repo, path })
-            }
-            Some(uri) => {
-                if path.is_some() {
-                    return Err(Error::Invalid("path is only for an HF source"));
-                }
-                let url = url::Url::parse(uri).map_err(|_| Error::Invalid("HTTPS source URL"))?;
-                super::acquire::validate_https(&url)?;
-                let bytes = match self {
-                    Self::Object(object) => object.bytes,
-                    _ => None,
-                }
-                .ok_or(Error::Invalid("HTTPS source requires bytes"))?;
-                Some(Source::Https {
-                    url,
-                    sha256,
-                    bytes: Some(bytes),
-                })
+                Some(locator.clone().into_source(bytes, sha256)?)
             }
             None => {
-                if path.is_some() || sha256.is_some() || expected.is_none() {
+                if sha256.is_some() || expected.is_none() {
                     return Err(Error::Invalid(
                         "local declaration requires expect and bytes",
                     ));
@@ -250,6 +229,16 @@ impl Config {
             None => home.child("store"),
         }
     }
+    pub fn uses_peers(&self) -> bool {
+        self.pins.values().any(|declaration| {
+            let locator = match declaration {
+                Declaration::Locator(locator) => Some(locator),
+                Declaration::Object(object) => object.url.as_ref(),
+            };
+            matches!(locator, Some(Locator::Hellas { .. }))
+        })
+    }
+
     pub fn validate(&self) -> Result<()> {
         for (name, declaration) in &self.pins {
             PinName::new(name.clone())?;
@@ -330,9 +319,10 @@ impl Reconciler {
                 if store.core.declaration_applied(name.clone(), digest).await? {
                     continue;
                 }
-                let target = expected.map(|object| match &source {
-                    Some(Source::HfXet { path: None, .. }) => Target::Tree(object),
-                    _ => Target::Object(object),
+                let target = expected.and_then(|object| match &source {
+                    Some(Source::HfXet { path: None, .. }) => Some(Target::Tree(object)),
+                    Some(Source::Peer { .. }) => None,
+                    _ => Some(Target::Object(object)),
                 });
                 let staging = PinName::new(format!(
                     "{STAGING}{}",
@@ -366,7 +356,7 @@ impl Reconciler {
                             .acquire(
                                 &Scope::Owner,
                                 source,
-                                target.map(Target::object),
+                                expected,
                                 PinTarget {
                                     name: staging.clone(),
                                     policy: PinPolicy::Owner,
@@ -451,7 +441,6 @@ mod tests {
         let object = ContentRef::for_bytes(bytes);
         Declaration::Object(Object {
             url: None,
-            path: None,
             bytes: Some(object.bytes()),
             expect: Some(object.id().to_string()),
             sha256: None,
@@ -518,9 +507,10 @@ mod tests {
         config.lower.clear();
         let sha = "a".repeat(40);
         let uri = format!("hf://org/repo@{sha}");
-        config
-            .pins
-            .insert("config/model".into(), Declaration::Hf(uri.clone()));
+        config.pins.insert(
+            "config/model".into(),
+            Declaration::Locator(uri.parse().unwrap()),
+        );
         let mut store = node(&config).await;
         store.finish_recovery().await.unwrap();
         let hf_name = format!("hf/org/repo@{sha}");
@@ -578,7 +568,7 @@ mod tests {
         let changed_sha = "b".repeat(40);
         config.pins.insert(
             "config/model".into(),
-            Declaration::Hf(format!("hf://org/repo@{changed_sha}")),
+            Declaration::Locator(format!("hf://org/repo@{changed_sha}").parse().unwrap()),
         );
         store = node(&config).await;
         store.finish_recovery().await.unwrap();
@@ -603,8 +593,7 @@ mod tests {
         config.pins.insert(
             "config/model".into(),
             Declaration::Object(Object {
-                url: Some(uri),
-                path: None,
+                url: Some(uri.parse().unwrap()),
                 bytes: Some(object.bytes()),
                 expect: Some(object.id().to_string()),
                 sha256: None,
@@ -749,7 +738,7 @@ mod tests {
             Declaration::Object(object) => object,
             _ => unreachable!(),
         };
-        object.url = Some(url.to_string());
+        object.url = Some(Locator::Https(url));
         config
             .pins
             .insert("config/download".into(), Declaration::Object(object));

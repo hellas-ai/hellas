@@ -185,31 +185,36 @@ pub(crate) async fn memory(
             )
             .await
         }
-        Source::Peer { node, at } => {
+        Source::Peer { id, seeds } => {
+            if expect.is_some_and(|expect| expect.id() != id) {
+                return Err(Error::Invalid("peer expectation"));
+            }
             let pool = store
                 .state
                 .lock()
                 .map_err(|_| Error::Invalid("store lock"))?
                 .peers
                 .clone()
-                .ok_or(Error::Invalid("no peer connection pool"))?;
-            let node =
-                iroh::EndpointId::from_bytes(&node).map_err(|_| Error::Invalid("peer identity"))?;
-            let transport = pool
-                .transport(node)
-                .await
-                .map_err(|_| Error::Invalid("peer connection failed"))?;
-            let remote = RemoteStore::new(transport, store.pool.clone());
-            let root = remote
-                .stat(&Scope::Public, &at)
-                .await?
-                .ok_or(Error::Missing)?
-                .target;
-            if expect.is_some_and(|expect| expect != root.object()) {
-                return Err(Error::Invalid("peer expectation"));
+                .filter(|_| !seeds.is_empty())
+                .ok_or_else(super::locator::no_peer)?;
+            let at = Path::new(PinName::new(format!("object/{id}"))?, String::new())?;
+            for seed in seeds {
+                let Ok(transport) = pool.transport(seed).await else {
+                    continue;
+                };
+                let remote = RemoteStore::new(transport, store.pool.clone());
+                let Ok(Some(found)) = remote.stat(&Scope::Public, &at).await else {
+                    continue;
+                };
+                let root = found.target;
+                if root.object().id() != id || expect.is_some_and(|expect| expect != root.object())
+                {
+                    continue;
+                }
+                let pin = root_pin(pin, || format!("peer/{id}"))?;
+                return peer(store, scope, &remote, &at, root, pin, requester).await;
             }
-            let pin = root_pin(pin, || format!("peer/{}", root.object().id()))?;
-            peer(store, scope, &remote, &at, root, pin, requester).await
+            Err(super::locator::no_peer())
         }
         Source::HfXet { repo, path } => {
             repo.validate().map_err(hf_error)?;
