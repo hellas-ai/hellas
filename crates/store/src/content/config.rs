@@ -201,24 +201,15 @@ impl MissPolicy {
                 }
                 Arc::new(AllowList {
                     fixed: sources,
-                    hints: hints
-                        .as_ref()
-                        .map(|hints| {
-                            HintPolicy::new(
-                                hints.callers.clone(),
-                                hints.kinds.clone(),
-                                hints.per_job_bytes.0,
-                                hints.total_bytes.0,
-                            )
-                        })
-                        .transpose()?,
+                    hints: hints.as_ref().map(HintConfig::policy).transpose()?,
                 })
             }
         })
     }
 }
 
-/// Source hints a provider follows on a miss. Without this table it follows none.
+/// Source hints a provider follows on a miss. Without this table it follows
+/// none, and it follows `https` hints only when `kinds` names `https`.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HintConfig {
@@ -226,6 +217,21 @@ pub struct HintConfig {
     kinds: BTreeSet<LocatorKind>,
     per_job_bytes: Bytes,
     total_bytes: Bytes,
+    /// Let `https` hints reach loopback, private, link-local and other
+    /// non-public addresses. Off: such destinations are refused.
+    #[serde(default)]
+    allow_private_addresses: bool,
+}
+impl HintConfig {
+    pub(crate) fn policy(&self) -> Result<HintPolicy> {
+        HintPolicy::new(
+            self.callers.clone(),
+            self.kinds.clone(),
+            self.per_job_bytes.0,
+            self.total_bytes.0,
+            self.allow_private_addresses,
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

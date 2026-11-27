@@ -304,7 +304,14 @@ impl LocalStore {
                         continue;
                     }
                     match destination
-                        .acquire_hint(&owner, source, object, pin.clone(), requester.clone())
+                        .acquire_hint(
+                            &owner,
+                            source,
+                            object,
+                            pin.clone(),
+                            requester.clone(),
+                            policy,
+                        )
                         .await
                     {
                         Ok(()) => {

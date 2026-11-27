@@ -131,8 +131,9 @@ pub(crate) async fn memory(
     expect: Option<ContentRef>,
     pin: Publication,
     requester: Option<(Core, Scope)>,
-    hint: bool,
+    hint: Option<&HintPolicy>,
 ) -> Result<Acquisition> {
+    let hinted = hint.is_some();
     match source {
         Source::Https { url, sha256, bytes } => {
             validate_https(&url)?;
@@ -148,7 +149,7 @@ pub(crate) async fn memory(
                 .map(|bytes| Ok::<_, Error>((bytes, store.reserve(bytes)?)))
                 .transpose()?;
             let core = store.clone();
-            let http = store.http.clone();
+            let http = hint.map_or_else(|| store.http.clone(), |policy| policy.agent(&store.http));
             let stage = tokio::task::spawn_blocking(move || {
                 let response = http
                     .get(url.as_str())
@@ -209,7 +210,7 @@ pub(crate) async fn memory(
                     continue;
                 };
                 let root = found.target;
-                if hint && !matches!(root, Target::Object(_)) {
+                if hinted && !matches!(root, Target::Object(_)) {
                     continue;
                 }
                 if root.object().id() != id || expect.is_some_and(|expect| expect != root.object())
@@ -237,7 +238,7 @@ pub(crate) async fn memory(
             if let Some(path) = &path {
                 super::tree::validate_path(path, false)?;
             }
-            if hint && (repo.default_branch || !crate::hf::immutable_sha(&repo.revision)) {
+            if hinted && (repo.default_branch || !crate::hf::immutable_sha(&repo.revision)) {
                 let core = store.clone();
                 let source = repo.clone();
                 repo.revision = tokio::task::spawn_blocking(move || {
@@ -258,7 +259,7 @@ pub(crate) async fn memory(
             let source_repo = repo.clone();
             let (stages, root, files) = tokio::task::spawn_blocking(move || {
                 let cas = core.hf(source_repo);
-                hf_stages(&cas, &core, path.as_deref(), expect, true, hint)
+                hf_stages(&cas, &core, path.as_deref(), expect, true, hinted)
             })
             .await
             .map_err(|_| Error::Invalid("HF worker failed"))??;

@@ -2,8 +2,10 @@ use super::{JobId, Locator, LocatorKind, Scope, Source};
 use hellas_rpc::{ContentId, ContentRef};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    net::IpAddr,
     sync::Mutex,
 };
+use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StoreStats {
@@ -66,6 +68,7 @@ pub struct HintPolicy {
     kinds: BTreeSet<LocatorKind>,
     per_job_bytes: u64,
     total_bytes: u64,
+    allow_private_addresses: bool,
     spent: Mutex<(u64, BTreeMap<JobId, u64>)>,
 }
 
@@ -75,19 +78,46 @@ impl HintPolicy {
         kinds: BTreeSet<LocatorKind>,
         per_job_bytes: u64,
         total_bytes: u64,
+        allow_private_addresses: bool,
     ) -> super::Result<Self> {
         if callers.is_empty() || kinds.is_empty() || per_job_bytes > total_bytes {
             return Err(super::Error::Invalid(
                 "source hint callers, kinds and budgets",
             ));
         }
+        if kinds.contains(&LocatorKind::Https) {
+            tracing::warn!(
+                "https source hints enabled: this provider will fetch URLs supplied by eligible callers"
+            );
+            if allow_private_addresses {
+                tracing::warn!(
+                    "https source hints may reach loopback, private and link-local networks \
+                     (including cloud metadata services): allow_private_addresses is set"
+                );
+            }
+        }
         Ok(Self {
             callers,
             kinds,
             per_job_bytes,
             total_bytes,
+            allow_private_addresses,
             spent: Mutex::default(),
         })
+    }
+
+    /// The agent for an HTTPS hint. Unless private destinations are allowed,
+    /// every connection, including each redirect hop, goes only to addresses
+    /// vetted as public at the moment they were resolved.
+    pub(crate) fn agent(&self, base: &ureq::Agent) -> ureq::Agent {
+        if self.allow_private_addresses {
+            return base.clone();
+        }
+        ureq::Agent::with_parts(
+            base.config().clone(),
+            ureq::unversioned::transport::DefaultConnector::new(),
+            PublicOnly,
+        )
     }
 
     /// A Hub hint must name one file: its cost is bounded by the expected object.
@@ -111,6 +141,59 @@ impl HintPolicy {
         *total += bytes;
         jobs.insert(job, used + bytes);
         true
+    }
+}
+
+/// Resolves like ureq, but refuses a name with any non-public address.
+#[derive(Debug)]
+struct PublicOnly;
+impl Resolver for PublicOnly {
+    fn resolve(
+        &self,
+        uri: &ureq::http::Uri,
+        config: &ureq::config::Config,
+        timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> Result<ResolvedSocketAddrs, ureq::Error> {
+        let addresses = DefaultResolver::default().resolve(uri, config, timeout)?;
+        if addresses.iter().all(|address| public(address.ip())) {
+            Ok(addresses)
+        } else {
+            Err(ureq::Error::BadUri(
+                "non-public source hint destination".into(),
+            ))
+        }
+    }
+}
+
+/// Globally routable unicast, as the HTTP provider's egress policy defines
+/// it; `IpAddr::is_global` is not yet stable.
+fn public(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let [a, b, c, _] = ip.octets();
+            !(ip.is_unspecified()
+                || ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || ip.is_broadcast()
+                || ip.is_documentation()
+                || ip.is_multicast()
+                || a == 0
+                || a >= 240
+                || (a == 100 && (64..=127).contains(&b)) // shared address space
+                || (a == 198 && (b == 18 || b == 19)) // benchmarking
+                || (a == 192 && b == 0 && c == 0)) // IETF protocol assignments
+        }
+        IpAddr::V6(ip) => {
+            // Global unicast only: this excludes loopback, unspecified, ULA
+            // (fc00::/7), link-local (fe80::/10), multicast and IPv4-mapped
+            // addresses, then documentation and transition ranges.
+            let [a, b, ..] = ip.segments();
+            a & 0xe000 == 0x2000
+                && a != 0x2002
+                && !(a == 0x2001 && (b < 0x0200 || b == 0x0db8))
+                && !(a == 0x3fff && b < 0x1000)
+        }
     }
 }
 
@@ -192,6 +275,7 @@ mod tests {
                     BTreeSet::from([LocatorKind::Https]),
                     object.bytes(),
                     object.bytes(),
+                    true,
                 )
                 .unwrap(),
             ),
@@ -237,6 +321,7 @@ mod tests {
             BTreeSet::from([LocatorKind::Https]),
             5,
             8,
+            false,
         )
         .unwrap();
         let other = JobId {
@@ -248,6 +333,29 @@ mod tests {
         assert!(!policy.charge(job(), 1));
         assert!(policy.charge(other, 3));
         assert!(!policy.charge(other, 1));
+    }
+
+    #[test]
+    fn https_hints_are_off_unless_named_and_refuse_loopback_unless_allowed() {
+        let hints = |kinds: &str, extra: &str| -> HintPolicy {
+            let config: crate::content::config::HintConfig = serde_json::from_str(&format!(
+                r#"{{"callers":["paid"],"kinds":[{kinds}],"per_job_bytes":1,"total_bytes":1{extra}}}"#
+            ))
+            .unwrap();
+            config.policy().unwrap()
+        };
+        let (url, http, serving) = super::super::acquire::tests::https(b"weights");
+        let https = Locator::Https(url.clone());
+        assert!(!hints(r#""hellas","hf""#, "").follows(HintCaller::Paid, &https));
+
+        let fetch = |policy: HintPolicy| policy.agent(&http).get(url.as_str()).call();
+        assert!(matches!(
+            fetch(hints(r#""https""#, "")),
+            Err(ureq::Error::BadUri(_))
+        ));
+        let allowed = hints(r#""https""#, r#","allow_private_addresses":true"#);
+        assert_eq!(fetch(allowed).unwrap().status(), 200);
+        serving.join().unwrap();
     }
 
     #[tokio::test]

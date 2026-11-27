@@ -465,7 +465,10 @@ For remote Compute and Fetch jobs, repeat
 `--source-hint 'CONTENT_ID=LOCATOR'` to offer alternate locations for objects
 the job already declares. A locator can be an HTTPS URL, a Hub file, or a
 Hellas object locator. A provider only uses hints on a cache miss when its
-content policy follows hints from that caller and locator kind. The job identity and
+content policy follows hints from that caller and locator kind; HTTPS hints
+are off by default and never reach private or loopback addresses unless the
+provider allows them (see [the store README](../crates/store/README.md#job-source-hints)).
+The job identity and
 signed request are independent of the hints, which can be supplied again on
 retry.
 

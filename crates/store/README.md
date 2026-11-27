@@ -62,10 +62,19 @@ its declared ID and length. A provider follows no hints unless it opts in:
 ```toml
 [content.policy.on_miss.hints]
 callers = ["paid", "grant"]
-kinds = ["hellas", "hf", "https"]
+kinds = ["hellas", "hf"]
 per_job_bytes = 104857600
 total_bytes = 1073741824
 ```
+
+HTTPS hints are off unless `kinds` names `"https"`. Enabling them lets eligible
+callers choose URLs this provider fetches, and logs a warning at startup. Each
+hint connection, and each redirect hop, goes only to the addresses resolved
+for it, and refuses loopback, private (RFC 1918, ULA), link-local (including
+`169.254.169.254`), unspecified and other non-global addresses, so an HTTP
+proxy on such an address is refused too. `allow_private_addresses = true`
+lifts that check and logs a stronger warning; use it only on an isolated test
+network.
 
 `allow_list` entries take precedence. A Hub hint must name a single file, and
 a Hellas hint must name a seed. Each attempt is charged the expected object

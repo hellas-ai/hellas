@@ -1542,7 +1542,7 @@ impl Core {
                     Ok(())
                 })
                 .await?;
-                super::acquire::memory(&core, &scope, source, expect, pin, requester, false).await
+                super::acquire::memory(&core, &scope, source, expect, pin, requester, None).await
             }
         })
         .await
@@ -1557,6 +1557,7 @@ impl Core {
         expected: ContentRef,
         pin: PinTarget,
         requester: (Core, Scope),
+        policy: &HintPolicy,
     ) -> Result<()> {
         let checking = requester.clone();
         let named = pin.clone();
@@ -1570,7 +1571,7 @@ impl Core {
             biased;
             () = live.ended() => Err(Error::Denied),
             outcome = super::acquire::memory(
-                self, scope, source, Some(expected), AcquirePin::Named(pin).into(), Some(requester), true,
+                self, scope, source, Some(expected), AcquirePin::Named(pin).into(), Some(requester), Some(policy),
             ) => outcome.map(|_| ()),
         }
     }
