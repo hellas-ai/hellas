@@ -1,6 +1,9 @@
-use super::{Scope, Source};
+use super::{JobId, Locator, LocatorKind, Scope, Source};
 use hellas_rpc::{ContentId, ContentRef};
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Mutex,
+};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StoreStats {
@@ -18,6 +21,10 @@ pub enum MissDecision {
 }
 pub trait OnMiss: Send + Sync {
     fn decide(&self, miss: &Miss, stats: &StoreStats) -> MissDecision;
+
+    fn hints(&self) -> Option<&HintPolicy> {
+        None
+    }
 }
 pub struct Refuse;
 impl OnMiss for Refuse {
@@ -25,17 +32,88 @@ impl OnMiss for Refuse {
         MissDecision::Refuse
     }
 }
-pub struct AllowList(pub BTreeMap<ContentId, (u64, Source)>);
+/// Administrator-fixed sources, plus any unsigned job hints the provider follows.
+pub struct AllowList {
+    pub fixed: BTreeMap<ContentId, (u64, Source)>,
+    pub hints: Option<HintPolicy>,
+}
 impl OnMiss for AllowList {
     fn decide(&self, miss: &Miss, _: &StoreStats) -> MissDecision {
-        self.0
+        self.fixed
             .get(&miss.object.id())
             .filter(|(bytes, _)| *bytes == miss.object.bytes())
             .map_or(MissDecision::Refuse, |(_, source)| MissDecision::Acquire {
                 source: source.clone(),
             })
     }
+
+    fn hints(&self) -> Option<&HintPolicy> {
+        self.hints.as_ref()
+    }
 }
+/// The funding host supplies the caller class after checking the signed opening.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HintCaller {
+    Paid,
+    Grant,
+}
+
+/// Which callers' hints a provider follows, by locator kind, and the bytes
+/// those attempts may cost each job and the provider as a whole.
+pub struct HintPolicy {
+    callers: BTreeSet<HintCaller>,
+    kinds: BTreeSet<LocatorKind>,
+    per_job_bytes: u64,
+    total_bytes: u64,
+    spent: Mutex<(u64, BTreeMap<JobId, u64>)>,
+}
+
+impl HintPolicy {
+    pub fn new(
+        callers: BTreeSet<HintCaller>,
+        kinds: BTreeSet<LocatorKind>,
+        per_job_bytes: u64,
+        total_bytes: u64,
+    ) -> super::Result<Self> {
+        if callers.is_empty() || kinds.is_empty() || per_job_bytes > total_bytes {
+            return Err(super::Error::Invalid(
+                "source hint callers, kinds and budgets",
+            ));
+        }
+        Ok(Self {
+            callers,
+            kinds,
+            per_job_bytes,
+            total_bytes,
+            spent: Mutex::default(),
+        })
+    }
+
+    /// A Hub hint must name one file: its cost is bounded by the expected object.
+    pub(crate) fn follows(&self, caller: HintCaller, locator: &Locator) -> bool {
+        self.callers.contains(&caller)
+            && self.kinds.contains(&locator.kind())
+            && !matches!(locator, Locator::Hub(reference) if reference.selector.is_none())
+    }
+
+    /// Charge an attempt to the job and the provider before any egress. A failed
+    /// attempt keeps its charge.
+    pub(crate) fn charge(&self, job: JobId, bytes: u64) -> bool {
+        let Ok(mut spent) = self.spent.lock() else {
+            return false;
+        };
+        let (total, jobs) = &mut *spent;
+        let used = jobs.get(&job).copied().unwrap_or(0);
+        if bytes > self.total_bytes - *total || bytes > self.per_job_bytes - used {
+            return false;
+        }
+        *total += bytes;
+        jobs.insert(job, used + bytes);
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -62,19 +140,116 @@ mod tests {
         node
     }
     fn allow(node: &DiskStore, object: ContentRef, url: url::Url) {
-        node.set_on_miss(Arc::new(AllowList(BTreeMap::from([(
-            object.id(),
-            (
-                object.bytes(),
-                Source::Https {
-                    url,
-                    sha256: None,
-                    bytes: Some(object.bytes()),
-                },
-            ),
-        )]))))
+        node.set_on_miss(Arc::new(AllowList {
+            fixed: BTreeMap::from([(
+                object.id(),
+                (
+                    object.bytes(),
+                    Source::Https {
+                        url,
+                        sha256: None,
+                        bytes: Some(object.bytes()),
+                    },
+                ),
+            )]),
+            hints: None,
+        }))
         .unwrap();
     }
+    #[tokio::test]
+    async fn authenticated_hints_fetch_only_an_allowed_missing_object() {
+        let root = tempfile::tempdir().unwrap();
+        let mut node = node(root.path(), vec![]).await;
+        let object = ContentRef::for_bytes(b"hinted weights");
+        let reference = ContentRef::for_bytes(b"root");
+        let outside = ContentRef::for_bytes(b"not in the work closure");
+        let (url, http, serving) = super::super::acquire::tests::https(b"hinted weights");
+        node.core.http = http;
+        let hints = SourceHints::new(BTreeMap::from([
+            (object.id(), vec![Locator::Https(url.clone())]),
+            (outside.id(), vec![Locator::Https(url.clone())]),
+        ]))
+        .unwrap();
+        let work = JobContent::new(&node, job(), vec![reference], reference.bytes())
+            .await
+            .unwrap();
+        let scope = work.scope().clone();
+        let local = LocalStore::Job(work);
+        let closure = vec![reference, object];
+        assert!(
+            local
+                .acquire_hinted_misses(&scope, closure.clone(), HintCaller::Grant, &hints)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        node.set_on_miss(Arc::new(AllowList {
+            fixed: BTreeMap::new(),
+            hints: Some(
+                HintPolicy::new(
+                    BTreeSet::from([HintCaller::Grant]),
+                    BTreeSet::from([LocatorKind::Https]),
+                    object.bytes(),
+                    object.bytes(),
+                )
+                .unwrap(),
+            ),
+        }))
+        .unwrap();
+        assert!(
+            local
+                .acquire_hinted_misses(&scope, closure.clone(), HintCaller::Paid, &hints)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            local
+                .acquire_hinted_misses(&scope, closure, HintCaller::Grant, &hints)
+                .await
+                .unwrap(),
+            BTreeSet::from([object.id()]),
+        );
+        serving.join().unwrap();
+        let LocalStore::Job(work) = local else {
+            unreachable!()
+        };
+        let widened = work
+            .widen(vec![reference, object], reference.bytes())
+            .await
+            .unwrap();
+        let mut reader = LocalStore::Job(widened.clone())
+            .open_verified(widened.scope(), object, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"hinted weights");
+        widened.end().await.unwrap();
+    }
+
+    #[test]
+    fn every_attempt_is_charged_to_its_job_and_provider() {
+        let policy = HintPolicy::new(
+            BTreeSet::from([HintCaller::Paid]),
+            BTreeSet::from([LocatorKind::Https]),
+            5,
+            8,
+        )
+        .unwrap();
+        let other = JobId {
+            id: hellas_auth::Digest::from_bytes([43; 32]),
+            ..job()
+        };
+        assert!(!policy.charge(job(), 6));
+        assert!(policy.charge(job(), 5));
+        assert!(!policy.charge(job(), 1));
+        assert!(policy.charge(other, 3));
+        assert!(!policy.charge(other, 1));
+    }
+
     #[tokio::test]
     async fn the_same_policy_fetches_before_ram_widening_and_releases_work_pins_for_both_uppers() {
         for ephemeral in [false, true] {

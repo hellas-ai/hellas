@@ -440,6 +440,7 @@ async fn idle_work_upload_ends_on_its_proposal_cancellation_or_deadline() {
         let mut call = ContentClientImpl::new(client).upload().await.unwrap();
         call.send(pb::UploadRequest {
             part: Some(pb::upload_request::Part::Open(pb::UploadOpen {
+                source_hints: Vec::new(),
                 object: Some(pb::ContentRef {
                     id: object.id().as_bytes().to_vec(),
                     bytes: object.bytes(),

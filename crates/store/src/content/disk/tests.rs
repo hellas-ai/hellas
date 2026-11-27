@@ -710,17 +710,20 @@ async fn acquired_pin_deletion_can_retry_after_sql_failure_even_when_work_has_en
         let (url, http, serving) = super::super::acquire::tests::https(b"weights");
         store.core.http = http;
         store
-            .set_on_miss(Arc::new(AllowList(BTreeMap::from([(
-                object.id(),
-                (
-                    object.bytes(),
-                    Source::Https {
-                        url,
-                        sha256: None,
-                        bytes: Some(object.bytes()),
-                    },
-                ),
-            )]))))
+            .set_on_miss(Arc::new(AllowList {
+                fixed: BTreeMap::from([(
+                    object.id(),
+                    (
+                        object.bytes(),
+                        Source::Https {
+                            url,
+                            sha256: None,
+                            bytes: Some(object.bytes()),
+                        },
+                    ),
+                )]),
+                hints: None,
+            }))
             .unwrap();
         let (local, scope) = if ephemeral {
             let work = JobContent::new(&store, recovery_job(), vec![], 0)

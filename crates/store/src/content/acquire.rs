@@ -131,6 +131,7 @@ pub(crate) async fn memory(
     expect: Option<ContentRef>,
     pin: Publication,
     requester: Option<(Core, Scope)>,
+    hint: bool,
 ) -> Result<Acquisition> {
     match source {
         Source::Https { url, sha256, bytes } => {
@@ -208,6 +209,9 @@ pub(crate) async fn memory(
                     continue;
                 };
                 let root = found.target;
+                if hint && !matches!(root, Target::Object(_)) {
+                    continue;
+                }
                 if root.object().id() != id || expect.is_some_and(|expect| expect != root.object())
                 {
                     continue;
@@ -228,10 +232,23 @@ pub(crate) async fn memory(
             }
             Err(super::locator::no_peer())
         }
-        Source::HfXet { repo, path } => {
+        Source::HfXet { mut repo, path } => {
             repo.validate().map_err(hf_error)?;
             if let Some(path) = &path {
                 super::tree::validate_path(path, false)?;
+            }
+            if hint && (repo.default_branch || !crate::hf::immutable_sha(&repo.revision)) {
+                let core = store.clone();
+                let source = repo.clone();
+                repo.revision = tokio::task::spawn_blocking(move || {
+                    let default_branch = source.default_branch;
+                    core.hf(source)
+                        .resolve_revision(default_branch, &core.pool)
+                        .map_err(hf_error)
+                })
+                .await
+                .map_err(|_| Error::Invalid("resolve worker failed"))??;
+                repo.default_branch = false;
             }
             if !crate::hf::immutable_sha(&repo.revision) {
                 return Err(Error::Invalid("HF immutable commit"));
@@ -241,7 +258,7 @@ pub(crate) async fn memory(
             let source_repo = repo.clone();
             let (stages, root, files) = tokio::task::spawn_blocking(move || {
                 let cas = core.hf(source_repo);
-                hf_stages(&cas, &core, path.as_deref(), expect, true)
+                hf_stages(&cas, &core, path.as_deref(), expect, true, hint)
             })
             .await
             .map_err(|_| Error::Invalid("HF worker failed"))??;
@@ -424,6 +441,7 @@ fn hf_stages(
     path: Option<&str>,
     expect: Option<ContentRef>,
     weights: bool,
+    file_only: bool,
 ) -> Result<HfStages> {
     let (mut files, _metadata) = cas.files(&core.pool).map_err(hf_error)?;
     let mut stages = BTreeMap::new();
@@ -436,6 +454,9 @@ fn hf_stages(
             root,
             BTreeMap::from([(file.path.clone(), root.object())]),
         ));
+    }
+    if file_only {
+        return Err(Error::Missing);
     }
     let prefix = path.map_or_else(String::new, |path| format!("{path}/"));
     if path.is_some() {
@@ -569,7 +590,7 @@ impl Core {
         let alias = hf_tree_alias(&repo)?;
         let sha = repo.revision.clone();
         let (stages, root, _) = tokio::task::spawn_blocking(move || {
-            hf_stages(&core.hf(repo), &core, None, None, false)
+            hf_stages(&core.hf(repo), &core, None, None, false, false)
         })
         .await
         .map_err(|_| Error::Invalid("resolve worker failed"))??;

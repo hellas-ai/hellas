@@ -1,7 +1,10 @@
 //! Declared node content, reconciled through the ordinary scoped store operations.
 use super::{owner_pin as pin, owner_pins as snapshot, *};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+};
 
 const MANAGED: &str = "config/";
 const STAGING: &str = "config/.acquire/";
@@ -147,7 +150,9 @@ impl Declaration {
 pub enum MissPolicy {
     Name(RefuseName),
     Allow {
+        #[serde(default)]
         allow_list: BTreeMap<String, Object>,
+        hints: Option<HintConfig>,
     },
 }
 #[derive(Clone, Debug, Deserialize)]
@@ -164,7 +169,7 @@ impl MissPolicy {
     fn policy(&self) -> Result<Arc<dyn OnMiss>> {
         Ok(match self {
             Self::Name(RefuseName::Refuse) => Arc::new(Refuse),
-            Self::Allow { allow_list } => {
+            Self::Allow { allow_list, hints } => {
                 let mut sources = BTreeMap::new();
                 for (id, object) in allow_list {
                     if object.policy.is_some() {
@@ -194,10 +199,33 @@ impl MissPolicy {
                         ),
                     );
                 }
-                Arc::new(AllowList(sources))
+                Arc::new(AllowList {
+                    fixed: sources,
+                    hints: hints
+                        .as_ref()
+                        .map(|hints| {
+                            HintPolicy::new(
+                                hints.callers.clone(),
+                                hints.kinds.clone(),
+                                hints.per_job_bytes.0,
+                                hints.total_bytes.0,
+                            )
+                        })
+                        .transpose()?,
+                })
             }
         })
     }
+}
+
+/// Source hints a provider follows on a miss. Without this table it follows none.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HintConfig {
+    callers: BTreeSet<HintCaller>,
+    kinds: BTreeSet<LocatorKind>,
+    per_job_bytes: Bytes,
+    total_bytes: Bytes,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

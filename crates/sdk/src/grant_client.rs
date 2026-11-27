@@ -414,9 +414,14 @@ struct PreparedUpload {
     manifest: Vec<u8>,
     root: Option<Vec<u8>>,
     objects: Vec<ContentRef>,
+    hints: hellas_store::content::SourceHints,
 }
 impl PreparedUpload {
-    async fn new(input: &PreparedInvocation, content: &(LocalStore, Scope)) -> Result<Self> {
+    async fn new(
+        input: &PreparedInvocation,
+        content: &(LocalStore, Scope),
+        hints: hellas_store::content::SourceHints,
+    ) -> Result<Self> {
         let bytes = input.canonical_bytes()?;
         let reference = ContentRef::for_bytes(&bytes);
         let manifest = input.manifest();
@@ -442,6 +447,7 @@ impl PreparedUpload {
             manifest: manifest.canonical_bytes(),
             root,
             objects,
+            hints,
         })
     }
 }
@@ -534,7 +540,8 @@ impl Link {
                 ($transport:expr) => {{
                     let remote =
                         hellas_store::content::RemoteStore::new($transport, content.0.ram_pool())
-                            .with_opening(opening);
+                            .with_opening(opening)
+                            .with_source_hints(&input.hints);
                     let transferred: std::result::Result<(), hellas_store::content::Error> =
                         async {
                             for object in std::iter::once(first).chain(
@@ -649,6 +656,13 @@ enum GrantSelection<'a> {
     Resource(hellas_auth::authority::ResourceId),
 }
 
+#[derive(Clone)]
+struct PendingUpload {
+    body: PreparedInvocation,
+    content: (LocalStore, Scope),
+    hints: hellas_store::content::SourceHints,
+}
+
 pub struct GrantSession {
     options: GrantSessionOptions,
     transport: SessionTransport,
@@ -658,7 +672,7 @@ pub struct GrantSession {
     observed: UnixMillis,
     standing_now: UnixMillis,
     observed_at: Instant,
-    pending_body: std::collections::BTreeMap<Digest, (PreparedInvocation, (LocalStore, Scope))>,
+    pending_body: std::collections::BTreeMap<Digest, PendingUpload>,
 }
 impl GrantSession {
     pub(crate) fn reusable_with(&self, options: &GrantSessionOptions) -> bool {
@@ -846,7 +860,11 @@ impl GrantSession {
         let signature = job.client_signature();
         let prepared = self.pending_body.get(&id).cloned();
         let prepared = match prepared {
-            Some((body, content)) => Some((PreparedUpload::new(&body, &content).await?, content)),
+            Some(PendingUpload {
+                body,
+                content,
+                hints,
+            }) => Some((PreparedUpload::new(&body, &content, hints).await?, content)),
             None => None,
         };
         let probe = prepared.is_none();
@@ -1026,7 +1044,14 @@ impl GrantSession {
         tracker: Option<&mut crate::execution::GrantAttempt>,
     ) -> Result<GrantWorkResult> {
         let delivery = self
-            .propose_selected(selection, input, content, proposed, tracker)
+            .propose_selected(
+                selection,
+                input,
+                content,
+                &Default::default(),
+                proposed,
+                tracker,
+            )
             .await?;
         let completed = delivery.collect(progress, accepted).await?;
         self.complete(completed).await
@@ -1037,6 +1062,7 @@ impl GrantSession {
         resource: hellas_auth::authority::ResourceId,
         input: PreparedInvocation,
         content: &(LocalStore, Scope),
+        hints: &hellas_store::content::SourceHints,
         proposed: Option<&std::sync::atomic::AtomicBool>,
         tracker: Option<&mut crate::execution::GrantAttempt>,
     ) -> Result<GrantDelivery> {
@@ -1044,6 +1070,7 @@ impl GrantSession {
             GrantSelection::Resource(resource),
             input,
             content,
+            hints,
             proposed,
             tracker,
         )
@@ -1055,11 +1082,12 @@ impl GrantSession {
         selection: GrantSelection<'_>,
         input: PreparedInvocation,
         content: &(LocalStore, Scope),
+        hints: &hellas_store::content::SourceHints,
         proposed: Option<&std::sync::atomic::AtomicBool>,
         tracker: Option<&mut crate::execution::GrantAttempt>,
     ) -> Result<GrantDelivery> {
         let (policy, id, link, finish_by) = self
-            .admit(selection, &input, content, proposed, tracker)
+            .admit(selection, &input, content, hints, proposed, tracker)
             .await?;
         let acceptance_signature = self
             .store
@@ -1111,6 +1139,7 @@ impl GrantSession {
         selection: GrantSelection<'_>,
         input: &PreparedInvocation,
         content: &(LocalStore, Scope),
+        hints: &hellas_store::content::SourceHints,
         proposed: Option<&std::sync::atomic::AtomicBool>,
         mut tracker: Option<&mut crate::execution::GrantAttempt>,
     ) -> Result<(GrantPolicy, Digest, Link, tokio::time::Instant)> {
@@ -1121,7 +1150,7 @@ impl GrantSession {
             return Err(GrantProtocolError::Assurance.into());
         }
         let channel = self.store.channel().id;
-        let prepared = PreparedUpload::new(input, content).await?;
+        let prepared = PreparedUpload::new(input, content, hints.clone()).await?;
         let prepared_input_digest = hellas_channel::job::bound_prepared_input_digest(
             self.target.network,
             channel.0,
@@ -1218,8 +1247,14 @@ impl GrantSession {
             .store
             .propose(&self.offer, a, input, &self.options.signer, now, proposed)
             .await?;
-        self.pending_body
-            .insert(id, (input.clone(), content.clone()));
+        self.pending_body.insert(
+            id,
+            PendingUpload {
+                body: input.clone(),
+                content: content.clone(),
+                hints: hints.clone(),
+            },
+        );
 
         let request = AcceptWorkRequest {
             route: Some(WorkRoute::grant(channel.0)),

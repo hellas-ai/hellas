@@ -498,6 +498,10 @@ async fn generic_fetch_through_a_grant_uses_the_provider_sealed_credential_witho
     .unwrap();
     let url = format!("{}/v1/chat/completions", host.https.origin);
     let data = format!("@{}", body.display());
+    let hint = format!(
+        "{}=https://example.test/unrelated",
+        hellas_rpc::ContentId::hash(b"outside this Fetch closure"),
+    );
     let arguments = vec![
         "fetch",
         &url,
@@ -513,6 +517,8 @@ async fn generic_fetch_through_a_grant_uses_the_provider_sealed_credential_witho
         string(&root),
         "--max-response-bytes",
         "65536",
+        "--source-hint",
+        &hint,
         "--access",
         string(&access),
     ];

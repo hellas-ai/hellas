@@ -17,7 +17,24 @@ pub enum Locator {
     Https(Url),
 }
 
+/// A locator's scheme, as named in provider hint policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LocatorKind {
+    Hellas,
+    Hf,
+    Https,
+}
+
 impl Locator {
+    pub const fn kind(&self) -> LocatorKind {
+        match self {
+            Self::Hellas { .. } => LocatorKind::Hellas,
+            Self::Hub(_) => LocatorKind::Hf,
+            Self::Https(_) => LocatorKind::Https,
+        }
+    }
+
     pub fn into_source(
         self,
         bytes: Option<u64>,

@@ -52,6 +52,27 @@ length without `expect`. With no URL, `expect` and `bytes` name a local object. 
 file and are sent only to HF HTTPS origins. Downloads stream on blocking
 workers with bounded reservations and the existing read/idle timeouts.
 
+### Job source hints
+
+A remote job may carry unsigned hints naming locators for objects in its
+authenticated content closure. Hints sit outside the job identity, so a bad
+hint only fails its own fetch, and every fetched object is verified against
+its declared ID and length. A provider follows no hints unless it opts in:
+
+```toml
+[content.policy.on_miss.hints]
+callers = ["paid", "grant"]
+kinds = ["hellas", "hf", "https"]
+per_job_bytes = 104857600
+total_bytes = 1073741824
+```
+
+`allow_list` entries take precedence. A Hub hint must name a single file, and
+a Hellas hint must name a seed. Each attempt is charged the expected object
+size (per seed for Hellas) against the job and the provider before any
+egress, and keeps its charge if it fails. Budgets reset when the provider
+installs the policy again.
+
 ## Owner commands
 
 The normal mode is authenticated daemon RPC using an existing Owner profile:

@@ -43,6 +43,7 @@ pub struct Job {
     price: u64,
     input: Arc<JobInput>,
     manifest: ProgramManifest,
+    source_hints: hellas_store::content::SourceHints,
 }
 #[derive(Clone)]
 pub enum JobInput {
@@ -302,6 +303,16 @@ impl JobInput {
 }
 
 impl Job {
+    /// Supply acquisition candidates for the next remote execution.
+    pub fn with_source_hints(mut self, hints: hellas_store::content::SourceHints) -> Self {
+        self.source_hints = hints;
+        self
+    }
+
+    pub fn source_hints(&self) -> &hellas_store::content::SourceHints {
+        &self.source_hints
+    }
+
     pub fn from_input(price: u64, input: JobInput) -> Result<Self> {
         if price > i64::MAX as u64 {
             return Err(invalid("payment price must be a non-negative TOML integer"));
@@ -311,6 +322,7 @@ impl Job {
             price,
             input: Arc::new(input),
             manifest,
+            source_hints: Default::default(),
         })
     }
     pub fn fetch(

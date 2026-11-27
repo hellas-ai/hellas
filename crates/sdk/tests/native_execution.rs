@@ -151,7 +151,7 @@ async fn execute(
 ) -> Result<hellas_sdk::execution::Completed, hellas_sdk::execution::ExecutionError> {
     Ok(session
         .run(
-            &hellas_sdk::WorkRequest::Job(input),
+            &hellas_sdk::WorkRequest::Job(input, Default::default()),
             terms,
             signer,
             hellas_sdk::execution::Controls {

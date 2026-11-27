@@ -359,7 +359,8 @@ async fn resolve_tree_fetches_git_files_but_not_weights_and_missing_weights_stay
     });
     let cas = crate::hf::HfCas::new(repo(crate::hf::RepoKind::Model)).with_hub(base);
     let pool = Reservations::ram(16 << 20);
-    let (stages, root, _) = hf_stages(&cas, &Core::new(pool.clone()), None, None, false).unwrap();
+    let (stages, root, _) =
+        hf_stages(&cas, &Core::new(pool.clone()), None, None, false, false).unwrap();
     serving.join().unwrap();
     assert!(!stages.contains_key(&weight.id()));
     let store = MemoryStore::new(pool.clone());

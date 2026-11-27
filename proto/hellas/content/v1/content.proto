@@ -48,7 +48,9 @@ message WorkOpening {
   // One application signature binds this opening to the live connection.
   bytes binding_signature = 4;
 }
-message UploadOpen { ContentRef object = 1; PinTarget pin = 2; WorkOpening work = 3; }
+message SourceHint { bytes id = 1; repeated string locator = 2; }
+message SourceHints { repeated SourceHint entries = 1; }
+message UploadOpen { ContentRef object = 1; PinTarget pin = 2; WorkOpening work = 3; bytes source_hints = 4; }
 message ChunkList { repeated Chunk chunks = 1; bool complete = 2; }
 message UploadRequest {
   oneof part { UploadOpen open = 1; ChunkList list = 2; bytes chunk = 3; }

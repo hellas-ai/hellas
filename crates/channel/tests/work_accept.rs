@@ -315,6 +315,7 @@ async fn an_accepted_exchange_leaves_both_signatures_on_both_disks() {
         &mut endpoint,
         &proposal(1),
         &hellas_channel::test_support::channel::program_content().await,
+        &Default::default(),
         None,
     )
     .await;
@@ -380,11 +381,13 @@ async fn a_retained_compute_proposal_resumes_after_an_interrupted_preacceptance_
     let content = hellas_channel::test_support::channel::program_content().await;
     let pending_proposal = proposal(1);
     {
+        let hints = Default::default();
         let sending = propose_work(
             client_transport,
             &mut endpoint,
             &pending_proposal,
             &content,
+            &hints,
             None,
         );
         tokio::pin!(sending);
@@ -435,9 +438,14 @@ async fn a_retained_compute_proposal_resumes_after_an_interrupted_preacceptance_
     let (client_transport, server_transport) = transport_pair();
     let serving = serve(server_transport, service);
     let mut endpoint = ClientEndpoint::new(ready(), store, client()).unwrap();
-    let resumed =
-        hellas_channel::work::resume_work_proposal(client_transport, &mut endpoint, id, &content)
-            .await;
+    let resumed = hellas_channel::work::resume_work_proposal(
+        client_transport,
+        &mut endpoint,
+        id,
+        &content,
+        &Default::default(),
+    )
+    .await;
     serving.abort();
     let _ = serving.await;
     assert_eq!(
@@ -1671,6 +1679,7 @@ async fn expired_upload_returns_the_typed_refusal_and_preserves_the_signed_propo
         &mut endpoint,
         &proposal(1),
         &hellas_channel::test_support::channel::program_content().await,
+        &Default::default(),
         None,
     )
     .await;
@@ -2275,6 +2284,7 @@ async fn shared_client_can_follow_blocks_while_waiting_for_provider_acceptance()
             &mut client,
             &proposal(1),
             &hellas_channel::test_support::channel::program_content().await,
+            &Default::default(),
             None,
         )
         .await

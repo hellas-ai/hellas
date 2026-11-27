@@ -3758,6 +3758,7 @@ pub async fn propose_work<T>(
         hellas_store::content::LocalStore,
         hellas_store::content::Scope,
     ),
+    hints: &hellas_store::content::SourceHints,
     proposed: Option<Arc<AtomicBool>>,
 ) -> Result<Digest, ProposeError>
 where
@@ -3766,7 +3767,7 @@ where
     T::Stream: 'static,
 {
     let request = endpoint.propose(proposal, content, proposed).await?;
-    content::transfer_proposal(transport, endpoint, request, content).await
+    content::transfer_proposal(transport, endpoint, request, content, hints).await
 }
 
 /// Resend a retained proposal over a live transport and journal its answer.
@@ -3782,6 +3783,7 @@ pub async fn resume_work_proposal<T>(
         hellas_store::content::LocalStore,
         hellas_store::content::Scope,
     ),
+    hints: &hellas_store::content::SourceHints,
 ) -> Result<Digest, ProposeError>
 where
     T: StreamTransport + Clone + Send + Sync,
@@ -3789,7 +3791,7 @@ where
     T::Stream: 'static,
 {
     let request = endpoint.client().await?.resume_proposal(work_id).await?;
-    content::transfer_proposal(transport, endpoint, request, content).await
+    content::transfer_proposal(transport, endpoint, request, content, hints).await
 }
 
 // ── Wire shapes ───────────────────────────────────────────────────────

@@ -405,3 +405,84 @@ fn every_prepared_invocation_and_policy_field_is_bound_for_paid_and_grant_inputs
         }
     }
 }
+
+#[tokio::test]
+async fn source_hints_preserve_paid_and_granted_work_ids_and_connection_bindings() {
+    use futures::StreamExt as _;
+    use hellas_rpc::pb::{content as pb, work::AcceptWorkRequest};
+    use hellas_store::content::SourceHints;
+    use prost::Message as _;
+
+    let ready = fixture::ready();
+    let paid = fixture::authorization();
+    let granted = grant(&paid);
+    let content = paid.input_content;
+    let hints = SourceHints::new(std::collections::BTreeMap::from([(
+        content.id(),
+        vec!["https://example.test/asset".parse().unwrap()],
+    )]))
+    .unwrap();
+    let exporter = [7; 32];
+    let context = hellas_wire::TransportContext {
+        open_exporter: Some(exporter),
+        ..Default::default()
+    };
+    for (granted_work, authorization) in [(false, paid.encode()), (true, granted.encode())] {
+        let request = AcceptWorkRequest {
+            authorization,
+            prepared_input: hellas_rpc::protocol::content::encode_reference(content),
+            ..Default::default()
+        };
+        let mut opening = pb::WorkOpening {
+            signed_opening: request.encode_to_vec(),
+            ..Default::default()
+        };
+        opening.binding_signature = vec![1; 64];
+        let expected_binding = opening_digest(&opening, &exporter);
+        let expected_id = if granted_work {
+            crate::model::grant::grant_work_id(ready.channel().network(), &granted)
+        } else {
+            work_id(ready.channel(), &paid)
+        };
+        for source_hints in [Vec::new(), hints.encode()] {
+            let has_hints = !source_hints.is_empty();
+            let frame = pb::UploadRequest {
+                part: Some(pb::upload_request::Part::Open(pb::UploadOpen {
+                    object: Some(pb::ContentRef {
+                        id: content.id().as_bytes().to_vec(),
+                        bytes: content.bytes(),
+                    }),
+                    work: Some(opening.clone()),
+                    pin: None,
+                    source_hints,
+                })),
+            };
+            let (bound, decoded, exporter, read_hints, _) = crate::content::WorkUpload::read(
+                futures::stream::iter([Ok(frame)]).boxed(),
+                &context,
+            )
+            .await
+            .unwrap()
+            .into_parts();
+            assert_eq!(decoded, request);
+            assert_eq!(bound.binding_signature, opening.binding_signature);
+            assert_eq!(opening_digest(&bound, &exporter), expected_binding);
+            assert_eq!(
+                read_hints.sources(content.id()).len(),
+                usize::from(has_hints)
+            );
+            let actual_id = if granted_work {
+                crate::model::grant::grant_work_id(
+                    ready.channel().network(),
+                    &GrantJobAuthorizationV1::decode(&decoded.authorization).unwrap(),
+                )
+            } else {
+                work_id(
+                    ready.channel(),
+                    &PaidJobAuthorizationV2::decode(&decoded.authorization).unwrap(),
+                )
+            };
+            assert_eq!(actual_id, expected_id);
+        }
+    }
+}

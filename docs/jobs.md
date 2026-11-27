@@ -459,6 +459,16 @@ or paid channel. There is no separate Fetch configuration file.
 See [paid Work](../crates/channel/README.md) for channel configuration and
 [HTTPS Fetch](../crates/providers/HTTPS.md) for provider credentials and egress.
 
+## Source hints
+
+For remote Compute and Fetch jobs, repeat
+`--source-hint 'CONTENT_ID=LOCATOR'` to offer alternate locations for objects
+the job already declares. A locator can be an HTTPS URL, a Hub file, or a
+Hellas object locator. A provider only uses hints on a cache miss when its
+content policy follows hints from that caller and locator kind. The job identity and
+signed request are independent of the hints, which can be supplied again on
+retry.
+
 ## Folder rules and retries
 
 `job.toml` and all referenced files must be ordinary files inside the folder.

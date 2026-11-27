@@ -726,7 +726,7 @@ impl ExecutionSession<'_> {
         } = controls;
         let stop = stop.unwrap_or_else(|| stop_on(std::future::pending()));
         if let Some(attempt) = attempt.as_deref() {
-            let WorkRequest::Job(input) = request else {
+            let WorkRequest::Job(input, _) = request else {
                 return Err(pre(ExecutionError::Identity));
             };
             attempt.matches(input, terms).map_err(pre)?;
@@ -819,7 +819,9 @@ pub(crate) async fn run_paid(
             true,
         )
         .map_err(pre)?;
-    let job = Job::from_input(price, input).map_err(pre)?;
+    let job = Job::from_input(price, input)
+        .map_err(pre)?
+        .with_source_hints(request.source_hints());
     let tracked = attempt.is_some();
     let mut purchase = match attempt.as_deref_mut() {
         Some(attempt) => {
@@ -997,7 +999,14 @@ pub(crate) async fn run_grant(
         deadline,
         stop,
         Some(proposed),
-        session.propose_resource(resource, prepared, &content, Some(proposed), tracker),
+        session.propose_resource(
+            resource,
+            prepared,
+            &content,
+            &request.source_hints(),
+            Some(proposed),
+            tracker,
+        ),
     )
     .await?;
     let result = result.map_err(|error| {

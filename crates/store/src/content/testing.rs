@@ -108,9 +108,10 @@ impl AvailableHubFile {
         let served = Self::serve(store, repo, path, bytes);
         let object = served.file.object;
         store
-            .set_on_miss(std::sync::Arc::new(AllowList(
-                [(object.id(), (object.bytes(), served.file.source()))].into(),
-            )))
+            .set_on_miss(std::sync::Arc::new(AllowList {
+                fixed: [(object.id(), (object.bytes(), served.file.source()))].into(),
+                hints: None,
+            }))
             .unwrap();
         served
     }

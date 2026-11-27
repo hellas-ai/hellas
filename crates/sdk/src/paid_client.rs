@@ -825,6 +825,7 @@ impl PaidWorkSession {
             &ready,
             JobLookup::New,
             Some(proposed),
+            job.source_hints(),
         )
         .await?)
     }
@@ -1169,6 +1170,7 @@ async fn propose_on(
     proposal: &JobProposal,
     content: &(LocalStore, Scope),
     retained: Option<hellas_auth::Digest>,
+    hints: &hellas_store::content::SourceHints,
     proposed: Option<&Arc<AtomicBool>>,
 ) -> Result<hellas_auth::Digest> {
     let transport = dialer.work().await?;
@@ -1177,9 +1179,19 @@ async fn propose_on(
             if let Some(proposed) = proposed {
                 proposed.store(true, Ordering::Release);
             }
-            resume_work_proposal(transport, client, work_id, content).await?
+            resume_work_proposal(transport, client, work_id, content, hints).await?
         }
-        None => propose_work(transport, client, proposal, content, proposed.cloned()).await?,
+        None => {
+            propose_work(
+                transport,
+                client,
+                proposal,
+                content,
+                hints,
+                proposed.cloned(),
+            )
+            .await?
+        }
     })
 }
 
@@ -1212,7 +1224,15 @@ async fn execute_paid_job(
     purchase: Option<&mut crate::transact::Purchase>,
 ) -> Result<PaidWorkResult> {
     let delivery = propose_paid_job(
-        args, prepared, content, dialer, client, ready, lookup, proposed,
+        args,
+        prepared,
+        content,
+        dialer,
+        client,
+        ready,
+        lookup,
+        proposed,
+        &Default::default(),
     )
     .await?;
     let mut purchase = purchase;
@@ -1236,6 +1256,7 @@ async fn propose_paid_job(
     ready: &hellas_channel::model::setup::ReadyChannel,
     lookup: JobLookup,
     proposed: Option<&Arc<AtomicBool>>,
+    hints: &hellas_store::content::SourceHints,
 ) -> Result<PaidDelivery> {
     let prepared_bytes = prepared.canonical_bytes()?;
     let current = client.with_state(|state| state.cursor().0).await?;
@@ -1284,7 +1305,16 @@ async fn propose_paid_job(
     }
     let (work_id, collected) = match existing.first().copied() {
         Some((work_id, hellas_channel::work_store::JobPhase::HalfSigned, _)) => (
-            propose_on(dialer, client, &proposal, content, Some(work_id), proposed).await?,
+            propose_on(
+                dialer,
+                client,
+                &proposal,
+                content,
+                Some(work_id),
+                hints,
+                proposed,
+            )
+            .await?,
             None,
         ),
         Some((work_id, hellas_channel::work_store::JobPhase::Ready, _))
@@ -1302,7 +1332,7 @@ async fn propose_paid_job(
         }
         Some((work_id, _, _)) => (work_id, None),
         None => (
-            propose_on(dialer, client, &proposal, content, None, proposed).await?,
+            propose_on(dialer, client, &proposal, content, None, hints, proposed).await?,
             None,
         ),
     };

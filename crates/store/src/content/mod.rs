@@ -5,6 +5,7 @@ mod acquire;
 pub mod config;
 mod core;
 mod disk;
+mod hints;
 mod local;
 mod locator;
 mod memory;
@@ -54,11 +55,14 @@ pub fn file_content(path: &std::path::Path) -> std::io::Result<ContentRef> {
 pub(crate) use acquire::Publication;
 pub use acquire::validate_https;
 pub use disk::{DiskStore, IndexMode};
+pub use hints::SourceHints;
 pub use local::{JobContent, LocalStore, VerifiedReader};
-pub use locator::{Locator, LocatorError};
+pub use locator::{Locator, LocatorError, LocatorKind};
 pub use memory::MemoryStore;
 pub use page::{body_limit, chunk_page};
-pub use policy::{AllowList, Miss, MissDecision, OnMiss, Refuse, StoreStats};
+pub use policy::{
+    AllowList, HintCaller, HintPolicy, Miss, MissDecision, OnMiss, Refuse, StoreStats,
+};
 pub use remote::RemoteStore;
 pub use reservation::Reservations;
 pub use server::{ContentService, UploadRequests};

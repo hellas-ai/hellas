@@ -494,7 +494,15 @@ async fn model_job_restart_inner(provider_held: bool) {
         }
     });
 
-    let failed = propose_work(transport, &mut endpoint, &proposal, &content, None).await;
+    let failed = propose_work(
+        transport,
+        &mut endpoint,
+        &proposal,
+        &content,
+        &Default::default(),
+        None,
+    )
+    .await;
 
     serving.abort();
     let _ = serving.await;
@@ -632,7 +640,14 @@ async fn model_job_restart_inner(provider_held: bool) {
     let (transport, server) = transport_pair();
     let serving = serve(server, service);
 
-    let resumed = resume_work_proposal(transport, &mut endpoint, id, &recovered).await;
+    let resumed = resume_work_proposal(
+        transport,
+        &mut endpoint,
+        id,
+        &recovered,
+        &Default::default(),
+    )
+    .await;
 
     serving.abort();
     let _ = serving.await;

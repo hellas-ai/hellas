@@ -139,6 +139,7 @@ pub struct RemoteStore<T> {
     last_manifest: Option<tokio::sync::Mutex<Option<Arc<VerifiedManifest>>>>,
     pool: Reservations,
     opening: Option<pb::WorkOpening>,
+    source_hints: Vec<u8>,
     upload: Arc<std::sync::Mutex<UploadState>>,
 }
 impl<T> RemoteStore<T>
@@ -153,6 +154,7 @@ where
             last_manifest: None,
             pool,
             opening: None,
+            source_hints: Vec::new(),
             upload: Arc::new(std::sync::Mutex::new(UploadState {
                 call: None,
                 active: false,
@@ -167,6 +169,10 @@ where
     }
     pub fn with_opening(mut self, opening: pb::WorkOpening) -> Self {
         self.opening = Some(opening);
+        self
+    }
+    pub fn with_source_hints(mut self, hints: &SourceHints) -> Self {
+        self.source_hints = hints.encode();
         self
     }
     /// Transfer one verified local object through the common paged upload path.
@@ -423,6 +429,11 @@ where
                 part: Some(pb::upload_request::Part::Open(pb::UploadOpen {
                     object: Some(super::page::wire_ref(object)),
                     pin: pin.as_ref().map(w::pin_target),
+                    source_hints: if opening.is_some() {
+                        self.source_hints.clone()
+                    } else {
+                        Vec::new()
+                    },
                     work: opening,
                 })),
             })

@@ -1067,9 +1067,16 @@ async fn the_generic_proposal_helper_ignores_unneeded_cached_root_openings_for_f
         let content = (LocalStore::Memory(memory), Scope::Owner);
         let (transport, server) = transport::transport_pair();
         let serving = hellas_channel::test_support::channel::serve_work(server, service.clone());
-        let id = propose_work(transport, &mut client, &proposal(), &content, None)
-            .await
-            .unwrap();
+        let id = propose_work(
+            transport,
+            &mut client,
+            &proposal(),
+            &content,
+            &Default::default(),
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             client
                 .client()

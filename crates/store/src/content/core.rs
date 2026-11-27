@@ -1542,10 +1542,37 @@ impl Core {
                     Ok(())
                 })
                 .await?;
-                super::acquire::memory(&core, &scope, source, expect, pin, requester).await
+                super::acquire::memory(&core, &scope, source, expect, pin, requester, false).await
             }
         })
         .await
+    }
+
+    /// Fetch only the expected object from a hint, once: a retry would spend
+    /// bytes its charge does not cover.
+    pub(crate) async fn acquire_hint(
+        &self,
+        scope: &Scope,
+        source: Source,
+        expected: ContentRef,
+        pin: PinTarget,
+        requester: (Core, Scope),
+    ) -> Result<()> {
+        let checking = requester.clone();
+        let named = pin.clone();
+        self.access(scope, move |core| {
+            core.require_ready()?;
+            core.check_acquisition(&named, &Some(checking))
+        })
+        .await?;
+        let live = requester.1.clone();
+        tokio::select! {
+            biased;
+            () = live.ended() => Err(Error::Denied),
+            outcome = super::acquire::memory(
+                self, scope, source, Some(expected), AcquirePin::Named(pin).into(), Some(requester), true,
+            ) => outcome.map(|_| ()),
+        }
     }
 
     pub(crate) fn missing_refs(

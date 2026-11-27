@@ -263,7 +263,7 @@ impl<S: ContentStore + 'static> ContentHandler for ContentService<S> {
                             Err(status(Error::Invalid("object already open")))?;
                         }
                         let scope = service.scope()?;
-                        if open.work.is_some() {
+                        if open.work.is_some() || !open.source_hints.is_empty() {
                             Err(status(Error::Denied))?;
                         }
                         let object = w::object(&required(open.object)?).map_err(status)?;

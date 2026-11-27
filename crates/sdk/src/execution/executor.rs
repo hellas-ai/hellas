@@ -71,7 +71,7 @@ impl Executor {
                             None,
                         )
                     };
-                    let request = WorkRequest::Job(job.input().clone());
+                    let request = WorkRequest::Job(job.input().clone(), job.source_hints().clone());
                     let terms = ExecutionTerms::Paid { price: job.price() };
                     let mut completed = match self.attempt {
                         None => {
@@ -151,7 +151,7 @@ impl Executor {
                         policy,
                         ..
                     } = grant.as_ref();
-                    let request = WorkRequest::Job(job.input().clone());
+                    let request = WorkRequest::Job(job.input().clone(), job.source_hints().clone());
                     let terms = ExecutionTerms::Grant {
                         resource: policy.resource,
                     };

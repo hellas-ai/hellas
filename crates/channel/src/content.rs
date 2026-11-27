@@ -3,7 +3,7 @@ use hellas_auth::Digest;
 use hellas_rpc::{ContentId, ContentRef};
 use hellas_store::content::{
     ContentStore, Cursor, DiskStore, Error, LocalStore, PinName, PinPolicy, PinTarget, Scope,
-    ScopeKind, UploadSession, chunk_page,
+    ScopeKind, SourceHints, UploadSession, chunk_page,
 };
 
 pub(crate) mod tree;
@@ -18,6 +18,7 @@ pub struct WorkUpload {
     request: hellas_rpc::pb::work::AcceptWorkRequest,
     opening: hellas_rpc::pb::content::WorkOpening,
     exporter: [u8; 32],
+    hints: SourceHints,
     requests: hellas_store::content::UploadRequests,
 }
 impl WorkUpload {
@@ -30,9 +31,16 @@ impl WorkUpload {
         hellas_rpc::pb::content::WorkOpening,
         hellas_rpc::pb::work::AcceptWorkRequest,
         [u8; 32],
+        SourceHints,
         hellas_store::content::UploadRequests,
     ) {
-        (self.opening, self.request, self.exporter, self.requests)
+        (
+            self.opening,
+            self.request,
+            self.exporter,
+            self.hints,
+            self.requests,
+        )
     }
     pub async fn read(
         mut requests: hellas_store::content::UploadRequests,
@@ -52,6 +60,8 @@ impl WorkUpload {
             return Err(denied());
         };
         let opening = open.work.take().ok_or_else(denied)?;
+        let hints =
+            SourceHints::decode(&std::mem::take(&mut open.source_hints)).map_err(upload_status)?;
         let request =
             hellas_rpc::pb::work::AcceptWorkRequest::decode(opening.signed_opening.as_slice())
                 .map_err(|_| denied())?;
@@ -72,6 +82,7 @@ impl WorkUpload {
             request,
             opening,
             exporter: context.open_exporter.ok_or_else(denied)?,
+            hints,
             requests: futures::stream::once(async move { Ok(first) })
                 .chain(requests)
                 .boxed(),
@@ -84,6 +95,8 @@ pub async fn stage_work(
     policy: &hellas_rpc::protocol::invocation::InvocationPolicy,
     manifest: &hellas_rpc::ProgramManifest,
     input: ContentRef,
+    hints: &SourceHints,
+    caller: hellas_store::content::HintCaller,
 ) -> Result<Vec<ContentRef>, hellas_wire::WireStatus> {
     let bound = service.scope()?;
     let closure = work_closure(&service.store, &bound, policy, manifest, input)
@@ -91,7 +104,7 @@ pub async fn stage_work(
         .map_err(upload_status)?;
     service
         .store
-        .acquire_missing(&bound, closure.clone())
+        .acquire_hinted_misses(&bound, closure.clone(), caller, hints)
         .await
         .map_err(upload_status)?;
     Ok(closure)
