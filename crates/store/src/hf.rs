@@ -100,6 +100,8 @@ pub enum FetchError {
     Locator(&'static str),
     #[error("HF repository or revision not found: {0}")]
     NotFound(String),
+    #[error("HF authorization failed for {0}; set HF_TOKEN to a token with repository access")]
+    Unauthorized(String),
     #[error("Hub file I/O: {0}")]
     Io(#[from] std::io::Error),
     #[error("decoding a xorb: {0}")]
@@ -297,7 +299,7 @@ impl HfCas {
     pub fn token(&self) -> Result<XetToken> {
         self.repo.validate()?;
         let url = self.hub_url(true, &["xet-read-token", &self.repo.revision])?;
-        let body = get(url.as_str(), None, TOKEN_BODY_LIMIT)?;
+        let body = get(url.as_str(), None, TOKEN_BODY_LIMIT).map_err(|e| self.repo_error(e))?;
         serde_json::from_slice(&body)
             .map_err(|err| FetchError::Malformed(format!("token response: {err}")))
     }
@@ -571,10 +573,13 @@ impl Repo {
 impl HfCas {
     fn repo_error(&self, error: FetchError) -> FetchError {
         match error {
-            FetchError::Http { source, .. }
-                if matches!(*source, ureq::Error::StatusCode(404 | 401)) =>
-            {
+            FetchError::Http { source, .. } if matches!(*source, ureq::Error::StatusCode(404)) => {
                 FetchError::NotFound(self.repo.to_string())
+            }
+            FetchError::Http { source, .. }
+                if matches!(*source, ureq::Error::StatusCode(401 | 403)) =>
+            {
+                FetchError::Unauthorized(self.repo.to_string())
             }
             error => error,
         }
@@ -704,9 +709,12 @@ impl HfCas {
     pub(crate) fn small_file(&self, path: &str) -> Result<impl std::io::Read + use<>> {
         let url = self.file_url(path)?;
         let url = url.as_str();
-        let response = authenticated_get(url, None)
-            .call()
-            .map_err(|_| FetchError::Malformed("Hub file request failed".into()))?;
+        let response = authenticated_get(url, None).call().map_err(|source| {
+            self.repo_error(FetchError::Http {
+                context: "Hub file request failed".into(),
+                source: Box::new(source),
+            })
+        })?;
         if response.status() != 200 {
             return Err(FetchError::Malformed("Hub file status".into()));
         }

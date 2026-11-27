@@ -353,14 +353,16 @@ impl Reconciler {
                             .await?;
                     } else if let Some(source) = source {
                         store
-                            .acquire(
+                            .core
+                            .acquire_scoped(
                                 &Scope::Owner,
                                 source,
                                 expected,
-                                PinTarget {
+                                AcquirePin::Named(PinTarget {
                                     name: staging.clone(),
                                     policy: PinPolicy::Owner,
-                                },
+                                }),
+                                None,
                             )
                             .await?;
                     }

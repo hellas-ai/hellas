@@ -264,7 +264,7 @@ async fn invalid_acquired_tree_drops_private_files_and_cannot_fill_an_existing_p
             core.publish_acquired(
                 vec![(object, data, chunks)],
                 Target::Tree(object),
-                pin("bad"),
+                AcquirePin::Named(pin("bad")),
                 None,
                 None,
             )

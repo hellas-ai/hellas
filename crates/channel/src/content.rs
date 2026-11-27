@@ -156,7 +156,7 @@ pub(crate) async fn read_staged(
 
 pub fn object_pin(object: ContentRef) -> Result<PinTarget, Error> {
     Ok(PinTarget {
-        name: PinName::new(format!("object/{}", object.id()))?,
+        name: PinName::object(object.id()),
         policy: PinPolicy::Owner,
     })
 }
@@ -169,8 +169,7 @@ pub async fn root(store: &LocalStore, scope: &Scope, id: ContentId) -> Result<by
             .ok_or(Error::Missing)?;
         return read_staged(store, scope, object, MAX_PROGRAM_ROOT_BYTES as u64).await;
     }
-    let at =
-        hellas_store::content::Path::new(PinName::new(format!("object/{id}"))?, String::new())?;
+    let at = hellas_store::content::Path::new(PinName::object(id), String::new())?;
     let object = store
         .stat(scope, &at)
         .await?

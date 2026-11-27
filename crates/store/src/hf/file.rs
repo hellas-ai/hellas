@@ -303,15 +303,18 @@ impl PinnedFile {
             }
             return Ok(());
         }
-        let url = HfCas::new(self.repo.clone()).file_url(&self.path)?;
+        let cas = HfCas::new(self.repo.clone());
+        let url = cas.file_url(&self.path)?;
         let bounds = format!("{}-{}", range.start, range.end - 1);
         let mut response = authenticated_get(url.as_str(), None)
             .header("Range", &format!("bytes={bounds}"))
             .header("Accept-Encoding", "identity")
             .call()
-            .map_err(|source| FetchError::Http {
-                context: "Hub file range".into(),
-                source: Box::new(source),
+            .map_err(|source| {
+                cas.repo_error(FetchError::Http {
+                    context: "Hub file range".into(),
+                    source: Box::new(source),
+                })
             })?;
         if response.status() != 206
             || response
@@ -340,7 +343,7 @@ impl PinnedFile {
 
     /// Make this verified object available to local execution jobs.
     pub async fn acquire(&self, store: &crate::content::DiskStore) -> crate::content::Result<()> {
-        use crate::content::{ContentStore, LocalStore, PinTarget, Scope, Target};
+        use crate::content::{LocalStore, PinTarget, Publication, Scope, Target};
         let pin = PinTarget::model_object(self.object)?;
         if pin.holds(store, Target::Object(self.object)).await?
             && LocalStore::Disk(store.clone())
@@ -354,7 +357,14 @@ impl PinnedFile {
             return Ok(());
         }
         store
-            .acquire(&Scope::Owner, self.source(), Some(self.object), pin)
+            .core
+            .acquire_scoped(
+                &Scope::Owner,
+                self.source(),
+                Some(self.object),
+                Publication::Model(pin),
+                None,
+            )
             .await?;
         Ok(())
     }

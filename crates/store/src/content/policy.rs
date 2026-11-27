@@ -170,10 +170,10 @@ mod tests {
                             hellas_xet::chunk(b"root"),
                         )],
                         Target::Object(reference),
-                        PinTarget {
+                        AcquirePin::Named(PinTarget {
                             name: PinName::new("channel-private".into())?,
                             policy: PinPolicy::Channel(private_channel),
-                        },
+                        }),
                         None,
                         None,
                     )

@@ -51,6 +51,7 @@ pub fn file_content(path: &std::path::Path) -> std::io::Result<ContentRef> {
         })?;
     Ok(indexed.object())
 }
+pub(crate) use acquire::Publication;
 pub use acquire::validate_https;
 pub use disk::{DiskStore, IndexMode};
 pub use local::{JobContent, LocalStore, VerifiedReader};
@@ -82,6 +83,8 @@ pub enum Error {
     Missing,
     #[error("HF repository or revision not found: {0}")]
     HfNotFound(String),
+    #[error("HF authorization failed for {0}; set HF_TOKEN to a token with repository access")]
+    HfUnauthorized(String),
     #[error("pin or cursor changed")]
     Conflict,
     #[error("content reservation exhausted")]
@@ -144,6 +147,12 @@ pub struct PinTarget {
     pub policy: PinPolicy,
 }
 impl PinTarget {
+    fn automatic(self) -> AcquirePin {
+        AcquirePin::Automatic {
+            policy: Some(self.policy),
+            alias: Some(self.name),
+        }
+    }
     pub fn model_object(object: ContentRef) -> Result<Self> {
         Ok(Self {
             name: PinName::new(format!("models/{}", object.id()))?,
@@ -324,6 +333,7 @@ pub struct Acquisition {
     pub object: ContentRef,
     pub target: Target,
     pub root: PinName,
+    pub hub_alias: Option<PinName>,
     pub commit: Option<String>,
 }
 
@@ -331,7 +341,7 @@ pub struct Acquisition {
 pub enum AcquirePin {
     Named(PinTarget),
     Automatic {
-        policy: PinPolicy,
+        policy: Option<PinPolicy>,
         alias: Option<PinName>,
     },
 }

@@ -69,8 +69,9 @@ pub enum StoreCommand {
         /// Add a named GC root with the selected visibility policy.
         #[arg(long)]
         pin: Option<String>,
-        #[arg(long, default_value = "owner")]
-        policy: String,
+        /// Visibility for newly created roots (default owner). Existing roots retain their policy.
+        #[arg(long)]
+        policy: Option<PinPolicy>,
         /// Expected ContentId; supply --bytes with it.
         #[arg(long, requires = "bytes")]
         expect: Option<String>,
@@ -103,7 +104,7 @@ pub enum PinCommand {
         tree: bool,
         /// owner, jobs, granted, public, or channel:ID.
         #[arg(long, default_value = "owner")]
-        policy: String,
+        policy: PinPolicy,
         #[arg(long)]
         expires_ms: Option<u64>,
     },
@@ -293,7 +294,7 @@ where
                 })
                 .transpose()?;
             let alias = pin.map(PinName::new).transpose()?;
-            let policy = selected.parse()?;
+            let policy = selected;
             ensure!(
                 matches!(&source, Locator::Https(_)) || bytes.is_none() || expect.is_some(),
                 "HF and peer --bytes requires --expect"
@@ -320,7 +321,12 @@ where
             }
             target(acquired.target);
             println!("root\t{}", acquired.root.as_str());
-            if let Some(alias) = alias.filter(|alias| alias != &acquired.root) {
+            if let Some(hub) = &acquired.hub_alias {
+                println!("root\t{}", hub.as_str());
+            }
+            if let Some(alias) = alias.filter(|alias| {
+                alias != &acquired.root && Some(alias) != acquired.hub_alias.as_ref()
+            }) {
                 println!("root\t{}", alias.as_str());
             }
         }
@@ -345,7 +351,7 @@ where
                     } else {
                         Target::Object(object)
                     },
-                    policy: selected.parse()?,
+                    policy: selected,
                     expires: expires_ms.map(hellas_auth::authority::UnixMillis),
                 };
                 let previous = find_pin(store, &name).await?;
@@ -516,7 +522,7 @@ mod tests {
                         id: object.id().to_string(),
                         bytes: object.bytes(),
                         tree: false,
-                        policy: "owner".into(),
+                        policy: PinPolicy::Owner,
                         expires_ms: None,
                     },
                 },
@@ -612,7 +618,7 @@ mod tests {
                 StoreCommand::Acquire {
                     source: source.parse().unwrap(),
                     pin: Some("destination".into()),
-                    policy: "owner".into(),
+                    policy: None,
                     expect: None,
                     bytes: Some(1),
                     sha256: None,

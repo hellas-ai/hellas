@@ -128,9 +128,14 @@ fn status(error: Error) -> WireStatus {
             "this store is owned by a node with paid work; run the command against the daemon",
         ),
         Error::Missing => (WireCode::NotFound, "content is missing"),
+        error @ Error::HfUnauthorized(_) => {
+            let mut status = WireStatus::new(WireCode::PermissionDenied, error.to_string());
+            status.metadata.insert_text(w::ERROR_SOURCE, "hub");
+            return status;
+        }
         error @ Error::HfNotFound(_) => {
             let mut status = WireStatus::new(WireCode::NotFound, error.to_string());
-            status.details = bytes::Bytes::from_static(w::HF_NOT_FOUND);
+            status.metadata.insert_text(w::ERROR_SOURCE, "hub");
             return status;
         }
         Error::Conflict => (WireCode::Aborted, "pin or cursor changed"),
@@ -346,7 +351,11 @@ impl<S: ContentStore + 'static> ContentHandler for ContentService<S> {
         let pin = match required(r.root)? {
             Root::Pin(pin) => AcquirePin::Named(w::pin_target_from(pin).map_err(status)?),
             Root::Automatic(root) => AcquirePin::Automatic {
-                policy: w::policy_from(required(root.policy)?).map_err(status)?,
+                policy: root
+                    .policy
+                    .map(w::policy_from)
+                    .transpose()
+                    .map_err(status)?,
                 alias: root.alias.map(PinName::new).transpose().map_err(status)?,
             },
         };
@@ -359,6 +368,7 @@ impl<S: ContentStore + 'static> ContentHandler for ContentService<S> {
         Ok(self.reply(pb::AcquireResponse {
             target: Some(w::target(&acquired.target)),
             root: acquired.root.as_str().to_owned(),
+            hub_alias: acquired.hub_alias.map(|name| name.as_str().to_owned()),
             commit: acquired.commit,
         }))
     }

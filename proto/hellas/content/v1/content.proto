@@ -55,13 +55,13 @@ message UploadRequest {
 }
 message UploadResponse { uint64 next_chunk = 1; bool missing = 2; bool complete = 3; }
 message Peer { bytes id = 1; repeated string seeds = 2; }
-message HfXet { string repo = 1; string commit = 2; optional string path = 3; bool dataset = 4; bool default_branch = 5; }
+message HfXet { string repo = 1; string revision = 2; optional string path = 3; bool dataset = 4; bool default_branch = 5; }
 message Https { string url = 1; optional bytes sha256 = 2; optional uint64 bytes = 3; }
 message Source { oneof kind { Peer peer = 1; HfXet hf_xet = 2; Https https = 3; } }
-// Automatic roots the result under a name derived from the source, plus an optional alias.
+// Automatic roots the result by content ID, with an immutable Hub alias for trees and an optional caller alias.
 message AutomaticRoot { PinPolicy policy = 1; optional string alias = 2; }
 message AcquireRequest { Source source = 1; ContentRef expect = 2; oneof root { PinTarget pin = 3; AutomaticRoot automatic = 4; } }
-message AcquireResponse { Target target = 1; string root = 2; optional string commit = 3; }
+message AcquireResponse { Target target = 1; string root = 2; optional string commit = 3; optional string hub_alias = 4; }
 message SetPinRequest { string name = 1; PinValue expected = 2; PinValue value = 3; }
 message SetPinResponse {}
 message ListPinsRequest { string prefix = 1; Cursor cursor = 2; }

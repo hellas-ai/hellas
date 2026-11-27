@@ -102,10 +102,10 @@ impl Core {
         &self,
         objects: Vec<(ContentRef, super::storage::Data, Vec<Chunk>)>,
         target: Target,
-        pin: PinTarget,
-        alias: Option<PinName>,
+        pin: impl Into<Publication>,
+        hub_alias: Option<PinName>,
         requester: Option<(Core, Scope)>,
-    ) -> Result<()> {
+    ) -> Result<PinName> {
         let owner = requester
             .map(|(core, scope)| {
                 let ScopeKind::Work { reservation, .. } = scope.kind else {
@@ -114,29 +114,72 @@ impl Core {
                 Ok((Arc::downgrade(&core.state), reservation))
             })
             .transpose()?;
-        let name = pin.name.clone();
         let mut state = self.state()?;
         let objects = objects
             .into_iter()
             .map(|(object, data, chunks)| (object.id(), Arc::new(Stored::new(data, chunks))))
             .collect();
-        let policy = pin.policy.clone();
-        state.publish(objects, target, pin)?;
-        if let Some(alias) = alias {
-            state.change_pin(
-                alias,
-                Some(PinValue {
-                    target,
-                    policy,
-                    expires: None,
-                }),
-            )?;
-        }
-        if let Some(owner) = owner {
-            state.add_acquired(name, owner);
-        }
+        let name = match pin.into() {
+            Publication::Acquire(AcquirePin::Named(pin)) => {
+                let name = pin.name.clone();
+                state.publish(objects, target, pin)?;
+                if let Some(owner) = owner {
+                    state.add_acquired(name.clone(), owner);
+                }
+                name
+            }
+            publication => {
+                if owner.is_some() {
+                    return Err(Error::Denied);
+                }
+                let name = PinName::object(target.object().id());
+                let mut policies = BTreeMap::new();
+                match publication {
+                    Publication::Acquire(AcquirePin::Automatic { policy, alias }) => {
+                        for root in std::iter::once(&name)
+                            .chain(hub_alias.iter())
+                            .chain(alias.iter())
+                        {
+                            policies.insert(root.clone(), policy.clone());
+                        }
+                    }
+                    Publication::Model(alias) => {
+                        policies.insert(name.clone(), None);
+                        policies.insert(alias.name, Some(alias.policy));
+                    }
+                    Publication::Acquire(AcquirePin::Named(_)) => unreachable!(),
+                }
+                let mut missing = Vec::new();
+                for (root, policy) in policies {
+                    match state.pins.get(&root) {
+                        Some(value)
+                            if value.target != target
+                                || policy
+                                    .as_ref()
+                                    .is_some_and(|policy| *policy != value.policy) =>
+                        {
+                            return Err(Error::Conflict);
+                        }
+                        Some(_) => {}
+                        None => missing.push((root, policy.unwrap_or(PinPolicy::Owner))),
+                    }
+                }
+                state.publish_objects(objects, target)?;
+                for (root, policy) in missing {
+                    state.change_pin(
+                        root,
+                        Some(PinValue {
+                            target,
+                            policy,
+                            expires: None,
+                        }),
+                    )?;
+                }
+                name
+            }
+        };
         self.changed.notify_waiters();
-        Ok(())
+        Ok(name)
     }
     /// Called by the authenticated application opening, first with the root only.
     pub fn open_work(&self, job: JobId, closure: Closure, max_upload_bytes: u64) -> Result<Scope> {
@@ -871,14 +914,7 @@ impl Core {
             let lower = self.held_lower(scope, closure)?;
             if held.contains(&object.id()) || lower.contains(&object.id()) {
                 if let Some(pin) = pin {
-                    state.change_pin(
-                        pin.name,
-                        Some(PinValue {
-                            target: Target::Object(object),
-                            policy: pin.policy,
-                            expires: None,
-                        }),
-                    )?;
+                    state.publish_pin(pin, Target::Object(object))?;
                     self.changed.notify_waiters();
                 }
                 return Ok(UploadSession::present(object));
@@ -1348,6 +1384,10 @@ impl ContentStore for Core {
         expect: Option<ContentRef>,
         pin: AcquirePin,
     ) -> Result<Acquisition> {
+        let pin = match pin {
+            AcquirePin::Named(named) => named.automatic(),
+            automatic => automatic,
+        };
         self.acquire_scoped(s, source, expect, pin, None).await
     }
     async fn set_pin(
@@ -1459,13 +1499,14 @@ impl Core {
         s: &Scope,
         mut source: Source,
         expect: Option<ContentRef>,
-        pin: AcquirePin,
+        pin: impl Into<Publication>,
         requester: Option<(Core, Scope)>,
     ) -> Result<Acquisition> {
+        let pin = pin.into();
         if !matches!(s.kind, ScopeKind::Owner) {
             return Err(Error::Denied);
         }
-        if let AcquirePin::Automatic { alias, .. } = &pin {
+        if let Publication::Acquire(AcquirePin::Automatic { alias, .. }) = &pin {
             if alias
                 .as_ref()
                 .is_some_and(|name| name.as_str().starts_with("config/"))
@@ -1495,7 +1536,7 @@ impl Core {
                 let (checking_pin, checking_requester) = (pin.clone(), requester.clone());
                 core.access(&scope, move |core| {
                     core.require_ready()?;
-                    if let AcquirePin::Named(pin) = &checking_pin {
+                    if let Publication::Acquire(AcquirePin::Named(pin)) = &checking_pin {
                         core.check_acquisition(pin, &checking_requester)?;
                     }
                     Ok(())
@@ -1932,6 +1973,35 @@ impl State {
         if self.generation == u64::MAX {
             return Err(Error::Capacity);
         }
+        let reached = self.publish_objects(objects, target)?;
+        self.publish_pin(pin, target)?;
+        Ok(reached)
+    }
+    fn publish_pin(&mut self, pin: PinTarget, target: Target) -> Result<()> {
+        // Filling an existing content-ID root must preserve its access and expiry.
+        if pin.name == PinName::object(target.object().id())
+            && let Some(existing) = self.pins.get(&pin.name)
+        {
+            return if existing.target == target {
+                Ok(())
+            } else {
+                Err(Error::Conflict)
+            };
+        }
+        self.change_pin(
+            pin.name,
+            Some(PinValue {
+                target,
+                policy: pin.policy,
+                expires: None,
+            }),
+        )
+    }
+    fn publish_objects(
+        &mut self,
+        objects: BTreeMap<ContentId, Arc<Stored>>,
+        target: Target,
+    ) -> Result<BTreeSet<ContentId>> {
         let mut previous = Vec::new();
         for (id, stored) in objects {
             if let Some(old) = self.objects.get(&id) {
@@ -1963,14 +2033,6 @@ impl State {
             }
         }
         self.restore(previous, &published);
-        self.change_pin(
-            pin.name,
-            Some(PinValue {
-                target,
-                policy: pin.policy,
-                expires: None,
-            }),
-        )?;
         Ok(reached)
     }
     fn restore(

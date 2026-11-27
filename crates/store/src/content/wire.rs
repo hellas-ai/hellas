@@ -2,7 +2,7 @@ use super::*;
 use hellas_auth::{Digest, authority::UnixMillis};
 use hellas_rpc::{ContentId, ContentRef, pb::content as pb};
 
-pub(crate) const HF_NOT_FOUND: &[u8] = b"hf-revision";
+pub(crate) const ERROR_SOURCE: &str = "hellas-content-error-source";
 
 pub(crate) fn object(object: &pb::ContentRef) -> Result<ContentRef> {
     Ok(ContentRef::new(
@@ -179,7 +179,7 @@ pub(crate) fn source(source: Source) -> pb::Source {
             Source::HfXet { repo, path } => Kind::HfXet(pb::HfXet {
                 repo: repo.id,
                 dataset: repo.kind == crate::hf::RepoKind::Dataset,
-                commit: repo.revision,
+                revision: repo.revision,
                 default_branch: repo.default_branch,
                 path,
             }),
@@ -246,7 +246,7 @@ pub(crate) fn source_from(source: pb::Source) -> Result<Source> {
         Kind::HfXet(source) => Source::HfXet {
             repo: crate::hf::Repo {
                 id: source.repo,
-                revision: source.commit,
+                revision: source.revision,
                 default_branch: source.default_branch,
                 kind: if source.dataset {
                     crate::hf::RepoKind::Dataset

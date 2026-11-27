@@ -456,7 +456,7 @@ where
         let root = match root {
             AcquirePin::Named(pin) => Root::Pin(w::pin_target(&pin)),
             AcquirePin::Automatic { policy, alias } => Root::Automatic(pb::AutomaticRoot {
-                policy: Some(w::policy(&policy)),
+                policy: policy.as_ref().map(w::policy),
                 alias: alias.map(|name| name.as_str().to_owned()),
             }),
         };
@@ -472,14 +472,19 @@ where
                 root: Some(root),
             })
             .await
-            .map_err(|status| match hub {
-                Some(repo)
-                    if status.code() == hellas_wire::WireCode::NotFound
-                        && status.details().as_ref() == w::HF_NOT_FOUND =>
-                {
-                    Error::HfNotFound(repo)
+            .map_err(|status| {
+                let from_hub = status
+                    .metadata()
+                    .get(w::ERROR_SOURCE)
+                    .and_then(|value| value.as_text())
+                    == Some("hub");
+                match (hub.filter(|_| from_hub), status.code()) {
+                    (Some(repo), hellas_wire::WireCode::NotFound) => Error::HfNotFound(repo),
+                    (Some(repo), hellas_wire::WireCode::PermissionDenied) => {
+                        Error::HfUnauthorized(repo)
+                    }
+                    _ => w::error(status),
                 }
-                _ => w::error(status),
             })?;
         let target = w::target_from(
             response
@@ -494,6 +499,7 @@ where
             object,
             target,
             root: PinName::new(response.root)?,
+            hub_alias: response.hub_alias.map(PinName::new).transpose()?,
             commit: response.commit,
         })
     }
