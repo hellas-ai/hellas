@@ -15,7 +15,25 @@ use tokio::sync::oneshot;
 /// Open a byte stream for the caller's application authentication. The socket
 /// path supplies neither server trust nor application permission.
 pub async fn connect_stream(path: impl AsRef<Path>) -> io::Result<UnixStream> {
-    UnixStream::connect(path).await
+    let (address, _directory) = socket_address(path.as_ref())?;
+    UnixStream::connect(address).await
+}
+
+/// `sun_path` holds about a hundred bytes. On Linux a longer path is reached
+/// through an open descriptor for its directory, which the caller keeps open.
+fn socket_address(path: &Path) -> io::Result<(PathBuf, Option<std::fs::File>)> {
+    #[cfg(target_os = "linux")]
+    if path.as_os_str().len() >= 100
+        && let (Some(parent), Some(name)) = (path.parent(), path.file_name())
+    {
+        use std::os::fd::AsRawFd as _;
+        let directory = std::fs::File::open(parent)?;
+        let address = Path::new("/proc/self/fd")
+            .join(directory.as_raw_fd().to_string())
+            .join(name);
+        return Ok((address, Some(directory)));
+    }
+    Ok((path.to_owned(), None))
 }
 
 pub async fn connect(path: impl AsRef<Path>) -> io::Result<MuxTransport> {
@@ -89,7 +107,8 @@ impl LocalControlServer {
             }
             let probe = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
             probe.set_nonblocking(true)?;
-            let address = socket2::SockAddr::unix(path)?;
+            let (address, _directory) = socket_address(path)?;
+            let address = socket2::SockAddr::unix(address)?;
             match probe.connect(&address) {
                 Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {}
                 _ => {
@@ -111,7 +130,10 @@ impl LocalControlServer {
             }
             std::fs::remove_file(path)?;
         }
-        let listener = UnixListener::bind(path)?;
+        let listener = {
+            let (address, _directory) = socket_address(path)?;
+            UnixListener::bind(address)?
+        };
         let metadata = std::fs::symlink_metadata(path)?;
         let socket = SocketPath {
             socket: path.to_owned(),
