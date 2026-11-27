@@ -334,7 +334,7 @@ where
                 );
                 Source::Https {
                     url: source.parse()?,
-                    bytes: bytes.context("HTTPS requires --bytes")?,
+                    bytes,
                     sha256: sha256
                         .map(|sha| hellas_auth::hex::parse(&sha))
                         .transpose()?,

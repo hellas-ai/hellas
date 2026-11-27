@@ -13,7 +13,10 @@ pub(crate) struct Staged {
     data: Data,
     chunks: Vec<Chunk>,
 }
-pub(super) fn validate_https(url: &url::Url) -> Result<()> {
+pub(super) const HTTPS_LENGTH_REQUIRED: &str =
+    "HTTPS response has no usable Content-Length; supply --bytes";
+
+pub fn validate_https(url: &url::Url) -> Result<()> {
     if url.scheme() != "https"
         || url.host_str().is_none()
         || !url.username().is_empty()
@@ -64,10 +67,11 @@ async fn publish(
     scope: &Scope,
     stages: BTreeMap<ContentId, Staged>,
     target: Target,
-    pin: PinTarget,
+    (pin, alias): (PinTarget, Option<PinName>),
     requester: Option<(Core, Scope)>,
 ) -> Result<Acquisition> {
     let object = target.object();
+    let root = pin.name.clone();
     store
         .effect(scope, move |store| {
             store.require_ready()?;
@@ -79,37 +83,90 @@ async fn publish(
                     .collect(),
                 target,
                 pin,
+                alias,
                 requester,
             )
         })
         .await?;
-    Ok(Acquisition { object })
+    Ok(Acquisition {
+        object,
+        target,
+        root,
+        commit: None,
+    })
+}
+
+fn root_pin(
+    pin: AcquirePin,
+    name: impl FnOnce() -> String,
+) -> Result<(PinTarget, Option<PinName>)> {
+    match pin {
+        AcquirePin::Named(pin) => Ok((pin, None)),
+        AcquirePin::Automatic { policy, alias } => {
+            let name = PinName::new(name())?;
+            let alias = alias.filter(|alias| alias != &name);
+            Ok((PinTarget { name, policy }, alias))
+        }
+    }
+}
+
+fn hf_root(repo: &crate::hf::Repo, path: Option<&str>) -> String {
+    let prefix = if repo.kind == crate::hf::RepoKind::Dataset {
+        "hf-dataset"
+    } else {
+        "hf"
+    };
+    let mut root = format!("{prefix}/{}@{}", repo.id, repo.revision);
+    if let Some(path) = path {
+        root.push('/');
+        root.push_str(path);
+    }
+    root
 }
 pub(crate) async fn memory(
     store: &Core,
     scope: &Scope,
     source: Source,
     expect: Option<ContentRef>,
-    pin: PinTarget,
+    pin: AcquirePin,
     requester: Option<(Core, Scope)>,
 ) -> Result<Acquisition> {
     match source {
         Source::Https { url, sha256, bytes } => {
             validate_https(&url)?;
-            if expect.is_some_and(|expect| expect.bytes() != bytes) {
+            if let (Some(expect), Some(bytes)) = (expect, bytes)
+                && expect.bytes() != bytes
+            {
                 return Err(Error::Invalid("source length contract"));
             }
-            let charge = store.reserve(bytes)?;
+            // A declared length reserves before the request; otherwise the
+            // response length reserves, and `fill` still verifies it exactly.
+            let declared = bytes
+                .or(expect.map(|object| object.bytes()))
+                .map(|bytes| Ok::<_, Error>((bytes, store.reserve(bytes)?)))
+                .transpose()?;
             let core = store.clone();
             let http = store.http.clone();
             let stage = tokio::task::spawn_blocking(move || {
                 let response = http
                     .get(url.as_str())
+                    .header("Accept-Encoding", "identity")
                     .call()
                     .map_err(|_| Error::Invalid("HTTPS request failed"))?;
                 if response.status() != 200 {
                     return Err(Error::Invalid("HTTPS response status"));
                 }
+                let (bytes, charge) = match declared {
+                    Some(declared) => declared,
+                    None => {
+                        let bytes = response
+                            .headers()
+                            .get("content-length")
+                            .and_then(|length| length.to_str().ok()?.parse().ok())
+                            .ok_or(Error::Invalid(HTTPS_LENGTH_REQUIRED))?;
+                        (bytes, core.reserve(bytes)?)
+                    }
+                };
                 let mut body = Buffer::new(&core, bytes, charge)?;
                 let chunks = body.fill(response.into_body().into_reader(), sha256, &core.pool)?;
                 indexed_stage(body, expect, chunks)
@@ -117,6 +174,7 @@ pub(crate) async fn memory(
             .await
             .map_err(|_| Error::Invalid("acquisition worker failed"))??;
             let target = Target::Object(stage.object);
+            let pin = root_pin(pin, || format!("https/{}", stage.object.id()))?;
             publish(
                 store,
                 scope,
@@ -150,16 +208,18 @@ pub(crate) async fn memory(
             if expect.is_some_and(|expect| expect != root.object()) {
                 return Err(Error::Invalid("peer expectation"));
             }
+            let pin = root_pin(pin, || format!("peer/{}", root.object().id()))?;
             peer(store, scope, &remote, &at, root, pin, requester).await
         }
         Source::HfXet { repo, path } => {
             repo.validate().map_err(hf_error)?;
-            if !crate::hf::immutable_sha(&repo.revision) {
-                return Err(Error::Invalid("HF immutable commit"));
-            }
             if let Some(path) = &path {
                 super::tree::validate_path(path, false)?;
             }
+            if !crate::hf::immutable_sha(&repo.revision) {
+                return Err(Error::Invalid("HF immutable commit"));
+            }
+            let pin = root_pin(pin, || hf_root(&repo, path.as_deref()))?;
             let core = store.clone();
             let source_repo = repo.clone();
             let (stages, root, files) = tokio::task::spawn_blocking(move || {
@@ -168,7 +228,8 @@ pub(crate) async fn memory(
             })
             .await
             .map_err(|_| Error::Invalid("HF worker failed"))??;
-            let acquisition = publish(store, scope, stages, root, pin, requester).await?;
+            let mut acquisition = publish(store, scope, stages, root, pin, requester).await?;
+            acquisition.commit = Some(repo.revision.clone());
             if repo.kind == crate::hf::RepoKind::Model {
                 store
                     .record_hub_files(&repo.id, &repo.revision, files)
@@ -184,7 +245,7 @@ async fn peer(
     remote: &dyn ContentStore,
     at: &Path,
     root: Target,
-    pin: PinTarget,
+    pin: (PinTarget, Option<PinName>),
     requester: Option<(Core, Scope)>,
 ) -> Result<Acquisition> {
     let mut stages: BTreeMap<ContentId, Staged> = BTreeMap::new();
@@ -272,7 +333,7 @@ impl DiskStore {
                         remote,
                         at,
                         Target::Object(expect),
-                        pin,
+                        (pin, None),
                         None,
                     )
                     .await?;
@@ -347,21 +408,24 @@ fn hf_stages(
     expect: Option<ContentRef>,
     weights: bool,
 ) -> Result<HfStages> {
-    let (files, _metadata) = cas.files(&core.pool).map_err(hf_error)?;
+    let (mut files, _metadata) = cas.files(&core.pool).map_err(hf_error)?;
     let mut stages = BTreeMap::new();
-    if let Some(path) = path {
-        let file = files
-            .iter()
-            .find(|file| file.path == path)
-            .ok_or(Error::Missing)?;
+    if let Some(file) = path.and_then(|path| files.iter().find(|file| file.path == path)) {
         let stage = hf_file(cas, file, core, &stages, expect)?;
         let root = Target::Object(stage.object);
         stages.insert(stage.object.id(), stage);
         return Ok((
             stages,
             root,
-            BTreeMap::from([(path.to_owned(), root.object())]),
+            BTreeMap::from([(file.path.clone(), root.object())]),
         ));
+    }
+    let prefix = path.map_or_else(String::new, |path| format!("{path}/"));
+    if path.is_some() {
+        files.retain(|file| file.path.starts_with(&prefix));
+        if files.is_empty() {
+            return Err(Error::Missing);
+        }
     }
     let mut leaves = BTreeMap::new();
     for file in &files {
@@ -377,7 +441,11 @@ fn hf_stages(
             return Err(Error::Invalid("duplicate Hub file"));
         }
     }
-    let root = trees(leaves.clone(), core, &mut stages)?;
+    let tree_entries = leaves
+        .iter()
+        .map(|(name, object)| (name[prefix.len()..].to_owned(), *object))
+        .collect();
+    let root = trees(tree_entries, core, &mut stages)?;
     if expect.is_some_and(|expect| expect != root) {
         return Err(Error::Invalid("HF tree expectation"));
     }
@@ -446,15 +514,7 @@ impl Core {
             return Err(Error::Denied);
         }
         self.access(scope, |core| core.require_ready()).await?;
-        let core = self.clone();
-        let resolving = repo.clone();
-        let sha = tokio::task::spawn_blocking(move || {
-            core.hf(resolving)
-                .resolve_revision(false, &core.pool)
-                .map_err(hf_error)
-        })
-        .await
-        .map_err(|_| Error::Invalid("resolve worker failed"))??;
+        let sha = self.lock_hf(repo.clone()).await?;
         let repo = crate::hf::Repo {
             revision: sha.clone(),
             default_branch: false,
@@ -467,6 +527,21 @@ impl Core {
         })
         .await
     }
+    pub(crate) async fn lock_hf(&self, repo: crate::hf::Repo) -> Result<String> {
+        if !repo.default_branch && crate::hf::immutable_sha(&repo.revision) {
+            repo.validate().map_err(hf_error)?;
+            return Ok(repo.revision.to_ascii_lowercase());
+        }
+        let core = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let default_branch = repo.default_branch;
+            core.hf(repo)
+                .resolve_revision(default_branch, &core.pool)
+                .map_err(hf_error)
+        })
+        .await
+        .map_err(|_| Error::Invalid("resolve worker failed"))?
+    }
     async fn resolve_hf_once(
         &self,
         scope: &Scope,
@@ -474,7 +549,7 @@ impl Core {
     ) -> Result<(String, ContentRef)> {
         self.access(scope, |core| core.require_ready()).await?;
         let core = self.clone();
-        let id = repo.id.clone();
+        let name = PinName::new(hf_root(&repo, None))?;
         let sha = repo.revision.clone();
         let (stages, root, _) = tokio::task::spawn_blocking(move || {
             hf_stages(&core.hf(repo), &core, None, None, false)
@@ -482,10 +557,12 @@ impl Core {
         .await
         .map_err(|_| Error::Invalid("resolve worker failed"))??;
         let pin = PinTarget {
-            name: PinName::new(format!("hf/{id}@{sha}"))?,
+            name,
             policy: PinPolicy::Owner,
         };
-        let object = publish(self, scope, stages, root, pin, None).await?.object;
+        let object = publish(self, scope, stages, root, (pin, None), None)
+            .await?
+            .object;
         Ok((sha, object))
     }
 }

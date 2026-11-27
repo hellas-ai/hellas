@@ -266,6 +266,7 @@ async fn invalid_acquired_tree_drops_private_files_and_cannot_fill_an_existing_p
                 Target::Tree(object),
                 pin("bad"),
                 None,
+                None,
             )
         })
         .await;
@@ -716,7 +717,7 @@ async fn acquired_pin_deletion_can_retry_after_sql_failure_even_when_work_has_en
                     Source::Https {
                         url,
                         sha256: None,
-                        bytes: object.bytes(),
+                        bytes: Some(object.bytes()),
                     },
                 ),
             )]))))

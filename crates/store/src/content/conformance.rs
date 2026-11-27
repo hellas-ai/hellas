@@ -530,7 +530,7 @@ async fn suite(mut case: Case) {
                 Source::Https {
                     url: "https://example.invalid/file".parse().unwrap(),
                     sha256: None,
-                    bytes: 1
+                    bytes: Some(1)
                 },
                 None,
                 pin("bad", PinPolicy::Owner)
@@ -732,7 +732,7 @@ async fn suite(mut case: Case) {
         let source = Source::Https {
             url,
             sha256,
-            bytes: 16,
+            bytes: Some(16),
         };
         let result = client
             .acquire(&Scope::Owner, source, expect, pin(key, PinPolicy::Public))
@@ -981,7 +981,7 @@ async fn a_remote_owner_resolves_and_acquires_an_hf_repo_a_job_then_reads() {
     let (base, serving) = hub(|base| {
         vec![
             // Resolve: the revision, the listing, and the git-stored small file.
-            ("/api/models/org/repo/revision/main".into(), 200, serde_json::json!({"sha":sha}).to_string().into_bytes()),
+            ("/api/models/org/repo".into(), 200, serde_json::json!({"sha":sha}).to_string().into_bytes()),
             (tree_path.clone(), 200, listing.clone()),
             (tokenizer_path.clone(), 200, b"{}".to_vec()),
             // Acquire: the same tree, then the Xet weights.

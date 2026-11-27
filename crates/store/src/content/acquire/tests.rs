@@ -95,23 +95,31 @@ async fn cold_https_acquisition_pins_only_verified_bytes_and_sha_is_not_the_id()
     store.core.http = http;
     let sha: [u8; 32] = Sha256::digest(b"canonical HTTPS bytes").into();
     let got = store
-        .acquire(
+        .acquire_with(
             &Scope::Owner,
             Source::Https {
                 url,
                 sha256: Some(sha),
-                bytes: 21,
+                bytes: None,
             },
             None,
-            pin("https"),
+            AcquirePin::Automatic {
+                policy: PinPolicy::Public,
+                alias: None,
+            },
         )
         .await
         .unwrap();
     serving.join().unwrap();
     assert_eq!(got.object, ContentRef::for_bytes(b"canonical HTTPS bytes"));
     assert_ne!(got.object.id().as_bytes(), &sha);
+    assert_eq!(got.root.as_str(), format!("https/{}", got.object.id()));
     let mut read = store
-        .read(&Scope::Public, &path("https"), 0..21)
+        .read(
+            &Scope::Public,
+            &Path::new(got.root, String::new()).unwrap(),
+            0..21,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -136,7 +144,7 @@ async fn mismatched_https_expectation_or_transport_digest_leaves_no_pin_or_ram()
                 Source::Https {
                     url,
                     sha256: wrong_sha.then_some([0; 32]),
-                    bytes: 16,
+                    bytes: Some(16),
                 },
                 expect,
                 pin("failed"),
@@ -360,7 +368,7 @@ async fn resolve_tree_fetches_git_files_but_not_weights_and_missing_weights_stay
         &Scope::Owner,
         stages,
         root,
-        pin("resolved"),
+        (pin("resolved"), None),
         None,
     )
     .await
@@ -420,7 +428,7 @@ async fn disk_cold_https_streams_an_object_larger_than_any_tree_without_ram_mate
             Source::Https {
                 url,
                 sha256: None,
-                bytes: data.len() as u64,
+                bytes: Some(data.len() as u64),
             },
             None,
             pin("large"),
@@ -460,7 +468,7 @@ async fn disk_resolve_obeys_recovery_and_reclaims_before_retrying_the_same_commi
     .await
     .unwrap();
     store.core.hf_hub = Some("http://127.0.0.1:1".into());
-    let repo = "hf://org/repo".parse::<crate::hf::Repo>().unwrap();
+    let repo: crate::hf::Repo = "hf://org/repo".parse().unwrap();
     assert!(matches!(
         store.resolve_hf(&Scope::Owner, repo.clone()).await,
         Err(Error::Denied)
@@ -498,7 +506,7 @@ async fn disk_resolve_obeys_recovery_and_reclaims_before_retrying_the_same_commi
             .into_bytes();
         vec![
             (
-                "/api/models/org/repo/revision/main".into(),
+                "/api/models/org/repo".into(),
                 200,
                 serde_json::json!({"sha":sha}).to_string().into_bytes(),
             ),
@@ -633,4 +641,93 @@ async fn lfs_without_xet_id_requires_matching_sha_and_canonical_content() {
             .unwrap();
         assert_eq!(!proofs.is_empty(), accepted);
     }
+}
+
+#[tokio::test]
+async fn automatic_hub_acquisition_locks_once_and_roots_the_alias() {
+    let sha = "a".repeat(40);
+    let listing = serde_json::json!([{"type":"file","path":"sub/model.json","size":2}]);
+    let (base, serving) = hub(|_| {
+        vec![
+            ("/api/models/org/typo/revision/main".into(), 404, vec![]),
+            (
+                "/api/models/org/repo".into(),
+                200,
+                serde_json::json!({"sha":sha}).to_string().into_bytes(),
+            ),
+            (
+                format!("/api/models/org/repo/tree/{sha}?recursive=true"),
+                200,
+                listing.to_string().into_bytes(),
+            ),
+            (
+                format!("/org/repo/resolve/{sha}/sub/model.json"),
+                200,
+                b"{}".to_vec(),
+            ),
+            (
+                format!("/api/models/org/repo/tree/{sha}?recursive=true"),
+                200,
+                listing.to_string().into_bytes(),
+            ),
+            (
+                format!("/org/repo/resolve/{sha}/sub/model.json"),
+                200,
+                b"{}".to_vec(),
+            ),
+        ]
+    });
+    let mut store = MemoryStore::new(Reservations::ram(64 * 1024 * 1024));
+    store.core.hf_hub = Some(base);
+    let alias = PinName::new("models/current".into()).unwrap();
+    let owner = Scope::Owner;
+    let acquire = |repo: &str, path, alias| {
+        store.acquire_with(
+            &owner,
+            Source::HfXet {
+                repo: repo.parse().unwrap(),
+                path,
+            },
+            None,
+            AcquirePin::Automatic {
+                policy: PinPolicy::Jobs,
+                alias,
+            },
+        )
+    };
+    let missing = acquire("hf://org/typo@main", None, None).await.unwrap_err();
+    assert_eq!(
+        missing.to_string(),
+        "HF repository or revision not found: org/typo@main"
+    );
+    let tree = acquire("hf://org/repo", None, None).await.unwrap();
+    assert_eq!(tree.commit.as_deref(), Some(sha.as_str()));
+    assert_eq!(tree.root.as_str(), format!("hf/org/repo@{sha}"));
+    assert!(matches!(tree.target, Target::Tree(_)));
+    let leaf = acquire(
+        &format!("hf://org/repo@{sha}"),
+        Some("sub/model.json".into()),
+        Some(alias.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        leaf.root.as_str(),
+        format!("hf/org/repo@{sha}/sub/model.json")
+    );
+    assert_eq!(leaf.target, Target::Object(ContentRef::for_bytes(b"{}")));
+    store.collect(&owner).await.unwrap();
+    let value = PinValue {
+        target: leaf.target,
+        policy: PinPolicy::Jobs,
+        expires: None,
+    };
+    for name in [&leaf.root, &alias] {
+        assert_eq!(owner_pin(&store, name).await.unwrap(), Some(value.clone()));
+    }
+    assert_eq!(
+        owner_pin(&store, &tree.root).await.unwrap().unwrap().target,
+        tree.target
+    );
+    serving.join().unwrap();
 }

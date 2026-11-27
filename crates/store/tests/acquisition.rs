@@ -13,7 +13,7 @@ async fn untrusted_scopes_cannot_acquire_and_invalid_sources_never_reserve() {
     let source = Source::Https {
         url: "https://example.invalid/file".parse().unwrap(),
         sha256: None,
-        bytes: 1,
+        bytes: Some(1),
     };
     assert!(matches!(
         store.acquire(&Scope::Public, source, None, pin()).await,
@@ -31,7 +31,7 @@ async fn untrusted_scopes_cannot_acquire_and_invalid_sources_never_reserve() {
                     Source::Https {
                         url: url.parse().unwrap(),
                         sha256: None,
-                        bytes: 1
+                        bytes: Some(1)
                     },
                     None,
                     pin()
@@ -66,7 +66,7 @@ async fn incorrect_declared_length_fails_before_starting_a_source() {
     let source = Source::Https {
         url: "https://example.invalid/file".parse().unwrap(),
         sha256: None,
-        bytes: 7,
+        bytes: Some(7),
     };
     assert!(
         store

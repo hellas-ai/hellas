@@ -144,7 +144,11 @@ impl Declaration {
                     _ => None,
                 }
                 .ok_or(Error::Invalid("HTTPS source requires bytes"))?;
-                Some(Source::Https { url, sha256, bytes })
+                Some(Source::Https {
+                    url,
+                    sha256,
+                    bytes: Some(bytes),
+                })
             }
             None => {
                 if path.is_some() || sha256.is_some() || expected.is_none() {
